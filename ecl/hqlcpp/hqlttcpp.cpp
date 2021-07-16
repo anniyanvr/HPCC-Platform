@@ -728,10 +728,13 @@ void HqlThorBoundaryTransformer::transformCompound(HqlExprArray & result, node_o
 
     //Do thor and non-thor parallel actions independently
     HqlExprArray thor;
+    HqlExprArray attrs;
     ForEachItemIn(idx, args)
     {
         IHqlExpression * cur = &args.item(idx);
-        if (normalizeOptions.item(idx) == OptionYes)
+        if (cur->isAttribute())
+            attrs.append(*LINK(cur));
+        else if (normalizeOptions.item(idx) == OptionYes)
             thor.append(*LINK(cur));
         else
         {
@@ -745,6 +748,8 @@ void HqlThorBoundaryTransformer::transformCompound(HqlExprArray & result, node_o
     }
     if (thor.ordinality())
         result.append(*createWrapper(no_thor, createCompound(compoundOp, thor)));
+    if (result.ordinality() > 1)
+        appendArray(result, attrs);
 }
 
 IHqlExpression * HqlThorBoundaryTransformer::createTransformed(IHqlExpression * expr)
@@ -844,9 +849,9 @@ static YesNoOption combine(YesNoOption left, YesNoOption right, bool isUnion)
 {
     if ((left == OptionNo) || (right == OptionNo))
         return OptionNo;
-    if (left == OptionUnknown)
+    if ((left == OptionUnknown) || (left == OptionIgnore))
         return right;
-    if (right == OptionUnknown)
+    if ((right == OptionUnknown) || (right == OptionIgnore)) 
         return left;
 
     //Yes,Some,Maybe
@@ -901,12 +906,13 @@ YesNoOption HqlThorBoundaryTransformer::calcNormalizeThor(IHqlExpression * expr)
 
     switch (op)
     {
-    case no_constant:
-    case no_field:
-    case no_record:
     case no_attr:
     case no_attr_expr:
     case no_attr_link:
+        return OptionIgnore;
+    case no_constant:
+    case no_field:
+    case no_record:
     case no_getresult:
     case no_left:
     case no_right:
@@ -1260,7 +1266,7 @@ IHqlExpression * ThorScalarTransformer::createTransformed(IHqlExpression * expr)
             HqlExprArray children;
             unsigned firstArg = 0;
             unsigned numChildren = expr->numChildren();
-            children.ensure(numChildren);
+            children.ensureCapacity(numChildren);
             if (op != no_map)
             {
                 firstArg = 1;
@@ -1346,6 +1352,8 @@ unsigned SequenceNumberAllocator::getNextSequence()
 
 void SequenceNumberAllocator::nextSequence(HqlExprArray & args, IHqlExpression * name, IAtom * overwriteAction, IHqlExpression * value, bool needAttr, bool * duplicate)
 {
+    if (!overwriteAction)
+        overwriteAction = setAtom;
     IHqlExpression * seq = NULL;
     if (duplicate)
         *duplicate = false;
@@ -1358,44 +1366,34 @@ void SequenceNumberAllocator::nextSequence(HqlExprArray & args, IHqlExpression *
             name->toString(nameText);
 
             IHqlExpression * prev = matched->get();
-            if (prev->isAttribute())
+            IAtom * prevAction = prev->queryName();
+            if (prevAction != overwriteAction)
             {
-                IAtom * prevName = prev->queryName();
-                if (!overwriteAction)
-                {
-                    if (prevName == extendAtom)
-                        throwError1(HQLERR_ExtendMismatch, nameText.str());
-                    else
-                        throwError1(HQLERR_OverwriteMismatch, nameText.str());
-                }
-                else if (prevName != overwriteAction)
-                    throwError1(HQLERR_ExtendOverwriteMismatch, nameText.str());
-
-                IHqlExpression * prevValue = prev->queryChild(1);
-                if (!recordTypesMatch(prevValue->queryType(), value->queryType()))
-                    throwError1(HQLERR_ExtendTypeMismatch, nameText.str());
-                seq = LINK(prev->queryChild(0));
-                assertex(duplicate);
-                *duplicate = true;
+                if ((overwriteAction == extendAtom) || (prevAction == extendAtom))
+                    throwError1(HQLERR_ExtendMismatch, nameText.str());
+                if ((overwriteAction == overwriteAtom) || (prevAction == overwriteAtom))
+                    throwError1(HQLERR_OverwriteMismatch, nameText.str());
+                throwError1(HQLERR_OverwriteMismatch, nameText.str());
             }
             else
             {
-                if (overwriteAction)
-                {
-                    if (overwriteAction == extendAtom)
-                        throwError1(HQLERR_ExtendMismatch, nameText.str());
-                    else
-                        throwError1(HQLERR_OverwriteMismatch, nameText.str());
-                }
-                else
+                if (overwriteAction == setAtom)
                     throwError1(HQLERR_DuplicateNameOutput, nameText.str());
             }
+
+
+            IHqlExpression * prevValue = prev->queryChild(1);
+            if (!recordTypesMatch(prevValue->queryType(), value->queryType()))
+                throwError1(HQLERR_ExtendTypeMismatch, nameText.str());
+            seq = LINK(prev->queryChild(0));
+            if (duplicate)
+                *duplicate = true;
         }
 
         if (!seq)
         {
             seq = createConstant(signedType->castFrom(true, (__int64)getNextSequence()));
-            OwnedHqlExpr saveValue = overwriteAction ? createAttribute(overwriteAction, LINK(seq), LINK(value)) : LINK(seq);
+            OwnedHqlExpr saveValue = createAttribute(overwriteAction, LINK(seq), LINK(value));
             namedMap.setValue(name, saveValue);
         }
     }
@@ -1890,7 +1888,7 @@ protected:
                 unsigned max = expr->numChildren();
                 unsigned idx;
                 bool diff = false;
-                args.ensure(max);
+                args.ensureCapacity(max);
                 for (idx = 0; idx < max; idx++)
                 {
                     IHqlExpression * child = expr->queryChild(idx);
@@ -6917,6 +6915,9 @@ IHqlExpression * WorkflowTransformer::createSequentialWorkflow(IHqlExpression * 
     ForEachChild(i, expr)
     {
         IHqlExpression * cur = expr->queryChild(i);
+        if (cur->isAttribute())
+            continue;
+
         unsigned mark = markDependencies();
         OwnedHqlExpr transformed = transformRootAction(cur);
         restoreDependencies(mark);
@@ -7052,7 +7053,7 @@ IHqlExpression * WorkflowTransformer::createIfWorkflow(IHqlExpression * expr)
             ensureWorkflowAction(dependencies, setCondExpr);
             ensureWorkflowAction(dependencies, newTrueExpr);
 
-            if (newFalseExpr)
+            if (newFalseExpr && !newFalseExpr->isAttribute())
                 ensureWorkflowAction(dependencies, newFalseExpr);
 
             unsigned wfid = ++wfidCount;
@@ -7266,6 +7267,28 @@ void WorkflowTransformer::analyseAll(const HqlExprArray & in)
 }
 
 
+//Is there a single null action with a single workflow dependency, if so return it, else 0.
+unsigned WorkflowTransformer::querySingleRootWfid(const HqlExprArray & transformed)
+{
+    unsigned wfid = 0;
+    ForEachItemIn(i, transformed)
+    {
+        IHqlExpression & cur = transformed.item(i);
+        if (!isNullAction(&cur))
+            return 0;
+        UnsignedArray const & dependencies = queryBodyExtra(&cur)->queryDependencies();
+        if (dependencies.ordinality() > 1)
+            return 0;
+        if (dependencies.ordinality() == 1)
+        {
+            if (wfid)
+                return 0;
+            wfid = dependencies.item(0);
+        }
+    }
+    return wfid;
+}
+
 void WorkflowTransformer::transformRoot(const HqlExprArray & in, WorkflowArray & out)
 {
     wfidCount = translator.queryMaxWfid();
@@ -7275,8 +7298,7 @@ void WorkflowTransformer::transformRoot(const HqlExprArray & in, WorkflowArray &
     {
         OwnedHqlExpr ret = transform(&in.item(idx));
         copyDependencies(queryBodyExtra(ret), &globalInfo);
-        //ignore results that do nothing, but still collect the dependencies...
-        if (ret->getOperator() != no_null)
+        if ((ret->getOperator() != no_null) || queryBodyExtra(ret)->queryDependencies().ordinality())
             transformed.append(*ret.getClear());
     }
 
@@ -7300,9 +7322,10 @@ void WorkflowTransformer::transformRoot(const HqlExprArray & in, WorkflowArray &
     UnsignedArray const & dependencies = globalInfo.queryDependencies();
     if(transformed.ordinality() || dependencies.ordinality())
     {
-        if ((transformed.ordinality() == 0) && (dependencies.ordinality() == 1))
+        unsigned rootWfid = querySingleRootWfid(transformed);
+        if (rootWfid)
         {
-            Owned<IWorkflowItem> wf = lookupWorkflowItem(dependencies.item(0));
+            Owned<IWorkflowItem> wf = lookupWorkflowItem(rootWfid);
             wf->setScheduledNow();
         }
         else
@@ -10358,7 +10381,7 @@ IHqlExpression * HqlScopeTagger::transformAmbiguousChildren(IHqlExpression * exp
 
     bool same = true;
     HqlExprArray args;
-    args.ensure(max);
+    args.ensureCapacity(max);
     for(unsigned i=0; i < max; i++)
     {
         IHqlExpression * cur = expr->queryChild(i);
@@ -10378,7 +10401,7 @@ IHqlExpression * HqlScopeTagger::transformCall(IHqlExpression * expr)
     unsigned max = expr->numChildren();
     bool same = true;
     HqlExprArray args;
-    args.ensure(max);
+    args.ensureCapacity(max);
     for(unsigned i=0; i < max; i++)
     {
         IHqlExpression * cur = expr->queryChild(i);
@@ -11307,6 +11330,24 @@ IHqlExpression * AnnotationNormalizerTransformer::createTransformed(IHqlExpressi
 
     OwnedHqlExpr transformed = NewHqlTransformer::createTransformed(expr);
     return queryLocationIndependentExtra(body)->cloneAnnotations(transformed);
+}
+
+void AnnotationNormalizerTransformer::setTransformed(IHqlExpression * expr, IHqlExpression * transformed)
+{
+    NewHqlTransformer::setTransformed(expr, transformed);
+
+    //All derived expressions map to the same transformed expressions => override the default behaviour in
+    //NewHqlTransformer::transform which uses transformed->queryBody(true) for body
+    IHqlExpression * body = expr->queryBody(true);
+    while (body != expr)
+    {
+        //If child body is already mapped then don't remap it, otherwise tree can become inconsistent
+        if (queryAlreadyTransformed(body))
+            break;
+        NewHqlTransformer::setTransformed(body, transformed);
+        expr = body;
+        body = body->queryBody(true);
+    }
 }
 
 AnnotationTransformInfo * AnnotationNormalizerTransformer::queryLocationIndependentExtra(IHqlExpression * expr)
@@ -13751,7 +13792,7 @@ IHqlExpression * HqlTreeNormalizer::createTransformedBody(IHqlExpression * expr)
 
     bool same = true;
     HqlExprArray children;
-    children.ensure(max);
+    children.ensureCapacity(max);
     for (unsigned idx=0;idx<max;idx++)
     {
         IHqlExpression * child = expr->queryChild(idx);
@@ -13800,6 +13841,7 @@ void normalizeHqlTree(HqlCppTranslator & translator, HqlExprArray & exprs)
 //      logTreeStats(exprs);
 //      logTreeStats(transformed);
 //      DBGLOG("Before normalize %u unique expressions, after normalize %u unique expressions", getNumUniqueExpressions(exprs), getNumUniqueExpressions(transformed));
+        sanityCheckTransformation("Normalize", exprs, transformed);
         replaceArray(exprs, transformed);
         seenForceLocal = normalizer.querySeenForceLocal();
         seenLocalUpload = normalizer.querySeenLocalUpload();
@@ -14139,6 +14181,7 @@ void HqlCppTranslator::applyGlobalOptimizations(HqlExprArray & exprs)
             foldOptions = options.globalFoldOptions;
 
         foldHqlExpression(queryErrorProcessor(), folded, exprs, foldOptions);
+        sanityCheckTransformation("Global fold expressions", exprs, folded);
         replaceArray(exprs, folded);
     }
 
@@ -14149,6 +14192,7 @@ void HqlCppTranslator::applyGlobalOptimizations(HqlExprArray & exprs)
     {
         HqlExprArray folded;
         optimizeHqlExpression(queryErrorProcessor(), folded, exprs, HOOfold);
+        sanityCheckTransformation("Global optimize", exprs, folded);
         replaceArray(exprs, folded);
     }
 

@@ -24,12 +24,14 @@ import platform
 import atexit
 import traceback
 import glob
-
+import inspect
+import signal
 import argparse
+
 from hpcc.regression.regress import Regression
 from hpcc.util.util import checkClusters, checkHpccStatus
-from hpcc.util.util import setConfig, checkPqParam, getVersionNumbers, checkXParam, convertPath
-from hpcc.util.util import getEclRunArgs, isSudoer
+from hpcc.util.util import setConfig, checkPqParam, getVersionNumbers, checkXParam, convertPath, isPositiveIntNum
+from hpcc.util.util import getEclRunArgs, isSudoer, getCodeInfo
 from hpcc.util.expandcheck import ExpandCheck
 from hpcc.common.error import Error
 from hpcc.common.config import Config
@@ -110,6 +112,9 @@ class RegressMain:
             except IOError:
                 logging.error("%s. Some query does not exist!" % (0))
                 exit()
+            except Exception as e:
+                logging.critical(e)
+                logging.critical(traceback.format_exc())
 
     def setup(self):
         if len(self.args.setup) > 0:
@@ -188,8 +193,7 @@ class RegressMain:
         helperParser.add_argument('--config', help="Config file to use. Default: ecl-test.json",
                             nargs='?', default=defaultConfigFile)
         helperParser.add_argument('--loglevel', help="Set the log level. Use debug for more detailed logfile.",
-                            nargs='?', default="info",
-                            choices=['info', 'debug'])
+                            nargs='?', default="info", choices=['info', 'debug'])
 
         commonParser=argparse.ArgumentParser(add_help=False)
         commonParser.add_argument('--suiteDir', '-s', help="SuiteDir to use. Default value is the current directory and it can handle relative path.",
@@ -208,8 +212,8 @@ class RegressMain:
                                 type=checkPqParam,  default = 0,   metavar="threadNumber")
         commonParser.add_argument('--noversion', help="Avoid version expansion of queries. Execute them as a standard test.",
                                 action = 'store_true')
-        commonParser.add_argument('--server', help="ESP server address. Default value (espIp) defined in ecl-test.json config file.",
-                                nargs='?', default=None,  metavar="networkAddress")
+        commonParser.add_argument('--server', help="ESP server and optionally port address. Default value (espIp, espSocket) defined in ecl-test.json config file.",
+                                nargs='?', default=None,  metavar="networkAddress[:port]")
         commonParser.add_argument('--username',  '-u', help="Specify a username. If this appears in command line and the STDIO is a TTY like device then, the test engine displays a prompt to get user's password. Pipe like 'echo \"<password>\" | ./elc-test run -u <username>  ...' can be used to provide user's password as well. The username and password overrides those stored in ecl-test.json config file.",
                                 nargs='?', default=None,  metavar="username")
 
@@ -232,6 +236,8 @@ class RegressMain:
                                 action = 'store_true')
         executionParser.add_argument('--createEclRunArg', help="Generate ECL tool command line.",
                                 action='store_true')
+        executionParser.add_argument('--preAbort', help="Execute an arbitrary command/script before aborting.",
+                                default=None,  metavar='preAbortscriptName')
 
 
         parser = argparse.ArgumentParser(prog=prog, description=description,  parents=[helperParser, commonParser,  executionParser])
@@ -305,7 +311,17 @@ class RegressMain:
         # Process config parameter
         self.config = Config(self.args.config).configObj
         if ('server' in self.args) and (self.args.server != None):
-            self.config.set('espIp',  self.args.server)
+            if ':' in self.args.server:
+                ip, port = self.args.server.split(':')
+                if isPositiveIntNum(port):
+                    self.config.set('espSocket', port)
+                else:
+                    err = Error("6008")
+                    logging.error("%s. %s : '%s'." % (-1, err, port))
+                    exit(err.getErrorCode())
+            else:
+                ip = self.args.server
+            self.config.set('espIp', ip)
             pass
 
         if self.args.username != None:
@@ -349,6 +365,14 @@ class RegressMain:
         else:
             self.config.set('generateStackTrace', False)
 
+        self.config.set('preAbort', self.args.preAbort)
+
+        if not self.config.has('wuStatusTimeout'):
+            self.config.set('wuStatusTimeout', 30)
+
+        if not self.config.has('wuAbortTimeout'):
+            self.config.set('wuAbortTimeout', 30)
+
         self.config.set('log',  self.log)
         setConfig(self.config)
 
@@ -359,16 +383,16 @@ class RegressMain:
                 # Target not specified, use default from config
                 try:
                     if self.args.func == 'setup':
-                        defaultTargets = self.config.defaultSetupEngines
-                        targetSet='defaultSetupEngines'
+                        defaultTargets = self.config.defaultSetupTargets
+                        targetSet='defaultSetupTargets'
                     else:
-                        defaultTargets = self.config.defaultTargetEngines
-                        targetSet='defaultTargetEngines'
+                        defaultTargets = self.config.defaultTargets
+                        targetSet='defaultTargets'
 
                     self.targetEngines = checkClusters(defaultTargets, targetSet)
 
                 except AttributeError:
-                    # It seems there is no defaultSetupClusters|defaulttargetEngines array in the config file
+                    # It seems there is no defaultSetupTargets|defaultTargets array in the config file
                     # use the first one of cluster list in config file
                     self.targetEngines.append(self.config.Engines[0])
             elif 'all' == self.args.target:
@@ -403,8 +427,13 @@ class RegressMain:
             self.args.setupExtraX = []
             self.args.setupExtraX.append('OriginalTextFilesOsPath='+self.regressionSuiteHpccMainOsDir)
             self.args.setupExtraX.append('OriginalTextFilesEclPath='+self.regressionSuiteHpccMainEclDir)
-            self.args.setupExtraX.append('OriginalTextFilesIp=' +self.config.setupExtraParams['OriginalTextFilesIp'] )
-            self.args.setupExtraD = self.config.setupExtraDParams
+            if 'OriginalTextFilesIp' in self.config.setupExtraParams:
+                self.args.setupExtraX.append('OriginalTextFilesIp=' +self.config.setupExtraParams['OriginalTextFilesIp'] )
+            
+            try:
+                self.args.setupExtraD = self.config.setupExtraDParams
+            except AttributeError:
+                pass
 
             self.args.setupExtraX.append('dropzoneIp=' + self.config.dropzoneIp )
             self.args.setupExtraX.append('dropzonePath=' + self.config.dropzonePath )
@@ -456,12 +485,22 @@ class RegressMain:
             logging.critical(traceback.format_exc())
             exit(-1)
         except KeyboardInterrupt:
+            logger.debug("%3d. Keyboard interrupt in %s." % (-1, getCodeInfo(inspect.currentframe()) ))
             logging.critical("Keyboard Interrupt Caught.")
         finally:
             if self.regress:
-                self.regress.StopTimeoutThread()
+                self.regress.close()
+                self.regress = None
         exit()
 
+
+def signalHandler(signum, frame):
+    logging.critical("Signal %d received" %(signum))
+    raise KeyboardInterrupt
+    
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signalHandler)
+    signal.signal(signal.SIGTERM, signalHandler)
+
     regressMain = RegressMain()
     regressMain.main()

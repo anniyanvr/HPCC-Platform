@@ -53,7 +53,7 @@ protected:
 
 //---------------------------------------------------------------------------
 
-enum YesNoOption { OptionUnknown, OptionNo, OptionMaybe, OptionSome, OptionYes };   //NB: last 3 IN ascending order of definiteness.
+enum YesNoOption { OptionUnknown, OptionNo, OptionMaybe, OptionSome, OptionYes, OptionIgnore };   //NB: last 3 IN ascending order of definiteness.
 
 class HqlThorBoundaryInfo : public NewTransformInfo
 {
@@ -533,6 +533,7 @@ protected:
 
     void analyseExpr(IHqlExpression * expr);
     void addWorkflowItem(WorkflowItem & item);
+    unsigned querySingleRootWfid(const HqlExprArray & transformed);
 
 protected:
     IWorkUnit *               wu;
@@ -1156,6 +1157,8 @@ public:
     virtual void analyseExpr(IHqlExpression * expr);
     virtual ANewTransformInfo * createTransformInfo(IHqlExpression * expr);
     virtual IHqlExpression * createTransformed(IHqlExpression * expr);
+
+    virtual void setTransformed(IHqlExpression * expr, IHqlExpression * transformed) override;
 
 //  virtual void analyseSelector(IHqlExpression * expr);
 //  virtual IHqlExpression * transformSelector(IHqlExpression * expr);

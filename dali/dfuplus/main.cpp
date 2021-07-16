@@ -16,14 +16,13 @@
 ############################################################################## */
 
 #pragma warning (disable : 4786)
-#include <build-config.h>
 #include "daftcfg.hpp"
 #include "dfuerror.hpp"
 #include "dfuplus.hpp"
 
 void printVersion()
 {
-    printf("DFU Version: %d %s\n", DAFT_VERSION, BUILD_TAG);
+    printf("DFU Version: %d %s\n", DAFT_VERSION, hpccBuildInfo.buildTag);
 }
 
 void handleSyntax()
@@ -64,6 +63,7 @@ void handleSyntax()
     out.append("                                   source file set is empty.\n");
     out.append("    spray options:\n");
     out.append("        srcip=<source-machine-ip>\n");
+    out.append("        srcplane=<source-storage-plane-name>\n");
     out.append("        srcfile=<source-file-path>\n");
     out.append("        srcxml=<xml-file> -- replaces srcip and srcfile\n");
     out.append("        dstname=<destination-logical-name>\n");
@@ -102,6 +102,7 @@ void handleSyntax()
     out.append("    despray options:\n");
     out.append("        srcname=<source-logical-name>\n");
     out.append("        dstip=<destination-machine-ip>\n");
+    out.append("        dstplane=<destination-storage-plane-name>\n");
     out.append("        dstfile=<destination-file-path>\n");
     out.append("        dstxml=<xml-file> -- replaces dstip and dstfile\n");
     out.append("        splitprefix=... use prefix (same format as /prefix) to split file up\n");
@@ -160,6 +161,7 @@ void handleSyntax()
     out.append("        dstname=<destination-logical-name>\n");
     out.append("            -- To add remote files from another dali directly, use these\n");
     out.append("               options instead of srcxml:\n");
+    out.append("        dstcluster=<destination-cluster> -- which cluster contains the files\n");
     out.append("        srcname=<source-logical-name>\n");
     out.append("        srcdali=<source-dali-ip>\n");
     out.append("        srcusername=<user-name-for-source-dali>\n");
@@ -268,7 +270,7 @@ int main(int argc, const char* argv[])
     if(!action || !*action)
     {
         handleSyntax();
-        fprintf(stderr, "\nERROR: please specify one action");
+        fprintf(stderr, "\nERROR: please specify one action\n");
         releaseAtoms();
         return DFUERR_TooFewArguments;
     }

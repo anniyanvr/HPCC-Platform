@@ -29,13 +29,14 @@
 #endif
 #include "referencedfilelist.hpp"
 #include "ws_wuresult.hpp"
+#include "jsmartsock.ipp"
 
 #define UFO_DIRTY                                0x01
 #define UFO_RELOAD_TARGETS_CHANGED_PMID          0x02
 #define UFO_RELOAD_MAPPED_QUERIES                0x04
 #define UFO_REMOVE_QUERIES_NOT_IN_QUERYSET       0x08
 
-static const __uint64 defaultWUResultMaxSize = 10000000; //10M
+static const __uint64 defaultWUResultMaxSize = 0x100000*10; //10M
 
 class QueryFilesInUse : public CInterface, implements ISDSSubscription
 {
@@ -62,6 +63,9 @@ private:
 
     void updateUsers()
     {
+#ifdef _CONTAINERIZED
+        IERRLOG("CONTAINERIZED(QueryFilesInUse::updateUsers)");
+#else
         Owned<IStringIterator> clusters = getTargetClusters("RoxieCluster", NULL);
         ForEach(*clusters)
         {
@@ -74,6 +78,7 @@ private:
             roxieUserMap.setValue(target.str(), user);
             roxieUsers.append(*user.getClear());
         }
+#endif
     }
 
 public:
@@ -221,8 +226,6 @@ public:
         CWsWorkunits::setContainer(container);
         m_sched.setContainer(container);
     }
-    void refreshValidClusters();
-    bool isValidCluster(const char *cluster);
     void deploySharedObjectReq(IEspContext &context, IEspWUDeployWorkunitRequest & req, IEspWUDeployWorkunitResponse & resp, const char *dir, const char *xml=NULL);
     unsigned getGraphIdsByQueryId(const char *target, const char *queryId, StringArray& graphIds);
     bool getQueryFiles(IEspContext &context, const char* wuid, const char* query, const char* target, StringArray& logicalFiles, IArrayOf<IEspQuerySuperFile> *superFiles);
@@ -230,7 +233,7 @@ public:
     void checkAndSetClusterQueryState(IEspContext &context, const char* cluster, const char* querySetId, IArrayOf<IEspQuerySetQuery>& queries, bool checkAllNodes);
     void checkAndSetClusterQueryState(IEspContext &context, const char* cluster, StringArray& querySetIds, IArrayOf<IEspQuerySetQuery>& queries, bool checkAllNodes);
     IWorkUnitFactory *queryWUFactory() { return wuFactory; };
-    const char *getDataDirectory() const { return dataDirectory.str(); };
+    const char *getTempDirectory() const { return tempDirectory.str(); };
 
     bool onWUQuery(IEspContext &context, IEspWUQueryRequest &req, IEspWUQueryResponse &resp);
     bool onWULightWeightQuery(IEspContext &context, IEspWULightWeightQueryRequest &req, IEspWULightWeightQueryResponse &resp);
@@ -314,8 +317,11 @@ public:
     bool onWUDetailsMeta(IEspContext &context, IEspWUDetailsMetaRequest &req, IEspWUDetailsMetaResponse &resp);
 
     void setPort(unsigned short _port){port=_port;}
-
+#ifndef _CONTAINERIZED
     bool isQuerySuspended(const char* query, IConstWUClusterInfo *clusterInfo, unsigned wait, StringBuffer& errorMessage);
+#else
+    bool isQuerySuspended(const char* query, const char* target, unsigned wait, StringBuffer& errorMessage);
+#endif
     bool onWUCreateZAPInfo(IEspContext &context, IEspWUCreateZAPInfoRequest &req, IEspWUCreateZAPInfoResponse &resp);
     bool onWUGetZAPInfo(IEspContext &context, IEspWUGetZAPInfoRequest &req, IEspWUGetZAPInfoResponse &resp);
     bool onWUCheckFeatures(IEspContext &context, IEspWUCheckFeaturesRequest &req, IEspWUCheckFeaturesResponse &resp);
@@ -408,8 +414,6 @@ private:
     Owned<WUArchiveCache> wuArchiveCache;
     StringAttr sashaServerIp;
     unsigned short sashaServerPort;
-    BoolHash validClusters;
-    CriticalSection crit;
     WUSchedule m_sched;
     unsigned short port;
     Owned<IPropertyTree> directories;
@@ -417,11 +421,12 @@ private:
     Owned<IThreadPool> clusterQueryStatePool;
     unsigned thorSlaveLogThreadPoolSize = THOR_SLAVE_LOG_THREAD_POOL_SIZE;
     Owned<IWorkUnitFactory> wuFactory;
-    StringBuffer dataDirectory;
+    StringBuffer tempDirectory;
     __uint64 wuResultMaxSize = defaultWUResultMaxSize;
 
 public:
     QueryFilesInUse filesInUse;
+    MapStringToMyClass<ISmartSocketFactory> roxieConnMap;
     StringAttr zapEmailTo, zapEmailFrom, zapEmailServer;
     unsigned zapEmailMaxAttachmentSize = 0;
     unsigned zapEmailServerPort = 0;
@@ -451,7 +456,7 @@ public:
 
     virtual void getNavigationData(IEspContext &context, IPropertyTree & data)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
         {
             CHttpSoapBinding::getNavigationData(context, data);
             return;
@@ -468,7 +473,9 @@ public:
         }
     }
 
+#ifndef _CONTAINERIZED
     int onGetForm(IEspContext &context, CHttpRequest* request, CHttpResponse* response, const char *service, const char *method);
+#endif
     int onGet(CHttpRequest* request, CHttpResponse* response);
     int onStartUpload(IEspContext& ctx, CHttpRequest* request, CHttpResponse* response, const char* service, const char* method);
 
@@ -488,7 +495,7 @@ private:
     size32_t wuResultDownloadFlushThreshold = defaultWUResultDownloadFlushThreshold;
 };
 
-void deploySharedObject(IEspContext &context, StringBuffer &wuid, const char *filename, const char *cluster, const char *name, const MemoryBuffer &obj, const char *dir, const char *xml=NULL);
+void deploySharedObject(IEspContext &context, StringBuffer &wuid, const char *filename, const char *cluster, const char *name, const MemoryBuffer &obj, const char *dir, const char *xml=NULL, bool protect=false);
 
 class CClusterQueryStateParam : public CInterface
 {

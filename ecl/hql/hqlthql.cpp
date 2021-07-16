@@ -917,10 +917,13 @@ void HqltHql::toECL(IHqlExpression *expr, StringBuffer &s, bool paren, bool inTy
                     
                     StringBuffer temp;
                     scope.append(NULL);
+                    __uint64 uid = querySeqId(expr);
+                    if (uid == 0)
+                        uid = (__uint64)(memsize_t)expr;
                     if (expr->isDataset())
-                        temp.appendf("dataset%012" I64F "x ", (__uint64)(memsize_t)expr);
+                        temp.appendf("dataset%012" I64F "x ", uid);
                     else
-                        temp.appendf("dictionary%012" I64F "x ", (__uint64)(memsize_t)expr);
+                        temp.appendf("dictionary%012" I64F "x ", uid);
 #ifdef SHOW_NORMALIZED
                     if (expandProcessed)
                         temp.appendf("[N%p] ", expr->queryNormalizedSelector());
@@ -1497,6 +1500,10 @@ void HqltHql::toECL(IHqlExpression *expr, StringBuffer &s, bool paren, bool inTy
         case no_activetable:
         case no_counter:
             s.append(getEclOpString(no));
+            if (expandProcessed && expr->querySequenceExtra())
+            {
+                s.append("{").append(expr->querySequenceExtra()).append("}");
+            }
             break;
         case no_selfref:
             if (expandProcessed)
@@ -1627,7 +1634,7 @@ void HqltHql::toECL(IHqlExpression *expr, StringBuffer &s, bool paren, bool inTy
                     IHqlExpression *formal = formals->queryChild(idx);
                     isHidden = formal && formal->hasAttribute(_hidden_Atom);
                 }
-                if (!isHidden)
+                if (!isHidden && (expandProcessed || !isInternalAttribute(kid)))
                 {
                     if (first)
                         first = false;
@@ -3629,6 +3636,7 @@ StringBuffer & processedTreeToECL(IHqlExpression * expr, StringBuffer &s)
 {
     HqltHql hqlthql(true, false);
     hqlthql.setExpandProcessed(true);
+    hqlthql.setTryToRegenerate(true);  // Removes EXPORTs and makes it much easier to spot differences in graphs
 
     HqlExprArray queries;
     unwindCommaCompound(queries, expr);

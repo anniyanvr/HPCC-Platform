@@ -22,7 +22,6 @@
 #include "jargv.hpp"
 #include "junicode.hpp"
 
-#include "build-config.h"
 #include "workunit.hpp"
 #include "thorplugin.hpp"
 #ifndef _WIN32
@@ -52,12 +51,12 @@
 #include "hqlstmt.hpp"
 #include "hqlcache.hpp"
 
-#include "build-config.h"
 #include "rmtfile.hpp"
 #include "deffield.hpp"
 
 #include "reservedwords.hpp"
 #include "eclcc.hpp"
+#include "codesigner.hpp"
 
 #ifndef _CONTAINERIZED
 #include "environment.hpp"
@@ -75,9 +74,7 @@
 //#define TEST_LEGACY_DEPENDENCY_CODE
 
 #define INIFILE "eclcc.ini"
-#define SYSTEMCONFDIR CONFIG_DIR
 #define DEFAULTINIFILE "eclcc.ini"
-#define SYSTEMCONFFILE ENV_CONF_FILE
 #define DEFAULT_OUTPUTNAME  "a.out"
 
 //=========================================================================================
@@ -177,7 +174,7 @@ static bool getHomeFolder(StringBuffer & homepath)
 #ifndef WIN32
     homepath.append('.');
 #endif
-    homepath.append(DIR_NAME);
+    homepath.append(hpccBuildInfo.dirName);
     return true;
 }
 
@@ -251,6 +248,9 @@ public:
         cclogFilename.append("cc.").append((unsigned)GetCurrentProcessId()).append(".log");
         defaultAllowed[false] = true;  // May want to change that?
         defaultAllowed[true] = true;
+#ifdef _CONTAINERIZED
+        setSecurityOptions();
+#endif
     }
     ~EclCC()
     {
@@ -267,6 +267,7 @@ public:
     }
     bool printKeywordsToXml();
     int parseCommandLineOptions(int argc, const char* argv[]);
+    void setSecurityOptions();
     void loadOptions();
     void loadManifestOptions();
     bool processFiles();
@@ -289,7 +290,7 @@ protected:
     void applyDebugOptions(IWorkUnit * wu);
     bool checkWithinRepository(StringBuffer & attributePath, const char * sourcePathname);
     IFileIO * createArchiveOutputFile(EclCompileInstance & instance);
-    ICppCompiler *createCompiler(const char * coreName, const char * sourceDir = NULL, const char * targetDir = NULL);
+    ICppCompiler *createCompiler(const char * coreName, const char * sourceDir, const char * targetDir, const char *compileBatchOut);
     void evaluateResult(EclCompileInstance & instance);
     bool generatePrecompiledHeader();
     void generateOutput(EclCompileInstance & instance);
@@ -307,6 +308,7 @@ protected:
     void processDefinitions(EclRepositoryArray & repositories);
     void reportCompileErrors(IErrorReceiver & errorProcessor, const char * processName);
     void setDebugOption(const char * name, bool value);
+    void traceError(char const * format, ...) __attribute__((format(printf, 2, 3)));
     void usage();
 
 protected:
@@ -344,6 +346,7 @@ protected:
     StringAttr optUser;
     StringAttr optPassword;
     StringAttr optWUID;
+    StringAttr optCompileBatchOut;
     StringArray clusters;
     mutable int prevClusterSize = -1;  // i.e. not cached
     StringAttr optExpandPath;
@@ -394,6 +397,7 @@ protected:
     bool optWorkUnit = false;
     bool optNoCompile = false;
     bool optNoLogFile = false;
+    bool optLogToStdOut = false;
     bool optNoStdInc = false;
     bool optNoBundles = false;
     bool optBatchMode = false;
@@ -518,7 +522,7 @@ int main(int argc, const char *argv[])
     unsigned exitCode = 0;
     try
     {
-        configuration.setown(loadConfiguration(defaultYaml, argv, "eclccserver", "ECLCCSERVER", nullptr, nullptr));
+        configuration.setown(loadConfiguration(defaultYaml, argv, "eclccserver", "ECLCCSERVER", nullptr, nullptr, nullptr, false));
 
 #ifndef _CONTAINERIZED
         // Turn logging down (we turn it back up if -v option seen)
@@ -526,6 +530,11 @@ int main(int argc, const char *argv[])
         queryLogMsgManager()->changeMonitorFilter(queryStderrLogMsgHandler(), filter);
 #else
         setupContainerizedLogMsgHandler();
+        bool useChildProcesses = configuration->getPropInt("@useChildProcesses", false);
+        if (!useChildProcesses)  // If using eclcc in separate container (useChildProcesses==false),
+        {                        // it will need to create a directory for gpg and import keys from secrets
+            queryCodeSigner().initForContainer();
+        }
 #endif
         exitCode = doMain(argc, argv);
         stopPerformanceMonitor();
@@ -627,7 +636,7 @@ void EclCC::loadOptions()
             optIniFilename.set(INIFILE);
         else
         {
-            StringBuffer fn(SYSTEMCONFDIR);
+            StringBuffer fn(hpccBuildInfo.configDir);
             fn.append(PATHSEPSTR).append(DEFAULTINIFILE);
             if (checkFileExists(fn))
                 optIniFilename.set(fn);
@@ -663,21 +672,33 @@ void EclCC::loadOptions()
     }
     extractOption(stdIncludeLibraryPath, globals, "ECLCC_ECLINCLUDE_PATH", "eclIncludePath", ".", NULL);
 
-    if (!optLogfile.length() && !optBatchMode && !optNoLogFile)
-        extractOption(optLogfile, globals, "ECLCC_LOGFILE", "logfile", "eclcc.log", NULL);
-
-    if ((logVerbose || optLogfile) && !optNoLogFile)
+    if (optLogToStdOut)
     {
-        if (optLogfile.length())
-        {
-            StringBuffer lf;
-            openLogFile(lf, optLogfile, optLogDetail, false);
-            if (logVerbose)
-                fprintf(stdout, "Logging to '%s'\n",lf.str());
-        }
-        if (optMonitorInterval)
-            startPerformanceMonitor(optMonitorInterval*1000, PerfMonStandard, nullptr);
+        Owned<ILogMsgHandler> handler = getHandleLogMsgHandler(stdout);
+        handler->setMessageFields(MSGFIELD_STANDARD);
+        Owned<ILogMsgFilter> filter = getCategoryLogMsgFilter(MSGAUD_all, MSGCLS_all, optLogDetail ? optLogDetail : DefaultDetail, true);
+        queryLogMsgManager()->addMonitor(handler, filter);
     }
+#ifndef _CONTAINERIZED
+    else
+    {
+        if (!optLogfile.length() && !optBatchMode && !optNoLogFile)
+            extractOption(optLogfile, globals, "ECLCC_LOGFILE", "logfile", "eclcc.log", NULL);
+
+        if ((logVerbose || optLogfile) && !optNoLogFile)
+        {
+            if (optLogfile.length())
+            {
+                StringBuffer lf;
+                openLogFile(lf, optLogfile, optLogDetail, false);
+                if (logVerbose)
+                    fprintf(stdout, "Logging to '%s'\n",lf.str());
+            }
+            if (optMonitorInterval)
+                startPerformanceMonitor(optMonitorInterval*1000, PerfMonStandard, nullptr);
+        }
+    }
+#endif
 
     if (hooksPath.length())
         installFileHooks(hooksPath.str());
@@ -740,9 +761,9 @@ void EclCC::applyApplicationOptions(IWorkUnit * wu)
 
 //=========================================================================================
 
-ICppCompiler * EclCC::createCompiler(const char * coreName, const char * sourceDir, const char * targetDir)
+ICppCompiler * EclCC::createCompiler(const char * coreName, const char * sourceDir, const char * targetDir, const char *compileBatchOut)
 {
-    Owned<ICppCompiler> compiler = ::createCompiler(coreName, sourceDir, targetDir, optTargetCompiler, logVerbose);
+    Owned<ICppCompiler> compiler = ::createCompiler(coreName, sourceDir, targetDir, optTargetCompiler, logVerbose, compileBatchOut);
     compiler->setOnlyCompile(optOnlyCompile);
     compiler->setCCLogPath(cclogFilename);
 
@@ -831,7 +852,7 @@ void EclCC::instantECL(EclCompileInstance & instance, IWorkUnit *wu, const char 
         try
         {
             bool optSaveTemps = wu->getDebugValueBool("saveEclTempFiles", false);
-            bool optSaveCpp = optSaveTemps || optNoCompile || wu->getDebugValueBool("saveCppTempFiles", false) || wu->getDebugValueBool("saveCpp", false);
+            bool optSaveCpp = optSaveTemps || optNoCompile || !optCompileBatchOut.isEmpty() || wu->getDebugValueBool("saveCppTempFiles", false) || wu->getDebugValueBool("saveCpp", false);
             //New scope - testing things are linked correctly
             {
                 Owned<IHqlExprDllGenerator> generator = createDllGenerator(&errorProcessor, processName.str(), NULL, wu, optTargetClusterType, &instance, false, false);
@@ -871,7 +892,7 @@ void EclCC::instantECL(EclCompileInstance & instance, IWorkUnit *wu, const char 
                 instance.stats.cppSize = generator->getGeneratedSize();
                 if (generateOk && !optNoCompile)
                 {
-                    Owned<ICppCompiler> compiler = createCompiler(processName.str());
+                    Owned<ICppCompiler> compiler = createCompiler(processName.str(), nullptr, nullptr, optCompileBatchOut);
                     compiler->setSaveTemps(optSaveTemps);
 
                     bool compileOk = true;
@@ -892,6 +913,7 @@ void EclCC::instantECL(EclCompileInstance & instance, IWorkUnit *wu, const char 
 
                     if (!compileOk)
                         reportCompileErrors(errorProcessor, processName);
+                    compiler->finish();
                 }
                 else
                     wu->setState(generateOk ? WUStateCompleted : WUStateFailed);
@@ -905,7 +927,7 @@ void EclCC::instantECL(EclCompileInstance & instance, IWorkUnit *wu, const char 
                     fprintf(stdout, "Output file '%s' created\n",outputFile);
                     break;
                 case WUStateFailed:
-                    UERRLOG("Failed to create output file '%s'\n",outputFile);
+                    traceError("Failed to create output file '%s'\n",outputFile);
                     break;
                 case WUStateUploadingFiles:
                     fprintf(stdout, "Output file '%s' created, local file upload required\n",outputFile);
@@ -914,7 +936,7 @@ void EclCC::instantECL(EclCompileInstance & instance, IWorkUnit *wu, const char 
                     fprintf(stdout, "No DLL/SO required\n");
                     break;
                 default:
-                    UERRLOG("Unexpected Workunit state %d\n", (int) wu->getState());
+                    traceError("Unexpected Workunit state %d\n", (int) wu->getState());
                     break;
                 }
             }
@@ -1212,7 +1234,8 @@ void EclCC::processSingleQuery(EclCompileInstance & instance,
     if (optGatherDiskStats)
         systemIoStartInfo.setown(new OsDiskStats(true));
 
-    addTimeStamp(instance.wu, SSTcompilestage, "compile", StWhenStarted);
+    if (optCompileBatchOut.isEmpty())
+        addTimeStamp(instance.wu, SSTcompilestage, "compile", StWhenStarted);
     const char * sourcePathname = queryContents ? str(queryContents->querySourcePath()) : NULL;
     const char * defaultErrorPathname = sourcePathname ? sourcePathname : queryAttributePath;
 
@@ -1495,31 +1518,33 @@ void EclCC::processSingleQuery(EclCompileInstance & instance,
     if (optGatherDiskStats)
         systemIoFinishInfo.setown(new OsDiskStats(true));
     instance.stats.generateTime = (unsigned)nanoToMilli(totalTimeNs) - instance.stats.parseTime;
-    updateWorkunitStat(instance.wu, SSTcompilestage, "compile", StTimeElapsed, NULL, totalTimeNs);
+    const char *scopeName = optCompileBatchOut.isEmpty() ? "compile" : "compile:generate";
+    if (optCompileBatchOut.isEmpty())
+        updateWorkunitStat(instance.wu, SSTcompilestage, scopeName, StTimeElapsed, NULL, totalTimeNs);
 
     const cost_type cost = money2cost_type(calcCost(getMachineCostRate(), nanoToMilli(totalTimeNs)));
     if (cost)
-        instance.wu->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTcompilestage, "compile", StCostExecute, NULL, cost, 1, 0, StatsMergeReplace);
+        instance.wu->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTcompilestage, scopeName, StCostExecute, NULL, cost, 1, 0, StatsMergeReplace);
 
     if (systemFinishTime.getTotal())
     {
         CpuInfo systemElapsed = systemFinishTime - systemStartTime;
         CpuInfo processElapsed = processFinishTime - processStartTime;
-        updateWorkunitStat(instance.wu, SSTcompilestage, "compile", StNumSysContextSwitches, NULL, systemElapsed.getNumContextSwitches());
-        updateWorkunitStat(instance.wu, SSTcompilestage, "compile", StTimeOsUser, NULL, systemElapsed.getUserNs());
-        updateWorkunitStat(instance.wu, SSTcompilestage, "compile", StTimeOsSystem, NULL, systemElapsed.getSystemNs());
-        updateWorkunitStat(instance.wu, SSTcompilestage, "compile", StTimeOsTotal, NULL, systemElapsed.getTotalNs());
-        updateWorkunitStat(instance.wu, SSTcompilestage, "compile", StTimeUser, NULL, processElapsed.getUserNs());
-        updateWorkunitStat(instance.wu, SSTcompilestage, "compile", StTimeSystem, NULL, processElapsed.getSystemNs());
+        updateWorkunitStat(instance.wu, SSTcompilestage, scopeName, StNumSysContextSwitches, NULL, systemElapsed.getNumContextSwitches());
+        updateWorkunitStat(instance.wu, SSTcompilestage, scopeName, StTimeOsUser, NULL, systemElapsed.getUserNs());
+        updateWorkunitStat(instance.wu, SSTcompilestage, scopeName, StTimeOsSystem, NULL, systemElapsed.getSystemNs());
+        updateWorkunitStat(instance.wu, SSTcompilestage, scopeName, StTimeOsTotal, NULL, systemElapsed.getTotalNs());
+        updateWorkunitStat(instance.wu, SSTcompilestage, scopeName, StTimeUser, NULL, processElapsed.getUserNs());
+        updateWorkunitStat(instance.wu, SSTcompilestage, scopeName, StTimeSystem, NULL, processElapsed.getSystemNs());
     }
 
     if (optGatherDiskStats)
     {
         const BlockIoStats summaryIo = systemIoFinishInfo->querySummaryStats() - systemIoStartInfo->querySummaryStats();
         if (summaryIo.rd_sectors)
-            updateWorkunitStat(instance.wu, SSTcompilestage, "compile", StSizeOsDiskRead, NULL, summaryIo.rd_sectors * summaryIo.getSectorSize());
+            updateWorkunitStat(instance.wu, SSTcompilestage, scopeName, StSizeOsDiskRead, NULL, summaryIo.rd_sectors * summaryIo.getSectorSize());
         if (summaryIo.wr_sectors)
-            updateWorkunitStat(instance.wu, SSTcompilestage, "compile", StSizeOsDiskWrite, NULL, summaryIo.wr_sectors * summaryIo.getSectorSize());
+            updateWorkunitStat(instance.wu, SSTcompilestage, scopeName, StSizeOsDiskWrite, NULL, summaryIo.wr_sectors * summaryIo.getSectorSize());
     }
 }
 
@@ -1990,7 +2015,7 @@ bool EclCC::generatePrecompiledHeader()
 {
     if (inputFiles.ordinality() != 0)
     {
-        UERRLOG("No input files should be specified when generating precompiled header");
+        traceError("No input files should be specified when generating precompiled header");
         return false;
     }
     StringArray paths;
@@ -2009,10 +2034,10 @@ bool EclCC::generatePrecompiledHeader()
     }
     if (!foundPath)
     {
-        UERRLOG("Cannot find eclinclude4.hpp");
+        traceError("Cannot find eclinclude4.hpp");
         return false;
     }
-    Owned<ICppCompiler> compiler = createCompiler("precompile", foundPath, NULL);
+    Owned<ICppCompiler> compiler = createCompiler("precompile", foundPath, nullptr, nullptr);
     compiler->setDebug(true);  // a precompiled header with debug can be used for no-debug, but not vice versa
     compiler->addSourceFile("eclinclude4.hpp", nullptr);
     compiler->setPrecompileHeader(true);
@@ -2031,7 +2056,7 @@ bool EclCC::generatePrecompiledHeader()
     }
     else
     {
-        UERRLOG("Compilation failed - see %s for details", cclogFilename.str());
+        traceError("Compilation failed - see %s for details", cclogFilename.str());
         return false;
     }
 }
@@ -2103,7 +2128,6 @@ bool EclCC::processFiles()
         }
     }
 
-
     StringBuffer searchPath;
     if (!optNoStdInc && stdIncludeLibraryPath.length())
         searchPath.append(stdIncludeLibraryPath).append(ENVSEPCHAR);
@@ -2154,6 +2178,25 @@ void EclCC::setDebugOption(const char * name, bool value)
     debugOptions.append(temp);
 }
 
+
+void EclCC::traceError(char const * format, ...)
+{
+    va_list args;
+    va_start(args, format);
+
+    if (optXml)
+    {
+        StringBuffer msg;
+        msg.valist_appendf(format, args);
+        StringBuffer encoded;
+        encodeXML(msg.str(), encoded);
+        UERRLOG("<exception msg='%s'/>", encoded.str());
+    }
+    else
+        VALOG(MCuserError, unknownJob, format, args);
+
+    va_end(args);
+}
 
 void EclCompileInstance::checkEclVersionCompatible()
 {
@@ -2699,6 +2742,9 @@ int EclCC::parseCommandLineOptions(int argc, const char* argv[])
         else if (iter.matchFlag(optNoLogFile, "--nologfile"))
         {
         }
+        else if (iter.matchFlag(optLogToStdOut, "--logtostdout"))
+        {
+        }
         else if (iter.matchFlag(optIgnoreSignatures, "--nogpg"))
         {
         }
@@ -2767,6 +2813,9 @@ int EclCC::parseCommandLineOptions(int argc, const char* argv[])
         else if (iter.matchFlag(optNoCompile, "-S"))
         {
         }
+        else if (iter.matchOption(optCompileBatchOut, "-Sx"))
+        {
+        }
         else if (iter.matchFlag(optShared, "-shared"))
         {
         }
@@ -2785,7 +2834,7 @@ int EclCC::parseCommandLineOptions(int argc, const char* argv[])
         {
             if (!checkFileExists(optIniFilename))
             {
-                UERRLOG("Error: INI file '%s' does not exist",optIniFilename.get());
+                traceError("Error: INI file '%s' does not exist",optIniFilename.get());
                 return 1;
             }
         }
@@ -2845,7 +2894,7 @@ int EclCC::parseCommandLineOptions(int argc, const char* argv[])
         }
         else if (strcmp(arg, "--version")==0)
         {
-            fprintf(stdout,"%s %s\n", LANGUAGE_VERSION, BUILD_TAG);
+            fprintf(stdout,"%s %s\n", LANGUAGE_VERSION, hpccBuildInfo.buildTag);
             return 1;
         }
         else if (startsWith(arg, "-Wc,"))
@@ -2879,7 +2928,7 @@ int EclCC::parseCommandLineOptions(int argc, const char* argv[])
             //If --config has been specified, then ignore any unknown options beginning with -- since they will be added to the globals.
             if ((arg[1] == '-') && optConfig)
                 continue;
-            UERRLOG("Error: unrecognised option %s",arg);
+            traceError("Error: unrecognised option %s",arg);
             usage();
             return 1;
         }
@@ -2926,6 +2975,30 @@ int EclCC::parseCommandLineOptions(int argc, const char* argv[])
     return 0;
 }
 
+void EclCC::setSecurityOptions()
+{
+    IPropertyTree *eclSecurity = configuration->getPropTree("eclSecurity");
+    if (eclSecurity)
+    {
+        // Name of security option in configuration yaml
+        const char * configName[] = {"@embedded", "@pipe", "@extern", "@datafile" };
+        // Name of security option used internally
+        const char * securityOption[] = {"cpp", "pipe", "extern", "datafile" };
+        for (int i=0; i < 4; i++)
+        {
+            const char * optVal = eclSecurity->queryProp(configName[i]);
+            if (optVal)
+            {
+                if (!strcmp(optVal, "allow"))
+                    allowedPermissions.append(securityOption[i]);
+                else if (!strcmp(optVal, "deny"))
+                    deniedPermissions.append(securityOption[i]);
+                else if (!strcmp(optVal, "allowSigned"))
+                    allowSignedPermissions.append(securityOption[i]);
+            }
+        }
+    }
+}
 //=========================================================================================
 
 

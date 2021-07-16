@@ -694,12 +694,27 @@ void CXslTransform::message(StringBuffer& out, const char* in, IXslTransform* pT
     pTrans->m_sMessages.append(in).append('\n');
 }
 
+extern ICompiledXpath* compileOptionalXpath(const char * xpath)
+{
+    UNIMPLEMENTED;
+}
+
 extern ICompiledXpath* compileXpath(const char * xpath)
 {
     UNIMPLEMENTED;
 }
 
 extern IXpathContext* getXpathContext(const char * xmldoc, bool strictParameterDeclaration, bool removeDocNamespaces)
+{
+    UNIMPLEMENTED;
+}
+
+extern IXpathContext *createChildXpathContext(IXpathContext *parent, IEsdlScriptContext *scriptContext, const char *section, bool strictParameterDeclaration, bool removeDocNamespaces)
+{
+    UNIMPLEMENTED;
+}
+
+extern IEsdlScriptContext *createEsdlScriptContext(void* espCtx)
 {
     UNIMPLEMENTED;
 }

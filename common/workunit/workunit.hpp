@@ -35,6 +35,7 @@
 #include "jstats.h"
 #include "jutil.hpp"
 #include "jprop.hpp"
+#include "jmisc.hpp"
 #include "wuattr.hpp"
 #include <vector>
 #include <list>
@@ -46,7 +47,7 @@
 
 #define CHEAP_UCHAR_DEF
 #ifdef _WIN32
-typedef wchar_t UChar;
+typedef char16_t UChar;
 #else //_WIN32
 typedef unsigned short UChar;
 #endif //_WIN32
@@ -574,9 +575,11 @@ enum WFMode
     WFModeUnused = 8,
     WFModeCritical = 9,
     WFModeOrdered = 10,
+    //for parallel workflow at runtime
     WFModeConditionExpression = 11,
+    WFModePersistActivator = 12,
     //Size needs to be the last mode
-    WFModeSize = 12
+    WFModeSize = 13
 };
 
 enum WFState
@@ -1759,6 +1762,9 @@ extern WORKUNIT_API void deleteK8sResource(const char *componentName, const char
 extern WORKUNIT_API void waitK8sJob(const char *componentName, const char *job, unsigned pendingTimeoutSecs, KeepK8sJobs keepJob);
 extern WORKUNIT_API bool applyK8sYaml(const char *componentName, const char *wuid, const char *job, const char *suffix, const std::list<std::pair<std::string, std::string>> &extraParams, bool optional);
 extern WORKUNIT_API void runK8sJob(const char *componentName, const char *wuid, const char *job, const std::list<std::pair<std::string, std::string>> &extraParams={});
+
+// return the k8s external host and port for serviceName
+extern WORKUNIT_API std::pair<std::string, unsigned> getExternalService(const char *serviceName);
 #endif
 
 #endif

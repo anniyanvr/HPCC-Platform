@@ -176,11 +176,11 @@ namespace couchbaseembed
         if (pQcmd)
         {
             size32_t utf8chars;
-            char *utf8;
-            rtlStrToUtf8X(utf8chars, utf8, len, value);
-            auto status = pQcmd->named_param(cbPlaceholder.str(), utf8);
+            rtlDataAttr utf8;
+            rtlStrToUtf8X(utf8chars, utf8.refstr(), len, value);
+            auto status = pQcmd->named_param(cbPlaceholder.str(), utf8.getstr());
             if (!status.success())
-                failx("Could not bind Param: %s val: %s", cbPlaceholder.str(), utf8);
+                failx("Could not bind Param: %s val: %s", cbPlaceholder.str(), utf8.getstr());
         }
         else
             failx("Internal error: detected invalid CouchbaseQueryCommand while attempting to bind to field: %s", cbPlaceholder.str());
@@ -209,12 +209,12 @@ namespace couchbaseembed
         if (pQcmd)
         {
             size32_t bytes;
-            void *data;
-            rtlStrToDataX(bytes, data, len, value);
+            rtlDataAttr data;
+            rtlStrToDataX(bytes, data.refdata(), len, value);
 
-            auto status = pQcmd->named_param(cbPlaceholder.str(), (char *)data);
+            auto status = pQcmd->named_param(cbPlaceholder.str(), data.getstr());
             if (!status.success())
-                failx("Could not bind Param: %s val: %s", cbPlaceholder.str(), (char *)data);
+                failx("Could not bind Param: %s val: %s", cbPlaceholder.str(), data.getstr());
         }
         else
             failx("Internal error: detected invalid CouchbaseQueryCommand while attempting to bind to field: %s", cbPlaceholder.str());
@@ -912,31 +912,32 @@ namespace couchbaseembed
 
     IPropertyTree * CouchbaseEmbedFunctionContext::nextResultRowTree()
     {
-        for (auto cbrow : *m_pQuery)
+        if (m_pQuery)
         {
-            auto json = cbrow.json().to_string();
+            reportIfQueryFailure(m_pQuery);
+
+            // Only the first callback query is processed
+            auto json = m_pQuery->begin()->json().to_string();
             Owned<IPropertyTree> contentTree = createPTreeFromJSONString(json.c_str());
             return contentTree.getLink();
         }
-
-        reportIfQueryFailure(m_pQuery);
 
         return nullptr;
     }
 
     IPropertyTreeIterator * CouchbaseEmbedFunctionContext::nextResultRowIterator()
     {
-        for (auto cbrow : *m_pQuery)
+        if (m_pQuery)
         {
-            auto json = cbrow.json().to_string();
+            reportIfQueryFailure(m_pQuery);
+
+            // Only the first callback query is processed
+            auto json = m_pQuery->begin()->json().to_string();
             Owned<IPropertyTree> contentTree = createPTreeFromJSONString(json.c_str());
             if (contentTree)
                 return contentTree->getElements("./*");
             failx("Could not fetch next result row.");
-            break;
         }
-
-        reportIfQueryFailure(m_pQuery);
 
         return nullptr;
     }
@@ -1121,11 +1122,11 @@ namespace couchbaseembed
         checkNextParam(name);
         VStringBuffer cbPlaceholder("$%s", name);
         size32_t bytes;
-        void *data;
-        rtlStrToDataX(bytes, data, len, val);
-        auto status = m_pQcmd->named_param(cbPlaceholder.str(), (char *)data);
+        rtlDataAttr data;
+        rtlStrToDataX(bytes, data.refdata(), len, val);
+        auto status = m_pQcmd->named_param(cbPlaceholder.str(), data.getstr());
         if (!status.success())
-            failx("Could not bind Param: %s val: %s", cbPlaceholder.str(), (char *)data);
+            failx("Could not bind Param: %s val: %s", cbPlaceholder.str(), data.getstr());
     }
 
     void CouchbaseEmbedFunctionContext::bindFloatParam(const char *name, float val)
@@ -1193,11 +1194,11 @@ namespace couchbaseembed
         checkNextParam(name);
         VStringBuffer cbPlaceholder("$%s", name);
         size32_t utf8chars;
-        char *utf8;
-        rtlStrToUtf8X(utf8chars, utf8, len, val);
-        auto status = m_pQcmd->named_param(cbPlaceholder.str(), utf8);
+        rtlDataAttr utf8;
+        rtlStrToUtf8X(utf8chars, utf8.refstr(), len, val);
+        auto status = m_pQcmd->named_param(cbPlaceholder.str(), utf8.getstr());
         if (!status.success())
-            failx("Could not bind Param: %s val: %s", cbPlaceholder.str(), utf8);
+            failx("Could not bind Param: %s val: %s", cbPlaceholder.str(), utf8.getstr());
     }
 
     void CouchbaseEmbedFunctionContext::bindVStringParam(const char *name, const char *val)
@@ -1404,11 +1405,8 @@ namespace couchbaseembed
         size32_t chars;
         rtlDataAttr result;
         value.setString(strlen(dvalue), dvalue);
-        if (field)
-        {
-            RtlDecimalTypeInfo *dtype = (RtlDecimalTypeInfo *) field->type;
-            value.setPrecision(dtype->getDecimalDigits(), dtype->getDecimalPrecision());
-        }
+        RtlDecimalTypeInfo *dtype = (RtlDecimalTypeInfo *) field->type;
+        value.setPrecision(dtype->getDecimalDigits(), dtype->getDecimalPrecision());
     }
 
     void CouchbaseRowBuilder::processBeginSet(const RtlFieldInfo * field, bool &isAll)

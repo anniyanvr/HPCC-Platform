@@ -2325,6 +2325,40 @@ IHqlExpression * CTreeOptimizer::replaceWithNullRowDs(IHqlExpression * expr)
 
 }
 
+static IHqlExpression * removeNullActions(IHqlExpression * expr)
+{
+    IHqlExpression * nullAction = nullptr;
+    IHqlExpression * lastAction = nullptr;
+    unsigned numAttrs = 0;
+    HqlExprArray args;
+    args.ensureCapacity(expr->numChildren()-1);
+    ForEachChild(i, expr)
+    {
+        IHqlExpression * cur = expr->queryChild(i);
+        if (cur->getOperator() != no_null)
+        {
+            args.append(*LINK(cur));
+            if (cur->isAttribute())
+                numAttrs++;
+            else
+                lastAction = cur;
+        }
+        else
+            nullAction = cur;
+    }
+
+    assertex(nullAction);
+    switch (args.ordinality() - numAttrs)
+    {
+    case 0:
+        return LINK(nullAction);
+    case 1:
+        return LINK(lastAction);
+    default:
+        return expr->clone(args);
+    }
+}
+
 
 IHqlExpression * CTreeOptimizer::transformExpanded(IHqlExpression * expr)
 {
@@ -2854,19 +2888,33 @@ IHqlExpression * CTreeOptimizer::doCreateTransformed(IHqlExpression * transforme
         }
         break;
     case no_split:
-        node_operator childOp = child->getOperator();
-        if (childOp == no_split)
         {
-            //Don't convert an unbalanced splitter into a balanced splitter
-            //- best would be to set unbalanced on the child, but that would require more complication.
-            if (transformed->hasAttribute(balancedAtom) || !child->hasAttribute(balancedAtom))
-                return removeParentNode(transformed);
-        }
+            node_operator childOp = child->getOperator();
+            if (childOp == no_split)
+            {
+                //Don't convert an unbalanced splitter into a balanced splitter
+                //- best would be to set unbalanced on the child, but that would require more complication.
+                if (transformed->hasAttribute(balancedAtom) || !child->hasAttribute(balancedAtom))
+                    return removeParentNode(transformed);
+            }
 
-        //This would remove splits only used once, but dangerous if we ever get the usage counting wrong...
-        //if (queryBodyExtra(transformed)->useCount == 1)
-        //    return removeParentNode(transformed);
-        break;
+            //This would remove splits only used once, but dangerous if we ever get the usage counting wrong...
+            //if (queryBodyExtra(transformed)->useCount == 1)
+            //    return removeParentNode(transformed);
+            break;
+        }
+    case no_orderedactionlist:
+    case no_parallel:
+    case no_sequential:
+        {
+            ForEachChild(i, transformed)
+            {
+                IHqlExpression * cur = transformed->queryChild(i);
+                if (cur->getOperator() == no_null)
+                    return removeNullActions(transformed);
+            }
+            break;
+        }
     }
 
     bool shared = childrenAreShared(transformed);
@@ -3619,51 +3667,88 @@ IHqlExpression * CTreeOptimizer::doCreateTransformed(IHqlExpression * transforme
                     if (!isPureActivity(child) || hasUnknownTransform(child))
                         break;
 
-                    if (child->hasAttribute(_countProject_Atom) || child->hasAttribute(prefetchAtom))
-                        break;
-    
                     IHqlExpression * transformKeyed = transformed->queryAttribute(keyedAtom);
                     IHqlExpression * childKeyed = child->queryAttribute(keyedAtom);
                     if (childKeyed && !transformKeyed)
                         break;
 
                     IHqlExpression * grandchild = child->queryChild(0);
+                    IHqlExpression * transformExpr = transformed->queryChild(2);
                     OwnedMapper mapper = getMapper(child);
 
                     HqlExprArray args;
                     args.append(*LINK(grandchild));
-                    args.append(*LINK(transformed->queryChild(1)));
-                    
-                    ExpandSelectorMonitor monitor(*this);
-                    IHqlExpression * transformExpr = transformed->queryChild(2);
-                    HqlExprArray assigns;
-                    ForEachChild(idxt, transformExpr)
+
+                    try
                     {
-                        IHqlExpression * cur = transformExpr->queryChild(idxt);
-                        if (cur->getOperator() == no_assign)
+                        node_operator transformOp;
+                        OwnedHqlExpr newSelector;
+                        IHqlExpression * exprToClone = nullptr;
+                        if (!queryRealChild(transformed, 3) && (childOp == no_hqlproject))
                         {
-                            IHqlExpression * tgt = cur->queryChild(0);
-                            IHqlExpression * src = cur->queryChild(1);
-                            assigns.append(*createAssign(LINK(tgt), expandFields(mapper, src, child, grandchild, &monitor)));
+                            //Prefer combining TABLE(PROJECT) as a PROJECT because it allows PROJECT(,COUNT) and does not
+                            //have the potential to introduce ambiguities
+                            transformOp = no_transform;
+                            newSelector.setown(createSelector(no_left, grandchild, querySelSeq(child)));
+                            exprToClone = child;
                         }
                         else
                         {
-                            assigns.append(*LINK(cur));
+                            if (child->hasAttribute(_countProject_Atom) || child->hasAttribute(prefetchAtom))
+                                break;
+
+                            args.append(*LINK(transformed->queryChild(1)));
+
+                            transformOp = no_newtransform;
+                            newSelector.set(grandchild);
+                            exprToClone = transformed;
+                        }
+
+                        node_operator newOp = exprToClone->getOperator();
+                        ExpandSelectorMonitor monitor(*this);
+                        HqlExprArray assigns;
+
+                        ForEachChild(idxt, transformExpr)
+                        {
+                            IHqlExpression * cur = transformExpr->queryChild(idxt);
+                            if (cur->getOperator() == no_assign)
+                            {
+                                IHqlExpression * tgt = cur->queryChild(0);
+                                IHqlExpression * src = cur->queryChild(1);
+                                assigns.append(*createAssign(LINK(tgt), expandFields(mapper, src, child, newSelector, &monitor)));
+                            }
+                            else
+                            {
+                                assigns.append(*LINK(cur));
+                            }
+                        }
+                        OwnedHqlExpr expandedTransform = createValue(transformOp, transformExpr->getType(), assigns);
+                        args.append(*LINK(expandedTransform));
+
+                        if (newOp == no_hqlproject)
+                        {
+                            unwindChildren(args, child, 2);
+                            unwindChildren(args, transformed, 3);
+                        }
+                        else
+                        {
+                            unsigned max = transformed->numChildren();
+                            for(unsigned idx=3; idx < max; idx++)
+                                args.append(*expandFields(mapper, transformed->queryChild(idx), child, grandchild, &monitor));
+                        }
+
+                        if (!monitor.isComplex())
+                        {
+                            DBGLOG("Optimizer: Merge %s and %s", queryNode0Text(transformed), queryNode1Text(child));
+                            removeAttribute(args, _internal_Atom);
+                            noteUnused(child);
+                            return exprToClone->clone(args);
                         }
                     }
-                    OwnedHqlExpr expandedTransform = transformExpr->clone(assigns);
-                    args.append(*LINK(expandedTransform));
-
-                    unsigned max = transformed->numChildren();
-                    for(unsigned idx=3; idx < max; idx++)
-                        args.append(*expandFields(mapper, transformed->queryChild(idx), child, grandchild, &monitor));
-
-                    if (!monitor.isComplex())
+                    catch (IException * e)
                     {
-                        DBGLOG("Optimizer: Merge %s and %s", queryNode0Text(transformed), queryNode1Text(child));
-                        removeAttribute(args, _internal_Atom);
-                        noteUnused(child);
-                        return transformed->clone(args);
+                        DBGLOG(e, "Merging TABLE and PROJECT");
+                        e->Release();
                     }
                     break;
                 }
@@ -4280,6 +4365,7 @@ void optimizeHqlExpression(IErrorReceiver & errorProcessor, HqlExprArray & targe
     CTreeOptimizer optimizer(errorProcessor, options);
     optimizer.analyseArray(source, 0);
     optimizer.transformRoot(source, target);
+    sanityCheckTransformation("optimizeHqlExpression", source, target);
 }
 
 

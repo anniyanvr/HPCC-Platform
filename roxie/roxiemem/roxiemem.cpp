@@ -604,16 +604,16 @@ static StringBuffer &memmap(StringBuffer &stats)
     return stats.appendf("\nHeap size %u pages, %u free, largest block %u", heapTotalPages, freePages, maxBlock);
 }
 
-static void throwGlobalHeapExhausted(unsigned allocatorId, unsigned pages)
+static void throwGlobalHeapExhausted(unsigned pages)
 {
-    VStringBuffer msg("Global memory exhausted: pool id %u (%u pages) exhausted, requested %u active(%u) heap(%u/%u)", allocatorId, heapTotalPages, pages, activeRowManagers.load(), heapAllocated, heapTotalPages);
+    VStringBuffer msg("Global memory exhausted: (%u pages) exhausted, requested %u active(%u) heap(%u/%u)", heapTotalPages, pages, activeRowManagers.load(), heapAllocated, heapTotalPages);
     DBGLOG("%s", msg.str());
     throw MakeStringExceptionDirect(ROXIEMM_MEMORY_POOL_EXHAUSTED, msg.str());
 }
 
-static void throwGlobalHeapExhausted(unsigned allocatorId, unsigned newPages, unsigned oldPages)
+static void throwGlobalHeapExhausted(unsigned activityId, unsigned newPages, unsigned oldPages)
 {
-    VStringBuffer msg("Global memory exhausted: pool id %u (%u pages) exhausted, requested %u, had %u active(%u) heap(%u/%u)", allocatorId, heapTotalPages, newPages, oldPages, activeRowManagers.load(), heapAllocated, heapTotalPages);
+    VStringBuffer msg("Global memory exhausted: activity id %u (%u pages) exhausted, requested %u, had %u active(%u) heap(%u/%u)", activityId, heapTotalPages, newPages, oldPages, activeRowManagers.load(), heapAllocated, heapTotalPages);
     DBGLOG("%s", msg.str());
     throw MakeStringExceptionDirect(ROXIEMM_MEMORY_POOL_EXHAUSTED, msg.str());
 }
@@ -643,7 +643,7 @@ static void *suballoc_aligned(size32_t pages, bool returnNullWhenExhausted)
     if (heapAllocated + pages > heapTotalPages) {
         if (returnNullWhenExhausted)
             return NULL;
-        throwGlobalHeapExhausted(0, pages);
+        throwGlobalHeapExhausted(pages);
     }
     if (heapLargeBlockGranularity)
     {
@@ -748,10 +748,8 @@ static void *suballoc_aligned(size32_t pages, bool returnNullWhenExhausted)
                             //Check if all memory above this allocation is allocated - if so extend the HWM
                             if ((hbi == 0) && (i+1 == heapHWM))
                             {
-                                if (startHbi != 0)
-                                    heapHWM = start+1;
-                                else
-                                    heapHWM = start;
+                                //Could be some space in the first chunk - will be checked next time allocate is called.
+                                heapHWM = start+1;
                             }
 
                             if (memTraceLevel >= 2)
@@ -771,29 +769,29 @@ static void *suballoc_aligned(size32_t pages, bool returnNullWhenExhausted)
     }
     if (returnNullWhenExhausted)
         return NULL;
-    throwGlobalHeapExhausted(0, pages);
+    throwGlobalHeapExhausted(pages);
     return NULL;
 }
 
-static void subfree_aligned(void *ptr, unsigned pages = 1)
+static bool subfree_aligned(void *ptr, unsigned pages = 1)
 {
     unsigned _pages = pages;
     memsize_t offset = (char *)ptr - heapBase;
     memsize_t pageOffset = offset / HEAP_ALIGNMENT_SIZE;
     if (!pages)
     {
-        DBGLOG("RoxieMemMgr: Invalid parameter (pages=%u) to subfree_aligned", pages);
-        HEAPERROR("RoxieMemMgr: Invalid parameter (num pages) to subfree_aligned");
+        IERRLOG("RoxieMemMgr: Invalid parameter (pages=%u) to subfree_aligned", pages);
+        return false;
     }
     if (pageOffset + pages > heapTotalPages)
     {
-        DBGLOG("RoxieMemMgr: Freed area not in heap (ptr=%p)", ptr);
-        HEAPERROR("RoxieMemMgr: Freed area not in heap");
+        IERRLOG("RoxieMemMgr: Freed area not in heap (ptr=%p)", ptr);
+        return false;
     }
     if (pageOffset*HEAP_ALIGNMENT_SIZE != offset)
     {
-        DBGLOG("RoxieMemMgr: Incorrect alignment of freed area (ptr=%p)", ptr);
-        HEAPERROR("RoxieMemMgr: Incorrect alignment of freed area");
+        IERRLOG("RoxieMemMgr: Incorrect alignment of freed area (ptr=%p)", ptr);
+        return false;
     }
     if (heapNotifyUnusedEachFree)
         notifyMemoryUnused(ptr, pages*HEAP_ALIGNMENT_SIZE);
@@ -829,7 +827,10 @@ static void subfree_aligned(void *ptr, unsigned pages = 1)
         {
             heap_t prev = heapBitmap[wordOffset];
             if (unlikely((prev & mask) != 0))
-                HEAPERROR("RoxieMemMgr: Page freed twice");
+            {
+                IERRLOG("RoxieMemMgr: Page freed twice (ptr=%p)", ptr);
+                return false;
+            }
 
             heap_t next = prev | mask;
             heapBitmap[wordOffset] = next;
@@ -859,6 +860,7 @@ static void subfree_aligned(void *ptr, unsigned pages = 1)
 
     if (memTraceLevel >= 2)
         DBGLOG("RoxieMemMgr: subfree_aligned() %u pages ok - addr=%p heapLWM=%u heapHWM=%u totalPages=%u", _pages, ptr, heapLWM, heapHWM, heapTotalPages);
+    return true;
 }
 
 static void clearBits(unsigned start, unsigned len)
@@ -1533,7 +1535,7 @@ public:
             return;
         //The function is to aid testing - it allows the cas code to be tested without a surrounding lock
         //Allocate all possible rows and add them to the free space map.
-        //This is not worth doing in general because it effectively replaces atomic_sets with atomic_cas
+        //This is not worth doing in general because it effectively replaces atomic sets with atomic cas
         //relaxed memory order since there will be no multi-threaded access
         unsigned nextFree = freeBase.load(std::memory_order_relaxed);
         unsigned nextBlock = r_blocks.load(std::memory_order_relaxed);
@@ -2766,7 +2768,7 @@ public:
 
 protected:
     static const unsigned maxRows = 16; // Maximum number of rows to allocate at once.
-    char * rows[maxRows];
+    char * rows[maxRows]; // Deliberately uninitialized
     unsigned curRow = 0;
     unsigned numRows = 0;
 };
@@ -4275,7 +4277,7 @@ protected:
     unsigned backgroundReleaseCost;
     bool releaseWhenModifyCallback;
     bool releaseWhenModifyCallbackCritical;
-    volatile bool abortBufferThread;
+    std::atomic_bool abortBufferThread;
 };
 
 //Constants are here to ensure they can all be constant folded
@@ -4358,7 +4360,6 @@ private:
     Owned<IActivityMemoryUsageMap> peakUsageMap;
     CIArrayOf<CHeap> fixedHeaps;
     CICopyArrayOf<CRoxieFixedRowHeapBase> fixedRowHeaps;  // These are observed, NOT linked
-    const IRowAllocatorCache *allocatorCache;
     unsigned __int64 cyclesChecked;       // When we last checked timelimit
     unsigned __int64 cyclesCheckInterval; // How often we need to check timelimit
     bool outputOOMReports;
@@ -4367,6 +4368,7 @@ private:
     bool minimizeFootprintCritical;
 
 protected:
+    const IRowAllocatorCache *allocatorCache;
     const IContextLogger &logctx;
     unsigned maxPageLimit;
     unsigned spillPageLimit;
@@ -4996,7 +4998,8 @@ public:
 
     virtual void throwHeapExhausted(unsigned allocatorId, unsigned pages)
     {
-        VStringBuffer msg("Pool memory exhausted: pool id %u exhausted, requested %u heap(%u/%u) global(%u/%u) WM(%u..%u)", allocatorId, pages, getActiveHeapPages(), getPageLimit(), heapAllocated, heapTotalPages, heapLWM, heapHWM);
+        unsigned activityId = getRealActivityId(allocatorId, allocatorCache);
+        VStringBuffer msg("Pool memory exhausted: pool id %u{@%u} exhausted, requested %u heap(%u/%u) global(%u/%u) WM(%u..%u)", allocatorId, activityId, pages, getActiveHeapPages(), getPageLimit(), heapAllocated, heapTotalPages, heapLWM, heapHWM);
         DBGLOG("%s", msg.str());
         throw MakeStringExceptionDirect(ROXIEMM_MEMORY_POOL_EXHAUSTED, msg.str());
     }
@@ -5557,7 +5560,8 @@ public:
 
     void throwHeapExhausted(unsigned allocatorId, unsigned pages)
     {
-        VStringBuffer msg("Shared global memory exhausted: pool id %u exhausted, requested %u heap(%u/%u/%u/%u)) global(%u/%u) WM(%u..%u)", allocatorId, pages, getActiveHeapPages(), getPageLimit(), globalPageLimit, maxPageLimit, heapAllocated, heapTotalPages, heapLWM, heapHWM);
+        unsigned activityId = getRealActivityId(allocatorId, allocatorCache);
+        VStringBuffer msg("Shared global memory exhausted: pool id %u{@%u} exhausted, requested %u heap(%u/%u/%u/%u)) global(%u/%u) WM(%u..%u)", allocatorId, activityId, pages, getActiveHeapPages(), getPageLimit(), globalPageLimit, maxPageLimit, heapAllocated, heapTotalPages, heapLWM, heapHWM);
         DBGLOG("%s", msg.str());
         throw MakeStringExceptionDirect(ROXIEMM_MEMORY_POOL_EXHAUSTED, msg.str());
     }
@@ -5615,7 +5619,8 @@ void CSlaveRowManager::reportMemoryUsage(bool peak) const
 
 void CSlaveRowManager::throwHeapExhausted(unsigned allocatorId, unsigned pages)
 {
-    VStringBuffer msg("Channel memory exhausted: pool id %u exhausted, requested %u heap(%u/%u/%u)) global(%u/%u)", allocatorId, pages, getActiveHeapPages(), getPageLimit(), maxPageLimit, heapAllocated, heapTotalPages);
+    unsigned activityId = getRealActivityId(allocatorId, allocatorCache);
+    VStringBuffer msg("Channel memory exhausted: pool id %u{@%u} exhausted, requested %u heap(%u/%u/%u)) global(%u/%u)", allocatorId, activityId, pages, getActiveHeapPages(), getPageLimit(), maxPageLimit, heapAllocated, heapTotalPages);
     DBGLOG("%s", msg.str());
     throw MakeStringExceptionDirect(ROXIEMM_MEMORY_POOL_EXHAUSTED, msg.str());
 }
@@ -6628,13 +6633,13 @@ extern IDataBufferManager *createDataBufferManager(size32_t size)
 
 extern void setDataAlignmentSize(unsigned size)
 {
-    if (memTraceLevel >= 3) 
+    if (memTraceLevel)
         DBGLOG("RoxieMemMgr: setDataAlignmentSize to %u", size); 
 
     if ((size == 0) || ((HEAP_ALIGNMENT_SIZE % size) != 0))
         throw MakeStringException(ROXIEMM_INVALID_MEMORY_ALIGNMENT, "setDataAlignmentSize %u must be a factor of %u", size, (unsigned)HEAP_ALIGNMENT_SIZE);
 
-    if (size==0x400 || size==0x2000)
+    if (size>=0x400 && size<=0x2000)
         DATA_ALIGNMENT_SIZE = size;
     else
         throw MakeStringException(ROXIEMM_INVALID_MEMORY_ALIGNMENT, "Invalid parameter to setDataAlignmentSize %u", size);
@@ -7088,64 +7093,21 @@ protected:
         r = subrealloc_aligned(t1, 20, 60);
         ASSERT(r==(void *)(memsize_t)(maxAddr - HEAP_ALIGNMENT_SIZE*60));
         subfree_aligned(r, 60);
-        subfree_aligned(t3, 20);
+        bool ok = subfree_aligned(t3, 20);
+        ASSERT(ok);
 
         // Check some error cases
-        try
-        {
-            subfree_aligned((void*)0, 1);
-            ASSERT(false);
-        }
-        catch (IException *E)
-        {
-            StringBuffer s;
-            ASSERT(strcmp(E->errorMessage(s).str(), "RoxieMemMgr: Freed area not in heap")==0);
-            E->Release();
-        }
-        try
-        {
-            subfree_aligned((void*)(minAddr + HEAP_ALIGNMENT_SIZE / 2), 1);
-            ASSERT(false);
-        }
-        catch (IException *E)
-        {
-            StringBuffer s;
-            ASSERT(strcmp(E->errorMessage(s).str(), "RoxieMemMgr: Incorrect alignment of freed area")==0);
-            E->Release();
-        }
-        try
-        {
-            subfree_aligned((void*)(memsize_t)(minAddr + 20 * HEAP_ALIGNMENT_SIZE), 1);
-            ASSERT(false);
-        }
-        catch (IException *E)
-        {
-            StringBuffer s;
-            ASSERT(strcmp(E->errorMessage(s).str(), "RoxieMemMgr: Page freed twice")==0);
-            E->Release();
-        }
-        try
-        {
-            subfree_aligned((void*)(memsize_t)(maxAddr - 2 * HEAP_ALIGNMENT_SIZE), 3);
-            ASSERT(false);
-        }
-        catch (IException *E)
-        {
-            StringBuffer s;
-            ASSERT(strcmp(E->errorMessage(s).str(), "RoxieMemMgr: Freed area not in heap")==0);
-            E->Release();
-        }
-        try
-        {
-            subfree_aligned((void*)(memsize_t)0xbfe00000, 0);
-            ASSERT(false);
-        }
-        catch (IException *E)
-        {
-            StringBuffer s;
-            ASSERT(strcmp(E->errorMessage(s).str(), "RoxieMemMgr: Invalid parameter (num pages) to subfree_aligned")==0);
-            E->Release();
-        }
+        ok = subfree_aligned((void*)0, 1);
+        ASSERT(!ok);
+        ok = subfree_aligned((void*)(minAddr + HEAP_ALIGNMENT_SIZE / 2), 1);
+        ASSERT(!ok);
+        ok = subfree_aligned((void*)(memsize_t)(minAddr + 20 * HEAP_ALIGNMENT_SIZE), 1);
+        ASSERT(!ok);
+        ok = subfree_aligned((void*)(memsize_t)(maxAddr - 2 * HEAP_ALIGNMENT_SIZE), 3);
+        ASSERT(!ok);
+        ok = subfree_aligned((void*)(memsize_t)0xbfe00000, 0);
+        ASSERT(!ok);
+
         delete[] heapBitmap;
     }
 
@@ -7445,7 +7407,8 @@ protected:
             unsigned i = 0;
             for (;;)
             {
-                ASSERT(rm1->allocate(i++, 0) != NULL);
+                void * ret = rm1->allocate(i++, 0);
+                ASSERT(ret != NULL);
             }
         }
         catch (IException *E)
@@ -7710,6 +7673,8 @@ protected:
         Owned<IRowManager> rowManager = createRowManager(0, NULL, logctx, NULL, false);
         CountingRowAllocatorCache rowCache;
         void * memory = suballoc_aligned(1, true);
+        assertex(memory);
+
         unsigned heapFlags = 0;
         CFixedChunkedHeap dummyHeap((CChunkingRowManager*)rowManager.get(), logctx, &rowCache, 32, 0, SpillAllCost);
         FixedSizeHeaplet * heaplet = new (memory) FixedSizeHeaplet(&dummyHeap, &rowCache, 32, heapFlags);
@@ -9166,7 +9131,7 @@ protected:
     void createRows(IRowManager * rowManager, size_t numRows, ConstPointerArray & target, bool shuffle)
     {
         Owned<IFixedRowHeap> heap = rowManager->createFixedRowHeap(tuningAllocSize, 0, RHFpacked);
-        target.ensure(numTuningRows);
+        target.ensureSpace(numTuningRows);
         for (size_t i = 0; i < numRows; i++)
             target.append(heap->allocate());
 

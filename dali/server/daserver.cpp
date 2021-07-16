@@ -18,7 +18,6 @@
 #include <unordered_map>
 #include <string>
 
-#include "build-config.h"
 #include "platform.h"
 #include "thirdparty.h"
 #include "jlib.hpp"
@@ -184,8 +183,6 @@ static IPropertyTree *getSecMgrPluginPropTree(const IPropertyTree *configTree)
  */
 static bool populateAllowListFromEnvironment(IAllowListWriter &writer)
 {
-    if (isContainerized())
-        return false;
     Owned<IRemoteConnection> conn = querySDS().connect("/Environment", 0, 0, INFINITE);
     assertex(conn);
     if (!conn->queryRoot()->hasProp("Software/DaliServerProcess"))
@@ -401,8 +398,6 @@ version: 1.0
 dali:
   name: dali
   dataPath: "/var/lib/HPCCSystems/dalistorage"
-  logging:
-    detail: 100
 )!!";
 
 
@@ -427,13 +422,11 @@ int main(int argc, const char* argv[])
         Owned<IFile> sentinelFile = createSentinelTarget();
         removeSentinelFile(sentinelFile);
 #ifndef _CONTAINERIZED
+        if (!checkCreateDaemon(argc, argv))
+            return EXIT_FAILURE;
 
         for (unsigned i=1;i<(unsigned)argc;i++) {
             if (streq(argv[i],"--daemon") || streq(argv[i],"-d")) {
-                if (daemon(1,0) || write_pidfile(argv[++i])) {
-                    perror("Failed to daemonize");
-                    return EXIT_FAILURE;
-                }
             }
             else if (streq(argv[i],"--server") || streq(argv[i],"-s"))
                 server = argv[++i];
@@ -460,7 +453,7 @@ int main(int argc, const char* argv[])
 #else
         setupContainerizedLogMsgHandler();
 #endif
-        PROGLOG("Build %s", BUILD_TAG);
+        PROGLOG("Build %s", hpccBuildInfo.buildTag);
 
         StringBuffer dataPath;
         StringBuffer mirrorPath;
@@ -653,11 +646,11 @@ int main(int argc, const char* argv[])
 
         unsigned short myport = epa.item(myrank).port;
         startMPServer(DCR_DaliServer, myport, true, true);
+#ifndef _CONTAINERIZED
         Owned<IMPServer> mpServer = getMPServer();
         Owned<IAllowListHandler> allowListHandler = createAllowListHandler(populateAllowListFromEnvironment, formatDaliRole);
         mpServer->installAllowListCallback(allowListHandler);
-#ifndef _CONTAINERIZED
-        setMsgLevel(fileMsgHandler, serverConfig->getPropInt("SDS/@msgLevel", 100));
+        setMsgLevel(fileMsgHandler, serverConfig->getPropInt("SDS/@msgLevel", DebugMsgThreshold));
 #endif
         startLogMsgChildReceiver();
         startLogMsgParentReceiver();
@@ -670,6 +663,7 @@ int main(int argc, const char* argv[])
 // Audit logging
         StringBuffer auditDir;
         {
+            //MORE: Does this need to change in CONTAINERIZED mode?
             Owned<IComponentLogFileCreator> lf = createComponentLogFileCreator(serverConfig, "dali");
             lf->setLogDirSubdir("audit");//add to tail of config log dir
             lf->setName("DaAudit");//override default filename

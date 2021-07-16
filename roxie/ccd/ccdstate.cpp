@@ -17,9 +17,9 @@
 
 #include <platform.h>
 #include <jlib.hpp>
-#include "build-config.h"
 
 #include "jisem.hpp"
+#include "jhash.hpp"
 #include "jsort.hpp"
 #include "jregexp.hpp"
 
@@ -423,6 +423,7 @@ class CRoxiePackageNode : extends CPackageNode, implements IRoxiePackage
 {
 protected:
     static CResolvedFileCache daliFiles;
+    static CriticalSection daliLookupCrits[NUM_DALI_CRITS];
     mutable CResolvedFileCache fileCache;
     IArrayOf<IResolvedFile> files;  // Used when preload set
     IArrayOf<IKeyArray> keyArrays;  // Used when preload set
@@ -453,6 +454,8 @@ protected:
     // Use dali to resolve subfile into physical file info
     static IResolvedFile *resolveLFNusingDaliOrLocal(const char *fileName, bool useCache, bool cacheResult, bool writeAccess, bool alwaysCreate, bool resolveLocal, bool isPrivilegedUser)
     {
+        unsigned hash = hashc((const unsigned char *) fileName, strlen(fileName), 0x811C9DC5);
+        CriticalBlock b(daliLookupCrits[hash % NUM_DALI_CRITS]);
         // MORE - look at alwaysCreate... This may be useful to implement earlier locking semantics.
         if (traceLevel > 9)
             DBGLOG("resolveLFNusingDaliOrLocal %s %d %d %d %d", fileName, useCache, cacheResult, writeAccess, alwaysCreate);
@@ -731,7 +734,7 @@ public:
         else if (daliHelper)
             user = daliHelper->queryUserDescriptor();//predeployed query mode
 
-        Owned<ILocalOrDistributedFile> ldFile = createLocalOrDistributedFile(fileName, user, onlyLocal, onlyDFS, true, isPrivilegedUser);
+        Owned<ILocalOrDistributedFile> ldFile = createLocalOrDistributedFile(fileName, user, onlyLocal, onlyDFS, true, isPrivilegedUser, &clusters);
         if (!ldFile)
             throw MakeStringException(ROXIE_FILE_ERROR, "Cannot write %s", fileName.str());
         return createRoxieWriteHandler(daliHelper, ldFile.getClear(), clusters);
@@ -777,6 +780,7 @@ public:
 };
 
 CResolvedFileCache CRoxiePackageNode::daliFiles;
+CriticalSection CRoxiePackageNode::daliLookupCrits[NUM_DALI_CRITS];
 
 typedef CResolvedPackage<CRoxiePackageNode> CRoxiePackage;
 
@@ -1863,8 +1867,8 @@ public:
             daliHelper.setown(connectToDali());
         else
             daliHelper.setown(connectToDali(ROXIE_DALI_CONNECT_TIMEOUT));
-        atomic_set(&autoPending, 0);
-        atomic_set(&autoSignalsPending, 0);
+        autoPending = 0;
+        autoSignalsPending = 0;
         forcePending = false;
         pSetsNotifier.setown(daliHelper->getPackageSetsSubscription(this));
         pMapsNotifier.setown(daliHelper->getPackageMapsSubscription(this));
@@ -1887,8 +1891,8 @@ public:
         if (force)
             forcePending = true;    
         if (signal)
-            atomic_inc(&autoSignalsPending);
-        atomic_inc(&autoPending);
+            ++autoSignalsPending;
+        ++autoPending;
         autoReloadTrigger.signal();
         if (signal)
             autoReloadComplete.wait();
@@ -1969,8 +1973,8 @@ private:
 
     Semaphore autoReloadTrigger;
     Semaphore autoReloadComplete;
-    atomic_t autoSignalsPending;
-    atomic_t autoPending;
+    std::atomic<unsigned> autoSignalsPending;
+    std::atomic<unsigned> autoPending;
     bool forcePending;
 
     class AutoReloadThread : public Thread
@@ -1993,12 +1997,12 @@ private:
                 owner.autoReloadTrigger.wait();
                 if (closing)
                     break;
-                unsigned signalsPending = atomic_read(&owner.autoSignalsPending);
+                unsigned signalsPending = owner.autoSignalsPending;
                 if (!signalsPending)
                     Sleep(500); // Typically notifications come in clumps - this avoids reloading too often
-                if (atomic_read(&owner.autoPending))
+                if (owner.autoPending)
                 {
-                    atomic_set(&owner.autoPending, 0);
+                    owner.autoPending = 0;
                     try
                     {
                         owner.reload(owner.forcePending);
@@ -2017,7 +2021,7 @@ private:
                 }
                 if (signalsPending)
                 {
-                    atomic_dec(&owner.autoSignalsPending);
+                    owner.autoSignalsPending--;
                     owner.autoReloadComplete.signal();
                 }
             }
@@ -2339,7 +2343,7 @@ private:
             }
             else if (stricmp(queryName, "control:getBuildVersion")==0)
             {
-                reply.appendf("<version id='%s'/>", BUILD_TAG);
+                reply.appendf("<version id='%s'/>", hpccBuildInfo.buildTag);
             }
             else
                 unknown = true;
@@ -2366,6 +2370,12 @@ private:
                 leafCacheMB = control->getPropInt("@val", 50);
                 topology->setPropInt("@leafCacheMem", leafCacheMB);
                 setLeafCacheMem(leafCacheMB * 0x100000);
+            }
+            else if (stricmp(queryName, "control:legacyNodeCache")==0)
+            {
+                bool legacyNodeCache = control->getPropBool("@val", true);
+                topology->setPropInt("@legacyNodeCache", legacyNodeCache);
+                setLegacyNodeCache(legacyNodeCache);
             }
             else if (stricmp(queryName, "control:listFileOpenErrors")==0)
             {
@@ -2445,13 +2455,7 @@ private:
             break;
 
         case 'N':
-            if (stricmp(queryName, "control:nodeCachePreload")==0)
-            {
-                nodeCachePreload = control->getPropBool("@val", true);
-                topology->setPropBool("@nodeCachePreload", nodeCachePreload);
-                setNodeCachePreload(nodeCachePreload);
-            }
-            else if (stricmp(queryName, "control:nodeCacheMem")==0)
+            if (stricmp(queryName, "control:nodeCacheMem")==0)
             {
                 nodeCacheMB = control->getPropInt("@val", 100);
                 topology->setPropInt("@nodeCacheMem", nodeCacheMB);
@@ -2892,7 +2896,22 @@ extern void loadPlugins()
     if (pluginDirectory.length())
     {
         plugins = new SafePluginMap(&PluginCtx, traceLevel >= 1);
-        plugins->loadFromList(pluginDirectory);
+        if (topology->hasProp("preload"))
+        {
+            Owned<IPropertyTreeIterator> preloads = topology->getElements("preload");
+            ForEach(*preloads)
+            {
+                const char *preload = preloads->query().queryProp(".");
+                if (!streq(preload, "none"))
+                {
+                    VStringBuffer soname(SharedObjectPrefix "%s" SharedObjectExtension, preload);
+                    if (!plugins->loadNamed(pluginDirectory, soname))
+                        DBGLOG("Could not preload plugin %s at any of the following locations: %s", soname.str(), pluginDirectory.str());
+                }
+            }
+        }
+        else
+            plugins->loadFromList(pluginDirectory);
     }
 }
 

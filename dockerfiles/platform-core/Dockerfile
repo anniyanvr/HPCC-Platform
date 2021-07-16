@@ -38,12 +38,14 @@ RUN apt-get install -y \
   libpython3.8 \
   libmemcached11 \
   libmemcachedutil2 \
+  libmysqlclient21 \
   libxslt1.1 \
   locales \
   python \ 
   psmisc \
   r-base-core \
   zip \
+  libarchive13 \
   curl
 
 ARG USE_CPPUNIT=1
@@ -81,4 +83,4 @@ ENV PATH="/opt/HPCCSystems/bin:${PATH}"
 ENV HPCC_containerized=1
 ENV HPCC_DLLSERVER_PATH=/var/lib/HPCCSystems/queries
 WORKDIR /var/lib/HPCCSystems
-RUN eclcc -pch && rm eclcc.log
+RUN eclcc -pch

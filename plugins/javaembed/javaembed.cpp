@@ -28,7 +28,6 @@
 #include "rtlfield.hpp"
 #include "rtlds_imp.hpp"
 #include "jprop.hpp"
-#include "build-config.h"
 #include "roxiemem.hpp"
 #include "nbcd.hpp"
 #include "rtlformat.hpp"
@@ -899,6 +898,7 @@ public:
 
 static StringBuffer &appendClassPath(StringBuffer &classPath)
 {
+#ifndef _CONTAINERIZED
     const IProperties &conf = queryEnvironmentConf();
     if (conf.hasProp("classpath"))
     {
@@ -906,8 +906,9 @@ static StringBuffer &appendClassPath(StringBuffer &classPath)
         classPath.append(ENVSEPCHAR);
     }
     else
+#endif
     {
-        classPath.append(INSTALL_DIR).append(PATHSEPCHAR).append("classes").append(ENVSEPCHAR);
+        classPath.append(hpccBuildInfo.installDir).append(PATHSEPCHAR).append("classes").append(ENVSEPCHAR);
     }
     return classPath;
 }
@@ -931,6 +932,23 @@ public:
         newPath.append(".");
         optionStrings.append(newPath);
 
+        // Options we should set (but allow for override with jvmoptions below)
+        optionStrings.append("-XX:-UseLargePages");
+
+#ifdef _CONTAINERIZED
+        const char *jvmLibPath = getenv("JAVA_LIBRARY_PATH");
+        if (jvmLibPath)
+        {
+            VStringBuffer libPath("-Djava.library.path=%s", jvmLibPath);
+            optionStrings.append(libPath);
+        }
+        const char *jvmOptions = getenv("JVM_OPTIONS");
+        if (jvmOptions)
+        {
+            // Use space as field sep as ':' and ';' are valid
+            optionStrings.appendList(jvmOptions, " ");
+        }
+#else
         const IProperties &conf = queryEnvironmentConf();
         if (conf.hasProp("jvmlibpath"))
         {
@@ -939,15 +957,12 @@ public:
             conf.getProp("jvmlibpath", libPath);
             optionStrings.append(libPath);
         }
-
-        // Options we should set (but allow for override with jvmoptions below)
-        optionStrings.append("-XX:-UseLargePages");
-
         if (conf.hasProp("jvmoptions"))
         {
             // Use space as field sep as ':' and ';' are valid
             optionStrings.appendList(conf.queryProp("jvmoptions"), " ");
         }
+#endif
 
         // Options we know we always want set
         optionStrings.append("-Xrs");
@@ -4949,7 +4964,15 @@ void doPrecompile(size32_t & __lenResult, void * & __result, const char *funcNam
     StringBuffer options(compilerOptions);
     if (isEmptyString(compilerOptions))
         options.append("-g:none");
-    appendClassPath(options.append(" -cp "));
+    options.append(" -cp ");
+    const char* origPath = getenv("CLASSPATH");
+    StringBuffer newPath;
+    if (origPath && *origPath)
+    {
+        options.append(origPath).append(ENVSEPCHAR);
+    }
+    appendClassPath(options);
+    options.append(".");
     VStringBuffer javac("javac %s %s", options.str(), javafile.str());
     if (!pipe->run("javac", javac, tmpDirName, false, false, true, 0, false))
     {

@@ -67,6 +67,7 @@
           <AuthenticateFeature description="Access to cluster topology" path="ClusterTopologyAccess" resource="ClusterTopologyAccess" service="ws_topology"/>
           <AuthenticateFeature description="Access to own workunits" path="OwnWorkunitsAccess" resource="OwnWorkunitsAccess" service="ws_workunits"/>
           <AuthenticateFeature description="Access to others&apos; workunits" path="OthersWorkunitsAccess" resource="OthersWorkunitsAccess" service="ws_workunits"/>
+          <AuthenticateFeature description="Access to deploy workunits" path="DeployWorkunitsAccess" resource="DeployWorkunitsAccess" service="ws_workunits"/>
           <AuthenticateFeature description="Access to ECL direct service" path="EclDirectAccess" resource="EclDirectAccess" service="ecldirect"/>
           <AuthenticateFeature description="Access to ESDL configuration service" path="ESDLConfigAccess" resource="ESDLConfigAccess" service="ws_esdlconfig"/>
           <AuthenticateFeature description="Access to ELK integration service" path="WsELKAccess" resource="WsELKAccess" service="ws_elk"/>
@@ -128,6 +129,7 @@
       </BuildSet>
       <BuildSet deployable="no" installSet="deploy_map.xml" name="cassandraloggingagent" path="componentfiles/cassandraloggingagent" processName="CassandraLoggingAgent" schema="cassandraloggingagent.xsd"/>
       <BuildSet deployable="no" installSet="deploy_map.xml" name="esploggingagent" path="componentfiles/esploggingagent" processName="ESPLoggingAgent" schema="esploggingagent.xsd"/>
+      <BuildSet deployable="no" installSet="deploy_map.xml" name="modularlogagent" path="componentfiles/modularlogagent" processName="ModularLogAgent" schema="modularlogagent.xsd"/>
       <BuildSet deployable="no" installSet="deploy_map.xml" name="loggingmanager" path="componentfiles/loggingmanager" processName="LoggingManager" schema="loggingmanager.xsd"/>
       <BuildSet deployable="no" installSet="deploy_map.xml" name="wslogging" path="componentfiles/wslogging" processName="EspService" schema="wslogging.xsd">
         <Properties bindingType="loggingservice_binding" defaultPort="8146" defaultResourcesBasedn="ou=EspServices,ou=ecl" defaultSecurePort="18146" plugin="wslogging" type="wslogging">

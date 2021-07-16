@@ -8,14 +8,15 @@ import * as tree from "dgrid/tree";
 import * as ESPUtil from "src/ESPUtil";
 import { DojoComponent } from "../layouts/DojoAdapter";
 
-import "srcReact/components/DojoGrid.css";
+import "src-react-css/components/DojoGrid.css";
 
 export { selector, tree };
 
+const SimpleGrid = declare([ESPUtil.Grid(false, false, undefined, false, "SimpleGrid")]);
 const PageSelGrid = declare([ESPUtil.Grid(true, true, undefined, false, "PageSelGrid")]);
 const SelGrid = declare([ESPUtil.Grid(false, true, undefined, false, "SelGrid")]);
 
-type GridType = "PageSel" | "Sel";
+type GridType = "PageSel" | "Sel" | "SimpleGrid";
 
 interface DojoGridProps {
     type?: GridType;
@@ -34,7 +35,7 @@ interface DojoGridProps {
 export const DojoGrid: React.FunctionComponent<DojoGridProps> = ({
     type = "PageSel",
     store,
-    query = {},
+    query,
     sort,
     columns,
     setGrid,
@@ -43,6 +44,8 @@ export const DojoGrid: React.FunctionComponent<DojoGridProps> = ({
 
     const Grid = useConst(() => {
         switch (type) {
+            case "SimpleGrid":
+                return SimpleGrid;
             case "Sel":
                 return SelGrid;
             case "PageSel":
@@ -51,8 +54,20 @@ export const DojoGrid: React.FunctionComponent<DojoGridProps> = ({
         }
     });
 
-    return <DojoComponent Widget={Grid} WidgetParams={{ deselectOnRefresh: true, store, query, sort, columns: { ...columns } }} postCreate={grid => {
+    const params = React.useMemo(() => {
+        return {
+            deselectOnRefresh: true,
+            store,
+            query,
+            sort,
+            columns: { ...columns }
+        };
+    }, [columns, query, sort, store]);
+
+    const gridSelInit = React.useCallback(grid => {
         grid.onSelectionChanged(() => setSelection(grid.getSelected()));
         setGrid(grid);
-    }} />;
+    }, [setGrid, setSelection]);
+
+    return <DojoComponent Widget={Grid} WidgetParams={params} postCreate={gridSelInit} />;
 };

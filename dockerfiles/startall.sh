@@ -23,8 +23,36 @@
 DOCKER_REPO=hpccsystems
 scriptdir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 restArgs=()
+CLUSTERNAME=mycluster
+PVFILE=$scriptdir/../helm/examples/local/hpcc-localfile/values.yaml
+
+dependency_check () {
+
+  if [ -z "$1" ]
+  then
+      CHART_SUBPATH="hpcc"
+  else
+      CHART_SUBPATH=$1
+  fi
+
+  missingDeps=0
+  while IFS= read -r line
+  do
+    echo "${line}"
+    if echo "${line}" | egrep -q 'missing$'; then
+      let "missingDeps++"
+    fi
+  done < <(helm dependency list ${scriptdir}/../helm/${CHART_SUBPATH} | grep -v WARNING)
+  if [[ ${missingDeps} -gt 0 ]]; then
+    echo "Some of the chart dependencies are missing."
+    echo "Either issue a 'helm dependency update ${scriptdir}/../helm/${CHART_SUBPATH}' to fetch them,"
+    echo "or rerun $0 with option -c to auto update them."
+    exit 0
+  fi
+}
 
 CMD="install"
+DEVELOPER_OPTIONS="--set global.privileged=true"
 while [ "$#" -gt 0 ]; do
   arg=$1
   if [[ ${arg:0:1} == '-' ]]; then
@@ -32,20 +60,43 @@ while [ "$#" -gt 0 ]; do
       l) shift
          LABEL=$1
          ;;
+      n) shift
+         CLUSTERNAME=$1
+         ;;
       d) shift;
          INPUT_DOCKER_REPO=$1
          ;;
       u) CMD="upgrade"
          ;;
       p) shift
-         PERSIST=$1
+         if [[ $arg == '-pv' ]] ; then
+           PERSISTVALUES="--values=$1"
+           PVFILE=$1
+         else
+           PERSIST=$1
+         fi
+         ;;
+      c) DEP_UPDATE_ARG="--dependency-update"
          ;;
       h) echo "Usage: startall.sh [options]"
          echo "    -d <docker-repo>   Docker repository to fetch images from"
          echo "    -l                 Build image label to use"
-         echo "    -u                 Use "upgrade" rather than "install"
-         echo "    -p <location>      Use local persistent data
+         echo "    -u                 Use "upgrade" rather than "install""
+         echo "    -t                 Generate templates instead of starting the system"
+         echo "    -n <name>          Specify cluster name"
+         echo "    -c                 Update chart dependencies"
+         echo "    -p <location>      Use local persistent data"
+         echo "    -pv <yamlfile>     Override dataplane definitions for local persistent data"
+         echo "    -e                 Deploy light-weight Elastic Stack for component log processing"
          exit
+         ;;
+      t) CMD="template"
+         restArgs+="--debug"
+         ;;
+      # vanilla install - for testing system in the same way it will normally be used
+      v) DEVELOPER_OPTIONS=""
+         ;;
+      e) DEPLOY_ES=true
          ;;
       *) restArgs+=(${arg})
          ;;
@@ -56,19 +107,42 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+
+if [[ -n "${DEP_UPDATE_ARG}" ]]; then
+  if [[ "${CMD}" = "upgrade" ]]; then
+    echo "Chart dependencies cannot be updated whilst performing a helm upgrade"
+    DEP_UPDATE_ARG=""
+  fi
+else
+  dependency_check "hpcc"
+fi
+
 [[ -n ${INPUT_DOCKER_REPO} ]] && DOCKER_REPO=${INPUT_DOCKER_REPO}
 [[ -z ${LABEL} ]] && LABEL=$(docker image ls | fgrep "${DOCKER_REPO}/platform-core" | head -n 1 | awk '{print $2}')
 
 if [[ -n ${PERSIST} ]] ; then
-  mkdir -p ${PERSIST}/dlls
-  mkdir -p ${PERSIST}/dali
-  mkdir -p ${PERSIST}/data
-  helm ${CMD} localfile $scriptdir/../helm/examples/local/hpcc-localfile --set common.hostpath=${PERSIST} | grep -A100 storage > localstorage.yaml && \
-  helm ${CMD} mycluster $scriptdir/../helm/hpcc/ --set global.image.root="${DOCKER_REPO}" --set global.image.version=$LABEL --set global.privileged=true -f localstorage.yaml ${restArgs[@]}
+  PERSIST=$(realpath -q $PERSIST || echo $PERSIST)
+  PERSIST_PATH=$(echo $PERSIST | sed 's/\\//g')
+  for subdir in `grep subPath: $PVFILE | awk '{ print $2 }'` ; do
+    echo mkdir -p ${PERSIST_PATH}/$subdir
+    mkdir -p ${PERSIST_PATH}/$subdir
+  done
+  helm ${CMD} localfile $scriptdir/../helm/examples/local/hpcc-localfile --set common.hostpath=${PERSIST} $PERSISTVALUES | tee lsfull.yaml | grep -A1000 storage: > localstorage.yaml && \
+  grep "##" lsfull.yaml  && \
+  helm ${CMD} $CLUSTERNAME $scriptdir/../helm/hpcc/ --set global.image.root="${DOCKER_REPO}" --set global.image.version=$LABEL $DEVELOPER_OPTIONS $DEP_UPDATE_ARG ${restArgs[@]} -f localstorage.yaml
 else
-  helm ${CMD} mycluster $scriptdir/../helm/hpcc/ --set global.image.root="${DOCKER_REPO}" --set global.image.version=$LABEL --set global.privileged=true ${restArgs[@]}
+  helm ${CMD} $CLUSTERNAME $scriptdir/../helm/hpcc/ --set global.image.root="${DOCKER_REPO}" --set global.image.version=$LABEL $DEVELOPER_OPTIONS $DEP_UPDATE_ARG ${restArgs[@]}
 fi
 
-sleep 1
-kubectl get pods
+if [[ $DEPLOY_ES ]] ; then
+  echo -e "\n\nDeploying "myelastic4hpcclogs" - light-weight Elastic Stack:"
+  if [[ -z "${DEP_UPDATE_ARG}" ]]; then
+    dependency_check "managed/logging/elastic"
+  fi
+  helm ${CMD} myelastic4hpcclogs $scriptdir/../helm/managed/logging/elastic $DEP_UPDATE_ARG ${restArgs[@]}
+fi
 
+if [ ${CMD} != "template" ] ; then
+  sleep 1
+  kubectl get pods
+fi

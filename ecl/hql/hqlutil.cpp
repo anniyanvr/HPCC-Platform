@@ -1151,7 +1151,7 @@ IHqlExpression * JoinOrderSpotter::doTraverseStripSelect(IHqlExpression * expr, 
         if (max != 0)
         {
             HqlExprArray args;
-            args.ensure(max);
+            args.ensureCapacity(max);
 
             unsigned idx;
             bool same = true;
@@ -2096,6 +2096,12 @@ void unwindHintAttrs(HqlExprArray & args, IHqlExpression * expr)
     }
 }
 
+bool getHintBool(IHqlExpression * expr, IAtom * name, bool dft)
+{
+    IHqlExpression * match = queryHint(expr, name);
+    return getBoolAttributeValue(match, dft);
+}
+
 //---------------------------------------------------------------------------
 
 IHqlExpression * createCompare(node_operator op, IHqlExpression * l, IHqlExpression * r)
@@ -2294,9 +2300,19 @@ unsigned getNumActivityArguments(IHqlExpression * expr)
     case no_compound:
     case no_addfiles:
     case no_map:
-        return expr->numChildren();
+        {
+            unsigned max = expr->numChildren();
+            while (max && expr->queryChild(max-1)->isAttribute())
+                max--;
+            return max;
+        }
     case no_case:
-        return expr->numChildren()-1;
+    {
+        unsigned max = expr->numChildren();
+        while (max > 1 && expr->queryChild(max-1)->isAttribute())
+            max--;
+        return max-1;
+    }
     case no_forcelocal:
         return 0;
     default:
@@ -6081,7 +6097,7 @@ extern HQL_API bool containsVirtualField(IHqlExpression * record, IAtom * kind)
 IHqlExpression * removeVirtualFields(IHqlExpression * record)
 {
     HqlExprArray args;
-    args.ensure(record->numChildren());
+    args.ensureCapacity(record->numChildren());
     ForEachChild(i, record)
     {
         IHqlExpression * cur = record->queryChild(i);
@@ -10257,6 +10273,10 @@ void getFieldTypeInfo(FieldTypeInfoStruct &out, ITypeInfo *type)
                 out.fieldType |= RFTMlinkcounted;
                 out.fieldType &= ~RFTMunknownsize;
             }
+
+            // DATASET(record, COUNT()/SIZEOF) cannot currently be serialized/deserialized
+            if (queryAttributeModifier(type, _childAttr_Atom))
+                out.fieldType |= RFTMnoserialize;
             break;
         }
     case type_dictionary:
@@ -10324,7 +10344,7 @@ static IFieldFilter * createIfBlockFilter(IRtlFieldTypeDeserializer &deserialize
     OwnedHqlExpr mappedCondition = replaceSelector(cond, querySelfReference(), dummyDataset);
     Owned <IErrorReceiver> errorReceiver = createThrowingErrorReceiver();
 
-    FilterExtractor extractor(*errorReceiver, dummyDataset, rowRecord->numChildren(), true, true);
+    FilterExtractor extractor(*errorReceiver, dummyDataset, rowRecord->numChildren(), true, true, false);
     OwnedHqlExpr extraFilter;
     extractor.extractFilters(mappedCondition, extraFilter);
 
@@ -10569,4 +10589,25 @@ const RtlTypeInfo *buildRtlType(IRtlFieldTypeDeserializer &deserializer, ITypeIn
         info.fieldType |= info.childType->fieldType & RFTMinherited;
 
     return deserializer.addType(info, type);
+}
+
+
+IHqlExpression * queryAttributeModifier(ITypeInfo * type, IAtom * name)
+{
+    ITypeInfo * cur = type;
+    for(;;)
+    {
+        typemod_t mod = cur->queryModifier();
+        if (mod == typemod_none)
+            break;
+        if (mod == typemod_attr)
+        {
+            IHqlExpression * attr = (IHqlExpression *)cur->queryModifierExtra();
+            if (!name || (name == attr->queryName()))
+                return attr;
+        }
+
+        cur = cur->queryTypeBase();
+    }
+    return nullptr;
 }

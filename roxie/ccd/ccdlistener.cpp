@@ -965,11 +965,11 @@ public:
         worker->threadmain();
     }
 
-    virtual void noteQuery(IHpccProtocolMsgContext *msgctx, const char *peer, bool failed, unsigned bytesOut, unsigned elapsed, unsigned memused, unsigned agentsReplyLen, bool continuationNeeded)
+    virtual void noteQuery(IHpccProtocolMsgContext *msgctx, const char *peer, bool failed, unsigned bytesOut, unsigned elapsed, unsigned memused, unsigned agentsReplyLen, unsigned agentsDuplicates, unsigned agentsResends, bool continuationNeeded, unsigned requestArraySize)
     {
     }
 
-    virtual void onQueryMsg(IHpccProtocolMsgContext *msgctx, IPropertyTree *msg, IHpccProtocolResponse *protocol, unsigned flags, PTreeReaderOptions readFlags, const char *target, unsigned idx, unsigned &memused, unsigned &agentReplyLen)
+    virtual void onQueryMsg(IHpccProtocolMsgContext *msgctx, IPropertyTree *msg, IHpccProtocolResponse *protocol, unsigned flags, PTreeReaderOptions readFlags, const char *target, unsigned idx, unsigned &memused, unsigned &agentReplyLen, unsigned &agentsDuplicates, unsigned &agentsResends)
     {
         UNIMPLEMENTED;
     }
@@ -1102,24 +1102,6 @@ protected:
     unsigned qstart;
     time_t startTime;
 
-    void noteQuery(bool failed, unsigned elapsedTime, unsigned priority)
-    {
-        Owned <IJlibDateTime> now = createDateTimeNow();
-        unsigned y,mo,d,h,m,s,n;
-        now->getLocalTime(h, m, s, n);
-        now->getLocalDate(y, mo, d);
-        lastQueryTime = h*10000 + m * 100 + s;
-        lastQueryDate = y*10000 + mo * 100 + d;
-
-        switch(priority)
-        {
-        case 0: loQueryStats.noteQuery(failed, elapsedTime); break;
-        case 1: hiQueryStats.noteQuery(failed, elapsedTime); break;
-        case 2: slaQueryStats.noteQuery(failed, elapsedTime); break;
-        default: unknownQueryStats.noteQuery(failed, elapsedTime); return; // Don't include unknown in the combined stats
-        }
-        combinedQueryStats.noteQuery(failed, elapsedTime);
-    }
 };
 
 /**
@@ -1138,6 +1120,23 @@ protected:
 
 class RoxieWorkUnitWorker : public RoxieQueryWorker
 {
+    void noteQuery(bool failed, unsigned elapsedTime, unsigned priority)
+    {
+        Owned <IJlibDateTime> now = createDateTimeNow();
+        unsigned y,mo,d,h,m,s,n;
+        now->getLocalTime(h, m, s, n);
+        now->getLocalDate(y, mo, d);
+        lastQueryTime = h*10000 + m * 100 + s;
+        lastQueryDate = y*10000 + mo * 100 + d;
+
+        switch(priority)
+        {
+        case 0: loQueryStats.noteQuery(failed, elapsedTime); break;
+        case 1: hiQueryStats.noteQuery(failed, elapsedTime); break;
+        case 2: slaQueryStats.noteQuery(failed, elapsedTime); break;
+        }
+        combinedQueryStats.noteQuery(failed, elapsedTime);
+    }
 public:
     RoxieWorkUnitWorker(RoxieListener *_pool)
         : RoxieQueryWorker(_pool)
@@ -1228,6 +1227,8 @@ public:
         bool failed = true; // many paths to failure, only one to success...
         unsigned memused = 0;
         unsigned agentsReplyLen = 0;
+        unsigned agentsDuplicates = 0;
+        unsigned agentsResends = 0;
         unsigned priority = (unsigned) -2;
         try
         {
@@ -1264,6 +1265,8 @@ public:
                 ctx->process();
                 memused = (unsigned)(ctx->getMemoryUsage() / 0x100000);
                 agentsReplyLen = ctx->getAgentsReplyLen();
+                agentsDuplicates = ctx->getAgentsDuplicates();
+                agentsResends = ctx->getAgentsResends();
                 ctx->done(false);
                 failed = false;
             }
@@ -1271,6 +1274,8 @@ public:
             {
                 memused = (unsigned)(ctx->getMemoryUsage() / 0x100000);
                 agentsReplyLen = ctx->getAgentsReplyLen();
+                agentsDuplicates = ctx->getAgentsDuplicates();
+                agentsResends = ctx->getAgentsResends();
                 ctx->done(true);
                 throw;
             }
@@ -1314,7 +1319,7 @@ public:
                 txidInfo.append(']');
             }
 
-            logctx.CTXLOG("COMPLETE: %s%s complete in %d msecs memory=%d Mb priority=%d agentsreply=%d%s", wuid.get(), txidInfo.str(), elapsed, memused, priority, agentsReplyLen, s.str());
+            logctx.CTXLOG("COMPLETE: %s%s complete in %u msecs memory=%u Mb priority=%d agentsreply=%u duplicatePackets=%u resentPackets=%u%s", wuid.get(), txidInfo.str(), elapsed, memused, priority, agentsReplyLen, agentsDuplicates, agentsResends, s.str());
         }
     }
 
@@ -1357,6 +1362,7 @@ public:
 
     SocketEndpoint ep;
     time_t startTime;
+    bool notedActive = false;
 public:
     IMPLEMENT_IINTERFACE;
 
@@ -1368,6 +1374,8 @@ public:
     }
     ~RoxieProtocolMsgContext()
     {
+        if (!notedActive)
+            unknownQueryStats.noteComplete();
     }
 
     inline ContextLogger &ensureContextLogger()
@@ -1420,6 +1428,7 @@ public:
         }
         unknownQueryStats.noteComplete();
         combinedQueryStats.noteActive();
+        notedActive = true;
     }
     IQueryFactory *queryQueryFactory(){return queryFactory;}
     virtual IContextLogger *queryLogContext()
@@ -1439,7 +1448,7 @@ public:
             return;
         uid.set(id);
         ensureContextLogger();
-        if (!isEmptyString(logctx->queryGlobalId())) //globalId wins
+        if (!global && !isEmptyString(logctx->queryGlobalId())) //globalId wins
             return;
         StringBuffer s;
         ep.getIpText(s).appendf(":%u{%s}", ep.port, uid.str()); //keep no matter what for existing log parsers
@@ -1564,17 +1573,24 @@ public:
         now->getLocalDate(y, mo, d);
         lastQueryTime = h*10000 + m * 100 + s;
         lastQueryDate = y*10000 + mo * 100 + d;
-
-        switch(getQueryPriority())
+        if (!notedActive)
         {
-        case 0: loQueryStats.noteQuery(failed, elapsedTime); break;
-        case 1: hiQueryStats.noteQuery(failed, elapsedTime); break;
-        case 2: slaQueryStats.noteQuery(failed, elapsedTime); break;
-        default: unknownQueryStats.noteQuery(failed, elapsedTime); return; // Don't include unknown in the combined stats
+            unknownQueryStats.noteQuery(failed, elapsedTime);
+            notedActive = true;
         }
-        combinedQueryStats.noteQuery(failed, elapsedTime);
+        else
+        {
+            switch(getQueryPriority())
+            {
+            case 0: loQueryStats.noteQuery(failed, elapsedTime); break;
+            case 1: hiQueryStats.noteQuery(failed, elapsedTime); break;
+            case 2: slaQueryStats.noteQuery(failed, elapsedTime); break;
+            default: unknownQueryStats.noteQuery(failed, elapsedTime); return; // Don't include unknown in the combined stats
+            }
+            combinedQueryStats.noteQuery(failed, elapsedTime);
+        }
     }
-    void noteQuery(const char *peer, bool failed, unsigned elapsed, unsigned memused, unsigned agentsReplyLen, unsigned bytesOut, bool continuationNeeded)
+    void noteQuery(const char *peer, bool failed, unsigned elapsed, unsigned memused, unsigned agentsReplyLen, unsigned agentsDuplicates, unsigned agentsResends, unsigned bytesOut, bool continuationNeeded, unsigned requestArraySize)
     {
         noteQueryStats(failed, elapsed);
         if (queryFactory)
@@ -1601,7 +1617,10 @@ public:
                 }
                 if (txIds.length())
                     txIds.insert(0, '[').append(']');
-                logctx->CTXLOG("COMPLETE: %s %s%s from %s complete in %d msecs memory=%d Mb priority=%d agentsreply=%d resultsize=%d continue=%d%s", queryName.get(), uid.get(), txIds.str(), peer, elapsed, memused, getQueryPriority(), agentsReplyLen, bytesOut, continuationNeeded, s.str());
+                if (requestArraySize > 1)
+                    logctx->CTXLOG("COMPLETE: %s(x%u) %s%s from %s complete in %u msecs memory=%u Mb priority=%d agentsreply=%u duplicatePackets=%u resentPackets=%u resultsize=%u continue=%d%s", queryName.get(), requestArraySize, uid.get(), txIds.str(), peer, elapsed, memused, getQueryPriority(), agentsReplyLen, agentsDuplicates, agentsResends, bytesOut, continuationNeeded, s.str());
+                else
+                    logctx->CTXLOG("COMPLETE: %s %s%s from %s complete in %u msecs memory=%u Mb priority=%d agentsreply=%u duplicatePackets=%u resentPackets=%u resultsize=%u continue=%d%s", queryName.get(), uid.get(), txIds.str(), peer, elapsed, memused, getQueryPriority(), agentsReplyLen, agentsDuplicates, agentsResends, bytesOut, continuationNeeded, s.str());
             }
         }
     }
@@ -1736,7 +1755,8 @@ public:
         return checkGetRoxieMsgContext(msgctx);
     }
 
-    virtual void onQueryMsg(IHpccProtocolMsgContext *msgctx, IPropertyTree *msg, IHpccProtocolResponse *protocol, unsigned flags, PTreeReaderOptions xmlReadFlags, const char *target, unsigned idx, unsigned &memused, unsigned &agentsReplyLen)
+    virtual void onQueryMsg(IHpccProtocolMsgContext *msgctx, IPropertyTree *msg, IHpccProtocolResponse *protocol, unsigned flags, PTreeReaderOptions xmlReadFlags,
+                            const char *target, unsigned idx, unsigned &memused, unsigned &agentsReplyLen, unsigned &agentsDuplicates, unsigned &agentsResends)
     {
         RoxieProtocolMsgContext *roxieMsgCtx = checkGetRoxieMsgContext(msgctx, msg);
         IQueryFactory *f = roxieMsgCtx->queryQueryFactory();
@@ -1753,6 +1773,8 @@ public:
             protocol->finalize(idx);
             memused += (unsigned)(ctx->getMemoryUsage() / 0x100000);
             agentsReplyLen += ctx->getAgentsReplyLen();
+            agentsDuplicates += ctx->getAgentsDuplicates();
+            agentsResends += ctx->getAgentsResends();
         }
         else
         {
@@ -1761,12 +1783,16 @@ public:
                 ctx->process();
                 memused = (unsigned)(ctx->getMemoryUsage() / 0x100000);
                 agentsReplyLen = ctx->getAgentsReplyLen();
+                agentsDuplicates = ctx->getAgentsDuplicates();
+                agentsResends = ctx->getAgentsResends();
                 ctx->done(false);
             }
             catch(...)
             {
                 memused = (unsigned)(ctx->getMemoryUsage() / 0x100000);
                 agentsReplyLen = ctx->getAgentsReplyLen();
+                agentsDuplicates = ctx->getAgentsDuplicates();
+                agentsResends = ctx->getAgentsResends();
                 ctx->done(true);
                 throw;
             }
@@ -1865,10 +1891,10 @@ public:
         roxieMsgCtx->ensureDebugCommandHandler().doDebugCommand(msg, &roxieMsgCtx->ensureDebuggerContext(uid), out);
     }
 
-    virtual void noteQuery(IHpccProtocolMsgContext *msgctx, const char *peer, bool failed, unsigned bytesOut, unsigned elapsed, unsigned memused, unsigned agentsReplyLen, bool continuationNeeded)
+    virtual void noteQuery(IHpccProtocolMsgContext *msgctx, const char *peer, bool failed, unsigned bytesOut, unsigned elapsed, unsigned memused, unsigned agentsReplyLen, unsigned agentsDuplicates, unsigned agentsResends, bool continuationNeeded, unsigned requestArraySize)
     {
         RoxieProtocolMsgContext *roxieMsgCtx = checkGetRoxieMsgContext(msgctx);
-        roxieMsgCtx->noteQuery(peer, failed, elapsed, memused, agentsReplyLen, bytesOut, continuationNeeded);
+        roxieMsgCtx->noteQuery(peer, failed, elapsed, memused, agentsReplyLen, agentsDuplicates, agentsResends, bytesOut, continuationNeeded, requestArraySize);
     }
 
 };

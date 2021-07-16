@@ -18,8 +18,6 @@ limitations under the License.
 #ifndef _ESPWIZ_WS_SQL_HPP__
 #define _ESPWIZ_WS_SQL_HPP__
 
-#include <build-config.h>
-
 #include "ws_sql.hpp"
 #include "ws_sql_esp.ipp"
 
@@ -62,9 +60,6 @@ public:
 class CwssqlEx : public Cwssql
 {
 private:
-    BoolHash validClusters;
-    CriticalSection crit;
-
     IPropertyTree *cfg;
     std::map<std::string,std::string> cachedSQLQueries;
 
@@ -115,8 +110,6 @@ public:
     bool onSetRelatedIndexes(IEspContext &context, IEspSetRelatedIndexesRequest &req, IEspSetRelatedIndexesResponse &resp);
     bool onCreateTableAndLoad(IEspContext &context, IEspCreateTableAndLoadRequest &req, IEspCreateTableAndLoadResponse &resp);
 
-    void refreshValidClusters();
-    bool isValidCluster(const char *cluster);
     void processMultipleClusterOption(StringArray & clusters, const char  * targetcluster, StringBuffer & hashoptions);
 
     void fetchRequiredHpccFiles(IArrayOf<SQLTable> * sqltables);

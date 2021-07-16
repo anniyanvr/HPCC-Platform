@@ -43,6 +43,8 @@
 #include "rtlrecord.hpp"
 #include "roxiemem.hpp"
 #include "roxierowbuff.hpp"
+
+#include "thormeta.hpp"
 #include "thorread.hpp"
 
 roxiemem::IRowManager * queryRowManager();
@@ -200,21 +202,22 @@ class CHThorActivityBase : public CInterface, implements IHThorActivity, impleme
 {
 protected:
     enum ActivityState { StateCreated, StateReady, StateDone };
-    IHThorInput *input;
+    IHThorInput *input = nullptr;
     IHThorArg & help;
     ThorActivityKind kind;
     EclGraph & graph;
-    CHThorActivityBase(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorArg & _help, ThorActivityKind _kind, EclGraph & _graph);
-    ~CHThorActivityBase();
     IAgentContext &agent;
     CachedOutputMetaData outputMeta;
-    unsigned __int64 processed;
-    unsigned __int64 initialProcessed;
+    unsigned __int64 processed = 0;
+    unsigned __int64 initialProcessed = 0;
     unsigned activityId;
     unsigned subgraphId;
+    IEngineRowAllocator *rowAllocator = nullptr;
+
+    CHThorActivityBase(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorArg & _help, ThorActivityKind _kind, EclGraph & _graph);
+    ~CHThorActivityBase();
     IException * makeWrappedException(IException * e) const;
     IException * makeWrappedException(IException * e, char const * extra) const;
-    IEngineRowAllocator *rowAllocator;
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -567,9 +570,8 @@ private:
 class HashDedupTable : public SuperHashTable
 {
 public:
-    HashDedupTable(IHThorHashDedupArg & _helper, unsigned _activityId)
-        : helper(_helper), 
-          activityId(_activityId)
+    HashDedupTable(IHThorHashDedupArg & _helper)
+        : helper(_helper)
     {
         queryBestCompare = helper.queryCompareBest();
     }
@@ -607,7 +609,6 @@ public:
 
 private:
     IHThorHashDedupArg & helper;
-    unsigned activityId;
     Owned<IEngineRowAllocator> keyRowAllocator;
     ICompare * queryBestCompare;
 };
@@ -633,7 +634,6 @@ class CHThorNormalizeActivity : public CHThorSimpleActivityBase
 {
     IHThorNormalizeArg &helper;
     OwnedConstRoxieRow inbuff;
-    bool isVariable;
     unsigned numThisRow;
     unsigned curRow;
     unsigned __int64 numProcessedLastGroup;
@@ -917,11 +917,10 @@ public:
 
 class CHThorHashAggregateActivity : public CHThorSimpleActivityBase
 {
-    IHThorHashAggregateArg &helper;
     RowAggregator aggregated;
 
-    bool eof;
-    bool gathered;
+    bool eof = false;
+    bool gathered = false;
     bool isGroupedAggregate;
 public:
     CHThorHashAggregateActivity(IAgentContext &agent, unsigned _activityId, unsigned _subgraphId, IHThorHashAggregateArg &_arg, ThorActivityKind _kind, EclGraph & _graph, bool _isGroupedAggregate);
@@ -951,7 +950,7 @@ public:
 class CHThorFirstNActivity : public CHThorSimpleActivityBase
 {
     IHThorFirstNArg &helper;
-    __int64 doneThisGroup = 0;
+    __uint64 doneThisGroup = 0;
     __uint64 limit = 0;  // You would think int was enough for most practical cases...
     __uint64 skip = 0;
     bool finished = false;
@@ -1051,7 +1050,6 @@ public:
 
 class CHThorDegroupActivity : public CHThorSteppableActivityBase
 {
-    IHThorDegroupArg &helper;
 public:
     CHThorDegroupActivity(IAgentContext &agent, unsigned _activityId, unsigned _subgraphId, IHThorDegroupArg &_arg, ThorActivityKind _kind, EclGraph & _graph);
 
@@ -1118,8 +1116,8 @@ protected:
 class CSimpleSorterBase : public ISorter, public CInterface
 {
 public:
-    CSimpleSorterBase(ICompare * _compare, roxiemem::IRowManager * _rowManager, size32_t _initialSize, size32_t _commitDelta) : compare(_compare), finger(0), rowManager(_rowManager),
-        rowsToSort(_rowManager, _initialSize, _commitDelta, UNKNOWN_ROWSET_ID) {}
+    CSimpleSorterBase(ICompare * _compare, roxiemem::IRowManager * _rowManager, size32_t _initialSize, size32_t _commitDelta) : rowManager(_rowManager), compare(_compare),
+        rowsToSort(_rowManager, _initialSize, _commitDelta, UNKNOWN_ROWSET_ID), finger(0) {}
     virtual ~CSimpleSorterBase()                            { killSorted(); }
     IMPLEMENT_IINTERFACE;
     virtual bool addRow(const void * next)                  { return rowsToSort.append(next); }
@@ -1144,7 +1142,7 @@ public:
 
 protected:
     roxiemem::IRowManager * rowManager;
-    unsigned activityId;
+    unsigned activityId = 0;
     ICompare * compare;
     DynamicRoxieOutputRowArray rowsToSort;
     aindex_t finger;
@@ -1167,7 +1165,8 @@ public:
 class CStableSorter : public CSimpleSorterBase
 {
 public:
-    CStableSorter(ICompare * _compare, roxiemem::IRowManager * _rowManager, size32_t _initialSize, size32_t _commitDelta, roxiemem::IBufferedRowCallback * _rowCB) : CSimpleSorterBase(_compare, _rowManager, _initialSize, _commitDelta), commitDelta(_commitDelta), index(NULL), indexCapacity(0) {}
+    CStableSorter(ICompare * _compare, roxiemem::IRowManager * _rowManager, size32_t _initialSize, size32_t _commitDelta, roxiemem::IBufferedRowCallback * _rowCB)
+     : CSimpleSorterBase(_compare, _rowManager, _initialSize, _commitDelta), index(NULL), indexCapacity(0), commitDelta(_commitDelta) {}
     virtual ~CStableSorter() { killSorted(); }
 
     virtual bool addRow(const void * next);
@@ -1629,8 +1628,6 @@ public:
 
 class CHThorDatasetResultActivity : public CHThorResultActivity
 {
-    IHThorDatasetResultArg &helper;
-
 public:
     IMPLEMENT_SINKACTIVITY;
 
@@ -1640,8 +1637,6 @@ public:
 
 class CHThorRowResultActivity : public CHThorResultActivity
 {
-    IHThorRowResultArg &helper;
-
 public:
     IMPLEMENT_SINKACTIVITY;
 
@@ -1667,7 +1662,6 @@ public:
 
 class CHThorNullActivity : public CHThorSimpleActivityBase
 {
-    IHThorArg &helper;
 public:
     CHThorNullActivity(IAgentContext &agent, unsigned _activityId, unsigned _subgraphId, IHThorArg &_arg, ThorActivityKind _kind, EclGraph & _graph);
 
@@ -1820,7 +1814,6 @@ public:
 
 class CHThorRegroupActivity : public CHThorMultiInputActivity
 {
-    IHThorRegroupArg &helper;
     unsigned inputIndex;
     bool eof;
     unsigned __int64 numProcessedLastGroup;
@@ -2725,7 +2718,6 @@ public:
 
 class CHThorGraphLoopResultWriteActivity : public CHThorActivityBase
 {
-    IHThorGraphLoopResultWriteArg &helper;
     ILocalEclGraphResults * graph;
 
 public:
@@ -2937,7 +2929,6 @@ protected:
     {
         IDistributedFile * file;
         Owned<IOutputMetaData> actualMeta;
-        Owned<const IPropertyTree> formatOptions;
         Owned<const IPropertyTree> meta;
         unsigned actualCrc;
     };
@@ -3053,6 +3044,169 @@ protected:
 };
 
 
+//---------------------------------------------------------------------------------------------------------------------
+
+//Could be a useful general class for caching workunit debug and tree values
+template <class T>
+class CachedValue
+{
+public:
+    T getValue(const T dft = false) { return hasValue ? value : dft; }
+
+protected:
+    bool hasValue = false;
+    T value = false;
+};
+
+class CachedBoolValue : public CachedValue<bool>
+{
+public:
+    CachedBoolValue(IConstWorkUnit * wu, const char * name)
+    {
+        hasValue = wu->hasDebugValue(name);
+        if (hasValue)
+            value = wu->getDebugValueBool(name, false);
+    }
+
+    CachedBoolValue(IPropertyTree * tree, const char * name)
+    {
+        hasValue = tree->queryProp(name) != nullptr;
+        if (hasValue)
+            value = tree->getPropBool(name);
+    }
+};
+
+class RemoteReadChecker
+{
+public:
+    RemoteReadChecker(IConstWorkUnit * wu)
+    : forceRemoteDisabled(wu, "forceRemoteDisabled"), forceRemoteRead(wu, "forceRemoteRead")
+    {
+    }
+
+    bool onlyReadLocally(const CLogicalFileSlice & nextSlice, unsigned copy);
+
+protected:
+    CachedBoolValue forceRemoteDisabled;
+    CachedBoolValue forceRemoteRead;
+};
+
+//---------------------------------------------------------------------------------------------------------------------
+
+class CHThorGenericDiskReadBaseActivity : public CHThorActivityBase, implements IThorDiskCallback, implements IIndexReadContext, public IFileCollectionContext
+{
+protected:
+    IHThorNewDiskReadBaseArg &helper;
+    IHThorCompoundBaseArg & segHelper;
+    IDiskRowReader * activeReader = nullptr;
+    CLogicalFileCollection files;
+    Owned<IPropertyTree> spillPlane;
+    std::vector<CLogicalFileSlice> slices;
+    IArrayOf<IDiskRowReader> readers;
+    IDiskRowStream * inputRowStream = nullptr;
+    RemoteReadChecker remoteReadChecker;
+    IOutputMetaData *expectedDiskMeta = nullptr;
+    IOutputMetaData *projectedDiskMeta = nullptr;
+    IConstArrayOf<IFieldFilter> fieldFilters;  // These refer to the expected layout
+    Owned<IPropertyTree> inputOptions;
+    Owned<IPropertyTree> curInputOptions;
+    CLogicalFileSlice * activeSlice = nullptr;
+    unsigned curSlice = 0;
+    RecordTranslationMode recordTranslationModeHint = RecordTranslationMode::Unspecified;
+    bool useRawStream = false; // Constant for the lifetime of the activity
+    bool grouped = false;
+    bool outputGrouped = false;
+    bool opened = false;
+    bool finishedParts = false;
+    bool isCodeSigned = false;
+    bool resolved = false;
+    unsigned __int64 stopAfter = 0;
+
+protected:
+    void close();
+    void resolveFile();
+    StringBuffer &translateLFNtoLocal(const char *filename, StringBuffer &localName);
+
+    inline void queryUpdateProgress()
+    {
+        agent.reportProgress(NULL);
+    }
+
+    RecordTranslationMode getLayoutTranslationMode()
+    {
+        if (recordTranslationModeHint != RecordTranslationMode::Unspecified)
+            return recordTranslationModeHint;
+        return agent.getLayoutTranslationMode();
+    }
+
+public:
+    CHThorGenericDiskReadBaseActivity(IAgentContext &agent, unsigned _activityId, unsigned _subgraphId, IHThorNewDiskReadBaseArg &_arg, IHThorCompoundBaseArg & _segHelper, ThorActivityKind _kind, EclGraph & _graph, IPropertyTree *node);
+    ~CHThorGenericDiskReadBaseActivity();
+    IMPLEMENT_IINTERFACE_USING(CHThorActivityBase)
+
+    virtual void ready();
+    virtual void stop();
+
+    IHThorInput *queryOutput(unsigned index)                { return this; }
+
+//interface IHThorInput
+    virtual bool isGrouped()                                { return outputGrouped; }
+    virtual IOutputMetaData * queryOutputMeta() const       { return outputMeta; }
+
+//interface IFilePositionProvider
+    virtual unsigned __int64 getFilePosition(const void * row);
+    virtual unsigned __int64 getLocalFilePosition(const void * row);
+    virtual const char * queryLogicalFilename(const void * row);
+    virtual const byte * lookupBlob(unsigned __int64 id) { UNIMPLEMENTED; }
+
+//interface IIndexReadContext
+    virtual void append(IKeySegmentMonitor *segment) override { throwUnexpected(); }
+    virtual void append(FFoption option, const IFieldFilter * filter) override;
+
+//interface IFileCollectionContext
+    virtual void noteException(unsigned severity, unsigned code, const char * text) override;
+
+protected:
+    bool openFirstPart();
+    void initStream(CLogicalFileSlice * slice, IDiskRowReader * reader);
+    bool openFilePart(unsigned whichSlice);
+    bool openFilePart(CLogicalFileSlice * nextSlice);
+    void setEmptyStream();
+
+    virtual void open();
+    virtual bool openNext();
+    virtual void closepart();
+
+    bool openNextPart();
+    IDiskRowReader * ensureRowReader(const char * format, bool streamRemote, unsigned expectedCrc, IOutputMetaData & expected, unsigned projectedCrc, IOutputMetaData & projected, unsigned actualCrc, IOutputMetaData & actual, CLogicalFileSlice * slice);
+};
+
+
+class CHThorGenericDiskReadActivity : public CHThorGenericDiskReadBaseActivity
+{
+    typedef CHThorGenericDiskReadBaseActivity PARENT;
+protected:
+    IHThorNewDiskReadArg &helper;
+    bool needTransform = false;
+    bool hasMatchFilter = false;
+    unsigned __int64 lastGroupProcessed = 0;
+    RtlDynamicRowBuilder outBuilder;
+    unsigned __int64 limit = 0;
+    unsigned __int64 remoteLimit = 0;
+
+public:
+    CHThorGenericDiskReadActivity(IAgentContext &agent, unsigned _activityId, unsigned _subgraphId, IHThorNewDiskReadArg &_arg, ThorActivityKind _kind, EclGraph & _graph, IPropertyTree *node);
+
+    virtual void ready();
+    virtual void stop();
+    virtual bool needsAllocator() const { return true; }
+
+    //interface IHThorInput
+    virtual const void *nextRow();
+
+protected:
+    void onLimitExceeded();
+};
 
 
 #define MAKEFACTORY(NAME) \

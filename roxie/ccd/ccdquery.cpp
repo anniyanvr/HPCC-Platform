@@ -334,6 +334,7 @@ QueryOptions::QueryOptions()
     failOnLeaks = alwaysFailOnLeaks;
     collectFactoryStatistics = defaultCollectFactoryStatistics;
     parallelWorkflow = false;
+    sinkMode = defaultSinkMode;
     numWorkflowThreads = 1;
 }
 
@@ -369,6 +370,7 @@ QueryOptions::QueryOptions(const QueryOptions &other)
     collectFactoryStatistics = other.collectFactoryStatistics;
 
     parallelWorkflow = other.parallelWorkflow;
+    sinkMode = other.sinkMode;
     numWorkflowThreads = other.numWorkflowThreads;
 }
 
@@ -414,6 +416,7 @@ void QueryOptions::setFromWorkUnit(IConstWorkUnit &wu, const IPropertyTree *stat
     updateFromWorkUnit(collectFactoryStatistics, wu, "collectFactoryStatistics");
 
     updateFromWorkUnit(parallelWorkflow, wu, "parallelWorkflow");
+    updateFromWorkUnit(sinkMode, wu, "sinkMode");
     updateFromWorkUnit(numWorkflowThreads, wu, "numWorkflowthreads");
 }
 
@@ -443,6 +446,14 @@ void QueryOptions::updateFromWorkUnit(RecordTranslationMode &value, IConstWorkUn
     wu.getDebugValue(name, val);
     if (val.length())
         value = getTranslationMode(val.str(), false);
+}
+
+void QueryOptions::updateFromWorkUnit(SinkMode &value, IConstWorkUnit &wu, const char *name)
+{
+    SCMStringBuffer val;
+    wu.getDebugValue(name, val);
+    if (val.length())
+        value = ::getSinkMode(val.str());
 }
 
 void QueryOptions::setFromContext(const IPropertyTree *ctx)
@@ -552,6 +563,8 @@ protected:
     ClusterType targetClusterType;
     unsigned libraryInterfaceHash;
     hash64_t hashValue;
+
+    mutable unsigned timeActResetLastLogged;
 
     static CriticalSection activeQueriesCrit;
     static CopyMapXToMyClass<hash64_t, hash64_t, CQueryFactory> activeQueries;    // Active queries
@@ -1125,6 +1138,7 @@ public:
         libraryInterfaceHash = 0;
         options.enableFieldTranslation = package.getEnableFieldTranslation();  // NOTE - can be overridden by wu settings
         options.allSortsMaySpill = dynamic;
+        timeActResetLastLogged = 0;
         addToCache();
     }
 
@@ -1649,6 +1663,16 @@ static hash64_t getQueryHash(const char *id, const IQueryDll *dll, const IRoxieP
         return dynamic;
     }
 
+    virtual unsigned getTimeActResetLastLogged() const override
+    {
+        return timeActResetLastLogged;
+    }
+
+    virtual void setTimeActResetLastLogged(unsigned _ntime) const override
+    {
+        timeActResetLastLogged = _ntime;
+    }
+
 protected:
     IPropertyTree *queryWorkflowTree() const
     {
@@ -1784,6 +1808,23 @@ unsigned checkWorkunitVersionConsistency(const IConstWorkUnit *wu)
         throw makeStringException(ROXIE_MISMATCH, "Attempting to execute a workunit that hasn't been compiled");
     if (wuVersion > ACTIVITY_INTERFACE_VERSION || wuVersion < MIN_ACTIVITY_INTERFACE_VERSION)
         throw MakeStringException(ROXIE_MISMATCH, "Workunit was compiled for eclhelper interface version %d, this roxie requires version %d..%d", wuVersion, MIN_ACTIVITY_INTERFACE_VERSION, ACTIVITY_INTERFACE_VERSION);
+    if (wuVersion == 652)
+    {
+        // Any workunit compiled using eclcc 7.12.0-7.12.18 is not compatible
+        StringBuffer buildVersion, eclVersion;
+        wu->getBuildVersion(StringBufferAdaptor(buildVersion), StringBufferAdaptor(eclVersion));
+        const char *version = strstr(buildVersion, "7.12.");
+
+        //Avoid matching a version number in the path that was used to build (enclosed in [] at the end)
+        const char *extra = strchr(buildVersion, '[');
+        if (version && (!extra || version < extra))
+        {
+            const char *point = version + strlen("7.12.");
+            unsigned pointVer = atoi(point);
+            if (pointVer <= 18)
+                throw MakeStringException(ROXIE_MISMATCH, "Workunit was compiled by eclcc version %s which is not compatible with this runtime", buildVersion.str());
+        }
+    }
     return wuVersion;
 }
 
@@ -2093,7 +2134,7 @@ IQueryFactory *createAgentQueryFactory(const char *id, const IQueryDll *dll, con
         else if (dll)
         {
             checkWorkunitVersionConsistency(dll);
-            Owned<IQueryFactory> serverFactory = CQueryFactory::getCachedQuery(hashValue, 0);
+            Owned<IQueryFactory> serverFactory = createServerQueryFactory(id, LINK(dll), package, stateInfo, isDynamic, forceRetry);
             assertex(serverFactory);
             ret.setown(new CAgentQueryFactory(id, dll, package, hashValue, channel, serverFactory->querySharedOnceContext(), isDynamic));
         }

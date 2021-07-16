@@ -25,7 +25,13 @@
 #include "workunit.hpp"
 #include "exception_util.hpp"
 #include "portlist.h"
+#include "daqueue.hpp"
+#include "dautils.hpp"
+#include "dameta.hpp"
 
+#ifdef _CONTAINERIZED
+#error "Should not be compiled in the container build"
+#endif
 
 const char* MSG_FAILED_GET_ENVIRONMENT_INFO = "Failed to get environment information.";
 
@@ -45,27 +51,6 @@ IPropertyTree* CTpWrapper::getEnvironment(const char* xpath)
         return LINK(pSubTree);
 
     return NULL;
-}
-
-bool CTpWrapper::getClusterLCR(const char* clusterType, const char* clusterName)
-{
-    bool bLCR = false;
-    if (!clusterType || !*clusterType || !clusterName || !*clusterName)
-        return bLCR;
-
-    Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
-    Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
-    Owned<IPropertyTree> root = &constEnv->getPTree();
-
-    StringBuffer xpath;
-    xpath.appendf("Software/%s[@name='%s']", clusterType, clusterName);
-    IPropertyTree* pCluster = root->queryPropTree( xpath.str() );
-    if (!pCluster)
-        throw MakeStringException(ECLWATCH_CLUSTER_NOT_IN_ENV_INFO, "'%s %s' is not defined.", clusterType, clusterName);
-
-    bLCR = !pCluster->getPropBool("@Legacy");
-
-    return bLCR;
 }
 
 void CTpWrapper::getClusterMachineList(double clientVersion,
@@ -156,7 +141,7 @@ void CTpWrapper::fetchInstances(const char* ServiceType, IPropertyTree& service,
 
             IEspTpMachine* machine = createTpMachine("", "");
             getMachineInfo(*machine, instanceNode, "/Environment/Software", ServiceType, "@computer");
-         machine->setPort( instanceNode.getPropInt("@port") );
+            machine->setPort( instanceNode.getPropInt("@port") );
             const char* directory = instanceNode.queryProp("@directory");
             if (directory && *directory)
                 machine->setDirectory( directory );
@@ -496,7 +481,7 @@ void CTpWrapper::getTpDfuServers(IArrayOf<IConstTpDfuServer>& list)
         fetchInstances(eqDfu, serviceTree, tpMachines);
         pService->setTpMachines(tpMachines);
 
-        list.append(*pService.getLink());
+        list.append(*pService.getClear());
     }
 }
 
@@ -605,30 +590,6 @@ void CTpWrapper::getTpFTSlaves(IArrayOf<IConstTpFTSlave>& list)
 
         IArrayOf<IEspTpMachine> tpMachines;
         fetchInstances(eqFTSlave, serviceTree, tpMachines);
-        pService->setTpMachines(tpMachines);
-
-        list.append(*pService.getLink());
-    }
-}
-
-void CTpWrapper::getTpDkcSlaves(IArrayOf<IConstTpDkcSlave>& list)
-{
-    Owned<IPropertyTree> root = getEnvironment("Software");
-    if (!root)
-        throw MakeStringExceptionDirect(ECLWATCH_CANNOT_GET_ENV_INFO, MSG_FAILED_GET_ENVIRONMENT_INFO);
-
-    Owned<IPropertyTreeIterator> services= root->getElements(eqDkcSlave);
-    ForEach(*services)
-    {
-        IPropertyTree& serviceTree = services->query();
-
-        Owned<IEspTpDkcSlave> pService =createTpDkcSlave("","");
-        pService->setName(serviceTree.queryProp("@name"));
-        pService->setDescription(serviceTree.queryProp("@description"));
-        pService->setBuild(serviceTree.queryProp("@build"));
-
-        IArrayOf<IEspTpMachine> tpMachines;
-        fetchInstances(eqDkcSlave, serviceTree, tpMachines);
         pService->setTpMachines(tpMachines);
 
         list.append(*pService.getLink());
@@ -1304,64 +1265,6 @@ bool CTpWrapper::checkGroupReplicateOutputs(const char* groupName, const char* k
     return false;
 }
 
-void CTpWrapper::resolveGroupInfo(const char* groupName,StringBuffer& Cluster, StringBuffer& ClusterPrefix)
-{
-    if(*groupName == 0)
-    {
-        DBGLOG("NULL PARAMETER groupName");
-        return;
-    }
-    //There is a big estimate here.... namely that one group can only be associated with one cluster.......
-    // if this changes then this code may be invalidated....
-    try
-    {
-        Owned<IPropertyTree> pTopology = getEnvironment("Software/Topology");
-        if (!pTopology)
-            throw MakeStringExceptionDirect(ECLWATCH_CANNOT_GET_ENV_INFO, MSG_FAILED_GET_ENVIRONMENT_INFO);
-
-        Owned<IPropertyTreeIterator> nodes=  pTopology->getElements("//Cluster");
-        if (nodes->first()) 
-        {
-            do 
-            {
-
-                IPropertyTree &node = nodes->query();
-                if (ContainsProcessDefinition(node,groupName)==true)
-                {
-                    //the prefix info is contained within the parent
-                    ClusterPrefix.append(node.queryProp("@prefix"));
-                    Cluster.append(node.queryProp("@name"));
-                    break;
-                }
-            } while (nodes->next());
-        }
-    }
-    catch(IException* e){   
-      StringBuffer msg;
-      e->errorMessage(msg);
-        IWARNLOG("%s", msg.str());
-        e->Release();
-    }
-    catch(...){
-        IWARNLOG("Unknown Exception caught within CTpWrapper::resolveGroupInfo");
-    }
-}
-
-bool CTpWrapper::ContainsProcessDefinition(IPropertyTree& clusterNode,const char* clusterName)
-{
-    Owned<IPropertyTreeIterator> processNodes = clusterNode.getElements("*");
-    if (processNodes->first()) {
-        do {
-            IPropertyTree &node = processNodes->query();
-            const char* processName = node.queryProp("@process");
-            if (*processName > 0 && (strcmp(processName,clusterName) == 0))
-                return true;
-        } while (processNodes->next());
-        }
-    return false;
-}
-
-
 void CTpWrapper::getMachineInfo(double clientVersion, const char* name, const char* netAddress, IEspTpMachine& machineInfo)
 {
     Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
@@ -1664,7 +1567,6 @@ void CTpWrapper::getDropZoneMachineList(double clientVersion, bool ECLWatchVisib
     {
         IWARNLOG("Unknown Exception caught within CTpWrapper::getDropZoneMachineList");
     }
-    
 }
 
 //For a given dropzone or every dropzones (check ECLWatchVisible if needed), read: "@name",
@@ -1970,84 +1872,306 @@ void CTpWrapper::getAttPath(const char* Path,StringBuffer& returnStr)
     JBASE64_Decode(Path, returnStr);
 }
 
-extern TPWRAPPER_API ISashaCommand* archiveOrRestoreWorkunits(StringArray& wuids, IProperties* params, bool archive, bool dfu)
+void CTpWrapper::getServices(double version, const char* serviceType, const char* serviceName, IArrayOf<IConstHPCCService>& services)
 {
-
-    StringBuffer sashaAddress;
-    unsigned port = DEFAULT_SASHA_PORT;
-    if (params && params->hasProp("sashaServerIP"))
+    Owned<IPropertyTreeIterator> itr = getGlobalConfigSP()->getElements("services");
+    ForEach(*itr)
     {
-        sashaAddress.set(params->queryProp("sashaServerIP"));
-        port = params->getPropInt("sashaServerPort", DEFAULT_SASHA_PORT);
+        IPropertyTree& service = itr->query();
+        //Only show the public services for now
+        if (!service.getPropBool("@public"))
+            continue;
+
+        const char* type = service.queryProp("@type");
+        if (isEmptyString(type) || (!isEmptyString(serviceType) && !strieq(serviceType, type)))
+            continue;
+
+        const char* name = service.queryProp("@name");
+        if (isEmptyString(name) || (!isEmptyString(serviceName) && !strieq(serviceName, name)))
+            continue;
+
+        Owned<IEspHPCCService> svc = createHPCCService();
+        svc->setName(name);
+        svc->setType(type);
+        svc->setPort(service.getPropInt("@port"));
+        if (service.getPropBool("@tls"))
+            svc->setTLSSecure(true);
+        services.append(*svc.getLink());
+        if (!isEmptyString(serviceName))
+            break;
     }
-    else
-    {
-        IArrayOf<IConstTpSashaServer> sashaservers;
-        CTpWrapper dummy;
-        dummy.getTpSashaServers(sashaservers);
-        if (sashaservers.ordinality() == 0)
-            throw makeStringException(ECLWATCH_ARCHIVE_SERVER_NOT_FOUND, "Sasha server not found");
-
-        IArrayOf<IConstTpMachine>& sashaservermachine = sashaservers.item(0).getTpMachines();
-        sashaAddress.set(sashaservermachine.item(0).getNetaddress());
-        if (sashaAddress.isEmpty())
-            throw makeStringException(ECLWATCH_ARCHIVE_SERVER_NOT_FOUND, "Sasha address not found");
-    }
-
-    SocketEndpoint ep(sashaAddress.str(), port);
-    Owned<INode> node = createINode(ep);
-    Owned<ISashaCommand> cmd = createSashaCommand();
-    cmd->setAction(archive ? SCA_ARCHIVE : SCA_RESTORE);
-    if (dfu)
-        cmd->setDFU(true);
-
-    ForEachItemIn(i, wuids)
-        cmd->addId(wuids.item(i));
-
-    if (!cmd->send(node, 1*60*1000))
-        throw MakeStringException(ECLWATCH_CANNOT_CONNECT_ARCHIVE_SERVER,
-            "Sasha (%s) took too long to respond for Archive/restore workunit.",
-            sashaAddress.str());
-    return cmd.getClear();
 }
 
-extern TPWRAPPER_API IStringIterator* getContainerTargetClusters(const char* processType, const char* processName)
+
+class CContainerWUClusterInfo : public CSimpleInterfaceOf<IConstWUClusterInfo>
 {
-    Owned<CStringArrayIterator> ret = new CStringArrayIterator;
-    Owned<IPropertyTreeIterator> queues = queryComponentConfig().getElements("queues");
+    StringAttr name;
+    StringAttr serverQueue;
+    StringAttr agentQueue;
+    StringAttr thorQueue;
+    ClusterType platform;
+    unsigned clusterWidth;
+    StringArray thorProcesses;
+
+public:
+    CContainerWUClusterInfo(const char* _name, const char* type, unsigned _clusterWidth)
+        : name(_name), clusterWidth(_clusterWidth)
+    {
+        StringBuffer queue;
+        if (strieq(type, "thor"))
+        {
+            thorQueue.set(getClusterThorQueueName(queue.clear(), name));
+            platform = ThorLCRCluster;
+            thorProcesses.append(name);
+        }
+        else if (strieq(type, "roxie"))
+        {
+            agentQueue.set(getClusterEclAgentQueueName(queue.clear(), name));
+            platform = RoxieCluster;
+        }
+        else
+        {
+            agentQueue.set(getClusterEclAgentQueueName(queue.clear(), name));
+            platform = HThorCluster;
+        }
+
+        serverQueue.set(getClusterEclCCServerQueueName(queue.clear(), name));
+    }
+
+    virtual IStringVal& getName(IStringVal& str) const override
+    {
+        str.set(name.get());
+        return str;
+    }
+    virtual IStringVal& getAgentQueue(IStringVal& str) const override
+    {
+        str.set(agentQueue);
+        return str;
+    }
+    virtual IStringVal& getServerQueue(IStringVal& str) const override
+    {
+        str.set(serverQueue);
+        return str;
+    }
+    virtual IStringVal& getThorQueue(IStringVal& str) const override
+    {
+        str.set(thorQueue);
+        return str;
+    }
+    virtual ClusterType getPlatform() const override
+    {
+        return platform;
+    }
+    virtual unsigned getSize() const override
+    {
+        return clusterWidth;
+    }
+    virtual bool isLegacyEclServer() const override
+    {
+        return false;
+    }
+    virtual IStringVal& getScope(IStringVal& str) const override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual unsigned getNumberOfSlaveLogs() const override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual IStringVal & getAgentName(IStringVal & str) const override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual IStringVal & getECLSchedulerName(IStringVal & str) const override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual const StringArray & getECLServerNames() const override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual IStringVal & getRoxieProcess(IStringVal & str) const override
+    {
+        str.set(name.get());
+        return str;
+    }
+    virtual const StringArray & getThorProcesses() const override
+    {
+        return thorProcesses;
+    }
+    virtual const StringArray & getPrimaryThorProcesses() const override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual const SocketEndpointArray & getRoxieServers() const override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual const char *getLdapUser() const override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual const char *getLdapPassword() const override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual unsigned getRoxieRedundancy() const override
+    {
+        return 1;
+    }
+    virtual unsigned getChannelsPerNode() const override
+    {
+        return 1;
+    }
+    virtual int getRoxieReplicateOffset() const override
+    {
+        return 0;
+    }
+    virtual const char *getAlias() const override
+    {
+        UNIMPLEMENTED;
+    }
+};
+
+extern TPWRAPPER_API unsigned getContainerWUClusterInfo(CConstWUClusterInfoArray& clusters)
+{
+    Owned<IPropertyTreeIterator> queues = getComponentConfigSP()->getElements("queues");
     ForEach(*queues)
     {
         IPropertyTree& queue = queues->query();
-        if (!isEmptyString(processType))
-        {
-            const char* type = queue.queryProp("@type");
-            if (isEmptyString(type) || !strieq(type, processType))
-                continue;
-        }
-        const char* qName = queue.queryProp("@name");
-        if (isEmptyString(qName))
-            continue;
-
-        if (!isEmptyString(processName) && !strieq(qName, processName))
-            continue;
-
-        ret->append_unique(qName);
+        Owned<IConstWUClusterInfo> cluster = new CContainerWUClusterInfo(queue.queryProp("@name"),
+            queue.queryProp("@type"), (unsigned) queue.getPropInt("@width", 1));
+        clusters.append(*cluster.getClear());
     }
-    if (!isEmptyString(processType) && !strieq("roxie", processType))
-        return ret.getClear();
 
-    Owned<IPropertyTreeIterator> services = queryComponentConfig().getElements("services[@type='roxie']");
+    return clusters.ordinality();
+}
+
+extern TPWRAPPER_API unsigned getWUClusterInfo(CConstWUClusterInfoArray& clusters)
+{
+    return getEnvironmentClusterInfo(clusters);
+}
+
+static IPropertyTree * getContainerClusterConfig(const char * clusterName)
+{
+    VStringBuffer xpath("queues[@name='%s']", clusterName);
+    return getComponentConfigSP()->getPropTree(xpath);
+}
+
+extern TPWRAPPER_API IConstWUClusterInfo* getWUClusterInfoByName(const char* clusterName)
+{
+    return getTargetClusterInfo(clusterName);
+}
+
+extern TPWRAPPER_API void initContainerRoxieTargets(MapStringToMyClass<ISmartSocketFactory>& connMap)
+{
+    Owned<IPropertyTreeIterator> services = getGlobalConfigSP()->getElements("services[@type='roxie']");
     ForEach(*services)
     {
         IPropertyTree& service = services->query();
-        const char* targetName = service.queryProp("@target");
-        if (isEmptyString(targetName))
+        const char* name = service.queryProp("@name");
+        const char* target = service.queryProp("@target");
+        const char* port = service.queryProp("@port");
+
+        if (isEmptyString(target) || isEmptyString(name)) //bad config?
             continue;
 
-        if (!isEmptyString(processName) && !strieq(targetName, processName))
-            continue;
-
-        ret->append_unique(targetName);
+        StringBuffer s;
+        s.append(name).append(':').append(port ? port : "9876");
+        Owned<ISmartSocketFactory> sf = new CSmartSocketFactory(s.str(), false, 60, (unsigned) -1);
+        connMap.setValue(target, sf.get());
     }
-    return ret.getClear();
+}
+
+extern TPWRAPPER_API unsigned getThorClusterNames(StringArray& targetNames, StringArray& queueNames)
+{
+    StringArray thorNames, groupNames;
+    getEnvironmentThorClusterNames(thorNames, groupNames, targetNames, queueNames);
+    return targetNames.ordinality();
+}
+
+static std::set<std::string> validTargets;
+static CriticalSection validTargetSect;
+
+// called within validTargetSect lock
+static void refreshValidTargets()
+{
+    validTargets.clear();
+    Owned<IStringIterator> it = getTargetClusters(nullptr, nullptr);
+    ForEach(*it)
+    {
+        SCMStringBuffer s;
+        IStringVal& val = it->str(s);
+        if (validTargets.find(val.str()) == validTargets.end())
+        {
+            validTargets.insert(val.str());
+            PROGLOG("adding valid target: %s", val.str());
+        }
+    }
+}
+
+extern TPWRAPPER_API void validateTargetName(const char* target)
+{
+    if (isEmptyString(target))
+        throw makeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Empty target name.");
+
+    CriticalBlock block(validTargetSect);
+    if (validTargets.find(target) == validTargets.end())
+    {
+        // bare metal rechecks in case env. changed since target list built
+        if (!validateTargetClusterName(target))
+            throw makeStringExceptionV(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid target name: %s", target);
+        refreshValidTargets();
+    }
+}
+
+extern TPWRAPPER_API bool validateDataPlaneName(const char * remoteDali, const char * name)
+{
+    return isProcessCluster(remoteDali, name);
+}
+
+bool getSashaService(StringBuffer &serviceAddress, const char *serviceName, bool failIfNotFound)
+{
+    if (!isEmptyString(serviceName))
+    {
+        // all services are on same sasha on bare-metal as far as esp services are concerned
+        StringBuffer sashaAddress;
+        IArrayOf<IConstTpSashaServer> sashaservers;
+        CTpWrapper dummy;
+        dummy.getTpSashaServers(sashaservers);
+        if (0 != sashaservers.ordinality())
+        {
+            // NB: this code (in bare-matal) doesn't handle >1 Sasha.
+            // Prior to this change, it would have failed to [try to] contact any Sasha.
+            IConstTpSashaServer& sashaserver = sashaservers.item(0);
+            IArrayOf<IConstTpMachine> &sashaservermachine = sashaserver.getTpMachines();
+            sashaAddress.append(sashaservermachine.item(0).getNetaddress());
+            if (!sashaAddress.isEmpty())
+            {
+                serviceAddress.append(sashaAddress).append(':').append(DEFAULT_SASHA_PORT);
+                return true;
+            }
+        }
+    }
+    if (failIfNotFound)
+        throw makeStringExceptionV(ECLWATCH_ARCHIVE_SERVER_NOT_FOUND, "Sasha '%s' server not found", serviceName);
+    return false;
+}
+
+bool getSashaServiceEP(SocketEndpoint &serviceEndpoint, const char *service, bool failIfNotFound)
+{
+    StringBuffer serviceAddress;
+    if (!getSashaService(serviceAddress, service, failIfNotFound))
+        return false;
+    serviceEndpoint.set(serviceAddress);
+    return true;
+}
+
+StringBuffer & getRoxieDefaultPlane(StringBuffer & plane, const char * roxieName)
+{
+    Owned <IConstWUClusterInfo> clusterInfo(getTargetClusterInfo(roxieName));
+    StringBufferAdaptor process(plane);
+    if (clusterInfo && clusterInfo->getPlatform()==RoxieCluster)
+        clusterInfo->getRoxieProcess(process);
+    return plane;
 }

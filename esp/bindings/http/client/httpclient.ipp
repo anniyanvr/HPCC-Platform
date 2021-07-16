@@ -33,6 +33,8 @@ private:
     Owned<IPropertyTree> m_config;
     CriticalSection m_sscrit;
     Owned<IPersistentHandler> m_persistentHandler;
+    StringAttr m_mtls_secret;
+
     void initPersistentHandler();
 
 #ifdef COOKIE_HANDLING
@@ -73,13 +75,7 @@ public:
     CHttpClientContext(IPropertyTree* config);
     virtual ~CHttpClientContext();
     virtual IHttpClient* createHttpClient(const char* proxy, const char* url);
-};
-
-enum class HttpClientErrCode
-{
-    PeerClosed = -2,
-    Error = -1,
-    OK = 0
+    void setMtlsSecretName(const char *name){m_mtls_secret.set(name);}
 };
 
 class CHttpClient : implements IHttpClient, public CInterface
@@ -116,12 +112,14 @@ private:
     int m_numRequests = 0;
     SocketEndpoint m_ep;
     Owned<IMultiException> m_exceptions;
+    Linked<CTxSummary> m_txSummary;
 
     virtual int connect(StringBuffer& errmsg, bool forceNewConnection);
     void close();
 
     HttpClientErrCode sendRequest(const char* method, const char* contenttype, StringBuffer& request, StringBuffer& response, bool forceNewConnection);
     HttpClientErrCode sendRequest(IProperties *headers, const char* method, const char* contenttype, StringBuffer& request, StringBuffer& response, StringBuffer& responseStatus, bool alwaysReadContent, bool forceNewConnection);
+
     HttpClientErrCode proxyRequest(IHttpMessage *request, IHttpMessage *response,  bool forceNewConnection, bool resetForwardedFor);
     HttpClientErrCode postRequest(ISoapMessage &req, ISoapMessage& resp, bool forceNewConnection);
 
@@ -132,10 +130,14 @@ public:
     virtual ~CHttpClient();
     virtual void setSsCtx(ISecureSocketContext* ctx);
     virtual void disableKeepAlive() { m_disableKeepAlive = true; }
+    virtual void setMtlsSecretName(const char *name){}
+    virtual const char *getMtlsSecretName(){return nullptr;}
+
 
     virtual int sendRequest(const char* method, const char* contenttype, StringBuffer& request, StringBuffer& response);
     virtual int sendRequest(const char* method, const char* contenttype, StringBuffer& request, StringBuffer& response, StringBuffer& responseStatus, bool alwaysReadContent = false);
     virtual int sendRequest(IProperties *headers, const char* method, const char* contenttype, StringBuffer& request, StringBuffer& response, StringBuffer& responseStatus, bool alwaysReadContent = false);
+    virtual IHttpMessage *sendRequestEx(const char* method, const char* contenttype, StringBuffer& content, HttpClientErrCode &code, StringBuffer &errmsg, IProperties *headers = nullptr, bool alwaysReadContent = false, bool forceNewConnection = false) override ;
     virtual int proxyRequest(IHttpMessage *request, IHttpMessage *response, bool resetForwardedFor) override;
 
     virtual int postRequest(ISoapMessage &req, ISoapMessage& resp);
@@ -149,6 +151,7 @@ public:
     virtual void setTimeOut(unsigned int timeout);
     virtual void setPersistentHandler(IPersistentHandler* handler) { m_persistentHandler = handler; }
     virtual IMultiException* queryExceptions();
+    virtual void setTxSummary(CTxSummary* txSummary) override;
 };
 
 #endif

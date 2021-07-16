@@ -46,6 +46,7 @@ include_directories (
          ${HPCC_SOURCE_DIR}/system/mp
          ${HPCC_SOURCE_DIR}/system/xmllib
          ${HPCC_SOURCE_DIR}/rtl/eclrtl
+         ${HPCC_SOURCE_DIR}/rtl/include
          ${HPCC_SOURCE_DIR}/esp/platform
          ${HPCC_SOURCE_DIR}/esp/clients
          ${HPCC_SOURCE_DIR}/esp/bindings
@@ -66,9 +67,12 @@ install ( TARGETS ws_esdlconfig RUNTIME DESTINATION bin LIBRARY DESTINATION lib 
 target_link_libraries ( ws_esdlconfig
          jlib
          esphttp
-         environment
          dllserver
          SMCLib
          esdl_svc_engine
          dalibase
     )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( ws_esdlconfig environment )
+endif()

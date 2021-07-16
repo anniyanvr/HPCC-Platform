@@ -47,18 +47,6 @@ static const char *QuerySetQueryActionTypes[] = { "Suspend", "Unsuspend", "Toggl
 static unsigned NumOfQuerySetAliasActionTypes = 1;
 static const char *QuerySetAliasActionTypes[] = { "Deactivate", NULL };
 
-bool isRoxieProcess(const char *process)
-{
-    if (!process)
-        return false;
-
-    Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
-    Owned<IConstEnvironment> env = factory->openEnvironment();
-    Owned<IPropertyTree> root = &env->getPTree();
-    VStringBuffer xpath("Software/RoxieCluster[@name=\"%s\"]", process);
-    return root->hasProp(xpath.str());
-}
-
 void checkUseEspOrDaliIP(SocketEndpoint &ep, const char *ip, const char *esp)
 {
     if (!ip || !*ip)
@@ -173,7 +161,7 @@ void doWuFileCopy(IClientFileSpray &fs, IEspWULogicalFileCopyInfo &info, const c
     }
 }
 
-bool copyWULogicalFiles(IEspContext &context, IConstWorkUnit &cw, const char *cluster, bool copyLocal, IEspWUCopyLogicalClusterFileSections &lfinfo)
+bool copyWULogicalFiles(IEspContext &context, IConstWorkUnit &cw, const char *cluster, bool isRoxie, bool copyLocal, IEspWUCopyLogicalClusterFileSections &lfinfo)
 {
     if (isEmpty(cluster))
         throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "copyWULogicalFiles Cluster parameter not set.");
@@ -193,8 +181,6 @@ bool copyWULogicalFiles(IEspContext &context, IConstWorkUnit &cw, const char *cl
         VStringBuffer url("http://.:%d/FileSpray", 8010);
         fs->addServiceUrl(url.str());
     }
-
-    bool isRoxie = isRoxieProcess(cluster);
 
     Owned<IConstWUGraphIterator> graphs = &cw.getGraphs(GraphTypeActivities);
     ForEach(*graphs)
@@ -270,7 +256,7 @@ void copyWULogicalFilesToTarget(IEspContext &context, IConstWUClusterInfo &clust
     ForEachItemIn(i, thors)
     {
         Owned<IEspWUCopyLogicalClusterFileSections> files = createWUCopyLogicalClusterFileSections();
-        copyWULogicalFiles(context, cw, thors.item(i), doLocalCopy, *files);
+        copyWULogicalFiles(context, cw, thors.item(i), false, doLocalCopy, *files);
         clusterfiles.append(*files.getClear());
     }
     SCMStringBuffer roxie;
@@ -278,7 +264,7 @@ void copyWULogicalFilesToTarget(IEspContext &context, IConstWUClusterInfo &clust
     if (roxie.length())
     {
         Owned<IEspWUCopyLogicalClusterFileSections> files = createWUCopyLogicalClusterFileSections();
-        copyWULogicalFiles(context, cw, roxie.str(), doLocalCopy, *files);
+        copyWULogicalFiles(context, cw, roxie.str(), true, doLocalCopy, *files);
         clusterfiles.append(*files.getClear());
     }
 }
@@ -288,7 +274,7 @@ void QueryFilesInUse::loadTarget(IPropertyTree *t, const char *target, unsigned 
     if (!target || !*target)
         return;
 
-    Owned<IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(target);
+    Owned<IConstWUClusterInfo> clusterInfo = getWUClusterInfoByName(target);
     if (!clusterInfo || !(clusterInfo->getPlatform() == RoxieCluster))
         return;
 
@@ -474,10 +460,9 @@ bool CWsWorkunitsEx::onWUCopyLogicalFiles(IEspContext &context, IEspWUCopyLogica
         cluster.set(req.getCluster());
     else
         cluster.set(cw->queryClusterName());
-    if (!isValidCluster(cluster))
-        throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid cluster name: %s", cluster.str());
+    validateTargetName(cluster);
 
-    Owned <IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(cluster.str());
+    Owned<IConstWUClusterInfo> clusterInfo = getWUClusterInfoByName(cluster);
 
     IArrayOf<IConstWUCopyLogicalClusterFileSections> clusterfiles;
     PROGLOG("WUCopyLogicalFiles: %s", wuid.str());
@@ -495,44 +480,61 @@ static inline unsigned remainingMsWait(unsigned wait, unsigned start)
     return (wait>waited) ? wait-waited : 0;
 }
 
+#ifndef _CONTAINERIZED
 bool reloadCluster(IConstWUClusterInfo *clusterInfo, unsigned wait)
+#else
+bool reloadCluster(MapStringToMyClass<ISmartSocketFactory> &roxieConnMap, const char *target, unsigned wait)
+#endif
 {
+#ifndef _CONTAINERIZED
     if (0==wait || !clusterInfo || clusterInfo->getPlatform()!=RoxieCluster)
         return true;
 
     const SocketEndpointArray &addrs = clusterInfo->getRoxieServers();
-    if (addrs.length())
+    if (addrs.length() == 0)
+        return true;
+#else
+    if (0==wait)
+        return true;
+    ISmartSocketFactory *conn = roxieConnMap.getValue(target);
+    if (!conn)
+        return true;
+#endif
+    try
     {
-        try
-        {
-            Owned<IPropertyTree> result = sendRoxieControlAllNodes(addrs.item(0), "<control:reload/>", false, wait);
-            const char *status = result->queryProp("Endpoint[1]/Status");
-            if (!status || !strieq(status, "ok"))
-                return false;
-        }
-        catch(IMultiException *me)
-        {
-            StringBuffer err;
-            IERRLOG("ERROR control:reloading roxie query info %s", me->errorMessage(err.append(me->errorCode()).append(' ')).str());
-            me->Release();
+#ifndef _CONTAINERIZED
+        Owned<IPropertyTree> result = sendRoxieControlAllNodes(addrs.item(0), "<control:reload/>", false, wait);
+#else
+        Owned<IPropertyTree> result = sendRoxieControlAllNodes(conn->nextEndpoint(), "<control:reload/>", false, wait);
+#endif
+        const char *status = result->queryProp("Endpoint[1]/Status");
+        if (!status || !strieq(status, "ok"))
             return false;
-        }
-        catch(IException *e)
-        {
-            StringBuffer err;
-            IERRLOG("ERROR control:reloading roxie query info %s", e->errorMessage(err.append(e->errorCode()).append(' ')).str());
-            e->Release();
-            return false;
-        }
+    }
+    catch(IMultiException *me)
+    {
+        StringBuffer err;
+        IERRLOG("ERROR control:reloading roxie query info %s", me->errorMessage(err.append(me->errorCode()).append(' ')).str());
+        me->Release();
+        return false;
+    }
+    catch(IException *e)
+    {
+        StringBuffer err;
+        IERRLOG("ERROR control:reloading roxie query info %s", e->errorMessage(err.append(e->errorCode()).append(' ')).str());
+        e->Release();
+        return false;
     }
     return true;
 }
 
+#ifndef _CONTAINERIZED
 bool reloadCluster(const char *cluster, unsigned wait)
 {
     Owned <IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(cluster);
     return (clusterInfo) ? reloadCluster(clusterInfo, wait) : true;
 }
+#endif
 
 static inline void updateQuerySetting(bool ignore, IPropertyTree *queryTree, const char *xpath, int value)
 {
@@ -737,7 +739,7 @@ public:
         if (!process.length())
             return;
 #else
-        StringBuffer process(target);
+        process.set(target);
 #endif
 
         ps.setown(createPackageSet(process.str()));
@@ -750,11 +752,21 @@ public:
         if (queryname && *queryname)
             queryname = queryid.append(queryname).append(".0").str(); //prepublish dummy version number to support fuzzy match like queries="myquery.*" in package
         files->addFilesFromQuery(cw, pm, queryname);
-        files->resolveFiles(process.str(), remoteIP, remotePrefix, srcCluster, !(updateFlags & (DALI_UPDATEF_REPLACE_FILE | DALI_UPDATEF_CLONE_FROM | DALI_UPDATEF_SUPERFILES)), true, false, true);
+
+#ifdef _CONTAINERIZED
+        StringBuffer targetPlane;
+        getRoxieDefaultPlane(targetPlane, target);
+        const char * targetPlaneOrGroup = targetPlane;
+#else
+        const char * targetPlaneOrGroup = process;
+#endif
+        files->resolveFiles(targetPlaneOrGroup, remoteIP, remotePrefix, srcCluster, !(updateFlags & (DALI_UPDATEF_REPLACE_FILE | DALI_UPDATEF_CLONE_FROM | DALI_UPDATEF_SUPERFILES)), true, false, true);
+        Owned<IDFUhelper> helper = createIDFUhelper();
+#ifdef _CONTAINERIZED
+        files->cloneAllInfo(updateFlags, helper, true, true, 0, 1, 0, nullptr);
+#else
         StringBuffer defReplicateFolder;
         getConfigurationDirectory(NULL, "data2", "roxie", process.str(), defReplicateFolder);
-        Owned<IDFUhelper> helper = createIDFUhelper();
-#ifndef _CONTAINERIZED
         files->cloneAllInfo(updateFlags, helper, true, true, clusterInfo->getRoxieRedundancy(), clusterInfo->getChannelsPerNode(), clusterInfo->getRoxieReplicateOffset(), defReplicateFolder);
 #endif
     }
@@ -782,20 +794,35 @@ public:
     StringAttr queryname;
 };
 
-bool CWsWorkunitsEx::isQuerySuspended(const char* query, IConstWUClusterInfo *clusterInfo, unsigned wait, StringBuffer& errorMessage)
+#ifndef _CONTAINERIZED
+bool CWsWorkunitsEx::isQuerySuspended(const char* query, IConstWUClusterInfo* clusterInfo, unsigned wait, StringBuffer& errorMessage)
+#else
+bool CWsWorkunitsEx::isQuerySuspended(const char* query, const char* target, unsigned wait, StringBuffer& errorMessage)
+#endif
 {
     try
     {
+#ifndef _CONTAINERIZED
         if (0==wait || !clusterInfo || clusterInfo->getPlatform()!=RoxieCluster)
             return false;
 
         const SocketEndpointArray &addrs = clusterInfo->getRoxieServers();
         if (addrs.length() < 1)
             return false;
-
+#else
+        if (0==wait)
+            return false;
+        ISmartSocketFactory *conn = roxieConnMap.getValue(target);
+        if (!conn)
+            return false;
+#endif
         StringBuffer control;
         control.appendf("<control:queries><Query id='%s'/></control:queries>",  query);
+#ifndef _CONTAINERIZED
         Owned<IPropertyTree> result = sendRoxieControlAllNodes(addrs.item(0), control.str(), false, wait);
+#else
+        Owned<IPropertyTree> result = sendRoxieControlAllNodes(conn->nextEndpoint(), control, false, wait);
+#endif
         if (!result)
             return false;
 
@@ -836,7 +863,9 @@ bool CWsWorkunitsEx::onWUPublishWorkunit(IEspContext &context, IEspWUPublishWork
     resp.setWuid(wuid.str());
 
     StringAttr queryName;
-    if (notEmpty(req.getJobName()))
+    if (notEmpty(req.getQueryName()))
+        queryName.set(req.getQueryName());
+    else if (notEmpty(req.getJobName()))
         queryName.set(req.getJobName());
     else
         queryName.set(cw->queryJobName());
@@ -848,12 +877,9 @@ bool CWsWorkunitsEx::onWUPublishWorkunit(IEspContext &context, IEspWUPublishWork
         target.set(req.getCluster());
     else
         target.set(cw->queryClusterName());
-    if (!target.length())
-        throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Cluster name not defined for publishing workunit %s", wuid.str());
-    if (!isValidCluster(target.str()))
-        throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid cluster name: %s", target.str());
+    validateTargetName(target);
 
-    DBGLOG("%s publishing wuid %s to target %s as query %s", context.queryUserId(), wuid.str(), target.str(), queryName.str());
+    DBGLOG("%s publishing wuid %s to target %s as query %s", nullText(context.queryUserId()), wuid.str(), target.str(), queryName.str());
 
     StringBuffer daliIP;
     StringBuffer srcCluster;
@@ -862,7 +888,7 @@ bool CWsWorkunitsEx::onWUPublishWorkunit(IEspContext &context, IEspWUPublishWork
 
     if (srcCluster.length())
     {
-        if (!isProcessCluster(daliIP, srcCluster))
+        if (!validateDataPlaneName(daliIP, srcCluster))
             throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Process cluster %s not found on %s DALI", srcCluster.str(), daliIP.length() ? daliIP.str() : "local");
     }
     unsigned updateFlags = 0;
@@ -890,7 +916,9 @@ bool CWsWorkunitsEx::onWUPublishWorkunit(IEspContext &context, IEspWUPublishWork
     }
 
     WorkunitUpdate wu(&cw->lock());
-    if (req.getUpdateWorkUnitName() && notEmpty(req.getJobName()))
+    if (notEmpty(req.getWorkUnitJobName()))
+        wu->setJobName(req.getWorkUnitJobName());
+    else if (req.getUpdateWorkUnitName() && notEmpty(req.getJobName()))
         wu->setJobName(req.getJobName());
 
     StringBuffer queryId;
@@ -914,18 +942,27 @@ bool CWsWorkunitsEx::onWUPublishWorkunit(IEspContext &context, IEspWUPublishWork
     resp.setQueryName(queryName.str());
     resp.setQuerySet(target.str());
 
-    Owned <IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(target.str());
     bool reloadFailed = false;
+#ifndef _CONTAINERIZED
+    Owned <IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(target.str());
+#endif
     if (0!=req.getWait() && !req.getNoReload())
+#ifndef _CONTAINERIZED
         reloadFailed = !reloadCluster(clusterInfo, (unsigned)req.getWait());
-    
+#else
+        reloadFailed = !reloadCluster(roxieConnMap, target, (unsigned)req.getWait());
+#endif
     resp.setReloadFailed(reloadFailed);
 
     double version = context.getClientVersion();
     if (version > 1.38)
     {
         StringBuffer errorMessage;
+#ifndef _CONTAINERIZED
         if (!reloadFailed && !req.getNoReload() && isQuerySuspended(queryName.str(), clusterInfo, (unsigned)req.getWait(), errorMessage))
+#else
+        if (!reloadFailed && !req.getNoReload() && isQuerySuspended(queryName.str(), target, (unsigned)req.getWait(), errorMessage))
+#endif
         {
             resp.setSuspended(true);
             resp.setErrorMessage(errorMessage);
@@ -991,8 +1028,21 @@ void addClusterQueryStates(IPropertyTree* queriesOnCluster, const char *target, 
     clusterStates.append(*clusterState.getClear());
 }
 
+template<typename T>
+void checkAndSetQueryPriority(double version, IPropertyTree *query, T *ret)
+{
+    if (!query->hasProp("@priority"))
+        return;
+
+    int priorityID = query->getPropInt("@priority");
+    ret->setPriority(getQueryPriorityName(priorityID));
+    if (version >= 1.83)
+        ret->setPriorityID(priorityID);
+}
+
 void gatherQuerySetQueryDetails(IEspContext &context, IPropertyTree *query, IEspQuerySetQuery *queryInfo, const char *cluster, IPropertyTree *queriesOnCluster)
 {
+    double version = context.getClientVersion();
     queryInfo->setId(query->queryProp("@id"));
     queryInfo->setName(query->queryProp("@name"));
     queryInfo->setDll(query->queryProp("@dll"));
@@ -1008,13 +1058,11 @@ void gatherQuerySetQueryDetails(IEspContext &context, IPropertyTree *query, IEsp
         queryInfo->setTimeLimit(query->getPropInt("@timeLimit"));
     if (query->hasProp("@warnTimeLimit"))
         queryInfo->setWarnTimeLimit(query->getPropInt("@warnTimeLimit"));
-    if (query->hasProp("@priority"))
-        queryInfo->setPriority(getQueryPriorityName(query->getPropInt("@priority")));
+    checkAndSetQueryPriority(version, query, queryInfo);
     if (query->hasProp("@comment"))
         queryInfo->setComment(query->queryProp("@comment"));
     if (query->hasProp("@snapshot"))
         queryInfo->setSnapshot(query->queryProp("@snapshot"));
-    double version = context.getClientVersion();
     if (version >= 1.46)
     {
         queryInfo->setPublishedBy(query->queryProp("@publishedBy"));
@@ -1176,20 +1224,32 @@ void retrieveQuerysetDetails(IEspContext &context, IArrayOf<IEspWUQuerySetDetail
     retrieveQuerysetDetails(context, details, registry, type, value, cluster, queriesOnCluster);
 }
 
-IPropertyTree* getQueriesOnCluster(const char *target, const char *queryset, StringArray *queryIDs, bool checkAllNodes)
+#ifndef _CONTAINERIZED
+IPropertyTree *getQueriesOnCluster(const char *target, const char *queryset, StringArray *queryIDs, bool checkAllNodes)
+#else
+IPropertyTree *getQueriesOnCluster(const char *target, const char *queryset, StringArray *queryIDs, bool checkAllNodes,
+    MapStringToMyClass<ISmartSocketFactory> &roxieConnMap)
+#endif
 {
     if (isEmpty(target))
         target = queryset;
+    else if (queryset && *queryset && !strieq(target, queryset))
+        throw makeStringExceptionV(ECLWATCH_QUERYSET_NOT_ON_CLUSTER, "Target %s and QuerySet %s should match", target, queryset);
+
+#ifndef _CONTAINERIZED
     Owned<IConstWUClusterInfo> info = getTargetClusterInfo(target);
     if (!info)
         throw MakeStringException(ECLWATCH_CANNOT_RESOLVE_CLUSTER_NAME, "Cluster %s not found", target);
-    if (queryset && *queryset && !strieq(target, queryset))
-        throw MakeStringException(ECLWATCH_QUERYSET_NOT_ON_CLUSTER, "Target %s and QuerySet %s should match", target, queryset);
     if (info->getPlatform()!=RoxieCluster)
         return NULL;
     const SocketEndpointArray &eps = info->getRoxieServers();
     if (!eps.length())
         return NULL;
+#else
+    ISmartSocketFactory *conn = roxieConnMap.getValue(target);
+    if (!conn)
+        return nullptr;
+#endif
 
     try
     {
@@ -1203,7 +1263,11 @@ IPropertyTree* getQueriesOnCluster(const char *target, const char *queryset, Str
                 control.appendf("<Query id='%s'/>",  queryIDs->item(i));
             control.append("</control:queries>");
         }
+#ifndef _CONTAINERIZED
         Owned<ISocket> sock = ISocket::connect_timeout(eps.item(0), ROXIECONNECTIONTIMEOUT);
+#else
+        Owned<ISocket> sock = ISocket::connect_timeout(conn->nextEndpoint(), ROXIECONNECTIONTIMEOUT);
+#endif
         if (checkAllNodes)
             return sendRoxieControlAllNodes(sock, control, false, ROXIECONTROLQUERIESTIMEOUT);
         else
@@ -1218,9 +1282,17 @@ IPropertyTree* getQueriesOnCluster(const char *target, const char *queryset, Str
     }
 }
 
+#ifndef _CONTAINERIZED
 void retrieveQuerysetDetailsByCluster(IEspContext &context, IArrayOf<IEspWUQuerySetDetail> &details, const char *target, const char *queryset, const char *type, const char *value, bool checkAllNodes)
 {
     Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(target, queryset, nullptr, checkAllNodes);
+#else
+void retrieveQuerysetDetailsByCluster(IEspContext &context, IArrayOf<IEspWUQuerySetDetail> &details,
+    const char *target, const char *queryset, const char *type, const char *value, bool checkAllNodes,
+    MapStringToMyClass<ISmartSocketFactory> &roxieConnMap)
+{
+    Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(target, queryset, nullptr, checkAllNodes, roxieConnMap);
+#endif
     retrieveQuerysetDetails(context, details, target, type, value, target, queriesOnCluster);
 }
 
@@ -1260,7 +1332,11 @@ bool CWsWorkunitsEx::onWUQuerysetDetails(IEspContext &context, IEspWUQuerySetDet
         const char* cluster = req.getClusterName();
         if (isEmpty(cluster))
             cluster = req.getQuerySetName();
+#ifndef _CONTAINERIZED
         Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(cluster, req.getQuerySetName(), nullptr, req.getCheckAllNodes());
+#else
+        Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(cluster, req.getQuerySetName(), nullptr, req.getCheckAllNodes(), roxieConnMap);
+#endif
         retrieveQuerysetDetails(context, registry, req.getFilterTypeAsString(), req.getFilter(), respQueries, respAliases, cluster, queriesOnCluster);
 
         resp.setQuerysetQueries(respQueries);
@@ -1269,7 +1345,12 @@ bool CWsWorkunitsEx::onWUQuerysetDetails(IEspContext &context, IEspWUQuerySetDet
     else
     {
         IArrayOf<IEspWUQuerySetDetail> respDetails;
+#ifndef _CONTAINERIZED
         retrieveQuerysetDetailsByCluster(context, respDetails, req.getClusterName(), req.getQuerySetName(), req.getFilterTypeAsString(), req.getFilter(), false);
+#else
+        retrieveQuerysetDetailsByCluster(context, respDetails, req.getClusterName(), req.getQuerySetName(), req.getFilterTypeAsString(), req.getFilter(), false,
+            roxieConnMap);
+#endif
         if (respDetails.ordinality())
         {
             IEspWUQuerySetDetail& detail = respDetails.item(0);
@@ -1288,7 +1369,12 @@ bool CWsWorkunitsEx::onWUMultiQuerysetDetails(IEspContext &context, IEspWUMultiQ
     if (notEmpty(req.getClusterName()))
     {
         PROGLOG("WUMultiQuerysetDetails for cluster %s", req.getClusterName());
+#ifndef _CONTAINERIZED
         retrieveQuerysetDetailsByCluster(context, respDetails, req.getClusterName(), req.getQuerySetName(), req.getFilterTypeAsString(), req.getFilter(), req.getCheckAllNodes());
+#else
+        retrieveQuerysetDetailsByCluster(context, respDetails, req.getClusterName(), req.getQuerySetName(), req.getFilterTypeAsString(), req.getFilter(), req.getCheckAllNodes(),
+            roxieConnMap);
+#endif
     }
     else if (notEmpty(req.getQuerySetName()))
     {
@@ -1340,6 +1426,7 @@ unsigned CWsWorkunitsEx::getGraphIdsByQueryId(const char *target, const char *qu
     if (!queryId || !*queryId)
         throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Query Id required");
 
+#ifndef _CONTAINERIZED
     Owned<IConstWUClusterInfo> info = getTargetClusterInfo(target);
     if (!info || (info->getPlatform()!=RoxieCluster)) //Only roxie query has query graph.
         return 0;
@@ -1347,9 +1434,18 @@ unsigned CWsWorkunitsEx::getGraphIdsByQueryId(const char *target, const char *qu
     const SocketEndpointArray &eps = info->getRoxieServers();
     if (eps.empty())
         return 0;
+#else
+    ISmartSocketFactory *conn = roxieConnMap.getValue(target);
+    if (!conn)
+        return 0;
+#endif
 
     VStringBuffer xpath("<control:querystats><Query id='%s'/></control:querystats>", queryId);
+#ifndef _CONTAINERIZED
     Owned<ISocket> sock = ISocket::connect_timeout(eps.item(0), ROXIECONNECTIONTIMEOUT);
+#else
+    Owned<ISocket> sock = ISocket::connect_timeout(conn->nextEndpoint(), ROXIECONNECTIONTIMEOUT);
+#endif
     Owned<IPropertyTree> querystats = sendRoxieControlQuery(sock, xpath.str(), ROXIECONTROLQUERYTIMEOUT);
     if (!querystats)
         return 0;
@@ -1389,7 +1485,11 @@ void CWsWorkunitsEx::checkAndSetClusterQueryState(IEspContext &context, const ch
         if (queryIDs.ordinality() == 0)
             return;
 
+#ifndef _CONTAINERIZED
         Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(cluster, querySetId, &queryIDs, checkAllNodes);
+#else
+        Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(cluster, querySetId, &queryIDs, checkAllNodes, roxieConnMap);
+#endif
         if (!queriesOnCluster)
         {
             UWARNLOG("getQueriesOnCluster() returns NULL for cluster<%s> and querySetId<%s>", cluster, querySetId);
@@ -1573,6 +1673,7 @@ bool CWsWorkunitsEx::onWUListQueries(IEspContext &context, IEspWUListQueriesRequ
         q->setWuid(query.queryProp("@wuid"));
         q->setActivated(query.getPropBool("@activated", false));
         q->setSuspended(query.getPropBool("@suspended", false));
+
         if (query.hasProp("@memoryLimit"))
         {
             StringBuffer s;
@@ -1583,8 +1684,7 @@ bool CWsWorkunitsEx::onWUListQueries(IEspContext &context, IEspWUListQueriesRequ
             q->setTimeLimit(query.getPropInt("@timeLimit"));
         if (query.hasProp("@warnTimeLimit"))
             q->setWarnTimeLimit(query.getPropInt("@warnTimeLimit"));
-        if (query.hasProp("@priority"))
-            q->setPriority(getQueryPriorityName(query.getPropInt("@priority")));
+        checkAndSetQueryPriority(version, &query, q.get());
         if (query.hasProp("@comment"))
             q->setComment(query.queryProp("@comment"));
         if (version >= 1.46)
@@ -1615,7 +1715,11 @@ void CWsWorkunitsEx::getSuspendedQueriesByCluster(MapStringTo<bool> &suspendedQu
 
     if (!isEmptyString(querySet))
     {
+#ifndef _CONTAINERIZED
         Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(querySet, querySet, &queryIDs, checkAllNodes);
+#else
+        Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(querySet, querySet, &queryIDs, checkAllNodes, roxieConnMap);
+#endif
         addSuspendedQueryIDs(suspendedQueries, queriesOnCluster, querySet);
     }
     else
@@ -1630,7 +1734,11 @@ void CWsWorkunitsEx::getSuspendedQueriesByCluster(MapStringTo<bool> &suspendedQu
             SCMStringBuffer target;
             targets->str(target);
 
+#ifndef _CONTAINERIZED
             Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(target.str(), target.str(), &queryIDs, checkAllNodes);
+#else
+            Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(target.str(), target.str(), &queryIDs, checkAllNodes, roxieConnMap);
+#endif
             addSuspendedQueryIDs(suspendedQueries, queriesOnCluster, target.str());
         }
     }
@@ -1726,11 +1834,9 @@ bool CWsWorkunitsEx::onWUListQueriesUsingFile(IEspContext &context, IEspWUListQu
 bool CWsWorkunitsEx::onWUQueryFiles(IEspContext &context, IEspWUQueryFilesRequest &req, IEspWUQueryFilesResponse &resp)
 {
     const char *target = req.getTarget();
+    validateTargetName(target);
+
     const char *query = req.getQueryId();
-    if (!target || !*target)
-        throw MakeStringException(ECLWATCH_QUERYSET_NOT_FOUND, "Target not specified");
-    if (!isValidCluster(target))
-        throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid target name: %s", target);
     if (!query || !*query)
         throw MakeStringException(ECLWATCH_QUERYID_NOT_FOUND, "Query not specified");
     Owned<IPropertyTree> registeredQuery = resolveQueryAlias(target, query, true);
@@ -1880,7 +1986,7 @@ bool CWsWorkunitsEx::onWURecreateQuery(IEspContext &context, IEspWURecreateQuery
 
                 if (srcCluster.length())
                 {
-                    if (!isProcessCluster(daliIP, srcCluster))
+                    if (!validateDataPlaneName(daliIP, srcCluster))
                         throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Process cluster %s not found on %s DALI", srcCluster.str(), daliIP.length() ? daliIP.str() : "local");
                 }
                 unsigned updateFlags = 0;
@@ -1931,15 +2037,24 @@ bool CWsWorkunitsEx::onWURecreateQuery(IEspContext &context, IEspWURecreateQuery
             resp.setQueryName(srcQueryName);
             resp.setQueryId(queryId.str());
 
-            Owned <IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(target);
             bool reloadFailed = false;
+#ifndef _CONTAINERIZED
+            Owned<IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(target);
+#endif
             if (0!=req.getWait() && !req.getNoReload())
+#ifndef _CONTAINERIZED
                 reloadFailed = !reloadCluster(clusterInfo, (unsigned)req.getWait());
-
+#else
+                reloadFailed = !reloadCluster(roxieConnMap, target, (unsigned)req.getWait());
+#endif
             resp.setReloadFailed(reloadFailed);
 
             StringBuffer errorMessage;
+#ifndef _CONTAINERIZED
             if (!reloadFailed && !req.getNoReload() && isQuerySuspended(queryId.str(), clusterInfo, (unsigned)req.getWait(), errorMessage))
+#else
+            if (!reloadFailed && !req.getNoReload() && isQuerySuspended(queryId, target, (unsigned)req.getWait(), errorMessage))
+#endif
             {
                 resp.setSuspended(true);
                 resp.setErrorMessage(errorMessage);
@@ -1997,8 +2112,7 @@ void CWsWorkunitsEx::getWUQueryDetails(IEspContext &context, CWUQueryDetailsReq 
     double version = context.getClientVersion();
     if (version >= 1.46)
     {
-        if (query->hasProp("@priority"))
-            resp.setPriority(getQueryPriorityName(query->getPropInt("@priority")));
+        checkAndSetQueryPriority(version, query, &resp);
         resp.setIsLibrary(query->getPropBool("@isLibrary"));
 
         if (version < 1.64)
@@ -2083,7 +2197,11 @@ void CWsWorkunitsEx::getWUQueryDetails(IEspContext &context, CWUQueryDetailsReq 
         StringArray queryIds;
         queryIds.append(queryId);
 
+#ifndef _CONTAINERIZED
         Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(querySet, querySet, &queryIds, req.getCheckAllNodes());
+#else
+        Owned<IPropertyTree> queriesOnCluster = getQueriesOnCluster(querySet, querySet, &queryIds, req.getCheckAllNodes(), roxieConnMap);
+#endif
         if (queriesOnCluster)
         {
             IArrayOf<IEspClusterQueryState> clusterStates;
@@ -2095,6 +2213,7 @@ void CWsWorkunitsEx::getWUQueryDetails(IEspContext &context, CWUQueryDetailsReq 
     if (req.getIncludeWsEclAddresses())
     {
         StringArray wseclAddresses;
+#ifndef _CONTAINERIZED
         Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
         Owned<IConstEnvironment> env = factory->openEnvironment();
         Owned<IPropertyTree> root = &env->getPTree();
@@ -2142,6 +2261,17 @@ void CWsWorkunitsEx::getWUQueryDetails(IEspContext &context, CWUQueryDetailsReq 
                 }
             }
         }
+#else
+        IArrayOf<IConstHPCCService> eclservices;
+        CTpWrapper tpWrapper;
+        tpWrapper.getServices(version, "eclqueries", nullptr, eclservices);
+        ForEachItemIn(i, eclservices)
+        {
+            IConstHPCCService& eclservice = eclservices.item(i);
+            VStringBuffer wseclAddr("%s:%u", eclservice.getName(), eclservice.getPort());
+            wseclAddresses.append(wseclAddr);
+        }
+#endif
         resp.setWsEclAddresses(wseclAddresses);
     }
 }
@@ -2255,7 +2385,7 @@ bool CWsWorkunitsEx::getQueryFiles(IEspContext &context, const char* wuid, const
 {
     try
     {
-        Owned<IConstWUClusterInfo> info = getTargetClusterInfo(target);
+        Owned<IConstWUClusterInfo> info = getWUClusterInfoByName(target);
         if (!info || (info->getPlatform()!=RoxieCluster))
             return false;
 
@@ -2392,10 +2522,7 @@ void expandQueryActionTargetList(IProperties *queryIds, IPropertyTree *queryset,
 bool CWsWorkunitsEx::onWUQueryConfig(IEspContext &context, IEspWUQueryConfigRequest & req, IEspWUQueryConfigResponse & resp)
 {
     StringAttr target(req.getTarget());
-    if (target.isEmpty())
-        throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Target name required");
-    if (!isValidCluster(target))
-        throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid target name: %s", target.get());
+    validateTargetName(target);
 
     Owned<IPropertyTree> queryset = getQueryRegistry(target.get(), false);
     if (!queryset)
@@ -2430,7 +2557,11 @@ bool CWsWorkunitsEx::onWUQueryConfig(IEspContext &context, IEspWUQueryConfigRequ
 
     bool reloadFailed = false;
     if (0!=req.getWait() && !req.getNoReload())
+#ifndef _CONTAINERIZED
         reloadFailed = !reloadCluster(target.get(), (unsigned)req.getWait());
+#else
+        reloadFailed = !reloadCluster(roxieConnMap, target.get(), (unsigned)req.getWait());
+#endif
     resp.setReloadFailed(reloadFailed);
 
     return true;
@@ -2661,7 +2792,7 @@ public:
         StringBuffer fetchedName;
         StringBuffer remoteDfs;
         fetchRemoteWorkunit(NULL, context, srcAddress.str(), NULL, NULL, wuid, fetchedName, xml, dllname, dll, remoteDfs);
-        deploySharedObject(*context, wuid, dllname, target, queryName, dll, queryDirectory, xml.str());
+        deploySharedObject(*context, wuid, dllname, target, queryName, dll, queryDirectory, xml.str(), false);
 
         SCMStringBuffer existingQueryId;
         queryIdFromQuerySetWuid(destQuerySet, wuid, queryName, existingQueryId);
@@ -2828,7 +2959,13 @@ public:
         wufiles.setown(createReferencedFileList(context->queryUserId(), context->queryPassword(), allowForeign, false));
         Owned<IHpccPackageSet> ps = createPackageSet(destProcess);
         pm.set(ps->queryActiveMap(target));
-        process.set(destProcess);
+        if (isContainerized())
+        {
+            StringAttrBuilder builder(process);
+            getRoxieDefaultPlane(builder, target);
+        }
+        else
+            process.set(destProcess);
     }
 
     void cloneFiles()
@@ -2837,13 +2974,17 @@ public:
         {
             wufiles->resolveFiles(process, dfsIP, srcPrefix, srcCluster, !(updateFlags & (DALI_UPDATEF_REPLACE_FILE | DALI_UPDATEF_CLONE_FROM)), true, false, true);
             Owned<IDFUhelper> helper = createIDFUhelper();
-            Owned <IConstWUClusterInfo> cl = getTargetClusterInfo(target);
+            Owned <IConstWUClusterInfo> cl = getWUClusterInfoByName(target);
             if (cl)
             {
+#ifdef _CONTAINERIZED
+                wufiles->cloneAllInfo(updateFlags, helper, true, true, 0, 1, 0, nullptr);
+#else
                 SCMStringBuffer process;
                 StringBuffer defReplicateFolder;
                 getConfigurationDirectory(NULL, "data2", "roxie", cl->getRoxieProcess(process).str(), defReplicateFolder);
                 wufiles->cloneAllInfo(updateFlags, helper, true, true, cl->getRoxieRedundancy(), cl->getChannelsPerNode(), cl->getRoxieReplicateOffset(), defReplicateFolder);
+#endif
             }
         }
     }
@@ -2886,14 +3027,12 @@ bool CWsWorkunitsEx::onWUCopyQuerySet(IEspContext &context, IEspWUCopyQuerySetRe
     StringBuffer srcTarget;
     if (!splitQueryPath(source, srcAddress, srcTarget, NULL))
         throw MakeStringException(ECLWATCH_INVALID_INPUT, "Invalid source target");
-    if (!srcAddress.length() && !isValidCluster(srcTarget))
-        throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid source target name: %s", source);
+    //don't validate source target if it's remote (has srcAddress)
+    if (srcAddress.isEmpty() && !srcTarget.isEmpty())
+        validateTargetName(srcTarget);
 
     const char *target = req.getTarget();
-    if (!target || !*target)
-        throw MakeStringException(ECLWATCH_MISSING_PARAMS, "No destination target specified");
-    if (!isValidCluster(target))
-        throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid destination target name: %s", target);
+    validateTargetName(target);
 
     DBGLOG("%s copying queryset %s from %s target %s", context.queryUserId(), target, srcAddress.str(), srcTarget.str());
 
@@ -2903,7 +3042,7 @@ bool CWsWorkunitsEx::onWUCopyQuerySet(IEspContext &context, IEspWUCopyQuerySetRe
     SCMStringBuffer process;
     if (req.getCopyFiles())
     {
-        Owned <IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(target);
+        Owned <IConstWUClusterInfo> clusterInfo = getWUClusterInfoByName(target);
         if (clusterInfo && clusterInfo->getPlatform()==RoxieCluster)
         {
             clusterInfo->getRoxieProcess(process);
@@ -2951,8 +3090,7 @@ bool CWsWorkunitsEx::onWUQuerysetCopyQuery(IEspContext &context, IEspWUQuerySetC
         throw MakeStringException(ECLWATCH_INVALID_INPUT, "Invalid target queryset name");
     if (req.getCluster() && *req.getCluster() && !strieq(req.getCluster(), target)) //backward compatability check
         throw MakeStringException(ECLWATCH_INVALID_INPUT, "Invalid target cluster and queryset must match");
-    if (!isValidCluster(target))
-        throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid target name: %s", target);
+    validateTargetName(target);
 
     StringBuffer srcAddress, srcQuerySet, srcQuery;
     if (!splitQueryPath(source, srcAddress, srcQuerySet, &srcQuery))
@@ -2979,7 +3117,7 @@ bool CWsWorkunitsEx::onWUQuerysetCopyQuery(IEspContext &context, IEspWUQuerySetC
             wuid.set(srcInfo->getWuid());
         if (targetQueryName.isEmpty())
             targetQueryName.set(queryName);
-        deploySharedObject(context, wuid, dllname.str(), target, targetQueryName.get(), dll, queryDirectory.str(), xml.str());
+        deploySharedObject(context, wuid, dllname.str(), target, targetQueryName.get(), dll, queryDirectory.str(), xml.str(), false);
     }
     else
     {
@@ -3059,7 +3197,11 @@ bool CWsWorkunitsEx::onWUQuerysetCopyQuery(IEspContext &context, IEspWUQuerySetC
     resp.setQueryId(targetQueryId.str());
 
     if (0!=req.getWait() && !req.getNoReload())
+#ifndef _CONTAINERIZED
         reloadCluster(target, remainingMsWait(req.getWait(), start));
+#else
+        reloadCluster(roxieConnMap, target, (unsigned)req.getWait());
+#endif
     return true;
 }
 
@@ -3071,7 +3213,7 @@ bool CWsWorkunitsEx::onWUQuerysetImport(IEspContext &context, IEspWUQuerysetImpo
         if (!target || !*target)
             throw MakeStringException(ECLWATCH_QUERYSET_NOT_FOUND, "Target not specified");
 
-        Owned <IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(target);
+        Owned <IConstWUClusterInfo> clusterInfo = getWUClusterInfoByName(target);
         if (!clusterInfo)
             throw MakeStringException(ECLWATCH_CANNOT_RESOLVE_CLUSTER_NAME, "Target not found");
 
@@ -3226,6 +3368,7 @@ void CWsWorkunitsEx::getGraphsByQueryId(const char *target, const char *queryId,
     if (!queryId || !*queryId)
         throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Query Id required");
 
+#ifndef _CONTAINERIZED
     Owned<IConstWUClusterInfo> info = getTargetClusterInfo(target);
     if (!info || (info->getPlatform()!=RoxieCluster)) //Only support roxie for now
         throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid Roxie name");
@@ -3238,6 +3381,15 @@ void CWsWorkunitsEx::getGraphsByQueryId(const char *target, const char *queryId,
 
     VStringBuffer control("<control:querystats><Query id='%s'/></control:querystats>", queryId);
     Owned<IPropertyTree> querystats = sendRoxieControlAllNodes(eps.item(0), control.str(), false, ROXIELOCKCONNECTIONTIMEOUT);
+#else
+    ISmartSocketFactory *conn = roxieConnMap.getValue(target);
+    if (!conn)
+        throw makeStringExceptionV(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid Roxie name %s", target);
+
+    PROGLOG("getGraphsByQueryId: target %s, query %s", target, queryId);
+    VStringBuffer control("<control:querystats><Query id='%s'/></control:querystats>", queryId);
+    Owned<IPropertyTree> querystats = sendRoxieControlAllNodes(conn->nextEndpoint(), control.str(), false, ROXIELOCKCONNECTIONTIMEOUT);
+#endif
     if (!querystats)
         return;
 
@@ -3347,6 +3499,7 @@ IPropertyTree* CWsWorkunitsEx::sendControlQuery(IEspContext& context, const char
     if (!query || !*query)
         throw MakeStringException(ECLWATCH_MISSING_PARAMS, "CWsWorkunitsEx::sendControlQuery: Control query not specified");
 
+#ifndef _CONTAINERIZED
     Owned<IConstWUClusterInfo> info = getTargetClusterInfo(target);
     if (!info || (info->getPlatform()!=RoxieCluster)) //Only support roxie for now
         throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "CWsWorkunitsEx::sendControlQuery: Invalid target name %s", target);
@@ -3356,6 +3509,13 @@ IPropertyTree* CWsWorkunitsEx::sendControlQuery(IEspContext& context, const char
         throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "CWsWorkunitsEx::sendControlQuery: Server not found for %s", target);
 
     Owned<ISocket> sock = ISocket::connect_timeout(eps.item(0), timeout);
+#else
+    ISmartSocketFactory *conn = roxieConnMap.getValue(target);
+    if (!conn)
+        throw makeStringExceptionV(ECLWATCH_CANNOT_GET_ENV_INFO, "roxie target cluster not mapped: %s", target);
+
+    Owned<ISocket> sock = ISocket::connect_timeout(conn->nextEndpoint(), timeout);
+#endif
     return sendRoxieControlQuery(sock, query, timeout);
 }
 
@@ -3394,14 +3554,21 @@ bool CWsWorkunitsEx::onWUGetNumFileToCopy(IEspContext& context, IEspWUGetNumFile
     {
         StringAttr clusterName;
         StringAttr sortOrder;
+        MapStringToMyClass<ISmartSocketFactory> *roxieConnMap;
     public:
         IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
 
+#ifndef _CONTAINERIZED
         CWUGetNumFileToCopyPager(const char* _clusterName, const char *_sortOrder)
             : clusterName(_clusterName), sortOrder(_sortOrder) { };
+#else
+        CWUGetNumFileToCopyPager(const char* _clusterName, const char* _sortOrder, MapStringToMyClass<ISmartSocketFactory>* _roxieConnMap)
+            : clusterName(_clusterName), sortOrder(_sortOrder), roxieConnMap(_roxieConnMap) { };
+#endif
 
         virtual IRemoteConnection* getElements(IArrayOf<IPropertyTree> &elements)
         {
+#ifndef _CONTAINERIZED
             SocketEndpointArray servers;
             getRoxieProcessServers(clusterName.get(), servers);
             if (servers.length() < 1)
@@ -3410,6 +3577,15 @@ bool CWsWorkunitsEx::onWUGetNumFileToCopy(IEspContext& context, IEspWUGetNumFile
                 return NULL;
             }
             Owned<IPropertyTree> result = sendRoxieControlAllNodes(servers.item(0), "<control:numfilestoprocess/>", false, ROXIELOCKCONNECTIONTIMEOUT);
+#else
+            ISmartSocketFactory *conn = roxieConnMap->getValue(clusterName);
+            if (!conn)
+            {
+                PROGLOG("WUGetNumFileToCopy: Process Server not found for %s", clusterName.get());
+                return nullptr;
+            }
+            Owned<IPropertyTree> result = sendRoxieControlAllNodes(conn->nextEndpoint(), "<control:numfilestoprocess/>", false, ROXIELOCKCONNECTIONTIMEOUT);
+#endif
             if (!result)
             {
                 PROGLOG("WUGetNumFileToCopy: Empty result received for cluster %s", clusterName.get());
@@ -3428,10 +3604,17 @@ bool CWsWorkunitsEx::onWUGetNumFileToCopy(IEspContext& context, IEspWUGetNumFile
 
     try
     {
+#ifndef _CONTAINERIZED
         StringBuffer clusterName(req.getClusterName());
         if (clusterName.isEmpty())
             throw MakeStringException(ECLWATCH_CANNOT_RESOLVE_CLUSTER_NAME, "Cluster not specified");
-
+#else
+        StringBuffer targetName(req.getTargetName());
+        if (targetName.isEmpty())
+            targetName.set(req.getClusterName()); //for backward compatible
+        if (targetName.isEmpty())
+            throw makeStringException(ECLWATCH_CANNOT_RESOLVE_CLUSTER_NAME, "Target not specified");
+#endif
         StringBuffer so;
         bool descending = req.getDescending();
         if (descending)
@@ -3455,7 +3638,11 @@ bool CWsWorkunitsEx::onWUGetNumFileToCopy(IEspContext& context, IEspWUGetNumFile
 
         unsigned numberOfEndpoints = 0;
         IArrayOf<IPropertyTree> results;
-        Owned<IElementsPager> elementsPager = new CWUGetNumFileToCopyPager(clusterName.str(), so.str());
+#ifndef _CONTAINERIZED
+        Owned<IElementsPager> elementsPager = new CWUGetNumFileToCopyPager(clusterName, so);
+#else
+        Owned<IElementsPager> elementsPager = new CWUGetNumFileToCopyPager(targetName, so, &roxieConnMap);
+#endif
         getElementsPaged(elementsPager, pageStartFrom, pageSize, NULL, "", &cacheHint, results, &numberOfEndpoints, NULL, false);
 
         IArrayOf<IEspClusterEndpoint> endpoints;
@@ -3489,9 +3676,15 @@ bool CWsWorkunitsEx::onWUQueryGetSummaryStats(IEspContext& context, IEspWUQueryG
         if (isEmptyString(target))
             throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Target name required");
 
+#ifndef _CONTAINERIZED
         Owned<IConstWUClusterInfo> info = getTargetClusterInfo(target);
         if (!info || (info->getPlatform()!=RoxieCluster)) //Only support roxie for now
             throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Roxie name not found");
+#else
+        ISmartSocketFactory *conn = roxieConnMap.getValue(target);
+        if (!conn)
+            throw makeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Roxie name not found");
+#endif
 
         double version = context.getClientVersion();
         const char *queryId = req.getQueryId();
@@ -3500,12 +3693,14 @@ bool CWsWorkunitsEx::onWUQueryGetSummaryStats(IEspContext& context, IEspWUQueryG
         else
             PROGLOG("WUQueryGetSummaryStats: target %s", target);
 
+#ifndef _CONTAINERIZED
         const SocketEndpointArray &eps = info->getRoxieServers();
         if (eps.empty())
         {
             IERRLOG("WUQueryGetSummaryStats: Failed to getRoxieServers for %s", target);
             return true;
         }
+#endif
 
         bool includeRawStats = req.getIncludeRawStats();
         const char *fromTime = req.getFromTime();
@@ -3529,7 +3724,11 @@ bool CWsWorkunitsEx::onWUQueryGetSummaryStats(IEspContext& context, IEspWUQueryG
         else
             control.append(" />");
 
+#ifndef _CONTAINERIZED
         Owned<IPropertyTree> queryAggregates = sendRoxieControlAllNodes(eps.item(0), control.str(), false, ROXIELOCKCONNECTIONTIMEOUT);
+#else
+        Owned<IPropertyTree> queryAggregates = sendRoxieControlAllNodes(conn->nextEndpoint(), control, false, ROXIELOCKCONNECTIONTIMEOUT);
+#endif
         if (!queryAggregates)
         {
             PROGLOG("WUQueryGetSummaryStats: %s returns empty for %s", control.str(), target);

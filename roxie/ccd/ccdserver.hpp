@@ -116,6 +116,8 @@ interface IFinalRoxieInput : extends IInputBase
     }
 };
 
+extern SinkMode getSinkMode(const char *sinkModetext);
+
 extern IEngineRowStream *connectSingleStream(IRoxieAgentContext *ctx, IFinalRoxieInput *input, unsigned idx, Owned<IStrandJunction> &junction, bool consumerOrdered);
 
 interface ISteppedConjunctionCollector;
@@ -218,6 +220,8 @@ interface IRoxieServerActivityFactory : extends IActivityFactory
     virtual bool isInputOrdered(bool consumerOrdered, unsigned idx) const = 0;
     virtual roxiemem::RoxieHeapFlags getHeapFlags() const = 0;
     virtual bool isActivityCodeSigned() const = 0;
+    virtual RecordTranslationMode getEnableFieldTranslation() const = 0;
+    virtual SinkMode getSinkMode() const = 0;
 };
 interface IGraphResult : public IInterface
 {

@@ -8,31 +8,42 @@ import * as Utility from "src/Utility";
 import nlsHPCC from "src/nlsHPCC";
 import { HolyGrail } from "../layouts/HolyGrail";
 import { pushParams } from "../util/history";
-import { Fields, Filter } from "./Filter";
-import { ShortVerticalDivider } from "./Common";
+import { Fields } from "./forms/Fields";
+import { Filter } from "./forms/Filter";
+import { createCopyDownloadSelection, ShortVerticalDivider } from "./Common";
 import { DojoGrid, selector } from "./DojoGrid";
 
 const FilterFields: Fields = {
     "Type": { type: "checkbox", label: nlsHPCC.ArchivedOnly },
     "Wuid": { type: "string", label: nlsHPCC.WUID, placeholder: "W20200824-060035" },
     "Owner": { type: "string", label: nlsHPCC.Owner, placeholder: nlsHPCC.jsmi },
-    "JobName": { type: "string", label: nlsHPCC.JobName, placeholder: nlsHPCC.log_analysis_1 },
-    "Cluster": { type: "target-cluster", label: nlsHPCC.Cluster, placeholder: nlsHPCC.Owner },
-    "State": { type: "workunit-state", label: nlsHPCC.State, placeholder: nlsHPCC.Created },
+    "Jobname": { type: "string", label: nlsHPCC.JobName, placeholder: nlsHPCC.log_analysis_1 },
+    "Cluster": { type: "target-cluster", label: nlsHPCC.Cluster, placeholder: "" },
+    "State": { type: "workunit-state", label: nlsHPCC.State, placeholder: "" },
     "ECL": { type: "string", label: nlsHPCC.ECL, placeholder: nlsHPCC.dataset },
     "LogicalFile": { type: "string", label: nlsHPCC.LogicalFile, placeholder: nlsHPCC.somefile },
     "LogicalFileSearchType": { type: "logicalfile-type", label: nlsHPCC.LogicalFileType, placeholder: "", disabled: (params: Fields) => !params.LogicalFile.value },
+    "LastNDays": { type: "string", label: nlsHPCC.LastNDays, placeholder: "2" },
     "StartDate": { type: "datetime", label: nlsHPCC.FromDate, placeholder: "" },
     "EndDate": { type: "datetime", label: nlsHPCC.ToDate, placeholder: "" },
-    "LastNDays": { type: "string", label: nlsHPCC.LastNDays, placeholder: "2" }
 };
 
-function formatQuery(filter) {
-    if (filter.StartDate) {
-        filter.StartDate = new Date(filter.StartDate).toISOString();
-    }
-    if (filter.EndDate) {
-        filter.EndDate = new Date(filter.StartDate).toISOString();
+function formatQuery(_filter) {
+    const filter = { ..._filter };
+    if (filter.LastNDays) {
+        const end = new Date();
+        const start = new Date();
+        start.setDate(end.getDate() - filter.LastNDays);
+        filter.StartDate = start.toISOString();
+        filter.EndDate = end.toISOString();
+        delete filter.LastNDays;
+    } else {
+        if (filter.StartDate) {
+            filter.StartDate = new Date(filter.StartDate).toISOString();
+        }
+        if (filter.EndDate) {
+            filter.EndDate = new Date(filter.StartDate).toISOString();
+        }
     }
     return filter;
 }
@@ -65,8 +76,68 @@ export const Workunits: React.FunctionComponent<WorkunitsProps> = ({
     const [selection, setSelection] = React.useState([]);
     const [uiState, setUIState] = React.useState({ ...defaultUIState });
 
+    //  Grid ---
+    const gridStore = useConst(() => store ? store : ESPWorkunit.CreateWUQueryStore({}));
+    const gridQuery = useConst(formatQuery(filter));
+    const gridSort = useConst([{ attribute: "Wuid", "descending": true }]);
+    const gridColumns = useConst({
+        col1: selector({
+            width: 27,
+            selectorType: "checkbox"
+        }),
+        Protected: {
+            renderHeaderCell: function (node) {
+                node.innerHTML = Utility.getImageHTML("locked.png", nlsHPCC.Protected);
+            },
+            width: 25,
+            sortable: false,
+            formatter: function (_protected) {
+                if (_protected === true) {
+                    return Utility.getImageHTML("locked.png");
+                }
+                return "";
+            }
+        },
+        Wuid: {
+            label: nlsHPCC.WUID, width: 180,
+            formatter: function (Wuid) {
+                const wu = ESPWorkunit.Get(Wuid);
+                return `${wu.getStateImageHTML()}&nbsp;<a href='#/workunits/${Wuid}' class='dgrid-row-url''>${Wuid}</a>`;
+            }
+        },
+        Owner: { label: nlsHPCC.Owner, width: 90 },
+        Jobname: { label: nlsHPCC.JobName, width: 500 },
+        Cluster: { label: nlsHPCC.Cluster, width: 90 },
+        RoxieCluster: { label: nlsHPCC.RoxieCluster, width: 99 },
+        State: { label: nlsHPCC.State, width: 90 },
+        TotalClusterTime: {
+            label: nlsHPCC.TotalClusterTime, width: 117,
+            renderCell: function (object, value, node) {
+                domClass.add(node, "justify-right");
+                node.innerText = value;
+            }
+        }
+    });
+
+    const refreshTable = React.useCallback((clearSelection = false) => {
+        grid?.set("query", formatQuery(filter));
+        if (clearSelection) {
+            grid?.clearSelection();
+        }
+    }, [filter, grid]);
+
+    //  Filter  ---
+    const filterFields: Fields = {};
+    for (const fieldID in FilterFields) {
+        filterFields[fieldID] = { ...FilterFields[fieldID], value: filter[fieldID] };
+    }
+
+    React.useEffect(() => {
+        refreshTable();
+    }, [refreshTable, filter, store?.data]);
+
     //  Command Bar  ---
-    const buttons: ICommandBarItemProps[] = [
+    const buttons = React.useMemo((): ICommandBarItemProps[] => [
         {
             key: "refresh", text: nlsHPCC.Refresh, iconProps: { iconName: "Refresh" },
             onClick: () => refreshTable()
@@ -124,84 +195,11 @@ export const Workunits: React.FunctionComponent<WorkunitsProps> = ({
                 setMine(!mine);
             }
         },
-    ];
+    ], [mine, refreshTable, selection, store, uiState.hasNotCompleted, uiState.hasNotProtected, uiState.hasProtected, uiState.hasSelection]);
 
-    const rightButtons: ICommandBarItemProps[] = [
-        {
-            key: "copy", text: nlsHPCC.CopyWUIDs, disabled: !uiState.hasSelection || !navigator?.clipboard?.writeText, iconOnly: true, iconProps: { iconName: "Copy" },
-            onClick: () => {
-                const wuids = selection.map(s => s.Wuid);
-                navigator?.clipboard?.writeText(wuids.join("\n"));
-            }
-        },
-        {
-            key: "download", text: nlsHPCC.DownloadToCSV, disabled: !uiState.hasSelection, iconOnly: true, iconProps: { iconName: "Download" },
-            onClick: () => {
-                Utility.downloadToCSV(grid, selection.map(row => ([row.Protected, row.Wuid, row.Owner, row.Jobname, row.Cluster, row.RoxieCluster, row.State, row.TotalClusterTime])), "workunits.csv");
-            }
-        }
-    ];
-
-    //  Grid ---
-    const gridStore = useConst(store || ESPWorkunit.CreateWUQueryStore({}));
-    const gridQuery = useConst(formatQuery(filter));
-    const gridSort = useConst([{ attribute: "Wuid", "descending": true }]);
-    const gridColumns = useConst({
-        col1: selector({
-            width: 27,
-            selectorType: "checkbox"
-        }),
-        Protected: {
-            renderHeaderCell: function (node) {
-                node.innerHTML = Utility.getImageHTML("locked.png", nlsHPCC.Protected);
-            },
-            width: 25,
-            sortable: false,
-            formatter: function (_protected) {
-                if (_protected === true) {
-                    return Utility.getImageHTML("locked.png");
-                }
-                return "";
-            }
-        },
-        Wuid: {
-            label: nlsHPCC.WUID, width: 180,
-            formatter: function (Wuid) {
-                const wu = ESPWorkunit.Get(Wuid);
-                return `${wu.getStateImageHTML()}&nbsp;<a href='#/workunits/${Wuid}' class='dgrid-row-url''>${Wuid}</a>`;
-            }
-        },
-        Owner: { label: nlsHPCC.Owner, width: 90 },
-        Jobname: { label: nlsHPCC.JobName, width: 500 },
-        Cluster: { label: nlsHPCC.Cluster, width: 90 },
-        RoxieCluster: { label: nlsHPCC.RoxieCluster, width: 99 },
-        State: { label: nlsHPCC.State, width: 90 },
-        TotalClusterTime: {
-            label: nlsHPCC.TotalClusterTime, width: 117,
-            renderCell: function (object, value, node) {
-                domClass.add(node, "justify-right");
-                node.innerText = value;
-            }
-        }
-    });
-
-    const refreshTable = (clearSelection = false) => {
-        grid?.set("query", formatQuery(filter));
-        if (clearSelection) {
-            grid?.clearSelection();
-        }
-    };
-
-    //  Filter  ---
-    const filterFields: Fields = {};
-    for (const field in FilterFields) {
-        filterFields[field] = { ...FilterFields[field], value: filter[field] };
-    }
-
-    React.useEffect(() => {
-        refreshTable();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [filter]);
+    const rightButtons = React.useMemo((): ICommandBarItemProps[] => [
+        ...createCopyDownloadSelection(grid, selection, "workunits.csv")
+    ], [grid, selection]);
 
     //  Selection  ---
     React.useEffect(() => {

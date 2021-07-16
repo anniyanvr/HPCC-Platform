@@ -54,6 +54,11 @@ static struct MainThreadIdHelper
     }
 } mainThreadIdHelper;
 
+extern bool isMainThread()
+{
+    return GetCurrentThreadId() == mainThreadIdHelper.tid;
+}
+
 /*
  * NB: Thread termination hook functions are tracked using a thread local vector (threadTermHooks).
  * However, hook functions installed on the main thread must be tracked separately in a non thread local vector (mainThreadTermHooks).
@@ -405,6 +410,12 @@ void Thread::startRelease()
                 pthread_attr_setstacksize(&attr, LINUX_STACKSIZE_CAP);
 #endif
         }
+        sched_param param;
+        pthread_attr_getschedparam(&attr, &param);
+        param.sched_priority = 0;
+        pthread_attr_setschedparam(&attr, &param);
+        pthread_attr_setschedpolicy(&attr, SCHED_OTHER);
+        pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
         status = pthread_create(&threadid, &attr, Thread::_threadmain, this);
         if ((status==EAGAIN)||(status==EINTR)) {
             if (numretrys--==0)
@@ -736,7 +747,7 @@ void CAsyncFor::For(unsigned num,unsigned maxatonce,bool abortFollowingException
             for (i=0;(i<num)&&(i<maxatonce);i++)
                 ready.signal();
             IArrayOf<Thread> started;
-            started.ensure(num);
+            started.ensureCapacity(num);
             for (i=0;i<num;i++) {
                 ready.wait();
                 if (abortFollowingException && e) break;
@@ -792,14 +803,34 @@ void CAsyncFor::For(unsigned num,unsigned maxatonce,bool abortFollowingException
                 }
             };
             IArrayOf<Thread> started;
-            started.ensure(num);
+            started.ensureCapacity(num);
             for (i=0;i<num-1;i++)
             {
                 Owned<Thread> thread = new cdothread(this,i,&errmutex,e);
                 thread->start();
                 started.append(*thread.getClear());
             }
-            Do(num-1);
+
+            try {
+                Do(num-1);
+            }
+            catch (IException * _e)
+            {
+                synchronized block(errmutex);
+                if (e)
+                    _e->Release();  // only return first
+                else
+                    e = _e;
+            }
+#ifndef NO_CATCHALL
+            catch (...)
+            {
+                synchronized block(errmutex);
+                if (!e)
+                    e = MakeStringException(0, "Unknown exception in main Thread");
+            }
+#endif
+
             ForEachItemIn(idx, started)
             {
                 started.item(idx).join();

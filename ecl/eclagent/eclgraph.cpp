@@ -240,7 +240,12 @@ static IHThorActivity * createActivity(IAgentContext & agent, unsigned activityI
     case TAKspillread:
         return createDiskReadActivity(agent, activityId, subgraphId, (IHThorDiskReadArg &)arg, kind, graph, node);
     case TAKnewdiskread:
-        return createNewDiskReadActivity(agent, activityId, subgraphId, (IHThorNewDiskReadArg &)arg, kind, graph, node);
+        {
+            bool isGeneric = (((IHThorNewDiskReadArg &)arg).getFlags() & TDXgeneric) != 0;
+            if (isGeneric)
+                return createGenericDiskReadActivity(agent, activityId, subgraphId, (IHThorNewDiskReadArg &)arg, kind, graph, node);
+            return createNewDiskReadActivity(agent, activityId, subgraphId, (IHThorNewDiskReadArg &)arg, kind, graph, node);
+        }
     case TAKdisknormalize:
         return createDiskNormalizeActivity(agent, activityId, subgraphId, (IHThorDiskNormalizeArg &)arg, kind, graph, node);
     case TAKdiskaggregate:
@@ -418,7 +423,7 @@ bool EclGraphElement::alreadyUpToDate(IAgentContext & agent)
     }
 
     IPropertyTree & cur = f->queryAttributes();
-    if ((eclCRC != cur.getPropInt("@eclCRC")) || (totalCRC != cur.getPropInt64("@totalCRC")))
+    if ((eclCRC != (unsigned)cur.getPropInt("@eclCRC")) || (totalCRC != (unsigned __int64)cur.getPropInt64("@totalCRC")))
         return false;
     return true;
 }
@@ -754,7 +759,7 @@ IHThorException * EclGraphElement::makeWrappedException(IException * e)
 //---------------------------------------------------------------------------
 
 EclSubGraph::EclSubGraph(IAgentContext & _agent, EclGraph & _parent, EclSubGraph * _owner, unsigned _seqNo, bool enableProbe, CHThorDebugContext * _debugContext, IProbeManager * _probeManager)
-    : parent(_parent), owner(_owner), seqNo(_seqNo), probeEnabled(enableProbe), debugContext(_debugContext), probeManager(_probeManager), isLoopBody(false)
+    : probeEnabled(enableProbe), seqNo(_seqNo), parent(_parent), owner(_owner), debugContext(_debugContext), probeManager(_probeManager), isLoopBody(false)
 {
     executed = false;
     created = false;
@@ -1249,7 +1254,6 @@ void EclGraph::execute(const byte * parentExtract)
     try
     {
         unsigned startTime = msTick();
-        aindex_t lastSink = -1;
         ForEachItemIn(idx, graphs)
         {
             EclSubGraph & cur = graphs.item(idx);
@@ -1430,7 +1434,7 @@ const void * GraphResult::getLinkedRowResult()
 
 GraphResults::GraphResults(unsigned _maxResults)
 {
-    results.ensure(_maxResults);
+    results.ensureCapacity(_maxResults);
 }
 
 void GraphResults::clear()

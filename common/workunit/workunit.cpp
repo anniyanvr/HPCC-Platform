@@ -1575,20 +1575,13 @@ private:
                 return true;
             case SChildGraph:
             {
+#ifdef _DEBUG
+                assertex(treeIters.tos().query().getPropInt("att[@name='_kind']/@value") == TAKsubgraph);
                 unsigned numIters = treeIters.ordinality();
-                //This should really be implemented by a filter on the node - but it would require _kind/_parentActivity to move to the node tag
-                if (treeIters.tos().query().getPropInt("att[@name='_kind']/@value") != TAKsubgraph)
-                {
-                    state = SChildGraphNext;
-                    break;
-                }
                 unsigned parentActivityId = treeIters.item(numIters-2).query().getPropInt("@id");
                 unsigned parentId = treeIters.tos().query().getPropInt("att[@name='_parentActivity']/@value");
-                if (parentId != parentActivityId)
-                {
-                    state = SChildGraphNext;
-                    break;
-                }
+                assertex(parentId == parentActivityId);
+#endif
                 scopeId.set(ChildGraphScopePrefix).append(treeIters.tos().query().getPropInt("@id"));
                 pushScope(scopeId);
                 scopeType = SSTchildgraph;
@@ -1694,11 +1687,27 @@ private:
             }
             case SSubGraphFirstActivity:
             {
+                //Walk the contents of each subgraph once, splitting the entries into activities and child graphs
+                IArrayOf<IPropertyTree> activities;
+                IArrayOf<IPropertyTree> childGraphs;
                 Owned<IPropertyTreeIterator> treeIter = treeIters.tos().query().getElements("att/graph/node");
-                if (treeIter && treeIter->first())
+                ForEach(*treeIter)
                 {
-                    treeIter.setown(createSortedIterator(*treeIter, compareActivityNode));
-                    pushIterator(treeIter, SSubGraphEnd);
+                    IPropertyTree & cur = treeIter->get();
+                    if (cur.getPropInt("att[@name='_kind']/@value") != TAKsubgraph)
+                        activities.append(cur);
+                    else
+                        childGraphs.append(cur);
+                }
+                if (activities.ordinality())
+                {
+                    //Create an iterator for the child graphs in this subgraph which is iterated in order as the activities are processed
+                    Owned<IPropertyTreeIterator> graphIter = createSortedIterator(childGraphs, compareSubGraphNode);
+                    graphIter->first();
+                    childGraphIters.append(*graphIter.getClear());
+
+                    Owned<IPropertyTreeIterator> activityIter = createSortedIterator(activities, compareActivityNode);
+                    pushIterator(activityIter, SSubGraphEnd);
                     state = SActivity;
                 }
                 else
@@ -1727,7 +1736,11 @@ private:
                 if (treeIters.tos().next())
                     state = SActivity;
                 else
+                {
+                    assertex(!childGraphIters.tos().isValid());
+                    childGraphIters.pop();
                     state = popIterator();
+                }
                 break;
             case SChildGraphNext:
                 if (treeIters.tos().next())
@@ -1737,13 +1750,22 @@ private:
                 break;
             case SChildGraphFirst:
             {
-                unsigned numIters = treeIters.ordinality();
-                IPropertyTreeIterator & graphIter = treeIters.item(numIters-2);
-                Owned<IPropertyTreeIterator> treeIter = graphIter.query().getElements("att/graph/node");
-                //Really want to filter by <att name="_parentActivity" value="<parentid>">
-                if (treeIter && treeIter->first())
+                unsigned parentActivityId = treeIters.tos().query().getPropInt("@id");
+                IArrayOf<IPropertyTree> childGraphs;
+                IPropertyTreeIterator & allGraphs = childGraphIters.tos();
+                while (allGraphs.isValid())
                 {
-                    treeIter.setown(createSortedIterator(*treeIter, compareSubGraphNode));
+                    IPropertyTree & cur = allGraphs.query();
+                    unsigned parentId = cur.getPropInt("att[@name='_parentActivity']/@value");
+                    if (parentId != parentActivityId)
+                        break;
+                    childGraphs.append(OLINK(cur));
+                    allGraphs.next();
+                }
+
+                if (childGraphs.ordinality())
+                {
+                    Owned<IPropertyTreeIterator> treeIter = createSortedIterator(childGraphs, compareSubGraphNode);
                     pushIterator(treeIter, SActivityEnd);
                     state = SChildGraph;
                 }
@@ -1839,10 +1861,12 @@ private:
         case SGraph:
             state = SDone;
             break;
+        case SActivity:
+            childGraphIters.pop();
+            //fall through
         case SChildGraph:
         case SSubGraph:
         case SEdge:
-        case SActivity:
             popScope();
             state = popIterator();
             break;
@@ -1859,6 +1883,7 @@ protected:
     Owned<IConstWUGraphIterator> graphIter;
     Owned<IPropertyTree> curGraph;
     IArrayOf<IPropertyTreeIterator> treeIters;
+    IArrayOf<IPropertyTreeIterator> childGraphIters;
     UnsignedArray scopeLengths;
     UnsignedArray stateStack;
     StringBuffer curScopeName;
@@ -3572,7 +3597,7 @@ public:
         priorityLevel = calcPriorityValue(&p);
         wuscope.set(p.queryProp("@scope"));
         appvalues.loadBranch(&p,"Application");
-        totalThorTime = (unsigned)nanoToMilli(extractTimeCollatable(p.queryProp("@totalThorTime"), false));
+        totalThorTime = (unsigned)nanoToMilli(extractTimeCollatable(p.queryProp("@totalThorTime"), nullptr));
         _isProtected = p.getPropBool("@protected", false);
     }
     virtual const char *queryWuid() const { return wuid.str(); }
@@ -3599,7 +3624,7 @@ public:
     virtual IConstWUAppValueIterator & getApplicationValues() const { return *new CArrayIteratorOf<IConstWUAppValue,IConstWUAppValueIterator> (appvalues, 0, (IConstWorkUnitInfo *) this); };
 protected:
     StringAttr wuid, user, jobName, clusterName, timeScheduled, wuscope;
-    mutable CachedTags<CLocalWUAppValue,IConstWUAppValue> appvalues;
+    mutable CachedWUAppValues appvalues;
     unsigned totalThorTime;
     WUState state;
     WUAction action;
@@ -7000,7 +7025,7 @@ unsigned CLocalWorkUnit::getTotalThorTime() const
 {
     CriticalBlock block(crit);
     if (p->hasProp("@totalThorTime"))
-        return (unsigned)nanoToMilli(extractTimeCollatable(p->queryProp("@totalThorTime"), false));
+        return (unsigned)nanoToMilli(extractTimeCollatable(p->queryProp("@totalThorTime"), nullptr));
 
     const WuScopeFilter filter("stype[graph],nested[0],stat[TimeElapsed]");
     StatsAggregation summary;
@@ -7586,6 +7611,10 @@ bool extractFromWorkunitDAToken(const char * distributedAccessToken, StringBuffe
 //   Throws if unable to open workunit
 wuTokenStates verifyWorkunitDAToken(const char * ctxUser, const char * daToken)
 {
+    #ifdef _CONTAINERIZED
+    if (!getComponentConfigSP()->getPropBool("@wuTokens", false))
+        return wuTokenInvalid;
+    #endif
     if (isEmptyString(daToken))
     {
         ERRLOG("verifyWorkunitDAToken : Token must be provided");
@@ -8486,7 +8515,7 @@ void CLocalWorkUnit::setStatistic(StatisticCreatorType creatorType, const char *
             statTree->setProp("@desc", optDescription);
 
         if (statistics.cached)
-            statistics.append(LINK(statTree));
+            statistics.append(statTree); // links statTree
 
         mergeAction = StatsMergeAppend;
     }
@@ -11499,33 +11528,28 @@ void CLocalWUException::setPriority(unsigned _priority)
 
 //==========================================================================================
 
-CLocalWUAppValue::CLocalWUAppValue(IPropertyTree *props, unsigned child) : p(props)
+CLocalWUAppValue::CLocalWUAppValue(const IPropertyTree *_owner, const IPropertyTree *_props) : owner(_owner), props(_props)
 {
-    StringAttrBuilder propPath(prop);
-    propPath.append("*[").append(child).append("]");
 }
 
 const char * CLocalWUAppValue::queryApplication() const
 {
-    return p->queryName();
+    return owner->queryName();
 }
 
 const char * CLocalWUAppValue::queryName() const
 {
-    IPropertyTree* val=p->queryPropTree(prop.str());
-    if(val)
-        return val->queryName();
-    return ""; // Should not happen in normal usage
+    return props->queryName();
 }
 
 const char * CLocalWUAppValue::queryValue() const
 {
-    return p->queryProp(prop.str());
+    return props->queryProp(nullptr);
 }
 
 //==========================================================================================
 
-CLocalWUStatistic::CLocalWUStatistic(IPropertyTree *props) : p(props)
+CLocalWUStatistic::CLocalWUStatistic(const IPropertyTree *props) : p(props)
 {
 }
 
@@ -12807,12 +12831,7 @@ static void clearAliases(IPropertyTree * queryRegistry, const char * id)
 
     StringBuffer xpath;
     xpath.append("Alias[@id=\"").append(lcId).append("\"]");
-
-    Owned<IPropertyTreeIterator> iter = queryRegistry->getElements(xpath);
-    ForEach(*iter)
-    {
-        queryRegistry->removeProp(xpath.str());
-    }
+    while (queryRegistry->removeProp(xpath));
 }
 
 IPropertyTree * addNamedQuery(IPropertyTree * queryRegistry, const char * name, const char * wuid, const char * dll, bool library, const char *userid, const char *snapshot)
@@ -13326,7 +13345,7 @@ extern WORKUNIT_API void associateLocalFile(IWUQuery * query, WUFileType type, c
             source->copyTo(target, 0, NULL, true);
         }
         query->addAssociatedFile(type, destPathName, "localhost", description, crc, minActivity, maxActivity);
-        // Should we delete the local files? May not matter...
+        // Should we delete the local files? No - they may not be finished with
     }
     else
     {
@@ -13401,7 +13420,8 @@ extern WORKUNIT_API void addTimeStamp(IWorkUnit * wu, StatisticScopeType scopeTy
 
 static double getCpuSize(const char *resourceName)
 {
-    const char * cpuRequestedStr = queryComponentConfig().queryProp(resourceName);
+    Owned<IPropertyTree> compConfig = getComponentConfig();
+    const char * cpuRequestedStr = compConfig->queryProp(resourceName);
     if (!cpuRequestedStr)
         return 0.0;
     char * endptr;
@@ -13415,7 +13435,7 @@ static double getCpuSize(const char *resourceName)
 
 static double getCostCpuHour()
 {
-    double costCpuHour = queryGlobalConfig().getPropReal("cost/@perCpu");
+    double costCpuHour = getGlobalConfigSP()->getPropReal("cost/@perCpu");
     if (costCpuHour < 0.0)
         return 0.0;
     return costCpuHour;
@@ -14117,18 +14137,31 @@ KeepK8sJobs translateKeepJobs(const char *keepJob)
     return KeepK8sJobs::none;
 }
 
+// NB: will fire an exception if command fails (returns non-zero exit code)
+static void runKubectlCommand(const char *title, const char *cmd, const char *input, StringBuffer *output)
+{
+    StringBuffer _output, error;
+    if (!output)
+        output = &_output;
+    unsigned ret = runExternalCommand(title, *output, error, cmd, input);
+    if (output->length())
+        MLOG(MCExtraneousInfo, unknownJob, "%s: ret=%u, stdout=%s", cmd, ret, output->trimRight().str());
+    if (error.length())
+        MLOG(MCinternalError, unknownJob, "%s: ret=%u, stderr=%s", cmd, ret, error.trimRight().str());
+    if (ret)
+    {
+        if (input)
+            MLOG(MCinternalError, unknownJob, "Using input %s", input);
+        throw makeStringExceptionV(0, "Failed to run %s: error %u: %s", cmd, ret, error.str());
+    }
+}
+
 void deleteK8sResource(const char *componentName, const char *job, const char *resource)
 {
     VStringBuffer jobname("%s-%s", componentName, job);
     jobname.toLowerCase();
     VStringBuffer deleteResource("kubectl delete %s/%s", resource, jobname.str());
-    StringBuffer output, error;
-    bool ret = runExternalCommand(componentName, output, error, deleteResource.str(), nullptr);
-    DBGLOG("kubectl delete output: %s", output.trimRight().str());
-    if (error.length())
-        DBGLOG("kubectl delete error: %s", error.trimRight().str());
-    if (ret)
-        throw makeStringException(0, "Failed to run kubectl delete");
+    runKubectlCommand(componentName, deleteResource, nullptr, nullptr);
 }
 
 void waitK8sJob(const char *componentName, const char *job, unsigned pendingTimeoutSecs, KeepK8sJobs keepJob)
@@ -14148,27 +14181,19 @@ void waitK8sJob(const char *componentName, const char *job, unsigned pendingTime
     {
         for (;;)
         {
-            StringBuffer output, error;
-            unsigned ret = runExternalCommand(nullptr, output, error, waitJob.str(), nullptr);
-            if (ret || error.length())
-                throw makeStringExceptionV(0, "Failed to run %s: error %u: %s", waitJob.str(), ret, error.str());
+            StringBuffer output;
+            runKubectlCommand(componentName, waitJob, nullptr, &output);
             if (!streq(output, "1"))  // status.active value
             {
                 // Job is no longer active - we can terminate
                 DBGLOG("kubectl jobs output: %s", output.str());
-                unsigned ret = runExternalCommand(nullptr, output.clear(), error.clear(), checkJobExitCode.str(), nullptr);
-                if (ret || error.length())
-                    throw makeStringExceptionV(0, "Failed to run %s: error %u: %s", checkJobExitCode.str(), ret, error.str());
+                runKubectlCommand(componentName, checkJobExitCode, nullptr, &output.clear());
                 if (output.length() && !streq(output, "0"))  // state.terminated.exitCode
                     throw makeStringExceptionV(0, "Failed to run %s: pod exited with error: %s", jobname.str(), output.str());
                 break;
             }
-            ret = runExternalCommand(nullptr, output.clear(), error.clear(), getScheduleStatus.str(), nullptr);
-            if (error.length())
-            {
-                DBGLOG("kubectl get schedule status error: %s", error.str());
-                break;
-            }
+            runKubectlCommand(nullptr, getScheduleStatus, nullptr, &output.clear());
+
             // Check whether pod has been scheduled yet - if resources are not available pods may block indefinitely waiting to be scheduled, and
             // we would prefer them to fail instead.
             bool pending = streq(output, "False");
@@ -14176,7 +14201,7 @@ void waitK8sJob(const char *componentName, const char *job, unsigned pendingTime
             {
                 schedulingTimeout = true;
                 VStringBuffer getReason("kubectl get pods --selector=job-name=%s \"--output=jsonpath={range .items[*].status.conditions[?(@.type=='PodScheduled')]}{.reason}{': '}{.message}{end}\"", jobname.str());
-                runExternalCommand(componentName, output.clear(), error.clear(), getReason.str(), nullptr);
+                runKubectlCommand(componentName, getReason, nullptr, &output.clear());
                 throw makeStringExceptionV(0, "Failed to run %s - pod not scheduled after %u seconds: %s ", jobname.str(), pendingTimeoutSecs, output.str());
             }
             MilliSleep(delay);
@@ -14216,17 +14241,17 @@ bool applyK8sYaml(const char *componentName, const char *wuid, const char *job, 
         E->Release();
         return false;
     }
-    jobYaml.replaceString("%jobname", jobname.str());
+    jobYaml.replaceString("_HPCC_JOBNAME_", jobname.str());
 
     VStringBuffer args("\"--workunit=%s\"", wuid);
     for (const auto &p: extraParams)
     {
-        if ('%' == p.first[0]) // jobspec substituion
+        if (hasPrefix(p.first.c_str(), "_HPCC_", false)) // jobspec substituion
             jobYaml.replaceString(p.first.c_str(), p.second.c_str());
         else
-            args.append(',').newline().append("\"--").append(p.first.c_str()).append('=').append(p.second.c_str()).append("\"");
+            args.append(" \"--").append(p.first.c_str()).append('=').append(p.second.c_str()).append("\"");
     }
-    jobYaml.replaceString("%args", args.str());
+    jobYaml.replaceString("_HPCC_ARGS_", args.str());
 
 // Disable ability change resources from within workunit
 // - all values are unquoted by toYAML.  This caused problems when previous string values are
@@ -14246,24 +14271,16 @@ bool applyK8sYaml(const char *componentName, const char *wuid, const char *job, 
     }
 #endif
 
-    StringBuffer output, error;
-    unsigned ret = runExternalCommand(componentName, output, error, "kubectl replace --force -f -", jobYaml.str());
-    DBGLOG("kubectl output: %s", output.trimRight().str());
-    if (error.length())
-        DBGLOG("kubectl error: %s", error.trimRight().str());
-    if (ret)
-    {
-        DBGLOG("Using yaml %s", jobYaml.str());
-        throw makeStringException(0, "Failed to replace k8s resource");
-    }
+    runKubectlCommand(componentName, "kubectl replace --force -f -", jobYaml, nullptr);
     return true;
 }
 
 static constexpr unsigned defaultPendingTimeSecs = 600;
 void runK8sJob(const char *componentName, const char *wuid, const char *job, const std::list<std::pair<std::string, std::string>> &extraParams)
 {
-    KeepK8sJobs keepJob = translateKeepJobs(queryComponentConfig().queryProp("@keepJobs"));
-    unsigned pendingTimeoutSecs = queryComponentConfig().getPropInt("@pendingTimeoutSecs", defaultPendingTimeSecs);
+    Owned<IPropertyTree> compConfig = getComponentConfig();
+    KeepK8sJobs keepJob = translateKeepJobs(compConfig->queryProp("@keepJobs"));
+    unsigned pendingTimeoutSecs = compConfig->getPropInt("@pendingTimeoutSecs", defaultPendingTimeSecs);
 
     bool removeNetwork = applyK8sYaml(componentName, wuid, job, "networkspec", extraParams, true);
     applyK8sYaml(componentName, wuid, job, "jobspec", extraParams, false);
@@ -14281,6 +14298,50 @@ void runK8sJob(const char *componentName, const char *wuid, const char *job, con
         deleteK8sResource(componentName, job, "networkpolicy");
     if (exception)
         throw exception.getClear();
+}
+
+
+std::pair<std::string, unsigned> getExternalService(const char *serviceName)
+{
+    static CTimeLimitedCache<std::string, std::pair<std::string, unsigned>> externalServiceCache;
+    static CriticalSection externalServiceCacheCrit;
+
+    {
+        CriticalBlock b(externalServiceCacheCrit);
+        std::pair<std::string, unsigned> cachedExternalSevice;
+        if (externalServiceCache.get(serviceName, cachedExternalSevice))
+            return cachedExternalSevice;
+    }
+
+    StringBuffer output;
+    try
+    {
+        VStringBuffer getServiceCmd("kubectl get svc --selector=server=%s --output=jsonpath={.items[0].status.loadBalancer.ingress[0].hostname},{.items[0].spec.ports[0].port}", serviceName);
+        runKubectlCommand("get-external-service", getServiceCmd, nullptr, &output);
+    }
+    catch (IException *e)
+    {
+        EXCLOG(e);
+        VStringBuffer exceptionText("Failed to get external service for '%s'. Error: [%d, ", serviceName, e->errorCode());
+        e->errorMessage(exceptionText).append("]");
+        e->Release();
+        throw makeStringException(-1, exceptionText);
+    }
+    StringArray fields;
+    fields.appendList(output, ",");
+
+    // NB: add even if no result, want non-result to be cached too
+    std::string host;
+    unsigned port = 0;
+    if (fields.ordinality())
+    {
+        host = fields.item(0);
+        if (fields.ordinality()>1)
+            port = atoi(fields.item(1));
+    }
+    auto servicePair = std::make_pair(host, port);
+    externalServiceCache.add(serviceName, servicePair);
+    return servicePair;
 }
 
 #endif

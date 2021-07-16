@@ -142,7 +142,7 @@ protected:
         unsigned expectedFormatCrc = helper->getDiskFormatCrc();
         IOutputMetaData *expectedFormat = helper->queryDiskRecordSize();
 
-        Owned<ITranslator> ret = ::getTranslators("rowstream", expectedFormatCrc, expectedFormat, publishedFormatCrc, publishedFormat, projectedFormatCrc, projectedFormat, translationMode);
+        Owned<ITranslator> ret = ::getTranslators(logicalFilename, expectedFormatCrc, expectedFormat, publishedFormatCrc, publishedFormat, projectedFormatCrc, projectedFormat, translationMode);
         if (!ret)
             return nullptr;
         if (!ret->queryTranslator().canTranslate())
@@ -306,7 +306,7 @@ public:
                 StringBuffer path;
                 rfn.getPath(path); // NB: use for tracing only, IDelayedFile uses IPartDescriptor and any copy
 
-                Owned<IKeyIndex> keyIndex = createKeyIndex(path, crc, *lazyIFileIO, (unsigned) -1, false, false);
+                Owned<IKeyIndex> keyIndex = createKeyIndex(path, crc, *lazyIFileIO, (unsigned) -1, false);
                 Owned<IKeyManager> klManager = createLocalKeyManager(helper->queryDiskRecordSize()->queryRecordAccessor(true), keyIndex, nullptr, helper->hasNewSegmentMonitors(), false);
                 if (localMerge)
                 {
@@ -868,7 +868,7 @@ public:
             const CFieldOffsetSize * fields = rawMeta->queryFields();
             unsigned maxFields = rawMeta->getNumFields();
             seekGEOffset = fields[0].offset;
-            seekSizes.ensure(maxFields);
+            seekSizes.ensureCapacity(maxFields);
             seekSizes.append(fields[0].size);
             for (unsigned i=1; i < maxFields; i++)
                 seekSizes.append(seekSizes.item(i-1) + fields[i].size);

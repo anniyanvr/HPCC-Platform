@@ -15,7 +15,6 @@
     limitations under the License.
 ############################################################################## */
 
-#include "build-config.h"
 #include "jlib.hpp"
 #include "jmisc.hpp"
 #include "jdebug.hpp"
@@ -85,7 +84,6 @@ typedef IEclProcess* (* EclProcessFactory)();
 
 constexpr LogMsgCategory MCsetresult = MCprogress(100);     // Category used to inform when setting result
 constexpr LogMsgCategory MCgetresult = MCprogress(200);     // Category used to inform when getting result
-constexpr LogMsgCategory MCresolve = MCprogress(100);       // Category used to inform during name resolution
 constexpr LogMsgCategory MCrunlock = MCprogress(100);      // Category used to inform about run lock progress
 
 Owned<IPropertyTree> agentTopology;
@@ -233,6 +231,7 @@ public:
         while (running)
         {
             ISocket *client = socket->accept(true);
+            // TLS TODO: secure_accept() on hThor debug socket if globally configured for mtls ...
             if (client)
             {
                 client->set_linger(-1);
@@ -336,14 +335,11 @@ public:
     virtual void threadmain() override
     {
         StringBuffer rawText;
-        unsigned priority = (unsigned) -2;
-        unsigned memused = 0;
         IpAddress peer;
         bool continuationNeeded;
         bool isStatus;
 
         Owned<IDebuggerContext> debuggerContext;
-        unsigned slavesReplyLen = 0;
         HttpHelper httpHelper(NULL);
         try
         {
@@ -373,7 +369,6 @@ public:
             return;
         }
 
-        bool isRaw = false;
         bool isHTTP = false;
         Owned<IPropertyTree> queryXml;
         StringBuffer sanitizedText;
@@ -397,8 +392,6 @@ public:
             }
             bool isRequest = false;
             bool isRequestArray = false;
-            bool isBlind = false;
-            bool isDebug = false;
 
             sanitizeQuery(queryXml, queryName, sanitizedText, isHTTP, uid, isRequest, isRequestArray);
             DBGLOG("Received debug query %s", sanitizedText.str());
@@ -568,7 +561,7 @@ EclAgent::EclAgent(IConstWorkUnit *wu, const char *_wuid, bool _checkVersion, bo
     agentMachineCost = getMachineCostRate();
     if (agentMachineCost > 0.0)
     {
-        IPropertyTree *costs = queryCostsConfiguration();
+        Owned<const IPropertyTree> costs = getCostsConfiguration();
         if (costs)
         {
             double softCostLimit = costs->getPropReal("@limit");
@@ -627,7 +620,7 @@ const char *EclAgent::queryTempfilePath()
 
 StringBuffer & EclAgent::getTempfileBase(StringBuffer & buff)
 {
-    return buff.append(queryTempfilePath()).append(PATHSEPCHAR).append(wuid);
+    return buff.append(queryTempfilePath()).append(PATHSEPCHAR).appendLower(wuid);
 }
 
 const char *EclAgent::queryTemporaryFile(const char *fname)
@@ -919,7 +912,6 @@ UChar *EclAgent::getResultVarUnicode(const char * stepname, unsigned sequence)
     PROTECTED_GETRESULT(stepname, sequence, "VarUnicode", "unicode",
         MemoryBuffer result;
         r->getResultUnicode(MemoryBuffer2IDataVal(result));
-        unsigned tlen = result.length()/2;
         result.append((UChar)0);
         return (UChar *)result.detach();
     );
@@ -1403,7 +1395,12 @@ ILocalOrDistributedFile *EclAgent::resolveLFN(const char *fname, const char *err
     }
     if (expandedlfn)
         *expandedlfn = lfn;
-    Owned<ILocalOrDistributedFile> ldFile = createLocalOrDistributedFile(lfn.str(), queryUserDescriptor(), resolveFilesLocally, !resolveFilesLocally, isWrite, isPrivilegedUser);
+    /*
+     * NB: this code and ILocalOrDistributedFile should be revisited when DFS is refactored
+     * hthor doesn't use it to write, but instead uses createClusterWriteHandler to handle cluster writing.
+     * See code in e.g.: CHThorDiskWriteActivity::resolve
+     */
+    Owned<ILocalOrDistributedFile> ldFile = createLocalOrDistributedFile(lfn.str(), queryUserDescriptor(), resolveFilesLocally, !resolveFilesLocally, isWrite, isPrivilegedUser, nullptr);
     if (ldFile)
     {
         IDistributedFile * dFile = ldFile->queryDistributedFile();
@@ -1437,7 +1434,6 @@ ILocalOrDistributedFile *EclAgent::resolveLFN(const char *fname, const char *err
 
 bool EclAgent::fileExists(const char *name)
 {
-    unsigned __int64 size = 0;
     StringBuffer lfn;
     expandLogicalName(lfn, name);
 
@@ -1619,7 +1615,7 @@ void EclAgent::restoreCluster(IWorkUnit *wu)
 
 unsigned EclAgent::getNodes()//retrieve node count for current cluster
 {
-    if (clusterWidth == -1)
+    if (clusterWidth == (unsigned)-1)
     {
         if (!isStandAloneExe)
         {
@@ -1867,7 +1863,7 @@ void EclAgent::doProcess()
             LOG(MCrunlock, unknownJob, "Obtained workunit lock");
             if (w->hasDebugValue("traceLevel"))
                 traceLevel = w->getDebugValueInt("traceLevel", 10);
-            w->setTracingValue("EclAgentBuild", BUILD_TAG);
+            w->setTracingValue("EclAgentBuild", hpccBuildInfo.buildTag);
             if (agentTopology->hasProp("@name"))
                 w->addProcess("EclAgent", agentTopology->queryProp("@name"), GetCurrentProcessId(), 0, nullptr, false, logname.str());
 
@@ -1876,6 +1872,23 @@ void EclAgent::doProcess()
                 throw makeStringException(0, "Attempting to execute a workunit that hasn't been compiled");
             if (checkVersion && ((eclccCodeVersion > ACTIVITY_INTERFACE_VERSION) || (eclccCodeVersion < MIN_ACTIVITY_INTERFACE_VERSION)))
                 failv(0, "Workunit was compiled for eclagent interface version %d, this eclagent requires version %d..%d", eclccCodeVersion, MIN_ACTIVITY_INTERFACE_VERSION, ACTIVITY_INTERFACE_VERSION);
+            if (checkVersion && eclccCodeVersion == 652)
+            {
+                // Any workunit compiled using eclcc 7.12.0-7.12.18 is not compatible
+                StringBuffer buildVersion, eclVersion;
+                w->getBuildVersion(StringBufferAdaptor(buildVersion), StringBufferAdaptor(eclVersion));
+                const char *version = strstr(buildVersion, "7.12.");
+
+                //Avoid matching a version number in the path that was used to build (enclosed in [] at the end)
+                const char *extra = strchr(buildVersion, '[');
+                if (version && (!extra || version < extra))
+                {
+                    const char *point = version + strlen("7.12.");
+                    unsigned pointVer = atoi(point);
+                    if (pointVer <= 18)
+                        failv(0, "Workunit was compiled by eclcc version %s which is not compatible with this runtime", buildVersion.str());
+                }
+            }
             if(noRetry && (w->getState() == WUStateFailed))
                 throw MakeStringException(0, "Ecl agent started in 'no retry' mode for failed workunit, so failing");
             w->setState(WUStateRunning);
@@ -2212,10 +2225,72 @@ void EclAgentWorkflowMachine::begin()
     if(agent.queryWorkUnit()->getDebugValueBool("prelockpersists", false))
         prelockPersists();
 }
+
+IRemoteConnection *EclAgentWorkflowMachine::startPersist(const char * logicalName)
+{
+    CriticalBlock block(finishPersistCritSec);
+    IRemoteConnection * persistLock;
+    if(persistsPrelocked)
+    {
+        persistLock = persistCache.getValue(logicalName);
+        persistCache.setValue(logicalName, NULL);
+        LOG(MCrunlock, unknownJob, "Decached persist read lock for %s", logicalName);
+    }
+    else
+        persistLock = agent.startPersist(logicalName);
+    return persistLock;
+}
+
+void EclAgentWorkflowMachine::finishPersist(const char * persistName, IRemoteConnection *persistLock)
+{
+    //this protects lock list from race conditions
+    CriticalBlock block(finishPersistCritSec);
+    agent.finishPersist(persistName, persistLock);
+}
+
+void EclAgentWorkflowMachine::deleteLRUPersists(const char *logicalName, unsigned keep)
+{
+    agent.deleteLRUPersists(logicalName, keep);
+}
+
+void EclAgentWorkflowMachine::updatePersist(IRemoteConnection *persistLock, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC)
+{
+    agent.updatePersist(persistLock, logicalName, eclCRC, allCRC);
+}
+
+bool EclAgentWorkflowMachine::checkFreezePersists(const char *logicalName, unsigned eclCRC)
+{
+    bool freeze = agent.arePersistsFrozen();
+    if (freeze)
+        agent.checkPersistMatches(logicalName, eclCRC);
+    return freeze;
+}
+
+bool EclAgentWorkflowMachine::isPersistUptoDate(Owned<IRemoteConnection> &persistLock, IRuntimeWorkflowItem & item, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC, bool isFile)
+{
+    return agent.isPersistUptoDate(persistLock, item, logicalName, eclCRC, allCRC, isFile);
+}
+
+void EclAgentWorkflowMachine::checkPersistSupported()
+{
+    if (agent.isStandAloneExe)
+    {
+        throw MakeStringException(0, "PERSIST not supported when running standalone");
+    }
+}
+
+bool EclAgentWorkflowMachine::isPersistAlreadyLocked(const char * logicalName)
+{
+    //this makes sure that the lock array is up to date
+    CriticalBlock thisBlock(finishPersistCritSec);
+    return agent.alreadyLockedPersist(logicalName);
+}
+
 bool EclAgentWorkflowMachine::getParallelFlag() const
 {
     return agent.queryWorkUnit()->getDebugValueBool("parallelWorkflow", false);
 }
+
 unsigned EclAgentWorkflowMachine::getThreadNumFlag() const
 {
     return agent.queryWorkUnit()->getDebugValueInt("numWorkflowThreads", 4);
@@ -2985,7 +3060,7 @@ char * EclAgent::getGroupName()
 #ifdef _CONTAINERIZED
     // in a containerized setup, the group is moving..
     return strdup("unknown");
-#endif
+#else
     StringBuffer groupName;
     if (!isStandAloneExe)
     {
@@ -3029,6 +3104,7 @@ char * EclAgent::getGroupName()
         }
     }
     return groupName.detach();
+#endif
 }
 
 char * EclAgent::queryIndexMetaData(char const * lfn, char const * xpath)
@@ -3049,14 +3125,14 @@ char * EclAgent::queryIndexMetaData(char const * lfn, char const * xpath)
         try
         {
             OwnedIFile file = createIFile(part->getFilename(rfn, copy));
-            unsigned __int64 thissize = file->size();
-            if(thissize != -1)
+            offset_t thissize = file->size();
+            if(thissize != (offset_t)-1)
             {
                 StringBuffer remotePath;
                 rfn.getPath(remotePath);
                 unsigned crc;
                 part->getCrc(crc);
-                key.setown(createKeyIndex(remotePath.str(), crc, false, false));
+                key.setown(createKeyIndex(remotePath.str(), crc, false));
                 break;
             }
         }
@@ -3419,7 +3495,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
         }
         try
         {
-            agentTopology.setown(loadConfiguration(defaultYaml, argv, "hthor", "ECLAGENT", "agentexec.xml", nullptr));
+            agentTopology.setown(loadConfiguration(defaultYaml, argv, "hthor", "ECLAGENT", "agentexec.xml", nullptr, nullptr, false));
         }
         catch (IException *E)
         {
@@ -3428,7 +3504,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
         }
     }
     else
-        agentTopology.setown(loadConfiguration(defaultYaml, argv, "hthor", "ECLAGENT", nullptr, nullptr));
+        agentTopology.setown(loadConfiguration(defaultYaml, argv, "hthor", "ECLAGENT", nullptr, nullptr, nullptr, false));
 
     installDefaultFileHooks(agentTopology);
 
@@ -3466,7 +3542,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
     if (traceLevel)
     {
         printStart(argc, argv);
-        DBGLOG("Build %s", BUILD_TAG);
+        DBGLOG("Build %s", hpccBuildInfo.buildTag);
     }
 
     // Extract any params into stored - primarily for standalone case but handy for debugging eclagent sometimes too
@@ -3583,6 +3659,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
             startLogMsgParentReceiver();
             connectLogMsgManagerToDali();
 
+#ifndef _CONTAINERIZED
             StringBuffer baseDir;
             if (getConfigurationDirectory(agentTopology->queryPropTree("Directories"),"data","eclagent",agentTopology->queryProp("@name"),baseDir.clear()))
                 setBaseDirectory(baseDir.str(), false);
@@ -3591,6 +3668,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
 
             if (agentTopology->getPropBool("@useNASTranslation", true))
                 envInstallNASHooks();
+#endif
 
             if (standAloneWorkUnit)
             {
@@ -3621,7 +3699,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
                 }
 
                 const char * appName = argv[0];
-                for (int finger=0; argv[0][finger] != (const char)NULL; finger++)
+                for (int finger=0; argv[0][finger] != '\0'; finger++)
                 {
                     if (argv[0][finger] == PATHSEPCHAR)
                         appName = (const char *)(argv[0] + finger + 1);
@@ -3654,7 +3732,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
             wuid.set(uid);
         }
         setDefaultJobId(wuid.str());
-        LOG(MCoperatorInfo, "hthor build %s", BUILD_TAG);
+        LOG(MCoperatorInfo, "hthor build %s", hpccBuildInfo.buildTag);
 
 #ifdef MONITOR_ECLAGENT_STATUS
         if (serverstatus)
@@ -3997,7 +4075,7 @@ class DebugProbe : public InputProbe, implements IActivityDebugContext
 public:
     DebugProbe(IHThorInput *_in, IEngineRowStream *_stream, unsigned _sourceId, unsigned _sourceIdx, DebugActivityRecord *_sourceAct, unsigned _targetId, unsigned _targetIdx, DebugActivityRecord *_targetAct, unsigned _iteration, unsigned _channel, IDebuggableContext *_debugContext)
         : InputProbe(_in, _stream, _sourceId, _sourceIdx, _targetId, _targetIdx, _iteration, _channel),
-          sourceAct(_sourceAct), targetAct(_targetAct), debugContext(_debugContext)
+          debugContext(_debugContext), sourceAct(_sourceAct), targetAct(_targetAct)
     {
         historyCapacity = debugContext->getDefaultHistoryCapacity();
         nextHistorySlot = 0;

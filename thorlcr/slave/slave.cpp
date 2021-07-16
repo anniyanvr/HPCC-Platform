@@ -503,6 +503,9 @@ public:
             case TAKcombine:
                 ret = createCombineSlave(this);
                 break;
+            case TAKcombinegroup:
+                ret = createCombineGroupSlave(this);
+                break;
             case TAKregroup:
                 ret = createRegroupSlave(this);
                 break;
@@ -669,6 +672,9 @@ public:
                 break;
             case TAKsimpleaction:
                 ret = createNullSlave(this);
+                break;
+            case TAKemptyaction:
+                ret = createNullSinkSlave(this);
                 break;
             case TAKtopn:
                 if (queryGrouped())

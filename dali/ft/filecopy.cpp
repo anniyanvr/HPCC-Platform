@@ -43,6 +43,25 @@
 #include "dalienv.hpp"
 #include "ftbase.ipp"
 
+#ifdef _CONTAINERIZED
+//Temporary see HPCC-25822
+inline bool canAccessFilesDirectly(const RemoteFilename & file)
+{
+    if (file.queryEndpoint().port!=0)
+        return false;
+    const IpAddress & ip = file.queryIP();
+    if (ip.isLocal()||ip.isNull())  // the isNull check is probably an error but saves time
+        return true;                // I think usually already checked, but another can't harm
+    return false;
+}
+
+inline void setCanAccessDirectly(RemoteFilename & file)
+{
+    setCanAccessDirectly(file,canAccessFilesDirectly(file));
+}
+
+#endif
+
 #define DEFAULT_MAX_CONNECTIONS 800
 #define PARTITION_RECOVERY_LIMIT 1000
 #define EXPECTED_RESPONSE_TIME          (60 * 1000)
@@ -778,7 +797,8 @@ void FileSprayer::afterTransfer()
         }
     }
 
-    if (isSafeMode || !usePullOperation())
+    //For safe mode and push mode the temporary files need to be renamed once everything has completed.
+    if (isSafeMode || usePushOperation())
     {
         unsigned numTargets = targets.ordinality();
         AsyncAfterTransfer async(*this);
@@ -852,7 +872,7 @@ void FileSprayer::beforeTransfer()
         checker.For(targets.ordinality(), 25, true, true);
     }
 
-    if (!isRecovering && !usePullOperation())
+    if (!isRecovering && writeFromMultipleSlaves())
     {
         try {
             //Should this be on an option.  Shouldn't be too inefficient since push is seldom used.
@@ -894,8 +914,16 @@ void FileSprayer::beforeTransfer()
                     file->remove();
                 }
 
+                //unsigned firstPartition = curPartition;
                 while (partition.isItem(curPartition+1) && partition.item(curPartition+1).whichOutput == idxTarget)
                     curPartition++;
+
+                //MORE: If 1:N mapping then don't extend to the maximum length - it is a waste of time, and messes up
+                //And should generate the file header on the push machine - would always be more efficient.
+                //Possibly conditional on whether it is worth pre-extending on the target os.
+                //if (curPartition == firstPartition)
+                //    continue;
+
                 PartitionPoint & lastPartition = partition.item(curPartition);
                 offset_t lastOutputOffset = lastPartition.outputOffset + lastPartition.outputLength;
 
@@ -926,6 +954,8 @@ void FileSprayer::beforeTransfer()
     }
 
     throttleNicSpeed = options->getPropInt(ANthrottle, 0);
+#ifndef _CONTAINERIZED
+    //MORE: This is very old windows support code.  We could add support for per-plane throttling if it is required.
     if (throttleNicSpeed == 0 && !usePullOperation() && targets.ordinality() == 1 && sources.ordinality() > 1)
     {
         Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
@@ -942,6 +972,7 @@ void FileSprayer::beforeTransfer()
             }
         }
     }
+#endif
 }
 
 
@@ -1414,20 +1445,41 @@ void FileSprayer::cleanupRecovery()
 }
 
 
+bool FileSprayer::usePushWholeOperation() const
+{
+    return targets.item(0).filename.isUrl();
+}
+
+bool FileSprayer::canRenameOutput() const
+{
+    return targets.item(0).filename.queryFileSystemProperties().canRename;
+}
+
+void FileSprayer::checkSprayOptions()
+{
+    if (isSafeMode && !canRenameOutput())
+    {
+        isSafeMode = false;
+        UWARNLOG("Safe mode is disable because the target cannot be renamed");
+    }
+}
+
 //Several files being pulled to the same machine - only run ftslave once...
 void FileSprayer::commonUpSlaves()
 {
     unsigned max = partition.ordinality();
     bool pull = usePullOperation();
+    bool pushWhole = usePushWholeOperation();
+    bool slaveMatchesOutput = pull || pushWhole;      // One slave per target if a url
     for (unsigned idx = 0; idx < max; idx++)
     {
         PartitionPoint & cur = partition.item(idx);
-        cur.whichSlave = pull ? cur.whichOutput : cur.whichInput;
+        cur.whichSlave = slaveMatchesOutput ? cur.whichOutput : cur.whichInput;
         if (cur.whichSlave == -1)
             cur.whichSlave = 0;
     }
 
-    if (options->getPropBool(ANnocommon, true))
+    if (options->getPropBool(ANnocommon, true) || pushWhole)
         return;
 
     //First work out which are the same slaves, and then map the partition.
@@ -2422,6 +2474,41 @@ void FileSprayer::pullParts()
 }
 
 
+//Execute a parallel write to a remote part, but each slave writes the entire contents of the file
+void FileSprayer::pushWholeParts()
+{
+    bool needCalcCRC = calcCRC();
+    LOG(MCdebugInfoDetail, job, "Calculate CRC = %d", needCalcCRC);
+    //Create a slave for each of the target files, but execute it on the node corresponding to the first source file
+    //For container mode this will need to execute on this node, or on a load balanced service
+    ForEachItemIn(idx, targets)
+    {
+        TargetLocation & cur = targets.item(idx);
+        SocketEndpoint ep;
+        ForEachItemIn(idx3, partition)
+        {
+            PartitionPoint & cur = partition.item(idx3);
+            if (cur.whichOutput == idx)
+            {
+                ep = sources.item(cur.whichInput).filename.queryEndpoint();
+                break;
+            }
+        }
+        FileTransferThread & next = * new FileTransferThread(*this, FTactionpull, ep, needCalcCRC, wuid);
+        transferSlaves.append(next);
+    }
+
+    ForEachItemIn(idx3, partition)
+    {
+        PartitionPoint & cur = partition.item(idx3);
+        if (!filter || filter->includePart(cur.whichOutput))
+            transferSlaves.item(cur.whichSlave).addPartition(cur, progress.item(idx3));
+    }
+
+    performTransfer();
+}
+
+
 void FileSprayer::pushParts()
 {
     bool needCalcCRC = calcCRC();
@@ -2709,6 +2796,8 @@ void FileSprayer::setTarget(IDistributedFile * target)
         TargetLocation & next = * new TargetLocation(curPart->getFilename(rfn,copy));
         targets.append(next);
     }
+
+    checkSprayOptions();
 }
 
 void FileSprayer::setTarget(IFileDescriptor * target, unsigned copy)
@@ -2728,6 +2817,8 @@ void FileSprayer::setTarget(IFileDescriptor * target, unsigned copy)
         target->getFilename(idx, copy, filename);
         targets.append(*new TargetLocation(filename));
     }
+
+    checkSprayOptions();
 }
 
 void FileSprayer::updateProgress(const OutputProgress & newProgress)
@@ -2810,6 +2901,8 @@ void FileSprayer::addTarget(unsigned idx, INode * node)
     filename.setEp(node->endpoint());
 
     targets.append(* new TargetLocation(filename));
+
+    checkSprayOptions();
 }
 
 bool FileSprayer::isAborting()
@@ -2838,8 +2931,11 @@ const char * FileSprayer::querySplitPrefix()
     return NULL;
 }
 
-const char * FileSprayer::querySlaveExecutable(const IpAddress &ip, StringBuffer &ret)
+const char * FileSprayer::querySlaveExecutable(const IpAddress &ip, StringBuffer &ret) const
 {
+#ifdef _CONTAINERIZED
+    return ret.append("ftslave").str();
+#else
     const char * slave = queryFixedSlave();
     try {
         queryFtSlaveExecutable(ip, ret);
@@ -2854,10 +2950,11 @@ const char * FileSprayer::querySlaveExecutable(const IpAddress &ip, StringBuffer
     if (slave)
         ret.append(slave);
     return ret.str();
+#endif
 }
 
 
-const char * FileSprayer::queryFixedSlave()
+const char * FileSprayer::queryFixedSlave() const
 {
     return options->queryProp("@slave");
 }
@@ -2994,7 +3091,9 @@ void FileSprayer::spray()
     throwExceptionIfAborting();
 
     beforeTransfer();
-    if (usePullOperation())
+    if (usePushWholeOperation())
+        pushWholeParts();
+    else if (usePullOperation())
         pullParts();
     else
         pushParts();
@@ -3413,7 +3512,7 @@ const char * FileSprayer::getOperationTypeString() const
     return DfuOperationStr[operation];
 }
 
-bool FileSprayer::usePullOperation()
+bool FileSprayer::usePullOperation() const
 {
     if (!calcedPullPush)
     {
@@ -3423,8 +3522,12 @@ bool FileSprayer::usePullOperation()
     return cachedUsePull;
 }
 
+bool FileSprayer::usePushOperation() const
+{
+    return !usePullOperation() && !usePushWholeOperation();
+}
 
-bool FileSprayer::canLocateSlaveForNode(const IpAddress &ip)
+bool FileSprayer::canLocateSlaveForNode(const IpAddress &ip) const
 {
     try
     {
@@ -3440,7 +3543,7 @@ bool FileSprayer::canLocateSlaveForNode(const IpAddress &ip)
 }
 
 
-bool FileSprayer::calcUsePull()
+bool FileSprayer::calcUsePull() const
 {
     if (allowRecovery && progressTree->hasProp(ANpull))
     {

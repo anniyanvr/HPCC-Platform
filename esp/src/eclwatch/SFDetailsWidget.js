@@ -7,7 +7,7 @@ define([
     "dojo/dom-attr",
     "dojo/dom-class",
     "dojo/dom-form",
-    "dojo/store/Memory",
+    "src/Memory",
     "dojo/store/Observable",
     "dojo/promise/all",
 
@@ -37,7 +37,7 @@ define([
     "dijit/form/DropDownButton",
     "dijit/form/ToggleButton",
     "dijit/TitlePane"
-], function (exports, declare, nlsHPCCMod, arrayUtil, dom, domAttr, domClass, domForm, Memory, Observable, all,
+], function (exports, declare, nlsHPCCMod, arrayUtil, dom, domAttr, domClass, domForm, MemoryMod, Observable, all,
     registry,
     selector,
     _TabContainerWidget,
@@ -171,11 +171,8 @@ define([
 
         initSubfilesGrid: function () {
             var context = this;
-            var store = new Memory({
-                idProperty: "Name",
-                data: []
-            });
-            this.subfilesStore = Observable(store);
+            var store = new MemoryMod.Memory("Name");
+            this.subfilesStore = new Observable(store);
             this.subfilesGrid = new declare([ESPUtil.Grid(false, true)])({
                 columns: {
                     sel: selector({

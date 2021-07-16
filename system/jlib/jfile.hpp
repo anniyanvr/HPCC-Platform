@@ -20,6 +20,10 @@
 #ifndef JFILE_HPP
 #define JFILE_HPP
 
+#if defined (__linux__)
+#include <sys/inotify.h>
+#endif
+
 #include "jiface.hpp"
 #include "jio.hpp"
 #include "jtime.hpp"
@@ -35,6 +39,7 @@ interface IMemoryMappedFile;
 
 class MemoryBuffer;
 class Semaphore;
+struct FileSystemProperties;
 
 enum IFOmode { IFOcreate, IFOread, IFOwrite, IFOreadwrite, IFOcreaterw };    // modes for open
 enum IFSHmode { IFSHnone, IFSHread=0x8, IFSHfull=0x10};   // sharing modes
@@ -262,7 +267,7 @@ extern jlib_decl void createHardLink(const char* fileName, const char* existingF
 
 extern jlib_decl IFile * createIFile(const char * filename);
 extern jlib_decl IFile * createIFile(MemoryBuffer & buffer);
-extern jlib_decl IFileIO * createIFileIO(HANDLE handle,IFOmode=IFOreadwrite,IFEflags extraFlags=IFEnone);
+extern jlib_decl IFileIO * createIFileIO(HANDLE handle,IFOmode mode,IFEflags extraFlags=IFEnone);
 extern jlib_decl IDirectoryIterator * createDirectoryIterator(const char * path = NULL, const char * wildcard = NULL, bool sub = false, bool includedirs = true);
 extern jlib_decl IDirectoryIterator * createNullDirectoryIterator();
 extern jlib_decl IFileIO * createIORange(IFileIO * file, offset_t header, offset_t length);     // restricts input/output to a section of a file.
@@ -371,9 +376,11 @@ public:
     StringBuffer & getPath(StringBuffer & name) const;      // Either local or full depending on location 
     StringBuffer & getLocalPath(StringBuffer &name) const;  // Local Path (e.g. "c:\dfsdata\test.d00._1_of_3")
     StringBuffer & getRemotePath(StringBuffer &name) const; // Full Remote Path  (e.g. "\\192.168.0.123\c$\dfsdata\test.d00._1_of_3")
-    
+
+    const FileSystemProperties & queryFileSystemProperties() const;
     bool isLocal() const;                                   // on calling node
     bool isUnixPath() const;                                // a unix filename
+    bool isUrl() const;
     char getPathSeparator() const;                          // separator for this path
     const SocketEndpoint & queryEndpoint() const            { return ep; } // node containing file
     const IpAddress      & queryIP() const                  { return ep; }
@@ -597,7 +604,7 @@ extern jlib_decl void extractBlobElements(const char * prefix, const RemoteFilen
 extern jlib_decl bool mountDrive(const char *drv,const RemoteFilename &rfn); // linux only currently
 extern jlib_decl bool unmountDrive(const char *drv); // linux only currently
 
-extern jlib_decl IFileIO *createUniqueFile(const char *dir, const char *prefix, const char *ext, StringBuffer &tmpName);
+extern jlib_decl IFileIO *createUniqueFile(const char *dir, const char *prefix, const char *ext, StringBuffer &tmpName, IFOmode mode=IFOcreate);
 
 
 // used by remote copy
@@ -628,6 +635,9 @@ const static bool filenamesAreCaseSensitive = true;
 extern jlib_decl IDirectoryIterator *getSortedDirectoryIterator(IFile *directory, SortDirectoryMode mode = SD_byname, bool rev = false, const char *mask = nullptr, bool sub = false, bool includedirs = false);
 extern jlib_decl IDirectoryIterator *getSortedDirectoryIterator(const char *dirName, SortDirectoryMode mode = SD_byname, bool rev = false, const char *mask = nullptr, bool sub = false, bool includedirs = false);
 
+//Locally copy from the source to the target
+extern jlib_decl void copyFileSection(IFile * src, IFile * target, offset_t toOfs, offset_t fromOfs, offset_t size, ICopyFileProgress *progress, CFflags copyFlags);
+
 //--------------------------------------------------------------------------------------------------------------------
 
 class jlib_decl FileIOStats
@@ -645,5 +655,78 @@ public:
     RelaxedAtomic<__uint64> ioWrites{0};
 };
 
+//--------------------------------------------------------------------------------------------------------------------
+
+// A structure that contains information about files on a file system.  Should be extended with any useful information.
+struct FileSystemProperties
+{
+public:
+    const bool canRename;
+    const bool canSeekWrite;
+    const bool hasDirectories;
+    const bool preExtendOutput;
+    const offset_t minimumBufferSize;
+};
+
+//Return information about files on a particular filesystem.  Objects returned will always remain valid.
+extern jlib_decl const FileSystemProperties & queryFileSystemProperties(const char * filename);
+inline bool canRename(const char * filename) { return queryFileSystemProperties(filename).canRename; }
+inline bool canSeekWrite(const char * filename) { return queryFileSystemProperties(filename).canSeekWrite; }
+inline bool hasDirectories(const char * filename) { return queryFileSystemProperties(filename).hasDirectories; }
+
+
+enum class FileWatchEvents
+{
+    none          = 0,
+#ifdef __linux__
+    // mapped directly for convenience, any other impl. will need to map to FileWatchEvents values
+    acessed       = IN_ACCESS,
+    modified      = IN_MODIFY,
+    metaModified  = IN_ATTRIB,
+    closed        = IN_CLOSE_NOWRITE,
+    closedWrite   = IN_CLOSE_WRITE,
+    opened        = IN_OPEN,
+    movedFrom     = IN_MOVED_FROM,
+    movedTo       = IN_MOVED_TO,
+    created       = IN_CREATE,
+    deleted       = IN_DELETE,
+#else
+    acessed       = 0x001,
+    modified      = 0x002,
+    closed        = 0x004,
+    closedWrite   = 0x008,
+    metaModified  = 0x010,
+    opened        = 0x020,
+    movedFrom     = 0x040,
+    movedTo       = 0x080,
+    created       = 0x100,
+    deleted       = 0x200,
+#endif
+    anyChange     = created | deleted | movedTo | movedFrom | closedWrite | modified | metaModified
+};
+BITMASK_ENUM(FileWatchEvents);
+
+inline bool containsFileWatchEvents(FileWatchEvents src, FileWatchEvents find)
+{
+    return FileWatchEvents::none != (src & find);
+}
+
+
+
+interface IFileEventWatcher : extends IInterface
+{
+    virtual void start() = 0;
+    virtual void stop() = 0;
+    virtual bool add(const char *filename, FileWatchEvents event) = 0; // returns false if file already monitored
+    virtual bool remove(const char *filename) = 0;                // returns false if file not being monitored
+};
+
+typedef std::function<void (const char *, FileWatchEvents)> FileWatchFunc;
+jlib_decl IFileEventWatcher *createFileEventWatcher(FileWatchFunc callback);
+
+//---- Storage plane related functions ----------------------------------------------------
+
+extern jlib_decl IPropertyTree * getHostGroup(const char * name, bool required);
+extern jlib_decl IPropertyTree * getStoragePlane(const char * name);
 
 #endif

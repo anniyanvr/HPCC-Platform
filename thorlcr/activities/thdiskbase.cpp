@@ -68,19 +68,20 @@ void CDiskReadMasterBase::init()
             mapping.setown(getFileSlaveMaps(file->queryLogicalName(), *fileDesc, container.queryJob().queryUserDescriptor(), container.queryJob().querySlaveGroup(), local, false, hash, file->querySuperFile()));
             addReadFile(file, temp);
         }
+        IDistributedSuperFile *super = file->querySuperFile();
+        unsigned numsubs = super?super->numSubFiles(true):0;
         if (0 != (helper->getFlags() & TDRfilenamecallback)) // only get/serialize if using virtual file name fields
         {
-            IDistributedSuperFile *super = file->querySuperFile();
-            if (super)
+            for (unsigned s=0; s<numsubs; s++)
             {
-                unsigned numsubs = super->numSubFiles(true);
-                unsigned s=0;
-                for (; s<numsubs; s++)
-                {
-                    IDistributedFile &subfile = super->querySubFile(s, true);
-                    subfileLogicalFilenames.append(subfile.queryLogicalName());
-                }
+                IDistributedFile &subfile = super->querySubFile(s, true);
+                subfileLogicalFilenames.append(subfile.queryLogicalName());
             }
+        }
+        if (0==(helper->getFlags() & TDXtemporary))
+        {
+            for (unsigned i=0; i<numsubs; i++)
+                subFileStats.push_back(new CThorStatsCollection(diskReadRemoteStatistics));
         }
         void *ekey;
         size32_t ekeylen;
@@ -116,6 +117,34 @@ void CDiskReadMasterBase::serializeSlaveData(MemoryBuffer &dst, unsigned slave)
         CSlavePartMapping::serializeNullMap(dst);
 }
 
+void CDiskReadMasterBase::done()
+{
+    if (!subFileStats.empty())
+    {
+        unsigned numSubFiles = subFileStats.size();
+        for (unsigned i=0; i<numSubFiles; i++)
+        {
+            IDistributedFile *file = queryReadFile(i);
+            if (file)
+                file->addAttrValue("@numDiskReads", subFileStats[i]->getStatisticSum(StNumDiskReads));
+        }
+    }
+    else
+    {
+        IDistributedFile *file = queryReadFile(0);
+        if (file)
+            file->addAttrValue("@numDiskReads", statsCollection.getStatisticSum(StNumDiskReads));
+    }
+    CMasterActivity::done();
+}
+
+void CDiskReadMasterBase::deserializeStats(unsigned node, MemoryBuffer &mb)
+{
+    CMasterActivity::deserializeStats(node, mb);
+
+    for (auto &stats: subFileStats)
+        stats->deserialize(node, mb);
+}
 /////////////////
 
 void CWriteMasterBase::init()
@@ -156,8 +185,8 @@ void CWriteMasterBase::init()
 
         if (idx == 0)
         {
-            const char * defaultCluster = queryDefaultStoragePlane();
-            if (defaultCluster)
+            StringBuffer defaultCluster;
+            if (getDefaultStoragePlane(defaultCluster))
                 clusters.append(defaultCluster);
         }
 
@@ -224,6 +253,7 @@ void CWriteMasterBase::publish()
     }
     if (TDWrestricted & diskHelperBase->getFlags())
         props.setPropBool("restricted", true );
+    props.setPropInt64("@numDiskWrites", statsCollection.getStatisticSum(StNumDiskWrites));
     container.queryTempHandler()->registerFile(fileName, container.queryOwner().queryGraphId(), diskHelperBase->getTempUsageCount(), TDXtemporary & diskHelperBase->getFlags(), getDiskOutputKind(diskHelperBase->getFlags()), &clusters);
     if (!dlfn.isExternal())
     {
@@ -284,13 +314,10 @@ void CWriteMasterBase::publish()
                             dbgassertex(iFileIO.get());
                             iFileIO.clear();
                             // ensure copies have matching datestamps, as they would do normally (backupnode expects it)
-                            if (partDesc->numCopies() > 1)
-                            {
-                                if (0 == c)
-                                    iFile->getTime(&createTime, &modifiedTime, NULL);
-                                else
-                                    iFile->setTime(&createTime, &modifiedTime, NULL);
-                            }
+                            if (0 == c)
+                                iFile->getTime(&createTime, &modifiedTime, NULL);
+                            else
+                                iFile->setTime(&createTime, &modifiedTime, NULL);
                         }
                         catch (IException *e)
                         {
@@ -302,7 +329,14 @@ void CWriteMasterBase::publish()
                             queryJob().fireException(e2);
                         }
                     }
-                    partDesc->queryProperties().setPropInt64("@size", 0);
+                    IPropertyTree &props = partDesc->queryProperties();
+                    StringBuffer timeStr;
+                    modifiedTime.getString(timeStr);
+                    props.setProp("@modified", timeStr.str());
+                    props.setPropInt64("@recordCount", 0);
+                    props.setPropInt64("@size", 0);
+                    if (compressed)
+                        props.setPropInt64("@compressedSize", 0);
                     p++;
                 }
             }

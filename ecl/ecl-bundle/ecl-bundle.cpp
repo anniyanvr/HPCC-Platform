@@ -23,8 +23,6 @@
 
 #include "rmtfile.hpp"
 
-#include "build-config.h"
-
 #include "eclcmd.hpp"
 #include "eclcmd_common.hpp"
 #include "eclcmd_core.hpp"
@@ -750,7 +748,7 @@ public:
         const char *name = bundle->queryCleanName();
         const char *version = bundle->queryCleanVersion();
         VStringBuffer redirect("IMPORT %s.%s.%s.%s as _%s; EXPORT %s := _%s;", VERSION_SUBDIR, name, version, name, name, name, name);
-        Owned<IFileIO> rfile = redirector->open(IFOcreaterw);
+        Owned<IFileIO> rfile = redirector->open(IFOcreate);
         rfile->write(0, redirect.length(), redirect.str());
         bundle->setActive(true);
     }
@@ -1839,7 +1837,7 @@ public:
 
 static int doMain(int argc, const char *argv[])
 {
-    BundleCMDShell processor(argc, argv, createBundleSubCommand, BUILD_TAG);
+    BundleCMDShell processor(argc, argv, createBundleSubCommand, hpccBuildInfo.buildTag);
     return processor.run();
 }
 

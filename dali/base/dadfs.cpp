@@ -39,11 +39,13 @@
 #include "dadfs.hpp"
 #include "eclhelper.hpp"
 #include "seclib.hpp"
+#include "dameta.hpp"
 
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
+#include <time.h>
 
 #ifdef _DEBUG
 //#define EXTRA_LOGGING
@@ -173,6 +175,15 @@ const char *normalizeLFN(const char *s,StringBuffer &tmp)
 static IPropertyTree *getEmptyAttr()
 {
     return createPTree("Attr");
+}
+
+static double calcFileCost(const char * cluster, double sizeGB, double fileAgeDays)
+{
+    Owned<IPropertyTree> plane = getStoragePlane(cluster);
+    if (!plane)
+        return 0.0;
+    double storageCostDaily = plane->getPropReal("cost/@storageAtRest", 0.0) * 12 / 365;
+    return storageCostDaily * sizeGB * fileAgeDays;
 }
 
 RemoteFilename &constructPartFilename(IGroup *grp,unsigned partno,unsigned partmax,const char *name,const char *partmask,const char *partdir,unsigned copy,ClusterPartDiskMapSpec &mspec,RemoteFilename &rfn)
@@ -1150,11 +1161,13 @@ public:
 // === Transactions
 class CDFAction: public CInterface
 {
-    unsigned locked;
+    unsigned locked = 0;
+    unsigned timeoutCount = 0;
 protected:
-    IDistributedFileTransactionExt *transaction;
+    IDistributedFileTransactionExt *transaction = nullptr;
     IArrayOf<IDistributedFile> lockedFiles;
-    DFTransactionState state;
+    DFTransactionState state = TAS_NONE;
+    StringBuffer tracing;
     void addFileLock(IDistributedFile *file)
     {
         // derived's prepare must call this before locking
@@ -1174,7 +1187,13 @@ protected:
                 if (SDSExcpt_LockTimeout != e->errorCode())
                     throw;
                 e->Release();
-                PROGLOG("CDFAction lock timed out on %s",lockedFiles.item(i).queryLogicalName());
+                PROGLOG("CDFAction[%s] lock timed out on %s", tracing.str(), lockedFiles.item(i).queryLogicalName());
+
+                /* Can be v. useful to know what call stack is if stuck..
+                 * Trace after 30 timeouts (each timeout period ~60s)
+                 */
+                if (0 == (++timeoutCount % 30))
+                    PrintStackReport();
                 return false;
             }
             locked++;
@@ -1189,9 +1208,8 @@ protected:
         lockedFiles.kill();
     }
 public:
-    CDFAction() : locked(0), state(TAS_NONE)
+    CDFAction()
     {
-        transaction = NULL;
     }
     // Clear all locked files (when re-using transaction on auto-commit mode)
     virtual ~CDFAction()
@@ -2767,6 +2785,18 @@ public:
         DistributedFilePropertyLock lock(this);
         queryAttributes().removeTree(queryHistory());
     }
+    void lockFileAttrLock(CFileAttrLock & attrLock)
+    {
+        if (!attrLock.init(logicalName, DXB_File, RTM_LOCK_WRITE, conn, defaultTimeout, "CDistributedFile::lockFileAttrLock"))
+        {
+            // In unlikely event File/Attr doesn't exist, must ensure created, commited and root connection is reloaded.
+            verifyex(attrLock.init(logicalName, DXB_File, RTM_LOCK_WRITE|RTM_CREATE_QUERY, conn, defaultTimeout, "CDistributedFile::lockFileAttrLock"));
+            attrLock.commit();
+            conn->commit();
+            conn->reload();
+            root.setown(conn->getRoot());
+        }
+    }
 
 protected:
     class CFileChangeWriteLock
@@ -3125,6 +3155,24 @@ public:
         setAccessedTime(dt);
     }
 
+    virtual void addAttrValue(const char *attr, unsigned __int64 value) override
+    {
+        if (0==value)
+            return;
+        if (logicalName.isForeign())
+        {
+            // Note: it is not possible to update foreign attributes at the moment, so ignoring
+        }
+        else
+        {
+            CFileAttrLock attrLock;
+            if (conn)
+                lockFileAttrLock(attrLock);
+            unsigned __int64 currentVal = queryAttributes().getPropInt64(attr);
+            queryAttributes().setPropInt64(attr, currentVal+value);
+        }
+    }
+
     virtual StringBuffer &getColumnMapping(StringBuffer &mapping)
     {
         queryAttributes().getProp("@columnMapping",mapping);
@@ -3239,6 +3287,7 @@ protected:
     StringAttr directory;
     StringAttr partmask;
     FileClusterInfoArray clusters;
+    FileDescriptorFlags fileFlags = FileDescriptorFlags::none;
 
     void savePartsAttr(bool force) override
     {
@@ -3414,6 +3463,10 @@ protected:
             minSkew = (unsigned)(10000.0 * ((avgPartSz-(double)minPartSz)/avgPartSz));
         }
 
+        // +1 because published part number references are 1 based.
+        maxSkewPart++;
+        minSkewPart++;
+
         return true;
     }
 
@@ -3487,29 +3540,42 @@ public:
 #ifdef EXTRA_LOGGING
         LOGPTREE("CDistributedFile.b root.1",root);
 #endif
-        offset_t totalsize=0;
+        offset_t totalsize = 0;
+        offset_t totalCompressedSize = 0;
         unsigned checkSum = ~0;
         bool useableCheckSum = true;
         MemoryBuffer pmb;
         unsigned n = fdesc->numParts();
-        for (unsigned i=0;i<n;i++) {
+        bool compressed = isCompressed(nullptr);
+        for (unsigned i=0;i<n;i++)
+        {
             IPropertyTree *partattr = &fdesc->queryPart(i)->queryProperties();
             if (!partattr)
             {
-                totalsize = (unsigned)-1;
+                totalsize = (offset_t)-1;
+                totalCompressedSize = (offset_t)-1;
                 useableCheckSum = false;
             }
             else
             {
-                offset_t psz;
-                if (totalsize!=(offset_t)-1) {
-                    psz = (offset_t)partattr->getPropInt64("@size", -1);
+                if (totalsize!=(offset_t)-1)
+                {
+                    offset_t psz = (offset_t)partattr->getPropInt64("@size", -1);
                     if (psz==(offset_t)-1)
                         totalsize = psz;
                     else
                         totalsize += psz;
+                    if (compressed)
+                    {
+                        psz = (offset_t)partattr->getPropInt64("@compressedSize", -1);
+                        if (psz==(offset_t)-1)
+                            totalCompressedSize = psz;
+                        else
+                            totalCompressedSize += psz;
+                    }
                 }
-                if (useableCheckSum) {
+                if (useableCheckSum)
+                {
                     unsigned crc;
                     if (fdesc->queryPart(i)->getCrc(crc))
                         checkSum ^= crc;
@@ -3521,6 +3587,8 @@ public:
         shrinkFileTree(root);
         if (totalsize!=(offset_t)-1)
             queryAttributes().setPropInt64("@size", totalsize);
+        if (totalCompressedSize!=(offset_t)-1)
+            queryAttributes().setPropInt64("@compressedSize", totalCompressedSize);
         if (useableCheckSum)
             queryAttributes().setPropInt64("@checkSum", checkSum);
         setModified();
@@ -3543,6 +3611,11 @@ public:
             conn->rollback();       // changes should always be done in locked properties
         killParts();
         clusters.kill();
+    }
+
+    bool hasDirPerPart() const
+    {
+        return FileDescriptorFlags::none != (fileFlags & FileDescriptorFlags::dirperpart);
     }
 
     IFileDescriptor *getFileDescriptor(const char *_clusterName) override
@@ -3575,21 +3648,23 @@ public:
                 partmask.set(mask);
             }
         }
-        if (!save)
-            return;
-        if (directory.isEmpty())
-            root->removeProp("@directory");
-        else
-            root->setProp("@directory",directory);
-        if (partmask.isEmpty())
-            root->removeProp("@partmask");
-        else
-            root->setProp("@partmask",partmask);
-        IPropertyTree *t = &fdesc->queryProperties();
-        if (isEmptyPTree(t))
-            resetFileAttr();
-        else
-            resetFileAttr(createPTreeFromIPT(t));
+        if (save)
+        {
+            if (directory.isEmpty())
+                root->removeProp("@directory");
+            else
+                root->setProp("@directory",directory);
+            if (partmask.isEmpty())
+                root->removeProp("@partmask");
+            else
+                root->setProp("@partmask",partmask);
+            IPropertyTree *t = &fdesc->queryProperties();
+            if (isEmptyPTree(t))
+                resetFileAttr();
+            else
+                resetFileAttr(createPTreeFromIPT(t));
+        }
+        fileFlags = static_cast<FileDescriptorFlags>(root->getPropInt("Attr/@flags"));
     }
 
     void setClusters(IFileDescriptor *fdesc)
@@ -4626,17 +4701,8 @@ public:
         {
             CFileAttrLock attrLock;
             if (conn)
-            {
-                if (!attrLock.init(logicalName, DXB_File, RTM_LOCK_WRITE, conn, defaultTimeout, "CDistributedFile::setAccessedTime"))
-                {
-                    // In unlikely event File/Attr doesn't exist, must ensure created, commited and root connection is reloaded.
-                    verifyex(attrLock.init(logicalName, DXB_File, RTM_LOCK_WRITE|RTM_CREATE_QUERY, conn, defaultTimeout, "CDistributedFile::setAccessedTime"));
-                    attrLock.commit();
-                    conn->commit();
-                    conn->reload();
-                    root.setown(conn->getRoot());
-                }
-            }
+                lockFileAttrLock(attrLock);
+
             if (dt.isNull())
                 queryAttributes().removeProp("@accessed");
             else
@@ -4677,6 +4743,27 @@ public:
             return calculateSkew(maxSkew, minSkew, maxSkewPart, minSkewPart);
         else
             return false;
+    }
+    virtual double getCost(const char * cluster) override
+    {
+        CDateTime dt;
+        getModificationTime(dt);
+        double fileAgeDays = difftime(time(nullptr), dt.getSimple())/(24*60*60);
+        double sizeGB = getDiskSize(true, false) / ((double)1024 * 1024 * 1024);
+
+        if (isEmptyString(cluster))
+        {
+            StringArray clusterNames;
+            unsigned countClusters = getClusterNames(clusterNames);
+            double totalCost = 0.0;
+            for (unsigned i = 0; i < countClusters; i++)
+                totalCost += calcFileCost(clusterNames[i], sizeGB, fileAgeDays);
+            return totalCost;
+        }
+        else
+        {
+            return calcFileCost(cluster, sizeGB, fileAgeDays);
+        }
     }
 };
 
@@ -4719,6 +4806,7 @@ class CDistributedSuperFile: public CDistributedFileBase<IDistributedSuperFile>
         cAddSubFileAction(const char *_parentlname,const char *_subfile,bool _before,const char *_other)
             : parentlname(_parentlname), subfile(_subfile), before(_before), other(_other)
         {
+            tracing.appendf("AddSubFile: %s, to super: %s", _subfile, _parentlname);
         }
         virtual bool prepare()
         {
@@ -4794,6 +4882,7 @@ class CDistributedSuperFile: public CDistributedFileBase<IDistributedSuperFile>
         cRemoveSubFileAction(const char *_parentlname,const char *_subfile,bool _remsub=false)
             : parentlname(_parentlname), subfile(_subfile), remsub(_remsub)
         {
+            tracing.appendf("RemoveSubFile: %s, from super: %s", _subfile, _parentlname);
         }
         virtual bool prepare()
         {
@@ -4885,6 +4974,7 @@ class CDistributedSuperFile: public CDistributedFileBase<IDistributedSuperFile>
         cRemoveOwnedSubFilesAction(IDistributedFileTransaction *_transaction, const char *_parentlname,bool _remsub=false)
             : parentlname(_parentlname), remsub(_remsub)
         {
+            tracing.appendf("RemoveOwnedSubFiles: super: %s", _parentlname);
         }
         virtual bool prepare()
         {
@@ -4967,6 +5057,7 @@ class CDistributedSuperFile: public CDistributedFileBase<IDistributedSuperFile>
         cSwapFileAction(const char *_super1Name, const char *_super2Name)
             : super1Name(_super1Name), super2Name(_super2Name)
         {
+            tracing.appendf("SwapFile: super1: %s, super2: %s", _super1Name, _super2Name);
         }
         virtual bool prepare()
         {
@@ -5073,6 +5164,8 @@ protected:
             {
                 CDfsLogicalFileName subfn;
                 subfn.set(name);
+                if (subfn.isForeign() || subfn.isExternal())
+                    continue; // can't be owned by a super in this environment, no locking
                 CFileLock fconnlockSub;
                 // JCSMORE - this is really not right, but consistent with previous version
                 // MORE: Use CDistributedSuperFile::linkSuperOwner(false) - ie. unlink
@@ -6621,6 +6714,18 @@ public:
     {
         return false;
     }
+
+    virtual double getCost(const char * cluster) override
+    {
+        double totalCost = 0.0;
+        CriticalBlock block (sect);
+        ForEachItemIn(i,subfiles)
+        {
+            IDistributedFile &f = subfiles.item(i);
+            totalCost += f.getCost(cluster);
+        }
+        return totalCost;
+    }
 };
 
 // --------------------------------------------------------
@@ -6790,6 +6895,8 @@ StringBuffer &CDistributedFilePart::getPartDirectory(StringBuffer &ret,unsigned 
         parent.adjustClusterDir(partIndex,copy,dir);
         ret.append(dir);
     }
+    if (parent.hasDirPerPart())
+        addPathSepChar(ret).append(partIndex+1); // part subdir 1 based
     return ret;
 }
 
@@ -7946,6 +8053,7 @@ public:
                            bool _interleaved)
         : parent(_parent), user(_user), created(false), interleaved(_interleaved)
     {
+        tracing.appendf("CreateSuperFile: super: %s", _flname);
         logicalname.set(_flname);
     }
     IDistributedSuperFile *getSuper()
@@ -8079,6 +8187,7 @@ public:
                            bool _delSub)
         : user(_user), delSub(_delSub)
     {
+        tracing.appendf("RemoveSuperFile: super: %s", _flname);
         logicalname.set(_flname);
     }
     virtual bool prepare()
@@ -8150,6 +8259,7 @@ public:
                       const char *_newname)
         : user(_user), parent(_parent)
     {
+        tracing.appendf("RenameFile: name: %s, newname: %s", _flname, _newname);
         fromName.set(_flname);
         // Basic consistency checking
         toName.set(_newname);
@@ -10025,10 +10135,9 @@ public:
         return createClusterGroup(grp_unknown, hosts, path, nullptr, false, false);
     }
 
-    void ensureStorageGroup(bool force, const char * name, unsigned numDevices, const char * path, StringBuffer & messages)
+    void ensureConsistentStorageGroup(bool force, const char * name, IPropertyTree * newClusterGroup, StringBuffer & messages)
     {
         IPropertyTree *existingClusterGroup = queryExistingGroup(name);
-        Owned<IPropertyTree> newClusterGroup = createStorageGroup(name, numDevices, path);
         bool matchExisting = clusterGroupCompare(newClusterGroup, existingClusterGroup);
         if (!existingClusterGroup || !matchExisting)
         {
@@ -10037,30 +10146,37 @@ public:
                 VStringBuffer msg("New cluster layout for cluster %s", name);
                 UWARNLOG("%s", msg.str());
                 messages.append(msg).newline();
-                addClusterGroup(name, newClusterGroup.getClear(), false);
+                addClusterGroup(name, LINK(newClusterGroup), false);
             }
             else if (force)
             {
                 VStringBuffer msg("Forcing new group layout for storageplane %s", name);
                 UWARNLOG("%s", msg.str());
                 messages.append(msg).newline();
-                addClusterGroup(name, newClusterGroup.getClear(), false);
+                addClusterGroup(name, LINK(newClusterGroup), false);
             }
             else
             {
-                VStringBuffer msg("Active cluster '%s' group layout does not match stroageplane definition", name);
+                VStringBuffer msg("Active cluster '%s' group layout does not match storageplane definition", name);
                 UWARNLOG("%s", msg.str());                                                                        \
                 messages.append(msg).newline();
             }
         }
     }
 
+    void ensureStorageGroup(bool force, const char * name, unsigned numDevices, const char * path, StringBuffer & messages)
+    {
+        Owned<IPropertyTree> newClusterGroup = createStorageGroup(name, numDevices, path);
+        ensureConsistentStorageGroup(force, name, newClusterGroup, messages);
+    }
+
     void constructStorageGroups(bool force, StringBuffer &messages)
     {
-        IPropertyTree & global = queryGlobalConfig();
-        IPropertyTree * storage = global.queryPropTree("storage");
+        Owned<IPropertyTree> storage = getGlobalConfigSP()->getPropTree("storage");
         if (storage)
         {
+            normalizeHostGroups();
+
             Owned<IPropertyTreeIterator> planes = storage->getElements("planes");
             ForEach(*planes)
             {
@@ -10069,25 +10185,45 @@ public:
                 if (isEmptyString(name))
                     continue;
 
-                //Lower case the group name - see CnamedGroupStore::dolookup which lower cases before resolving.
+                //Lower case the group name - see CNamedGroupStore::dolookup which lower cases before resolving.
                 StringBuffer gname;
                 gname.append(name).toLowerCase();
 
                 //Two main type of storage plane - with a host group (bare metal) and without.
-                IPropertyTree *existingGroup = queryExistingGroup(gname);
-                const char * hosts = plane.queryProp("@hosts");
+                const char * hostGroup = plane.queryProp("@hostGroup");
                 const char * prefix = plane.queryProp("@prefix");
-                if (hosts)
+                Owned<IPropertyTree> newClusterGroup;
+                if (hostGroup)
                 {
-                    IPropertyTree *existingClusterGroup = queryExistingGroup(gname);
-                    if (!existingClusterGroup)
-                        UNIMPLEMENTED_X("Bare metal storage planes not yet supported");
+                    Owned<IPropertyTree> match = getHostGroup(hostGroup, true);
+                    std::vector<std::string> hosts;
+                    Owned<IPropertyTreeIterator> hostIter = match->getElements("hosts");
+                    ForEach (*hostIter)
+                        hosts.push_back(hostIter->query().queryProp(nullptr));
+
+                    //A bare-metal storage plane defined in terms of a hostGroup
+                    newClusterGroup.setown(createClusterGroup(grp_unknown, hosts, prefix, nullptr, false, false));
+                }
+                else if (plane.hasProp("hostGroup"))
+                {
+                    throw makeStringExceptionV(-1, "Use 'hosts' rather than 'hostGroup' for inline list of hosts for plane %s", name);
+                }
+                else if (plane.hasProp("hosts"))
+                {
+                    //A bare-metal storage plane defined by an explicit list of ips (useful for landing zones)
+                    std::vector<std::string> hosts;
+                    Owned<IPropertyTreeIterator> iter = plane.getElements("hosts");
+                    ForEach(*iter)
+                        hosts.push_back(iter->query().queryProp(nullptr));
+                    newClusterGroup.setown(createClusterGroup(grp_unknown, hosts, prefix, nullptr, false, false));
                 }
                 else
                 {
+                    //Locally mounted, or url accessed storage plane - no associated hosts, localhost used as a placeholder
                     unsigned numDevices = plane.getPropInt("@numDevices", 1);
-                    ensureStorageGroup(force, gname, numDevices, prefix, messages);
+                    newClusterGroup.setown(createStorageGroup(name, numDevices, prefix));
                 }
+                ensureConsistentStorageGroup(force, name, newClusterGroup, messages);
             }
         }
     }

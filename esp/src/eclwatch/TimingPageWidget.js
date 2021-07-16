@@ -1,6 +1,7 @@
 define([
     "dojo/_base/declare",
     "src/nlsHPCC",
+    "src/Memory",
     "dojo/store/Observable",
 
     "dijit/registry",
@@ -20,6 +21,7 @@ define([
     "dijit/layout/ContentPane",
     "dijit/Toolbar",
     "dijit/ToolbarSeparator",
+    "dijit/form/Form",
     "dijit/form/Button",
     "dijit/form/ToggleButton",
     "dijit/form/Select",
@@ -27,7 +29,7 @@ define([
     "dijit/form/DropDownButton",
     "dijit/TooltipDialog"
 
-], function (declare, nlsHPCCMod, Observable,
+], function (declare, nlsHPCCMod, MemoryMod, Observable,
     registry,
     _TabContainerWidget, ESPWorkunit, DelayLoadWidget, ESPUtil, srcTimings,
     hpccComms,
@@ -117,13 +119,11 @@ define([
                 context.refreshGrid();
             };
 
-            var store = new ESPUtil.UndefinedMemory({
-                idProperty: "__hpcc_id",
-                data: []
-            });
-            this.store = Observable(store);
+            var store = new MemoryMod.AlphaNumSortMemory("__hpcc_id", { Scope: true });
+            this.store = new Observable(store);
             this.grid = new declare([ESPUtil.Grid(false, true)])({
-                store: this.store
+                store: this.store,
+                sort: "__hpcc_id"
             }, this.id + "Grid");
             this.grid.on(".dgrid-row-url:click", function (evt) {
                 var row = context.grid.row(evt).data;

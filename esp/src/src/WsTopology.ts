@@ -1,22 +1,37 @@
 import { Connection } from "@hpcc-js/comms";
 import * as arrayUtil from "dojo/_base/array";
-import * as declare from "dojo/_base/declare";
 import * as Deferred from "dojo/_base/Deferred";
 import * as lang from "dojo/_base/lang";
-import * as Evented from "dojo/Evented";
-import * as Memory from "dojo/store/Memory";
 import * as Observable from "dojo/store/Observable";
 import * as QueryResults from "dojo/store/util/QueryResults";
+import * as on from "dojo/on";
+import * as aspect from "dojo/aspect";
 
 import * as ESPRequest from "./ESPRequest";
 import * as Utility from "./Utility";
+import { Memory } from "src/Memory";
 
 declare const dojoConfig;
 
-const TpLogFileStore = declare([Memory, Evented], {
+class TpLogFileStore extends Memory {
+
     constructor() {
-        this.idProperty = "__hpcc_id";
-    },
+        super("__hpcc_id");
+    }
+
+    //  Evented  ---
+    on(type, listener) {
+        return on.parse(this, type, listener, function (target, type) {
+            return aspect.after(target, "on" + type, listener, true);
+        });
+    }
+
+    emit(type, event?) {
+        const args = [this];
+        args.push.apply(args, arguments);
+        return on.emit.apply(on, args);
+    }
+    //  --- --- ---
 
     query(query, options) {
         const deferredResults = new Deferred();
@@ -66,8 +81,8 @@ const TpLogFileStore = declare([Memory, Evented], {
                                 }
 
                                 tempObj[cleanName] = value;
-                                data.push(tempObj);
                             }
+                            data.push(tempObj);
                         }
                     }, this);
                 }
@@ -88,7 +103,7 @@ const TpLogFileStore = declare([Memory, Evented], {
 
         return QueryResults(deferredResults);
     }
-});
+}
 
 export function TpServiceQuery(params) {
     lang.mixin(params.request, {
@@ -166,7 +181,14 @@ export function TpTargetClusterQuery(params) {
 export function TpGroupQuery(params) {
     return ESPRequest.send("WsTopology", "TpGroupQuery", params);
 }
-export function TpLogicalClusterQuery(params?) {
+
+export enum RoxieQueueFilter {
+    All = "All",
+    QueriesOnly = "QueriesOnly",
+    WorkunitsOnly = "WorkunitsOnly"
+}
+
+export function TpLogicalClusterQuery(params?: { EclServerQueue?: string, RoxieQueueFilter?: RoxieQueueFilter }) {
     return ESPRequest.send("WsTopology", "TpLogicalClusterQuery", params).then(function (response) {
         let best = null;
         let hthor = null;
@@ -214,7 +236,7 @@ export function TpLogFile(params) {
 }
 export function CreateTpLogFileStore() {
     const store = new TpLogFileStore();
-    return Observable(store);
+    return new Observable(store);
 }
 export function TpGetServerVersion() {
     const connection = new Connection({ baseUrl: "/esp", type: "get" });

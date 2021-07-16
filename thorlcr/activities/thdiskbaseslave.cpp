@@ -71,7 +71,6 @@ CDiskPartHandlerBase::CDiskPartHandlerBase(CDiskReadSlaveActivityBase &_activity
     eoi = false;
     kindStr = activityKindStr(activity.queryContainer().getKind());
     compressed = blockCompressed = firstInGroup = checkFileCrc = false;
-
 }
 
 void CDiskPartHandlerBase::setPart(IPartDescriptor *_partDesc)
@@ -235,13 +234,36 @@ void CDiskReadSlaveActivityBase::init(MemoryBuffer &data, MemoryBuffer &slaveDat
     {
         deserializePartFileDescriptors(data, partDescs);
 
-        // put temp files in individual slave temp dirs (incl port)
-        if ((helper->getFlags() & TDXtemporary) && (!container.queryJob().queryUseCheckpoints()))
-            partDescs.item(0).queryOwner().setDefaultDir(queryTempDir());
+        if (helper->getFlags() & TDXtemporary)
+        {
+            // put temp files in individual slave temp dirs (incl port)
+            if (!container.queryJob().queryUseCheckpoints())
+                partDescs.item(0).queryOwner().setDefaultDir(queryTempDir());
+        }
+        else
+        {
+            ISuperFileDescriptor *super = partDescs.item(0).queryOwner().querySuperFileDescriptor();
+            if (super)
+            {
+                unsigned numSubFiles = super->querySubFiles();
+                for (unsigned i=0; i<numSubFiles; i++)
+                    subFileStats.push_back(new CRuntimeStatisticCollection(diskReadRemoteStatistics));
+            }
+        }
     }
     gotMeta = false; // if variable filename and inside loop, need to invalidate cached meta
 }
-
+void CDiskReadSlaveActivityBase::mergeSubFileStats(IPartDescriptor *partDesc, IExtRowStream *partStream)
+{
+    if (subFileStats.size()>0)
+    {
+        ISuperFileDescriptor * superFDesc = partDesc->queryOwner().querySuperFileDescriptor();
+        dbgassertex(superFDesc);
+        unsigned subfile, lnum;
+        if(superFDesc->mapSubPart(partDesc->queryPartIndex(), subfile, lnum))
+            mergeStats(*subFileStats[subfile], partStream);
+    }
+}
 const char *CDiskReadSlaveActivityBase::queryLogicalFilename(unsigned index)
 {
     return subfileLogicalFilenames.item(index);
@@ -300,6 +322,8 @@ void CDiskReadSlaveActivityBase::serializeStats(MemoryBuffer &mb)
     }
     stats.setStatistic(StNumDiskRowsRead, diskProgress);
     PARENT::serializeStats(mb);
+    for (auto &stats: subFileStats)
+        stats->serialize(mb);
 }
 
 
@@ -414,32 +438,40 @@ void CDiskWriteSlaveActivityBase::close()
 {
     try
     {
-        if (out) {
-            uncompressedBytesWritten = out->getPosition();
-            if (calcFileCrc) {
-                if (diskHelperBase->getFlags() & TDWextend) {
-                    assertex(!"TBD need to merge CRC");
-                }   
-                else
-                    out->flush(&fileCRC);
-            }
-            else if (!abortSoon)
-                out->flush();
-            out.clear();
-        }
-        else if (outraw) {
-            outraw->flush();
-            uncompressedBytesWritten = outraw->tell();
-            outraw.clear();
-        }
-
-        Owned<IFileIO> tmpFileIO;
+        if (outputIO)
         {
-            CriticalBlock block(outputCs);
-            // ensure it is released/destroyed after releasing crit, since the IFileIO might involve a final copy and take considerable time.
-            tmpFileIO.setown(outputIO.getClear());
+            if (out)
+            {
+                uncompressedBytesWritten = out->getPosition();
+                if (calcFileCrc)
+                {
+                    if (diskHelperBase->getFlags() & TDWextend)
+                    {
+                        assertex(!"TBD need to merge CRC");
+                    }
+                    else
+                        out->flush(&fileCRC);
+                }
+                else if (!abortSoon)
+                    out->flush();
+                out.clear();
+            }
+            else if (outraw)
+            {
+                outraw->flush();
+                uncompressedBytesWritten = outraw->tell();
+                outraw.clear();
+            }
+
+            Owned<IFileIO> tmpFileIO;
+            {
+                CriticalBlock block(outputCs);
+                // ensure it is released/destroyed after releasing crit, since the IFileIO might involve a final copy and take considerable time.
+                tmpFileIO.setown(outputIO.getClear());
+            }
+            mergeStats(stats, tmpFileIO, diskWriteRemoteStatistics);
+            tmpFileIO->close(); // NB: close now, do not rely on close in dtor
         }
-        mergeStats(stats, tmpFileIO, diskWriteRemoteStatistics);
 
         if (!rfsQueryParallel && dlfn.isExternal() && !lastNode())
         {

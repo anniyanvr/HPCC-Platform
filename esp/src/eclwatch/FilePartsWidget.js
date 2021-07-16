@@ -1,7 +1,7 @@
 define([
     "dojo/_base/declare",
     "src/nlsHPCC",
-    "dojo/store/Memory",
+    "src/Memory",
     "dojo/store/Observable",
 
     "dgrid/OnDemandGrid",
@@ -11,16 +11,22 @@ define([
 
     "hpcc/_Widget",
 
+    "@hpcc-js/common",
+
     "dojo/text!../templates/FilePartsWidget.html",
 
     "dijit/layout/ContentPane"
 ],
-    function (declare, nlsHPCCMod, Memory, Observable,
+    function (declare, nlsHPCCMod, MemoryMod, Observable,
         OnDemandGrid, Keyboard, ColumnResizer, DijitRegistry,
         _Widget,
+        hpccCommon,
         template) {
 
+        var formatNum = hpccCommon.format(",");
+
         var nlsHPCC = nlsHPCCMod.default;
+
         return declare("FilePartsWidget", [_Widget], {
             templateString: template,
             baseClass: "FilePartsWidget",
@@ -41,11 +47,8 @@ define([
 
             startup: function (args) {
                 this.inherited(arguments);
-                var store = new Memory({
-                    idProperty: "__hpcc_id",
-                    data: []
-                });
-                this.filePartsStore = Observable(store);
+                var store = new MemoryMod.Memory("__hpcc_id");
+                this.filePartsStore = new Observable(store);
 
                 this.filePartsGrid = new declare([OnDemandGrid, Keyboard, ColumnResizer, DijitRegistry])({
                     allowSelectAll: true,
@@ -54,14 +57,18 @@ define([
                         Copy: { label: this.i18n.Copy, width: 40 },
                         Ip: { label: this.i18n.IP },
                         Cluster: { label: this.i18n.Cluster, width: 108 },
-                        PartsizeInt64: {
-                            label: this.i18n.Size,
-                            width: 120,
-                            formatter: function (intsize, row) {
-                                return row.Partsize;
+                        PartSizeInt64: {
+                            label: this.i18n.Size, width: 120,
+                            formatter: function (intsize) {
+                                return formatNum(intsize);
                             }
                         },
-                        ActualSize: { label: this.i18n.ActualSize, width: 120 }
+                        CompressedSize: {
+                            label: this.i18n.CompressedSize, width: 120,
+                            formatter: function (intsize) {
+                                return formatNum(intsize);
+                            }
+                        }
                     },
                     store: this.filePartsStore
                 }, this.id + "FilePartsGrid");

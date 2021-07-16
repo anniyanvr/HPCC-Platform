@@ -13,6 +13,9 @@
 #include "wujobq.hpp"
 #include "environment.hpp"
 
+#ifndef _CONTAINERIZED
+//not currently created or used in the containerized version
+
 //#define TESTING
 
 #define DEFAULT_QMONITOR_INTERVAL       1  // minutes
@@ -179,8 +182,14 @@ public:
                 srcq.copyItems(qc);
                 Owned<IJobQueueIterator> iter = qc.getIterator();
                 ForEach(*iter) {
-                    const char *wuid = iter->query().queryWUID();
-                    if (wuid&&*wuid) {
+                    const char *wuidGraph = iter->query().queryWUID();
+                    if (!isEmptyString(wuidGraph)) {
+                        const char *sep = strchr(wuidGraph, '/');
+                        StringAttr wuid;
+                        if (sep)
+                            wuid.set(wuidGraph, sep-wuidGraph);
+                        else
+                            wuid.set(wuidGraph);
                         Owned<IConstWorkUnit> wu = factory->openWorkUnit(wuid);
                         if (wu) {
                             SCMStringBuffer allowedClusters;
@@ -288,5 +297,4 @@ ISashaServer *createSashaQMonitorServer()
     return sashaQMonitorServer;
 }
 
-
-
+#endif // !_CONTAINERIZED

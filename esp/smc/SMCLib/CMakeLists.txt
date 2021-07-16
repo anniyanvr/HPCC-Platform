@@ -28,12 +28,20 @@ include(${HPCC_SOURCE_DIR}/esp/scm/smcscm.cmake)
 
 set (    SRCS
          ${HPCC_SOURCE_DIR}/dali/sasha/sacmd.cpp
-         ${ESPSCM_GENERATED_DIR}/ws_topology_esp.cpp 
+         ${ESPSCM_GENERATED_DIR}/ws_topology_esp.cpp
+         ${ESPSCM_GENERATED_DIR}/ws_resources_esp.cpp
          LogicFileWrapper.cpp 
-         TpWrapper.cpp 
+         TpCommon.cpp
          WUXMLInfo.cpp
          InfoCacheReader.cpp
     )
+
+if (CONTAINERIZED)
+    set (SRCS  ${SRCS}  TpContainer.cpp)
+else ()
+    set (SRCS  ${SRCS}  TpWrapper.cpp)
+endif()
+
 
 include_directories ( 
          ./../../../system/mp 
@@ -71,7 +79,6 @@ target_link_libraries ( SMCLib
          xmllib 
          esphttp 
          dalibase 
-         environment 
          dalift 
          dllserver 
          nbcd 
@@ -79,3 +86,7 @@ target_link_libraries ( SMCLib
          deftype 
          workunit 
     )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( SMCLib environment )
+endif()

@@ -56,7 +56,7 @@ public:
         defaultXmlReadFlags = ctx.ctxGetPropBool("@defaultStripLeadingWhitespace", true) ? ptr_ignoreWhiteSpace : ptr_none;
         trapTooManyActiveQueries = ctx.ctxGetPropBool("@trapTooManyActiveQueries", true);
         numRequestArrayThreads = ctx.ctxGetPropInt("@requestArrayThreads", 5);
-        maxHttpConnectionRequests = ctx.ctxGetPropInt("@maxHttpConnectionRequests", 10);
+        maxHttpConnectionRequests = ctx.ctxGetPropInt("@maxHttpConnectionRequests", 0);
         maxHttpKeepAliveWait = ctx.ctxGetPropInt("@maxHttpKeepAliveWait", 5000); // In milliseconds
     }
     IHpccProtocolListener *createListener(const char *protocol, IHpccProtocolMsgSink *sink, unsigned port, unsigned listenQueue, const char *config, const char *certFile=nullptr, const char *keyFile=nullptr, const char *passPhrase=nullptr)
@@ -69,7 +69,7 @@ public:
     PTreeReaderOptions defaultXmlReadFlags;
     unsigned maxBlockSize;
     unsigned numRequestArrayThreads;
-    unsigned maxHttpConnectionRequests = 10;
+    unsigned maxHttpConnectionRequests = 0;
     unsigned maxHttpKeepAliveWait = 5000;
     bool trapTooManyActiveQueries;
 };
@@ -314,9 +314,9 @@ public:
                         if (!secureContext)
                             secureContext.setown(createSecureSocketContextEx(certFile.get(), keyFile.get(), passPhrase.get(), ServerSocket));
                         ssock.setown(secureContext->createSecureSocket(client.getClear()));
-                        int loglevel = 0;
+                        int loglevel = SSLogMin;
                         if (traceLevel > 1)
-                            loglevel = traceLevel;
+                            loglevel = SSLogMax;
                         int status = ssock->secure_accept(loglevel);
                         if (status < 0)
                         {
@@ -1368,14 +1368,17 @@ private:
     PTreeReaderOptions xmlReadFlags;
     unsigned &memused;
     unsigned &agentReplyLen;
+    unsigned &agentDuplicates;
+    unsigned &agentResends;
     CriticalSection crit;
     unsigned flags;
 
 public:
     CHttpRequestAsyncFor(const char *_queryName, IHpccProtocolMsgSink *_sink, IHpccProtocolMsgContext *_msgctx, IArrayOf<IPropertyTree> &_requestArray,
-            SafeSocket &_client, HttpHelper &_httpHelper, unsigned _flags, unsigned &_memused, unsigned &_agentReplyLen, const char *_queryText, const IContextLogger &_logctx, PTreeReaderOptions _xmlReadFlags, const char *_querySetName)
+            SafeSocket &_client, HttpHelper &_httpHelper, unsigned _flags, unsigned &_memused, unsigned &_agentReplyLen, unsigned &_agentDuplicates, unsigned &_agentResends,
+            const char *_queryText, const IContextLogger &_logctx, PTreeReaderOptions _xmlReadFlags, const char *_querySetName)
     : querySetName(_querySetName), logctx(_logctx), requestArray(_requestArray), sink(_sink), msgctx(_msgctx), client(_client), httpHelper(_httpHelper), xmlReadFlags(_xmlReadFlags)
-      , memused(_memused), agentReplyLen(_agentReplyLen), flags(_flags)
+      , memused(_memused), agentReplyLen(_agentReplyLen), agentDuplicates(_agentDuplicates), agentResends(_agentResends), flags(_flags)
     {
         queryName = _queryName;
         queryText = _queryText;
@@ -1398,7 +1401,8 @@ public:
         {
             IPropertyTree &request = requestArray.item(idx);
             Owned<IHpccProtocolResponse> protocol = createProtocolResponse(request.queryName(), &client, httpHelper, logctx, flags, xmlReadFlags);
-            sink->onQueryMsg(msgctx, &request, protocol, flags, xmlReadFlags, querySetName, idx, memused, agentReplyLen);
+            // MORE - agentReply etc should really be atomic
+            sink->onQueryMsg(msgctx, &request, protocol, flags, xmlReadFlags, querySetName, idx, memused, agentReplyLen, agentDuplicates, agentResends);
         }
         catch (IException * E)
         {
@@ -1728,15 +1732,17 @@ private:
         unsigned memused = 0;
         IpAddress peer;
         bool continuationNeeded = false;
+        bool resetQstart = false;
         bool isStatus = false;
         unsigned remainingHttpConnectionRequests = global->maxHttpConnectionRequests ? global->maxHttpConnectionRequests : 1;
         unsigned readWait = WAIT_FOREVER;
 
         Owned<IHpccProtocolMsgContext> msgctx = sink->createMsgContext(startTime);
-        IContextLogger &logctx = *msgctx->queryLogContext();
 
 readAnother:
         unsigned agentsReplyLen = 0;
+        unsigned agentsDuplicates = 0;
+        unsigned agentsResends = 0;
         StringArray allTargets;
         sink->getTargetNames(allTargets);
         HttpHelper httpHelper(&allTargets);
@@ -1756,15 +1762,32 @@ readAnother:
                     return;
                 }
             }
-            if (continuationNeeded)
+            if (resetQstart)
             {
+                resetQstart = false;
                 qstart = msTick();
                 time(&startTime);
+                msgctx.setown(sink->createMsgContext(startTime));
             }
         }
         catch (IException * E)
         {
-            if (traceLevel > 0)
+            bool expectedError = false;
+            if (resetQstart) //persistent connection - initial request has already been processed
+            {
+                switch (E->errorCode())
+                {
+                    //closing of persistent socket is not an error
+                    case JSOCKERR_not_opened:
+                    case JSOCKERR_broken_pipe:
+                    case JSOCKERR_timeout_expired:
+                    case JSOCKERR_graceful_close:
+                        expectedError = true;
+                    default:
+                        break;
+                }
+            }
+            if (traceLevel > 0 && !expectedError)
             {
                 StringBuffer b;
                 IERRLOG("Error reading query from socket: %s", E->errorMessage(b).str());
@@ -1774,6 +1797,7 @@ readAnother:
             return;
         }
 
+        IContextLogger &logctx = *msgctx->queryLogContext();
         bool isHTTP = httpHelper.isHttp();
         if (isHTTP)
         {
@@ -1811,6 +1835,7 @@ readAnother:
         bool isBlind = false;
         bool isDebug = false;
         unsigned protocolFlags = isHTTP ? 0 : HPCC_PROTOCOL_NATIVE;
+        unsigned requestArraySize = 0; //for logging, considering all the ways requests can be counted this name seems least confusing
 
         Owned<IPropertyTree> queryPT;
         StringBuffer sanitizedText;
@@ -1860,7 +1885,7 @@ readAnother:
                 Owned<IHpccProtocolResponse> protocol = createProtocolResponse(queryPT->queryName(), client, httpHelper, logctx, protocolFlags | HPCC_PROTOCOL_CONTROL, global->defaultXmlReadFlags);
                 sink->onControlMsg(msgctx, queryPT, protocol);
                 protocol->finalize(0);
-                if (streq(queryName, "lock") || streq(queryName, "childlock"))
+                if (streq(queryName, "lock") || streq(queryName, "childlock")) //don't reset qstart, lock time should be included
                     goto readAnother;
             }
             else if (isStatus)
@@ -1974,6 +1999,7 @@ readAnother:
                                         fixedreq->addPropTree(iter->query().queryName(), LINK(&iter->query()));
                                     }
                                     requestArray.append(*fixedreq);
+                                    requestArraySize++;
                                 }
                             }
                             else
@@ -1985,6 +2011,7 @@ readAnother:
                                     fixedreq->addPropTree(iter->query().queryName(), LINK(&iter->query()));
                                 }
                                 requestArray.append(*fixedreq);
+                                requestArraySize = 1;
 
                                 msgctx->setIntercept(queryPT->getPropBool("@log", false));
                                 msgctx->setTraceLevel(queryPT->getPropInt("@traceLevel", logctx.queryTraceLevel()));
@@ -2027,13 +2054,13 @@ readAnother:
 
                         if (isHTTP)
                         {
-                            CHttpRequestAsyncFor af(queryName, sink, msgctx, requestArray, *client, httpHelper, protocolFlags, memused, agentsReplyLen, sanitizedText, logctx, (PTreeReaderOptions)readFlags, querySetName);
+                            CHttpRequestAsyncFor af(queryName, sink, msgctx, requestArray, *client, httpHelper, protocolFlags, memused, agentsReplyLen, agentsDuplicates, agentsResends, sanitizedText, logctx, (PTreeReaderOptions)readFlags, querySetName);
                             af.For(requestArray.length(), global->numRequestArrayThreads);
                         }
                         else
                         {
                             Owned<IHpccProtocolResponse> protocol = createProtocolResponse(queryPT->queryName(), client, httpHelper, logctx, protocolFlags, (PTreeReaderOptions)readFlags);
-                            sink->onQueryMsg(msgctx, queryPT, protocol, protocolFlags, (PTreeReaderOptions)readFlags, querySetName, 0, memused, agentsReplyLen);
+                            sink->onQueryMsg(msgctx, queryPT, protocol, protocolFlags, (PTreeReaderOptions)readFlags, querySetName, 0, memused, agentsReplyLen, agentsDuplicates, agentsResends);
                         }
                     }
                 }
@@ -2102,10 +2129,11 @@ readAnother:
         }
         unsigned bytesOut = client? client->bytesOut() : 0;
         unsigned elapsed = msTick() - qstart;
-        sink->noteQuery(msgctx.get(), peerStr, failed, bytesOut, elapsed,  memused, agentsReplyLen, continuationNeeded);
+        sink->noteQuery(msgctx.get(), peerStr, failed, bytesOut, elapsed,  memused, agentsReplyLen, agentsDuplicates, agentsResends, continuationNeeded, requestArraySize);
         if (continuationNeeded)
         {
             rawText.clear();
+            resetQstart = true;
             goto readAnother;
         }
         else
@@ -2126,6 +2154,7 @@ readAnother:
                 if (isHTTP && --remainingHttpConnectionRequests > 0)
                 {
                     readWait = global->maxHttpKeepAliveWait;
+                    resetQstart = true;
                     goto readAnother;
                 }
 

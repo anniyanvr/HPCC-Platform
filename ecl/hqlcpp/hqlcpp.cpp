@@ -1539,6 +1539,12 @@ void HqlCppTranslator::checkAbort()
 // Without this restriction it becomes much easier.
 void HqlCppTranslator::cacheOptions()
 {
+    size32_t outputLimit = wu()->getDebugValueInt("outputLimitMb", 0);
+    if (outputLimit > daliResultOutputMax)
+        throwError2(HQLERR_OutputLimitMaxExceeded, daliResultOutputMax, outputLimit);
+    if (outputLimit > futureResultOutputMax)
+        WARNING2(CategoryDeprecated, HQLERR_OutputLimitFutureMaxExceeded, futureResultOutputMax, outputLimit);
+
     SCMStringBuffer targetText;
     wu()->getDebugValue("targetClusterType", targetText);
     ClusterType clusterType = getClusterType(targetText.s.str());
@@ -1856,7 +1862,8 @@ void HqlCppTranslator::cacheOptions()
         DebugOption(options.checkDuplicateThreshold, "checkDuplicateThreshold", 0), // If non zero, create a warning if duplicates > this percentage increase
         DebugOption(options.checkDuplicateMinActivities, "checkDuplicateMinActivities", 100),
         DebugOption(options.diskReadsAreSimple, "diskReadsAreSimple", false), // Not yet enabled - needs filters to default to generating keyed info first
-        DebugOption(options.genericDiskReads, "genericDiskReads", false),
+        DebugOption(options.allKeyedFiltersOptional, "allKeyedFiltersOptional", false),
+        DebugOption(options.genericDiskReads, "genericDiskReads", false), // Can be enabled for hthor, but locking not currently supported
         DebugOption(options.generateActivityFormats, "generateActivityFormats", false),
         DebugOption(options.generateDiskFormats, "generateDiskFormats", false),
         DebugOption(options.maxOptimizeSize, "maxOptimizeSize", 5),             // Remove the overhead from very small functions e.g. function prolog
@@ -3884,7 +3891,9 @@ void HqlCppTranslator::buildStmt(BuildCtx & _ctx, IHqlExpression * expr)
                 //Add a group for each branch of a sequential to ensure all branches are independent
                 if (op == no_sequential)
                     subctx.addGroup();
-                buildStmt(subctx, expr->queryChild(idx));
+                IHqlExpression * cur = expr->queryChild(idx);
+                if (!cur->isAttribute())
+                    buildStmt(subctx, cur);
             }
             return;
         }

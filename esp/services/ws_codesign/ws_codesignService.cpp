@@ -35,6 +35,9 @@ void Cws_codesignEx::init(IPropertyTree *cfg, const char *process, const char *s
     StringBuffer xpath;
     xpath.appendf("Software/EspProcess[@name=\"%s\"]/EspService[@name=\"%s\"]", process, service);
     m_serviceCfg.setown(cfg->getPropTree(xpath.str()));
+#ifdef _CONTAINERIZED
+    queryCodeSigner().initForContainer();
+#endif
 }
 
 bool Cws_codesignEx::onSign(IEspContext &context, IEspSignRequest &req, IEspSignResponse &resp)
@@ -85,5 +88,38 @@ bool Cws_codesignEx::onListUserIDs(IEspContext &context, IEspListUserIDsRequest 
     }
 
     resp.setUserIDs(userIds);
+    return true;
+}
+
+bool Cws_codesignEx::onVerify(IEspContext &context, IEspVerifyRequest &req, IEspVerifyResponse &resp)
+{
+    const char* text = req.getText();
+    if (!text || !*text)
+    {
+        resp.setErrMsg("No text provided");
+        return false;
+    }
+    StringBuffer signer;
+    bool isValidSig = false;
+
+    try
+    {
+        isValidSig = queryCodeSigner().verifySignature(text, signer);
+    }
+    catch (IException *e)
+    {
+        StringBuffer msg;
+        e->errorMessage(msg);
+        unsigned code = e->errorCode();
+        e->Release();
+        OERRLOG("Signature verify error %d: %s", code, msg.str());
+        resp.setIsVerified(false);
+        resp.setErrMsg("Signature verify error");
+        resp.setRetCode(code);
+        return false;
+    }
+    resp.setRetCode(0);
+    resp.setSignedBy(signer);
+    resp.setIsVerified(isValidSig);
     return true;
 }

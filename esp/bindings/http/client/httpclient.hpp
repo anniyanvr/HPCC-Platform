@@ -23,14 +23,25 @@
 
 #define HTTP_CLIENT_DEFAULT_CONNECT_TIMEOUT 3000
 
+enum class HttpClientErrCode
+{
+    PeerClosed = -2,
+    Error = -1,
+    OK = 0
+};
+
 interface IHttpClient : extends ITransportClient
 {
     virtual void setProxy(const char* proxy) = 0;
     virtual void setUserID(const char* userid) = 0;
     virtual void setPassword(const char* password) = 0;
     virtual void setRealm(const char* realm) = 0;
+    virtual void setMtlsSecretName(const char *name) = 0;
+    virtual const char *getMtlsSecretName() = 0;
+
     virtual void setConnectTimeOutMs(unsigned timeout) = 0;
     virtual void setTimeOut(unsigned int timeout) = 0;
+    virtual void setTxSummary(CTxSummary* txSummary) = 0;
     virtual void disableKeepAlive() = 0;
     virtual IMultiException* queryExceptions() = 0;
 
@@ -39,8 +50,9 @@ interface IHttpClient : extends ITransportClient
     virtual int sendRequest(IProperties *headers, const char* method, const char* contenttype, StringBuffer& content, StringBuffer &response, StringBuffer& responseStatus, bool alwaysReadContent = false) = 0;
     virtual int proxyRequest(IHttpMessage *request, IHttpMessage *response, bool resetForwardedFor) = 0;
 
-    virtual int postRequest(ISoapMessage & request, ISoapMessage & response) = 0;
+    virtual IHttpMessage *sendRequestEx(const char* method, const char* contenttype, StringBuffer& content, HttpClientErrCode &code, StringBuffer &errmsg, IProperties *headers = nullptr, bool alwaysReadContent = false, bool forceNewConnection = false) = 0;
 
+    virtual int postRequest(ISoapMessage & request, ISoapMessage & response) = 0;
 };
 
 interface IHttpClientContext : extends IInterface
@@ -51,5 +63,6 @@ interface IHttpClientContext : extends IInterface
 
 esp_http_decl IHttpClientContext* getHttpClientContext();
 esp_http_decl IHttpClientContext* createHttpClientContext(IPropertyTree* config);
+esp_http_decl IHttpClientContext* getHttpClientSecretContext(const char *secret);
 
 #endif

@@ -35,18 +35,13 @@
         },
         "timeout":"720",
         "maxAttemptCount":"3",
-        "defaultSetupClusters": [
-            "mythor",
-            "myroxie"
-        ],
-        "defaultSetupEngines": [
+        "wuStatusTimeout":"30",
+        "wuAbortTimeout":"30",
+        "defaultSetupTargets": [
             "thor",
             "roxie"
         ],
-        "defaultTargetClusters": [
-            "all"
-        ],
-        "defaultTargetEngines": [
+        "defaultTargets": [
             "all"
         ],
         "Params":[
@@ -55,7 +50,8 @@
             "soapcall_multihttpheader.ecl:TargetIP=."
         ],
         "engineParams":[
-            "failOnLeaks"
+            "failOnLeaks",
+            "disableLocalOptimizations"
         ],
         "setupExtraParams":{
             "OriginalTextFilesOsPath" : "/opt/HPCCSystems/testing/regress",

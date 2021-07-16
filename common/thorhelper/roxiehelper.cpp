@@ -2370,18 +2370,18 @@ void FlushingJsonBuffer::startScalar(const char *resultName, unsigned sequence, 
     }
 }
 
-void FlushingJsonBuffer::setScalarInt(const char *resultName, unsigned sequence, __int64 value, unsigned size, bool simpleTag, const char *simpleName)
+void FlushingJsonBuffer::setScalarInt(const char *resultName, unsigned sequence, __int64 value, unsigned size)
 {
-    startScalar(resultName, sequence, simpleTag, simpleName);
+    startScalar(resultName, sequence, false, nullptr);
     if (size < 7) //JavaScript only supports 53 significant bits
         s.append(value);
     else
         s.append('"').append(value).append('"');
 }
 
-void FlushingJsonBuffer::setScalarUInt(const char *resultName, unsigned sequence, unsigned __int64 value, unsigned size, bool simpleTag, const char *simpleName)
+void FlushingJsonBuffer::setScalarUInt(const char *resultName, unsigned sequence, unsigned __int64 value, unsigned size)
 {
-    startScalar(resultName, sequence, simpleTag, simpleName);
+    startScalar(resultName, sequence, false, nullptr);
     if (size < 7) //JavaScript doesn't support unsigned, and only supports 53 significant bits
         s.append(value);
     else
@@ -2669,12 +2669,16 @@ StringBuffer & mangleHelperFileName(StringBuffer & out, const char * in, const c
 {
     out = in;
     if (flags & (TDXtemporary | TDXjobtemp))
-        out.append("__").append(wuid);
+        out.append("__").appendLower(wuid);
     return out;
 }
 
-StringBuffer & mangleLocalTempFilename(StringBuffer & out, char const * in)
+
+//Replace any occurrences of :: in the logical name with __scope__, and optionally append with the wuid
+StringBuffer & mangleLocalTempFilename(StringBuffer & out, char const * in, const char * wuid)
 {
+    if (*in == '~')
+        in++;
     char const * start = in;
     while(true)
     {
@@ -2690,6 +2694,8 @@ StringBuffer & mangleLocalTempFilename(StringBuffer & out, char const * in)
             break;
         }
     }
+    if (wuid)
+        out.append("__").appendLower(wuid);
     return out;
 }
 
@@ -2734,6 +2740,10 @@ StringBuffer & expandLogicalFilename(StringBuffer & logicalName, const char * fn
         StringBuffer sb(fname);
         sb.replaceString("::",PATHSEPSTR);
         makeAbsolutePath(sb.str(), logicalName.clear());
+    }
+    else if (strchr(fname, PATHSEPCHAR))
+    {
+        logicalName.append(fname);
     }
     else
     {

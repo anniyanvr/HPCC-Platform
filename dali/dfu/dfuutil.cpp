@@ -69,7 +69,8 @@ static bool physicalPartCopy(IFile *from,const char *tofile, Owned<IException> &
                 0,
                 (offset_t)-1, // all file
                 NULL,
-                PHYSICAL_COPY_POLL_TIME)) {
+                PHYSICAL_COPY_POLL_TIME,
+                CFflush_rdwr)) {
             // Abort check TBD
         }
     }
@@ -1043,7 +1044,7 @@ public:
         return out;
     }
 
-    void addFileXML(const char *lfn, const StringBuffer &xml, IUserDescriptor *user)
+    virtual void addFileXML(const char *lfn, const StringBuffer &xml, const char * cluster, IUserDescriptor *user) override
     {
         Owned<IPropertyTree> t = createPTreeFromXMLString(xml);
         IDistributedFileDirectory &dfd = queryDistributedFileDirectory();
@@ -1062,6 +1063,36 @@ public:
         else if (0 == strcmp(nodeName, queryDfsXmlBranchName(DXB_File)))
         {
             // Logical file map
+            //Patch the cluster before the file is created
+            if (!isEmptyString(cluster))
+            {
+                //In containerized mode the directory is configured somewhere else...
+                //replace @directory with a directory calculated from the storage plane
+                //prefix and the scope of the logical filename
+                //MORE: This could should be commoned up with similar code elsewhere
+                Owned<IStoragePlane> plane = getStoragePlane(cluster, true);
+                StringBuffer location(plane->queryPrefix());
+                const char * temp = lfn;
+                for (;;)
+                {
+                    const char * sep = strstr(temp, "::");
+                    if (!sep)
+                        break;
+                    addPathSepChar(location);
+                    location.appendLower(sep - temp, temp);
+                    temp = sep + 2;
+                }
+                t->setProp("@directory", location);
+
+                //Remove any clusters in the incoming definition, and replace it with a single entry
+                while (t->removeProp("Cluster"))
+                {
+                    //Loop again incase there are any other matches - currently removeProp() appears to remove the whole
+                    //list, but when qualified it would only remove the 1st...
+                }
+                IPropertyTree * entry = t->addPropTree("Cluster", createPTree());
+                entry->setProp("@name", cluster);
+            }
 
             Owned<IFileDescriptor> fdesc = deserializeFileDescriptorTree(t, &queryNamedGroupStore(), 0);
             file.setown(dfd.createNew(fdesc));
@@ -1235,11 +1266,17 @@ public:
     {
         DBGLOG("cloneRoxieSubFile src=%s@%s, dst=%s@%s, prefix=%s, ow=%d, docopy=false", srcLFN, srcCluster, dstLFN, dstCluster, prefix, overwriteFlags);
         CFileCloner cloner;
-        cloner.init(dstCluster, DFUcpdm_c_replicated_by_d, true, NULL, userdesc, foreigndali, NULL, NULL, false, false);
+        bool copyPhysical = false;
+        // MORE: Would the following be better to ensure files are copied when queries are deployed?
+        // bool copyPhysical = isContainerized() && (foreigndali != nullptr);
+        cloner.init(dstCluster, DFUcpdm_c_replicated_by_d, true, NULL, userdesc, foreigndali, NULL, NULL, false, copyPhysical);
         cloner.overwriteFlags = overwriteFlags;
+#ifndef _CONTAINERIZED
+        //In containerized mode there is no need to replicate files to the local disks of the roxie cluster - so don't set the special flag
         cloner.spec1.setRoxie(redundancy, channelsPerNode, replicateOffset);
         if (defReplicateFolder)
             cloner.spec1.setDefaultReplicateDir(defReplicateFolder);
+#endif
         cloner.srcCluster.set(srcCluster);
         cloner.prefix.set(prefix);
         cloner.cloneRoxieFile(srcLFN, dstLFN);

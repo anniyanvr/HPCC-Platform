@@ -104,6 +104,7 @@ interface IConstInstanceInfo : extends IConstEnvBase
 
 interface IConstDropZoneServerInfo : extends IConstEnvBase
 {
+    using IConstEnvBase::getName;     // The following function has a different prototype to the base interface
     virtual StringBuffer & getName(StringBuffer & name) const = 0;
     virtual StringBuffer & getServer(StringBuffer & server) const = 0;
 };
@@ -140,6 +141,7 @@ interface IConstDfuQueueInfoIterator : extends IIteratorOf<IConstDfuQueueInfo>
 
 interface IConstDaFileSrvInfo : extends IConstEnvBase
 {
+    using IConstEnvBase::getName;     // The following function has a different prototype to the base interface
     virtual const char *getName() const = 0;
     virtual unsigned getPort() const = 0;
     virtual bool getSecure() const = 0;
@@ -152,6 +154,7 @@ interface IConstInstanceInfoIterator : extends IIteratorOf<IConstInstanceInfo>
 
 interface IConstSparkThorInfo : extends IConstEnvBase
 {
+    using IConstEnvBase::getName;     // The following function has a different prototype to the base interface
     virtual IStringVal & getName(IStringVal & str) const = 0;
     virtual IStringVal & getBuild(IStringVal & str) const = 0;
     virtual IStringVal & getThorClusterName(IStringVal & str) const = 0;
@@ -223,11 +226,18 @@ interface IEnvironmentFactory : extends IInterface
     virtual void validateCache() = 0;
 };
 
+#ifndef _CONTAINERIZED
+
 class StringBuffer;
 extern "C" ENVIRONMENT_API IEnvironmentFactory * getEnvironmentFactory(bool update);
 extern "C" ENVIRONMENT_API void closeEnvironment();
 
 extern ENVIRONMENT_API unsigned getAccessibleServiceURLList(const char *serviceType, std::vector<std::string> &list);
+
+#else
+inline void closeEnvironment() {}
+
+#endif
 
 //------------------- Moved from workunit.hpp -------------
 
@@ -266,6 +276,10 @@ interface IConstWUClusterInfo : extends IInterface
     virtual const char *getAlias() const = 0;
 };
 
+typedef IArrayOf<IConstWUClusterInfo> CConstWUClusterInfoArray;
+
+#ifndef _CONTAINERIZED
+
 extern ENVIRONMENT_API void getDFUServerQueueNames(StringArray &ret, const char *process);
 extern ENVIRONMENT_API IStringVal &getEclCCServerQueueNames(IStringVal &ret, const char *process);
 extern ENVIRONMENT_API IStringVal &getEclServerQueueNames(IStringVal &ret, const char *process);
@@ -279,13 +293,14 @@ extern ENVIRONMENT_API StringBuffer &getClusterThorGroupName(StringBuffer &ret, 
 extern ENVIRONMENT_API IStringIterator *getTargetClusters(const char *processType, const char *processName);
 extern ENVIRONMENT_API bool validateTargetClusterName(const char *clustname);
 extern ENVIRONMENT_API IConstWUClusterInfo* getTargetClusterInfo(const char *clustname);
-typedef IArrayOf<IConstWUClusterInfo> CConstWUClusterInfoArray;
 extern ENVIRONMENT_API unsigned getEnvironmentClusterInfo(CConstWUClusterInfoArray &clusters);
 extern ENVIRONMENT_API unsigned getEnvironmentClusterInfo(IPropertyTree* environmentRoot, CConstWUClusterInfoArray &clusters);
 extern ENVIRONMENT_API void getRoxieProcessServers(const char *process, SocketEndpointArray &servers);
 extern ENVIRONMENT_API bool isProcessCluster(const char *remoteDali, const char *process);
 extern ENVIRONMENT_API bool isProcessCluster(const char *process);
 extern ENVIRONMENT_API unsigned getEnvironmentThorClusterNames(StringArray &thorNames, StringArray &groupNames, StringArray &targetNames, StringArray &queueNames);
+
+#endif // !_CONTAINERIZED
 
 #endif // _ENVIRONMENT_INCL
 //end

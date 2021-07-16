@@ -198,22 +198,11 @@ public:
 };
 
 //=======================================================================================================================
-#define DEFAULT_PERSIST_COPIES (-1)
 #define PERSIST_LOCK_TIMEOUT 10000
 #define PERSIST_LOCK_SLEEP 5000
 
 class CRoxieWorkflowMachine : public WorkflowMachine
 {
-    class PersistVersion : public CInterface
-    {
-    public:
-        PersistVersion(char const * _logicalName, unsigned _eclCRC, unsigned __int64 _allCRC, bool _isFile) : logicalName(_logicalName), eclCRC(_eclCRC), allCRC(_allCRC), isFile(_isFile) {}
-        StringAttr logicalName;
-        unsigned eclCRC;
-        unsigned __int64 allCRC;
-        bool isFile;
-    };
-
 public:
     CRoxieWorkflowMachine(IPropertyTree *_workflowInfo, IConstWorkUnit *_wu, bool _doOnce, bool _parallelWorkflow, unsigned _numWorkflowThreads, const IRoxieContextLogger &_logctx)
     : WorkflowMachine(_logctx)
@@ -647,7 +636,7 @@ private:
         return false;
     }
 
-    void updatePersist(IRemoteConnection *persistLock, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC)
+    virtual void updatePersist(IRemoteConnection *persistLock, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC)
     {
         StringBuffer lfn, crcName, eclName, whenName;
         expandLogicalFilename(lfn, logicalName, workunit, false, false);
@@ -663,7 +652,7 @@ private:
         changePersistLockMode(persistLock, RTM_LOCK_READ, logicalName, true);
     }
 
-    IRemoteConnection *startPersist(const char * logicalName)
+    virtual IRemoteConnection *startPersist(const char * logicalName)
     {
         setBlockedOnPersist(logicalName);
         IRemoteConnection *persistLock = getPersistReadLock(logicalName);
@@ -671,7 +660,32 @@ private:
         w->setState(WUStateRunning);
         return persistLock;
     }
-
+    virtual void finishPersist(const char * persistName, IRemoteConnection *persistLock)
+    {
+        //this protects lock array from race conditions
+        CriticalBlock block(finishPersistCritSec);
+        logctx.CTXLOG("Finished persists - add to read lock list");
+        persistReadLocks.append(*persistLock);
+    }
+    virtual bool checkFreezePersists(const char *logicalName, unsigned eclCRC)
+    {
+        bool freeze = (workunit->getDebugValueInt("freezepersists", 0) != 0);
+        if (freeze)
+            checkPersistMatches(logicalName, eclCRC);
+        return freeze;
+    }
+    virtual void checkPersistSupported()
+    {
+        if (!workunit)
+        {
+            throw MakeStringException(0, "PERSIST not supported when running predeployed queries");
+        }
+    }
+    virtual bool isPersistAlreadyLocked(const char * logicalName)
+    {
+        //Note: if workunits are restarted, then the engine should check to verify that the persist has not already been calculated
+        return false;
+    }
     void checkPersistMatches(const char * logicalName, unsigned eclCRC)
     {
         StringBuffer lfn, eclName;
@@ -782,7 +796,6 @@ private:
     IConstWorkUnit *workunit;
     IPropertyTree *workflowInfo;
     Owned<IWorkflowScheduleConnection> wfconn;
-    Owned<PersistVersion> persist;
     IArray persistReadLocks;
     bool doOnce;
     bool parallelWorkflow;
@@ -1184,7 +1197,9 @@ protected:
     Owned<IPropertyTree> probeQuery;
     unsigned lastWuAbortCheck;
     unsigned startTime;
-    unsigned totAgentsReplyLen;
+    std::atomic<unsigned> totAgentsReplyLen = {0};
+    std::atomic<unsigned> totAgentsDuplicates = {0};
+    std::atomic<unsigned> totAgentsResends = {0};
     CCycleTimer elapsedTimer;
 
     QueryOptions options;
@@ -1264,6 +1279,8 @@ public:
         aborted = false;
         exceptionLogged = false;
         totAgentsReplyLen = 0;
+        totAgentsDuplicates = 0;
+        totAgentsResends = 0;
 
         allocatorMetaCache.setown(createRowAllocatorCache(this));
         rowManager.setown(roxiemem::createRowManager(options.memoryLimit, this, logctx, allocatorMetaCache, false));
@@ -1600,7 +1617,8 @@ public:
 
         if (realThor)
         {
-            executeThorGraph(name, *workUnit, queryComponentConfig());
+            Owned<IPropertyTree> compConfig = getComponentConfig();
+            executeThorGraph(name, *workUnit, *compConfig);
         }
         else
         {
@@ -1676,10 +1694,13 @@ public:
         return *rowManager;
     }
 
-    virtual void addAgentsReplyLen(unsigned len)
+    virtual void addAgentsReplyLen(unsigned len, unsigned duplicates, unsigned resends)
     {
-        CriticalBlock b(statsCrit); // MORE: change to atomic_add, or may not need it at all?
         totAgentsReplyLen += len;
+        if (duplicates)
+            totAgentsDuplicates += duplicates;
+        if (resends)
+            totAgentsResends += resends;
     }
 
     virtual const char *loadResource(unsigned id)
@@ -1903,32 +1924,31 @@ public:
     }
     virtual void getResultDecimal(unsigned tlen, int precision, bool isSigned, void * tgt, const char * stepname, unsigned sequence)
     {
-        if (isSpecialResultSequence(sequence))
+        memset(tgt, 0, tlen);
+        CriticalBlock b(contextCrit);
+        IPropertyTree &ctx = useContext(sequence);
+        if (ctx.hasProp(stepname))
         {
-            MemoryBuffer m;
-            CriticalBlock b(contextCrit);
-            useContext(sequence).getPropBin(stepname, m);
-            if (m.length())
+            if (ctx.isBinary(stepname))
             {
-                assertex(m.length() == tlen);
-                m.read(tlen, tgt);
+                MemoryBuffer m;
+                ctx.getPropBin(stepname, m);
+                if (m.length())
+                {
+                    assertex(m.length() == tlen);
+                    m.read(tlen, tgt);
+                }
             }
             else
-                memset(tgt, 0, tlen);
-        }
-        else
-        {
-            StringBuffer x;
             {
-                CriticalBlock b(contextCrit);
-                useContext(sequence).getProp(stepname, x);
+                const char *val = ctx.queryProp(stepname);
+                Decimal d;
+                d.setCString(val);
+                if (isSigned)
+                    d.getDecimal(tlen, precision, tgt);
+                else
+                    d.getUDecimal(tlen, precision, tgt);
             }
-            Decimal d;
-            d.setString(x.length(), x.str());
-            if (isSigned)
-                d.getDecimal(tlen, precision, tgt);
-            else
-                d.getUDecimal(tlen, precision, tgt);
         }
     }
     virtual __int64 getResultInt(const char * name, unsigned sequence)
@@ -2518,6 +2538,8 @@ public:
 
 };
 
+enum LogActReset { LogResetSkip=0, LogResetOK, LogResetInit };
+
 class CRoxieServerContext : public CRoxieContextBase, implements IRoxieServerContext, implements IGlobalCodeContext, implements IEngineContext
 {
     const IQueryFactory *serverQueryFactory = nullptr;
@@ -2542,6 +2564,7 @@ protected:
     bool isBlocked;
     bool isNative;
     bool trim;
+    LogActReset actResetLogState = LogResetInit;
 
     void doPostProcess()
     {
@@ -2582,6 +2605,8 @@ protected:
     void init()
     {
         totAgentsReplyLen = 0;
+        totAgentsDuplicates = 0;
+        totAgentsResends = 0;
         isRaw = false;
         isBlocked = false;
         isNative = true;
@@ -2751,11 +2776,14 @@ public:
         {
             if (socketCheckInterval)
             {
-                if (ticksNow - lastSocketCheckTime > socketCheckInterval)
+                if (ticksNow - lastSocketCheckTime >= socketCheckInterval)
                 {
                     CriticalBlock b(abortLock);
                     if (!protocol->checkConnection())
+                    {
+                        DBGLOG("Client socket close detected");
                         throw MakeStringException(ROXIE_CLIENT_CLOSED, "Client socket closed");
+                    }
                     lastSocketCheckTime = ticksNow;
                 }
             }
@@ -2792,9 +2820,19 @@ public:
         return rowManager->getMemoryUsage();
     }
 
-    virtual unsigned getAgentsReplyLen()
+    virtual unsigned getAgentsReplyLen() const
     {
         return totAgentsReplyLen;
+    }
+
+    virtual unsigned getAgentsDuplicates() const
+    {
+        return totAgentsDuplicates;
+    }
+
+    virtual unsigned getAgentsResends() const
+    {
+        return totAgentsResends;
     }
 
     virtual void process()
@@ -3610,7 +3648,7 @@ public:
 #ifdef _CONTAINERIZED
         // in a containerized setup, the group is moving..
         return strdup("unknown");
-#endif
+#else
         StringBuffer groupName;
         if (workUnit && clusterNames.length())
         {
@@ -3651,6 +3689,7 @@ public:
             }
         }
         return groupName.detach();
+#endif
     }
     virtual char *queryIndexMetaData(char const * lfn, char const * xpath) { throwUnexpected(); }
     virtual char *getEnv(const char *name, const char *defaultValue) const
@@ -3897,6 +3936,37 @@ public:
             wu->setClusterName(clusterNames.item(clusterNames.length()-1));
         clusterNames.pop();
         clusterWidth = -1;
+    }
+
+    virtual bool okToLogStartStopError()
+    {
+        if (!actResetLogPeriod)
+            return false;
+        // Each query starts with actResetLogState set to LogResetInit
+        // State is changed to LogResetOK and a timer is started
+        // If same query runs again then time since last logged is checked
+        // If two of the same query run at the same time and it is
+        // past the logging skip period then both will log activity reset msgs
+        if (actResetLogState == LogResetInit)
+        {
+            unsigned timeNow = msTick();
+            unsigned timePrev = serverQueryFactory->getTimeActResetLastLogged();
+            if ((timeNow - timePrev) > (actResetLogPeriod*1000))
+            {
+                serverQueryFactory->setTimeActResetLastLogged(timeNow);
+                actResetLogState = LogResetOK;
+                return true;
+            }
+            else
+            {
+                actResetLogState = LogResetSkip;
+                return false;
+            }
+        }
+        else if (actResetLogState == LogResetOK)
+            return true;
+        else
+            return false;
     }
 };
 

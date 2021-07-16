@@ -67,7 +67,12 @@
 #
 #########################################################
 
-project(hpccsystems-platform)
+project(hpccsystems-platform LANGUAGES C CXX)
+
+# Stupid workaround. See https://gitlab.kitware.com/cmake/cmake/-/issues/21378
+# If cmake runs twice, cmake might not correctly set the compiler version variables
+unset ( ENV{CC} )
+unset ( ENV{CXX} )
 
 cmake_minimum_required(VERSION 3.13.0)
 
@@ -176,6 +181,7 @@ elseif ( NOT MAKE_DOCS_ONLY )
     HPCC_ADD_SUBDIRECTORY (rtl)
     HPCC_ADD_SUBDIRECTORY (services "PLATFORM")
     HPCC_ADD_SUBDIRECTORY (thorlcr "PLATFORM")
+    HPCC_ADD_SUBDIRECTORY (system/metrics)
     HPCC_ADD_SUBDIRECTORY (testing)
     if (NOT CONTAINERIZED)
       HPCC_ADD_SUBDIRECTORY (deploy)
@@ -337,16 +343,18 @@ endif(TOP_LEVEL_PROJECT)
 ## Run file configuration to set build tag along with install lines for generated
 ## config files.
 ###
-set(BUILD_TAG "${projname}_${version}-${stagever}")
-if(USE_GIT_DESCRIBE OR CHECK_GIT_TAG)
-    FETCH_GIT_TAG(${CMAKE_SOURCE_DIR} ${projname}_${version} GIT_BUILD_TAG)
-    message("-- Git tag is '${GIT_BUILD_TAG}'")
-    if(NOT "${GIT_BUILD_TAG}" STREQUAL "${BUILD_TAG}")
-        if(CHECK_GIT_TAG)
-            message(FATAL_ERROR "Git tag '${GIT_BUILD_TAG}' does not match source version '${BUILD_TAG}'")
-        else()
-            if(NOT "${GIT_BUILD_TAG}" STREQUAL "") # probably means being built from a tarball...
-                set(BUILD_TAG "${BUILD_TAG}[${GIT_BUILD_TAG}]")
+if(NOT BUILD_TAG)
+    set(BUILD_TAG "${projname}_${version}-${stagever}")
+    if(USE_GIT_DESCRIBE OR CHECK_GIT_TAG)
+        FETCH_GIT_TAG(${CMAKE_SOURCE_DIR} ${projname}_${version} GIT_BUILD_TAG)
+        message("-- Git tag is '${GIT_BUILD_TAG}'")
+        if(NOT "${GIT_BUILD_TAG}" STREQUAL "${BUILD_TAG}")
+            if(CHECK_GIT_TAG)
+                message(FATAL_ERROR "Git tag '${GIT_BUILD_TAG}' does not match source version '${BUILD_TAG}'")
+            else()
+                if(NOT "${GIT_BUILD_TAG}" STREQUAL "") # probably means being built from a tarball...
+                    set(BUILD_TAG "${BUILD_TAG}[${GIT_BUILD_TAG}]")
+                endif()
             endif()
         endif()
     endif()
@@ -392,11 +400,12 @@ if(TOP_LEVEL_PROJECT)
             ## CPack instruction required for RPM
             ###
             set(CPACK_RPM_SPEC_MORE_DEFINE
-                "%define _use_internal_dependency_generator 0
-                %define __getdeps()while read file; do /usr/lib/rpm/rpmdeps -%{1} ${file} | %{__grep} -v libantlr3c.so | %{__grep} -v libtbb.so ; done | /bin/sort -u
-                %define __find_provides /bin/sh -c '%{__getdeps P}'
-                %define __find_requires /bin/sh -c '%{__getdeps R}'
-                %undefine __brp_mangle_shebangs")
+"%define _use_internal_dependency_generator 0
+%define __getdeps() while read file; do /usr/lib/rpm/rpmdeps -%{1} ${file} | %{__grep} -v libantlr3c.so | %{__grep} -v libtbb.so ; done | /bin/sort -u
+%define __find_provides /bin/sh -c '%{__getdeps P}'
+%define __find_requires /bin/sh -c '%{__getdeps R}'
+%undefine __brp_mangle_shebangs
+%global __os_install_post %(echo '%{__os_install_post}' | sed -e 's!/usr/lib[^[:space:]]*/brp-python-bytecompile[[:space:]].*$!!g')")
             message("-- Will build RPM package")
             message("-- Packing BASH installation files")
             if(CLIENTTOOLS_ONLY)
@@ -485,8 +494,7 @@ if(TOP_LEVEL_PROJECT)
 
             add_custom_target(SIGN
                 COMMAND signtool sign /f "${SIGN_DIRECTORY}/hpcc_code_signing.pfx"
-/p "${PFX_PASSWORD}" /t "http://timestamp.globalsign.com/scripts/timstamp.dll"
-"${CMAKE_BINARY_DIR}/${PACKAGE_FILE_NAME_PREFIX}*.exe"
+/p "${PFX_PASSWORD}" /tr "http://timestamp.digicert.com" "${CMAKE_BINARY_DIR}/${PACKAGE_FILE_NAME_PREFIX}*.exe"
                 COMMENT "Digital Signature"
             )
             add_dependencies(SIGN PACKAGE)
@@ -515,7 +523,7 @@ add_custom_target(uninstall
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)
 
 add_custom_target(localinstall
-	COMMAND $(MAKE) install
+    COMMAND ${CMAKE_MAKE_PROGRAM} install
     )
 
 include(CPack)

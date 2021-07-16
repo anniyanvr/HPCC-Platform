@@ -6,7 +6,7 @@ define([
     "dojo/dom",
     "dojo/dom-construct",
     "dojo/dom-class",
-    "dojo/store/Memory",
+    "src/Memory",
     "dojo/store/Observable",
     "dojo/topic",
     "dojo/has",
@@ -29,7 +29,7 @@ define([
     "dijit/Toolbar",
     "dijit/ToolbarSeparator"
 ],
-    function (declare, lang, nlsHPCCMod, arrayUtil, dom, domConstruct, domClass, Memory, Observable, topic, has,
+    function (declare, lang, nlsHPCCMod, arrayUtil, dom, domConstruct, domClass, MemoryMod, Observable, topic, has,
         registry,
         _Widget, ESPUtil, ESPWorkunit, Utility,
         template) {
@@ -110,11 +110,8 @@ define([
                 }
 
                 var context = this;
-                var store = new Memory({
-                    idProperty: "id",
-                    data: []
-                });
-                this.infoStore = Observable(store);
+                var store = new MemoryMod.Memory("id");
+                this.infoStore = new Observable(store);
 
                 this.infoGrid = new declare([ESPUtil.Grid(false, true)])({
                     selectionMode: "single",
@@ -217,75 +214,15 @@ define([
                 this.infoData = [];
                 this.refreshTopics();
             },
-
-            toCSVCell: function (str) {
-                str = "" + str;
-                var mustQuote = (str.indexOf(",") >= 0 || str.indexOf("\"") >= 0 || str.indexOf("\r") >= 0 || str.indexOf("\n") >= 0);
-                if (mustQuote) {
-                    var retVal = "\"";
-                    for (var i = 0; i < str.length; ++i) {
-                        var c = str.charAt(i);
-                        retVal += c === "\"" ? "\"\"" : c;
-
-                    }
-                    retVal += "\"";
-                    return retVal;
-                }
-                return str;
-            },
-            csvFormatHeader: function (data, delim) {
-                var retVal = "";
-                if (data.length) {
-                    for (var key in data[0]) {
-                        if (retVal.length)
-                            retVal += delim;
-                        retVal += key;
-                    }
-                }
-                return retVal;
-            },
-            csvFormatRow: function (row, idx, delim) {
-                var retVal = "";
-                for (var key in row) {
-                    if (retVal.length)
-                        retVal += delim;
-                    retVal += this.toCSVCell(row[key]);
-                }
-                return retVal;
-            },
-            csvFormatFooter: function (data) {
-                return "";
-            },
-            toCSV: function (data, delim) {
-                var retVal = this.csvFormatHeader(data, delim) + "\n";
-                var context = this;
-                arrayUtil.forEach(data, function (item, idx) {
-                    retVal += context.csvFormatRow(item, idx, delim) + "\n";
-                });
-                retVal += this.csvFormatFooter(data);
-                return retVal;
-            },
             _onCopy: function (evt) {
-                var csvContent = this.toCSV(this.infoData, "\t");
+                var csvContent = Utility.toCSV(this.infoData, "\t");
                 this.widget.ErrWarnDialogTextArea.set("value", csvContent);
                 this.widget.ErrWarnDialog.show();
                 this.widget.ErrWarnDialogTextArea.focus();
                 this.widget.ErrWarnDialogTextArea.domNode.select();
             },
             _onDownload: function (evt) {
-                var csvContent = this.toCSV(this.infoData, ",");
-                var encodedUri = "data:text/csv;charset=utf-8,\uFEFF" + encodeURI(csvContent);
-                if (navigator.msSaveBlob) {
-                    var blob = new Blob([csvContent], {
-                        type: "text/csv;charset=utf-8;"
-                    });
-                    navigator.msSaveBlob(blob, "ErrWarn.csv");
-                } else {
-                    var link = document.createElement("a");
-                    link.setAttribute("href", encodedUri);
-                    link.appendChild(document.createTextNode("ErrWarn.csv"));
-                    link.click();
-                }
+                Utility.downloadText(Utility.toCSV(this.infoData, ","), "ErrWarn.csv");
             },
 
             _onErrors: function (args) {

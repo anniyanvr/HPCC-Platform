@@ -47,6 +47,25 @@
 #define SDS_CONNECT_TIMEOUT  (1000*60*60*2)     // better than infinite
 #define MIN_REDIRECTION_LOAD_INTERVAL 1000
 
+
+constexpr const char * lz_plane_path = "storage/planes[@category='lz']";
+
+IPropertyTreeIterator * getDropZonePlanesIterator(const char * name)
+{
+    StringBuffer xpath(lz_plane_path);
+    if (!isEmptyString(name))
+        xpath.appendf("[@name='%s']", name);
+    return getGlobalConfigSP()->getElements(xpath);
+}
+IPropertyTree * getDropZonePlane(const char * name)
+{
+    if (isEmptyString(name))
+        throw makeStringException(-1, "Drop zone name required");
+    StringBuffer xpath(lz_plane_path);
+    xpath.appendf("[@name='%s']", name);
+    return getGlobalConfigSP()->getPropTree(xpath);
+}
+
 extern da_decl const char *queryDfsXmlBranchName(DfsXmlBranchKind kind)
 {
     switch (kind) {
@@ -286,6 +305,42 @@ CDfsLogicalFileName & CDfsLogicalFileName::operator = (CDfsLogicalFileName const
     return *this;
 }
 
+bool CDfsLogicalFileName::isExternalPlane() const
+{
+    return external && startsWithIgnoreCase(lfn, PLANE_SCOPE "::");
+}
+
+bool CDfsLogicalFileName::getExternalPlane(StringBuffer & plane) const
+{
+    if (!isExternalPlane())
+        return false;
+
+    const char * start = lfn.str() + strlen(PLANE_SCOPE "::");
+    const char * end = strstr(start,"::");
+    assertex(end);
+    plane.append(end-start, start);
+    return true;
+}
+
+
+bool CDfsLogicalFileName::isExternalFile() const
+{
+    return external && startsWithIgnoreCase(lfn, EXTERNAL_SCOPE "::");
+}
+
+bool CDfsLogicalFileName::getExternalHost(StringBuffer & host) const
+{
+    if (!isExternalFile())
+        return false;
+
+    const char * start = lfn.str() + strlen(EXTERNAL_SCOPE "::");
+    const char * end = strstr(start,"::");
+    assertex(end);
+    host.append(end-start, start);
+    return true;
+}
+
+
 void CDfsLogicalFileName::set(const CDfsLogicalFileName &other)
 {
     lfn.set(other.lfn);
@@ -396,6 +451,94 @@ void normalizeNodeName(const char *node, unsigned len, SocketEndpoint &ep, bool 
     if (!strict)
         nodename.clip();
     ep.set(nodename.str());
+}
+
+
+//s points to the second "::" in the external filename (file::ip or plane::<plane>::)
+bool expandExternalPath(StringBuffer &dir, StringBuffer &tail, const char * filename, const char * s, bool iswin, IException **e)
+{
+    if (e)
+        *e = NULL;
+    if (!s) {
+        if (e)
+            *e = MakeStringException(-1,"Invalid format for external file (%s)",filename);
+        return false;
+    }
+    if (s[2]=='>') {
+        dir.append('/');
+        tail.append(s+2);
+        return true;
+    }
+
+    // check for ::c$/
+    if (iswin&&(s[3]=='$'))
+        s += 2;                 // no leading '\'
+    const char *s1=s;
+    const char *t1=NULL;
+    for (;;) {
+        s1 = strstr(s1,"::");
+        if (!s1)
+            break;
+        t1 = s1;
+        s1 = s1+2;
+    }
+    //The following code is never actually executed, since s always points at the leading '::'
+    if (!t1||!*t1) {
+        if (e)
+            *e = MakeStringException(-1,"No directory specified in external file name (%s)",filename);
+        return false;
+    }
+    size32_t odl = dir.length();
+    bool start=true;
+    while (s!=t1) {
+        char c=*(s++);
+        if (isPathSepChar(c)) {
+            if (e)
+                *e = MakeStringException(-1,"Path cannot contain separators, use '::' to separate directories: (%s)",filename);
+            return false;
+        }
+        if ((c==':')&&(s!=t1)&&(*s==':')) {
+            dir.append(iswin?'\\':'/');
+            s++;
+            //Disallow ::..:: to gain access to parent subdirectories
+            if (strncmp(s, "..::", 4) == 0)
+            {
+                if (e)
+                    *e = MakeStringException(-1,"External filename cannot contain relative path '..' (%s)", filename);
+                return false;
+            }
+        }
+        else if (c==':') {
+            if (e)
+                *e = MakeStringException(-1,"Path cannot contain single ':', use 'c$' to indicate 'c:' (%s)",filename);
+            return false;
+        }
+        else if (iswin&&start&&(s!=t1)&&(*s=='$')) {
+            dir.append(c).append(':');
+            s++;
+        }
+        else {
+            if ((c=='^')&&(s!=t1)) {
+                c = toupper(*s);
+                s++;
+            }
+            dir.append(c);
+        }
+        start = false;
+    }
+    t1+=2; // skip ::
+    //Always ensure there is a // - if not directory is provided it will be in the root
+    if ((dir.length()==0)||(!isPathSepChar(dir.charAt(dir.length()-1))))
+        dir.append(iswin?'\\':'/');
+    while (*t1) {
+        char c = *(t1++);
+        if ((c=='^')&&*t1) {
+            c = toupper(*t1);
+            t1++;
+        }
+        tail.append(c);
+    }
+    return true;
 }
 
 void CDfsLogicalFileName::normalizeName(const char *name, StringAttr &res, bool strict)
@@ -590,8 +733,8 @@ bool CDfsLogicalFileName::normalizeExternal(const char * name, StringAttr &res, 
         normalizeScope(s1, s1, ns1-s1, planeName, strict);
 
         Owned<IStoragePlane> plane = getStoragePlane(planeName, true);
-        if (plane->numDevices() != 1)
-            throw makeStringExceptionV(-1, "Scope contains invalid storage plane '%s'", name);
+        if (plane->numDevices() == 0)
+            throw makeStringExceptionV(-1, "Scope contains invalid storage plane '%s'", planeName.str());
             
         str.append("::").append(planeName);
         str.append(ns1);
@@ -1160,7 +1303,6 @@ bool CDfsLogicalFileName::getExternalPath(StringBuffer &dir, StringBuffer &tail,
     if (multi)
         DBGLOG("CDfsLogicalFileName::makeFullnameQuery called on multi-lfn %s",get());
 
-    size32_t odl = dir.length();
     const char *s = skipScope(lfn,EXTERNAL_SCOPE);
     if (s)
     {
@@ -1194,83 +1336,7 @@ bool CDfsLogicalFileName::getExternalPath(StringBuffer &dir, StringBuffer &tail,
             }
         }
     }
-    if (!s) {
-        if (e)
-            *e = MakeStringException(-1,"Invalid format for external file (%s)",get());
-        return false;
-    }
-    if (s[2]=='>') {
-        dir.append('/');
-        tail.append(s+2);
-        return true;
-    }
-
-    // check for ::c$/
-    if (iswin&&(s[3]=='$'))
-        s += 2;                 // no leading '\'
-    const char *s1=s;
-    const char *t1=NULL;
-    for (;;) {
-        s1 = strstr(s1,"::");
-        if (!s1)
-            break;
-        t1 = s1;
-        s1 = s1+2;
-    }
-    if (!t1||!*t1) {
-        if (e)
-            *e = MakeStringException(-1,"No directory specified in external file name (%s)",get());
-        return false;
-    }
-    bool start=true;
-    while (s!=t1) {
-        char c=*(s++);
-        if (isPathSepChar(c)) {
-            if (e)
-                *e = MakeStringException(-1,"Path cannot contain separators, use '::' to separate directories: (%s)",get());
-            return false;
-        }
-        if ((c==':')&&(s!=t1)&&(*s==':')) {
-            dir.append(iswin?'\\':'/');
-            s++;
-            //Disallow ::..:: to gain access to parent subdirectories
-            if (strncmp(s, "..::", 4) == 0)
-            {
-                if (e)
-                    *e = MakeStringException(-1,"External filename cannot contain relative path '..' (%s)", get());
-                return false;
-            }
-        }
-        else if (c==':') {
-            if (e)
-                *e = MakeStringException(-1,"Path cannot contain single ':', use 'c$' to indicate 'c:' (%s)",get());
-            return false;
-        }
-        else if (iswin&&start&&(s!=t1)&&(*s=='$')) {
-            dir.append(c).append(':');
-            s++;
-        }
-        else {
-            if ((c=='^')&&(s!=t1)) {
-                c = toupper(*s);
-                s++;
-            }
-            dir.append(c);
-        }
-        start = false;
-    }
-    t1+=2; // skip ::
-    if ((dir.length()!=odl)&&(!isPathSepChar(dir.charAt(dir.length()-1))))
-        dir.append(iswin?'\\':'/');
-    while (*t1) {
-        char c = *(t1++);
-        if ((c=='^')&&*t1) {
-            c = toupper(*t1);
-            t1++;
-        }
-        tail.append(c);
-    }
-    return true;
+    return expandExternalPath(dir, tail, get(), s, iswin, e);
 }
 
 bool CDfsLogicalFileName::getExternalFilename(RemoteFilename &rfn) const
@@ -3128,7 +3194,7 @@ public:
         return dfile.get(); 
     }
 
-    bool init(const char *fname,IUserDescriptor *user,bool onlylocal,bool onlydfs, bool write, bool isPrivilegedUser)
+    bool init(const char *fname,IUserDescriptor *user,bool onlylocal,bool onlydfs, bool write, bool isPrivilegedUser, const StringArray *clusters)
     {
         fileExists = false;
         if (!onlydfs)
@@ -3179,9 +3245,24 @@ public:
                 if (dfile.get())
                     return true;
             }
+
+            StringBuffer dir;
+#ifdef _CONTAINERIZED
+            StringBuffer cluster;
+            if (clusters)
+            {
+                if (clusters->ordinality()>1)
+                    throw makeStringExceptionV(0, "Container mode does not yet support output to multiple clusters while writing file %s)", fname);
+                cluster.append(clusters->item(0));
+            }
+            else
+                getDefaultStoragePlane(cluster);
+            Owned<IStoragePlane> plane = getStoragePlane(cluster, true);
+            dir.append(plane->queryPrefix());
+#endif
             // MORE - should we create the IDistributedFile here ready for publishing (and/or to make sure it's locked while we write)?
             StringBuffer physicalPath;
-            makePhysicalPartName(lfn.get(), 1, 1, physicalPath, false); // more - may need to override path for roxie
+            makePhysicalPartName(lfn.get(), 1, 1, physicalPath, false, DFD_OSdefault, dir); // more - may need to override path for roxie
             localpath.set(physicalPath);
             fileExists = (dfile != NULL);
             return write;
@@ -3327,10 +3408,10 @@ public:
 
 };
 
-ILocalOrDistributedFile* createLocalOrDistributedFile(const char *fname,IUserDescriptor *user,bool onlylocal,bool onlydfs, bool iswrite, bool isPrivilegedUser)
+ILocalOrDistributedFile* createLocalOrDistributedFile(const char *fname,IUserDescriptor *user,bool onlylocal,bool onlydfs, bool iswrite, bool isPrivilegedUser, const StringArray *clusters)
 {
     Owned<CLocalOrDistributedFile> ret = new CLocalOrDistributedFile();
-    if (ret->init(fname,user,onlylocal,onlydfs,iswrite,isPrivilegedUser))
+    if (ret->init(fname,user,onlylocal,onlydfs,iswrite,isPrivilegedUser,clusters))
         return ret.getClear();
     return NULL;
 }
@@ -3388,7 +3469,7 @@ public:
         mb.read(count);
         if (count)
         {
-            ldInfo.ensure(count);
+            ldInfo.ensureCapacity(count);
             for (unsigned c=0; c<count; c++)
                 ldInfo.append(new CLockMetaData(mb));
         }
@@ -3549,4 +3630,37 @@ ILockInfoCollection *createLockInfoCollection()
 ILockInfoCollection *deserializeLockInfoCollection(MemoryBuffer &mb)
 {
     return new CLockInfoCollection(mb);
+}
+
+static const char* remLeading(const char* s)
+{
+    if (*s == '/')
+        s++;
+    return s;
+}
+
+static unsigned daliConnectTimeoutMs = 5000;
+extern da_decl IRemoteConnection* connectXPathOrFile(const char* path, bool safe, StringBuffer& xpath)
+{
+    CDfsLogicalFileName lfn;
+    StringBuffer lfnPath;
+    if ((strstr(path, "::") != nullptr) && !strchr(path, '/'))
+    {
+        lfn.set(path);
+        lfn.makeFullnameQuery(lfnPath, DXB_File);
+        path = lfnPath.str();
+    }
+    else if (strchr(path + ((*path == '/') ? 1 : 0),'/') == nullptr)
+        safe = true;    // all root trees safe
+
+    Owned<IRemoteConnection> conn = querySDS().connect(remLeading(path), myProcessSession(), safe ? 0 : RTM_LOCK_READ, daliConnectTimeoutMs);
+    if (!conn && !lfnPath.isEmpty())
+    {
+        lfn.makeFullnameQuery(lfnPath.clear(), DXB_SuperFile);
+        path = lfnPath.str();
+        conn.setown(querySDS().connect(remLeading(path), myProcessSession(), safe? 0 : RTM_LOCK_READ, daliConnectTimeoutMs));
+    }
+    if (conn.get())
+        xpath.append(path);
+    return conn.getClear();
 }

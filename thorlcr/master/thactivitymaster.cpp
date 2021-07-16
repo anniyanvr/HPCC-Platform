@@ -141,6 +141,7 @@ public:
             case TAKapply:
             case TAKfunnel:
             case TAKcombine:
+            case TAKcombinegroup:
             case TAKregroup:
             case TAKsorted:
             case TAKnwayinput:
@@ -157,6 +158,7 @@ public:
             case TAKhttp_rowdataset:
             case TAKdistributed:
             case TAKtrace:
+            case TAKemptyaction:
                 ret = new CMasterActivity(this);
                 break;
             case TAKskipcatch:

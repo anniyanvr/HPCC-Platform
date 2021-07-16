@@ -19,6 +19,7 @@
 #define _ESPWIZ_WsFileIO_HPP__
 
 #include "ws_fileio_esp.ipp"
+#include "TpWrapper.hpp"
 
 class CWsFileIOSoapBindingEx : public CWsFileIOSoapBinding
 {
@@ -27,7 +28,7 @@ public:
 
     virtual void getNavigationData(IEspContext &context, IPropertyTree & data)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
         {
             CHttpSoapBinding::getNavigationData(context, data);
             return;
@@ -37,6 +38,7 @@ public:
 
 class CWsFileIOEx : public CWsFileIO
 {
+    IArrayOf<IConstTpDropZone> allTpDropZones;
 public:
     virtual void init(IPropertyTree *cfg, const char *process, const char *service);
 
@@ -45,7 +47,7 @@ public:
     virtual bool onReadFileData(IEspContext &context,     IEspReadFileDataRequest &req,   IEspReadFileDataResponse &resp);
 
 protected:
-    bool CheckServerAccess(const char* server, const char* relPath, StringBuffer& netAddr, StringBuffer& absPath);
+    bool CheckServerAccess(const char* server, const char* netAddrIn, const char* relPath, StringBuffer& netAddrOut, StringBuffer& absPath);
 };
 
 #endif //_ESPWIZ_WsFileIO_HPP__

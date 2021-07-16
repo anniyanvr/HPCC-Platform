@@ -31,6 +31,7 @@
 #ifdef _WIN32
 #include "windows.h"
 #endif
+#include "jlog.hpp"
 
 #include "dalienv.hpp"
 
@@ -40,6 +41,8 @@
 #include "sacmd.hpp"
 #include "exception_util.hpp"
 #include "LogicFileWrapper.hpp"
+#include "dameta.hpp"
+#include "daqueue.hpp"
 
 #define DFU_WU_URL          "DfuWorkunitsAccess"
 #define DFU_EX_URL          "DfuExceptionsAccess"
@@ -116,8 +119,8 @@ int Schedule::run()
 
 void CFileSprayEx::init(IPropertyTree *cfg, const char *process, const char *service)
 {
+#ifndef _CONTAINERIZED
     StringBuffer xpath;
-
     xpath.clear().appendf("Software/EspProcess[@name=\"%s\"]/EspService[@name=\"%s\"]/QueueLabel", process, service);
     cfg->getProp(xpath.str(), m_QueueLabel);
     StringArray qlist;
@@ -154,13 +157,24 @@ void CFileSprayEx::init(IPropertyTree *cfg, const char *process, const char *ser
     cfg->getProp(xpath.str(), m_MonitorQueueLabel);
 
     directories.set(cfg->queryPropTree("Software/Directories"));
-
-    StringBuffer prop;
-    prop.appendf("queueLabel=%s", m_QueueLabel.str());
-    DBGLOG("%s", prop.str());
-    prop.clear();
-    prop.appendf("monitorQueueLabel=%s", m_MonitorQueueLabel.str());
-    DBGLOG("%s", prop.str());
+#else
+    // Using the first queue for now.
+    // TODO: Re-design support for multiple queues
+    Owned<IPropertyTreeIterator> dfuQueues = getComponentConfigSP()->getElements("dfuQueues");
+    ForEach(*dfuQueues)
+    {
+        IPropertyTree & dfuQueue = dfuQueues->query();
+        const char * dfuName = dfuQueue.queryProp("@name");
+        if (!isEmptyString(dfuName))
+        {
+            getDfuQueueName(m_QueueLabel, dfuName);
+            getDfuMonitorQueueName(m_MonitorQueueLabel, dfuName);
+            break;
+        }
+    }
+#endif
+    DBGLOG("queueLabel=%s", m_QueueLabel.str());
+    DBGLOG("monitorQueueLabel=%s", m_MonitorQueueLabel.str());
 
     if (!daliClientActive())
     {
@@ -222,13 +236,15 @@ static void DeepAssign(IEspContext &context, IConstDFUWorkUnit *src, IEspDFUWork
     if(src == NULL)
         throw MakeStringException(ECLWATCH_MISSING_PARAMS, "'Source DFU workunit' doesn't exist.");
 
+    StringBuffer tmp;
+    double version = context.getClientVersion();
+    dest.setID(src->queryId());
+
+#ifndef _CONTAINERIZED
     Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
     Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
     Owned<IPropertyTree> root = &constEnv->getPTree();
 
-    double version = context.getClientVersion();
-    StringBuffer tmp, encoded;
-    dest.setID(src->queryId());
     if (src->getClusterName(tmp.clear()).length()!=0)
     {
         char *clusterName = (char *)tmp.str();
@@ -282,7 +298,10 @@ static void DeepAssign(IEspContext &context, IConstDFUWorkUnit *src, IEspDFUWork
             dest.setClusterName(clusterNameForDisplay.str());
         }
     }
-
+#else
+    src->getClusterName(tmp.clear());
+    dest.setClusterName(tmp.str());
+#endif
     if ((version > 1.05) && src->getDFUServerName(tmp.clear()).length())
         dest.setDFUServerName(tmp.str());
 
@@ -349,7 +368,9 @@ static void DeepAssign(IEspContext &context, IConstDFUWorkUnit *src, IEspDFUWork
         StringBuffer lfn;
         file->getLogicalName(lfn);
         if (lfn.length() != 0)
+        {
             dest.setSourceLogicalName(lfn.str());
+        }
         else
             dest.setSourceFormat(file->getFormat());
 
@@ -443,6 +464,8 @@ static void DeepAssign(IEspContext &context, IConstDFUWorkUnit *src, IEspDFUWork
             if (clusterName)
                 dest.setDestGroupName(clusterName);
         }
+        if (version >= 1.21)
+            dest.setPreserveFileParts(file->getWrap());
 
         StringBuffer socket, dir, title;
         unsigned np = file->getNumParts(0);                 // should handle multiple clusters?
@@ -512,6 +535,11 @@ bool CFileSprayEx::ParseLogicalPath(const char * pLogicalPath, const char* group
 
     if(groupName != NULL && *groupName != '\0')
     {
+#ifdef _CONTAINERIZED
+        Owned<IPropertyTree> plane = getStoragePlane(groupName);
+        if (plane)
+            defaultFolder.append(plane->queryProp("@prefix"));
+#else
         StringBuffer basedir;
         GroupType groupType;
         Owned<IGroup> group = queryNamedGroupStore().lookup(groupName, basedir, groupType);
@@ -546,6 +574,7 @@ bool CFileSprayEx::ParseLogicalPath(const char * pLogicalPath, const char* group
         {
             // Error here?
         }
+#endif
     }
 
     makePhysicalPartName(pLogicalPath,0,0,folder,false,os,defaultFolder.str());
@@ -582,6 +611,9 @@ bool CFileSprayEx::ParseLogicalPath(const char * pLogicalPath, StringBuffer &tit
 void setRoxieClusterPartDiskMapping(const char *clusterName, const char *defaultFolder, const char *defaultReplicateFolder,
                                bool supercopy, IDFUfileSpec *wuFSpecDest, IDFUoptions *wuOptions)
 {
+#ifdef _CONTAINERIZED
+    UNIMPLEMENTED_X("CONTAINERIZED(setRoxieClusterPartDiskMapping)");
+#else
     Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
     Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
 
@@ -635,6 +667,7 @@ void setRoxieClusterPartDiskMapping(const char *clusterName, const char *default
         spec.setRepeatedCopies(CPDMSRP_lastRepeated,false);
     wuFSpecDest->setClusterPartDiskMapSpec(clusterName,spec);
     wuOptions->setReplicate(replicate);
+#endif
 }
 
 StringBuffer& constructFileMask(const char* filename, StringBuffer& filemask)
@@ -647,6 +680,9 @@ bool CFileSprayEx::onDFUWUSearch(IEspContext &context, IEspDFUWUSearchRequest & 
 {
     try
     {
+#ifdef _CONTAINERIZED
+        UNIMPLEMENTED_X("CONTAINERIZED(CFileSprayEx::onDFUWUSearch)");
+#else
         context.ensureFeatureAccess(DFU_WU_URL, SecAccess_Read, ECLWATCH_DFU_WU_ACCESS_DENIED, "Access to DFU workunit is denied.");
 
         Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
@@ -668,6 +704,7 @@ bool CFileSprayEx::onDFUWUSearch(IEspContext &context, IEspDFUWUSearchRequest & 
         }
 
         resp.setClusterNames(dfuclusters);
+#endif
     }
     catch(IException* e)
     {
@@ -724,19 +761,8 @@ bool CFileSprayEx::GetArchivedDFUWorkunits(IEspContext &context, IEspGetDFUWorku
     StringBuffer user;
     context.getUserID(user);
 
-    StringBuffer sashaAddress;
-    IArrayOf<IConstTpSashaServer> sashaservers;
-    CTpWrapper dummy;
-    dummy.getTpSashaServers(sashaservers);
-    ForEachItemIn(i, sashaservers)
-    {
-        IConstTpSashaServer& sashaserver = sashaservers.item(i);
-        IArrayOf<IConstTpMachine> &sashaservermachine = sashaserver.getTpMachines();
-        sashaAddress.append(sashaservermachine.item(0).getNetaddress());
-    }
-
     SocketEndpoint ep;
-    ep.set(sashaAddress,DEFAULT_SASHA_PORT);
+    getSashaServiceEP(ep, "dfuwu-archiver", true);
     Owned<INode> sashaserver = createINode(ep);
 
     __int64 count=req.getPageSize();
@@ -752,8 +778,8 @@ bool CFileSprayEx::GetArchivedDFUWorkunits(IEspContext &context, IEspGetDFUWorku
     cmd->setOnline(false);
     cmd->setArchived(true);
     cmd->setDFU(true);
-   cmd->setLimit((int) count+1);
-   cmd->setStart((int)begin);
+    cmd->setLimit((int) count+1);
+    cmd->setStart((int)begin);
     if(req.getCluster() && *req.getCluster())
         cmd->setCluster(req.getCluster());
     if(req.getOwner() && *req.getOwner())
@@ -805,8 +831,8 @@ bool CFileSprayEx::GetArchivedDFUWorkunits(IEspContext &context, IEspGetDFUWorku
 
     resp.setPageStartFrom(begin+1);
     resp.setNextPage(-1);
-   if(count < actualCount)
-   {
+    if(count < actualCount)
+    {
         if (results.length() > count)
         {
             results.pop();
@@ -828,7 +854,7 @@ bool CFileSprayEx::GetArchivedDFUWorkunits(IEspContext &context, IEspGetDFUWorku
             resp.setPrevPage(0);
     }
 
-   resp.setPageSize(count);
+    resp.setPageSize(count);
     resp.setResults(results);
 
     StringBuffer basicQuery;
@@ -938,11 +964,14 @@ bool CFileSprayEx::onGetDFUWorkunits(IEspContext &context, IEspGetDFUWorkunits &
             clusterReq.append(clusterName);
         }
 
+        StringArray targetClusters, clusterProcesses;
+#ifdef _CONTAINERIZED
+        IERRLOG("CONTAINERIZED(CFileSprayEx::onGetDFUWorkunits)");
+#else
         Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
         Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
         Owned<IPropertyTree> root = &constEnv->getPTree();
 
-        StringArray targetClusters, clusterProcesses;
         Owned<IPropertyTreeIterator> clusters= root->getElements("Software/Topology/Cluster");
         if (clusters->first())
         {
@@ -989,6 +1018,7 @@ bool CFileSprayEx::onGetDFUWorkunits(IEspContext &context, IEspGetDFUWorkunits &
                 }
             } while (clusters->next());
         }
+#endif
 
         __int64 pagesize = req.getPageSize();
         __int64 pagefrom = req.getPageStartFrom();
@@ -1236,7 +1266,7 @@ void CFileSprayEx::getInfoFromSasha(IEspContext &context, const char *sashaServe
     cmd->setAction(SCA_GET);
     cmd->setArchived(true);
     cmd->setDFU(true);
-    SocketEndpoint ep(sashaServer, DEFAULT_SASHA_PORT);
+    SocketEndpoint ep(sashaServer);
     Owned<INode> node = createINode(ep);
     if (!cmd->send(node,1*60*1000))
     {
@@ -1341,22 +1371,9 @@ bool CFileSprayEx::getArchivedWUInfo(IEspContext &context, IEspGetDFUWorkunit &r
     const char *wuid = req.getWuid();
     if (wuid && *wuid)
     {
-        StringBuffer sashaAddress;
-        IArrayOf<IConstTpSashaServer> sashaservers;
-        CTpWrapper dummy;
-        dummy.getTpSashaServers(sashaservers);
-        ForEachItemIn(i, sashaservers)
-        {
-            IConstTpSashaServer& sashaserver = sashaservers.item(i);
-            IArrayOf<IConstTpMachine> &sashaservermachine = sashaserver.getTpMachines();
-            sashaAddress.append(sashaservermachine.item(0).getNetaddress());
-        }
-        if (sashaAddress.length() < 1)
-        {
-            throw MakeStringException(ECLWATCH_ARCHIVE_SERVER_NOT_FOUND,"Archive server not found.");
-        }
-
-        getInfoFromSasha(context, sashaAddress.str(), wuid, &resp.updateResult());
+        StringBuffer serviceEndpoint;
+        getSashaService(serviceEndpoint, "sasha-dfuwu-archiver", true);
+        getInfoFromSasha(context, serviceEndpoint, wuid, &resp.updateResult());
         return true;
     }
 
@@ -1809,21 +1826,101 @@ bool CFileSprayEx::onGetDFUExceptions(IEspContext &context, IEspGetDFUExceptions
     return true;
 }
 
-void CFileSprayEx::readAndCheckSpraySourceReq(MemoryBuffer& srcxml, const char* srcIP, const char* srcPath,
+void CFileSprayEx::readAndCheckSpraySourceReq(MemoryBuffer& srcxml, const char* srcIP, const char* srcPath, const char* srcPlane,
     StringBuffer& sourceIPReq, StringBuffer& sourcePathReq)
 {
-    StringBuffer sourcePath(srcPath);
-    sourceIPReq.set(srcIP);
-    sourceIPReq.trim();
-    sourcePath.trim();
+    StringBuffer sourcePath;
+
     if(srcxml.length() == 0)
     {
+        if (!isEmptyString(srcPlane))
+        {
+            Owned<IPropertyTree> dropZone = getDropZonePlane(srcPlane);
+            if (!dropZone)
+                throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Unknown landing zone: %s", srcPlane);
+            const char * dropZonePlanePath = dropZone->queryProp("@prefix");
+            if (isAbsolutePath(srcPath))
+            {
+                if (!startsWith(srcPath,dropZonePlanePath))
+                    throw MakeStringException(ECLWATCH_INVALID_INPUT, "Invalid source path");
+                sourcePath.append(srcPath).trim();
+            }
+            else
+            {
+                sourcePath.append(dropZonePlanePath);
+                addNonEmptyPathSepChar(sourcePath);
+                sourcePath.append(srcPath).trim();
+            }
+            const char * hostGroup = dropZone->queryProp("@hostGroup");
+            if (hostGroup)
+            {
+                Owned<IPropertyTree> match = getHostGroup(hostGroup,true);
+                if (!isEmptyString(srcIP))
+                {
+                    // Already have srcIP. Just need to check that the ip is valid for storage plane.
+                    bool ipAddressMatches = false;
+                    Owned<IPropertyTreeIterator> hostIter = match->getElements("hosts");
+                    ForEach (*hostIter)
+                    {
+                        const char *knownIP = hostIter->query().queryProp(nullptr);
+                        if (strcmp(knownIP, srcIP)==0)
+                        {
+                            ipAddressMatches=true;
+                            break;
+                        }
+                    }
+                    if (!ipAddressMatches)
+                        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "srcip %s is not valid storage plane %s", srcIP, srcPlane);
+                    sourceIPReq.set(srcIP);
+                }
+                else
+                    sourceIPReq.set(match->queryProp("hosts[1]"));
+            }
+            else
+            {
+                sourceIPReq.set("localhost"); // storage plane will be mounted when not using hostgroup
+            }
+        }
+        else
+        {
+            sourcePath.append(srcPath).trim();
+            sourceIPReq.set(srcIP).trim();
+        }
         if (sourceIPReq.isEmpty())
-            throw MakeStringException(ECLWATCH_INVALID_INPUT, "Source network IP not specified.");
+            throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Source network IP not specified.");
         if (sourcePath.isEmpty())
-            throw MakeStringException(ECLWATCH_INVALID_INPUT, "Source path not specified.");
+            throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Source path not specified.");
     }
     getStandardPosixPath(sourcePathReq, sourcePath.str());
+}
+
+static void checkValidDfuQueue(const char * dfuQueue)
+{
+    if (isEmptyString(dfuQueue))
+        return;
+#ifndef _CONTAINERIZED
+        Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
+        Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
+        if (!constEnv->isValidDfuQueueName(dfuQueue))
+            throw MakeStringException(ECLWATCH_INVALID_INPUT, "Invalid DFU server queue name:'%s'", dfuQueue);
+#else
+        bool isValidDfuQueueName = false;
+        Owned<IPropertyTreeIterator> dfuServers = getComponentConfigSP()->getElements("dfuQueues");
+        ForEach(*dfuServers)
+        {
+            IPropertyTree & dfuServer = dfuServers->query();
+            const char * dfuServerName = dfuServer.queryProp("@name");
+            StringBuffer knownDfuQueueName;
+            getDfuQueueName(knownDfuQueueName, dfuServerName);
+            if (streq(dfuQueue, knownDfuQueueName))
+            {
+                isValidDfuQueueName = true;
+                break;
+            }
+        }
+        if (!isValidDfuQueueName)
+            throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid DFU server queue name: '%s'", dfuQueue);
+#endif
 }
 
 bool CFileSprayEx::onSprayFixed(IEspContext &context, IEspSprayFixed &req, IEspSprayFixedResponse &resp)
@@ -1835,20 +1932,20 @@ bool CFileSprayEx::onSprayFixed(IEspContext &context, IEspSprayFixed &req, IEspS
         StringBuffer destFolder, destTitle, defaultFolder, defaultReplicateFolder;
 
         const char* destNodeGroup = req.getDestGroup();
-        if(destNodeGroup == NULL || *destNodeGroup == '\0')
-            throw MakeStringException(ECLWATCH_INVALID_INPUT, "Destination node group not specified.");
+        if (isEmptyString(destNodeGroup))
+            throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Destination node group not specified.");
 
         MemoryBuffer& srcxml = (MemoryBuffer&)req.getSrcxml();
         StringBuffer sourceIPReq, sourcePathReq;
-        readAndCheckSpraySourceReq(srcxml, req.getSourceIP(), req.getSourcePath(), sourceIPReq, sourcePathReq);
+        readAndCheckSpraySourceReq(srcxml, req.getSourceIP(), req.getSourcePath(), req.getSourcePlane(), sourceIPReq, sourcePathReq);
         const char* srcip = sourceIPReq.str();
         const char* srcfile = sourcePathReq.str();
         const char* destname = req.getDestLogicalName();
-        if(!destname || !*destname)
-            throw MakeStringException(ECLWATCH_INVALID_INPUT, "Destination file not specified.");
+        if(isEmptyString(destname))
+            throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Destination file not specified.");
         CDfsLogicalFileName lfn;
         if (!lfn.setValidate(destname))
-            throw MakeStringException(ECLWATCH_INVALID_INPUT, "invalid destination filename:'%s'", destname);
+            throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid destination filename:'%s'", destname);
         destname = lfn.get();
         PROGLOG("SprayFixed: DestLogicalName %s, DestGroup %s", destname, destNodeGroup);
 
@@ -1874,13 +1971,7 @@ bool CFileSprayEx::onSprayFixed(IEspContext &context, IEspSprayFixed &req, IEspS
 
         wu->setJobName(destTitle.str());
         const char * dfuQueue = req.getDFUServerQueue();
-        Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
-        Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
-        if (!isEmptyString(dfuQueue))
-        {
-            if (!constEnv->isValidDfuQueueName(dfuQueue))
-                throw MakeStringException(ECLWATCH_INVALID_INPUT, "invalid DFU server queue name:'%s'", dfuQueue);
-        }
+        checkValidDfuQueue(dfuQueue);
         setDFUServerQueueReq(dfuQueue, wu);
         setUserAuth(context, wu);
         wu->setCommand(DFUcmd_import);
@@ -1891,7 +1982,7 @@ bool CFileSprayEx::onSprayFixed(IEspContext &context, IEspSprayFixed &req, IEspS
             RemoteMultiFilename rmfn;
             SocketEndpoint ep(srcip);
             if (ep.isNull())
-                throw MakeStringException(ECLWATCH_INVALID_INPUT, "SprayFixed to %s: cannot resolve source network IP from %s.", destname, srcip);
+                throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "SprayFixed to %s: cannot resolve source network IP from %s.", destname, srcip);
 
             rmfn.setEp(ep);
             StringBuffer fnamebuf(srcfile);
@@ -2014,8 +2105,8 @@ bool CFileSprayEx::onSprayVariable(IEspContext &context, IEspSprayVariable &req,
         StringBuffer destFolder, destTitle, defaultFolder, defaultReplicateFolder;
 
         const char* destNodeGroup = req.getDestGroup();
-        if(destNodeGroup == NULL || *destNodeGroup == '\0')
-            throw MakeStringException(ECLWATCH_INVALID_INPUT, "Destination node group not specified.");
+        if (isEmptyString(destNodeGroup))
+            throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Destination node group not specified.");
 
         StringBuffer gName, ipAddr;
         const char *pTr = strchr(destNodeGroup, ' ');
@@ -2029,15 +2120,15 @@ bool CFileSprayEx::onSprayVariable(IEspContext &context, IEspSprayVariable &req,
 
         MemoryBuffer& srcxml = (MemoryBuffer&)req.getSrcxml();
         StringBuffer sourceIPReq, sourcePathReq;
-        readAndCheckSpraySourceReq(srcxml, req.getSourceIP(), req.getSourcePath(), sourceIPReq, sourcePathReq);
+        readAndCheckSpraySourceReq(srcxml, req.getSourceIP(), req.getSourcePath(), req.getSourcePlane(), sourceIPReq, sourcePathReq);
         const char* srcip = sourceIPReq.str();
         const char* srcfile = sourcePathReq.str();
         const char* destname = req.getDestLogicalName();
-        if(!destname || !*destname)
-            throw MakeStringException(ECLWATCH_INVALID_INPUT, "Destination file not specified.");
+        if(isEmptyString(destname))
+            throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Destination file not specified.");
         CDfsLogicalFileName lfn;
         if (!lfn.setValidate(destname))
-            throw MakeStringException(ECLWATCH_INVALID_INPUT, "invalid destination filename:'%s'", destname);
+            throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid destination filename:'%s'", destname);
 
         destname = lfn.get();
         PROGLOG("SprayVariable: DestLogicalName %s, DestGroup %s", destname, destNodeGroup);
@@ -2054,13 +2145,7 @@ bool CFileSprayEx::onSprayVariable(IEspContext &context, IEspSprayVariable &req,
         wu->setJobName(destTitle.str());
 
         const char * dfuQueue = req.getDFUServerQueue();
-        Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
-        Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
-        if (!isEmptyString(dfuQueue))
-        {
-            if (!constEnv->isValidDfuQueueName(dfuQueue))
-                throw MakeStringException(ECLWATCH_INVALID_INPUT, "invalid DFU server queue name:'%s'", dfuQueue);
-        }
+        checkValidDfuQueue(dfuQueue);
         setDFUServerQueueReq(dfuQueue, wu);
         setUserAuth(context, wu);
         wu->setCommand(DFUcmd_import);
@@ -2074,7 +2159,7 @@ bool CFileSprayEx::onSprayVariable(IEspContext &context, IEspSprayVariable &req,
             RemoteMultiFilename rmfn;
             SocketEndpoint ep(srcip);
             if (ep.isNull())
-                throw MakeStringException(ECLWATCH_INVALID_INPUT, "SprayVariable to %s: cannot resolve source network IP from %s.", destname, srcip);
+                throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "SprayVariable to %s: cannot resolve source network IP from %s.", destname, srcip);
 
             rmfn.setEp(ep);
             StringBuffer fnamebuf(srcfile);
@@ -2238,8 +2323,59 @@ bool CFileSprayEx::onReplicate(IEspContext &context, IEspReplicate &req, IEspRep
     return true;
 }
 
+void CFileSprayEx::getDropZoneInfoByDestPlane(double clientVersion, const char* destPlane, const char* destFileIn, StringBuffer& destFileOut, StringBuffer& umask, StringBuffer & hostip)
+{
+    Owned<IPropertyTree> dropZone = getDropZonePlane(destPlane);
+    if (!dropZone)
+        throw makeStringExceptionV(ECLWATCH_DROP_ZONE_NOT_FOUND, "Unknown landing zone %s", destPlane);
+
+    StringBuffer fullDropZoneDir(dropZone->queryProp("@prefix"));
+    addPathSepChar(fullDropZoneDir);
+    if (isAbsolutePath(destFileIn))
+    {
+        if (!startsWith(destFileIn, fullDropZoneDir))
+            throw makeStringExceptionV(ECLWATCH_DROP_ZONE_NOT_FOUND, "No landing zone configured for %s:%s", destPlane, destFileIn);
+    }
+    else
+    {
+        destFileOut.append(fullDropZoneDir);
+        addNonEmptyPathSepChar(destFileOut);
+    }
+    destFileOut.append(destFileIn).trim();
+    dropZone->getProp("@umask", umask);
+    const char * hostGroup = dropZone->queryProp("@hostGroup");
+    if (hostGroup)
+    {
+        Owned<IPropertyTree> match = getHostGroup(hostGroup,true);
+        if (!hostip.isEmpty())
+        {
+            // Already have hostip. Just need to check that the ip is valid for storage plane.
+            bool ipAddressMatches = false;
+            Owned<IPropertyTreeIterator> hostIter = match->getElements("hosts");
+            ForEach (*hostIter)
+            {
+                const char *knownIP = hostIter->query().queryProp(nullptr);
+                if (strcmp(knownIP, hostip)==0)
+                {
+                    ipAddressMatches=true;
+                    break;
+                }
+            }
+            if (!ipAddressMatches)
+                throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "destip %s is not valid storage plane %s", hostip.str(), destPlane);
+        }
+        else
+            hostip.set(match->queryProp("hosts[1]"));
+    }
+    else
+    {
+        hostip.set("localhost"); // storage plane will be mounted when not using hostgroup
+    }
+}
+
 void CFileSprayEx::getDropZoneInfoByIP(double clientVersion, const char* ip, const char* destFileIn, StringBuffer& destFileOut, StringBuffer& umask)
 {
+#ifndef _CONTAINERIZED
     if (destFileIn && *destFileIn)
         destFileOut.set(destFileIn);
 
@@ -2326,6 +2462,27 @@ void CFileSprayEx::getDropZoneInfoByIP(double clientVersion, const char* ip, con
         else
             LOG(MCdebugInfo, unknownJob, "No valid drop zone found for network address '%s'. Check your system drop zone configuration.", ip);
     }
+#else
+    throw makeStringException(-1, "Internal error: CFileSprayEx::getDropZoneInfoByIP should not be called in containerized environment");
+#endif
+}
+
+static StringBuffer & expandLogicalAsPhysical(StringBuffer & target, const char * name, const char * separator)
+{
+    const char * cur = name;
+    for (;;)
+    {
+        const char * colon = strstr(cur, "::");
+        if (!colon)
+            break;
+
+        //MORE: Process special characters?
+        target.append(colon - cur, cur);
+        target.append(separator);
+        cur = colon + 2;
+    }
+
+    return target.append(cur);
 }
 
 bool CFileSprayEx::onDespray(IEspContext &context, IEspDespray &req, IEspDesprayResponse &resp)
@@ -2340,17 +2497,29 @@ bool CFileSprayEx::onDespray(IEspContext &context, IEspDespray &req, IEspDespray
 
         PROGLOG("Despray %s", srcname);
         double version = context.getClientVersion();
-        const char* destip = req.getDestIP();
+        StringBuffer destip(req.getDestIP());
+        const char* destPlane = req.getDestPlane();
+#ifdef _CONTAINERIZED
+        if (isEmptyString(destPlane))
+            destPlane = req.getDestGroup();  // allow eclwatch to continue providing storage plane as 'destgroup' field
+#endif
+
         StringBuffer destPath;
+        StringBuffer implicitDestFile;
         const char* destfile = getStandardPosixPath(destPath, req.getDestPath()).str();
 
         MemoryBuffer& dstxml = (MemoryBuffer&)req.getDstxml();
         if(dstxml.length() == 0)
         {
-            if(!destip || !*destip)
-                throw MakeStringException(ECLWATCH_INVALID_INPUT, "Destination network IP not specified.");
+            if(isEmptyString(destPlane) && destip.isEmpty())
+                throw MakeStringException(ECLWATCH_INVALID_INPUT, "Destination network IP/storage plane not specified.");
+
+            //If the destination filename is not provided, calculate a relative filename from the logical filename
             if(!destfile || !*destfile)
-                throw MakeStringException(ECLWATCH_INVALID_INPUT, "Destination file not specified.");
+            {
+                expandLogicalAsPhysical(implicitDestFile, srcname, "/");
+                destfile = implicitDestFile;
+            }
         }
 
         StringBuffer srcTitle;
@@ -2367,18 +2536,27 @@ bool CFileSprayEx::onDespray(IEspContext &context, IEspDespray &req, IEspDespray
         IDFUfileSpec *source = wu->queryUpdateSource();
         IDFUfileSpec *destination = wu->queryUpdateDestination();
         IDFUoptions *options = wu->queryUpdateOptions();
+        bool preserveFileParts = req.getWrap();
 
         source->setLogicalName(srcname);
 
         if(dstxml.length() == 0)
         {
-            RemoteFilename rfn;
-            SocketEndpoint ep(destip);
-            if (ep.isNull())
-                throw MakeStringException(ECLWATCH_INVALID_INPUT, "Despray %s: cannot resolve destination network IP from %s.", srcname, destip);
-
             StringBuffer destfileWithPath, umask;
-            getDropZoneInfoByIP(version, destip, destfile, destfileWithPath, umask);
+            if (!isEmptyString(destPlane))
+                getDropZoneInfoByDestPlane(version, destPlane, destfile, destfileWithPath, umask, destip);
+            else
+                getDropZoneInfoByIP(version, destip, destfile, destfileWithPath, umask);
+
+            RemoteFilename rfn;
+            SocketEndpoint ep(destip.str());
+            if (ep.isNull())
+                throw MakeStringException(ECLWATCH_INVALID_INPUT, "Despray %s: cannot resolve destination network IP from %s.", srcname, destip.str());
+
+            //Ensure the filename is dependent on the file part if parts are being preserved
+            if (preserveFileParts && !strstr(destfileWithPath, "$P$"))
+                destfileWithPath.append("._$P$_of_$N$");
+
             rfn.setPath(ep, destfileWithPath.str());
             if (umask.length())
                 options->setUMask(umask.str());
@@ -2419,7 +2597,7 @@ bool CFileSprayEx::onDespray(IEspContext &context, IEspDespray &req, IEspDespray
         if(req.getNorecover())
             options->setNoRecover(true);
 
-        if (req.getWrap()) {
+        if (preserveFileParts) {
             options->setPush();             // I think needed for a despray
             destination->setWrap(true);
         }
@@ -2483,7 +2661,7 @@ bool CFileSprayEx::onCopy(IEspContext &context, IEspCopy &req, IEspCopyResponse 
         if (!bRoxie)
         {
             if (!lfn.setValidate(dstname))
-                throw MakeStringException(ECLWATCH_INVALID_INPUT, "invalid destination filename:'%s'", dstname);
+                throw MakeStringException(ECLWATCH_INVALID_INPUT, "Invalid destination filename:'%s'", dstname);
             dstname = lfn.get();
         }
 
@@ -2859,6 +3037,10 @@ bool CFileSprayEx::onFileList(IEspContext &context, IEspFileListRequest &req, IE
 
 bool CFileSprayEx::checkDropZoneIPAndPath(double clientVersion, const char* dropZoneName, const char* netAddr, const char* path)
 {
+#ifdef _CONTAINERIZED
+    IERRLOG("CONTAINERIZED(CFileSprayEx::checkDropZoneIPAndPath)");
+    return false;
+#else
     if (isEmptyString(netAddr) || isEmptyString(path))
         throw MakeStringException(ECLWATCH_INVALID_INPUT, "NetworkAddress or Path not defined.");
 
@@ -2881,6 +3063,7 @@ bool CFileSprayEx::checkDropZoneIPAndPath(double clientVersion, const char* drop
         }
     }
     return false;
+#endif
 }
 
 void CFileSprayEx::addDropZoneFile(IEspContext& context, IDirectoryIterator* di, const char* name, const char pathSep, IArrayOf<IEspPhysicalFileStruct>& files)
@@ -2970,6 +3153,9 @@ bool CFileSprayEx::onDropZoneFileSearch(IEspContext &context, IEspDropZoneFileSe
         if (!validNameFilter)
             throw MakeStringException(ECLWATCH_INVALID_INPUT, "Invalid Name Filter '*'");
 
+#ifdef _CONTAINERIZED
+        UNIMPLEMENTED_X("CONTAINERIZED(CFileSprayEx::onDropZoneFileSearch)");
+#else
         Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
         Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
         Owned<IConstDropZoneInfo> dropZoneInfo = constEnv->getDropZone(dropZoneName);
@@ -3017,6 +3203,7 @@ bool CFileSprayEx::onDropZoneFileSearch(IEspContext &context, IEspDropZoneFileSe
             resp.setWarning(msg.str());
         }
         resp.setFiles(files);
+#endif
     }
     catch(IException* e)
     {
@@ -3182,9 +3369,21 @@ bool CFileSprayEx::onDropZoneFiles(IEspContext &context, IEspDropZoneFilesReques
         context.ensureFeatureAccess(FILE_SPRAY_URL, SecAccess_Read, ECLWATCH_FILE_SPRAY_ACCESS_DENIED, "Permission denied.");
 
         const char* netAddress = req.getNetAddress();
+        if (!isEmptyString(netAddress))
+        {
+            IpAddress ipToCheck;
+            ipToCheck.ipset(netAddress);
+            if (ipToCheck.isNull())
+                throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid server %s specified.", netAddress);
+        }
+
         bool filesFromALinux = false;
         IArrayOf<IEspDropZone> dropZoneList;
         bool ECLWatchVisibleOnly = req.getECLWatchVisibleOnly();
+
+#ifdef _CONTAINERIZED
+        IERRLOG("CONTAINERIZED(CFileSprayEx::onDropZoneFileSearch)");
+#else
         Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
         Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
         Owned<IConstDropZoneInfoIterator> dropZoneItr = constEnv->getDropZoneIterator();
@@ -3227,6 +3426,7 @@ bool CFileSprayEx::onDropZoneFiles(IEspContext &context, IEspDropZoneFilesReques
                 dropZoneList.append(*aDropZone.getClear());
             }
         }
+#endif
 
         if (dropZoneList.ordinality())
             resp.setDropZones(dropZoneList);
@@ -3371,7 +3571,17 @@ bool CFileSprayEx::onGetSprayTargets(IEspContext &context, IEspGetSprayTargetsRe
     try
     {
         context.ensureFeatureAccess(FILE_SPRAY_URL, SecAccess_Read, ECLWATCH_FILE_SPRAY_ACCESS_DENIED, "Permission denied.");
-
+#ifdef _CONTAINERIZED
+        IArrayOf<IEspGroupNode> sprayTargets;
+        Owned<IPropertyTreeIterator> dataPlanes = getGlobalConfigSP()->getElements("storage/planes[@category='data']");
+        ForEach(*dataPlanes)
+        {
+            IPropertyTree & plane = dataPlanes->query();
+            const char * name = plane.queryProp("@name");
+            appendGroupNode(sprayTargets, name, "storage plane", false /*replicate outputs*/);
+        }
+        resp.setGroupNodes(sprayTargets);
+#else
         Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
         Owned<IConstEnvironment> environment = factory->openEnvironment();
         Owned<IPropertyTree> root = &environment->getPTree();
@@ -3425,6 +3635,7 @@ bool CFileSprayEx::onGetSprayTargets(IEspContext &context, IEspGetSprayTargetsRe
         }
 
         resp.setGroupNodes(sprayTargets);
+#endif
     }
     catch(IException* e)
     {
@@ -3450,11 +3661,15 @@ bool CFileSprayEx::onGetDFUServerQueues(IEspContext &context, IEspGetDFUServerQu
 {
     try
     {
+#ifdef _CONTAINERIZED
+        UNIMPLEMENTED_X("CONTAINERIZED(CFileSprayEx::onGetDFUServerQueues)");
+#else
         context.ensureFeatureAccess(FILE_SPRAY_URL, SecAccess_Read, ECLWATCH_FILE_SPRAY_ACCESS_DENIED, "Permission denied.");
 
         StringArray qlist;
         getDFUServerQueueNames(qlist, req.getDFUServerName());
         resp.setNames(qlist);
+#endif
     }
     catch(IException* e)
     {

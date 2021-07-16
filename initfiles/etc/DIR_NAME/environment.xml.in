@@ -87,7 +87,7 @@
                 logQueueLen="512"
                 lowTimeout="10000"
                 maxBlockSize="10000000"
-                maxHttpConnectionRequests="10"
+                maxHttpConnectionRequests="0"
                 maxHttpKeepAliveWait="5000"
                 maxLocalFilesOpen="4000"
                 maxLockAttempts="5"
@@ -120,7 +120,6 @@
                 reloadRetriesFailed="true"
                 remoteFilesExpire="3600000"
                 roxieMulticastEnabled="true"
-                serverSideCacheSize="0"
                 serverThreads="30"
                 simpleLocalKeyedJoins="true"
                 siteCertificate=""
@@ -143,8 +142,6 @@
                 traceLimit="10"
                 trapTooManyActiveQueries="true"
                 udpFlowSocketsSize="131071"
-                udpInlineCollation="false"
-                udpInlineCollationPacketLimit="50"
                 udpLocalWriteSocketSize="131071"
                 udpMaxRetryTimedoutReqs="0"
                 udpMaxSlotsPerClient="2147483647"
@@ -152,11 +149,8 @@
                 udpOutQsPriority="0"
                 udpQueueSize="100"
                 udpRequestToSendTimeout="5"
-                udpResendEnabled="false"
-                udpRetryBusySenders="0"
-                udpSendCompletedInData="false"
+                udpResendLostPackets="true"
                 udpSendQueueSize="50"
-                udpSnifferEnabled="true"
                 udpTraceLevel="1"
                 useHardLink="false"
                 useLogQueue="true"
@@ -219,8 +213,7 @@
                     monitorinterval="900"
                     monitorqueue="dfuserver_monitor_queue"
                     name="mydfuserver"
-                    queue="dfuserver_queue"
-                    transferBufferSize="65536">
+                    queue="dfuserver_queue">
    <Instance computer="localhost"
              directory="${RUNTIME_PATH}/mydfuserver"
              name="s1"
@@ -401,6 +394,11 @@
                          resource="OthersWorkunitsAccess"
                          service="ws_workunits"/>
     <AuthenticateFeature authenticate="Yes"
+                         description="Access to deploy workunits"
+                         path="DeployWorkunitsAccess"
+                         resource="DeployWorkunitsAccess"
+                         service="ws_workunits"/>
+    <AuthenticateFeature authenticate="Yes"
                          description="Access to ESDL configuration service"
                          path="ESDLConfigAccess"
                          resource="ESDLConfigAccess"
@@ -482,6 +480,11 @@
                          description="Access to others&apos; workunits"
                          path="OthersWorkunitsAccess"
                          resource="OthersWorkunitsAccess"
+                         service="ws_sql"/>
+    <AuthenticateFeature authenticate="Yes"
+                         description="Access to deploy workunits"
+                         path="DeployWorkunitsAccess"
+                         resource="DeployWorkunitsAccess"
                          service="ws_sql"/>
    </EspBinding>
    @WSSQL_SERVICE_BLOCK_E@
@@ -736,6 +739,10 @@
                          path="OthersWorkunitsAccess"
                          resource="OthersWorkunitsAccess"
                          service="ws_workunits"/>
+    <AuthenticateFeature description="Access to deploy workunits"
+                         path="DeployWorkunitsAccess"
+                         resource="DeployWorkunitsAccess"
+                         service="ws_workunits"/>
     <AuthenticateFeature description="Access to ESDL configuration service"
                          path="ESDLConfigAccess"
                          resource="ESDLConfigAccess"
@@ -840,6 +847,10 @@
     <AuthenticateFeature description="Access to others&apos; workunits"
                          path="OthersWorkunitsAccess"
                          resource="OthersWorkunitsAccess"
+                         service="ws_sql"/>
+    <AuthenticateFeature description="Access to deploy workunits"
+                         path="DeployWorkunitsAccess"
+                         resource="DeployWorkunitsAccess"
                          service="ws_sql"/>
    </Properties>
   </EspService>
@@ -1127,6 +1138,10 @@
      <AuthenticateFeature description="Access to workunits owned by others"
                           path="OthersWorkunitsAccess"
                           resource="OthersWorkunitsAccess"
+                          service="ws_workunits"/>
+     <AuthenticateFeature description="Access to deploy workunits"
+                          path="DeployWorkunitsAccess"
+                          resource="DeployWorkunitsAccess"
                           service="ws_workunits"/>
      <AuthenticateFeature description="Access to ESDL configuration service"
                           path="ESDLConfigAccess"

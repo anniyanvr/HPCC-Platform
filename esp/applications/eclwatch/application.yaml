@@ -9,10 +9,11 @@ application:
    - WsFileIO
    - WsPackageProcess
    - FileSpray
-   - ws_machine
    - ws_elk
    - ws_access
    - ws_account
    - ws_esdlconfig
    - ws_store
    - ws_codesign
+   - ws_resources
+   - WSDali

@@ -187,6 +187,10 @@ public:
     {
         ctx->checkAbort();
     }
+    virtual unsigned checkInterval() const
+    {
+        return ctx->checkInterval();
+    }
     virtual void notifyAbort(IException *E) 
     {
         ctx->notifyAbort(E);
@@ -291,9 +295,9 @@ public:
     {
         return ctx->queryOptions();
     }
-    virtual void addAgentsReplyLen(unsigned len) 
+    virtual void addAgentsReplyLen(unsigned len, unsigned duplicates, unsigned resends)
     {
-        ctx->addAgentsReplyLen(len);
+        ctx->addAgentsReplyLen(len, duplicates, resends);
     }
     virtual const char *queryAuthToken() 
     {
@@ -404,6 +408,21 @@ static const StatisticsMapping indexWriteStatistics({ StNumDuplicateKeys }, actS
 
 //=================================================================================
 
+extern SinkMode getSinkMode(const char *val)
+{
+    if (strieq(val, "parallelpersistent"))
+        return SinkMode::ParallelPersistent;
+    else if (strieq(val, "sequential"))
+        return SinkMode::Sequential;
+    else
+    {
+        if (!strieq(val, "parallel"))
+            WARNLOG("Unsupported sinkmode %s - assuming parallel", val);
+        return SinkMode::Parallel;
+    }
+}
+
+
 const static unsigned minus1U = (0U-1U);
 class CRoxieServerActivityFactoryBase : public CActivityFactory, implements IRoxieServerActivityFactory
 {
@@ -418,6 +437,7 @@ protected:
     bool optUnstableInput = false;  // is the input forced to unordered?
     bool optUnordered = false; // is the output specified as unordered?
     bool isCodeSigned = false;
+    SinkMode sinkMode = SinkMode::Parallel;
     unsigned heapFlags;
     mutable RelaxedAtomic<__int64> processed = {0};
     mutable RelaxedAtomic<__int64> started = {0};
@@ -432,6 +452,11 @@ public:
         optParallel = _graphNode.getPropInt("att[@name='parallel']/@value", 0);
         optUnordered = !_graphNode.getPropBool("att[@name='ordered']/@value", true);
         heapFlags = _graphNode.getPropInt("hint[@name='heapflags']/@value", _queryFactory.queryOptions().heapFlags);
+        const char *sinkModeText  = _graphNode.queryProp("hint[@name='sinkmode']/@value");
+        if (sinkModeText)
+            sinkMode = ::getSinkMode(sinkModeText);
+        else
+            sinkMode = _queryFactory.queryOptions().sinkMode;
         isCodeSigned = ::isActivityCodeSigned(_graphNode);
     }
     
@@ -610,6 +635,14 @@ public:
     virtual bool isActivityCodeSigned() const
     {
         return isCodeSigned;
+    }
+    virtual RecordTranslationMode getEnableFieldTranslation() const
+    {
+        return CActivityFactory::getEnableFieldTranslation();
+    }
+    virtual SinkMode getSinkMode() const override
+    {
+        return sinkMode;
     }
 };
 
@@ -1450,11 +1483,28 @@ public:
             {
                 if (state==STATEstarted || state==STATEstarting)
                 {
+                    if (ctx->queryServerContext()->okToLogStartStopError()) // && traceLevel ?
+                    {
+                        VStringBuffer err("STATE: activity %d reset without stop", activityId);
+                        ctx->queryCodeContext()->addWuException(err.str(), ROXIE_INTERNAL_ERROR, SeverityError, "roxie");
+                    }
                     if (ctx->queryOptions().failOnLeaks)
                         throw makeStringExceptionV(ROXIE_INTERNAL_ERROR, "STATE: activity %d reset without stop", activityId);
-                    if (traceStartStop || traceLevel > 2)
-                        CTXLOG("STATE: activity %d reset without stop", activityId);
-                    stop();
+                    try
+                    {
+                        stop();
+                    }
+                    catch (IException *E)
+                    {
+                        EXCLOG(E, "Unexpected exception in stop() called from reset()");
+                        printStackReport();
+                        ::Release(E);
+                    }
+                    catch (...)
+                    {
+                        DBGLOG("Unexpected unknown exception in stop() called from reset()");
+                        printStackReport();
+                    }
                 }
                 state = STATEreset;
 #ifdef TRACE_STARTSTOP
@@ -1665,7 +1715,7 @@ public:
 protected:
     RecordTranslationMode getEnableFieldTranslation() const
     {
-        return factory->queryQueryFactory().queryOptions().enableFieldTranslation;
+        return factory->getEnableFieldTranslation();
     }
 };
 
@@ -2113,27 +2163,27 @@ public:
 
 //=====================================================================================================
 
-atomic_t nextInstanceId;
+static std::atomic<unsigned> nextInstanceId;
 
 extern unsigned getNextInstanceId()
 {
-    return atomic_add_exchange(&nextInstanceId, 1)+1;
+    return ++nextInstanceId;
 }
 
-atomic_t nextRuid;
+static std::atomic<unsigned> nextRuid;
 
 ruid_t getNextRuid()
 {
-    ruid_t ret = atomic_add_exchange(&nextRuid, 1)+1;
+    ruid_t ret = ++nextRuid;
     while (ret < RUID_FIRST)
-        ret = atomic_add_exchange(&nextRuid, 1)+1; // ruids 0 and 1 are reserved for pings/unwanted discarder.
+        ret = ++nextRuid; // ruids 0 and 1 are reserved for pings/unwanted discarder.
     return ret;
 }
 
 void setStartRuid(unsigned restarts)
 {
-    atomic_set(&nextRuid, restarts * 0x10000);
-    atomic_set(&nextInstanceId, restarts * 10000);
+    nextRuid = restarts * 0x10000;
+    nextInstanceId = restarts * 10000;
 }
 
 enum { LimitSkipErrorCode = 0, KeyedLimitSkipErrorCode = 1 };
@@ -2971,10 +3021,6 @@ public:
     {
         return result != NULL;
     }
-    virtual bool hasContinuation() const 
-    {
-        return continuation != NULL;
-    }
     virtual void setDelayed(bool _delayed)
     {
         delayed = _delayed;
@@ -3381,11 +3427,11 @@ class CRemoteResultAdaptor : implements IEngineRowStream, implements IFinalRoxie
             const byte *metaInfo = (const byte *) result->getMessageMetadata(metaLen);
             if (metaLen)
             {
-                unsigned short continuationLen = *(unsigned short *) metaInfo;
-                if (continuationLen >= sizeof(bool))
+                unsigned continuationLen = *(unsigned *) metaInfo;
+                if (continuationLen >= sizeof(bool)*2)
                 {
-                    metaInfo += sizeof(unsigned short);
-                    return *(bool *) metaInfo;
+                    metaInfo += sizeof(unsigned)+sizeof(bool);
+                    return *(bool *) metaInfo;                     // The field we want is the second bool field in the continuation data, and is always stored uncompressed
                 }
             }
             return true; // if no continuation info, last row was complete.
@@ -4358,7 +4404,7 @@ public:
         merger.reset();
         pending.kill();
         if (mc && ctx)
-            ctx->addAgentsReplyLen(mc->queryBytesReceived());
+            ctx->addAgentsReplyLen(mc->queryBytesReceived(), mc->queryDuplicates(), mc->queryResends());
         mc.clear(); // Or we won't free memory for graphs that get recreated
         mu.clear(); //ditto
         deferredStart = false;
@@ -4545,18 +4591,24 @@ public:
     {
         mu.clear();
         unsigned ctxTraceLevel = activity.queryLogCtx().queryTraceLevel();
+        unsigned timeout = remoteId.isSLAPriority() ? slaTimeout : (remoteId.isHighPriority() ? highTimeout : lowTimeout);
+        unsigned checkInterval = activity.queryContext()->checkInterval();
+        if (checkInterval > timeout)
+            checkInterval = timeout;
+        unsigned lastActivity = msTick();
         for (;;)
         {
             checkDelayed();
-            unsigned timeout = remoteId.isSLAPriority() ? slaTimeout : (remoteId.isHighPriority() ? highTimeout : lowTimeout);
             activity.queryContext()->checkAbort();
             bool anyActivity;
             if (ctxTraceLevel > 5)
-                activity.queryLogCtx().CTXLOG("Calling getNextUnpacker(%d)", timeout);
-            mr.setown(mc->getNextResult(timeout, anyActivity));
+                activity.queryLogCtx().CTXLOG("Calling getNextUnpacker(%d)", checkInterval);
+            mr.setown(mc->getNextResult(checkInterval, anyActivity));
             if (ctxTraceLevel > 6)
-                activity.queryLogCtx().CTXLOG("Called getNextUnpacker(%d), activity=%d", timeout, anyActivity);
+                activity.queryLogCtx().CTXLOG("Called getNextUnpacker(%d), activity=%d", checkInterval, anyActivity);
             activity.queryContext()->checkAbort();
+            if (anyActivity)
+                lastActivity = msTick();
             if (mr)
             {
                 unsigned roxieHeaderLen;
@@ -4798,7 +4850,7 @@ public:
                                 StringBuffer s;
                                 activity.queryLogCtx().CTXLOG("Additional data size %d on query %s mergeOrder %p", metaLen, header.toString(s).str(), mergeOrder);
                             }
-                            if (*((unsigned short *) metaData) + sizeof(unsigned short) != metaLen)
+                            if (*((unsigned *) metaData) + sizeof(unsigned) != metaLen)
                             {
                                 StringBuffer s;
                                 activity.queryLogCtx().CTXLOG("Additional data size %d on query %s mergeOrder %p", metaLen, header.toString(s).str(), mergeOrder);
@@ -4808,8 +4860,8 @@ public:
 
                             MemoryBuffer nextQuery;
                             nextQuery.append(sizeof(RoxiePacketHeader), &header);
-                            nextQuery.append(metaLen, metaData);
                             nextQuery.append(op->getTraceLength(), op->queryTraceInfo());
+                            nextQuery.append(metaLen, metaData);
                             nextQuery.append(op->getContextLength(), op->queryContextData());
                             if (resendSequence == CONTINUESEQUENCE_MAX)
                             {
@@ -4848,9 +4900,9 @@ public:
             }
             else
             {
-                if (!anyActivity && !localAgent)
+                if (!anyActivity && !localAgent && (msTick()-lastActivity >= timeout))
                 {
-                    activity.queryLogCtx().CTXLOG("Input has stalled - retry required?");
+                    activity.queryLogCtx().CTXLOG("Input has stalled for %u ms - retry required?", timeout);
                     retryPending();
                 }
             }
@@ -7542,7 +7594,8 @@ class CRoxieServerHashDedupActivity : public CRoxieServerActivity
         virtual ~HashDedupTable()
         {
             //elementRowAllocator is a unique allocator, so all rows can be freed in a single call
-            elementRowAllocator->releaseAllRows();
+            if (elementRowAllocator)
+                elementRowAllocator->releaseAllRows();
             tablecount = 0;
         }
 
@@ -11536,8 +11589,6 @@ protected:
             OwnedRoxieString cluster(helper.getCluster(clusterIdx));
             if(!cluster)
                 break;
-            if (isContainerized())
-                throw makeStringException(0, "Output clusters not supported in cloud environment");
             clusters.append(cluster);
             clusterIdx++;
         }
@@ -11548,12 +11599,9 @@ protected:
         }
         else
         {
-            if (isContainerized() && fileNameServiceDali)
-            {
-                StringBuffer nasGroupName;
-                queryNamedGroupStore().getNasGroupName(nasGroupName, 1);
-                clusters.append(nasGroupName);
-            }
+            StringBuffer defaultCluster;
+            if (getDefaultStoragePlane(defaultCluster))
+                clusters.append(defaultCluster);
             else if (roxieName.length())
                 clusters.append(roxieName.str());
             else
@@ -11689,9 +11737,7 @@ public:
         {
             // caller has already set @size from file size...
             fileProps.setPropBool("@blockCompressed", true);
-            fileProps.setPropInt64("@compressedSize", partProps.getPropInt64("@size", 0));
             partProps.setPropInt64("@compressedSize", partProps.getPropInt64("@size", 0));
-            fileProps.setPropInt64("@size", uncompressedBytesWritten);
             partProps.setPropInt64("@size", uncompressedBytesWritten);
         }
         else if (tallycrc && crc.get())
@@ -12030,20 +12076,15 @@ class CRoxieServerIndexWriteActivity : public CRoxieServerInternalSinkActivity, 
             OwnedRoxieString cluster(helper.getCluster(clusterIdx));
             if(!cluster)
                 break;
-            if (isContainerized())
-                throw makeStringException(0, "Output clusters not supported in cloud environment");
             clusters.append(cluster);
             clusterIdx++;
         }
 
         if (!clusters.length())
         {
-            if (isContainerized() && fileNameServiceDali)
-            {
-                StringBuffer nasGroupName;
-                queryNamedGroupStore().getNasGroupName(nasGroupName, 1);
-                clusters.append(nasGroupName);
-            }
+            StringBuffer defaultCluster;
+            if (getDefaultStoragePlane(defaultCluster))
+                clusters.append(defaultCluster);
             else if (roxieName.length())
                 clusters.append(roxieName.str());
             else
@@ -21357,8 +21398,8 @@ public:
                 // In absense of OPT_OUTPUTLIMIT check pre 5.2 legacy name OPT_OUTPUTLIMIT_LEGACY
                 outputLimit = workunit->getDebugValueInt(OPT_OUTPUTLIMIT, workunit->getDebugValueInt(OPT_OUTPUTLIMIT_LEGACY, defaultDaliResultLimit));
             }
-            if (outputLimit>defaultDaliResultOutputMax)
-                throw MakeStringException(0, "Dali result outputs are restricted to a maximum of %d MB, the current limit is %d MB. A huge dali result usually indicates the ECL needs altering.", defaultDaliResultOutputMax, defaultDaliResultLimit);
+            if (outputLimit>daliResultOutputMax)
+                throw MakeStringException(0, "Dali result outputs are restricted to a maximum of %d MB, the current limit is %d MB. A huge dali result usually indicates the ECL needs altering.", daliResultOutputMax, defaultDaliResultLimit);
             assertex(outputLimit<=0x1000); // 32bit limit because MemoryBuffer/CMessageBuffers involved etc.
             outputLimitBytes = outputLimit * 0x100000;
         }
@@ -25127,7 +25168,7 @@ class CJoinGroup : public CInterface
 protected:
     const void *left;                   // LHS row
     PointerArrayOf<KeyedJoinHeader> rows;           // matching RHS rows
-    atomic_t endMarkersPending; // How many agent responses still waiting for
+    std::atomic<unsigned> endMarkersPending; // How many agent responses still waiting for
     CJoinGroup *groupStart;     // Head of group, or NULL if not grouping
     unsigned lastPartNo;
     unsigned pos;
@@ -25161,9 +25202,9 @@ public:
         groupStart = _groupStart;
         if (_groupStart)
         {
-            atomic_inc(&_groupStart->endMarkersPending);
+            ++_groupStart->endMarkersPending;
         }
-        atomic_set(&endMarkersPending, 1);
+        endMarkersPending = 1;
     }
 
     ~CJoinGroup()
@@ -25186,7 +25227,7 @@ public:
 
     inline bool complete() const
     {
-        return atomic_read(&endMarkersPending) == 0;
+        return endMarkersPending == 0;
     }
 
 #ifdef TRACE_JOINGROUPS
@@ -25196,9 +25237,9 @@ public:
 #endif
     {
         assert(!complete());
-        atomic_inc(&endMarkersPending);
+        ++endMarkersPending;
 #ifdef TRACE_JOINGROUPS
-        DBGLOG("CJoinGroup::notePending %p from %d, count became %d group count %d", this, lineNo, atomic_read(&endMarkersPending), groupStart ? atomic_read(&groupStart->endMarkersPending) : 0);
+        DBGLOG("CJoinGroup::notePending %p from %d, count became %d group count %d", this, lineNo, endMarkersPending.load(), groupStart ? groupStart->endMarkersPending.load() : 0);
 #endif
     }
 
@@ -25226,16 +25267,16 @@ public:
             candidates += candidateCount;
         }
 #ifdef TRACE_JOINGROUPS
-        DBGLOG("CJoinGroup::noteEndReceived %p from %d, candidates %d + %d, my count was %d, group count was %d", this, lineNo, candidates, candidateCount, atomic_read(&endMarkersPending), groupStart ? atomic_read(&groupStart->endMarkersPending) : 0);
+        DBGLOG("CJoinGroup::noteEndReceived %p from %d, candidates %d + %d, my count was %d, group count was %d", this, lineNo, candidates, candidateCount, endMarkersPending.load(), groupStart ? groupStart->endMarkersPending.load() : 0);
 #endif
         // NOTE - as soon as endMarkersPending and groupStart->endMarkersPending are decremented to zero this object may get released asynchronously by other threads
         // There must therefore be nothing in this method after them that acceses member variables. Think of it as a delete this...
         // In particular, we can't safely reference groupStart after the dec_and_test of endMarkersPending, hence copy local first 
         CJoinGroup *localGroupStart = groupStart;
-        if (atomic_dec_and_test(&endMarkersPending))
+        if (--endMarkersPending == 0)
         {
             if (localGroupStart)
-                return atomic_dec_and_test(&localGroupStart->endMarkersPending);
+                return --localGroupStart->endMarkersPending == 0;
             else
                 return true;
         }
@@ -26810,6 +26851,7 @@ public:
             }
             catch (IException *E)
             {
+                E = makeWrappedException(E);
                 ctx->notifyAbort(E);
                 exception.set(E);
                 abort();
@@ -26856,23 +26898,30 @@ public:
         ActivityTimer t(activityStats, timeActivities);
         if(eof) return NULL;
 
-        if (soaphelper == NULL)
+        try
         {
-            if (factory->getKind()==TAKhttp_rowdataset)
-                soaphelper.setown(createHttpCallHelper(this, rowAllocator, authToken.str(), SCrow, pClientCert, *this, this));
-            else
-                soaphelper.setown(createSoapCallHelper(this, rowAllocator, authToken.str(), SCrow, pClientCert, *this, this));
-            soaphelper->start();
-        }
+            if (soaphelper == NULL)
+            {
+                if (factory->getKind()==TAKhttp_rowdataset)
+                    soaphelper.setown(createHttpCallHelper(this, rowAllocator, authToken.str(), SCrow, pClientCert, *this, this));
+                else
+                    soaphelper.setown(createSoapCallHelper(this, rowAllocator, authToken.str(), SCrow, pClientCert, *this, this));
+                soaphelper->start();
+            }
 
-        OwnedConstRoxieRow ret = soaphelper->getRow();
-        if (!ret)
-        {
-            eof = true;
-            return NULL;
+            OwnedConstRoxieRow ret = soaphelper->getRow();
+            if (!ret)
+            {
+                eof = true;
+                return NULL;
+            }
+            ++processed;
+            return ret.getClear();
         }
-        ++processed;
-        return ret.getClear();
+        catch (IException *E)
+        {
+            throw makeWrappedException(E);
+        }
     }
 };
 
@@ -26991,20 +27040,27 @@ public:
         ActivityTimer t(activityStats, timeActivities);
         if(eof) return NULL;
 
-        if (soaphelper == NULL)
+        try
         {
-            soaphelper.setown(createSoapCallHelper(this, rowAllocator, authToken.str(), SCdataset, pClientCert, *this, this));
-            soaphelper->start();
-        }
+            if (soaphelper == NULL)
+            {
+                soaphelper.setown(createSoapCallHelper(this, rowAllocator, authToken.str(), SCdataset, pClientCert, *this, this));
+                soaphelper->start();
+            }
 
-        OwnedConstRoxieRow ret = soaphelper->getRow();
-        if (!ret)
-        {
-            eof = true;
-            return NULL;
+            OwnedConstRoxieRow ret = soaphelper->getRow();
+            if (!ret)
+            {
+                eof = true;
+                return NULL;
+            }
+            ++processed;
+            return ret.getClear();
         }
-        ++processed;
-        return ret.getClear();
+        catch (IException *E)
+        {
+            throw makeWrappedException(E);
+        }
     }
 };
 
@@ -27352,6 +27408,7 @@ protected:
     IRoxieServerActivity *parentActivity;
     unsigned id;
     unsigned loopCounter;
+    SinkMode sinkMode = SinkMode::Parallel;
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -27365,6 +27422,10 @@ public:
         loopCounter = 0;
         graphAgentContext.setCodeContext(&graphCodeContext);
         graphCodeContext.setContainer(&graphAgentContext, this);
+        if (parentActivity)
+            sinkMode = parentActivity->queryFactory()->getSinkMode();
+        else
+            sinkMode = _ctx->queryOptions().sinkMode;
     }
 
     ~CActivityGraph()
@@ -27544,68 +27605,73 @@ public:
         if (sinks.ordinality()==1)
             sinks.item(0).execute(parentExtractSize, parentExtract);
 #ifdef PARALLEL_EXECUTE
-        else if (!probeManager && !graphDefinition.isSequential())
+        else if (!probeManager && !graphDefinition.isSequential() && sinkMode != SinkMode::Sequential)
         {
-#ifdef PARALLEL_PERSISTANT_THREADS
-            if (!threads.ordinality())
+            if (sinkMode == SinkMode::ParallelPersistent)
             {
-                for (unsigned i = 0; i < sinks.ordinality()-1; i++)
+                if (!threads.ordinality())
                 {
-                    threads.append(*new SinkThread(*this, sinks.item(i)));
+                    for (unsigned i = 0; i < sinks.ordinality()-1; i++)
+                    {
+                        threads.append(*new SinkThread(*this, sinks.item(i)));
+                    }
                 }
-            }
-            for (unsigned i = 0; i < sinks.ordinality()-1; i++)
-                threads.item(i).start(parentExtractSize, parentExtract);
-            try
-            {
-                sinks.item(sinks.ordinality()-1).execute(parentExtractSize, parentExtract);
-            }
-            catch (IException *E)
-            {
-                noteException(E);
-                E->Release();
-            }
-            for (unsigned i = 0; i < sinks.ordinality()-1; i++)
-            {
+                for (unsigned i = 0; i < sinks.ordinality()-1; i++)
+                    threads.item(i).start(parentExtractSize, parentExtract);
                 try
                 {
-                    threads.item(i).join();
+                    sinks.item(sinks.ordinality()-1).execute(parentExtractSize, parentExtract);
                 }
                 catch (IException *E)
                 {
                     noteException(E);
                     E->Release();
                 }
-            }
-            checkAbort();
- #else
-            class casyncfor: public CAsyncFor
-            {
-            public:
-                IActivityGraph &parent;
-                unsigned parentExtractSize;
-                const byte * parentExtract;
-
-                casyncfor(IRoxieServerActivityCopyArray &_sinks, IActivityGraph &_parent, unsigned _parentExtractSize, const byte * _parentExtract) : 
-                    sinks(_sinks), parent(_parent), parentExtractSize(_parentExtractSize), parentExtract(_parentExtract) { }
-                void Do(unsigned i)
+                for (unsigned i = 0; i < sinks.ordinality()-1; i++)
                 {
                     try
                     {
-                        sinks.item(i).execute(parentExtractSize, parentExtract);
+                        threads.item(i).join();
                     }
                     catch (IException *E)
                     {
-                        parent.noteException(E);
-                        throw;
+                        noteException(E);
+                        E->Release();
                     }
                 }
-            private:
-                IRoxieServerActivityCopyArray &sinks;
-            } afor(sinks, *this, parentExtractSize, parentExtract);
-            afor.For(sinks.ordinality(), sinks.ordinality());
-#endif
+                checkAbort();
             }
+            else if (sinkMode == SinkMode::Parallel)
+            {
+                class casyncfor: public CAsyncFor
+                {
+                public:
+                    IActivityGraph &parent;
+                    unsigned parentExtractSize;
+                    const byte * parentExtract;
+
+                    casyncfor(IRoxieServerActivityCopyArray &_sinks, IActivityGraph &_parent, unsigned _parentExtractSize, const byte * _parentExtract) :
+                        parent(_parent), parentExtractSize(_parentExtractSize), parentExtract(_parentExtract), sinks(_sinks) { }
+                    void Do(unsigned i)
+                    {
+                        try
+                        {
+                            sinks.item(i).execute(parentExtractSize, parentExtract);
+                        }
+                        catch (IException *E)
+                        {
+                            parent.noteException(E);
+                            throw;
+                        }
+                    }
+                private:
+                    IRoxieServerActivityCopyArray &sinks;
+                } afor(sinks, *this, parentExtractSize, parentExtract);
+                afor.For(sinks.ordinality(), sinks.ordinality());
+            }
+            else
+                throwUnexpected();
+        }
 #endif
         else
         {

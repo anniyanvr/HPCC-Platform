@@ -180,10 +180,10 @@ public:
         if (useAeron)
         {
             SocketEndpoint myEP(7000, myNode.getIpAddress());
-            rcvMgr.setown(createAeronReceiveManager(myEP));
+            rcvMgr.setown(createAeronReceiveManager(myEP, false));
         }
         else
-            rcvMgr.setown(createReceiveManager(7000, 7001, 7002, 7003, multicastIP, udpQueueSize, maxPacketsPerSender));
+            rcvMgr.setown(createReceiveManager(7000, 7001, 7002, udpQueueSize, maxPacketsPerSender, false));
         Owned<roxiemem::IRowManager> rowMgr = roxiemem::createRowManager(0, NULL, queryDummyContextLogger(), NULL, false);
         Owned<IMessageCollator> collator = rcvMgr->createMessageCollator(rowMgr, 1);
         unsigned lastReport = 0;
@@ -291,9 +291,9 @@ void testNxN()
         maxPacketsPerSender = udpQueueSize;
     Owned <ISendManager> sendMgr;
     if (useAeron)
-        sendMgr.setown(createAeronSendManager(7000, udpNumQs, myNode.getIpAddress()));
+        sendMgr.setown(createAeronSendManager(7000, udpNumQs, myNode.getIpAddress(), false));
     else
-        sendMgr.setown(createSendManager(7000, 7001, 7002, 7003, multicastIP, 100, udpNumQs, NULL));
+        sendMgr.setown(createSendManager(7000, 7001, 7002, 100, udpNumQs, NULL, false));
     Receiver receiver;
 
     IMessagePacker **packers = new IMessagePacker *[numNodes];
@@ -681,13 +681,6 @@ int main(int argc, char * argv[] )
                     usage();
                 udpLocalWriteSocketSize = atoi(argv[c]);
             }
-            else if (strcmp(ip, "--udpRetryBusySenders")==0)
-            {
-                c++;
-                if (c==argc)
-                    usage();
-                udpRetryBusySenders = atoi(argv[c]);
-            }
             else if (strcmp(ip, "--maxPacketsPerSender")==0)
             {
                 c++;
@@ -695,26 +688,12 @@ int main(int argc, char * argv[] )
                     usage();
                 maxPacketsPerSender = atoi(argv[c]);
             }
-            else if (strcmp(ip, "--udpSnifferEnabled")==0)
-            {
-                c++;
-                if (c==argc)
-                    usage();
-                udpSnifferEnabled = atoi(argv[c]) != 0;
-            }
             else if (strcmp(ip, "--udpTraceLevel")==0)
             {
                 c++;
                 if (c==argc)
                     usage();
                 udpTraceLevel = atoi(argv[c]);
-            }
-            else if (strcmp(ip, "--udpTraceCategories")==0)
-            {
-                c++;
-                if (c==argc)
-                    usage();
-                udpTraceCategories = atoi(argv[c]);
             }
             else if (strcmp(ip, "--dontSendToSelf")==0)
             {

@@ -736,9 +736,15 @@ class JlibTimingTest : public CppUnit::TestFixture
         CPPUNIT_TEST(testMsTick);
         CPPUNIT_TEST(testGetCyclesNow);
         CPPUNIT_TEST(testStdChrono);
+        CPPUNIT_TEST(testGetTimeOfDay);
+        CPPUNIT_TEST(testClockGetTimeReal);
+        CPPUNIT_TEST(testClockGetTimeMono);
+        CPPUNIT_TEST(testTimestampNow);
     CPPUNIT_TEST_SUITE_END();
 
 public:
+    static constexpr unsigned scale = 10;
+    static constexpr unsigned iters = 1000000 * scale;
     JlibTimingTest()
     {
     }
@@ -747,25 +753,72 @@ public:
     {
         unsigned startTime = msTick();
         unsigned value = 0;
-        for (unsigned i=0; i < 1000000; i++)
+        for (unsigned i=0; i < iters; i++)
             value += msTick();
-        printf("msTick() %uns = %u\n", msTick()-startTime, value);
+        printf("msTick() %uns = %u\n", (msTick()-startTime)/scale, value);
     }
     void testGetCyclesNow()
     {
         unsigned startTime = msTick();
         unsigned value = 0;
-        for (unsigned i=0; i < 1000000; i++)
+        for (unsigned i=0; i < iters; i++)
             value += get_cycles_now();
-        printf("get_cycles_now() %uns = %u\n", msTick()-startTime, value);
+        printf("get_cycles_now() %uns = %u\n", (msTick()-startTime)/scale, value);
     }
     void testStdChrono()
     {
         unsigned startTime = msTick();
         unsigned value = 0;
-        for (unsigned i=0; i < 1000000; i++)
+        for (unsigned i=0; i < iters; i++)
             value += std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        printf("std::chrono::high_resolution_clock::now() %uns = %u\n", msTick()-startTime, value);
+        printf("std::chrono::high_resolution_clock::now() %uns = %u\n", (msTick()-startTime)/scale, value);
+    }
+    void testGetTimeOfDay()
+    {
+        unsigned startTime = msTick();
+        struct timeval tv;
+        unsigned value = 0;
+        for (unsigned i=0; i < iters; i++)
+        {
+            gettimeofday(&tv, NULL);
+            value += tv.tv_sec;
+        }
+        printf("gettimeofday() %uns = %u\n", (msTick()-startTime)/scale, value);
+    }
+    void testClockGetTimeReal()
+    {
+        unsigned startTime = msTick();
+        struct timespec ts;
+        unsigned value = 0;
+        for (unsigned i=0; i < iters; i++)
+        {
+            clock_gettime(CLOCK_REALTIME, &ts);
+            value += ts.tv_sec;
+        }
+        printf("clock_gettime(REALTIME) %uns = %u\n", (msTick()-startTime)/scale, value);
+    }
+    void testClockGetTimeMono()
+    {
+        unsigned startTime = msTick();
+        struct timespec ts;
+        unsigned value = 0;
+        for (unsigned i=0; i < iters; i++)
+        {
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            value += ts.tv_sec;
+        }
+        printf("clock_gettime(MONOTONIC) %uns = %u\n", (msTick()-startTime)/scale, value);
+    }
+    void testTimestampNow()
+    {
+        unsigned startTime = msTick();
+        struct timespec ts;
+        unsigned value = 0;
+        for (unsigned i=0; i < iters; i++)
+        {
+            value += getTimeStampNowValue();
+        }
+        printf("getTimeStampNowValue() %uns = %u\n", (msTick()-startTime)/scale, value);
     }
 };
 
@@ -1272,6 +1325,7 @@ class JlibIPTTest : public CppUnit::TestFixture
         CPPUNIT_TEST(testRootArrayMarkup);
         CPPUNIT_TEST(testArrayMarkup);
         CPPUNIT_TEST(testMergeConfig);
+        CPPUNIT_TEST(testRemoveReuse);
     CPPUNIT_TEST_SUITE_END();
 
 public:
@@ -1975,6 +2029,23 @@ subX:
             ++match;
         }
     }
+    void testRemoveReuse()
+    {
+        Owned<IPropertyTree> t = createPTree();
+        t->addPropInt("a", 1);
+        t->addPropInt("a", 2);
+        Owned<IPropertyTree> a1 = t->getPropTree("a[1]");
+        Owned<IPropertyTree> a2 = t->getPropTree("a[2]");
+        CPPUNIT_ASSERT(t->removeProp("a[2]"));
+        CPPUNIT_ASSERT(t->removeProp("a"));
+        CPPUNIT_ASSERT(!a1->isArray(nullptr));
+        CPPUNIT_ASSERT(!a2->isArray(nullptr));
+        IPropertyTree *na2 = t->addPropTree("na", a2.getClear());
+        CPPUNIT_ASSERT(!na2->isArray(nullptr));
+        IPropertyTree *na1 = t->addPropTree("na", a1.getClear());
+        CPPUNIT_ASSERT(na1->isArray(nullptr));
+        CPPUNIT_ASSERT(na2->isArray(nullptr));
+    }
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION(JlibIPTTest);
@@ -2459,6 +2530,85 @@ public:
 
 CPPUNIT_TEST_SUITE_REGISTRATION( JlibFriendlySizeTest );
 CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibFriendlySizeTest, "JlibFriendlySizeTest" );
+
+
+static stat_type readCheckStatisticValue(const char * cur, StatisticMeasure measure)
+{
+    const char * end = nullptr;
+    stat_type ret = readStatisticValue(cur, &end, measure);
+    CPPUNIT_ASSERT(end && *end == '!');
+    return ret;
+}
+
+class JlibStatsTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(JlibStatsTest);
+        CPPUNIT_TEST(test);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void test()
+    {
+        StringBuffer temp;
+        CPPUNIT_ASSERT(readCheckStatisticValue("100s!", SMeasureTimeNs) ==  U64C(100000000000));
+        CPPUNIT_ASSERT(readCheckStatisticValue("100ms!", SMeasureTimeNs) == U64C(100000000));
+        CPPUNIT_ASSERT(readCheckStatisticValue("100us!", SMeasureTimeNs) == U64C(100000));
+        CPPUNIT_ASSERT(readCheckStatisticValue("100ns!", SMeasureTimeNs) == U64C(100));
+
+        CPPUNIT_ASSERT_EQUAL(U64C(1000000000), readCheckStatisticValue("0:0:1!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(60000000000), readCheckStatisticValue("0:1:0!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(3600000000000), readCheckStatisticValue("1:0:0!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(3600123456789), readCheckStatisticValue("1:0:0.123456789!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(1000), readCheckStatisticValue("0:0:0.000001!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(3600000000000), readCheckStatisticValue("1:0:0!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(86412123456789), readCheckStatisticValue("1d 0:0:12.123456789!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(86460123456789), readCheckStatisticValue("1d 0:1:0.123456789!", SMeasureTimeNs));
+
+        CPPUNIT_ASSERT_EQUAL(U64C(1000), readCheckStatisticValue("1970-01-01T00:00:00.001Z!", SMeasureTimestampUs));
+        CPPUNIT_ASSERT_EQUAL(std::string("1970-01-01T00:00:00.001Z"), std::string(formatStatistic(temp.clear(), 1000, SMeasureTimestampUs)));
+        CPPUNIT_ASSERT_EQUAL(U64C(1608899696789000), readCheckStatisticValue("2020-12-25T12:34:56.789Z!", SMeasureTimestampUs));
+        CPPUNIT_ASSERT_EQUAL(std::string("2020-12-25T12:34:56.789Z"), std::string(formatStatistic(temp.clear(), U64C(1608899696789000), SMeasureTimestampUs)));
+        CPPUNIT_ASSERT_EQUAL(U64C(1608899696789000), readCheckStatisticValue("1608899696789000!", SMeasureTimestampUs));
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( JlibStatsTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibStatsTest, "JlibStatsTest" );
+
+class HashTableTests : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE( HashTableTests );
+        CPPUNIT_TEST(testTimedCache);
+    CPPUNIT_TEST_SUITE_END();
+
+    void testTimedCache()
+    {
+        unsigned hv = 0;
+        unsigned __int64 inputHvSum = 0;
+        unsigned __int64 lookupHvSum = 0;
+        CTimeLimitedCache<unsigned, unsigned> cache(100); // 100ms timeout
+        for (unsigned i=0; i<10; i++)
+        {
+            hv = hashc((const byte *)&i,sizeof(i), hv);
+            inputHvSum += hv;
+            cache.add(i, hv);
+            unsigned lookupHv;
+            CPPUNIT_ASSERT(cache.get(i, lookupHv));
+            lookupHvSum += lookupHv;
+        }
+        CPPUNIT_ASSERT(inputHvSum == lookupHvSum);
+        MilliSleep(50);
+        CPPUNIT_ASSERT(nullptr != cache.query(0, true)); // touch
+        MilliSleep(60);
+        // all except 0 that was touched should have expired
+        CPPUNIT_ASSERT(nullptr != cache.query(0));
+        for (unsigned i=1; i<10; i++)
+            CPPUNIT_ASSERT(nullptr == cache.query(i));
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( HashTableTests );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( HashTableTests, "HashTableTests" );
 
 
 #endif // _USE_CPPUNIT

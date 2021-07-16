@@ -173,6 +173,7 @@ private:
     CriticalSection daliConnectionCrit;
     Owned<IUserDescriptor> userdesc;
     InterruptableSemaphore disconnectSem;
+    CriticalSection watchersCrit;
     IArrayOf<IDaliPackageWatcher> watchers;
     CSDSServerStatus *serverStatus;
 
@@ -726,14 +727,18 @@ public:
 
     virtual void releaseSubscription(IDaliPackageWatcher *subscription)
     {
-        watchers.zap(*subscription);
         subscription->unsubscribe();
+        CriticalBlock b(watchersCrit);
+        watchers.zap(*subscription);
     }
 
     IDaliPackageWatcher *getSubscription(const char *id, const char *xpath, ISafeSDSSubscription *notifier, bool exact)
     {
         IDaliPackageWatcher *watcher = new CDaliPackageWatcher(id, xpath, notifier);
-        watchers.append(*LINK(watcher));
+        {
+            CriticalBlock b(watchersCrit);
+            watchers.append(*LINK(watcher));
+        }
         if (isConnected)
             watcher->subscribe(exact);
         return watcher;
@@ -795,10 +800,19 @@ public:
                     serverStatus->queryProperties()->setProp("@cluster", roxieName.str());
                     serverStatus->commitProperties();
                     isConnected = true; // Make sure this is set before the onReconnect calls, so that they refresh with info from Dali rather than from cache
-                    ForEachItemIn(idx, watchers)
+                    IArrayOf<IDaliPackageWatcher> watchersToReconnect;
                     {
-                        watchers.item(idx).onReconnect();
+                        CriticalBlock b(watchersCrit);
+                        ForEachItemIn(idx, watchers)
+                        {
+                            watchersToReconnect.append(OLINK(watchers.item(idx)));
+                        }
                     }
+                    ForEachItemIn(idx, watchersToReconnect)
+                    {
+                        watchersToReconnect.item(idx).onReconnect();
+                    }
+
                 }
                 catch(IException *e)
                 {

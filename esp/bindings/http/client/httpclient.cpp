@@ -28,8 +28,10 @@
 #include "bindutil.hpp"
 #include "espplugin.ipp"
 #include "SOAP/Platform/soapmessage.hpp"
+#include "txsummary.hpp"
 
 static Owned<CHttpClientContext> theHttpClientContext;
+static MapStringToMyClass<CHttpClientContext> httpClientContextsUsingSecrets;
 static CriticalSection httpCrit;
 
 MODULE_INIT(INIT_PRIORITY_STANDARD)
@@ -40,6 +42,7 @@ MODULE_INIT(INIT_PRIORITY_STANDARD)
 MODULE_EXIT()
 {
     theHttpClientContext.clear();
+    httpClientContextsUsingSecrets.kill();
 }
 
 /*************************************************************************
@@ -101,12 +104,12 @@ IHttpClient* CHttpClientContext::createHttpClient(const char* proxy, const char*
 
             if(m_config.get() == NULL)
             {
-                createSecureSocketContext_t xproc = NULL;
-                xproc = (createSecureSocketContext_t) pplg->getProcAddress("createSecureSocketContext");
+                createSecureSocketContextSecret_t xproc = NULL;
+                xproc = (createSecureSocketContextSecret_t) pplg->getProcAddress("createSecureSocketContextSecret");
                 if (xproc)
-                    m_ssctx.setown(xproc(ClientSocket));
+                    m_ssctx.setown(xproc(m_mtls_secret.str(), ClientSocket));
                 else
-                    throw MakeStringException(-1, "procedure createSecureSocketContext can't be loaded");
+                    throw MakeStringException(-1, "procedure createSecureSocketContextSecret can't be loaded");
             }
             else
             {
@@ -402,15 +405,8 @@ HttpClientErrCode CHttpClient::sendRequest(const char* method, const char* conte
     {
         StringBuffer uidpair;
         uidpair.append(m_userid.get()).append(":").append(m_password.get());
-        StringBuffer result;
-        JBASE64_Encode(uidpair.str(), uidpair.length(), result, false);
         StringBuffer authhdr("Basic ");
-
-        //Remove the \n from the end of the encoded string.
-        //Should it even be there??
-        result.setCharAt(result.length() - 1,0);
-
-        authhdr.append(result.str());
+        JBASE64_Encode(uidpair.str(), uidpair.length(), authhdr, false);
         httprequest->addHeader("Authorization", authhdr.str());
     }
     if(m_realm.length() > 0)
@@ -647,13 +643,13 @@ int CHttpClient::sendRequest(IProperties *headers, const char* method, const cha
     return static_cast<int>(ret);
 }
 
-HttpClientErrCode CHttpClient::sendRequest(IProperties *headers, const char* method, const char* contenttype, StringBuffer& content, StringBuffer& responseContent, StringBuffer& responseStatus, bool alwaysReadContent, bool forceNewConnection)
+IHttpMessage *CHttpClient::sendRequestEx(const char* method, const char* contenttype, StringBuffer& content, HttpClientErrCode &code, StringBuffer &errmsg, IProperties *headers, bool alwaysReadContent, bool forceNewConnection)
 {
-    StringBuffer errmsg;
     if (connect(errmsg, forceNewConnection) < 0)
     {
-        responseContent.append(errmsg);
-        return HttpClientErrCode::Error;
+        errmsg.append(errmsg);
+        code = HttpClientErrCode::Error;
+        return nullptr;
     }
 
     Owned<CHttpRequest> httprequest;
@@ -662,21 +658,15 @@ HttpClientErrCode CHttpClient::sendRequest(IProperties *headers, const char* met
     httprequest.setown(new CHttpRequest(*m_socket));
     httpresponse.setown(new CHttpResponse(*m_socket));
 
+    if(m_proxy.length() <= 0)
+        httprequest->setPath(m_path.get());
+    else
+        httprequest->setPath(m_url.get());
+
     httprequest->setMethod(method);
     httprequest->setVersion("HTTP/1.1");
-
-    if(m_proxy.length() <= 0)
-    {
-        httprequest->setPath(m_path.get());
-    }
-    else
-    {
-        httprequest->setPath(m_url.get());
-    }
-
     httprequest->setHost(m_host.get());
     httprequest->setPort(m_port);
-
     httprequest->setContentType(contenttype);
 
     bool alreadyEncoded = false;
@@ -707,11 +697,8 @@ HttpClientErrCode CHttpClient::sendRequest(IProperties *headers, const char* met
     {
         StringBuffer uidpair;
         uidpair.append(m_userid.get()).append(":").append(m_password.get());
-        StringBuffer result;
-        JBASE64_Encode(uidpair.str(), uidpair.length(), result, false);
         StringBuffer authhdr("Basic ");
-
-        authhdr.append(result.str());
+        JBASE64_Encode(uidpair.str(), uidpair.length(), authhdr, false);
         httprequest->addHeader("Authorization", authhdr.str());
     }
     if(m_realm.length() > 0)
@@ -749,7 +736,10 @@ HttpClientErrCode CHttpClient::sendRequest(IProperties *headers, const char* met
     m_exceptions.setown(MakeMultiException());
     int ret = httpresponse->receive(alwaysReadContent, m_exceptions);
     if (ret < 0 && m_isPersistentSocket && httpresponse->getPeerClosed())
-        return HttpClientErrCode::PeerClosed;
+    {
+        code = HttpClientErrCode::PeerClosed;
+        return nullptr;
+    }
 
 #ifdef COOKIE_HANDLING
     if(m_context)
@@ -766,16 +756,27 @@ HttpClientErrCode CHttpClient::sendRequest(IProperties *headers, const char* met
     }
 #endif
 
-    httpresponse->getContent(responseContent);
-    httpresponse->getStatus(responseStatus);
-
     m_persistable = httpresponse->getPersistentEligible();
     m_numRequests++;
+
+    code = HttpClientErrCode::OK;
+    return httpresponse.getClear();
+}
+
+HttpClientErrCode CHttpClient::sendRequest(IProperties *headers, const char* method, const char* contenttype, StringBuffer& content, StringBuffer& responseContent, StringBuffer& responseStatus, bool alwaysReadContent, bool forceNewConnection)
+{
+    HttpClientErrCode code = HttpClientErrCode::OK;
+    Owned<IHttpMessage> resp = sendRequestEx(method, contenttype, content, code, responseContent, headers, alwaysReadContent, forceNewConnection);
+    if (!resp || code != HttpClientErrCode::OK)
+        return code;
+
+    resp->getContent(responseContent);
+    resp->getStatus(responseStatus);
 
     if (getEspLogLevel()>LogNormal)
         DBGLOG("Response content: %s", responseContent.str());
 
-    return HttpClientErrCode::OK;
+    return code;
 }
 
 int CHttpClient::sendRequest(const char* method, const char* contenttype, StringBuffer& request, StringBuffer& response, StringBuffer& responseStatus, bool alwaysReadContent)
@@ -894,15 +895,8 @@ HttpClientErrCode CHttpClient::postRequest(ISoapMessage &req, ISoapMessage& resp
     {
         StringBuffer uidpair;
         uidpair.append(m_userid.get()).append(":").append(m_password.get());
-        StringBuffer result;
-        JBASE64_Encode(uidpair.str(), uidpair.length(), result, false);
         StringBuffer authhdr("Basic ");
-
-        //Remove the \n from the end of the encoded string.
-        //Should it even be there??
-        result.setCharAt(result.length() - 1,0);
-
-        authhdr.append(result.str());
+        JBASE64_Encode(uidpair.str(), uidpair.length(), authhdr, false);
         httprequest->addHeader("Authorization", authhdr.str());
         if(m_proxy.length())
             httprequest->addHeader("Proxy-Authorization", authhdr.str());
@@ -1047,6 +1041,11 @@ HttpClientErrCode CHttpClient::postRequest(ISoapMessage &req, ISoapMessage& resp
     return HttpClientErrCode::OK;
 }
 
+void CHttpClient::setTxSummary(CTxSummary* txSummary)
+{
+    m_txSummary.set(txSummary);
+}
+
 IHttpClientContext* getHttpClientContext()
 {
     CriticalBlock b(httpCrit);
@@ -1055,6 +1054,25 @@ IHttpClientContext* getHttpClientContext()
         theHttpClientContext.setown(new CHttpClientContext());
     }
     return theHttpClientContext.getLink();
+}
+
+IHttpClientContext* getHttpClientSecretContext(const char *secret)
+{
+    if (isEmptyString(secret))
+        return getHttpClientContext();
+    else
+    {
+        CriticalBlock b(httpCrit);
+        CHttpClientContext *ctx = httpClientContextsUsingSecrets.getValue(secret);
+        if(ctx == NULL)
+        {
+            Owned<CHttpClientContext> newctx = new CHttpClientContext();
+            newctx->setMtlsSecretName(secret);
+            httpClientContextsUsingSecrets.setValue(secret, newctx.getLink());
+            return newctx.getClear();
+        }
+        return LINK(ctx);
+    }
 }
 
 IHttpClientContext* createHttpClientContext(IPropertyTree* config)

@@ -48,6 +48,7 @@ static const char* const DEFAULT_LOGIN_URL = "/esp/files/Login.html";
 static const char* const DEFAULT_LOGIN_LOGO_URL = "/esp/files/eclwatch/img/Loginlogo.png";
 static const char* const DEFAULT_GET_USER_NAME_URL = "/esp/files/GetUserName.html";
 static const char* const ECLWATCH_STUB_REQ = "/esp/files/stub.htm";
+static const char* const ECLWATCH_INDEX_REQ = "/esp/files/index.html";
 static const char* const DEFAULT_UNRESTRICTED_RESOURCES = "/favicon.ico,/esp/files/*,/esp/xslt/*";
 static const char* const AUTH_STATUS_NA = "NA";
 static const char* const AUTH_STATUS_FAIL = "Fail";
@@ -129,6 +130,10 @@ esp_http_decl LogLevel getEspLogLevel();
 esp_http_decl LogRequest getEspLogRequests();
 esp_http_decl bool getEspLogResponses();
 esp_http_decl LogLevel getTxSummaryLevel();
+esp_http_decl const unsigned int getTxSummaryStyle();
+esp_http_decl const unsigned int readTxSummaryStyle(const char* style);
+esp_http_decl const unsigned int getTxSummaryGroup();
+esp_http_decl const unsigned int readTxSummaryGroup(const char* group);
 esp_http_decl bool getTxSummaryResourceReq();
 esp_http_decl unsigned getSlowProcessingTime();
 
@@ -144,7 +149,6 @@ esp_http_decl const char* getCFD();
 esp_http_decl void setBuildVersion(const char* buildVersion);
 esp_http_decl const char* getBuildVersion();
 esp_http_decl void setBuildLevel(const char* buildLevel);
-esp_http_decl const char* getBuildLevel();
 esp_http_decl IEspServer* queryEspServer();
 
 #define SDSSESSION_CONNECT_TIMEOUTMS (180*1000)

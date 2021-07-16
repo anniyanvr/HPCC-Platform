@@ -47,14 +47,14 @@ static IKeyIndex *openKeyFile(IDistributedFilePart & keyFile)
         try
         {
             OwnedIFile ifile = createIFile(keyFile.getFilename(rfn,copy));
-            unsigned __int64 thissize = ifile->size();
-            if (thissize != -1)
+            offset_t thissize = ifile->size();
+            if (thissize != (offset_t)-1)
             {
                 StringBuffer remotePath;
                 rfn.getPath(remotePath);
                 unsigned crc = 0;
                 keyFile.getCrc(crc);
-                return createKeyIndex(remotePath.str(), crc, false, false);
+                return createKeyIndex(remotePath.str(), crc, false);
             }
         }
         catch (IException *E)
@@ -74,19 +74,6 @@ static IKeyIndex *openKeyFile(IDistributedFilePart & keyFile)
     keyFile.getFilename(rfn).getRemotePath(url);
     throw MakeStringException(1001, "Could not open key file at %s%s", url.str(), (numCopies > 1) ? " or any alternate location." : ".");
 }
-
-static void setProgress(IPropertyTree &node, const char *name, const char *value)
-{
-    StringBuffer attr("@");
-    node.setProp(attr.append(name).str(), value);
-}
-
-static void setProgress(IPropertyTree &node, const char *name, unsigned __int64 value)
-{
-    StringBuffer attr("@");
-    node.setPropInt64(attr.append(name).str(), value);
-}
-
 
 class TransformCallback : public CInterface, implements IThorIndexCallback 
 {
@@ -1707,20 +1694,19 @@ class ThreadedPartHandler : public CInterface
 {
 protected:
     Linked<IThreadPool> threadPool;
-    PooledThreadHandle threadHandle;
+    PooledThreadHandle threadHandle = 0;
     QueueOf<ROW, true> pending;
     CriticalSection crit;
     Semaphore limit;
-    bool started;
+    bool started = false;
     Owned<IDistributedFilePart> part;
     IThreadedExceptionHandler *handler;
 
 public:
     typedef ThreadedPartHandler<ROW> SELF;
     ThreadedPartHandler(IDistributedFilePart *_part, IThreadedExceptionHandler *_handler, IThreadPool * _threadPool)
-        : limit(MAX_FETCH_LOOKAHEAD), part(_part), handler(_handler), threadHandle(0), threadPool(_threadPool)
+        : threadPool(_threadPool), limit(MAX_FETCH_LOOKAHEAD), part(_part), handler(_handler)
     {
-        started = false;
     }
 
     ~ThreadedPartHandler()
@@ -1833,8 +1819,8 @@ public:
           encryptionkey(_encryptionkey), 
           activityId(_activityId), 
           outputMeta(_outputMeta),
-          prefetcher(_prefetcher),
-          rowAllocator(_rowAllocator)
+          rowAllocator(_rowAllocator),
+          prefetcher(_prefetcher)
     {
         base = _base;
         top = _base + _size;
@@ -1871,8 +1857,8 @@ public:
             try
             {
                 OwnedIFile ifile = createIFile(part->getFilename(rfn,copy));
-                unsigned __int64 thissize = ifile->size();
-                if (thissize != -1)
+                offset_t thissize = ifile->size();
+                if (thissize != (offset_t)-1)
                 {
                     IPropertyTree & props = part->queryAttributes();
                     unsigned __int64 expectedSize;
@@ -1885,7 +1871,7 @@ public:
                         expectedSize = props.getPropInt64("@compressedSize", -1);
                     else
                         expectedSize = props.getPropInt64("@size", -1);
-                    if(thissize != expectedSize && expectedSize != -1)
+                    if(thissize != expectedSize && expectedSize != (unsigned __int64)-1)
                         throw MakeStringException(0, "File size mismatch: file %s was supposed to be %" I64F "d bytes but appears to be %" I64F "d bytes", ifile->queryFilename(), expectedSize, thissize); 
                     if(blockcompressed)
                         rawFile.setown(createCompressedFileReader(ifile,eexp));
@@ -1980,7 +1966,7 @@ protected:
     static offset_t getPartSize(IDistributedFilePart *part)
     {
         offset_t partsize = part->queryAttributes().getPropInt64("@size", -1);
-        if (partsize==-1)
+        if (partsize == (offset_t)-1)
         {
             MTIME_SECTION(queryActiveTimer(), "Fetch remote file size");
             unsigned numCopies = part->numCopies();
@@ -1991,7 +1977,7 @@ protected:
                 {
                     OwnedIFile ifile = createIFile(part->getFilename(rfn,copy));
                     partsize = ifile->size();
-                    if (partsize != -1)
+                    if (partsize != (offset_t)-1)
                     {
                         // TODO: Create DistributedFilePropertyLock for parts
                         part->lockProperties();
@@ -2007,7 +1993,7 @@ protected:
                 }
             }
         }
-        if (partsize==-1)
+        if (partsize == (offset_t)-1)
             throw MakeStringException(0, "Unable to determine size of filepart"); 
         return partsize;
     }
@@ -2885,26 +2871,26 @@ public:
         left = NULL;
         prev = NULL;
         next = NULL;
-        atomic_set(&endMarkersPending,0);
+        endMarkersPending = 0;
         groupStart = NULL;
         matchcount = 0;
     }
 
     IMPLEMENT_IINTERFACE;
 
-    CJoinGroup(const void *_left, IJoinProcessor *_join, CJoinGroup *_groupStart) : join(_join), matches(*this)
+    CJoinGroup(const void *_left, IJoinProcessor *_join, CJoinGroup *_groupStart) : matches(*this),join(_join)
     {
         candidates = 0;
         left = _left;
         if (_groupStart)
         {
             groupStart = _groupStart;
-            atomic_inc(&_groupStart->endMarkersPending);
+            ++_groupStart->endMarkersPending;
         }
         else
         {
             groupStart = this;
-            atomic_set(&endMarkersPending, 1);
+            endMarkersPending = 1;
         }
         matchcount = 0;
     }
@@ -2926,12 +2912,12 @@ public:
     inline void notePending()
     {
 //      assertex(!complete());
-        atomic_inc(&groupStart->endMarkersPending);
+        ++groupStart->endMarkersPending;
     }
 
     inline bool complete() const
     {
-        return atomic_read(&groupStart->endMarkersPending) == 0;
+        return groupStart->endMarkersPending == 0;
     }
 
     inline bool inGroup(CJoinGroup *leader) const
@@ -2945,7 +2931,7 @@ public:
         //Another completing group could cause this group to be processed once endMarkersPending is set to 0
         //So link this object to ensure it is not disposed of while this function is executing
         Linked<CJoinGroup> saveThis(this);
-        if (atomic_dec_and_test(&groupStart->endMarkersPending))
+        if (--groupStart->endMarkersPending == 0)
         {
             join->onComplete(groupStart);
         }
@@ -2980,8 +2966,8 @@ protected:
     const void *left;
     unsigned matchcount;
     CIArrayOf<MatchSet> matchsets;
-    atomic_t endMarkersPending;
-    IJoinProcessor *join;
+    std::atomic<unsigned> endMarkersPending;
+    IJoinProcessor *join = nullptr;
     mutable CriticalSection crit;
     CJoinGroup *groupStart;
     unsigned candidates;
@@ -3088,7 +3074,6 @@ class KeyedLookupPartHandler : extends ThreadedPartHandler<MatchSet>, implements
     Owned<IKeyManager> manager;
     IAgentContext &agent;
     DistributedKeyLookupHandler * tlk;
-    unsigned subno;
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -3164,7 +3149,7 @@ public:
     IMPLEMENT_IINTERFACE;
 
     DistributedKeyLookupHandler(IDistributedFile *f, IJoinProcessor &_owner, IAgentContext &_agent)
-        : file(f), owner(_owner), agent(_agent)
+        : owner(_owner), file(f), agent(_agent)
     {
         threadPool.setown(createThreadPool("hthor keyed join lookup thread pool", &threadFactory));
         IDistributedSuperFile *super = f->querySuperFile();
@@ -3259,7 +3244,7 @@ public:
 };
 
 KeyedLookupPartHandler::KeyedLookupPartHandler(IJoinProcessor &_owner, IDistributedFilePart *_part, DistributedKeyLookupHandler * _tlk, unsigned _subno, IThreadPool * _threadPool, IAgentContext &_agent)
-    : owner(_owner), ThreadedPartHandler<MatchSet>(_part, _tlk, _threadPool), agent(_agent), tlk(_tlk), subno(_subno)
+    : ThreadedPartHandler<MatchSet>(_part, _tlk, _threadPool), owner(_owner), agent(_agent), tlk(_tlk)
 {
 }
 
@@ -3454,9 +3439,9 @@ class CHThorKeyedJoinActivity  : public CHThorThreadedActivityBase, implements I
     Owned<JoinGroupPool> pool;
     QueueOf<const void, true> pending;
     CriticalSection statsCrit, imatchCrit, fmatchCrit;
-    atomic_t prefiltered;
-    atomic_t postfiltered;
-    atomic_t skips;
+    RelaxedAtomic<unsigned> prefiltered;
+    RelaxedAtomic<unsigned> postfiltered;
+    RelaxedAtomic<unsigned> skips;
     unsigned seeks;
     unsigned scans;
     unsigned wildseeks;
@@ -3475,9 +3460,9 @@ public:
     CHThorKeyedJoinActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorKeyedJoinArg &_arg, ThorActivityKind _kind, EclGraph & _graph, IPropertyTree *_node)
         : CHThorThreadedActivityBase(_agent, _activityId, _subgraphId, _arg, _arg, _kind, _graph, _arg.queryDiskRecordSize(), _node), helper(_arg)
     {
-        atomic_set(&prefiltered, 0);
-        atomic_set(&postfiltered, 0);
-        atomic_set(&skips, 0);
+        prefiltered = 0;
+        postfiltered = 0;
+        skips = 0;
         seeks = 0;
         scans = 0;
         eclKeySize.set(helper.queryIndexRecordSize());
@@ -3689,7 +3674,7 @@ public:
         CriticalBlock proc(fmatchCrit);
         bool ret = helper.fetchMatch(ms->queryJoinGroup()->queryLeft(), right);
         if (!ret)
-            atomic_inc(&postfiltered);
+            ++postfiltered;
         return ret;
     }
 
@@ -3697,7 +3682,7 @@ public:
     {
         bool ret = helper.leftCanMatch(_left);
         if (!ret)
-            atomic_inc(&prefiltered);
+            ++prefiltered;
         return ret;
     }
 
@@ -3817,7 +3802,7 @@ public:
                 }
                 else
                 {
-                    atomic_inc(&skips);
+                    ++skips;
                 }
             }
             else
@@ -3848,7 +3833,7 @@ public:
                             }
                             else
                             {
-                                atomic_inc(&skips);
+                                ++skips;
                             }
                         }
                         catch(IException * e)
@@ -3898,7 +3883,7 @@ public:
                                 }
                                 else
                                 {
-                                    atomic_inc(&skips);
+                                    ++skips;
                                 }
                             }
                             catch(IException * e)
@@ -3941,7 +3926,7 @@ public:
                                 }
                                 else
                                 {
-                                    atomic_inc(&skips);
+                                    ++skips;
                                 }
                             }
                             catch(IException * e)
@@ -3988,7 +3973,7 @@ public:
                         }
                         else
                         {
-                            atomic_inc(&skips);
+                            ++skips;
                         }
                     }
                     catch(IException * e)
@@ -4103,7 +4088,7 @@ public:
         }
         else
         {
-            atomic_inc(&postfiltered);
+            ++postfiltered;
         }
         return false;
     }
@@ -4130,9 +4115,9 @@ public:
     {
         CHThorThreadedActivityBase::updateProgress(progress);
         StatsActivityScope scope(progress, activityId);
-        progress.addStatistic(StNumPreFiltered, atomic_read(&prefiltered));
-        progress.addStatistic(StNumPostFiltered, atomic_read(&postfiltered));
-        progress.addStatistic(StNumIndexSkips, atomic_read(&skips));
+        progress.addStatistic(StNumPreFiltered, prefiltered);
+        progress.addStatistic(StNumPostFiltered, postfiltered);
+        progress.addStatistic(StNumIndexSkips, skips);
         progress.addStatistic(StNumIndexSeeks, seeks);
         progress.addStatistic(StNumIndexScans, scans);
         progress.addStatistic(StNumIndexWildSeeks, wildseeks);

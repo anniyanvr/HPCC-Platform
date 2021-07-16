@@ -53,6 +53,8 @@ enum MessageLogFlag
 #define HTTP_HEADER_CONTENT_ENCODING  "Content-Encoding"
 #define HTTP_HEADER_TRANSFER_ENCODING "Transfer-Encoding"
 #define HTTP_HEADER_ACCEPT_ENCODING   "Accept-Encoding"
+#define HTTP_HEADER_HPCC_GLOBAL_ID    "Global-Id"
+#define HTTP_HEADER_HPCC_CALLER_ID    "Caller-Id"
 
 class esp_http_decl CHttpMessage : implements IHttpMessage, public CInterface
 {
@@ -162,7 +164,7 @@ public:
     virtual const char *queryParamStr(){return m_paramstr.get();}
     virtual void setHeader(const char* headername, const char* headerval);
     virtual void addHeader(const char* headername, const char* headerval);
-    virtual StringBuffer& getHeader(const char* headername, StringBuffer& headerval);
+    virtual StringBuffer &getHeader(const char* headername, StringBuffer& headerval);
     virtual bool hasHeader(const char* headername);
     virtual void removeHeader(const char* headername);
     virtual int getParameterCount(){return m_paramCount;}
@@ -279,6 +281,8 @@ public:
     virtual bool decompressContent(StringBuffer* originalContent, int compressType) { return false; }
     virtual void setSocketReturner(ISocketReturner* returner) { m_socketReturner = returner; }
     virtual ISocketReturner* querySocketReturner() { return m_socketReturner; }
+    virtual StringBuffer& getStatus(StringBuffer& status) { return status; }
+
 };
 
 
@@ -393,7 +397,7 @@ public:
     CHttpResponse(ISocket& socket);
     virtual ~CHttpResponse();
     virtual void setStatus(const char* status);
-    virtual StringBuffer& getStatus(StringBuffer& status);
+    virtual StringBuffer& getStatus(StringBuffer& status) override;
     virtual void sendBasicChallenge(const char* realm, bool includeContent);
     virtual void sendBasicChallenge(const char* realm, const char* content);
 
@@ -450,7 +454,7 @@ inline bool checkRedirect(IEspContext &ctx)
 
 inline bool skipXslt(IEspContext &context)
 {
-    if (queryComponentConfig().getPropBool("@api_only"))
+    if (getComponentConfigSP()->getPropBool("@api_only"))
         return true;
     return (context.getResponseFormat()!=ESPSerializationANY);  //for now
 }

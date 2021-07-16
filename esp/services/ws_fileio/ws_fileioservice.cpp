@@ -30,13 +30,46 @@
 
 void CWsFileIOEx::init(IPropertyTree *cfg, const char *process, const char *service)
 {
+    CTpWrapper tpWrapper;
+    tpWrapper.getTpDropZones(9999, nullptr, false, allTpDropZones); //version 9999: get the latest information about dropzone
 }
 
-bool CWsFileIOEx::CheckServerAccess(const char* targetDZNameOrAddress, const char* relPath, StringBuffer& netAddr, StringBuffer& absPath)
+bool CWsFileIOEx::CheckServerAccess(const char* targetDZNameOrAddress, const char* netAddrReq, const char* relPath, StringBuffer& netAddr, StringBuffer& absPath)
 {
     if (!targetDZNameOrAddress || (targetDZNameOrAddress[0] == 0) || !relPath || (relPath[0] == 0))
         return false;
 
+#ifdef _CONTAINERIZED
+    bool isIp4Req = isIPAddress(netAddrReq);
+    ForEachItemIn(i, allTpDropZones)
+    {
+        IConstTpDropZone& dropZone = allTpDropZones.item(i);
+        if (!dropZone.getECLWatchVisible())
+            continue;
+
+        const char* name = dropZone.getName();
+        if (isEmptyString(name) || !streq(targetDZNameOrAddress, name))
+            continue;
+
+        const char* prefix = dropZone.getPath();
+        if (isEmptyString(prefix))
+            continue;
+
+        IArrayOf<IConstTpMachine>& tpMachines = dropZone.getTpMachines();
+        ForEachItemIn(ii, tpMachines)
+        {
+            IConstTpMachine& tpMachine = tpMachines.item(ii);
+            if (!isEmptyString(netAddrReq) && !matchNetAddressRequest(netAddrReq, isIp4Req, tpMachine))
+                continue;
+
+            netAddr.set(tpMachine.getNetaddress());
+            absPath.set(prefix);
+            addPathSepChar(absPath);
+            absPath.append(relPath);
+            return true;
+        }
+    }
+#else
     netAddr.clear();
     Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
     Owned<IConstEnvironment> env = factory->openEnvironment();
@@ -117,6 +150,7 @@ bool CWsFileIOEx::CheckServerAccess(const char* targetDZNameOrAddress, const cha
         }
 
     }
+#endif
 
     return false;
 }
@@ -145,7 +179,7 @@ bool CWsFileIOEx::onCreateFile(IEspContext &context, IEspCreateFileRequest &req,
 
     StringBuffer destAbsPath;
     StringBuffer destNetAddr;
-    if (!CheckServerAccess(server, destRelativePath, destNetAddr, destAbsPath))
+    if (!CheckServerAccess(server, req.getDestNetAddress(), destRelativePath, destNetAddr, destAbsPath))
     {
         result.appendf("Failed to access the destination: %s %s.", server, destRelativePath);
         resp.setResult(result.str());
@@ -203,7 +237,7 @@ bool CWsFileIOEx::onReadFileData(IEspContext &context, IEspReadFileDataRequest &
 
     StringBuffer destAbsPath;
     StringBuffer destNetAddr;
-    if (!CheckServerAccess(server, destRelativePath, destNetAddr, destAbsPath))
+    if (!CheckServerAccess(server, req.getDestNetAddress(), destRelativePath, destNetAddr, destAbsPath))
     {
         result.appendf("Failed to access the destination: %s %s.", server, destRelativePath);
         resp.setResult(result.str());
@@ -314,7 +348,7 @@ bool CWsFileIOEx::onWriteFileData(IEspContext &context, IEspWriteFileDataRequest
 
     StringBuffer destAbsPath;
     StringBuffer destNetAddr;
-    if (!CheckServerAccess(server, destRelativePath, destNetAddr, destAbsPath))
+    if (!CheckServerAccess(server, req.getDestNetAddress(), destRelativePath, destNetAddr, destAbsPath))
     {
         result.appendf("Failed to access the destination: %s %s.", server, destRelativePath);
         resp.setResult(result.str());

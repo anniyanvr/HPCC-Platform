@@ -29,7 +29,6 @@
 #include <direct.h> 
 #endif
 
-#include "build-config.h"
 #include "jlib.hpp"
 #include "jdebug.hpp"
 #include "jfile.hpp"
@@ -71,6 +70,20 @@
 #define MAX_SLAVEREG_DELAY 60*1000*15 // 15 mins
 #define SLAVEREG_VERIFY_DELAY 5*1000
 #define SHUTDOWN_IN_PARALLEL 20
+
+
+/* These percentages are used to determine the amount roxiemem allocated
+ * from total system memory.
+ *
+ * For historical reasons the default in bare-metal has always been a
+ * conservative 75%.
+ *
+ * NB: These percentages do not apply if the memory amount has been configured
+ * manually via 'globalMemorySize' and 'masterMemorySize'
+ */
+
+static constexpr unsigned bareMetalRoxieMemPC = 75;
+static constexpr unsigned containerRoxieMemPC = 90;
 
 
 class CThorEndHandler : implements IThreaded
@@ -265,7 +278,7 @@ public:
         LOG(MCdebugProgress, thorJob, "Waiting for %d slaves to register", slaves);
 
         IPointerArrayOf<INode> connectedSlaves;
-        connectedSlaves.ensure(slaves);
+        connectedSlaves.ensureCapacity(slaves);
         unsigned remaining = slaves;
         INode *_sender = nullptr;
         CMessageBuffer msg;
@@ -570,17 +583,9 @@ bool ControlHandler(ahType type)
 #include "thactivitymaster.hpp"
 int main( int argc, const char *argv[]  )
 {
-#ifndef _CONTAINERIZED
-    for (unsigned i=0;i<(unsigned)argc;i++) {
-        if (streq(argv[i],"--daemon") || streq(argv[i],"-d")) {
-            if (daemon(1,0) || write_pidfile(argv[++i])) {
-                perror("Failed to daemonize");
-                return EXIT_FAILURE;
-            }
-            break;
-        }
-    }
-#endif
+    if (!checkCreateDaemon(argc, argv))
+        return EXIT_FAILURE;
+
 #if defined(WIN32) && defined(_DEBUG)
     int tmpFlag = _CrtSetDbgFlag( _CRTDBG_REPORT_FLAG );
     tmpFlag |= _CRTDBG_LEAK_CHECK_DF;
@@ -591,7 +596,7 @@ int main( int argc, const char *argv[]  )
     InitModuleObjects();
     NoQuickEditSection xxx;
     {
-        globals.setown(loadConfiguration(thorDefaultConfigYaml, argv, "thor", "THOR", "thor.xml", nullptr));
+        globals.setown(loadConfiguration(thorDefaultConfigYaml, argv, "thor", "THOR", "thor.xml", nullptr, nullptr, false));
     }
 #ifdef _DEBUG
     unsigned holdSlave = globals->getPropInt("@holdSlave", NotFound);
@@ -605,7 +610,7 @@ int main( int argc, const char *argv[]  )
 #endif
     setStatisticsComponentName(SCTthor, globals->queryProp("@name"), true);
 
-    globals->setProp("@masterBuildTag", BUILD_TAG);
+    globals->setProp("@masterBuildTag", hpccBuildInfo.buildTag);
 
     setIORetryCount(globals->getPropInt("Debug/@ioRetries")); // default == 0 == off
     StringBuffer daliServer;
@@ -639,7 +644,9 @@ int main( int argc, const char *argv[]  )
 #endif
     const char *thorname = NULL;
     StringBuffer nodeGroup, logUrl;
+#ifndef _CONTAINERIZED
     unsigned slavesPerNode = globals->getPropInt("@slavesPerNode", 1);
+#endif
     unsigned channelsPerWorker;
     if (globals->hasProp("@channelsPerWorker"))
         channelsPerWorker = globals->getPropInt("@channelsPerWorker", 1);
@@ -672,7 +679,7 @@ int main( int argc, const char *argv[]  )
         logHandler = queryStderrLogMsgHandler();
         logUrl.set("stderr");
 #endif
-        LOG(MCdebugProgress, thorJob, "Build %s", BUILD_TAG);
+        LOG(MCdebugProgress, thorJob, "Build %s", hpccBuildInfo.buildTag);
 
         Owned<IGroup> serverGroup = createIGroupRetry(daliServer.str(), DALI_SERVER_PORT);
 
@@ -726,6 +733,7 @@ int main( int argc, const char *argv[]  )
             globals->setProp("@nodeGroup", thorname);
         }
 
+#ifndef _CONTAINERIZED
         if (globals->getPropBool("@useNASTranslation", true))
         {
             Owned<IPropertyTree> nasConfig = envGetNASConfiguration();
@@ -733,6 +741,7 @@ int main( int argc, const char *argv[]  )
                 globals->setPropTree("NAS", nasConfig.getLink()); // for use by slaves
             Owned<IPropertyTree> masterNasFilters = envGetInstallNASHooks(nasConfig, &thorEp);
         }
+#endif
         
         HardwareInfo hdwInfo;
         getHardwareInfo(hdwInfo);
@@ -741,44 +750,57 @@ int main( int argc, const char *argv[]  )
         unsigned gmemSize = globals->getPropInt("@globalMemorySize"); // in MB
         if (0 == gmemSize)
         {
-            unsigned maxMem = hdwInfo.totalMemory;
-#ifdef _WIN32
-            if (maxMem > 2048)
-                maxMem = 2048;
-#else
-#ifndef __64BIT__
-            if (maxMem > 2048)
+            // NB: This could be in a isContainerized(), but the 'workerResources' section only applies to containerized setups
+            const char *workerResourcedMemory = globals->queryProp("workerResources/@memory");
+            if (!isEmptyString(workerResourcedMemory))
             {
-                // 32 bit OS doesn't handle whole physically installed RAM
-                maxMem = 2048;
-            }
-#ifdef __ARM_ARCH_7A__
-            // For ChromeBook with 2GB RAM
-            if (maxMem <= 2048)
-            {
-                // Decrease max memory to 2/3 
-                maxMem = maxMem * 2 / 3; 
-            }
-#endif            
-#endif
-#endif
-            if (globals->getPropBool("@localThor") && 0 == mmemSize)
-            {
-                gmemSize = maxMem / 2; // 50% of total for slaves
-                mmemSize = maxMem / 4; // 25% of total for master
+                offset_t sizeBytes = friendlyStringToSize(workerResourcedMemory);
+                gmemSize = (unsigned)(sizeBytes / 0x100000);
+                gmemSize = gmemSize * containerRoxieMemPC / 100;
             }
             else
             {
-                gmemSize = maxMem * 3 / 4; // 75% of total for slaves
-                if (0 == mmemSize)
-                    mmemSize = gmemSize; // default to same as slaves
+                unsigned maxMem = hdwInfo.totalMemory;
+#ifdef _WIN32
+                if (maxMem > 2048)
+                    maxMem = 2048;
+#else
+#ifndef __64BIT__
+                if (maxMem > 2048)
+                {
+                    // 32 bit OS doesn't handle whole physically installed RAM
+                    maxMem = 2048;
+                }
+#ifdef __ARM_ARCH_7A__
+                // For ChromeBook with 2GB RAM
+                if (maxMem <= 2048)
+                {
+                    // Decrease max memory to 2/3 
+                    maxMem = maxMem * 2 / 3; 
+                }
+#endif            
+#endif
+#endif
+#ifdef _CONTAINERIZED
+                gmemSize = maxMem * containerRoxieMemPC / 100; // NB: MB's
+#else
+                if (globals->getPropBool("@localThor") && 0 == mmemSize)
+                {
+                    gmemSize = maxMem / 2; // 50% of total for slaves
+                    mmemSize = maxMem / 4; // 25% of total for master
+                }
+                else
+                    gmemSize = maxMem * bareMetalRoxieMemPC / 100; // NB: MB's
+#endif
             }
             unsigned perSlaveSize = gmemSize;
+#ifndef _CONTAINERIZED
             if (slavesPerNode>1)
             {
                 PROGLOG("Sharing globalMemorySize(%d MB), between %d slave processes. %d MB each", perSlaveSize, slavesPerNode, perSlaveSize / slavesPerNode);
                 perSlaveSize /= slavesPerNode;
             }
+#endif
             globals->setPropInt("@globalMemorySize", perSlaveSize);
         }
         else
@@ -787,9 +809,21 @@ int main( int argc, const char *argv[]  )
             {
                 // should prob. error here
             }
-            if (0 == mmemSize)
-                mmemSize = gmemSize;
         }
+        if (0 == mmemSize)
+        {
+            // NB: This could be in a isContainerized(), but the 'managerResources' section only applies to containerized setups
+            const char *managerResourcedMemory = globals->queryProp("managerResources/@memory");
+            if (!isEmptyString(managerResourcedMemory))
+            {
+                offset_t sizeBytes = friendlyStringToSize(managerResourcedMemory);
+                mmemSize = (unsigned)(sizeBytes / 0x100000);
+                mmemSize = mmemSize * containerRoxieMemPC / 100;
+            }
+            else
+                mmemSize = gmemSize; // default to same as slaves
+        }
+
         bool gmemAllowHugePages = globals->getPropBool("@heapUseHugePages", false);
         gmemAllowHugePages = globals->getPropBool("@heapMasterUseHugePages", gmemAllowHugePages);
         bool gmemAllowTransparentHugePages = globals->getPropBool("@heapUseTransparentHugePages", true);
@@ -801,6 +835,7 @@ int main( int argc, const char *argv[]  )
         PROGLOG("Global memory size = %d MB", mmemSize);
         roxiemem::setTotalMemoryLimit(gmemAllowHugePages, gmemAllowTransparentHugePages, gmemRetainMemory, ((memsize_t)mmemSize) * 0x100000, 0, thorAllocSizes, NULL);
 
+#ifndef _CONTAINERIZED
         const char * overrideBaseDirectory = globals->queryProp("@thorDataDirectory");
         const char * overrideReplicateDirectory = globals->queryProp("@thorReplicateDirectory");
         StringBuffer datadir;
@@ -813,6 +848,8 @@ int main( int argc, const char *argv[]  )
             setBaseDirectory(overrideBaseDirectory, false);
         if (overrideReplicateDirectory&&*overrideBaseDirectory)
             setBaseDirectory(overrideReplicateDirectory, true);
+#endif
+
         StringBuffer tempDirStr;
         if (!getConfigurationDirectory(globals->queryPropTree("Directories"),"temp","thor",globals->queryProp("@name"), tempDirStr))
         {
@@ -872,12 +909,15 @@ int main( int argc, const char *argv[]  )
         e->Release();
         return -1;
     }
+
     StringBuffer queueName;
+#ifndef _CONTAINERIZED
     SCMStringBuffer _queueNames;
     const char *thorName = globals->queryProp("@name");
     if (!thorName) thorName = "thor";
     getThorQueueNames(_queueNames, thorName);
     queueName.set(_queueNames.str());
+#endif
 
     Owned<IException> exception;
     StringBuffer cloudJobName;
@@ -935,7 +975,7 @@ int main( int argc, const char *argv[]  )
         StringBuffer myEp;
         queryMyNode()->endpoint().getUrlStr(myEp);
 
-        applyK8sYaml("thorworker", workunit, cloudJobName, "jobspec", { { "graphName", graphName}, { "master", myEp.str() }, { "%numWorkers", std::to_string(numWorkers)} }, false);
+        applyK8sYaml("thorworker", workunit, cloudJobName, "jobspec", { { "graphName", graphName}, { "master", myEp.str() }, { "_HPCC_NUM_WORKERS_", std::to_string(numWorkers)} }, false);
 #else
         StringBuffer thorEpStr;
         LOG(MCdebugProgress, thorJob, "ThorMaster version %d.%d, Started on %s", THOR_VERSION_MAJOR,THOR_VERSION_MINOR,thorEp.getUrlStr(thorEpStr).str());
@@ -1003,7 +1043,7 @@ int main( int argc, const char *argv[]  )
                 StringBuffer uniqueGrpName;
                 queryNamedGroupStore().addUnique(&queryProcessGroup(), uniqueGrpName);
                 // change default plane
-                queryComponentConfig().setProp("storagePlane", uniqueGrpName);
+                getComponentConfigSP()->setProp("@dataPlane", uniqueGrpName);
                 PROGLOG("Persistent Thor group created with group name: %s", uniqueGrpName.str());
             }
 #endif

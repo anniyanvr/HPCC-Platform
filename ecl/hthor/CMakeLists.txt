@@ -73,6 +73,10 @@ include_directories (
          ${HPCC_SOURCE_DIR}/common/wuanalysis
     )
 
+if (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG)
+  SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-switch -Wno-unused-parameter -Werror -Wno-error=delete-non-virtual-dtor")
+endif()
+
 ADD_DEFINITIONS( -D_USRDLL -DHTHOR_EXPORTS -DSTARTQUERY_EXPORTS )
 
 HPCC_ADD_LIBRARY( hthorlib SHARED ${SRCS} ${INCLUDES} )
@@ -83,7 +87,6 @@ target_link_libraries ( hthorlib
          hrpc
          dafsclient
          dalibase
-         environment
          dllserver
          nbcd
          eclrtl
@@ -95,6 +98,10 @@ target_link_libraries ( hthorlib
          schedulectrl
          wuanalysis
     )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( hthorlib environment )
+endif()
 
 IF (USE_OPENSSL)
     target_link_libraries ( hthorlib

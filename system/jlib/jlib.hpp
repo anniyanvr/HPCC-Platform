@@ -55,6 +55,7 @@ class jlib_decl ShortArray : public ArrayOf<short> { };
 class jlib_decl FloatArray : public ArrayOf<float> { };
 class jlib_decl DoubleArray : public ArrayOf<double> { };
 class jlib_decl UnsignedArray : public ArrayOf<unsigned> { };
+class jlib_decl Unsigned64Array : public ArrayOf<unsigned __int64> { };
 class jlib_decl UnsignedShortArray : public ArrayOf<unsigned short> { };
 class jlib_decl PointerArray : public ArrayOf<void *> { };
 class jlib_decl ConstPointerArray : public ArrayOf<const void *> { };
@@ -274,8 +275,6 @@ enum DAFSConnectCfg { SSLNone = 0, SSLOnly, SSLFirst, UnsecureFirst };
 
 #include "jstring.hpp"
 #include "jarray.hpp"
-#include "jhash.hpp"
-#include "jstream.hpp"
 #include "jutil.hpp"
 
 template <class ARRAY>
@@ -284,7 +283,7 @@ inline void appendArray(ARRAY & target, const ARRAY & source)
     unsigned max = source.ordinality();
     if (max)
     {
-        target.ensure(target.ordinality() + max);
+        target.ensureSpace(max);
         for (unsigned i=0; i < max; ++i)
             target.append(OLINK(source.item(i)));
     }
@@ -295,7 +294,7 @@ inline void appendArray(IArray & target, const IArray & source)
     unsigned max = source.ordinality();
     if (max)
     {
-        target.ensure(target.ordinality() + max);
+        target.ensureSpace(max);
         for (unsigned i=0; i < max; ++i)
             target.append(OLINK(source.item(i)));
     }
@@ -393,6 +392,7 @@ typedef CIArrayOf<StringBufferItem> StringBufferArray;
 //These could be template definitions, but that would potentially affect too many classes.
 #define BITMASK_ENUM(X) \
 inline constexpr X operator | (X l, X r) { return (X)((unsigned)l | (unsigned)r); } \
+inline constexpr X operator & (X l, X r) { return (X)((unsigned)l & (unsigned)r); } \
 inline constexpr X operator ~ (X l) { return (X)(~(unsigned)l); } \
 inline X & operator |= (X & l, X r) { l = l | r; return l; } \
 inline X & operator &= (X & l, X r) { l = (X)(l & r); return l; }

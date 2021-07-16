@@ -48,6 +48,7 @@ include_directories (
          ./../../fs/dafsclient
          ./../../system/security/shared
          ./../../system/security/zcrypt
+         ${HPCC_SOURCE_DIR}/system/codesigner
     )
 
 ADD_DEFINITIONS( -D_CONSOLE )
@@ -73,7 +74,7 @@ target_link_libraries ( eclcc
          dllserver
     )
 
-if (CONTAINERIZED)
+if (NOT CONTAINERIZED)
   target_link_libraries ( eclcc environment )
 endif()
 

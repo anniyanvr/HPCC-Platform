@@ -177,6 +177,7 @@ define([
         },
         _onRefresh: function (event) {
             this.wu.refresh(true);
+            this.wu.fetchServiceNames();
         },
         _onClone: function (event) {
             this.wu.clone();
@@ -265,10 +266,10 @@ define([
                         context.emailBody.set("disabled", false);
                     } else {
                         context.emailCheckbox.set("disabled", true);
-                        context.emailTo.set("disabled", true);
-                        context.emailFrom.set("disabled", true);
-                        context.emailSubject.set("disabled", true);
-                        context.emailBody.set("disabled", true);
+                        context.emailTo && context.emailTo.set("disabled", true);
+                        context.emailFrom && context.emailFrom.set("disabled", true);
+                        context.emailSubject && context.emailSubject.set("disabled", true);
+                        context.emailBody && context.emailBody.set("disabled", true);
                     }
                     context.updateInput("ZapWUID", null, response.WUGetZAPInfoResponse.WUID);
                     context.updateInput("BuildVersion", null, response.WUGetZAPInfoResponse.BuildVersion);
@@ -309,6 +310,7 @@ define([
                     context.updateInput(name, oldValue, newValue);
                 });
                 this.wu.refresh();
+                this.wu.fetchServiceNames();
             }
 
             this.infoGridWidget.init(params);
@@ -602,6 +604,9 @@ define([
             } else if (name === "Scope" && newValue) {
                 domClass.remove("scopeOptional", "hidden");
                 domClass.add("scopeOptional", "show");
+            } else if (name === "ServiceNames" && newValue && newValue.Item) {
+                var domElem = registry.byId(this.id + "ServiceNamesCustom");
+                domElem.set("value", newValue.Item.join("\n"));
             }
             if (name === "__hpcc_changedCount" && newValue > 0) {
                 var getInt = function (item) {

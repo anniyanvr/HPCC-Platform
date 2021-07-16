@@ -52,7 +52,7 @@ interface IRoxieAgentContext : extends IRoxieContextLogger
     virtual void noteChildGraph(unsigned id, IActivityGraph *childGraph) = 0;
     virtual roxiemem::IRowManager &queryRowManager() = 0;
     virtual const QueryOptions &queryOptions() const = 0;
-    virtual void addAgentsReplyLen(unsigned len) = 0;
+    virtual void addAgentsReplyLen(unsigned len, unsigned duplicates, unsigned resends) = 0;
     virtual const char *queryAuthToken() = 0;
     virtual const IResolvedFile *resolveLFN(const char *filename, bool isOpt, bool isPrivilegedUser) = 0;
     virtual IRoxieWriteHandler *createLFN(const char *filename, bool overwrite, bool extend, const StringArray &clusters, bool isPrivilegedUser) = 0;
@@ -68,6 +68,7 @@ interface IRoxieAgentContext : extends IRoxieContextLogger
     virtual IRoxieServerContext *queryServerContext() = 0;
     virtual IWorkUnitRowReader *getWorkunitRowReader(const char *wuid, const char * name, unsigned sequence, IXmlToRowTransformer * xmlTransformer, IEngineRowAllocator *rowAllocator, bool isGrouped) = 0;
     virtual IEngineRowAllocator * getRowAllocatorEx(IOutputMetaData * meta, unsigned activityId, roxiemem::RoxieHeapFlags flags) const = 0;
+    virtual unsigned checkInterval() const = 0;
 
 };
 
@@ -83,12 +84,15 @@ interface IRoxieServerContext : extends IInterface
     virtual void done(bool failed) = 0;
     virtual void finalize(unsigned seqNo) = 0;
     virtual memsize_t getMemoryUsage() = 0;
-    virtual unsigned getAgentsReplyLen() = 0;
+    virtual unsigned getAgentsReplyLen() const = 0;
+    virtual unsigned getAgentsDuplicates() const = 0;
+    virtual unsigned getAgentsResends() const = 0;
 
     virtual unsigned getXmlFlags() const = 0;
     virtual IConstWorkUnit *queryWorkUnit() const = 0;
     virtual const IQueryFactory *queryQueryFactory() const = 0;
     virtual bool outputResultsToSocket() const = 0;
+    virtual bool okToLogStartStopError() = 0;
 
     virtual IRoxieDaliHelper *checkDaliConnection() = 0;
     virtual const IProperties *queryXmlns(unsigned seqNo) = 0;

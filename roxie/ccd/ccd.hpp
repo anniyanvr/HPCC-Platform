@@ -49,6 +49,8 @@
 #define UDP_QUEUE_SIZE 100
 #define UDP_SEND_QUEUE_SIZE 50
 
+#define NUM_DALI_CRITS 64
+
 #define ROXIE_STATEFILE_VERSION 2
 
 // Have not yet tested impact of new IBYTI handling in non-containerized systems
@@ -144,6 +146,7 @@ public:
 };
 
 extern bool localAgent;
+extern bool encryptInTransit;
 
 class RoxiePacketHeader
 {
@@ -234,6 +237,16 @@ public:
     }
 };
 
+
+interface ISerializedRoxieQueryPacket : extends IInterface
+{
+    virtual RoxiePacketHeader &queryHeader() const = 0;
+    virtual const byte *queryTraceInfo() const = 0;
+    virtual unsigned getTraceLength() const = 0;
+    virtual IRoxieQueryPacket *deserialize() const = 0;
+    virtual ISerializedRoxieQueryPacket *cloneSerializedPacket(unsigned channel) const = 0;
+};
+
 interface IRoxieQueryPacket : extends IInterface
 {
     virtual RoxiePacketHeader &queryHeader() const = 0;
@@ -248,9 +261,23 @@ interface IRoxieQueryPacket : extends IInterface
 
     virtual IRoxieQueryPacket *clonePacket(unsigned channel) const = 0;
     virtual IRoxieQueryPacket *insertSkipData(size32_t skipDataLen, const void *skipData) const = 0;
+
+    virtual ISerializedRoxieQueryPacket *serialize() const = 0;
 };
 
 interface IQueryDll;
+
+//----------------------------------------------------------------------------------------------
+// SinkMode determines how parallel sinks are executed
+//----------------------------------------------------------------------------------------------
+
+enum class SinkMode : byte
+{
+    Parallel = 0,           // Execute sinks in parallel - this is the default
+    ParallelPersistent = 1, // Execute sinks in parallel using persistent threads. May be faster for a heavily-reused child query, but lead to higher thread usage
+    Sequential = 2          // Execute sinks sequentially - sometimes faster if sinks not doing much work
+};
+
 
 // Global configuration info
 extern bool shuttingDown;
@@ -310,6 +337,7 @@ extern bool prestartAgentThreads;
 extern unsigned preabortKeyedJoinsThreshold;
 extern unsigned preabortIndexReadsThreshold;
 extern bool traceStartStop;
+extern unsigned actResetLogPeriod;
 extern bool traceRoxiePackets;
 extern bool delaySubchannelPackets;
 extern bool traceTranslations;
@@ -325,6 +353,10 @@ extern bool fastLaneQueue;
 extern unsigned mtu_size;
 extern StringBuffer fileNameServiceDali;
 extern StringBuffer roxieName;
+#ifdef _CONTAINERIZED
+extern StringBuffer defaultPlane;
+extern StringBuffer defaultPlaneDirPrefix;
+#endif
 extern bool trapTooManyActiveQueries;
 extern unsigned maxEmptyLoopIterations;
 extern unsigned maxGraphLoopIterations;
@@ -342,9 +374,11 @@ extern bool defaultNoSeekBuildIndex;
 extern unsigned parallelLoadQueries;
 extern bool adhocRoxie;
 extern bool alwaysFailOnLeaks;
+extern SinkMode defaultSinkMode;
 
 #ifdef _CONTAINERIZED
 static constexpr bool roxieMulticastEnabled = false;
+extern unsigned myChannel;
 #else
 extern bool roxieMulticastEnabled;   // enable use of multicast for sending requests to agents
 #endif
@@ -362,7 +396,6 @@ extern unsigned roxiePort;     // If listening on multiple, this is the first. U
 extern unsigned udpMulticastBufferSize;
 extern size32_t diskReadBufferSize;
 
-extern bool nodeCachePreload;
 extern unsigned nodeCacheMB;
 extern unsigned leafCacheMB;
 extern unsigned blobCacheMB;
@@ -378,6 +411,7 @@ struct PartNoType
 extern unsigned statsExpiryTime;
 extern time_t startupTime;
 extern unsigned miscDebugTraceLevel;
+extern bool traceRemoteFiles;
 extern RecordTranslationMode fieldTranslationEnabled;
 
 extern unsigned defaultParallelJoinPreload;
@@ -392,6 +426,8 @@ extern unsigned defaultHeapFlags;
 
 extern bool defaultCheckingHeap;
 extern bool defaultDisableLocalOptimizations;
+
+extern unsigned continuationCompressThreshold;
 
 extern unsigned agentQueryReleaseDelaySeconds;
 extern unsigned coresPerQuery;
@@ -413,6 +449,11 @@ extern void doUNIMPLEMENTED(unsigned line, const char *file);
 
 extern IRoxieQueryPacket *createRoxiePacket(void *data, unsigned length);
 extern IRoxieQueryPacket *createRoxiePacket(MemoryBuffer &donor); // note: donor is empty after call
+// Direct deserialize callbeck packets from received network data
+extern IRoxieQueryPacket *deserializeCallbackPacket(MemoryBuffer &donor); // note: donor is empty after call
+// Delayed deserialize from received network data
+extern ISerializedRoxieQueryPacket *createSerializedRoxiePacket(MemoryBuffer &donor); // note: donor is empty after call
+
 extern void dumpBuffer(const char *title, const void *buf, unsigned recSize);
 
 inline unsigned getBondedChannel(unsigned partNo)
@@ -733,8 +774,8 @@ class AgentContextLogger : public StringContextLogger
     StringAttr wuid;
 public:
     AgentContextLogger();
-    AgentContextLogger(IRoxieQueryPacket *packet);
-    void set(IRoxieQueryPacket *packet);
+    AgentContextLogger(ISerializedRoxieQueryPacket *packet);
+    void set(ISerializedRoxieQueryPacket *packet);
     void putStatProcessed(unsigned subGraphId, unsigned actId, unsigned idx, unsigned processed, unsigned strands) const;
     void putStats(unsigned subGraphId, unsigned actId, const CRuntimeStatisticCollection &stats) const;
     void flush();
