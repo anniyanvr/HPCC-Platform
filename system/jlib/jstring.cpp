@@ -25,6 +25,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
+#include <algorithm>
 
 #include "jstring.hpp"
 #include "jexcept.hpp"
@@ -34,6 +35,7 @@
 #include "jdebug.hpp"
 #include "jutil.hpp"
 #include "junicode.hpp"
+#include "jerror.hpp"
 
 #define DOUBLE_FORMAT   "%.16g"
 #define FLOAT_FORMAT    "%.7g"
@@ -45,9 +47,9 @@
 
 static const char * TheNullStr = "";
 
-#define FIRST_CHUNK_SIZE  8
-#define DOUBLE_LIMIT      0x100000          // must be a power of 2
-#define DETACH_GRANULARITY 16
+constexpr unsigned STRING_FIRST_CHUNK_SIZE=8;
+constexpr unsigned STRING_DOUBLE_LIMIT = 0x100000;          // must be a power of 2
+constexpr unsigned STRING_DETACH_GRANULARITY = 16;
 
 //===========================================================================
 
@@ -100,17 +102,21 @@ StringBuffer::StringBuffer(StringBuffer && value)
     swapWith(value);
 }
 
-StringBuffer::StringBuffer(bool useInternal)
-{
-    if (useInternal)
-        init();
-    else
-        initNoInternal();
-}
-
 StringBuffer::~StringBuffer()
 {
+#ifdef CATCH_USE_AFTER_FREE
+    if (buffer == internalBuffer)
+        strncpy(internalBuffer, "use-after-free", InternalBufferSize-1);
+    else
+        strncpy(buffer, "use-after-free", curLen);
+#endif
     freeBuffer();
+#ifdef CATCH_USE_AFTER_FREE
+    //Try and cause any use after free to access invalid memory
+    curLen = 0;
+    maxLen = (size_t)-1;
+    buffer = nullptr;
+#endif
 }
 
 void StringBuffer::freeBuffer()
@@ -136,10 +142,10 @@ void StringBuffer::_realloc(size_t newLen)
     {
         size_t newMax = maxLen;
         if (newMax == 0)
-            newMax = FIRST_CHUNK_SIZE;
-        if (newLen > DOUBLE_LIMIT)
+            newMax = STRING_FIRST_CHUNK_SIZE;
+        if (newLen > STRING_DOUBLE_LIMIT)
         {
-            newMax = (newLen + DOUBLE_LIMIT) & ~(DOUBLE_LIMIT-1);
+            newMax = (newLen + STRING_DOUBLE_LIMIT) & ~(STRING_DOUBLE_LIMIT-1);
             if (newLen >= newMax)
                 throw MakeStringException(MSGAUD_operator, -1, "StringBuffer::_realloc: Request for %zu bytes oldMax = %zu", newLen, maxLen);
         }
@@ -176,7 +182,7 @@ char * StringBuffer::detach()
     }
     else
     {
-        if (maxLen>curLen+1+DETACH_GRANULARITY)
+        if (maxLen>curLen+1+STRING_DETACH_GRANULARITY)
             buffer = (char *)realloc(buffer,curLen+1); // shrink
         result = buffer;
     }
@@ -426,7 +432,7 @@ StringBuffer & StringBuffer::limited_valist_appendf(size_t szLimit, const char *
     catch (IException *e)
     {
         StringBuffer eMsg;
-        IException *e2 = MakeStringException(-1, "StringBuffer::valist_appendf(\"%s\"): vsnprintf failed or result exceeds limit (%zu): %s", format, size, e->errorMessage(eMsg).str());
+        IException *e2 = MakeStringException(JLIBERR_UtilStringbufferValistAppendf, "StringBuffer::valist_appendf(\"%s\"): vsnprintf failed or result exceeds limit (%zu): %s", format, size, e->errorMessage(eMsg).str());
         e->Release();
         throw e2;
     }
@@ -471,7 +477,7 @@ StringBuffer & StringBuffer::limited_valist_appendf(size_t szLimit, const char *
             catch (IException *e)
             {
                 StringBuffer eMsg;
-                IException *e2 = MakeStringException(-1, "StringBuffer::valist_appendf(\"%s\"): vsnprintf failed (%zu): %s", format, size, e->errorMessage(eMsg).str());
+                IException *e2 = MakeStringException(JLIBERR_UtilStringbufferValistAppendf_1, "StringBuffer::valist_appendf(\"%s\"): vsnprintf failed (%zu): %s", format, size, e->errorMessage(eMsg).str());
                 e->Release();
                 throw e2;
             }
@@ -512,6 +518,14 @@ void StringBuffer::setLength(size_t len)
     curLen = len;
 }
 
+char * StringBuffer::ensureCapacity(size_t max, size_t & got)
+{
+    if (maxLen <= curLen + max)
+        _realloc(curLen + max);
+    got = maxLen - curLen - 1;
+    return buffer + curLen;
+}
+
 size32_t StringBuffer::lengthUtf8() const
 {
     size_t chars = 0;
@@ -537,7 +551,7 @@ char * StringBuffer::reserveTruncate(size_t size)
         {
             char * newStr = (char *)malloc(newMax);
             if (!newStr)
-                throw MakeStringException(-1, "StringBuffer::_realloc: Failed to realloc newMax = %zu, oldMax = %zu", newMax, maxLen);
+                throw MakeStringException(JLIBERR_UtilStringbufferReallocFailedToReallocNewmaxZu, "StringBuffer::_realloc: Failed to realloc newMax = %zu, oldMax = %zu", newMax, maxLen);
             memcpy_iflen(newStr, buffer, curLen);
             buffer = newStr;
             maxLen = newMax;
@@ -547,7 +561,7 @@ char * StringBuffer::reserveTruncate(size_t size)
     {
         char * newStr = (char *) realloc(buffer, newMax);
         if (!newStr)
-            throw MakeStringException(-1, "StringBuffer::_realloc: Failed to realloc newMax = %zu, oldMax = %zu", newMax, maxLen);
+            throw MakeStringException(JLIBERR_UtilStringbufferReallocFailedToReallocNewmaxZu_1, "StringBuffer::_realloc: Failed to realloc newMax = %zu, oldMax = %zu", newMax, maxLen);
         buffer = newStr;
         maxLen = newMax;
     }
@@ -889,6 +903,15 @@ void StringBuffer::setCharAt(size_t offset, char value)
         buffer[offset] = value;
 }
 
+void StringBuffer::replace(size_t offset, size_t len, const void * value)
+{
+    if ((offset >= curLen) || (len == 0))
+        return;
+    if (offset + len > curLen)
+        len = curLen - offset;
+    memcpy(buffer + offset, value, len);
+}
+
 StringBuffer & StringBuffer::toLowerCase()
 {
     size_t l = curLen;
@@ -930,34 +953,45 @@ StringBuffer & StringBuffer::replace(char oldChar, char newChar)
 }
 
 // Copy source to result, replacing all occurrences of "oldStr" with "newStr"
-StringBuffer &replaceString(StringBuffer & result, size_t lenSource, const char *source, size_t lenOldStr, const char* oldStr, size_t lenNewStr, const char* newStr)
+bool replaceString(StringBuffer & result, size_t lenSource, const char *source, size_t lenOldStr, const char* oldStr, size_t lenNewStr, const char* newStr, bool avoidCopyIfUnmatched)
 {
-    if (lenSource)
+    if (lenOldStr && lenSource >= lenOldStr)
     {
-        size_t left = lenSource;
-        while (left >= lenOldStr)
+        size_t offset = 0;
+        size_t lastCopied = 0;
+        size_t maxOffset = lenSource - lenOldStr + 1;
+        char firstChar = oldStr[0];
+        while (offset < maxOffset)
         {
-            if (memcmp(source, oldStr, lenOldStr)==0)
+            if (unlikely(source[offset] == firstChar)
+                && unlikely((lenOldStr == 1) || memcmp(source + offset, oldStr, lenOldStr)==0))
             {
+                // Wait to allocate memory until a match is found
+                if (!lastCopied)
+                    result.ensureCapacity(lenSource); // Avoid allocating an unnecessarly large buffer and match the source string
+
+                // If lastCopied matches the offset nothing is appended, but we can avoid a test for offset == lastCopied
+                result.append(offset - lastCopied, source + lastCopied);
                 result.append(lenNewStr, newStr);
-                source += lenOldStr;
-                left -= lenOldStr;
+                offset += lenOldStr;
+                lastCopied = offset;
             }
             else
-            {
-                result.append(*source);
-                source++;
-                left--;
-            }
+                offset++;
         }
 
-        // there are no more possible replacements, make sure we keep the end of the original buffer
-        result.append(left, source);
+        if (lastCopied || !avoidCopyIfUnmatched)
+            result.append(lenSource - lastCopied, source + lastCopied); // Append the remaining characters
+
+        return lastCopied != 0;
     }
-    return result;
+    else if (!avoidCopyIfUnmatched)
+        result.append(lenSource, source); // Search string does not fit in source or is empty
+
+    return false;
 }
 
-StringBuffer &replaceEnvVariables(StringBuffer & result, const char *source, bool exceptions, const char* delim, const char* term)
+StringBuffer &replaceVariables(StringBuffer & result, const char *source, bool exceptions, IVariableSubstitutionHelper *helper, const char* delim, const char* term)
 {
     if (isEmptyString(source) || isEmptyString(delim) || isEmptyString(term))
         return result;
@@ -974,17 +1008,15 @@ StringBuffer &replaceEnvVariables(StringBuffer & result, const char *source, boo
             if (thumb)
             {
                 StringAttr name(finger, (size_t)(thumb - finger));
-                const char *value = getenv(name);
-                if (value)
+                if (helper->findVariable(name, result))
                 {
-                    result.append(value);
                     size_t replaced = (thumb - source) + lenTerm;
                     source = thumb + lenTerm;
                     left -= replaced;
                     continue;
                 }
                 if (exceptions)
-                    throw MakeStringException(-1, "Environment variable %s not set", name.str());
+                    throw MakeStringException(JLIBERR_UtilStringSubstitutionVariableSNotSet, "string substitution variable %s not set", name.str());
             }
         }
         result.append(*source);
@@ -995,6 +1027,25 @@ StringBuffer &replaceEnvVariables(StringBuffer & result, const char *source, boo
     // there are no more possible replacements, make sure we keep the end of the original buffer
     result.append(left, source);
     return result;
+}
+
+class CEnvVariableSubstitutionHelper : public CInterfaceOf<IVariableSubstitutionHelper>
+{
+public:
+    CEnvVariableSubstitutionHelper(){}
+    virtual bool findVariable(const char *name, StringBuffer &value) override
+    {
+        const char *s = getenv(name);
+        if (s)
+            value.append(s);
+        return s!=nullptr;
+    }
+};
+
+StringBuffer &replaceEnvVariables(StringBuffer & result, const char *source, bool exceptions, const char* delim, const char* term)
+{
+    CEnvVariableSubstitutionHelper helper;
+    return replaceVariables(result, source, exceptions, &helper, delim, term);
 }
 
 StringBuffer &replaceStringNoCase(StringBuffer & result, size_t lenSource, const char *source, size_t lenOldStr, const char* oldStr, size_t lenNewStr, const char* newStr)
@@ -1027,13 +1078,51 @@ StringBuffer &replaceStringNoCase(StringBuffer & result, size_t lenSource, const
 // this method will replace all occurrences of "oldStr" with "newStr"
 StringBuffer & StringBuffer::replaceString(const char* oldStr, const char* newStr)
 {
-    if (curLen)
+    if (curLen && oldStr)
     {
-        StringBuffer temp;
-        size_t oldlen = oldStr ? strlen(oldStr) : 0;
+        size_t oldlen = strlen(oldStr);
+        if (oldlen > curLen)
+            return *this;
+
         size_t newlen = newStr ? strlen(newStr) : 0;
-        ::replaceString(temp, curLen, buffer, oldlen, oldStr, newlen, newStr);
-        swapWith(temp);
+        // If target string (newStr) is shorter than or equal to search string, do an in-place replacement to avoid allocation
+        if (oldlen >= newlen)
+        {
+            size_t maxOffset = curLen - oldlen;
+            size_t offset = 0;
+            size_t targetOffset = 0;
+            size_t lastCopied = 0;
+            char firstChar = oldStr[0];
+            while (offset <= maxOffset)
+            {
+                if (unlikely(buffer[offset] == firstChar)
+                    && unlikely((oldlen == 1) || memcmp(buffer + offset, oldStr, oldlen)==0))
+                {
+                    if (lastCopied != targetOffset && likely(lastCopied != offset))
+                        memcpy(buffer + targetOffset, buffer + lastCopied, offset - lastCopied);
+                    targetOffset += offset - lastCopied;
+                    memcpy_iflen(buffer + targetOffset, newStr, newlen);
+                    offset += oldlen;
+                    targetOffset += newlen;
+                    lastCopied = offset;
+                }
+                else
+                    offset++;
+            }
+            // Copy remaining characters if in-place replacements were made
+            if (lastCopied)
+            {
+                if (lastCopied != targetOffset && lastCopied != curLen)
+                    memcpy(buffer + targetOffset, buffer + lastCopied, curLen - lastCopied);
+                setLength(targetOffset + (curLen - lastCopied));
+            }
+        }
+        else
+        {
+            StringBuffer temp;
+            if (::replaceString(temp, curLen, buffer, oldlen, oldStr, newlen, newStr, true))
+                swapWith(temp);
+        }
     }
     return *this;
 }
@@ -1085,7 +1174,7 @@ VStringBuffer::VStringBuffer(const char* format, ...)
 
 //===========================================================================
 
-StringAttrBuilder::StringAttrBuilder(StringAttr & _target) : StringBuffer(false), target(_target)
+StringAttrBuilder::StringAttrBuilder(StringAttr & _target) : target(_target)
 {
 }
 
@@ -1129,7 +1218,11 @@ String::String(StringBuffer & value)
 
 String::~String()
 {
-  if (text != TheNullStr) free(text);
+    if (text != TheNullStr)
+        free(text);
+#ifdef CATCH_USE_AFTER_FREE
+    text = nullptr;
+#endif
 }
 
 char String::charAt(size32_t index) const
@@ -1408,7 +1501,7 @@ StringAttr& StringAttr::operator = (StringAttr && from)
 
 StringAttr& StringAttr::operator = (const StringAttr & from)
 {
-    set(from.str());
+    set(from.get());
     return *this;
 }
 
@@ -1417,6 +1510,13 @@ void StringAttr::set(const char * _text)
     char * oldtext = text;
     text = _text ? strdup(_text) : NULL;
     free(oldtext);
+}
+
+void StringAttr::swapWith(StringAttr & other)
+{
+    char * temp = text;
+    text = other.text;
+    other.text = temp;
 }
 
 void StringAttr::set(const char * _text, size_t _len)
@@ -1488,7 +1588,7 @@ StringAttrItem::StringAttrItem(const char *_text, unsigned _len)
 }
 
 
-inline char hex(char c, char lower)
+inline char hex(char c, bool lower)
 {
   if (c < 10)
     return '0' + c;
@@ -1498,14 +1598,27 @@ inline char hex(char c, char lower)
     return 'A' + c - 10;
 }
 
-StringBuffer &  StringBuffer::appendhex(unsigned char c, char lower)
+StringBuffer &  StringBuffer::appendhex(unsigned char c, bool lower)
 {
     append(hex(c>>4, lower));
     append(hex(c&0xF, lower));
     return *this;
 }
 
-void appendURL(StringBuffer *dest, const char *src, size32_t len, char lower)
+StringBuffer &  StringBuffer::appendhex(size_t len, const void * data, bool lower)
+{
+    ensureCapacity(len * 2);
+    const unsigned char * bytes = static_cast<const unsigned char *>(data);
+    for (size_t i = 0; i < len; i++)
+    {
+        unsigned char c = bytes[i];
+        buffer[curLen++] = hex(c >> 4, lower);
+        buffer[curLen++] = hex(c & 0xF, lower);
+    }
+    return *this;
+}
+
+void appendURL(StringBuffer *dest, const char *src, size32_t len, char lower, bool keepUnderscore)
 {
   if (len == (size32_t)-1)
     len = (size32_t)strlen(src);
@@ -1515,6 +1628,8 @@ void appendURL(StringBuffer *dest, const char *src, size32_t len, char lower)
     unsigned char c = (unsigned char) *src;
     if (c == ' ')
       dest->append('+');
+    else if (c == '_' && keepUnderscore)
+      dest->append(c);
     else if ((c & 0x80) || !isalnum(*src))
     {
       dest->append('%');
@@ -1562,6 +1677,28 @@ StringBuffer &appendDecodedURL(StringBuffer &s, const char *url)
     }
     return s;
 }
+
+StringBuffer &appendDecodedURL(StringBuffer &s, size_t len, const char *url)
+{
+    size_t i = 0;
+    while (i < len)
+    {
+        char c = url[i++];
+        if (c == '+')
+            c = ' ';
+        else if (c == '%' && i + 1 < len)
+        {
+            if (isxdigit(url[i]) && isxdigit(url[i+1]))
+            {
+                c = translateHex(url[i], url[i+1]);
+                i+=2;
+            }
+        }
+        s.append(c);
+    }
+    return s;
+}
+
 
 static StringBuffer & appendStringExpandControl(StringBuffer &out, unsigned len, const char * src, bool addBreak, bool isCpp, bool isUtf8)
 {
@@ -1755,6 +1892,11 @@ int utf8CharLen(const unsigned char *ch, unsigned maxsize)
 
 const char *encodeXML(const char *x, StringBuffer &ret, unsigned flags, unsigned len, bool utf8)
 {
+    //Cost of strlen is small compared to benefits of ensureCapacity and the complexity of the rest of the function.
+    if (len == (unsigned)-1)
+        len = strlen(x);
+    // This is the minimum length that will get generated, and potentially saves large number of relocations for large strings
+    ret.ensureCapacity(len);
     while (len)
     {
         switch(*x)
@@ -1787,8 +1929,6 @@ const char *encodeXML(const char *x, StringBuffer &ret, unsigned flags, unsigned
             ret.append(flags & ENCODE_SPACES?"&#9;":"\t");
             break;
         case '\0':
-            if (len == (unsigned)-1)
-                return ret.str();
             ret.append("&#xe000;");   // hack!!! Characters below 0x20 are not legal in strict xml, even encoded.
             break;
         default:
@@ -1799,15 +1939,14 @@ const char *encodeXML(const char *x, StringBuffer &ret, unsigned flags, unsigned
             else if (utf8)
             {
                 unsigned chlen = utf8CharLen((const unsigned char *)x);     
-                if (chlen==0)
+                if (chlen==0 || (chlen > len)) // invalid utf8, or missing multi byte characters
                     ret.append("&#").append((unsigned int)*(unsigned char *) x).append(';');
                 else
                 {
                     ret.append(*x);
                     while(--chlen)
                     {
-                        if (len != (unsigned) -1)
-                            len--;
+                        len--;
                         ret.append(*(++x));
                     }
                 }
@@ -1817,8 +1956,7 @@ const char *encodeXML(const char *x, StringBuffer &ret, unsigned flags, unsigned
 
             break;
         }
-        if (len != (unsigned) -1)
-            len--;
+        len--;
         ++x;
     }
     return ret.str();
@@ -1987,7 +2125,7 @@ const char *decodeJSON(const char *j, StringBuffer &ret, unsigned len, const cha
                         }
                     }
 #ifdef JSONSTRICT
-                    throw MakeStringException(-1, "invalid json \\u escaped sequence");
+                    throw MakeStringException(JLIBERR_UtilInvalidJsonUEscapedSequence, "invalid json \\u escaped sequence");
 #endif
                     ret.append(*j);
                     break;
@@ -2015,7 +2153,7 @@ const char *decodeJSON(const char *j, StringBuffer &ret, unsigned len, const cha
                 default:
                 {
 #ifdef JSONSTRICT
-                    throw MakeStringException(-1, "invalid json escaped sequence");
+                    throw MakeStringException(JLIBERR_UtilInvalidJsonEscapedSequence, "invalid json escaped sequence");
 #endif
                     ret.append('\\');
                     ret.append(*j);
@@ -2122,7 +2260,7 @@ const char *decodeXML(const char *x, StringBuffer &ret, const char **errMark, IE
                     if (numstart==numend || *numend != ';')
                     {
                         if (strict)
-                            throw MakeStringException(-1, "invalid escaped sequence");
+                            throw MakeStringException(JLIBERR_UtilInvalidEscapedSequence, "invalid escaped sequence");
                     }
                     else // always convert to utf-8. Should potentially throw error if not marked as utf-8 encoded doc and out of ascii range.
                     {
@@ -2135,7 +2273,7 @@ const char *decodeXML(const char *x, StringBuffer &ret, const char **errMark, IE
                 case ';':
                 case '\0':
                     if (strict)
-                        throw MakeStringException(-1, "invalid escaped sequence");
+                        throw MakeStringException(JLIBERR_UtilInvalidEscapedSequence_1, "invalid escaped sequence");
                     break;
                 default:
                     if (entityHelper)
@@ -2155,7 +2293,7 @@ const char *decodeXML(const char *x, StringBuffer &ret, const char **errMark, IE
                         }
                     }
                     if (strict)
-                        throw MakeStringException(-1, "invalid escaped sequence");
+                        throw MakeStringException(JLIBERR_UtilInvalidEscapedSequence_1, "invalid escaped sequence");
                     break;
                 }
             }
@@ -2296,6 +2434,7 @@ StringBuffer &encodeJSON(StringBuffer &s, unsigned size, const char *value)
 {
     if (!value)
         return s;
+    s.ensureCapacity(size); // Minimum size that will be written
     while (size)
         encodeJSONChar(s, value, size);
     return s;
@@ -2306,6 +2445,42 @@ StringBuffer &encodeJSON(StringBuffer &s, const char *value)
     if (!value)
         return s;
     return encodeJSON(s, strlen(value), value);
+}
+
+inline StringBuffer & encodeCSVChar(StringBuffer & encodedCSV, char ch)
+{
+    byte next = ch;
+    switch (next)
+    {
+        case '\"':
+            encodedCSV.append("\"");
+            encodedCSV.append(next);
+            break;
+        //Any other character that needs to be escaped?
+        default:
+            encodedCSV.append(next);
+            break;
+    }
+    return encodedCSV;
+}
+
+StringBuffer & encodeCSVColumn(StringBuffer & encodedCSV, unsigned size, const char *rawCSVCol)
+{
+    if (!rawCSVCol)
+        return encodedCSV;
+    encodedCSV.ensureCapacity(size+2); // Minimum size that will be written
+    encodedCSV.append("\"");
+    for (size32_t i = 0; i < size; i++)
+        encodeCSVChar(encodedCSV, rawCSVCol[i]);
+    encodedCSV.append("\"");
+    return encodedCSV;
+}
+
+StringBuffer & encodeCSVColumn(StringBuffer & encodedCSV, const char *rawCSVCol)
+{
+    if (!rawCSVCol)
+        return encodedCSV;
+    return encodeCSVColumn(encodedCSV, strlen(rawCSVCol), rawCSVCol);
 }
 
 bool checkUnicodeLiteral(char const * str, unsigned length, unsigned & ep, StringBuffer & msg)
@@ -2410,7 +2585,7 @@ void decodeCppEscapeSequence(StringBuffer & out, const char * in, bool errorIfIn
                     break;
                 default:
                     if (errorIfInvalid)
-                        throw MakeStringException(1, "unrecognised character escape sequence '\\%c'", next);
+                        throw MakeStringException(JLIBERR_UtilUnrecognisedCharacterEscapeSequenceC, "unrecognised character escape sequence '\\%c'", next);
                     in--;   // keep it as is.
                     break;
                 }
@@ -2530,6 +2705,16 @@ bool clipStrToBool(const char * text)
 }
 
 
+void toLower(std::string & value)
+{
+    //Ugly.  Because we overload tolower in windows the std::transform resolution fails.
+    //Therefore assign the function to a variable to force the disambiguation.
+    int (*func)(int) = tolower;
+    std::transform(value.cbegin(), value.cend(), value.begin(), func);
+}
+
+
+
 StringBuffer & ncnameEscape(char const * in, StringBuffer & out)
 {
     if(!isalpha(*in))
@@ -2581,6 +2766,31 @@ StringBuffer & ncnameUnescape(char const * in, StringBuffer & out)
 }
 
 
+size32_t convertHexToData(size32_t lenTarget, void * target, size32_t len, const char * text)
+{
+    assertex(len % 2 == 0);
+    assertex(lenTarget * 2 >= len);
+    byte * dest = (byte *)target;
+    for (unsigned i=0; i < len; i+=2)
+    {
+        unsigned char next = hex2num(text[i]) << 4 | hex2num(text[i+1]);
+        dest[i/2] = next;
+    }
+    return len / 2;
+}
+
+size32_t convertDataToHex(size32_t lenTarget, char * target, size32_t len, const void * data, bool lowerCase)
+{
+    assertex(lenTarget >= len * 2);
+    const byte * src = (const byte *)data;
+    for (unsigned i=0; i < len; i++)
+    {
+        unsigned char next = src[i];
+        target[i*2] = hex(next >> 4, lowerCase);
+        target[i*2+1] = hex(next & 0x0F, lowerCase);
+    }
+    return len * 2;
+}
 
 bool startsWith(const char* src, const char* prefix)
 {
@@ -2611,6 +2821,59 @@ bool endsWithIgnoreCase(const char* src, const char* suffix)
         return memicmp(suffix, src+srcLen-suffixLen, suffixLen)==0;
     return false;
 }
+
+// Evaluates if wuid matches the pattern:
+//   firstChar # # # # # # # # "-" # # # # # # [ "-" #+ ] [ "T" #+ ]
+// All other deviations from the pattern, including an incomplete match or the use of wildcard
+// characters, will return false.
+bool looksLikeAWuid(const char * wuid, char firstChar)
+{
+    if (!wuid)
+        return false;
+    // pattern match required content
+    if ((toupper(wuid[0]) != toupper(firstChar)) ||
+        !isdigit(wuid[1]) || !isdigit(wuid[2]) || !isdigit(wuid[3]) || !isdigit(wuid[4]) ||
+        !isdigit(wuid[5]) || !isdigit(wuid[6]) || !isdigit(wuid[7]) || !isdigit(wuid[8]) ||
+        ('-' != wuid[9]) ||
+        !isdigit(wuid[10]) || !isdigit(wuid[11]) || !isdigit(wuid[12]) ||
+        !isdigit(wuid[13]) || !isdigit(wuid[14]) || !isdigit(wuid[15]))
+        return false;
+    // pattern match optional content
+    size_t idx = 16;
+    if ('-' == wuid[16] && wuid[17] != '\0' && isdigit(wuid[17]))
+    {
+        idx += 2;
+        while (isdigit(wuid[idx]))
+            idx++;
+    }
+    // pattern match optional task suffix (for publish WUIDs)
+    if ('T' == wuid[idx] && wuid[idx+1] != '\0' && isdigit(wuid[idx+1]))
+    {
+        // Only publish WUIDs can have a task suffix
+        if (toupper(wuid[0]) != 'P')
+            return false;
+
+        idx += 2;
+        while (isdigit(wuid[idx]))
+            idx++;
+    }
+    // expect the NULL terminator
+    return ('\0' == wuid[idx]);
+}
+
+bool looksLikeAWuid(const char * wuid, const char * anyFirstChar)
+{
+    if (!anyFirstChar)
+        return false;
+    // first character must be one of the specified characters
+    for (const char* ptr = anyFirstChar; *ptr != '\0'; ++ptr)
+    {
+        if (looksLikeAWuid(wuid, *ptr))
+            return true;
+    }
+    return false;
+}
+
 
 unsigned matchString(const char * search, const char * const * strings)
 {
@@ -2693,4 +2956,251 @@ StringBuffer& StringBuffer::operator=(StringBuffer&& value)
 {
     swapWith(value);
     return *this;
+}
+
+bool loadBinaryFile(StringBuffer & contents, const char *filename, bool throwOnError)
+{
+    int fd = open(filename, O_RDONLY);
+    bool ok = false;
+    if (fd != -1)
+    {
+        const unsigned chunkSize = 0x10000;
+        ssize_t bytes;
+        for (;;)
+        {
+            void * buffer = contents.reserve(chunkSize);
+            bytes = (size_t)read(fd, buffer, chunkSize);
+            if (bytes != chunkSize)
+                break;
+        }
+
+        if (bytes >= 0)
+            ok = true;
+        else
+            bytes = 0;
+        contents.setLength(contents.length() - (chunkSize - bytes));
+        close(fd);
+    }
+    else if (throwOnError)
+        throw MakeStringException(errno, "File %s could not be opened", filename);
+
+    return ok;
+}
+
+
+//Support option1=value1,option2(value2),option3,option4(nested=value,nested(value))
+// option1: value1
+// option2: value2
+// option3: 1
+// option4: nested=value,nested(value)
+void processOptionString(const char * options, optionCallback callback)
+{
+    if (!options || !callback)
+        return;
+
+    StringBuffer option;
+    StringBuffer value;
+    while (true)
+    {
+        const char * start = options;
+        const char * endname = nullptr;
+        const char * end = nullptr;
+        const char * comma = nullptr;
+        unsigned nesting = 0;
+        for (;;)
+        {
+            byte next = *options;
+            if (next == '\0')
+                break;
+            else if (next == '(')
+            {
+                if ((nesting++ == 0) && !endname)
+                    endname = options;
+            }
+            else if (next == ')')
+            {
+                if (nesting && --nesting==0 && !end)
+                {
+                    end = options;
+                    //All text after the closing ) until a comma is ignored.
+                }
+            }
+            else if (next == '=')
+            {
+                if (!nesting && !endname)
+                {
+                    endname = options;
+                }
+            }
+            else if (next == ',' && nesting == 0)
+            {
+                if (!end)
+                    end = options;
+                comma = options;
+                break;
+            }
+            options++;
+        }
+
+        option.clear();
+        value.clear();
+        if (endname)
+        {
+            option.append(endname-start, start);
+            if (end)
+                value.append(end-(endname+1), endname+1);
+            else
+                value.append(endname+1);
+        }
+        else
+        {
+            value.append("1");
+            if (end)
+                option.append(end-start, start);
+            else
+                option.append(start);
+        }
+
+        if (option.length())
+            callback(option, value);
+
+        if (!comma)
+            break;
+
+        options = comma+1;
+    }
+}
+
+void getSnakeCase(StringBuffer & out, const char * camelValue)
+{
+    if (isEmptyString(camelValue))
+        return;
+
+    out.append((char)tolower(*camelValue++));
+
+    for (;;)
+    {
+        byte next = *camelValue++;
+        if (!next)
+            break;
+
+        if (isupper(next))
+        {
+            out.append('_');
+            out.append((char)tolower(next));
+        }
+        else
+            out.append((char)next);
+    }
+}
+
+void ensureSeparator(StringBuffer & out, char separator)
+{
+    if (out.length() && (out.charAt(out.length()-1) != separator))
+        out.append(separator);
+}
+
+/**
+ * stristr - Case insensitive strstr()
+ * @haystack: Where we will search for our @needle
+ * @needle:   Search pattern.
+ *
+ * Description:
+ * This function is an ANSI version of strstr() with case insensitivity.
+ *
+ * It is a commodity funciton found on the web, cut'd, 'n', pasted..
+ * URL: http://www.brokersys.com/snippets/STRISTR.C
+ *
+ * Hereby donated to public domain.
+ *
+ * Returns:  char *pointer if needle is found in haystack, otherwise NULL.
+ *
+ * Rev History:  11/30/23                    JLibify
+ *               01/20/05  Joachim Nilsson   Cleanups
+ *               07/04/95  Bob Stout         ANSI-fy
+ *               02/03/94  Fred Cole         Original
+ */
+
+const char * stristr (const char *haystack, const char *needle)
+{
+    if (isEmptyString(haystack) || isEmptyString(needle))
+        return nullptr;
+
+    const char * start = haystack;
+    size_t slen  = strlen(haystack); /* Total size of haystack   */
+    size_t nlen  = strlen(needle);   /* Length of our needle     */
+    char needle0 = tolower(*needle);
+    for (; slen >= nlen; start++, slen--)
+    {
+        if (tolower(*start) == needle0)
+        {
+            size_t i = 1;
+            for (;;)
+            {
+                if (i == nlen)
+                    return start;
+                if (tolower(start[i]) != tolower(needle[i]))
+                    break;
+                i++;
+            }
+        }
+    }
+    return nullptr;
+}
+
+
+const void * jmemmem(size_t lenHaystack, const void * haystack, size_t lenNeedle, const void *needle)
+{
+    if (lenNeedle == 0)
+        return haystack;
+
+    if (lenHaystack < lenNeedle)
+        return nullptr;
+
+    const char * search = (const char *)needle;
+    char first = *search;
+    if (lenNeedle == 1)
+        return memchr(haystack, first, lenHaystack);
+
+    const char * buffer = (const char *)haystack;
+    for (size_t i = 0; i <= lenHaystack - lenNeedle; i++)
+    {
+        //Special case the first character to avoid a function call each iteration.
+        if (buffer[i] == first)
+        {
+            if (memcmp(buffer + i + 1, search + 1, lenNeedle-1) == 0)
+                return buffer + i;
+        }
+    }
+
+    return nullptr;
+}
+
+/**
+ * For preventing command injection, sanitize the argument to be passed to the system command.
+ * - Quote the entire argument with single quotes to prevent interpretation of shell metacharacters.
+ * - Since a single-quoted string can't contain single quotes, even escaped, replace each single
+ *   quote in the argument with the sequence '"'"' . That closes the single quoted string, appends
+ *   a literal single quote, and reopens the single quoted string
+ */
+StringBuffer& sanitizeCommandArg(const char* arg, StringBuffer& sanitized)
+{
+#if defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
+    if (!isEmptyString(arg))
+    {
+        size_t len = strlen(arg);
+        sanitized.append('\'');
+        for (size_t i = 0; i < len; i++)
+        {
+            if (arg[i] == '\'')
+                sanitized.append(R"('"'"')");
+            else
+                sanitized.append(arg[i]);
+        }
+        sanitized.append('\'');
+    }
+#else
+    sanitized.append(arg);
+#endif
+    return sanitized;
 }

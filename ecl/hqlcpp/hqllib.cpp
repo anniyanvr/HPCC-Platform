@@ -74,7 +74,10 @@ void HqlCppLibrary::extractOutputs()
         if (isExported(&cur))
         {
             IIdAtom * id = cur.queryId();
-            OwnedHqlExpr value = scope->lookupSymbol(id, LSFpublic, dummyctx);
+
+            // We are only interested in the type of the resolved symbol, not an expression to access it.
+            // Therefore pass LSFfromderived.
+            OwnedHqlExpr value = scope->lookupSymbol(id, LSFpublic|LSFfromderived, dummyctx);
 
             if (value && !value->isFunction())
             {
@@ -109,7 +112,7 @@ unsigned HqlCppLibrary::getHash(const HqlExprArray & values, unsigned crc) const
 
         //names are significant because inputs/outputs are ordered by name
         const char * name = str(cur.queryName());
-        crc = hashnc((const byte *)name, strlen(name), crc);
+        crc = hashncz((const byte *)name, crc);
 
         ITypeInfo * type = cur.queryType();
         byte tc = type->getTypeCode();
@@ -507,7 +510,7 @@ void HqlCppTranslator::buildLibraryInstanceExtract(BuildCtx & ctx, HqlCppLibrary
 
 ABoundActivity * HqlCppTranslator::doBuildActivityLibraryInstance(BuildCtx & ctx, IHqlExpression * expr)
 {
-    Owned<HqlCppLibraryInstance> libraryInstance = new HqlCppLibraryInstance(*this, expr, targetClusterType);
+    Owned<HqlCppLibraryInstance> libraryInstance = new HqlCppLibraryInstance(*this, expr, getTargetClusterType());
 
     CIArray boundInputs;
 

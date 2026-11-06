@@ -398,12 +398,207 @@ protected:
     std::atomic<int> activeReaders;
     std::atomic<int> activeWriters;
     std::atomic<bool> aborted;
-    Semaphore readers;
+    Semaphore readers{SYNC_LOCATION};
     char readerPadding[CACHE_LINE_SIZE - (sizeof(Semaphore) % CACHE_LINE_SIZE)];
-    Semaphore writers;
+    Semaphore writers{SYNC_LOCATION};
     char writerPadding[CACHE_LINE_SIZE - (sizeof(Semaphore) % CACHE_LINE_SIZE)];
     //Ensure the state is not on the same cache line as anything else, especially anything that is modified.
     std::atomic<state_t> state;
+};
+
+//Implementation of a queue using a doubly linked list.
+//Currently assumes next and prev fields in the element can be used to maintain the list
+template <class ELEMENT>
+class DListOf
+{
+    typedef DListOf<ELEMENT> SELF;
+    ELEMENT * pHead = nullptr;
+    ELEMENT * pTail = nullptr;
+    unsigned numEntries = 0;
+
+public:
+    void enqueueHead(ELEMENT * element)
+    {
+        assertex(!element->next && !element->prev);
+        if (pHead)
+        {
+            pHead->prev = element;
+            element->next = pHead;
+            pHead = element;
+        }
+        else
+        {
+            pHead = pTail = element;
+        }
+        numEntries++;
+    }
+    void enqueue(ELEMENT * element)
+    {
+        assertex(!element->next && !element->prev);
+        if (pTail)
+        {
+            pTail->next = element;
+            element->prev = pTail;
+            pTail = element;
+        }
+        else
+        {
+            pHead = pTail = element;
+        }
+        numEntries++;
+    }
+    void moveToHead(ELEMENT * element)
+    {
+        if (likely(pHead != element))
+        {
+            //Initial code from remove() - simplified since pHead != element, and no decrement of entries
+            ELEMENT * next = element->next;
+            ELEMENT * prev = element->prev;
+            dbgassertex(prev); // not at the head of the list, so must have a predecessor
+            if (likely(next))
+            {
+                next->prev = prev;
+            }
+            else
+            {
+                pTail = prev;
+            }
+
+            prev->next = next;
+
+            //enqueueHead() - simplified since pHead must be set, and no increment of number of entries
+            pHead->prev = element;
+            element->next = pHead;
+            element->prev = nullptr;
+            pHead = element;
+        }
+    }
+    ELEMENT *head() const { return pHead; }
+    ELEMENT *tail() const { return pTail; }
+    void remove(ELEMENT *element)
+    {
+        ELEMENT * next = element->next;
+        ELEMENT * prev = element->prev;
+        assertex(prev || next || element == pHead);
+        if (element == pHead)
+            pHead = next;
+        if (element == pTail)
+            pTail = prev;
+        if (next)
+            next->prev = prev;
+        if (prev)
+            prev->next = next;
+        element->next = nullptr;
+        element->prev = nullptr;
+        numEntries--;
+    }
+    ELEMENT *dequeue()
+    {
+        if (!pHead)
+            return nullptr;
+        ELEMENT * element = pHead;
+        ELEMENT * next = element->next;
+        pHead = next;
+        if (element == pTail)
+            pTail = nullptr;
+        if (next)
+            next->prev = nullptr;
+        element->next = nullptr;
+        numEntries--;
+        return element;
+    }
+    ELEMENT *dequeueTail()
+    {
+        if (!pTail)
+            return nullptr;
+        ELEMENT * element = pTail;
+        ELEMENT * prev = element->prev;
+        pTail = prev;
+        if (element == pHead)
+            pHead = nullptr;
+        if (prev)
+            prev->next = nullptr;
+        element->prev = nullptr;
+        numEntries--;
+        return element;
+    }
+    void dequeue(ELEMENT *element)
+    {
+        remove(element);
+    }
+    bool isEmpty() const { return numEntries == 0; }
+    inline unsigned ordinality() const { return numEntries; }
+    //Check that the linked list is self-consistent.  For debugging potential issues.
+    void validate() const
+    {
+        ELEMENT * prev = nullptr;
+        ELEMENT * cur = pHead;
+        unsigned count = 0;
+        while (cur)
+        {
+            assertex(cur->prev == prev);
+            prev = cur;
+            cur = cur->next;
+            count++;
+        }
+        assertex(prev == pTail);
+        assertex(count == numEntries);
+    }
+};
+
+// Lockfree Single Producer Single Conumser bounded queue implementation
+// No mutexes are required to interact with the queue, as long as there's a single consumer thread, and a single writer thread.
+template <typename T>
+class CSPSCQueue
+{
+    size32_t maxCapacity = 0;
+    std::vector<T> elements;
+    std::atomic<size32_t> head = 0;
+    std::atomic<size32_t> tail = 0;
+
+    inline size32_t increment(size32_t idx) const
+    {
+        size32_t next = idx+1;
+        if (next == maxCapacity)
+            next = 0;
+        return next;
+    }
+public:
+    CSPSCQueue()
+    {
+        // should set capacity before using
+    }
+    CSPSCQueue(size32_t _maxCapacity)
+        : maxCapacity(_maxCapacity + 1), // +1 to distinguish full vs empty
+          elements(maxCapacity)
+    {
+    }
+    void setCapacity(size32_t _maxCapacity)
+    {
+        maxCapacity = _maxCapacity + 1;
+        elements.resize(maxCapacity);
+    }
+    bool enqueue(const T e)
+    {
+        size32_t currentHead = head;
+        size32_t nextHead = increment(currentHead);
+        if (nextHead == tail)
+            return false; // full
+
+        elements[currentHead] = std::move(e);
+        head = nextHead;
+        return true;
+    }
+    bool dequeue(T &res)
+    {
+        size32_t currentTail = tail;
+        if (currentTail == head)
+            return false; // empty
+
+        res = std::move(elements[currentTail]);
+        tail = increment(currentTail);
+        return true;
+    }
 };
 
 #endif

@@ -50,32 +50,42 @@ class TPWRAPPER_API CInfoCacheReaderThread : public CSimpleInterfaceOf<IThreaded
 {
     StringAttr name;
     bool stopping = false;
-    bool active = true;
+    std::atomic<bool> active{true};
     bool first = true;
     bool firstBlocked = false;
+    bool enableAutoRebuild = true;
     unsigned autoRebuildSeconds = defaultInfoCacheAutoRebuildSecond;
     unsigned forceRebuildSeconds = defaultInfoCacheForceBuildSecond;
     Owned<CInfoCache> infoCache;
     CInfoCacheReader* infoCacheReader;
-    Semaphore sem;
-    Semaphore firstSem;
-    CriticalSection crit;
+    Semaphore sem{SYNC_LOCATION};
+    Semaphore firstSem{SYNC_LOCATION};
+    CriticalSection crit{SYNC_LOCATION};
     CThreaded threaded;
-    std::atomic<bool> waiting = {false};
+    std::atomic<bool> waiting{false};
 
 public:
-    CInfoCacheReaderThread(CInfoCacheReader* _reader, const char* _name, unsigned _autoRebuildSeconds, unsigned _forceRebuildSeconds)
-        : infoCacheReader(_reader), name(_name), autoRebuildSeconds(_autoRebuildSeconds), forceRebuildSeconds(_forceRebuildSeconds), threaded(_name)
+    CInfoCacheReaderThread(CInfoCacheReader* _reader, const char* _name, unsigned _autoRebuildSeconds, unsigned _forceRebuildSeconds, bool _enableAutoRebuild)
+        : name(_name), enableAutoRebuild(_enableAutoRebuild), autoRebuildSeconds(_autoRebuildSeconds), forceRebuildSeconds(_forceRebuildSeconds), infoCacheReader(_reader), threaded(_name)
     {
-        threaded.init(this);
     };
 
     ~CInfoCacheReaderThread()
+    {
+        stop();
+    }
+
+    void stop()
     {
         stopping = true;
         sem.signal();
         firstSem.signal(); // in case
         threaded.join();
+    }
+
+    void init()
+    {
+        threaded.init(this, false);
     }
 
     virtual void threadmain() override;
@@ -87,9 +97,9 @@ public:
             if (!active)
                 return nullptr;
             firstBlocked = true;
-            b.leave();
+            b.ensureLeave();
             firstSem.wait();
-            b.enter();
+            b.ensureEnter();
             if (first)
                 return nullptr;
         }
@@ -128,6 +138,12 @@ public:
     bool isActive() const { return active; }
 };
 
+/*
+    Derived instances are expected to be heap allocated and rely on Release()
+    semantics to ensure the background thread is stopped before destruction.
+    If stack allocated, caller must ensure the thread is stopped before destructor
+    runs (e.g. by calling stopThread() from derived class destructor).
+*/
 class CInfoCacheReader : implements IInfoCacheReader, public CInterface
 {
 public:
@@ -135,9 +151,14 @@ public:
 
     IMPLEMENT_IINTERFACE;
 
-    CInfoCacheReader(const char* _name, unsigned _autoRebuildSeconds, unsigned _forceRebuildSeconds)
+    CInfoCacheReader(const char* _name, unsigned _autoRebuildSeconds, unsigned _forceRebuildSeconds, bool _enableAutoRebuild)
     {
-        infoCacheReaderThread.setown(new CInfoCacheReaderThread(this, _name, _autoRebuildSeconds, _forceRebuildSeconds));
+        infoCacheReaderThread.setown(new CInfoCacheReaderThread(this, _name, _autoRebuildSeconds, _forceRebuildSeconds, _enableAutoRebuild));
+    }
+
+    void init()
+    {
+        infoCacheReaderThread->init();
     }
 
     virtual CInfoCache* getCachedInfo() const override { return infoCacheReaderThread->getCachedInfo(); }
@@ -146,7 +167,15 @@ public:
     virtual bool isActive() const override { return infoCacheReaderThread->isActive(); }
 
     virtual CInfoCache* read() = 0;
+
+protected:
+    void stopThread() { if (infoCacheReaderThread) infoCacheReaderThread->stop(); }
+
+    virtual void beforeDispose() override
+    {
+        stopThread();
+        CInterface::beforeDispose();
+    }
 };
 
 #endif //_ESPWIZ_InfoCacheReader_HPP__
-

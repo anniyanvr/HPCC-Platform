@@ -38,7 +38,7 @@ if the supplied pointer was not from the roxiemem heap. Usually an OwnedRoxieStr
 #include "unicode/utf.h"
 #else
 #ifdef _WIN32
-typedef wchar_t UChar;
+typedef char16_t UChar;
 #else //_WIN32
 typedef unsigned short UChar;
 #endif //_WIN32
@@ -46,9 +46,20 @@ typedef unsigned short UChar;
 #endif
 #include "rtlconst.hpp"
 
+
+#if !defined(ECLRTL_LOCAL)
+#ifdef ECLRTL_EXPORTS
+#define ECLRTL_API DECL_EXPORT
+#else
+#define ECLRTL_API DECL_IMPORT
+#endif
+#else
+#define ECLRTL_API
+#endif
+
 //Should be incremented whenever the virtuals in the context or a helper are changed, so
 //that a work unit can't be rerun.  Try as hard as possible to retain compatibility.
-#define ACTIVITY_INTERFACE_VERSION      652
+#define ACTIVITY_INTERFACE_VERSION      655
 #define MIN_ACTIVITY_INTERFACE_VERSION  650             //minimum value that is compatible with current interface
 
 typedef unsigned char byte;
@@ -173,7 +184,6 @@ interface IRecordSize : public IInterface
 interface IXmlWriter : public IInterface
 {
 public:
-    virtual void flushContent(bool close) = 0;
     virtual void outputQuoted(const char *text) = 0;
     virtual void outputString(unsigned len, const char *field, const char *fieldname) = 0;
     virtual void outputBool(bool field, const char *fieldname) = 0;
@@ -196,6 +206,7 @@ public:
     virtual void outputInlineXml(const char *text) = 0; //for appending raw xml content
     virtual void outputXmlns(const char *name, const char *uri) = 0;
     inline void outputCString(const char *field, const char *fieldname) { outputString((size32_t)strlen(field), field, fieldname); }
+    virtual void flushContent(bool close) = 0;
 };
 
 interface IFieldProcessor : public IInterface
@@ -283,6 +294,7 @@ interface IEngineRowAllocator : extends IInterface
 
     virtual void gatherStats(CRuntimeStatisticCollection & stats) = 0;
     virtual void releaseAllRows() = 0; // Only valid on unique allocators, use with extreme care
+    virtual void emptyCache() = 0;      // Should be called on all blocked allocators.
 };
 
 interface IRowSerializerTarget
@@ -456,6 +468,7 @@ public:
     unsigned length;                // for bitfield (int-size, # bits, bitoffset) << 16
                                     // for decimal, numdigits | precision << 16
                                     // if RFTMunknownsize then maxlength (records) [maxcount(datasets)]
+                                    // for string/data/qstring/unicode/utf8 - values of 1 or 2 indicate the number of bytes in the length (otherwise 4)
 protected:
     ~RtlTypeInfo() = default;
 };
@@ -483,7 +496,7 @@ inline byte getVirtualInitializer(const void * initializer) { return (byte)(mems
 typedef IThorDiskCallback IVirtualFieldCallback;
 
 //Core struct used for representing meta for a field.  Effectively used as an interface.
-struct RtlFieldInfo
+struct ECLRTL_API RtlFieldInfo
 {
     constexpr inline RtlFieldInfo(const char * _name, const char * _xpath, const RtlTypeInfo * _type, unsigned _flags = 0, const char *_initializer = NULL)
     : name(_name), xpath(_xpath), type(_type), initializer(_initializer), flags(_type->fieldType | _flags) {}
@@ -612,7 +625,10 @@ enum
     XWFtrim         = 0x0001,
     XWFopt          = 0x0002,
     XWFnoindent     = 0x0004,
-    XWFexpandempty  = 0x0008
+    XWFexpandempty  = 0x0008,
+    XWFonlyindentroot = 0x0010, //JSON only for now.  only indent and add newline at root level.  Useful for writing out individual rows in ECL output
+    XWFbracketformenc = 0x0020,  //form encoding has a couple different styles: bracket, dot, and our hpcc proprietary format
+    XWFhpccformenc = 0x0040
 };
 
 
@@ -659,6 +675,11 @@ interface ISectionTimer : public IInterface
 {
     virtual unsigned __int64 getStartCycles() = 0;
     virtual void noteSectionTime(unsigned __int64 startCycles) = 0;
+
+    // arg kind is of type StatisticKind
+    virtual void addStatistic(__int64 kind, unsigned __int64 value) = 0;
+    virtual void setStatistic(__int64 kind, unsigned __int64 value) = 0;
+    virtual void mergeStatistic(__int64 kind, unsigned __int64 value) = 0;
 };
 
 //NB: New methods must always be added at the end of this interface to retain backward compatibility
@@ -772,11 +793,13 @@ interface ICodeContext : public IResourceContext
     virtual const void * fromJson(IEngineRowAllocator * _rowAllocator, size32_t len, const char * utf8, IXmlToRowTransformer * xmlTransformer, bool stripWhitespace) = 0;
     virtual void getRowJSON(size32_t & lenResult, char * & result, IOutputMetaData & info, const void * row, unsigned flags) = 0;
     virtual unsigned getExternalResultHash(const char * wuid, const char * name, unsigned sequence) = 0;
-    virtual ISectionTimer * registerTimer(unsigned activityId, const char * name) = 0;
+    virtual ISectionTimer * registerTimer(unsigned activityId, const char * name) = 0; // see also registerStatTimer
     virtual IEngineRowAllocator * getRowAllocatorEx(IOutputMetaData * meta, unsigned activityId, unsigned flags) const = 0;
     virtual void addWuExceptionEx(const char * text, unsigned code, unsigned severity, unsigned audience, const char * source) = 0;
+    virtual unsigned getElapsedMs() const = 0;
+    virtual unsigned getWorkflowId() const = 0; // Note: don't use yet as it has not been fully implemented in all derived classes
+    virtual ISectionTimer * registerStatsTimer(unsigned activityId, const char * name, unsigned int statsOption) = 0;
 };
-
 
 //Provided by engine=>can extend
 interface IFilePositionProvider : extends IInterface
@@ -1110,6 +1133,10 @@ enum
     TDXupdateaccessed   = 0x0010,
     TDXdynamicfilename  = 0x0020,
     TDXjobtemp          = 0x0040,       // stay around while a wu is being executed.
+    TDXgeneric          = 0x0080,       // generic form of disk read/write
+
+    TDXdynprovideroptions = 0x40000000,     // The provider options are dynamic and must be called after onStart()
+    TDXdynformatoptions = 0x80000000,       // The format options are dynamic and must be called after onStart()
 
 //disk read flags
     TDRoptional         = 0x00000100,
@@ -1122,7 +1149,7 @@ enum
     TDRcountkeyedlimit  = 0x00008000,
     TDRkeyedlimitskips  = 0x00010000,
     TDRlimitskips       = 0x00020000,
-    //unused              0x00040000,
+    TDRfileposcallback  = 0x00040000,
     TDRaggregateexists  = 0x00080000,       // only aggregate is exists()
     TDRgroupmonitors    = 0x00100000,       // are segement monitors created for all group by conditions.
     TDRlimitcreates     = 0x00200000,
@@ -1130,8 +1157,12 @@ enum
     TDRunfilteredcount  = 0x00800000,       // count/aggregegate doesn't have an additional filter
     TDRfilenamecallback = 0x01000000,
     TDRtransformvirtual = 0x02000000,       // transform uses a virtual field.
-    TDRdynformatoptions = 0x04000000,
+    //UNUSED            = 0x04000000,
     TDRinvariantfilename= 0x08000000,       // filename is non constant but has the same value for the whole query
+    TDRprojectleading   = 0x10000000,       // The projeted format matches leading fields of the source row (so no need to project if disappearing quickly)
+    TDRcloneappendvirtual = 0x20000000,     // Can clone the disk record and then append the virtual fields.
+
+    //NB: All flags are now used.
 
 //disk write flags
     TDWextend           = 0x0100,
@@ -1147,6 +1178,8 @@ enum
     TDWupdatecrc        = 0x80000,      // has format crc
     TDWexpires          = 0x100000,
     TDWrestricted       = 0x200000,
+    TDWnocompress       = 0x400000,
+    TDWhaswidth         = 0x800000,
 };
 
 //flags for thor index read
@@ -1177,22 +1210,25 @@ enum
 //flags for thor index write
 enum 
 {
-    TIWoverwrite        = 0x0001,
-    TIWbackup           = 0x0002,
-    TIWunused           = 0x0004,       // no longer used
-    TIWvarfilename      = 0x0008,       // filename is dependant on the context.
-    TIWsmall            = 0x0010,
-    TIWupdate           = 0x0020,
-    TIWlocal            = 0x0040,       // i.e., no tlk
-    TIWrowcompress      = 0x0080,
-    TIWnolzwcompress    = 0x0100,
-    TIWnooverwrite      = 0x0200,
-    TIWupdatecrc        = 0x0400,
-    TIWhaswidth         = 0x0800,
-    TIWexpires          = 0x1000,
-    TIWmaxlength        = 0x2000,       // explicit maxlength
-    TIWrestricted       = 0x200000,     // value matches the equivalent TDW flag (same value as TDW* caused problems as some index related code uses TDW* flags)
+    TIWoverwrite        = 0x00000001,
+    TIWbackup           = 0x00000002,
+    TIWunused           = 0x00000004,       // no longer used
+    TIWvarfilename      = 0x00000008,       // filename is dependant on the context.
+    TIWsmall            = 0x00000010,
+    TIWupdate           = 0x00000020,
+    TIWlocal            = 0x00000040,       // i.e., no tlk
+    TIWrowcompress      = 0x00000080,
+    TIWnolzwcompress    = 0x00000100,
+    TIWnooverwrite      = 0x00000200,
+    TIWupdatecrc        = 0x00000400,
+    TIWhaswidth         = 0x00000800,
+    TIWexpires          = 0x00001000,
+    TIWmaxlength        = 0x00002000,       // explicit maxlength
+    TIWcompressdefined  = 0x00004000,       // compression is defined via string value
+    TIWzerofilepos      = 0x00008000,       // last field is always zero
+    TIWrestricted       = 0x00200000,     // value matches the equivalent TDW flag (same value as TDW* caused problems as some index related code uses TDW* flags)
 };
+static_assert((unsigned)TIWrestricted == (unsigned)TDWrestricted, "TIWrestricted and TDWrestricted must have the same value");
 
 //flags for thor dataset/temp tables
 enum
@@ -1231,6 +1267,7 @@ struct IHThorIndexWriteArg : public IHThorArg
     virtual unsigned getMaxKeySize() = 0;
     virtual const IBloomBuilderInfo * const *queryBloomInfo() const = 0;
     virtual __uint64 getPartitionFieldMask() const = 0;
+    virtual const char * queryCompression() = 0;
 };
 
 struct IHThorFirstNArg : public IHThorArg
@@ -1268,6 +1305,18 @@ struct IHThorDiskWriteArg : public IHThorArg
     virtual void getEncryptKey(size32_t & keyLen, void * & key) = 0;
     virtual unsigned getFormatCrc() = 0;
     virtual const char * getCluster(unsigned idx) = 0;
+    virtual unsigned getWidth() = 0;                // only guaranteed present if TDWhaswidth defined
+};
+
+//New prototype interface for writing any format file through the same interface
+//liable to change at any point.
+//Functions should only be called if getFlags() & TDXgeneric is true.
+struct IHThorGenericDiskWriteArg : extends IHThorDiskWriteArg
+{
+    virtual const char * queryFormat() = 0;                         // not needed for unified provider
+    virtual void getFormatOptions(IXmlWriter & options) = 0;        // not needed for unified provider
+    virtual const char * queryProvider() = 0;
+    virtual void getProviderOptions(IXmlWriter & options) = 0;
 };
 
 struct IHThorFilterArg : public IHThorArg
@@ -1419,12 +1468,7 @@ struct IHThorSplitArg : public IHThorArg
     virtual bool isBalanced() = 0;
 };
 
-struct IHThorSpillExtra : public IInterface
-{
-    //fill in functions here if we need any more...
-};
-
-struct IHThorSpillArg : public IHThorDiskWriteArg
+struct IHThorSpillArg : public IHThorGenericDiskWriteArg
 {
 };
 
@@ -1923,16 +1967,19 @@ struct IHThorHashDistributeArg : public IHThorArg
     virtual ICompare * queryMergeCompare()=0;       // iff TAKhasdistributemerge
 };
 
+
 enum
 {
-    SDFisall   = 0x0001,
+    SDFisall    = 0x0001,
+    SDFwidth    = 0x0002,
 };
-
 
 struct IHThorNWayDistributeArg : public IHThorArg
 {
     virtual unsigned   getFlags()=0;
     virtual bool       include(const byte * left, unsigned targetNode) = 0;
+    virtual unsigned   getWidth()=0;
+
     inline bool        isAll() { return (getFlags() & SDFisall) != 0; }
 };
 
@@ -2219,7 +2266,11 @@ enum
     SOAPFxpathhints     = 0x002000,
     SOAPFnoroot         = 0x004000,
     SOAPFjson           = 0x008000,
-    SOAPFxml            = 0x010000
+    SOAPFxml            = 0x010000,
+    SOAPFlogusertail    = 0x020000,
+    SOAPFformEncoded    = 0x040000,
+    SOAPFpersist        = 0x080000,
+    SOAPFpersistMax     = 0x100000,
 };
 
 struct IHThorWebServiceCallActionArg : public IHThorArg
@@ -2253,6 +2304,8 @@ struct IHThorWebServiceCallActionArg : public IHThorArg
     virtual const char * getXpathHintsXml() = 0; //iff SOAPFxpathhints
     virtual const char * getRequestHeader() = 0;
     virtual const char * getRequestFooter() = 0;
+    virtual void getLogTailText(size32_t & lenText, char * & text, const void * left) = 0;  // iff SOAPFlogusertail set
+    virtual unsigned getPersistMaxRequests() = 0; // only available iff SOAPFpersistMax
 };
 typedef IHThorWebServiceCallActionArg IHThorSoapActionArg ;
 typedef IHThorWebServiceCallActionArg IHThorHttpActionArg ;
@@ -2404,6 +2457,28 @@ struct IHThorIndexReadBaseArg : extends IHThorCompoundBaseArg
     virtual IHThorSteppedSourceExtra *querySteppingExtra() = 0;
 };
 
+
+/*
+ queryDiskRecordSize()
+    This is the expected record on disk.  It is always the serialialized form.  With the new disk reading implementation it may contain
+    the virtual fields as well as real fields.
+
+ queryProjectedDiskRecordSize()
+    This is the format that the transsform/match function expect as input.  It is generally the deserialized vesion of
+    the expected record with any fields that are not required removed.  If not transform is required then the row is
+    will match the queryOutputMetaData()
+
+There are some record formats that are not supported by the translation code (see canDefinitelyProcessWithTranslator() in hqlattr):
+    alien data types
+    dataset(record, count(x))
+    dataset(record, sizeof(x))
+    ifblock(complex-expression)
+
+    If these occur then the compound disk operations are disabled - field projection will not happen.  The projectedDiskRecordSize
+    will match the queryDiskRecordSize() and the transform will perform the deserialization.  The generated queryDiskRecordSize()
+    function will need to be used for calculating the size of the input record.
+
+*/
 struct IHThorDiskReadBaseArg : extends IHThorCompoundBaseArg
 {
     virtual const char * getFileName() = 0;
@@ -2421,11 +2496,13 @@ struct IHThorDiskReadBaseArg : extends IHThorCompoundBaseArg
 
 //New prototype interface for reading any format file through the same interface
 //liable to change at any point.
-struct IHThorNewDiskReadBaseArg : extends IHThorDiskReadBaseArg
+//Functions should only be called if getFlags() & TDXgeneric is true.
+struct IHThorGenericDiskReadBaseArg : extends IHThorDiskReadBaseArg
 {
     virtual const char * queryFormat() = 0;
     virtual void getFormatOptions(IXmlWriter & options) = 0;
-    virtual void getFormatDynOptions(IXmlWriter & options) = 0;
+    virtual const char * queryProvider() = 0;
+    virtual void getProviderOptions(IXmlWriter & options) = 0;
 };
 
 //The following are mixin classes added to one of the activity base interfaces above.
@@ -2568,7 +2645,7 @@ struct IHThorDiskGroupAggregateArg : extends IHThorDiskReadBaseArg, extends IHTh
 };
 
 
-struct IHThorNewDiskReadArg : extends IHThorNewDiskReadBaseArg, extends IHThorSourceLimitTransformExtra, extends IHThorCompoundReadExtra
+struct IHThorNewDiskReadArg : extends IHThorGenericDiskReadBaseArg, extends IHThorSourceLimitTransformExtra, extends IHThorCompoundReadExtra
 {
     COMMON_NEWTHOR_FUNCTIONS
 };
@@ -2780,6 +2857,8 @@ struct IHThorNWayMergeJoinArg : public IHThorArg
 enum
 {
     PPFparallel                 = 0x0001,
+    PPFsequential               = 0x0002,
+    PPFnulltransform            = 0x0004,
 };
 
 struct IHThorPrefetchProjectArg : public IHThorArg 
@@ -2913,7 +2992,7 @@ struct IGlobalCodeContext
     virtual void fail(int, const char *) = 0;  
 
     virtual bool isResult(const char * name, unsigned sequence) = 0;
-    virtual unsigned getWorkflowId() = 0;
+    virtual unsigned getWorkflowIdDeprecated() = 0; // Workflows are not associated with global context. Deprecated. Left here to avoid changing interface.
     virtual void doNotify(char const * name, char const * text) = 0;
 
     virtual int queryLastFailCode() = 0;
@@ -2932,13 +3011,11 @@ struct IGlobalCodeContext
     virtual void doNotify(char const * name, char const * text, const char * target) = 0;
 };
 
-
 struct IEclProcess : public IInterface
 {
     virtual int perform(IGlobalCodeContext * gctx, unsigned wfid) = 0;
     virtual unsigned getActivityVersion() const = 0;
 };
-
 
 //------------------------------------------------------------------------------------------------
 
@@ -2965,6 +3042,33 @@ protected:
     Owned<IColumnProviderIterator> iter;
     Owned<IColumnProvider> cur;
 };
+
+constexpr unsigned daliResultOutputMax = 2000; // MB
+constexpr unsigned futureResultOutputMax = 100; // MB
+
+//------------------------------------------------------------------------------------------------
+
+// RAII class to start and stop a section timer
+class SectionTimerBlock
+{
+private:
+    ISectionTimer * timer;
+    unsigned long long cycles = 0;
+
+public:
+    SectionTimerBlock(ISectionTimer * _timer) : timer(_timer)
+    {
+        if (timer)
+            cycles = timer->getStartCycles();
+    }
+    ~SectionTimerBlock()
+    {
+        if (timer)
+            timer->noteSectionTime(cycles);
+    }
+};
+
+//------------------------------------------------------------------------------------------------
 
 #ifdef STARTQUERY_EXPORTS
 #define STARTQUERY_API DECL_EXPORT

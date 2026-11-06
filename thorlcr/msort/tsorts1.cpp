@@ -16,6 +16,7 @@
 ############################################################################## */
 
 #include "platform.h"
+#include <atomic>
 #include <limits.h>
 
 #include "jlib.hpp"
@@ -26,6 +27,7 @@
 #include "tsorts.hpp"
 #include "thmem.hpp"
 
+#include "securesocket.hpp"
 
 #ifdef _DEBUG
 //#define TRACE_UNIQUE
@@ -34,7 +36,6 @@
 //#define TRACE_PARTITION
 //#define TRACE_PARTITION_OVERFLOW
 #endif
-
 
 // This contains the original global merge method
 
@@ -55,22 +56,44 @@ protected:
     }
 public:
     IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
-    CMergeReadStream(IThorRowInterfaces *rowif, unsigned streamno,SocketEndpoint &targetep, rowcount_t startrec, rowcount_t numrecs)
+    CMergeReadStream(IThorRowInterfaces *rowif, unsigned streamno,SocketEndpoint &targetep, rowcount_t startrec, rowcount_t numrecs, unsigned sortTraceLevel=0, ISecureSocketContext *secureContextClient=nullptr)
     {
         endpoint = targetep;
         char url[100];
-        targetep.getUrlStr(url,sizeof(url));
-        LOG(MCthorDetailedDebugInfo, thorJob, "SORT Merge READ: Stream(%u) %s, pos=%" RCPF "d len=%" RCPF "u",streamno,url,startrec,numrecs);
+        targetep.getEndpointHostText(url,sizeof(url));
+        LOG(MCthorDetailedDebugInfo, "SORT Merge READ: Stream(%u) %s, pos=%" RCPF "d len=%" RCPF "u",streamno,url,startrec,numrecs);
         SocketEndpoint mergeep = targetep;
         mergeep.port+=SOCKETSERVERINC; 
-        stream = ConnectMergeRead(streamno,rowif,mergeep,startrec,numrecs);
-        LOG(MCthorDetailedDebugInfo, thorJob, "SORT Merge READ: Stream(%u) connected to %s",streamno,url);
+
+        Owned<ISocket> socket = ISocket::connect_wait(mergeep,CONNECTTIMEOUT*1000);
+
+#if defined(_USE_OPENSSL)
+        if (secureContextClient)
+        {
+            Owned<ISecureSocket> ssock = secureContextClient->createSecureSocket(socket.getClear());
+            int tlsTraceLevel = SSLogMin;
+            if (sortTraceLevel >= ExtraneousMsgThreshold)
+                tlsTraceLevel = SSLogMax;
+            int status = ssock->secure_connect(tlsTraceLevel);
+            if (status < 0)
+            {
+                ssock->close();
+                VStringBuffer errmsg("Secure connect failed: %d", status);
+                THROWJSOCKEXCEPTION_MSG(JSOCKERR_connection_failed, errmsg);
+            }
+            socket.setown(ssock.getClear());
+        }
+#endif // OPENSSL
+
+        stream = ConnectMergeRead(streamno,rowif,mergeep,startrec,numrecs,socket);
+
+        LOG(MCthorDetailedDebugInfo, "SORT Merge READ: Stream(%u) connected to %s",streamno,url);
     }
     virtual ~CMergeReadStream()
     {
         if (stream) {
             char url[100];
-            endpoint.getUrlStr(url,sizeof(url));
+            endpoint.getEndpointHostText(url,sizeof(url));
             DBGLOG("SORT Merge READ: EOS via destructor for %s",url);
             stream->stop();
         }
@@ -85,8 +108,8 @@ public:
                 return row.getClear();
 #ifdef _FULL_TRACE
             char url[100];
-            endpoint.getUrlStr(url,sizeof(url));
-            LOG(MCthorDetailedDebugInfo, thorJob, "SORT Merge READ: EOS for %s",url);
+            endpoint.getEndpointHostText(url,sizeof(url));
+            LOG(MCthorDetailedDebugInfo, "SORT Merge READ: EOS for %s",url);
 #endif
             eos();
         }
@@ -98,8 +121,8 @@ public:
         if (stream) {
 #ifdef _FULL_TRACE
             char url[100];
-            endpoint.getUrlStr(url,sizeof(url));
-            LOG(MCthorDetailedDebugInfo, thorJob, "SORT Merge READ: stop for %s",url);
+            endpoint.getEndpointHostText(url,sizeof(url));
+            LOG(MCthorDetailedDebugInfo, "SORT Merge READ: stop for %s",url);
 #endif
             stream->stop();
             eos();
@@ -126,14 +149,13 @@ class CSortMerge: public CSimpleInterface, implements ISocketSelectNotify
     unsigned ndone;
     bool started;
     CSortTransferServerThread *parent;
-    bool done;
-    bool closing;
-    Semaphore donesem;
+    std::atomic_bool done;
+    Semaphore donesem{SYNC_LOCATION};
     Owned<IException> exception;
     ISocketSelectHandler *selecthandler;
 protected:
     Owned<ISocket> socket;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
 public:
     IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
 
@@ -141,12 +163,12 @@ public:
     ~CSortMerge()
     {
 #ifdef _FULL_TRACE
-        LOG(MCthorDetailedDebugInfo, thorJob, "~CSortMerge in");
+        LOG(MCthorDetailedDebugInfo, "~CSortMerge in");
 #endif
         if (started)
             closedown();
 #ifdef _FULL_TRACE
-        LOG(MCthorDetailedDebugInfo, thorJob, "~CSortMerge out");
+        LOG(MCthorDetailedDebugInfo, "~CSortMerge out");
 #endif
     }
     void init()
@@ -156,7 +178,7 @@ public:
         char name[64];
         int port = socket->peer_name(name,sizeof(name));
         url.append(name).append(':').append(port);
-        LOG(MCthorDetailedDebugInfo, thorJob, "SORT Merge WRITE: start %s, pos=%" RCPF "d, len=%" RCPF "d",url.str(),poscount,numrecs);
+        LOG(MCthorDetailedDebugInfo, "SORT Merge WRITE: start %s, pos=%" RCPF "d, len=%" RCPF "d",url.str(),poscount,numrecs);
         rowcount_t pos=poscount;
         try
         {
@@ -206,57 +228,57 @@ public:
         char peer[16];
         if (socket) {
             socket->peer_name(peer,sizeof(peer)-1);
-            LOG(MCthorDetailedDebugInfo, thorJob, "waitdone %s",peer);
+            LOG(MCthorDetailedDebugInfo, "waitdone %s",peer);
         }
         else
             peer[0] = 0;
-        while (!done)
+        while (!done.load())
             donesem.wait();
         if (exception)
             throw exception.getClear();
         if (peer[0])
-            LOG(MCthorDetailedDebugInfo, thorJob, "waitdone exit");
+            LOG(MCthorDetailedDebugInfo, "waitdone exit");
     }
-    bool notifySelected(ISocket *sock,unsigned selected)
+    bool notifySelected(ISocket *,unsigned)
     {
-        while (!done) {
-            try {
-                if (closing) {
-                    closing = false;
-#ifdef _FULL_TRACE
-                    LOG(MCthorDetailedDebugInfo, thorJob, "notifySelected calling closedown");
-#endif
-                    closedown();
-#ifdef _FULL_TRACE
-                    LOG(MCthorDetailedDebugInfo, thorJob, "notifySelected called closedown");
-#endif
-                    done = true;
-                    donesem.signal();
-                    return false;
-                }
-            }
-            catch (IException *e) {
-                EXCLOG(e,"CSortMerge notifySelected.1");
-                exception.setown(e);
-                done = true;
-                donesem.signal();
-                return false;
-            }
-            try {
-                if (processRows()) 
-                    return false;   // false correct here
-            }
-            catch (IException *e) {
-                EXCLOG(e,"CSortMerge notifySelected.2");
-                exception.setown(e);
-            }
-            closing = true;
-            CriticalBlock block(crit);
-            if (!sock||!socket)
-                break;
-            if (sock->avail_read()==0)
-                break;
+        if (done.load())
+            return false;
+
+        try
+        {
+            if (processRows())
+                return false;   // false correct here
         }
+        catch (IException *e)
+        {
+            IERRLOG(e,"CSortMerge notifySelected");
+            if (!exception)
+                exception.setown(e);
+            else
+                e->Release();
+        }
+
+        try
+        {
+#ifdef _FULL_TRACE
+            LOG(MCthorDetailedDebugInfo, "notifySelected calling closedown");
+#endif
+            closedown();
+#ifdef _FULL_TRACE
+            LOG(MCthorDetailedDebugInfo, "notifySelected called closedown");
+#endif
+        }
+        catch (IException *e)
+        {
+            IERRLOG(e,"CSortMerge notifySelected closedown");
+            if (!exception)
+                exception.setown(e);
+            else
+                e->Release();
+        }
+
+        done.store(true);
+        donesem.signal();
         return false; // false correct here
     }
 };
@@ -266,28 +288,47 @@ class CSortTransferServerThread: protected Thread, implements IMergeTransferServ
 {
 protected: friend class CSortMerge;
     ISortSlaveBase &slave;
-    bool term;
+    std::atomic_bool term;
     Owned<ISocket> server;
-    CriticalSection childsect;
+    CriticalSection childsect{SYNC_LOCATION};
     CSortMergeArray children;
     Owned<ISocketSelectHandler> selecthandler;
     Linked<IThorRowInterfaces> rowif;
-    CriticalSection rowifsect;
-    Semaphore rowifsem;
+    CriticalSection rowifsect{SYNC_LOCATION};
+    CriticalSection serversect{SYNC_LOCATION};
+    CriticalSection acceptsect{SYNC_LOCATION};
+    Linked<ISocket> pendingSocket;
+    Semaphore rowifsem{SYNC_LOCATION};
+    Owned<ISecureSocketContext> secureContextServer;
+    Owned<ISecureSocketContext> secureContextClients;
+    size32_t mergeBufSize;
 public:
     IMPLEMENT_IINTERFACE_USING(Thread)
 
     void start() 
     { 
-        Thread::start(); 
+        Thread::start(true);
     }
 
-    CSortTransferServerThread(ISortSlaveBase &in) 
-        : slave(in), Thread("SortTransferServer") 
+    CSortTransferServerThread(ISortSlaveBase &in, unsigned numnodes, size32_t totalBufSize)
+        : slave(in), Thread("SortTransferServer")
     {
         unsigned port = in.getTransferPort();
         server.setown(ISocket::create(port));
-        term = false;
+        term.store(false);
+#if defined(_USE_OPENSSL)
+        if (slave.queryTLS())
+        {
+            secureContextServer.setown(createSecureSocketContextSecretSrv("local", nullptr, true));
+            secureContextClients.setown(createSecureSocketContextSecret("local", ClientSocket));
+        }
+#endif
+        // numnodes is guaranteed to be non-zero
+        mergeBufSize = totalBufSize / numnodes;
+        if (mergeBufSize < 0x8000)
+            mergeBufSize = 0x8000;
+        else if (mergeBufSize > 0x100000)
+            mergeBufSize = 0x100000;
     }
 
     void setRowIF(IThorRowInterfaces *_rowif)
@@ -302,8 +343,8 @@ public:
     {
         // bit of a kludge
         CriticalBlock block(rowifsect);
-        while (!rowif&&!term) {
-            PROGLOG("CSortTransferServerThread waiting for row interface");
+        while (!rowif && !term.load()) {
+            DBGLOG("CSortTransferServerThread waiting for row interface");
             CriticalUnblock unblock(rowifsect);
             rowifsem.wait(60*1000);
         }
@@ -312,13 +353,27 @@ public:
     void stop()
     {
         DBGLOG("CSortTransferServerThread::stop");
-        term = true;
+        term.store(true);
+        rowifsem.signal();
+        Linked<ISocket> listenServer;
+        {
+            CriticalBlock block(serversect);
+            listenServer.set(server);
+        }
+        Linked<ISocket> activeSocket;
+        {
+            CriticalBlock block(acceptsect);
+            activeSocket.set(pendingSocket);
+        }
         try {
-            server->cancel_accept();
+            if (listenServer)
+                listenServer->cancel_accept();
         }
         catch (IJSOCK_Exception *e) {
             PrintExceptionLog(e,"CSortTransferServerThread:stop");
         }
+        shutdownAndCloseNoThrow(listenServer);
+        shutdownAndCloseNoThrow(activeSocket);
         verifyex(join(10*60*1000));
         DBGLOG("CSortTransferServerThread::stopped");
     }
@@ -327,23 +382,95 @@ public:
     {
         DBGLOG("CSortTransferServerThread started port %d",slave.getTransferPort());
         unsigned numretries = 10;
+        constexpr unsigned acceptPollMs = 1000;
         try {
-            while (!term)
+            while (!term.load())
             {
-                Owned<ISocket> socket = server->accept(true);
+                Linked<ISocket> listenServer;
+                {
+                    CriticalBlock block(serversect);
+                    if (!server)
+                        break;
+                    listenServer.set(server);
+                }
+
+                int canAccept = listenServer->wait_read(acceptPollMs);
+                if (canAccept < 0)
+                {
+                    if (!term.load())
+                        IWARNLOG("CSortTransferServerThread: wait_read failed");
+                    break;
+                }
+                if (canAccept == 0)
+                    continue;
+
+                if (term.load())
+                    break;
+
+                Owned<ISocket> socket = listenServer->accept(true);
                 if (!socket)
                     break;
+
+#if defined(_USE_OPENSSL)
+                if (slave.queryTLS())
+                {
+                    Owned<ISecureSocket> ssock = secureContextServer->createSecureSocket(socket.getClear());
+                    int tlsTraceLevel = SSLogMin;
+                    unsigned sortTraceLevel = slave.queryTraceLevel();
+                    if (sortTraceLevel >= ExtraneousMsgThreshold)
+                        tlsTraceLevel = SSLogMax;
+                    int status = ssock->secure_accept(tlsTraceLevel);
+                    if (status < 0)
+                    {
+                        ssock->close();
+                        VStringBuffer errmsg("Secure accept failed: %d", status);
+                        THROWJSOCKEXCEPTION_MSG(JSOCKERR_connection_failed, errmsg);
+                    }
+                    socket.setown(ssock.getClear());
+                }
+#endif // OPENSSL
 
                 rowcount_t poscount=0;
                 rowcount_t numrecs=0;
                 ISocketRowWriter *strm=NULL;
+                {
+                    CriticalBlock block(acceptsect);
+                    pendingSocket.set(socket);
+                }
                 try
                 {
                     waitRowIF();
-                    strm = ConnectMergeWrite(rowif,socket,0x100000,poscount,numrecs);
+                    if (term.load())
+                    {
+                        CriticalBlock block(acceptsect);
+                        pendingSocket.clear();
+                        break;
+                    }
+
+                    Linked<IThorRowInterfaces> localRowif;
+                    {
+                        CriticalBlock block(rowifsect);
+                        localRowif.set(rowif);
+                    }
+                    if (!localRowif)
+                    {
+                        CriticalBlock block(acceptsect);
+                        pendingSocket.clear();
+                        break;
+                    }
+
+                    strm = ConnectMergeWrite(localRowif,socket,mergeBufSize,poscount,numrecs);
+                    {
+                        CriticalBlock block(acceptsect);
+                        pendingSocket.clear();
+                    }
                 }
                 catch (IJSOCK_Exception *e) // retry if failed
                 {
+                    {
+                        CriticalBlock block(acceptsect);
+                        pendingSocket.clear();
+                    }
                     PrintExceptionLog(e, "WARNING: Exception(ConnectMergeWrite)");
                     if (--numretries==0)
                         throw;
@@ -352,9 +479,18 @@ public:
                 }
                 catch (IException *e) // only retry if serialization check failed, indicating possible foreign client connect
                 {
+                    {
+                        CriticalBlock block(acceptsect);
+                        pendingSocket.clear();
+                    }
                     PrintExceptionLog(e, "WARNING: Exception(ConnectMergeWrite)");
-                    if (TE_InvalidSortConnect != e->errorCode() || (--numretries==0))
-                        throw;
+
+                    if (TE_SortConnectProtocolErr != e->errorCode())
+                    {
+                        if (TE_SortConnectCrcErr != e->errorCode() || (--numretries==0))
+                            throw;
+                    }
+
                     e->Release();
                     continue;
                 }
@@ -370,17 +506,16 @@ public:
             }
             e->Release();
         }
-        try {
-            server->close();
-        }
-        catch (IJSOCK_Exception *e)
+        Owned<ISocket> listenServer;
         {
-            if (e->errorCode()!=JSOCKERR_cancel_accept) {
-                PrintExceptionLog(e,"CSortTransferServerThread closing");
-                // Ignore for now
-            }
-            e->Release();
+            CriticalBlock block(serversect);
+            listenServer.setown(server.getClear());
         }
+        {
+            CriticalBlock block(acceptsect);
+            pendingSocket.clear();
+        }
+        shutdownAndCloseNoThrow(listenServer);
         subjoin();
         DBGLOG("CSortTransferServerThread finished");
         return 0;
@@ -405,7 +540,10 @@ public:
             c.Release();
         }
         children.kill();
-        rowif.clear();
+        {
+            CriticalBlock rowifBlock(rowifsect);
+            rowif.clear();
+        }
 
     }
 
@@ -452,7 +590,7 @@ public:
         unsigned k = 0;
         for (i=0;i<numnodes;i++) {
             char url[100];
-            endpoints[i].getUrlStr(url,sizeof(url));
+            endpoints[i].getEndpointHostText(url,sizeof(url));
             DBGLOG("  %s",url);
             for (j=0;j<numnodes;j++) {
                 DBGLOG("  %u,",map[k]);
@@ -470,7 +608,7 @@ public:
                 respos += vMAPL(j,i)-vMAPL(j,i-1);      // note we are adding up all of the lower as we want start
 
         rowcount_t totalrows = resnum;
-        LOG(MCthorDetailedDebugInfo, thorJob, "Output start = %" RCPF "d, num = %" RCPF "u",respos,resnum);
+        LOG(MCthorDetailedDebugInfo, "Output start = %" RCPF "d, num = %" RCPF "u",respos,resnum);
 
         IArrayOf<IRowStream> readers;
         IException *exc = NULL;
@@ -485,11 +623,11 @@ public:
                 {
                     if (i==partno)
                     {
-                        LOG(MCthorDetailedDebugInfo, thorJob, "SORT Merge READ: Stream(%u) local, pos=%" RCPF "u len=%" RCPF "u",i,sstart,snum);
+                        LOG(MCthorDetailedDebugInfo, "SORT Merge READ: Stream(%u) local, pos=%" RCPF "u len=%" RCPF "u",i,sstart,snum);
                         readers.append(*slave.createMergeInputStream(sstart,snum));
                     }
                     else
-                        readers.append(*new CMergeReadStream(rowif,i,endpoints[i], sstart, snum));
+                        readers.append(*new CMergeReadStream(rowif,i,endpoints[i], sstart, snum, slave.queryTraceLevel(), secureContextClients));
                 }
             }
         }
@@ -523,15 +661,14 @@ CSortMerge::CSortMerge(CSortTransferServerThread *_parent,ISocket* _socket,ISock
     ndone = 0;
     started = false;
     selecthandler = _selecthandler;
-    done = false;
-    closing = false;
+    done.store(false);
 }
 
 void CSortMerge::closedown()
 {
     CriticalBlock block(crit);
 #ifdef _FULL_TRACE
-    LOG(MCthorDetailedDebugInfo, thorJob, "SORT Merge: closing %s",url.str());
+    LOG(MCthorDetailedDebugInfo, "SORT Merge: closing %s",url.str());
 #endif
     if (!socket)
         return;
@@ -566,10 +703,10 @@ void CSortMerge::closedown()
         throw;
     }
     started = false;
-    LOG(MCthorDetailedDebugInfo, thorJob, "SORT Merge: finished %s, %d rows merged",url.str(),ndone);
+    LOG(MCthorDetailedDebugInfo, "SORT Merge: finished %s, %d rows merged",url.str(),ndone);
 }
 
-IMergeTransferServer *createMergeTransferServer(ISortSlaveBase *parent)
+IMergeTransferServer *createMergeTransferServer(ISortSlaveBase *parent, unsigned numnodes, size32_t totalBufSize)
 {
-    return new CSortTransferServerThread(*parent);
+    return new CSortTransferServerThread(*parent, numnodes, totalBufSize);
 }

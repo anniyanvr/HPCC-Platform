@@ -250,6 +250,19 @@
             </xs:attribute>
           </xs:complexType>
         </xs:element>
+        <xs:element name="directAccessPlanes" type="xs:string" minOccurs="0" maxOccurs="unbounded">
+          <xs:annotation>
+            <xs:appinfo>
+              <tooltip>Storage plane Roxie can access directly without copying files to its default plane</tooltip>
+            </xs:appinfo>
+          </xs:annotation>
+        </xs:element>
+        <xs:element name="preferredPlanes" minOccurs="0" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:attribute name="name" type="xs:string" use="required"/>
+            <xs:attribute name="priority" type="xs:integer" use="optional"/>
+          </xs:complexType>
+        </xs:element>
         <xs:element name="PreferredCluster" maxOccurs="unbounded">
           <xs:annotation>
             <xs:appinfo>
@@ -617,17 +630,17 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="enableKeyDiff" type="xs:boolean" use="optional" default="true">
-      <xs:annotation>
-        <xs:appinfo>
-          <tooltip>Enable / Disable key diff functionality in roxie.</tooltip>
-        </xs:appinfo>
-      </xs:annotation>
-    </xs:attribute>
     <xs:attribute name="enableSysLog" type="xs:boolean" use="optional" default="true">
         <xs:annotation>
             <xs:appinfo>
                 <tooltip>Enable use of syslog for monitoring.</tooltip>
+            </xs:appinfo>
+        </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="encryptionInTransit" type="xs:boolean" use="optional" default="false">
+        <xs:annotation>
+            <xs:appinfo>
+                <tooltip>Encrypt traffic between Roxie nodes.</tooltip>
             </xs:appinfo>
         </xs:annotation>
     </xs:attribute>
@@ -638,7 +651,7 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="fieldTranslationEnabled" use="optional" default="payload">
+    <xs:attribute name="fieldTranslationEnabled" use="optional" default="payloadRemoveOnly">
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Enables translation (where possible) of mismatched file layouts on-the-fly. Specify 'payload' to attempt to translate payload fields only</tooltip>
@@ -649,6 +662,7 @@
           <xs:enumeration value="false"/>
           <xs:enumeration value="true"/>
           <xs:enumeration value="payload"/>
+          <xs:enumeration value="payloadRemoveOnly"/>
         </xs:restriction>
       </xs:simpleType>
     </xs:attribute>
@@ -670,6 +684,27 @@
       <xs:annotation>
         <xs:appinfo>
           <tooltip>HTTP Header field to use for sending and receiving GlobalId</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="mapHttpCallUrlsToSecrets" type="xs:boolean" use="optional" default="false">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>In SOAPCALL and HTTPCALL check if URLs have been mapped to secrets</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="warnIfUrlNotMappedToSecret" type="xs:boolean" use="optional" default="false">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>In SOAPCALL and HTTPCALL warn if URLs not mapped to secrets</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="requireUrlsMappedToSecrets" type="xs:boolean" use="optional" default="false">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>Require SOAPCALL and HTTPCALL URLs are secrets or mapped to secrets</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
@@ -725,7 +760,7 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="maxHttpConnectionRequests" type="xs:nonNegativeInteger" use="optional" default="10">
+    <xs:attribute name="maxHttpConnectionRequests" type="xs:nonNegativeInteger" use="optional" default="0">
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Max number of query requests per persistent http connection</tooltip>
@@ -781,6 +816,13 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
+    <xs:attribute name="parallelQueryLoadThreads" type="nonNegativeInteger" use="optional" default="0">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>Use up to n multiple threads for initial query loading</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
     <xs:attribute name="preferredSubnet" type="xs:string" use="optional" default="">
       <xs:annotation>
         <xs:appinfo>
@@ -809,10 +851,10 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="reloadRetriesFailed" type="xs:boolean" use="optional" default="true">
+    <xs:attribute name="reloadRetriesSuspended" type="xs:boolean" use="optional" default="true">
       <xs:annotation>
         <xs:appinfo>
-          <tooltip>Retry loading of failed queries whenever QuerySet reloads</tooltip>
+          <tooltip>Retry loading of suspended queries whenever QuerySet reloads</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
@@ -923,6 +965,13 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
+    <xs:attribute name="heapLockMemory" type="xs:boolean" use="optional" default="true">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>Disable locking of heap memory</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
   </xs:attributeGroup>
   <xs:attributeGroup name="Redundancy">
 
@@ -965,9 +1014,8 @@
         </xs:restriction>
       </xs:simpleType>
     </xs:attribute>
-
-
   </xs:attributeGroup>
+
   <xs:attributeGroup name="Tracing">
     <xs:attribute name="traceLevel" type="xs:nonNegativeInteger" use="optional" default="1">
       <xs:annotation>
@@ -1008,6 +1056,13 @@
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Level of detail in reporting SOAPCALL information(set to 0 for none, 1 for normal, >1 or more for extended)</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="soapAuthTraceLevel" type="xs:nonNegativeInteger" use="optional" default="1">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>Enable logging authorization headers in SOAPCALL or HTTPCALL information (set to 0 to suppress, >0 to log)</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
@@ -1069,6 +1124,13 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
+    <xs:attribute name="udpAdjustThreadPriorities" type="xs:boolean" use="optional" default="false">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>Should UDP socket reading threads operate at elevated priority</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
     <xs:attribute name="udpFlowSocketsSize" type="xs:nonNegativeInteger" use="optional" default="131071">
       <xs:annotation>
         <xs:appinfo>
@@ -1076,42 +1138,28 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="udpInlineCollation" type="xs:boolean" use="optional" default="false">
-      <xs:annotation>
-        <xs:appinfo>
-          <tooltip>Controls whether UDP packets are collated on the reading thread or queued up for collation on a separate thread</tooltip>
-        </xs:appinfo>
-      </xs:annotation>
-    </xs:attribute>
-    <xs:attribute name="udpInlineCollationPacketLimit" type="xs:nonNegativeInteger" use="optional" default="50">
-      <xs:annotation>
-        <xs:appinfo>
-          <tooltip>Controls how many UDP packets requested at once when inline collation selected</tooltip>
-        </xs:appinfo>
-      </xs:annotation>
-    </xs:attribute>
-    <xs:attribute name="udpLocalWriteSocketSize" type="xs:nonNegativeInteger" use="optional" default="131071">
+    <xs:attribute name="udpLocalWriteSocketSize" type="xs:nonNegativeInteger" use="optional" default="1024000">
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Controls the write socket buffer size of the local UDP sockets (Agent to Server on same node)</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="udpMaxRetryTimedoutReqs" type="xs:nonNegativeInteger" use="optional" default="0">
+    <xs:attribute name="tcpServerWorkerSendBufferSize" type="xs:nonNegativeInteger" use="optional" default="0">
       <xs:annotation>
         <xs:appinfo>
-          <tooltip>Controls the Max number of agent "request to send" to be retried. 0 means keep retrying forever</tooltip>
+          <tooltip>Controls the write socket buffer size of the TCP worker connection sockets</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="udpMaxSlotsPerClient" type="xs:nonNegativeInteger" use="optional" default="2147483647">
+    <xs:attribute name="tcpServerWorkerRecvBufferSize" type="xs:nonNegativeInteger" use="optional" default="0">
       <xs:annotation>
         <xs:appinfo>
-          <tooltip>UDP transport layer slots per client</tooltip>
+          <tooltip>Controls the read socket buffer size of the TCP worker connection sockets</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="udpMulticastBufferSize" type="xs:nonNegativeInteger" use="optional" default="131071">
+    <xs:attribute name="udpMulticastBufferSize" type="xs:nonNegativeInteger" use="optional" default="262142">
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Controls the read socket buffer size of the UDP multicast sockets</tooltip>
@@ -1132,24 +1180,10 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-        <xs:attribute name="udpRequestToSendTimeout" type="xs:nonNegativeInteger" use="optional" default="0">
-            <xs:annotation>
-                <xs:appinfo>
-                    <tooltip>Controls the timeout value agent udp will wait for permission to send from a Roxie server, in milliseconds. Specify 0 to calcuate automatically.</tooltip>
-                </xs:appinfo>
-            </xs:annotation>
-        </xs:attribute>
-    <xs:attribute name="udpResendEnabled" type="xs:boolean" use="optional" default="false">
+    <xs:attribute name="udpResendLostPackets" type="xs:boolean" use="optional" default="true">
       <xs:annotation>
         <xs:appinfo>
-          <tooltip>UDP transport layer packet resend ability</tooltip>
-        </xs:appinfo>
-      </xs:annotation>
-    </xs:attribute>
-    <xs:attribute name="udpRetryBusySenders" type="xs:nonNegativeInteger" use="optional" default="0">
-      <xs:annotation>
-        <xs:appinfo>
-          <tooltip>Controls the number of times Roxie server will repeat search for an idle sender when requesting new data</tooltip>
+          <tooltip>UDP transport layer resend lost packets</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
@@ -1160,28 +1194,14 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-        <xs:attribute name="udpSnifferEnabled" type="xs:boolean" use="optional" default="true">
-            <xs:annotation>
-                <xs:appinfo>
-                    <tooltip>Enable the UDP multicast sniffer for tracking which senders are busy</tooltip>
-                </xs:appinfo>
-            </xs:annotation>
-        </xs:attribute>
-        <xs:attribute name="udpSnifferReadThreadPriority" type="nonNegativeInteger" use="optional" default="3">
-            <xs:annotation>
-                <xs:appinfo>
-                    <tooltip>If non-zero, run the sniffer read thread at elevated priority level</tooltip>
-                </xs:appinfo>
-            </xs:annotation>
-        </xs:attribute>
-        <xs:attribute name="udpSnifferSendThreadPriority" type="nonNegativeInteger" use="optional" default="3">
-            <xs:annotation>
-                <xs:appinfo>
-                    <tooltip>If non-zero, run the sniffer send thread at elevated priority level</tooltip>
-                </xs:appinfo>
-            </xs:annotation>
-        </xs:attribute>
-    </xs:attributeGroup>
+    <xs:attribute name="udpStatsReportInterval" type="xs:nonNegativeInteger" use="optional" default="60000">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>UDP transport layer stats reporting interval</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
+  </xs:attributeGroup>
   <xs:attributeGroup name="Cache">
     <xs:attribute name="blobCacheMem" type="xs:nonNegativeInteger" use="optional" default="0">
       <xs:annotation>
@@ -1190,24 +1210,10 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="serverSideCacheSize" type="xs:nonNegativeInteger" use="optional" default="0">
-      <xs:annotation>
-        <xs:appinfo>
-          <tooltip>Number of agent results to cache on Roxie server</tooltip>
-        </xs:appinfo>
-      </xs:annotation>
-    </xs:attribute>
     <xs:attribute name="leafCacheMem" type="xs:nonNegativeInteger" use="optional" default="50">
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Size (in Mb) of leaf index page cache</tooltip>
-        </xs:appinfo>
-      </xs:annotation>
-    </xs:attribute>
-    <xs:attribute name="nodeCachePreload" type="xs:boolean" use="optional" default="false">
-      <xs:annotation>
-        <xs:appinfo>
-          <tooltip>Prefill the node cache with all non-leaf pages from all indexes</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
@@ -1313,16 +1319,9 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="snifferPort" type="xs:nonNegativeInteger" use="optional" default="9003">
-      <xs:annotation>
-        <xs:appinfo>
-          <tooltip>Port used for UDP (slave->server) sniffer</tooltip>
-        </xs:appinfo>
-      </xs:annotation>
-    </xs:attribute>
   </xs:attributeGroup>
   <xs:attributeGroup name="Debug">
-    <xs:attribute name="alwaysFailOnLeaks" type="xs:boolean" use="optional" default="true">
+    <xs:attribute name="alwaysFailOnLeaks" type="xs:boolean" use="optional" default="false">
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Fail any query that triggers internal consistency check or row leak errors</tooltip>
@@ -1385,14 +1384,7 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-      <xs:attribute name="diskReadBufferSize" type="xs:nonNegativeInteger" use="optional" default="65536">
-          <xs:annotation>
-              <xs:appinfo>
-                  <tooltip>Default buffer size for disk read operations</tooltip>
-              </xs:appinfo>
-          </xs:annotation>
-      </xs:attribute>
-      <xs:attribute name="doIbytiDelay" type="xs:boolean" use="optional" default="true">
+    <xs:attribute name="doIbytiDelay" type="xs:boolean" use="optional" default="true">
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Enables the IBYTI delay logic in the agents.</tooltip>
@@ -1434,7 +1426,7 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="initIbytiDelay" type="xs:nonNegativeInteger" use="optional" default="100">
+    <xs:attribute name="initIbytiDelay" type="xs:nonNegativeInteger" use="optional" default="50">
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Initial time (in milliseconds) a secondary agent will wait for an IBYTI packet from a primary peer.</tooltip>
@@ -1448,10 +1440,10 @@
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
-    <xs:attribute name="linuxYield" type="xs:boolean" use="optional" default="false">
+    <xs:attribute name="indexYieldFrequency" type="xs:nonNegativeInteger" use="optional" default="1">
       <xs:annotation>
         <xs:appinfo>
-          <tooltip>Yield to scheduler in some tight loops. May help latency on uniprocessor machines</tooltip>
+          <tooltip>Yield to scheduler in some tight index loops every N iterations. May help latency with few CPUs</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>
@@ -1494,13 +1486,6 @@
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Number of pending queries permitted per channel (per active activity) before blocking</tooltip>
-        </xs:appinfo>
-      </xs:annotation>
-    </xs:attribute>
-    <xs:attribute name="pingInterval" type="xs:nonNegativeInteger" use="optional" default="60">
-      <xs:annotation>
-        <xs:appinfo>
-          <tooltip>Interval (in seconds) between Roxie server ping tests</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>

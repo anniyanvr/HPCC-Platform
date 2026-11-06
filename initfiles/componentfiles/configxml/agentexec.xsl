@@ -20,6 +20,7 @@
 <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
 
   <xsl:output method="xml" version="1.0" encoding="UTF-8" indent="yes" omit-xml-declaration="yes"/>
+  <xsl:include href="vaults-common.xsl"/>
 
   <xsl:param name="process" select="'unknown'"/>
   <xsl:param name="instance" select="'s1'"/>
@@ -76,6 +77,10 @@
         <xsl:value-of select="@defaultMemoryLimitMB"/>
       </xsl:attribute>
 
+      <xsl:attribute name="fieldTranslationEnabled">
+        <xsl:value-of select="@fieldTranslationEnabled"/>
+      </xsl:attribute>
+
       <xsl:attribute name="logDir">
         <xsl:call-template name="makeAbsolutePath">
           <xsl:with-param name="path" select="@logDir"/>
@@ -99,6 +104,15 @@
       <xsl:attribute name="analyzeWorkunit">
         <xsl:value-of select="@analyzeWorkunit"/>
       </xsl:attribute>
+      <xsl:attribute name="mapHttpCallUrlsToSecrets">
+        <xsl:value-of select="@mapHttpCallUrlsToSecrets"/>
+      </xsl:attribute>
+      <xsl:attribute name="warnIfUrlNotMappedToSecret">
+        <xsl:value-of select="@warnIfUrlNotMappedToSecret"/>
+      </xsl:attribute>
+      <xsl:attribute name="requireUrlsMappedToSecrets">
+        <xsl:value-of select="@requireUrlsMappedToSecrets"/>
+      </xsl:attribute>
 
       <xsl:attribute name="thorConnectTimeout">
         <xsl:value-of select="@thorConnectTimeout"/>
@@ -112,8 +126,31 @@
         </xsl:attribute>
       </xsl:if>
       <xsl:copy-of select="analyzerOptions"/>
+      <xsl:call-template name="copyVaultsConfig"/>
       <xsl:copy-of select="/Environment/Software/Directories"/>  
-
+      <xsl:copy-of select="./protrace"/>
+      <xsl:choose>
+          <xsl:when test="tracing">
+              <xsl:copy-of select="./tracing"/>
+          </xsl:when>
+          <xsl:otherwise>
+              <xsl:copy-of select="/Environment/Software/tracing"/>
+          </xsl:otherwise>
+      </xsl:choose>
+      <!--
+      # Generated for configuration info. accessed by getGlobalConfig()
+      -->
+      <global>
+        <storage>
+          <xsl:copy-of select="/Environment/Software/RemoteStorage/*"/>
+          <xsl:copy-of select="/Environment/Software/Globals/storage/*"/>
+          <xsl:copy-of select="/Environment/Software/Storage/*"/>
+        </storage>
+        <expert>
+          <xsl:copy-of select="/Environment/Software/Globals/@* | /Environment/Software/Globals/*"/>
+        </expert>
+        <xsl:copy-of select="/Environment/Hardware/cost"/>
+      </global>
     </agentexec>
   </xsl:template>
 

@@ -90,7 +90,7 @@ class CIpOsHashTable: public CMinHashTable<CIpOsInstance>
 
 //---------------------------------------------------------------------------
 
-static CriticalSection ipcachesect;
+static CriticalSection ipcachesect{SYNC_LOCATION};
 static CIpOsHashTable *ipToOsCache = NULL;
 
 EnvMachineOS queryOS(const IpAddress & ip)
@@ -113,7 +113,7 @@ EnvMachineOS queryOS(const IpAddress & ip)
         Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
         Owned<IConstEnvironment> env = factory->openEnvironment();
         StringBuffer ipText;
-        ip.getIpText(ipText);
+        ip.getHostText(ipText);
         Owned<IConstMachineInfo> machine = env->getMachineByAddress(ipText.str());
         if (machine)
             ret = machine->getOS();
@@ -179,42 +179,13 @@ void setCanAccessDirectly(RemoteFilename & file)
     setCanAccessDirectly(file,canAccessFilesDirectly(file));
 }
 
-class CDaliEnvIntercept: public CInterface, implements IRemoteFileCreateHook
-{
-    bool active;
-    CriticalSection crit;
-public:
-    IMPLEMENT_IINTERFACE;
-    CDaliEnvIntercept() { active = false; }
-    virtual IFile * createIFile(const RemoteFilename & filename)
-    {
-        CriticalBlock block(crit);
-        if (active||!daliClientActive())
-            return NULL;
-        active = true;
-        IFile * ret;
-        if (canAccessFilesDirectly(filename)) 
-            ret = NULL;
-        else 
-            ret = createDaliServixFile(filename);   
-        active = false;
-        return ret;
-    }   
-} *DaliEnvIntercept;
-
-
-
 MODULE_INIT(INIT_PRIORITY_ENV_DALIENV)
 {
-    DaliEnvIntercept = new CDaliEnvIntercept;
-    addIFileCreateHook(DaliEnvIntercept);
     return true;
 }
 
 MODULE_EXIT()
 {
-    removeIFileCreateHook(DaliEnvIntercept);
-    ::Release(DaliEnvIntercept);
     delete ipToOsCache;
     ipToOsCache = NULL;
 }
@@ -226,7 +197,7 @@ const char * querySlaveExecutable(const char * keyName, const char * exeName, co
     Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
     Owned<IConstEnvironment> env = factory->openEnvironment();
     StringBuffer addr;
-    ip.getIpText(addr);
+    ip.getHostText(addr);
 
     StringBufferAdaptor spp(progpath);
     StringBufferAdaptor swd(workdir);
@@ -264,10 +235,10 @@ bool getRemoteRunInfo(const char * keyName, const char * exeName, const char * v
     // use dafilesrv to work out OS
     StringBuffer dalis;
     if (remotedali)
-        remotedali->endpoint().getUrlStr(dalis);
+        remotedali->endpoint().getEndpointHostText(dalis);
     // first get machine by IP
     StringBuffer ips;
-    ip.getIpText(ips);
+    ip.getHostText(ips);
 
     //Cannot use getEnvironmentFactory() since it is using a remotedali
     StringBuffer xpath;
@@ -330,21 +301,6 @@ bool getRemoteRunInfo(const char * keyName, const char * exeName, const char * v
             }
         }
     }
-    return false;
-}
-
-bool envGetConfigurationDirectory(const char *category, const char *component,const char *instance, StringBuffer &dirout)
-{
-    SessionId sessid = myProcessSession();
-    if (!sessid)
-        return false;
-
-    Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
-    Owned<IConstEnvironment> env = factory->openEnvironment();
-    Owned<IPropertyTree> root = &env->getPTree();
-    IPropertyTree * child = root->queryPropTree("Software/Directories");
-    if (child)
-        return getConfigurationDirectory(child,category,component,instance,dirout);
     return false;
 }
 

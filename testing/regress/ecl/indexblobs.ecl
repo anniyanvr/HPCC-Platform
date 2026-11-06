@@ -19,11 +19,26 @@
 //version useEmbedded=true,noSeek=false
 //version useEmbedded=false,noSeek=true
 //version useEmbedded=false,noSeek=false
+//version compression='hybrid'
+//version compression='inplace'
+//version compression='inplace:blob(lzw)'
+//version compression='inplace:blob(zstd)'
+//version compression='inplace:zstds'
+//comma in string not supported by the regression test engine: compression='inplace:zstds,blob(zstd)'
+//version compression='inplace:blob(zstd3)'
+//version compression='inplace:blob(zstd6)'
+//version compression='inplace:blob(zstd9)'
+//version compression='hybrid:blob(zstd3)'
+//version compression='hybrid:blob(zstd6)'
+//version compression='hybrid:blob(zstd9)'
 
-import setup;
+import ^ as root;
+import $.setup;
+import Std.File AS FileServices;
 
 useEmbedded := #IFDEFINED(root.useEmbedded, false);
-noSeek := #IFDEFINED(root.noSeek, false);
+noSeek := #IFDEFINED(root.noSeek, true);
+compressionType := #IFDEFINED(root.compression, 'legacy');
 
 #if (useEmbedded)
 attr := 'EMBEDDED';
@@ -71,9 +86,12 @@ idxRecord := RECORD
  DATASET(childRec) payload{BLOB};
 END;
 
+indexName := prefix+'anindex'+IF(useEmbedded,'E','L')+'_'+compressionType;
+
 p := PROJECT(ds, TRANSFORM(idxRecord, SELF.payload := LEFT.kids1; SELF := LEFT));
 
-i := INDEX(p, {uid}, {p}, prefix+'anindex'+IF(useEmbedded,'E','L'));
+//Duplicate the uid into the "fileposition" field so the value can be verified.
+i := INDEX(p, {uid}, {p, unsigned8 uid2 := uid}, indexName, compressed(compressionType));
 
 lhsRec := RECORD
  unsigned uid;
@@ -84,4 +102,7 @@ j := JOIN(lhs, i, LEFT.uid=RIGHT.uid, KEEP(1));
 SEQUENTIAL(
  BUILD(i, OVERWRITE);
  OUTPUT(count(nofold(j)) - numParents);
+
+ // Clean-up
+ FileServices.DeleteLogicalFile(indexName),
 );

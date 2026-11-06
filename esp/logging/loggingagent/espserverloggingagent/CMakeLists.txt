@@ -62,8 +62,7 @@ add_dependencies( espserverloggingagent espscm )
 
 install ( TARGETS espserverloggingagent RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
 
-target_link_libraries ( espserverloggingagent
-    ${XALAN_LIBRARIES} ${XERCES_LIBRARIES}
+target_link_libraries ( espserverloggingagent PRIVATE
     jlib
     xmllib
     logginglib

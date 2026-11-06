@@ -51,6 +51,12 @@
                     <xs:attribute name="recoverFromIncErrors" type="xs:boolean"
                                   hpcc:displayName="Enable Autorecover for Delta Files" hpcc:presetValue="true"
                                   hpcc:tooltip="Switch on to autorecover from corruption to delta files on load"/>
+                    <xs:attribute name="saveBinary" type="xs:boolean"
+                                  hpcc:displayName="Enable Saving Store in Binary Format" hpcc:presetValue="true"
+                                  hpcc:tooltip="Switch on to save the store in binary format"/>
+                    <xs:attribute name="saveAsync" type="xs:boolean"
+                                  hpcc:displayName="Enable Saving Store Asynchronously in XML and Binary formats" hpcc:presetValue="true"
+                                  hpcc:tooltip="Switch on to save the store asynchronously in XML and Binary formats"/>
                 </xs:attributeGroup>
                 <xs:attributeGroup name="backup" hpcc:groupByName="Backup" hpcc:docid="da.t3">
                     <xs:attribute name="backupComputer" hpcc:displayName="Backup Computer" type="nodeName"
@@ -61,15 +67,15 @@
                                   hpcc:presetValue="true" hpcc:tooltip="Asynchronous backup of transactions"/>
                     <xs:attribute name="useNFSBackupMount" type="xs:boolean" hpcc:displayName="Use NFS Backup Mount"
                                   hpcc:presetValue="false" hpcc:tooltip="Create and use a NFS mount point for backups"/>
-                    <xs:attribute name="backupLargeWarningThreshold" type="xs:nonNegativeInteger"
-                                  hpcc:displayName="Backup Warning Threshold" hpcc:presetValue="50"
-                                  hpcc:tooltip="Transaction granularity of pending backups to begin issue warnings about backlog"/>
-                    <xs:attribute name="backupSoftQueueLimit" type="xs:nonNegativeInteger"
-                                  hpcc:displayName="Backup Soft Queue Limit" hpcc:presetValue="200"
-                                  hpcc:tooltip="Number of transactions above which the backup queue will start introducing delays until the backup queue decreases below this limit"/>
-                    <xs:attribute name="backupSoftQueueLimitDelay" type="xs:nonNegativeInteger"
-                                  hpcc:displayName="Backup Soft Queue Limit Delay (s)" hpcc:presetValue="200"
-                                  hpcc:tooltip="The maximum delay to introduce when the backupSoftQueueLimit has been introduced"/>
+                    <xs:attribute name="deltaSaveThresholdSecs" type="xs:nonNegativeInteger"
+                                  hpcc:displayName="Seconds between transactions being committed to disk" hpcc:presetValue="0"
+                                  hpcc:tooltip="The maximum time between commit pending transactions to disk (default=0, meaning commit immediately)"/>
+                    <xs:attribute name="deltaTransactionQueueLimit" type="xs:nonNegativeInteger"
+                                  hpcc:displayName="Maximum number of pending uncommitted transaction" hpcc:presetValue="10000"
+                                  hpcc:tooltip="If exceeded, a synchronous save will be forced"/>
+                    <xs:attribute name="deltaTransactionMaxMemMB" type="xs:nonNegativeInteger"
+                                  hpcc:displayName="Maximum total pending transaction memory size" hpcc:presetValue="10"
+                                  hpcc:tooltip="If exceeded, a synchronous save will be forced"/>
                 </xs:attributeGroup>
                 <xs:attributeGroup name="dfs" hpcc:groupByName="DFS" hpcc:docid="da.t5">
                     <xs:attribute name="forceGroupUpdate" type="xs:boolean" hpcc:displayName="Force Group Update"
@@ -113,13 +119,6 @@
                                   hpcc:visibleIf="/Environment/Software/LDAPServerProcess"
                                   hpcc:requiredIf=".[@authMethod=('secmgrPlugin')]"
                                   hpcc:tooltip="Security Manager plugin name (when authentication method is secmgrPlugin)"/>
-                    <xs:attribute name="filesDefaultUser" type="xs:string" hpcc:displayName="Files Default User"
-                                  hpcc:visibleIf="/Environment/Software/LDAPServerProcess"
-                                  hpcc:tooltip="The default username for Files access (ActiveDirectory)"/>
-                    <xs:attribute name="filesDefaultPassword" type="xs:string" hpcc:modifiers="password"
-                                  hpcc:displayName="Files Default Password"
-                                  hpcc:visibleIf="/Environment/Software/LDAPServerProcess"
-                                  hpcc:tooltip="The default password for filesDefaultUser"/>
                     <xs:attribute name="reqSignatureExpiry" type="xs:string"
                                   hpcc:displayName="Signature Expiration (minutes)" hpcc:presetValue="10"
                                   hpcc:visibleIf="/Environment/Software/LDAPServerProcess"

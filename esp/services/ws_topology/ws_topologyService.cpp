@@ -34,6 +34,7 @@
 #endif
 #include "exception_util.hpp"
 #include "jwrapper.hpp"
+#include "datamasking.h"
 
 #define SDS_LOCK_TIMEOUT 30000
 
@@ -236,6 +237,16 @@ bool CWsTopologyEx::onTpLogFile(IEspContext &context,IEspTpLogFileRequest  &req,
     return true;
 }
 
+void CWsTopologyEx::validateFilePath(const char *file, const char *fileType, const char *compType, const char *compName)
+{
+    StringBuffer actualPath;
+    splitUNCFilename(file, nullptr, &actualPath, nullptr, nullptr);
+    if (containsRelPaths(actualPath)) //Detect a path like: /home/lexis/runtime/var/log/HPCCSystems/myesp/../../../
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid file path %s", actualPath.str());
+    if (!validateConfigurationDirectory(nullptr, fileType, compType, compName, actualPath))
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid file path %s", actualPath.str());
+}
+
 bool CWsTopologyEx::onSystemLog(IEspContext &context,IEspSystemLogRequest  &req, IEspSystemLogResponse &resp)
 {
     try
@@ -254,6 +265,7 @@ bool CWsTopologyEx::onSystemLog(IEspContext &context,IEspSystemLogRequest  &req,
         }
         else
         {
+            validateFilePath(name, "log", nullptr, nullptr);
             logname = name;
         }
 
@@ -643,8 +655,9 @@ bool CWsTopologyEx::readLastLogDateTime(const char *logName, IFileIO* rIO, size3
             break;
 
         previousPartialLine.clear().append(partialLineEndPtr - contentBuffer.str(), contentBuffer.str());
-        readFrom -= readSize;
-        if (readFrom < 0)
+        if ( readSize < readFrom)
+            readFrom -= readSize;
+        else
             readFrom = 0;
     }
     return false;
@@ -771,7 +784,7 @@ void CWsTopologyEx::readLogFileToArray(const char *logname, OwnedIFileIO rIO, Re
     }
 
     StringBuffer logLine, textLine, logFieldTime, logFieldTimeNextLine; //A logLine may has multiple textLines.
-    Owned<IFileIOStream> ios = createIOStream(rIO);
+    Owned<IFileIOStream> ios = createBufferedIOStream(rIO);
     Owned<IStreamLineReader> lineReader = createLineReader(ios, true);
     bool eof = lineReader->readLine(logLine);
     if (eof)
@@ -1117,7 +1130,10 @@ void CWsTopologyEx::readTpLogFile(IEspContext &context,const char* fileName, con
 {
     StringBuffer logname;
     if (strcmp(fileType,"thormaster_log"))
+    {
+        validateFilePath(fileName, "log", nullptr, nullptr);
         logname = fileName;
+    }
     else
         logname.append(CCluster(fileName)->queryRoot()->queryProp("LogFile"));
 
@@ -1181,6 +1197,9 @@ bool CWsTopologyEx::onTpListTargetClusters(IEspContext &context, IEspTpListTarge
     {
         context.ensureFeatureAccess(FEATURE_URL, SecAccess_Read, ECLWATCH_TOPOLOGY_ACCESS_DENIED, "WsTopology::TpListTargetClusters: Permission denied.");
 
+#ifdef _CONTAINERIZED
+        UNIMPLEMENTED_X("CONTAINERIZED(CWsTopologyEx::onTpListTargetClusters)");
+#else
         Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
         Owned<IConstEnvironment> env = factory->openEnvironment();
         Owned<IPropertyTree> root = &env->getPTree();
@@ -1256,6 +1275,7 @@ bool CWsTopologyEx::onTpListTargetClusters(IEspContext &context, IEspTpListTarge
             }
         }
         resp.setTargetClusters(clusters);
+#endif
     }
     catch(IException* e)
     {
@@ -1327,7 +1347,7 @@ bool CWsTopologyEx::onTpLogicalClusterQuery(IEspContext &context, IEspTpLogicalC
         if (roxieQueueFilter == RoxieQueueFilter_Undefined)
             roxieQueueFilter = CRoxieQueueFilter_All;
 
-        Owned<IPropertyTreeIterator> iter = queryComponentConfig().getElements("queues");
+        Owned<IPropertyTreeIterator> iter = getComponentConfigSP()->getElements("queues");
         ForEach(*iter)
         {
             IPropertyTree &queue = iter->query();
@@ -1397,9 +1417,12 @@ bool CWsTopologyEx::onTpClusterInfo(IEspContext &context, IEspTpClusterInfoReque
         Owned<IRemoteConnection> conn = querySDS().connect("/Status/Servers/", myProcessSession(),RTM_SUB,SDS_LOCK_TIMEOUT);
         if (conn)
         {
-            Owned<IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(req.getName());
+            StringBuffer encodedName;
+            // Prevent Blind XPath Injection
+            encodeXML(req.getName(), encodedName);
+            Owned<IConstWUClusterInfo> clusterInfo = getWUClusterInfoByName(encodedName.str());
             if (clusterInfo == nullptr)
-                throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid Target Cluster name provided: '%s'", req.getName());
+                throw makeStringExceptionV(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid Target Cluster name provided: '%s'", req.getName());
 
             SCMStringBuffer thorQueues;
             clusterInfo->getThorQueue(thorQueues);
@@ -1450,28 +1473,28 @@ bool CWsTopologyEx::onTpServiceQuery(IEspContext &context, IEspTpServiceQueryReq
         if (!type || !*type || (strcmp(eqAllServices,type) == 0))
         {
             IEspTpServices& ServiceList = resp.updateServiceList();
-
+            m_TpWrapper.getTpDfuServers( ServiceList.getTpDfuServers() );
+            m_TpWrapper.getTpDropZones(version, nullptr, true, ServiceList.getTpDropZones() );
+#ifndef _CONTAINERIZED
             m_TpWrapper.getTpDaliServers( version, ServiceList.getTpDalis() );
             m_TpWrapper.getTpEclServers( ServiceList.getTpEclServers() );
             m_TpWrapper.getTpEclCCServers( ServiceList.getTpEclCCServers() );
             m_TpWrapper.getTpEclAgents( ServiceList.getTpEclAgents() );
             m_TpWrapper.getTpEspServers( ServiceList.getTpEspServers() );
-            m_TpWrapper.getTpDfuServers( ServiceList.getTpDfuServers() );   
-            m_TpWrapper.getTpSashaServers( ServiceList.getTpSashaServers() );   
+            m_TpWrapper.getTpSashaServers( ServiceList.getTpSashaServers() );
             m_TpWrapper.getTpGenesisServers( ServiceList.getTpGenesisServers() );
             m_TpWrapper.getTpLdapServers( ServiceList.getTpLdapServers() );
-            m_TpWrapper.getTpDropZones(version, nullptr, true, ServiceList.getTpDropZones() );
             m_TpWrapper.getTpFTSlaves( ServiceList.getTpFTSlaves() );
-            m_TpWrapper.getTpDkcSlaves( ServiceList.getTpDkcSlaves() );
 
             if (version > 1.15)
-            {       
+            {
                 m_TpWrapper.getTpEclSchedulers( ServiceList.getTpEclSchedulers() );
             }
             if (version >= 1.28)
-            {       
+            {
                 m_TpWrapper.getTpSparkThors(version, nullptr, ServiceList.getTpSparkThors() );
             }
+#endif
         }
 
         resp.setMemThreshold( m_memThreshold );
@@ -1481,15 +1504,15 @@ bool CWsTopologyEx::onTpServiceQuery(IEspContext &context, IEspTpServiceQueryReq
         resp.setDiskThresholdType( m_bDiskThresholdIsPercentage ? "0" : "1");
 
         if (version > 1.06 && m_bEncapsulatedSystem)
-        {       
+        {
             resp.setEncapsulatedSystem( m_bEncapsulatedSystem );
         }
         if (version > 1.07)
-        {       
+        {
             resp.setEnableSNMP(m_enableSNMP);
         }
         if ((version > 1.12) && (m_preflightProcessFilter.length() > 0))
-        {       
+        {
             resp.setPreflightProcessFilter(m_preflightProcessFilter);
         }
         if (version >= 1.20)
@@ -1518,12 +1541,13 @@ bool CWsTopologyEx::onTpMachineQuery(IEspContext &context, IEspTpMachineQueryReq
         const char* directory = req.getDirectory();
 
         bool hasThorSpareProcess = false;
-        const char* type = req.getType();
-        if (!type || !*type || (strcmp(eqAllNodes,type) == 0))
+        const CTpMachineType type = req.getType();
+//        if (!type || !*type || (strcmp(eqAllNodes,type) == 0))
+        if (type == TpMachineType_Undefined || type == CTpMachineType_All )
         {
-            m_TpWrapper.getClusterMachineList(version, eqTHORMACHINES, path, directory, MachineList, hasThorSpareProcess);
-            m_TpWrapper.getClusterMachineList(version, eqHOLEMACHINES, path, directory, MachineList, hasThorSpareProcess);
-            m_TpWrapper.getClusterMachineList(version, eqROXIEMACHINES,path, directory, MachineList, hasThorSpareProcess);
+            m_TpWrapper.getClusterMachineList(version, CTpMachineType_Thor, path, directory, MachineList, hasThorSpareProcess);
+            m_TpWrapper.getClusterMachineList(version, CTpMachineType_Hole, path, directory, MachineList, hasThorSpareProcess);
+            m_TpWrapper.getClusterMachineList(version, CTpMachineType_Roxie,path, directory, MachineList, hasThorSpareProcess);
         }
         else
         {
@@ -1665,6 +1689,9 @@ bool CWsTopologyEx::onTpGetComponentFile(IEspContext &context, IEspTpGetComponen
         StringAttr      sDirectory;
         if (bCluster && !(netAddress && *netAddress))
         {
+#ifdef _CONTAINERIZED
+            UNIMPLEMENTED_X("CONTAINERIZED(CWsTopologyEx::onTpGetComponentFile)");
+#else
             Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
             Owned<IConstEnvironment> constEnv = factory->openEnvironment();
             Owned<IPropertyTree> pRoot = &constEnv->getPTree();
@@ -1704,7 +1731,7 @@ bool CWsTopologyEx::onTpGetComponentFile(IEspContext &context, IEspTpGetComponen
                     {
                         StringBuffer ipStr;
                         IpAddress ipaddr = queryHostIP();
-                        ipaddr.getIpText(ipStr);
+                        ipaddr.getHostText(ipStr);
                         if (ipStr.length() > 0)
                         {
                             netAddressStr = ipStr.str();
@@ -1712,6 +1739,7 @@ bool CWsTopologyEx::onTpGetComponentFile(IEspContext &context, IEspTpGetComponen
                     }
                 }
             }
+#endif
         }
 
         if (netAddressStr.length() > 0)
@@ -1743,6 +1771,8 @@ bool CWsTopologyEx::onTpGetComponentFile(IEspContext &context, IEspTpGetComponen
 
         StringBuffer uncPath;
         uncPath.append(pathSepChar).append(pathSepChar).append(netAddress).append(sDir).append(fileName);
+
+        validateFilePath(uncPath, (stricmp(fileType, "log") == 0) ? "log" : "run", nullptr, nullptr);
 
         if (stricmp(fileType, "log") == 0)
         {
@@ -1794,6 +1824,13 @@ bool CWsTopologyEx::onTpGetComponentFile(IEspContext &context, IEspTpGetComponen
             if (nRead != fileSize)
                 throw MakeStringException(ECLWATCH_CANNOT_READ_FILE, "Failed to read file %s.", uncPath.str());
 
+            IDataMaskingProfile* profile = queryDataMaskingProfile("urn:hpcc:platform:configs", 1);
+            if (nullptr == profile)
+                throw MakeStringException(ECLWATCH_DATAMASKING_FAILURE, "Unable to query the configuration data masking profile urn:hpcc:platform:configs");
+
+            // Masking does not change the length of the content so we can use the cast to avoid a copy
+            profile->maskContent("xml", static_cast<char*>(buf.bufferBase()), 0, buf.length());
+            
             const char* pchBuf = buf.toByteArray();
             const char* pchExt = strrchr(fileName, '.');
             if (!pchExt || (pchBuf[0] != '<') || stricmp(++pchExt, "xml"))
@@ -1954,3 +1991,173 @@ bool CWsTopologyEx::onTpDropZoneQuery(IEspContext &context, IEspTpDropZoneQueryR
     }
     return false;
 }
+
+bool CWsTopologyEx::onTpListLogFiles(IEspContext &context, IEspTpListLogFilesRequest &req, IEspTpListLogFilesResponse &resp)
+{
+    try
+    {
+        context.ensureFeatureAccess(FEATURE_URL, SecAccess_Read, ECLWATCH_TOPOLOGY_ACCESS_DENIED, "WsTopology::onTpListLogFile: Permission denied.");
+        m_TpWrapper.listLogFiles(req.getNetworkAddress(), req.getPath(), resp.getFiles());
+    }
+    catch(IException* e)
+    {
+        FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
+    }
+    return false;
+}
+
+void populateConfiguredComponents(StringArray& componentArray)
+{
+    componentArray.append("global");
+
+#ifdef _CONTAINERIZED
+    Owned<IPropertyTree> componentConfig = getComponentConfig();
+    Owned<IPropertyTreeIterator> components = componentConfig->getElements("configuredComponents[@name]");
+
+    ForEach(*components)
+    {
+        IPropertyTree &component = components->query();
+        componentArray.append(component.queryProp("@name"));
+    }
+#endif
+}
+
+bool CWsTopologyEx::onTpConfiguredComponents(IEspContext &context, IEspTpConfiguredComponentsRequest &req, IEspTpConfiguredComponentsResponse &resp)
+{
+    try
+    {
+        context.ensureFeatureAccess(FEATURE_URL, SecAccess_Read, ECLWATCH_TOPOLOGY_ACCESS_DENIED, "WsTopology::onTpConfiguredComponents: Permission denied.");
+        populateConfiguredComponents(resp.getConfiguredComponents());
+    }
+    catch(IException* e)
+    {
+        FORWARDEXCEPTION(context, e, ECLWATCH_INTERNAL_ERROR);
+    }
+    return true;
+}
+
+bool getConfigForComponent(const char* name, StringBuffer& config)
+{
+    if( isEmptyString(name) )
+        return false;
+    
+    if( stricmp(name, "global") == 0 )
+    {
+        Owned<IPropertyTree> globalConfig = getGlobalConfig();
+        if( isContainerized() )
+            toYAML(globalConfig, config, 2, 0);
+        else
+            toXML(globalConfig, config);
+        return true;
+    }
+
+    // Only "global" is supported for non-containerized systems for now
+    if( !isContainerized() )
+        throw makeStringExceptionV(ECLWATCH_INVALID_COMPONENT_NAME, "Unsupported config retrieval for non-containerized deployments: '%s'.", name);;
+
+    StringBuffer configMapPath;
+    if( stricmp(name, "eclwatch") == 0 )
+        configMapPath.set("/etc/config/eclwatch.yaml");
+    else
+        configMapPath.setf("/etc/component-configs/%s/%s.yaml", name, name);
+
+    // Read configuration from external configmap file
+    Owned<IPropertyTree> configTree = createPTreeFromYAMLFile(configMapPath.str());
+    if (!configTree)
+    {
+        DBGLOG("Failed to read config with createPTreeFromYAMLFile: %s", configMapPath.str());
+        return false;
+    }
+
+    // Trim sections we don't want out of the config
+    configTree->removeProp("global");
+    toYAML(configTree, config, 2, 0);
+    
+    return true;
+}
+
+bool CWsTopologyEx::onTpComponentConfiguration(IEspContext &context, IEspTpComponentConfigurationRequest &req, IEspTpComponentConfigurationResponse &resp)
+{
+    try
+    {
+        context.ensureFeatureAccess(FEATURE_URL, SecAccess_Read, ECLWATCH_TOPOLOGY_ACCESS_DENIED, "WsTopology::onTpComponentConfiguration: Permission denied.");
+        context.ensureSuperUser(ECLWATCH_SUPER_USER_ACCESS_DENIED, "Access denied, administrators only.");
+        
+        StringArray componentNames;
+        StringArray configuredComponentNames;
+        populateConfiguredComponents(configuredComponentNames);
+
+        if (req.getComponentNames().empty())
+            throw makeStringExceptionV(ECLWATCH_INVALID_COMPONENT_NAME, "No Component name provided.");
+        
+        if (req.getComponentNames().contains("ALL") || req.getComponentNames().contains("all"))
+            componentNames.appendArray(configuredComponentNames);
+        else
+            componentNames.appendArray(req.getComponentNames());
+
+        IArrayOf<IEspTpConfigResult> componentConfigs;
+
+        ForEachItemIn(i, componentNames)
+        {
+            const char *componentName = componentNames.item(i);
+            if (!componentName || !*componentName)
+                continue;
+            
+            if (!configuredComponentNames.contains(componentName))
+                throw makeStringExceptionV(ECLWATCH_INVALID_COMPONENT_NAME, "Invalid Component name provided: '%s' not configured.", componentName);
+
+            StringBuffer config;
+            if (!getConfigForComponent(componentName, config))
+                throw makeStringExceptionV(ECLWATCH_INVALID_COMPONENT_NAME, "Failure to read configuration for: '%s'.", componentName);
+
+            if (config.isEmpty())
+                throw makeStringExceptionV(ECLWATCH_COMPONENT_CONFIG_EMPTY, "Config for component: '%s' is empty.", componentName);
+
+            Owned<IEspTpConfigResult> configuration = createTpConfigResult();
+            configuration->setComponentName(componentName);
+            configuration->setConfiguration(config.str());
+            componentConfigs.append(*configuration.getClear());
+        }
+
+        if (isContainerized())
+            resp.setConfigFormat("YAML");
+        else
+            resp.setConfigFormat("XML");
+
+        resp.setResults(componentConfigs);
+    }
+    catch(IException* e)
+    {
+        FORWARDEXCEPTION(context, e, ECLWATCH_INTERNAL_ERROR);
+    }
+    return true;
+}
+
+#ifdef _USE_CPPUNIT
+#include "unittests.hpp"
+
+class WsTopologyTests : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(WsTopologyTests);
+    CPPUNIT_TEST(testReadLastLogDateTime_Underflow);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void testReadLastLogDateTime_Underflow()
+    {
+        const char *logname = "in_memory_mocked_log_file";
+        StringBuffer filebuf;
+        filebuf.appendN(100, 'X');
+        OwnedIFileIO memIO = createIFileI(filebuf.length(), filebuf.str());
+        CWsTopologyEx topologyService;
+        ReadLog readLogReq;
+        readLogReq.ltBytes = 1;
+        readLogReq.logfields = MSGFIELD_LEGACY;
+        CDateTime latestLogTime;
+        topologyService.readLastLogDateTime(logname, memIO, 100, 80, readLogReq, latestLogTime);
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(WsTopologyTests);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(WsTopologyTests, "WsTopologyTests");
+#endif

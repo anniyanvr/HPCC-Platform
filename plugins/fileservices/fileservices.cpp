@@ -32,9 +32,16 @@
 #include "rmtsmtp.hpp"
 #include "dfuplus.hpp"
 #include "daclient.hpp"
+#include "dadfs.hpp"
 #include "dasds.hpp"
 #include "enginecontext.hpp"
 #include "environment.hpp"
+#include "ws_dfsclient.hpp"
+#include "rtlfield.hpp"
+#include "eclrtl.hpp"
+#include "rtlds_imp.hpp"
+#include "jplane.hpp"
+#include "dafsaudit.hpp"
 
 #define USE_DALIDFS
 #define SDS_LOCK_TIMEOUT  10000
@@ -49,103 +56,7 @@ static const char * compatibleVersions[] = {
     "FILESERVICES 2.1.4",
     NULL };
 
-static const char * EclDefinition =
-"export FsFilenameRecord := record string name{maxlength(1023)}; integer8 size; string19 modified; end; \n"
-"export FsLogicalFileName := string{maxlength(255)}; \n"
-"export FsLogicalFileNameRecord := record FsLogicalFileName name; end; \n"
-"export FsLogicalFileInfoRecord := record(FsLogicalFileNameRecord) boolean superfile; integer8 size; integer8 rowcount; string19 modified; string owner{maxlength(255)}; string cluster{maxlength(255)}; end; \n"
-"export FsLogicalSuperSubRecord := record string supername{maxlength(255)}; string subname{maxlength(255)}; end; \n"
-"export FsFileRelationshipRecord := record  string primaryfile   {maxlength(1023)}; string secondaryfile {maxlength(1023)}; string primaryflds   {maxlength(1023)}; string secondaryflds {maxlength(1023)}; string kind {maxlength(16)}; string cardinality   {maxlength(16)}; boolean payload; string description   {maxlength(1023)}; end; \n"
-"export integer4 RECFMV_RECSIZE := -2; // special value for SprayFixed record size \n"
-"export integer4 RECFMVB_RECSIZE := -1; // special value for SprayFixed record size \n"
-"export integer4 PREFIX_VARIABLE_RECSIZE := -3; // special value for SprayFixed record size \n"
-"export integer4 PREFIX_VARIABLE_BIGENDIAN_RECSIZE := -4; // special value for SprayFixed record size \n"
-"export FsDropZone := string; \n"
-"export FsDropZoneRecord := record FsDropZone dropzone; end; \n"
-"export FileServices := SERVICE : time\n"
-"  boolean FileExists(const varstring lfn, boolean physical=false) : c,context,entrypoint='fsFileExists'; \n"
-"  DeleteLogicalFile(const varstring lfn,boolean ifexists=false) : c,action,context,entrypoint='fsDeleteLogicalFile'; \n"
-"  SetReadOnly(const varstring lfn, boolean ro) : c,action,context,entrypoint='fsSetReadOnly'; \n"
-"  RenameLogicalFile(const varstring oldname, const varstring newname, boolean allowoverwrite=false) : c,action,context,entrypoint='fsRenameLogicalFile_v2'; \n"
-"  varstring GetBuildInfo() : c,pure,entrypoint='fsGetBuildInfo';\n"
-"  SendEmail(const varstring to, const varstring subject, const varstring body, const varstring mailServer=GETENV('SMTPserver'), unsigned4 port=(unsigned4) GETENV('SMTPport', '25'), const varstring sender=GETENV('emailSenderAddress'), const varstring cc='', const varstring bcc='', boolean highPriority=false) : c,action,context,entrypoint='fsSendEmail_v2'; \n"
-"  SendEmailAttachText(const varstring to, const varstring subject, const varstring body, const varstring attachment, const varstring mimeType, const varstring attachmentName, const varstring mailServer=GETENV('SMTPserver'), unsigned4 port=(unsigned4) GETENV('SMTPport', '25'), const varstring sender=GETENV('emailSenderAddress'), const varstring cc='', const varstring bcc='', boolean highPriority=false) : c,action,context,entrypoint='fsSendEmailAttachText_v2'; \n"
-"  SendEmailAttachData(const varstring to, const varstring subject, const varstring body, const data attachment, const varstring mimeType, const varstring attachmentName, const varstring mailServer=GETENV('SMTPserver'), unsigned4 port=(unsigned4) GETENV('SMTPport', '25'), const varstring sender=GETENV('emailSenderAddress'), const varstring cc='', const varstring bcc='', boolean highPriority=false) : c,action,context,entrypoint='fsSendEmailAttachData_v2'; \n"
-"  varstring CmdProcess(const varstring prog, const varstring src) : c,action,entrypoint='fsCmdProcess'; \n"
-"  string CmdProcess2(const varstring prog, const string src) : c,action,entrypoint='fsCmdProcess2'; \n"
-"  SprayFixed(const varstring sourceIP, const varstring sourcePath, integer4 recordSize, const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false,boolean compress=false, boolean failIfNoSourceFile=false, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=false) : c,action,context,entrypoint='fsSprayFixed_v4'; \n"
-"  SprayVariable(const varstring sourceIP, const varstring sourcePath, integer4 sourceMaxRecordSize=8192, const varstring sourceCsvSeparate='\\\\,', const varstring sourceCsvTerminate='\\\\n,\\\\r\\\\n', const varstring sourceCsvQuote='\"', const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false,boolean compress=false,const varstring sourceCsvEscape='', boolean failIfNoSourceFile=false, boolean recordStructurePresent=false, boolean quotedTerminator=true, const varstring encoding='ascii', integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=false) : c,action,context,entrypoint='fsSprayVariable_v8'; \n"
-"  SprayXml(const varstring sourceIP, const varstring sourcePath, integer4 sourceMaxRecordSize=8192, const varstring sourceRowTag, const varstring sourceEncoding='utf8', const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false,boolean compress=false, boolean failIfNoSourceFile=false, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=false) : c,action,context,entrypoint='fsSprayXml_v4'; \n"
-"  SprayJson(const varstring sourceIP, const varstring sourcePath, integer4 sourceMaxRecordSize=8192, const varstring sourceRowPath='/', const varstring sourceEncoding='utf8', const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false,boolean compress=false, boolean failIfNoSourceFile=false, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=false, const varstring username = '', const varstring userPw = '') : c,action,context,entrypoint='fsSprayJson'; \n"
-"  Despray(const varstring logicalName, const varstring destinationIP, const varstring destinationPath, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false) : c,action,context,entrypoint='fsDespray'; \n"
-"  Copy(const varstring sourceLogicalName, const varstring destinationGroup, const varstring destinationLogicalName, const varstring sourceDali='', integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false, boolean asSuperfile=false, boolean compress=false, boolean forcePush=false, integer4 transferBufferSize=0, boolean preserveCompression=true, boolean noSplit=false, integer4 expireDays=-1) : c,action,context,entrypoint='fsCopy_v3'; \n"
-"  Replicate(const varstring logicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server')) : c,action,context,entrypoint='fsReplicate'; \n"
-"  CreateSuperFile(const varstring lsuperfn, boolean sequentialparts=false,boolean ifdoesnotexist=false) : c,action,context,entrypoint='fsCreateSuperFile'; \n"
-"  boolean SuperFileExists(const varstring lsuperfn) : c,context,entrypoint='fsSuperFileExists'; \n"
-"  DeleteSuperFile(const varstring lsuperfn,boolean deletesub=false) : c,action,context,entrypoint='fsDeleteSuperFile'; \n"
-"  unsigned4 GetSuperFileSubCount(const varstring lsuperfn) : c,context,entrypoint='fsGetSuperFileSubCount'; \n"
-"  varstring GetSuperFileSubName(const varstring lsuperfn,unsigned4 filenum,boolean abspath=false) : c,context,entrypoint='fsGetSuperFileSubName'; \n"
-"  unsigned4 FindSuperFileSubName(const varstring lsuperfn,const varstring lfn) : c,context,entrypoint='fsFindSuperFileSubName'; \n"
-"  StartSuperFileTransaction() : c,action,globalcontext,entrypoint='fsStartSuperFileTransaction'; \n"
-"  AddSuperFile(const varstring lsuperfn,const varstring lfn,unsigned4 atpos=0,boolean addcontents=false, boolean strict=false) : c,action,globalcontext,entrypoint='fsAddSuperFile'; \n"
-"  RemoveSuperFile(const varstring lsuperfn,const varstring lfn,boolean del=false,boolean remcontents=false) : c,action,globalcontext,entrypoint='fsRemoveSuperFile'; \n"
-"  ClearSuperFile(const varstring lsuperfn,boolean del=false) : c,action,globalcontext,entrypoint='fsClearSuperFile'; \n"
-"  RemoveOwnedSubFiles(const varstring lsuperfn,boolean del=false) : c,action,globalcontext,entrypoint='fsRemoveOwnedSubFiles'; \n"
-"  DeleteOwnedSubFiles(const varstring lsuperfn) : c,action,globalcontext,entrypoint='fsDeleteOwnedSubFiles'; // Obsolete, use RemoveOwnedSubFiles\n"
-"  SwapSuperFile(const varstring lsuperfn1,const varstring lsuperfn2) : c,action,globalcontext,entrypoint='fsSwapSuperFile'; \n"
-"  ReplaceSuperFile(const varstring lsuperfn,const varstring lfn,const varstring bylfn) : c,action,globalcontext,entrypoint='fsReplaceSuperFile'; \n"
-"  FinishSuperFileTransaction(boolean rollback=false) : c,action,globalcontext,entrypoint='fsFinishSuperFileTransaction'; \n"
-"  varstring ForeignLogicalFileName(const varstring name, const varstring foreigndali='', boolean abspath=false, boolean omitClusterPrefix=false) : c,context,entrypoint='fsForeignLogicalFileName_v2'; \n"
-"  varstring WaitDfuWorkunit(const varstring wuid, integer4 timeOut=-1,const varstring espServerIpPort=GETENV('ws_fs_server')) : c,action,globalcontext,entrypoint='fsWaitDfuWorkunit'; \n"
-"  AbortDfuWorkunit(const varstring wuid,const varstring espServerIpPort=GETENV('ws_fs_server')) : c,action,globalcontext,entrypoint='fsAbortDfuWorkunit'; \n"
-"  MonitorLogicalFileName(const varstring event_name, const varstring name, integer4 shotcount=1,const varstring espServerIpPort=GETENV('ws_fs_server')) : c,action,context,entrypoint='fsMonitorLogicalFileName'; \n"
-"  MonitorFile(const varstring event_name, const varstring ip, const varstring filename, boolean subdirs=false, integer4 shotcount=1,const varstring espServerIpPort=GETENV('ws_fs_server')) : c,action,context,entrypoint='fsMonitorFile'; \n"
-"  varstring fSprayFixed(const varstring sourceIP, const varstring sourcePath, integer4 recordSize, const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false, boolean compress=false, boolean failIfNoSourceFile=false, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=false) : c,action,context,entrypoint='fsfSprayFixed_v4'; \n"
-"  varstring fSprayVariable(const varstring sourceIP, const varstring sourcePath, integer4 sourceMaxRecordSize=8192, const varstring sourceCsvSeparate='\\\\,', const varstring sourceCsvTerminate='\\\\n,\\\\r\\\\n', const varstring sourceCsvQuote='\"', const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false, boolean compress=false,const varstring sourceCsvEscape='', boolean failIfNoSourceFile=false, boolean recordStructurePresent=false, boolean quotedTerminator=true, varstring encoding='ascii', integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=false) : c,action,context,entrypoint='fsfSprayVariable_v8'; \n"
-"  varstring fSprayXml(const varstring sourceIP, const varstring sourcePath, integer4 sourceMaxRecordSize=8192, const varstring sourceRowTag, const varstring sourceEncoding='utf8', const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false, boolean compress=false, boolean failIfNoSourceFile=false, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=false) : c,action,context,entrypoint='fsfSprayXml_v4'; \n"
-"  varstring fSprayJson(const varstring sourceIP, const varstring sourcePath, integer4 sourceMaxRecordSize=8192, const varstring sourceRowPath='/', const varstring sourceEncoding='utf8', const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false, boolean compress=false, boolean failIfNoSourceFile=false, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=false, const varstring username = '', const varstring userPw = '') : c,action,context,entrypoint='fsfSprayJson'; \n"
-"  varstring fDespray(const varstring logicalName, const varstring destinationIP, const varstring destinationPath, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false) : c,action,context,entrypoint='fsfDespray'; \n"
-"  varstring fCopy(const varstring sourceLogicalName, const varstring destinationGroup, const varstring destinationLogicalName, const varstring sourceDali='', integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false, boolean asSuperfile=false, boolean compress=false, boolean forcePush=false, integer4 transferBufferSize=0, boolean preserveCompression=true, boolean noSplit=false, integer4 expireDays=-1) : c,action,context,entrypoint='fsfCopy_v3'; \n"
-"  varstring fMonitorLogicalFileName(const varstring event_name, const varstring name, integer4 shotcount=1,const varstring espServerIpPort=GETENV('ws_fs_server')) : c,action,context,entrypoint='fsfMonitorLogicalFileName'; \n"
-"  varstring fMonitorFile(const varstring event_name, const varstring ip, const varstring filename, boolean subdirs=false, integer4 shotcount=1,const varstring espServerIpPort=GETENV('ws_fs_server')) : c,action,context,entrypoint='fsfMonitorFile'; \n"
-"  varstring fReplicate(const varstring logicalName, integer4 timeOut=-1, const varstring espServerIpPort=GETENV('ws_fs_server')) : c,action,context,entrypoint='fsfReplicate'; \n"
-"  varstring GetFileDescription(const varstring lfn) : c,context,entrypoint='fsGetFileDescription'; \n"
-"  SetFileDescription(const varstring lfn,const varstring val) : c,action,context,entrypoint='fsSetFileDescription'; \n"
-"  dataset(FsFilenameRecord) RemoteDirectory(const varstring machineIP,const varstring dir,const varstring mask='*',boolean sub=false) : c,entrypoint='fsRemoteDirectory';\n"
-"  dataset(FsLogicalFileInfoRecord) LogicalFileList(const varstring namepattern='*',boolean includenormal=true,boolean includesuper=false,boolean unknownszero=false,const varstring foreigndali='') : c,context,entrypoint='fsLogicalFileList';\n"
-"  dataset(FsLogicalFileNameRecord) SuperFileContents(const varstring lsuperfn,boolean recurse=false) : c,context,entrypoint='fsSuperFileContents';\n"
-"  dataset(FsLogicalFileNameRecord) LogicalFileSuperOwners(const varstring lfn) : c,context,entrypoint='fsLogicalFileSuperOwners';\n"
-"  varstring ExternalLogicalFileName(const varstring location, const varstring path,boolean abspath=true) : c,entrypoint='fsExternalLogicalFileName'; \n"
-"  integer4 CompareFiles(const varstring lfn1, const varstring lfn2,boolean logicalonly=true,boolean usecrcs=false) : c,context,entrypoint='fsCompareFiles'; \n"
-"  varstring VerifyFile(const varstring lfn, boolean usecrcs) : c,action,context,entrypoint='fsVerifyFile'; \n"
-"  RemotePull( const varstring remoteEspFsURL, const varstring sourceLogicalName, const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false, boolean asSuperfile=false,boolean forcePush=false, integer4 transferBufferSize=0,boolean wrap=false,boolean compress=false, boolean noSplit=false, integer4 expireDays=-1, const varstring username = '', const varstring userPw = ''): c,action,context,entrypoint='fsRemotePull_v3'; \n"
-"  varstring fRemotePull( const varstring remoteEspFsURL, const varstring sourceLogicalName, const varstring destinationGroup, const varstring destinationLogicalName, integer4 timeOut=-1, integer4 maxConnections=-1, boolean allowoverwrite=false, boolean replicate=false, boolean asSuperfile=false,boolean forcePush=false, integer4 transferBufferSize=0,boolean wrap=false,boolean compress=false, boolean noSplit=false, integer4 expireDays=-1, const varstring username = '', const varstring userPw = ''): c,action,context,entrypoint='fsfRemotePull_v3'; \n"
-"  dataset(FsLogicalSuperSubRecord) LogicalFileSuperSubList() : c,context,entrypoint='fsLogicalFileSuperSubList';\n"
-"  PromoteSuperFileList(const set of varstring lsuperfns,const varstring addhead='',boolean deltail=false,boolean createonlyonesuperfile=false,boolean reverse=false) : c,action,context,entrypoint='fsPromoteSuperFileList'; \n"
-"  varstring fPromoteSuperFileList(const set of varstring lsuperfns,const varstring addhead='', boolean deltail=false,boolean createonlyonesuperfile=false, boolean reverse=false) : c,action,context,entrypoint='fsfPromoteSuperFileList'; \n"
-"  unsigned8 getUniqueInteger(const varstring foreigndali='') : c,context,entrypoint='fsGetUniqueInteger'; \n"
-"  AddFileRelationship(const varstring primary, const varstring secondary, const varstring primaryflds,  const varstring secondaryflds, const varstring kind='link', const varstring cardinality, boolean payload, const varstring description='') : c,action,context,entrypoint='fsAddFileRelationship'; \n"
-"  dataset(FsFileRelationshipRecord) FileRelationshipList(const varstring primary, const varstring secondary, const varstring primflds='', const varstring secondaryflds='',  const varstring kind='link') : c,action,context,entrypoint='fsFileRelationshipList'; \n"
-"  RemoveFileRelationship(const varstring primary,  const varstring secondary, const varstring primaryflds='', const varstring secondaryflds='',  const varstring kind='link') : c,action,context,entrypoint='fsRemoveFileRelationship'; \n"
-"  varstring GetColumnMapping( const varstring LogicalFileName): c,context,entrypoint='fsfGetColumnMapping'; \n"
-"  SetColumnMapping( const varstring LogicalFileName, const varstring mapping): c,context,entrypoint='fsSetColumnMapping'; \n"
-"  varstring RfsQuery( const varstring server, const varstring query): c,entrypoint='fsfRfsQuery'; \n"
-"  RfsAction( const varstring server, const varstring query): c,entrypoint='fsRfsAction'; \n"
-"  varstring GetHostName( const varstring ipaddress ): c,entrypoint='fsfGetHostName'; \n"
-"  varstring ResolveHostName( const varstring hostname ): c,entrypoint='fsfResolveHostName'; \n"
-"  MoveExternalFile(const varstring location, const varstring frompath, const varstring topath): c,action,context,entrypoint='fsMoveExternalFile'; \n"
-"  DeleteExternalFile(const varstring location, const varstring path): c,action,context,entrypoint='fsDeleteExternalFile'; \n"
-"  CreateExternalDirectory(const varstring location, const varstring path): c,action,context,entrypoint='fsCreateExternalDirectory'; \n"
-"  varstring GetLogicalFileAttribute(const varstring lfn,const varstring attrname) : c,context,entrypoint='fsfGetLogicalFileAttribute'; \n"
-"  ProtectLogicalFile(const varstring lfn,boolean set=true) : c,context,entrypoint='fsProtectLogicalFile'; \n"
-"  DfuPlusExec(const varstring cmdline) : c,context,entrypoint='fsDfuPlusExec'; \n"
-"  varstring GetEspURL(const varstring username = '', const varstring userPW = '') : c,once,entrypoint='fsGetEspURL'; \n"
-"  varstring GetDefaultDropZone() : c,once,entrypoint='fsGetDefaultDropZone'; \n"
-"  dataset(FsDropZoneRecord) GetDropZones() : c,context,entrypoint='fsGetDropZones'; \n"
-"  integer4 GetExpireDays(const varstring lfn) : c,context,entrypoint='fsGetExpireDays'; \n"
-"  SetExpireDays(const varstring lfn, integer4 expireDays) : c,context,entrypoint='fsSetExpireDays'; \n"
-"  ClearExpireDays(const varstring lfn) : c,context,entrypoint='fsClearExpireDays'; \n"
-"END;";
+static const char * EclDefinition = nullptr;//Definitions specified in lib_fileservices.ecllib
 
 #define WAIT_SECONDS 30
 
@@ -192,6 +103,7 @@ static void setWorkunitState(ICodeContext * ctx, WUState state, const char * msg
     }
 }
 
+#ifndef _CONTAINERIZED
 static IConstEnvironment * openDaliEnvironment()
 {
     if (daliClientActive())
@@ -208,21 +120,33 @@ static IPropertyTree *getEnvironmentTree(IConstEnvironment * daliEnv)
         return &daliEnv->getPTree(); // No need to clone since daliEnv ensures connection stays alive.
     return getHPCCEnvironment();
 }
+#endif
 
 static void setServerAccess(CClientFileSpray &server, IConstWorkUnit * wu)
 {
+    if (!wu)
+        throw makeStringException(-1, "Distributed access token not supported for stand-alone workunits");
+
     SCMStringBuffer token;
     wu->getWorkunitDistributedAccessToken(token);
     server.setUsernameToken(wu->queryUser(), token.str(), "");//use workunit token as password
 }
 
 static StringArray availableWsFS;
-static CriticalSection espURLcrit;
+static CriticalSection espURLcrit{SYNC_LOCATION};
 
 static void addConfiguredWsFSUrl(const char * url)
 {
     CriticalBlock b(espURLcrit);
     availableWsFS.appendUniq(url);
+}
+
+static void setContainerLocalCertificate(IEspClientRpcSettings &rpc)
+{
+#ifdef _CONTAINERIZED
+    //will only affect HTTPS
+    rpc.setMtlsSecretName("local");
+#endif
 }
 
 static bool contactWsFS(const char * espurl, IConstWorkUnit * wu)
@@ -234,6 +158,7 @@ static bool contactWsFS(const char * espurl, IConstWorkUnit * wu)
     try
     {
         Owned<IClientEchoDateTime> req = server.createEchoDateTimeRequest();
+        setContainerLocalCertificate(req->rpc());
         Owned<IClientEchoDateTimeResponse> result = server.EchoDateTime(req);
 
         if (result->getResult())
@@ -278,9 +203,44 @@ static const char *getAccessibleEspServerURL(const char *param, IConstWorkUnit *
     if (param&&*param)
         return param;
 
+    if (!wu)
+        throw makeStringException(-1, "Server URL must be provided for stand-alone workunits");
+
     CriticalBlock b(espURLcrit);
     if (isUrlListEmpty())
     {
+#ifdef _CONTAINERIZED
+        // Look for 'eclservices' esp service, fallback to 'eclwatch' service.
+        Owned<IPropertyTree> globalConfig = getGlobalConfig();
+        Owned<IPropertyTreeIterator> iter = globalConfig->getElements("services");
+        IPropertyTree * match = nullptr;
+        ForEach(*iter)
+        {
+            IPropertyTree & cur = iter->query();
+            //Ecl queries should be connecting to the internal service - not the public services.
+            if (cur.getPropBool("@public"))
+                continue;
+
+            const char *type = cur.queryProp("@type");
+            if (streq("eclservices", type))
+            {
+                match = &cur;
+                break;
+            }
+            else if (streq("eclwatch", type))
+                match = &cur;
+        }
+
+        if (match)
+        {
+            const char * espService = match->queryProp("@name");
+            const char *protocol = match->getPropBool("@tls") ? "https" : "http";
+            unsigned port = match->getPropInt("@port", 8010);
+
+            VStringBuffer espURL("%s://%s:%u/FileSpray", protocol, espService, port);
+            addConfiguredWsFSUrl(espURL.str());
+        }
+#else
         Owned<IConstEnvironment> daliEnv = openDaliEnvironment();
         Owned<IPropertyTree> env = getEnvironmentTree(daliEnv);
 
@@ -327,6 +287,7 @@ static const char *getAccessibleEspServerURL(const char *param, IConstWorkUnit *
                 }//ESPBinding
             }//ESPProcess
         }
+#endif
 
         if (isUrlListEmpty())
             throw MakeStringException(-1,"Could not find any WS FileSpray in the target HPCC configuration.");
@@ -378,26 +339,44 @@ static void WUmessage(ICodeContext *ctx, ErrorSeverity sev, const char *fn, cons
     return;
 }
 
+// Build a request/base audit context for a code context.
+static DFSAuditContext buildFSAuditBaseContext(ICodeContext *ctx)
+{
+    DFSAuditContext baseAuditCtx = queryDefaultDFSAuditContext();
+    StringAttr wuid;
+    wuid.setown(ctx->getWuid());
+    if (wuid.length())
+        baseAuditCtx.setValue("wuid", wuid.str());
+    IUserDescriptor *udesc = ctx->queryUserDescriptor();
+    if (udesc)
+    {
+        StringBuffer userName;
+        udesc->getUserName(userName);
+        if (userName.length())
+            baseAuditCtx.setValue("user", userName.str());
+    }
+    return baseAuditCtx;
+}
+
+// Build a per-operation context by extending invariants with optional logical names.
+static DFSAuditContext buildFSAuditOperationContext(ICodeContext *ctx, const char *lfn1=nullptr, const char *lfn2=nullptr)
+{
+    DFSAuditContext auditCtx = buildFSAuditBaseContext(ctx);
+    if (!isEmptyString(lfn1))
+        auditCtx.setValue("lfn", lfn1);
+    if (!isEmptyString(lfn2))
+        auditCtx.setValue("lfn2", lfn2);
+    return auditCtx;
+}
+
 static void AuditMessage(ICodeContext *ctx,
                          const char *func,
                          const char *lfn1,
                          const char *lfn2=NULL)
 {
     // FileServices,WUID,user,function,LFN1,LFN2
-    Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    StringBuffer aln;
-    StringAttr wuid;
-    wuid.setown(ctx->getWuid());
-    aln.append(",FileAccess,FileServices,").append(func).append(',').append(wuid).append(',');
-    if (udesc)
-        udesc->getUserName(aln);
-    if (lfn1&&*lfn1) {
-        aln.append(',').append(lfn1);
-        if (lfn2&&*lfn2) {
-            aln.append(',').append(lfn2);
-        }
-    }
-    LOG(MCauditInfo,"%s",aln.str());
+    DFSAuditContext auditCtx = buildFSAuditOperationContext(ctx, lfn1, lfn2);
+    auditCtx.logFileAccess(func);
 }
 
 
@@ -422,7 +401,8 @@ FILESERVICES_API void FILESERVICES_CALL fsDeleteLogicalFile(ICodeContext *ctx, c
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
     StringBuffer uname;
     DBGLOG("Deleting NS logical file %s for user %s", lfn.str(),udesc?udesc->getUserName(uname).str():"");
-    if (queryDistributedFileDirectory().removeEntry(lfn.str(),udesc,transaction, INFINITE, true))
+    DFSAuditContext auditCtx = buildFSAuditOperationContext(ctx);
+    if (queryDistributedFileDirectory().removeEntry(lfn.str(), udesc, transaction, INFINITE, true, auditCtx))
     {
         StringBuffer s("DeleteLogicalFile ('");
         s.append(lfn);
@@ -431,8 +411,6 @@ FILESERVICES_API void FILESERVICES_CALL fsDeleteLogicalFile(ICodeContext *ctx, c
         else
             s.append("') done");
         WUmessage(ctx,SeverityInformation,NULL,s.str());
-        AuditMessage(ctx,"DeleteLogicalFile",lfn.str());
-
     }
     else if (!ifexists)
     {
@@ -447,8 +425,7 @@ FILESERVICES_API bool FILESERVICES_CALL fsFileExists(ICodeContext *ctx, const ch
     constructLogicalName(ctx, name, lfn);
     if (physical)
         return queryDistributedFileDirectory().existsPhysical(lfn.str(),ctx->queryUserDescriptor());
-
-    return queryDistributedFileDirectory().exists(lfn.str(),ctx->queryUserDescriptor(),false,false);
+    return wsdfs::exists(lfn.str(), ctx->queryUserDescriptor(), false, false, INFINITE);
 }
 
 FILESERVICES_API bool FILESERVICES_CALL fsFileValidate(ICodeContext *ctx, const char *name)
@@ -457,7 +434,7 @@ FILESERVICES_API bool FILESERVICES_CALL fsFileValidate(ICodeContext *ctx, const 
     constructLogicalName(ctx, name, lfn);
 
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, false, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = wsdfs::lookup(lfn.str(), udesc, AccessMode::readMeta, false, false, nullptr, defaultPrivilegedUser, INFINITE);
     if (df)
     {
         Owned<IDistributedFilePartIterator> partIter = df->getIterator();
@@ -498,7 +475,7 @@ FILESERVICES_API void FILESERVICES_CALL fsSetReadOnly(ICodeContext *ctx, const c
 
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
     Owned<IException> error;
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, true, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, AccessMode::writeLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
     if (df)
     {
         LOG(MCauditInfo, "Set ReadOnly:  %s", name);
@@ -548,12 +525,13 @@ FILESERVICES_API void FILESERVICES_CALL implementRenameLogicalFile(ICodeContext 
     if (overwrite && distributedDirectory.exists(newLfn.str(), udesc, false, false))
         fsDeleteLogicalFile(ctx, newname, true);
 
-    try {
-        distributedDirectory.renamePhysical(oldLfn.str(), newLfn.str(), udesc, transaction);
+    try
+    {
+        DFSAuditContext auditCtx = buildFSAuditOperationContext(ctx, oldLfn.str(), newLfn.str());
+        distributedDirectory.renamePhysical(oldLfn.str(), newLfn.str(), udesc, transaction, auditCtx);
         StringBuffer s("RenameLogicalFile ('");
         s.append(oldLfn).append(", '").append(newLfn).append("') done");
         WUmessage(ctx, SeverityInformation, NULL, s.str());
-        AuditMessage(ctx, "RenameLogicalFile", oldLfn.str(), newLfn.str());
     }
     catch (IException *e)
     {
@@ -561,7 +539,7 @@ FILESERVICES_API void FILESERVICES_CALL implementRenameLogicalFile(ICodeContext 
         e->errorMessage(s);
         WUmessage(ctx, SeverityWarning, "RenameLogicalFile", s.str());
         throw e;
-     }
+    }
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsRenameLogicalFile(ICodeContext *ctx, const char *oldname, const char *newname)
@@ -575,67 +553,77 @@ FILESERVICES_API void FILESERVICES_CALL fsRenameLogicalFile_v2(ICodeContext *ctx
 }
 
 
-FILESERVICES_API void FILESERVICES_CALL fsSendEmail_v2(ICodeContext * ctx, const char * to, const char * subject, const char * body, const char * mailServer, unsigned port, const char * sender, const char *cc, const char *bcc, bool highPriority)
+FILESERVICES_API void FILESERVICES_CALL fsSendEmail_v3(ICodeContext * ctx, const char * to, const char * subject, const char * body, const char * mailServer, unsigned port, const char * sender, const char *cc, const char *bcc, bool highPriority, bool termJobOnFail)
 {
     StringArray warnings;
-    sendEmail( to, cc, bcc, subject, body, mailServer, port, sender, &warnings, highPriority);
+    sendEmail( to, cc, bcc, subject, body, mailServer, port, sender, &warnings, highPriority, termJobOnFail);
     ForEachItemIn(i,warnings)
         WUmessage(ctx, SeverityWarning, "SendEmail", warnings.item(i));
 }
 
+FILESERVICES_API void FILESERVICES_CALL fsSendEmail_v2(ICodeContext * ctx, const char * to, const char * subject, const char * body, const char * mailServer, unsigned port, const char * sender, const char *cc, const char *bcc, bool highPriority)
+{
+    fsSendEmail_v3(ctx, to, subject, body, mailServer, port, sender, cc, bcc, highPriority, true);
+}
+
 FILESERVICES_API void FILESERVICES_CALL fsSendEmail(ICodeContext * ctx, const char * to, const char * subject, const char * body, const char * mailServer, unsigned port, const char * sender)
 {
-    fsSendEmail_v2(ctx, to, subject, body, mailServer, port, sender, nullptr, nullptr, false);
+    fsSendEmail_v3(ctx, to, subject, body, mailServer, port, sender, nullptr, nullptr, false, true);
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsSendEmailAttachText_v3(ICodeContext * ctx, const char * to, const char * subject, const char * body, const char * attachment, const char * mimeType, const char * attachmentName, const char * mailServer, unsigned int port, const char * sender, const char *cc, const char *bcc, bool highPriority, bool termJobOnFail)
+{
+    StringArray warnings;
+    sendEmailAttachText(to, cc, bcc, subject, body, attachment, mimeType, attachmentName, mailServer, port, sender, &warnings, highPriority, termJobOnFail);
+    ForEachItemIn(i,warnings)
+        WUmessage(ctx, SeverityWarning, "SendEmailAttachText", warnings.item(i));
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSendEmailAttachText_v2(ICodeContext * ctx, const char * to, const char * subject, const char * body, const char * attachment, const char * mimeType, const char * attachmentName, const char * mailServer, unsigned int port, const char * sender, const char *cc, const char *bcc, bool highPriority)
 {
     StringArray warnings;
-    sendEmailAttachText(to, cc, bcc, subject, body, attachment, mimeType, attachmentName, mailServer, port, sender, &warnings, highPriority);
+    sendEmailAttachText(to, cc, bcc, subject, body, attachment, mimeType, attachmentName, mailServer, port, sender, &warnings, highPriority, true);
     ForEachItemIn(i,warnings)
         WUmessage(ctx, SeverityWarning, "SendEmailAttachText", warnings.item(i));
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSendEmailAttachText(ICodeContext * ctx, const char * to, const char * subject, const char * body, const char * attachment, const char * mimeType, const char * attachmentName, const char * mailServer, unsigned int port, const char * sender)
 {
-    fsSendEmailAttachText_v2(ctx, to, subject, body, attachment, mimeType, attachmentName, mailServer, port, sender, nullptr, nullptr, false);
+    fsSendEmailAttachText_v3(ctx, to, subject, body, attachment, mimeType, attachmentName, mailServer, port, sender, nullptr, nullptr, false, true);
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsSendEmailAttachData_v3(ICodeContext * ctx, const char * to, const char * subject, const char * body, size32_t lenAttachment, const void * attachment, const char * mimeType, const char * attachmentName, const char * mailServer, unsigned int port, const char * sender, const char *cc, const char *bcc, bool highPriority, bool termJobOnFail)
+{
+    StringArray warnings;
+    sendEmailAttachData(to, cc, bcc, subject, body, lenAttachment, attachment, mimeType, attachmentName, mailServer, port, sender, &warnings, highPriority, termJobOnFail);
+    ForEachItemIn(i,warnings)
+        WUmessage(ctx, SeverityWarning, "SendEmailAttachData", warnings.item(i));
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSendEmailAttachData_v2(ICodeContext * ctx, const char * to, const char * subject, const char * body, size32_t lenAttachment, const void * attachment, const char * mimeType, const char * attachmentName, const char * mailServer, unsigned int port, const char * sender, const char *cc, const char *bcc, bool highPriority)
 {
     StringArray warnings;
-    sendEmailAttachData(to, cc, bcc, subject, body, lenAttachment, attachment, mimeType, attachmentName, mailServer, port, sender, &warnings, highPriority);
+    sendEmailAttachData(to, cc, bcc, subject, body, lenAttachment, attachment, mimeType, attachmentName, mailServer, port, sender, &warnings, highPriority, true);
     ForEachItemIn(i,warnings)
         WUmessage(ctx, SeverityWarning, "SendEmailAttachData", warnings.item(i));
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSendEmailAttachData(ICodeContext * ctx, const char * to, const char * subject, const char * body, size32_t lenAttachment, const void * attachment, const char * mimeType, const char * attachmentName, const char * mailServer, unsigned int port, const char * sender)
 {
-    fsSendEmailAttachData_v2(ctx, to, subject, body, lenAttachment, attachment, mimeType, attachmentName, mailServer, port, sender, nullptr, nullptr, false);
+    fsSendEmailAttachData_v3(ctx, to, subject, body, lenAttachment, attachment, mimeType, attachmentName, mailServer, port, sender, nullptr, nullptr, false, true);
 }
 
 
 
 FILESERVICES_API char * FILESERVICES_CALL fsCmdProcess(const char *prog, const char *src)
 {
-    StringBuffer in, out, err;
-    in.append(src);
-
-    runExternalCommand(out, err, prog, in);
-
-    return CTXSTRDUP(parentCtx, out.str());
+    throw makeStringException(0, "CmdProcess no longer supported for security reasons");
 }
 
 
 FILESERVICES_API void FILESERVICES_CALL fsCmdProcess2(unsigned & tgtLen, char * & tgt, const char *prog, unsigned srcLen, const char * src)
 {
-    StringBuffer in, out, err;
-    in.append(srcLen, src);
-
-    runExternalCommand(out, err, prog, in);
-
-    tgtLen = out.length();
-    tgt = (char *)CTXDUP(parentCtx, out.str(), out.length());
+    throw makeStringException(0, "CmdProcess no longer supported for security reasons");
 }
 
 
@@ -651,13 +639,14 @@ static void blockUntilComplete(const char * label, IClientFileSpray &server, ICo
 
     unsigned polltime = 1;
 
-    VStringBuffer reason("Blocked by fileservice activity: %s",label);
+    VStringBuffer reason("Blocked by fileservice activity: %s, workunit: %s", label, wuid);
     setWorkunitState(ctx, WUStateBlocked, reason.str());
-
+    bool isStartTimeRecorded = false;
     while(true)
     {
 
         Owned<IClientGetDFUWorkunit> req = server.createGetDFUWorkunitRequest();
+        setContainerLocalCertificate(req->rpc());
         req->setWuid(wuid);
         Owned<IClientGetDFUWorkunitResponse> result = server.GetDFUWorkunit(req);
 
@@ -671,24 +660,48 @@ static void blockUntilComplete(const char * label, IClientFileSpray &server, ICo
         }
 
         IConstDFUWorkunit & dfuwu = result->getResult();
+        DFUstate state = (DFUstate)dfuwu.getState();
         bool aborting = false;
         Owned<IWorkUnit> wu = ctx->updateWorkUnit(); // may return NULL
         if (wu.get()) { // if updatable (e.g. not hthor with no agent context)
             aborting = wu->aborting();
             StringBuffer wuScope, ElapsedLabel, RemainingLabel;
-            wuScope.appendf("%s-%s", label, dfuwu.getID());
+            StringBuffer labelbuf(label);
+            wuScope.appendf("w%u:>dfu:>%s:%s", ctx->getWorkflowId(), labelbuf.toLowerCase().str(), dfuwu.getID());
             ElapsedLabel.append(wuScope).append(" (Elapsed) ");
             RemainingLabel.append(wuScope).append(" (Remaining) ");
-
             //MORE: I think this are intended to replace the timing information, but will currently combine
             updateWorkunitStat(wu, SSTdfuworkunit, wuScope, StTimeElapsed, ElapsedLabel, milliToNano(time.elapsed()));
             updateWorkunitStat(wu, SSTdfuworkunit, wuScope, StTimeRemaining, RemainingLabel, milliToNano(dfuwu.getSecsLeft()*1000));
+            stat_type costFileAccess = money2cost_type(dfuwu.getFileAccessCost());
+            updateWorkunitStat(wu, SSTdfuworkunit, wuScope, StCostFileAccess, "", costFileAccess);
             wu->setApplicationValue(label, dfuwu.getID(), dfuwu.getSummaryMessage(), true);
+            if (!isStartTimeRecorded)
+            {
+                switch (state)
+                {
+                case DFUstate_started:
+                case DFUstate_aborting:
+                case DFUstate_monitoring:
+                case DFUstate_aborted:
+                case DFUstate_failed:
+                case DFUstate_finished:
+
+                    const char * whenStarted = dfuwu.getTimeStarted();
+                    if (!isEmptyString(whenStarted))
+                    {
+                        CDateTime startedAt;
+                        startedAt.setString(whenStarted);
+                        updateWorkunitStat(wu, SSTdfuworkunit, wuScope, StWhenStarted, 0, startedAt.getTimeStamp());
+                        isStartTimeRecorded = true;
+                    }
+                    break;
+                }
+            }
             wu->commit();
             wu.clear();
         }
 
-        DFUstate state = (DFUstate)dfuwu.getState();
         if (stateout)
             stateout->clear().append(dfuwu.getStateMessage());
         switch(state)
@@ -721,6 +734,7 @@ static void blockUntilComplete(const char * label, IClientFileSpray &server, ICo
         if (aborting)
         {
             Owned<IClientAbortDFUWorkunit> abortReq = server.createAbortDFUWorkunitRequest();
+            setContainerLocalCertificate(abortReq->rpc());
             abortReq->setWuid(wuid);
             Linked<IClientAbortDFUWorkunitResponse> abortResp = server.AbortDFUWorkunit(abortReq);
 
@@ -755,7 +769,7 @@ static void blockUntilComplete(const char * label, IClientFileSpray &server, ICo
 
 //----------------------------------------------------------------------------------
 
-FILESERVICES_API char * FILESERVICES_CALL implementSprayFixed(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int recordSize, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit)
+FILESERVICES_API char * FILESERVICES_CALL implementSprayFixed(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int recordSize, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane = nullptr, unsigned destinationNumParts = 0, bool noCommon = true)
 {
     LOG(MCauditInfo, "Spray:  %s", destinationLogicalName);
 
@@ -765,14 +779,17 @@ FILESERVICES_API char * FILESERVICES_CALL implementSprayFixed(ICodeContext *ctx,
     setServerAccess(server, wu);
 
     Owned<IClientSprayFixed> req = server.createSprayFixedRequest();
+    setContainerLocalCertificate(req->rpc());
     StringBuffer logicalName;
     constructLogicalName(wu, destinationLogicalName, logicalName);
 
     req->setSourceIP(sourceIP);
     req->setSourcePath(sourcePath);
+    req->setSourcePlane(sourcePlane);
     req->setSourceRecordSize(recordSize);
     req->setDestGroup(destinationGroup);
     req->setDestLogicalName(logicalName.str());
+    req->setDestNumParts(destinationNumParts);
     req->setOverwrite(overwrite);
     req->setReplicate(replicate);
     req->setCompress(compress);
@@ -790,28 +807,41 @@ FILESERVICES_API char * FILESERVICES_CALL implementSprayFixed(ICodeContext *ctx,
     if (noSplit)
         req->setNosplit(true);
 
-    Owned<IClientSprayFixedResponse> result = server.SprayFixed(req);
+    req->setNoCommon(noCommon);
 
-    StringBuffer wuid(result->getWuid());
-    if (!wuid.length())
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Dfu Spray Fixed");
+    clientSpan->setSpanAttribute("destinationFilename", logicalName);
+    try
     {
-        const IMultiException* excep = &result->getExceptions();
-        if ((excep != NULL) && (excep->ordinality() > 0))
+        Owned<IClientSprayFixedResponse> result = server.SprayFixed(req);
+
+        StringBuffer wuid(result->getWuid());
+        if (!wuid.length())
         {
-            StringBuffer errmsg;
-            excep->errorMessage(errmsg);
-            throw MakeStringExceptionDirect(0, errmsg.str());
+            const IMultiException* excep = &result->getExceptions();
+            if ((excep != NULL) && (excep->ordinality() > 0))
+            {
+                StringBuffer errmsg;
+                excep->errorMessage(errmsg);
+                throw MakeStringExceptionDirect(0, errmsg.str());
+            }
+            else
+            {
+                throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
+            }
         }
-        else
-        {
-            throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
-        }
+
+        wu.clear();
+
+        clientSpan->setSpanAttribute("wuid", wuid);
+        blockUntilComplete("Spray", server, ctx, wuid, timeOut);
+        return wuid.detach();
     }
-
-    wu.clear();
-
-    blockUntilComplete("Spray", server, ctx, wuid, timeOut);
-    return wuid.detach();
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSprayFixed(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int recordSize, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile)
@@ -834,6 +864,16 @@ FILESERVICES_API void FILESERVICES_CALL fsSprayFixed_v4(ICodeContext *ctx, const
     CTXFREE(parentCtx, implementSprayFixed(ctx, sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit));
 }
 
+FILESERVICES_API void FILESERVICES_CALL fsSprayFixed_v5(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int recordSize, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts)
+{
+    CTXFREE(parentCtx, implementSprayFixed(ctx, sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts));
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsSprayFixed_v6(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int recordSize, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts, bool noCommon)
+{
+    CTXFREE(parentCtx, implementSprayFixed(ctx, sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon));
+}
+
 FILESERVICES_API char * FILESERVICES_CALL fsfSprayFixed(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int recordSize, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile)
 {
     return implementSprayFixed(ctx, sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, -1, nullptr, false);
@@ -854,9 +894,19 @@ FILESERVICES_API char * FILESERVICES_CALL fsfSprayFixed_v4(ICodeContext *ctx, co
     return implementSprayFixed(ctx, sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit);
 }
 
+FILESERVICES_API char * FILESERVICES_CALL fsfSprayFixed_v5(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int recordSize, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts)
+{
+    return implementSprayFixed(ctx, sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts);
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfSprayFixed_v6(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int recordSize, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts, bool noCommon)
+{
+    return implementSprayFixed(ctx, sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
+}
+
 //----------------------------------------------------------------------------------
 
-static char * implementSprayVariable(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char * sourceCsvSeparate, const char * sourceCsvTerminate, const char * sourceCsvQuote, const char * sourceCsvEscape, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, bool recordStructurePresent, bool quotedTerminator, const char * encoding, int expireDays, const char * dfuServerQueue, bool noSplit)
+static char * implementSprayVariable(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char * sourceCsvSeparate, const char * sourceCsvTerminate, const char * sourceCsvQuote, const char * sourceCsvEscape, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, bool recordStructurePresent, bool quotedTerminator, const char * encoding, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane = nullptr, unsigned destinationNumParts = 0, bool noCommon = true)
 {
     LOG(MCauditInfo, "Spray:  %s", destinationLogicalName);
 
@@ -866,11 +916,13 @@ static char * implementSprayVariable(ICodeContext *ctx, const char * sourceIP, c
     setServerAccess(server, wu);
 
     Owned<IClientSprayVariable> req = server.createSprayVariableRequest();
+    setContainerLocalCertificate(req->rpc());
     StringBuffer logicalName;
     constructLogicalName(wu, destinationLogicalName, logicalName);
 
     req->setSourceIP(sourceIP);
     req->setSourcePath(sourcePath);
+    req->setSourcePlane(sourcePlane);
     req->setSourceMaxRecordSize(sourceMaxRecordSize);
     req->setSourceFormat(CDFUfileformat::decode(encoding));
     req->setSourceCsvSeparate(sourceCsvSeparate);
@@ -882,6 +934,7 @@ static char * implementSprayVariable(ICodeContext *ctx, const char * sourceIP, c
         req->setSourceCsvEscape(sourceCsvEscape);
     req->setDestGroup(destinationGroup);
     req->setDestLogicalName(logicalName.str());
+    req->setDestNumParts(destinationNumParts);
     req->setOverwrite(overwrite);
     req->setReplicate(replicate);
     req->setCompress(compress);
@@ -900,29 +953,41 @@ static char * implementSprayVariable(ICodeContext *ctx, const char * sourceIP, c
 
     if (noSplit)
         req->setNosplit(true);
+    req->setNoCommon(noCommon);
 
-    Owned<IClientSprayResponse> result = server.SprayVariable(req);
-
-    StringBuffer wuid(result->getWuid());
-    if (!wuid.length())
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Dfu Spray Variable");
+    clientSpan->setSpanAttribute("destinationFilename", logicalName);
+    try
     {
-        const IMultiException* excep = &result->getExceptions();
-        if ((excep != NULL) && (excep->ordinality() > 0))
+        Owned<IClientSprayResponse> result = server.SprayVariable(req);
+
+        StringBuffer wuid(result->getWuid());
+        if (!wuid.length())
         {
-            StringBuffer errmsg;
-            excep->errorMessage(errmsg);
-            throw MakeStringExceptionDirect(0, errmsg.str());
+            const IMultiException* excep = &result->getExceptions();
+            if ((excep != NULL) && (excep->ordinality() > 0))
+            {
+                StringBuffer errmsg;
+                excep->errorMessage(errmsg);
+                throw MakeStringExceptionDirect(0, errmsg.str());
+            }
+            else
+            {
+                throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
+            }
         }
-        else
-        {
-            throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
-        }
+
+        wu.clear();
+
+        clientSpan->setSpanAttribute("wuid", wuid);
+        blockUntilComplete("Spray", server, ctx, wuid, timeOut);
+        return wuid.detach();
     }
-
-    wu.clear();
-
-    blockUntilComplete("Spray", server, ctx, wuid, timeOut);
-    return wuid.detach();
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSprayVariable(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char * sourceCsvSeparate, const char * sourceCsvTerminate, const char * sourceCsvQuote, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile)
@@ -1005,9 +1070,30 @@ FILESERVICES_API char * FILESERVICES_CALL fsfSprayVariable_v8(ICodeContext *ctx,
     return implementSprayVariable(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, csvEscape, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit);
 }
 
+FILESERVICES_API void FILESERVICES_CALL fsSprayVariable_v9(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char * sourceCsvSeparate, const char * sourceCsvTerminate, const char * sourceCsvQuote, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, const char * csvEscape, bool failIfNoSourceFile, bool recordStructurePresent, bool quotedTerminator, const char * encoding, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts)
+{
+    CTXFREE(parentCtx, implementSprayVariable(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, csvEscape, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts));
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfSprayVariable_v9(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char * sourceCsvSeparate, const char * sourceCsvTerminate, const char * sourceCsvQuote, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, const char * csvEscape, bool failIfNoSourceFile, bool recordStructurePresent, bool quotedTerminator, const char * encoding, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts)
+{
+    return implementSprayVariable(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, csvEscape, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts);
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsSprayVariable_v10(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char * sourceCsvSeparate, const char * sourceCsvTerminate, const char * sourceCsvQuote, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, const char * csvEscape, bool failIfNoSourceFile, bool recordStructurePresent, bool quotedTerminator, const char * encoding, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts, bool noCommon)
+{
+    CTXFREE(parentCtx, implementSprayVariable(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, csvEscape, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon));
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfSprayVariable_v10(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char * sourceCsvSeparate, const char * sourceCsvTerminate, const char * sourceCsvQuote, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, const char * csvEscape, bool failIfNoSourceFile, bool recordStructurePresent, bool quotedTerminator, const char * encoding, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts, bool noCommon)
+{
+    return implementSprayVariable(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, csvEscape, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
+}
+
+
 //----------------------------------------------------------------------------------
 
-FILESERVICES_API char * FILESERVICES_CALL implementSprayXml(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit)
+FILESERVICES_API char * FILESERVICES_CALL implementSprayXml(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts=0, bool noCommon = true)
 {
     LOG(MCauditInfo, "Spray:  %s", destinationLogicalName);
 
@@ -1017,6 +1103,7 @@ FILESERVICES_API char * FILESERVICES_CALL implementSprayXml(ICodeContext *ctx, c
     setServerAccess(server, wu);
 
     Owned<IClientSprayVariable> req = server.createSprayVariableRequest();
+    setContainerLocalCertificate(req->rpc());
     StringBuffer logicalName;
     constructLogicalName(wu, destinationLogicalName, logicalName);
 
@@ -1028,11 +1115,13 @@ FILESERVICES_API char * FILESERVICES_CALL implementSprayXml(ICodeContext *ctx, c
 
     req->setSourceIP(sourceIP);
     req->setSourcePath(sourcePath);
+    req->setSourcePlane(sourcePlane);
     req->setSourceMaxRecordSize(sourceMaxRecordSize);
     req->setSourceFormat(dfufmt);
     req->setSourceRowTag(sourceRowTag);
     req->setDestGroup(destinationGroup);
     req->setDestLogicalName(logicalName.str());
+    req->setDestNumParts(destinationNumParts);
     req->setOverwrite(overwrite);
     req->setReplicate(replicate);
     req->setCompress(compress);
@@ -1049,74 +1138,109 @@ FILESERVICES_API char * FILESERVICES_CALL implementSprayXml(ICodeContext *ctx, c
     if (noSplit)
         req->setNosplit(true);
 
-    Owned<IClientSprayResponse> result = server.SprayVariable(req);
+    req->setNoCommon(noCommon);
 
-    StringBuffer wuid(result->getWuid());
-    if (!wuid.length())
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Dfu Spray Xml");
+    clientSpan->setSpanAttribute("destinationFilename", logicalName);
+    try
     {
-        const IMultiException* excep = &result->getExceptions();
-        if ((excep != NULL) && (excep->ordinality() > 0))
+        Owned<IClientSprayResponse> result = server.SprayVariable(req);
+
+        StringBuffer wuid(result->getWuid());
+        if (!wuid.length())
         {
-            StringBuffer errmsg;
-            excep->errorMessage(errmsg);
-            throw MakeStringExceptionDirect(0, errmsg.str());
+            const IMultiException* excep = &result->getExceptions();
+            if ((excep != NULL) && (excep->ordinality() > 0))
+            {
+                StringBuffer errmsg;
+                excep->errorMessage(errmsg);
+                throw MakeStringExceptionDirect(0, errmsg.str());
+            }
+            else
+            {
+                throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
+            }
         }
-        else
-        {
-            throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
-        }
+
+        wu.clear();
+
+        clientSpan->setSpanAttribute("wuid", wuid);
+        blockUntilComplete("Spray", server, ctx, wuid, timeOut);
+        return wuid.detach();
     }
-
-    wu.clear();
-
-    blockUntilComplete("Spray", server, ctx, wuid, timeOut);
-    return wuid.detach();
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
 
 FILESERVICES_API void FILESERVICES_CALL fsSprayXml(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile)
 {
-    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, -1, nullptr, false));
+    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, -1, nullptr, false, nullptr));
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSprayXml_v2(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays)
 {
-    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, nullptr, false));
+    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, nullptr, false, nullptr));
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSprayXml_v3(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue)
 {
-    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, false));
+    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, false, nullptr));
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSprayXml_v4(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit)
 {
-    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit));
+    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, nullptr));
 }
+
+FILESERVICES_API void FILESERVICES_CALL fsSprayXml_v5(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts)
+{
+    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts));
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsSprayXml_v6(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts, bool noCommon)
+{
+    CTXFREE(parentCtx, implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon));
+}
+
 
 FILESERVICES_API char * FILESERVICES_CALL fsfSprayXml(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile)
 {
-    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, -1, nullptr, false);
+    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, -1, nullptr, false, nullptr);
 }
 
 FILESERVICES_API char * FILESERVICES_CALL fsfSprayXml_v2(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays)
 {
-    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, nullptr, false);
+    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, nullptr, false, nullptr);
 }
 
 FILESERVICES_API char * FILESERVICES_CALL fsfSprayXml_v3(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue)
 {
-    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, false);
+    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, false, nullptr);
 }
 
 FILESERVICES_API char * FILESERVICES_CALL fsfSprayXml_v4(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit)
 {
-    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit);
+    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, nullptr);
 }
+
+FILESERVICES_API char * FILESERVICES_CALL fsfSprayXml_v5(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts)
+{
+    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts);
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfSprayXml_v6(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowTag, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * sourcePlane, unsigned destinationNumParts, bool noCommon)
+{
+    return implementSprayXml(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
+}
+
 
 //----------------------------------------------------------------------------------
 
-FILESERVICES_API char * FILESERVICES_CALL implementSprayJson(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowPath, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * username, const char * userPw)
+FILESERVICES_API char * FILESERVICES_CALL implementSprayJson(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowPath, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * username, const char * userPw, const char * sourcePlane, unsigned destinationNumParts=0, bool noCommon = true)
 {
     LOG(MCauditInfo, "Spray JSON: %s", destinationLogicalName);
 
@@ -1126,6 +1250,7 @@ FILESERVICES_API char * FILESERVICES_CALL implementSprayJson(ICodeContext *ctx, 
     setServerAccess(server, wu);
 
     Owned<IClientSprayVariable> req = server.createSprayVariableRequest();
+    setContainerLocalCertificate(req->rpc());
     StringBuffer logicalName;
     constructLogicalName(wu, destinationLogicalName, logicalName);
 
@@ -1137,11 +1262,13 @@ FILESERVICES_API char * FILESERVICES_CALL implementSprayJson(ICodeContext *ctx, 
 
     req->setSourceIP(sourceIP);
     req->setSourcePath(sourcePath);
+    req->setSourcePlane(sourcePlane);
     req->setSourceMaxRecordSize(sourceMaxRecordSize);
     req->setSourceFormat(dfufmt);
     req->setSourceRowTag(sourceRowPath);
     req->setDestGroup(destinationGroup);
     req->setDestLogicalName(logicalName.str());
+    req->setDestNumParts(destinationNumParts);
     req->setOverwrite(overwrite);
     req->setReplicate(replicate);
     req->setCompress(compress);
@@ -1159,6 +1286,8 @@ FILESERVICES_API char * FILESERVICES_CALL implementSprayJson(ICodeContext *ctx, 
     if (noSplit)
         req->setNosplit(true);
 
+    req->setNoCommon(noCommon);
+
     // Store username/psw
     if (!isEmptyString(username))
     {
@@ -1167,49 +1296,76 @@ FILESERVICES_API char * FILESERVICES_CALL implementSprayJson(ICodeContext *ctx, 
             req->setSrcPassword(userPw);
     }
 
-    Owned<IClientSprayResponse> result = server.SprayVariable(req);
-
-    StringBuffer wuid(result->getWuid());
-    if (!wuid.length())
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Dfu Spray Json");
+    clientSpan->setSpanAttribute("destinationFilename", logicalName);
+    try
     {
-        const IMultiException* excep = &result->getExceptions();
-        if ((excep != NULL) && (excep->ordinality() > 0))
+        Owned<IClientSprayResponse> result = server.SprayVariable(req);
+
+        StringBuffer wuid(result->getWuid());
+        if (!wuid.length())
         {
-            StringBuffer errmsg;
-            excep->errorMessage(errmsg);
-            throw MakeStringExceptionDirect(0, errmsg.str());
+            const IMultiException* excep = &result->getExceptions();
+            if ((excep != NULL) && (excep->ordinality() > 0))
+            {
+                StringBuffer errmsg;
+                excep->errorMessage(errmsg);
+                throw MakeStringExceptionDirect(0, errmsg.str());
+            }
+            else
+            {
+                throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
+            }
         }
-        else
-        {
-            throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
-        }
+
+        wu.clear();
+
+        clientSpan->setSpanAttribute("wuid", wuid);
+        blockUntilComplete("Spray", server, ctx, wuid, timeOut);
+        return wuid.detach();
     }
-
-    wu.clear();
-
-    blockUntilComplete("Spray", server, ctx, wuid, timeOut);
-    return wuid.detach();
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
 
 FILESERVICES_API void FILESERVICES_CALL fsSprayJson(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowPath, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * username, const char * userPw)
 {
-    CTXFREE(parentCtx, implementSprayJson(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw));
+    CTXFREE(parentCtx, implementSprayJson(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, nullptr));
 }
+
+FILESERVICES_API void FILESERVICES_CALL fsSprayJson_v2(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowPath, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * username, const char * userPw, const char * sourcePlane, unsigned destinationNumParts)
+{
+    CTXFREE(parentCtx, implementSprayJson(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, sourcePlane, destinationNumParts));
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsSprayJson_v3(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowPath, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * username, const char * userPw, const char * sourcePlane, unsigned destinationNumParts, bool noCommon)
+{
+    CTXFREE(parentCtx, implementSprayJson(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, sourcePlane, destinationNumParts, noCommon));
+}
+
 
 FILESERVICES_API char * FILESERVICES_CALL fsfSprayJson(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowPath, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * username, const char * userPw)
 {
-    return implementSprayJson(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw);
+    return implementSprayJson(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, nullptr);
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfSprayJson_v2(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowPath, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * username, const char * userPw, const char * sourcePlane, unsigned destinationNumParts)
+{
+    return implementSprayJson(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, sourcePlane, destinationNumParts);
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfSprayJson_v3(ICodeContext *ctx, const char * sourceIP, const char * sourcePath, int sourceMaxRecordSize, const char *sourceRowPath, const char *sourceEncoding, const char * destinationGroup, const char * destinationLogicalName, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool compress, bool failIfNoSourceFile, int expireDays, const char * dfuServerQueue, bool noSplit, const char * username, const char * userPw, const char * sourcePlane, unsigned destinationNumParts, bool noCommon)
+{
+    return implementSprayJson(ctx, sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, overwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, sourcePlane, destinationNumParts, noCommon);
 }
 
 //----------------------------------------------------------------------------------
 
-FILESERVICES_API void FILESERVICES_CALL fsDespray(ICodeContext *ctx, const char * sourceLogicalName, const char * destinationIP, const char * destinationPath, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite)
-{
-    CTXFREE(parentCtx, fsfDespray(ctx, sourceLogicalName, destinationIP, destinationPath, timeOut, espServerIpPort, maxConnections, overwrite));
-}
-
-FILESERVICES_API char * FILESERVICES_CALL fsfDespray(ICodeContext *ctx, const char * sourceLogicalName, const char * destinationIP, const char * destinationPath, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite)
+static char * implementDespray(ICodeContext *ctx, const char * sourceLogicalName, const char * destinationIP, const char * destinationPath, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, const char * destinationPlane = nullptr)
 {
     LOG(MCauditInfo, "Despray:  %s", sourceLogicalName);
 
@@ -1220,41 +1376,74 @@ FILESERVICES_API char * FILESERVICES_CALL fsfDespray(ICodeContext *ctx, const ch
         setServerAccess(server, wu);
 
     Owned<IClientDespray> req = server.createDesprayRequest();
+    setContainerLocalCertificate(req->rpc());
     StringBuffer logicalName;
     constructLogicalName(wu, sourceLogicalName, logicalName);
 
     req->setSourceLogicalName(logicalName.str());
     req->setDestIP(destinationIP);
     req->setDestPath(destinationPath);
+    req->setDestPlane(destinationPlane);
     req->setOverwrite(overwrite);
     if (maxConnections != -1)
         req->setMaxConnections(maxConnections);
 
-    Owned<IClientDesprayResponse> result = server.Despray(req);
-
-    StringBuffer wuid(result->getWuid());
-    if (!wuid.length())
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Dfu Despray");
+    clientSpan->setSpanAttribute("sourceFilename", logicalName);
+    try
     {
-        const IMultiException* excep = &result->getExceptions();
-        if ((excep != NULL) && (excep->ordinality() > 0))
+        Owned<IClientDesprayResponse> result = server.Despray(req);
+
+        StringBuffer wuid(result->getWuid());
+        if (!wuid.length())
         {
-            StringBuffer errmsg;
-            excep->errorMessage(errmsg);
-            throw MakeStringExceptionDirect(0, errmsg.str());
+            const IMultiException* excep = &result->getExceptions();
+            if ((excep != NULL) && (excep->ordinality() > 0))
+            {
+                StringBuffer errmsg;
+                excep->errorMessage(errmsg);
+                throw MakeStringExceptionDirect(0, errmsg.str());
+            }
+            else
+            {
+                throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
+            }
         }
-        else
-        {
-            throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
-        }
+
+        wu.clear();
+
+        clientSpan->setSpanAttribute("wuid", wuid);
+        blockUntilComplete("Despray", server, ctx, wuid, timeOut);
+        return wuid.detach();
     }
-
-    wu.clear();
-
-    blockUntilComplete("Despray", server, ctx, wuid, timeOut);
-    return wuid.detach();
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
-FILESERVICES_API char * FILESERVICES_CALL implementCopy(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays)
+FILESERVICES_API void FILESERVICES_CALL fsDespray(ICodeContext *ctx, const char * sourceLogicalName, const char * destinationIP, const char * destinationPath, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite)
+{
+    CTXFREE(parentCtx, implementDespray(ctx, sourceLogicalName, destinationIP, destinationPath, timeOut, espServerIpPort, maxConnections, overwrite));
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfDespray(ICodeContext *ctx, const char * sourceLogicalName, const char * destinationIP, const char * destinationPath, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite)
+{
+    return implementDespray(ctx, sourceLogicalName, destinationIP, destinationPath, timeOut, espServerIpPort, maxConnections, overwrite);
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsDespray2(ICodeContext *ctx, const char * sourceLogicalName, const char * destinationIP, const char * destinationPath, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, const char * destinationPlane)
+{
+    CTXFREE(parentCtx, implementDespray(ctx, sourceLogicalName, destinationIP, destinationPath, timeOut, espServerIpPort, maxConnections, overwrite, destinationPlane));
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfDespray2(ICodeContext *ctx, const char * sourceLogicalName, const char * destinationIP, const char * destinationPath, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, const char * destinationPlane)
+{
+    return implementDespray(ctx, sourceLogicalName, destinationIP, destinationPath, timeOut, espServerIpPort, maxConnections, overwrite, destinationPlane);
+}
+
+FILESERVICES_API char * FILESERVICES_CALL implementCopy(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays, bool ensure, bool wrap, const char * keyCompression)
 {
     LOG(MCauditInfo, "Copy:  %s%s", sourceLogicalName,asSuperfile?" as superfile":"");
 
@@ -1265,6 +1454,7 @@ FILESERVICES_API char * FILESERVICES_CALL implementCopy(ICodeContext *ctx, const
     setServerAccess(server, wu);
 
     Owned<IClientCopy> req = server.createCopyRequest();
+    setContainerLocalCertificate(req->rpc());
     if (asSuperfile)
         req->setSuperCopy(true);
 
@@ -1291,60 +1481,108 @@ FILESERVICES_API char * FILESERVICES_CALL implementCopy(ICodeContext *ctx, const
         req->setMaxConnections(maxConnections);
     if (noSplit)
         req->setNosplit(true);
+    if (ensure)
+        req->setEnsure(true);
+    if (wrap)
+        req->setWrap(true);
     req->setExpireDays(expireDays);
+    if (keyCompression && *keyCompression)
+        req->setKeyCompression(keyCompression);
 
-    Owned<IClientCopyResponse> result = server.Copy(req);
-
-    StringBuffer wuid(result->getResult());
-    if (!wuid.length())
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Dfu Copy");
+    clientSpan->setSpanAttribute("sourceFilename", sourceLogicalName);
+    clientSpan->setSpanAttribute("destinationFilename", destinationLogicalName);
+    try
     {
-        const IMultiException* excep = &result->getExceptions();
-        if ((excep != NULL) && (excep->ordinality() > 0))
+        Owned<IClientCopyResponse> result = server.Copy(req);
+
+        StringBuffer wuid(result->getResult());
+        if (!wuid.length())
         {
-            StringBuffer errmsg;
-            excep->errorMessage(errmsg);
-            throw MakeStringExceptionDirect(0, errmsg.str());
+            const IMultiException* excep = &result->getExceptions();
+            if ((excep != NULL) && (excep->ordinality() > 0))
+            {
+                StringBuffer errmsg;
+                excep->errorMessage(errmsg);
+                throw MakeStringExceptionDirect(0, errmsg.str());
+            }
+            else
+            {
+                throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
+            }
         }
-        else
-        {
-            throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
-        }
+
+        wu.clear();
+
+        clientSpan->setSpanAttribute("wuid", wuid);
+        blockUntilComplete("Copy", server, ctx, wuid, timeOut);
+        return wuid.detach();
     }
-
-    wu.clear();
-
-    blockUntilComplete("Copy", server, ctx, wuid, timeOut);
-    return wuid.detach();
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsCopy(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize)
 {
-    CTXFREE(parentCtx, implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, true, false, -1));
+    CTXFREE(parentCtx, implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, true, false, -1, false, false, nullptr));
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsCopy_v2(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression)
 {
-    CTXFREE(parentCtx, implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, false, -1));
+    CTXFREE(parentCtx, implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, false, -1, false, false, nullptr));
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsCopy_v3(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays)
 {
-    CTXFREE(parentCtx, implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays));
+    CTXFREE(parentCtx, implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, false, false, nullptr));
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsCopy_v4(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays, bool ensure)
+{
+    CTXFREE(parentCtx, implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, false, nullptr));
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsCopy_v5(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays, bool ensure, bool wrap)
+{
+    CTXFREE(parentCtx, implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, wrap, nullptr));
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsCopy_v6(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays, bool ensure, bool wrap, const char * keyCompression)
+{
+    CTXFREE(parentCtx, implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, wrap, keyCompression));
 }
 
 FILESERVICES_API char * FILESERVICES_CALL fsfCopy(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize)
 {
-    return implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, true, false, -1);
+    return implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, true, false, -1, false, false, nullptr);
 }
 
 FILESERVICES_API char * FILESERVICES_CALL fsfCopy_v2(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression)
 {
-    return implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, false,-1);
+    return implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, false, -1, false, false, nullptr);
 }
 
 FILESERVICES_API char * FILESERVICES_CALL fsfCopy_v3(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays)
 {
-    return implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays);
+    return implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, false, false, nullptr);
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfCopy_v4(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays, bool ensure)
+{
+    return implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, false, nullptr);
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfCopy_v5(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays, bool ensure, bool wrap)
+{
+    return implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, wrap, nullptr);
+}
+
+FILESERVICES_API char * FILESERVICES_CALL fsfCopy_v6(ICodeContext *ctx, const char * sourceLogicalName, const char *destinationGroup, const char * destinationLogicalName, const char * sourceDali, int timeOut, const char * espServerIpPort, int maxConnections, bool overwrite, bool replicate, bool asSuperfile, bool compress, bool forcePush, int transferBufferSize, bool preserveCompression, bool noSplit, int expireDays, bool ensure, bool wrap, const char * keyCompression)
+{
+    return implementCopy(ctx, sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, overwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, wrap, keyCompression);
 }
 
 
@@ -1363,33 +1601,45 @@ FILESERVICES_API char * FILESERVICES_CALL fsfReplicate(ICodeContext *ctx, const 
     setServerAccess(server, wu);
 
     Owned<IClientReplicate> req = server.createReplicateRequest();
+    setContainerLocalCertificate(req->rpc());
     StringBuffer logicalName;
     constructLogicalName(wu, sourceLogicalName, logicalName);
 
     req->setSourceLogicalName(logicalName.str());
-    Owned<IClientReplicateResponse> result = server.Replicate(req);
 
-    StringBuffer wuid(result->getWuid());
-    if (!wuid.length())
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Dfu Spray Fixed");
+    clientSpan->setSpanAttribute("destinationFilename", logicalName);
+    try
     {
-        const IMultiException* excep = &result->getExceptions();
-        if ((excep != NULL) && (excep->ordinality() > 0))
+        Owned<IClientReplicateResponse> result = server.Replicate(req);
+
+        StringBuffer wuid(result->getWuid());
+        if (!wuid.length())
         {
-            StringBuffer errmsg;
-            excep->errorMessage(errmsg);
-            throw MakeStringExceptionDirect(0, errmsg.str());
+            const IMultiException* excep = &result->getExceptions();
+            if ((excep != NULL) && (excep->ordinality() > 0))
+            {
+                StringBuffer errmsg;
+                excep->errorMessage(errmsg);
+                throw MakeStringExceptionDirect(0, errmsg.str());
+            }
+            else
+            {
+                throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
+            }
         }
-        else
-        {
-            throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
-        }
+
+        wu.clear();
+
+        clientSpan->setSpanAttribute("wuid", wuid);
+        blockUntilComplete("Replicate", server, ctx, wuid, timeOut);
+        return wuid.detach();
     }
-
-    wu.clear();
-
-    blockUntilComplete("Replicate", server, ctx, wuid, timeOut);
-    return wuid.detach();
-
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
 
@@ -1436,7 +1686,7 @@ public:
 };
 
 
-static bool lookupSuperFile(ICodeContext *ctx, const char *lsuperfn, Owned<IDistributedSuperFile> &file, bool throwerr, StringBuffer &lsfn, bool allowforeign, bool cacheFiles=false)
+static bool lookupSuperFile(ICodeContext *ctx, const char *lsuperfn, AccessMode accessMode, Owned<IDistributedSuperFile> &file, bool throwerr, StringBuffer &lsfn, bool allowforeign, bool cacheFiles=false)
 {
     lsfn.clear();
     IDistributedFileTransaction *transaction = ctx->querySuperFileTransaction();
@@ -1448,7 +1698,7 @@ static bool lookupSuperFile(ICodeContext *ctx, const char *lsuperfn, Owned<IDist
         if (dlfn.isForeign())
             throw MakeStringException(0, "Foreign superfile not allowed: %s", lsfn.str());
     }
-    file.setown(transaction->lookupSuperFile(lsfn.str()));
+    file.setown(transaction->lookupSuperFile(lsfn.str(), accessMode));
     if (file.get())
         return true;
     if (throwerr)
@@ -1478,6 +1728,25 @@ static void CheckNotInTransaction(ICodeContext *ctx, const char *fn)
     }
 }
 
+static IDistributedSuperFile *lookupRemoteOrForeignSuper(ICodeContext *ctx, const char *caller, const char *superfn)
+{
+    CDfsLogicalFileName slfn;
+    slfn.set(superfn);
+    // Foreign files route through the ordinary Dali path and support
+    // transactions naturally. Remote (~remote::) files are read-only
+    // from the transaction's perspective — the wsdfs lookup below reads current state
+    // without participating in the Dali locking protocol, which is safe for these
+    // read-only superfile enquiry operations.
+    Owned<IDistributedFile> df = wsdfs::lookup(slfn, ctx->queryUserDescriptor(), AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser, INFINITE);
+    if (!df)
+        throw makeStringExceptionV(0, "%s: Could not locate superfile: %s", caller, slfn.get());
+    IDistributedSuperFile *superFile = df->querySuperFile();
+    if (!superFile)
+        throw makeStringExceptionV(0, "%s: File is not a superfile: %s", caller, slfn.get());
+    return LINK(superFile);
+}
+
+
 FILESERVICES_API void FILESERVICES_CALL fsCreateSuperFile(ICodeContext *ctx, const char *lsuperfn, bool sequentialparts, bool ifdoesnotexist)
 {
     IDistributedFileTransaction *transaction = ctx->querySuperFileTransaction();
@@ -1488,7 +1757,9 @@ FILESERVICES_API void FILESERVICES_CALL fsCreateSuperFile(ICodeContext *ctx, con
     Owned<IDistributedSuperFile> file = queryDistributedFileDirectory().createSuperFile(lsfn,udesc,!sequentialparts,ifdoesnotexist,transaction);
     StringBuffer s("CreateSuperFile ('");
     s.append(lsfn).append("') done");
-    AuditMessage(ctx,"CreateSuperFile",lsfn.str());
+    // Temporary exception: superfile create/delete still emit here because the DFS
+    // create/remove superfile APIs do not yet accept DFSAuditContext for ownership transfer.
+    AuditMessage(ctx,"SUPER_CREATE",lsfn.str());
     WUmessage(ctx,SeverityInformation,NULL,s.str());
 }
 
@@ -1496,7 +1767,7 @@ FILESERVICES_API bool FILESERVICES_CALL fsSuperFileExists(ICodeContext *ctx, con
 {
     StringBuffer lsfn;
     constructLogicalName(ctx, lsuperfn, lsfn);
-    return queryDistributedFileDirectory().exists(lsfn,ctx->queryUserDescriptor(),false,true);
+    return wsdfs::exists(lsfn, ctx->queryUserDescriptor(), false, true, INFINITE);
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsDeleteSuperFile(ICodeContext *ctx, const char *lsuperfn,bool deletesub)
@@ -1505,7 +1776,7 @@ FILESERVICES_API void FILESERVICES_CALL fsDeleteSuperFile(ICodeContext *ctx, con
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
     Owned<IDistributedSuperFile> file;
     StringBuffer lsfn;
-    bool found = lookupSuperFile(ctx, lsuperfn, file, false, lsfn, false);
+    bool found = lookupSuperFile(ctx, lsuperfn, AccessMode::writeLogicalMeta, file, false, lsfn, false);
     file.clear(); // MORE: this should really be exists(file)
     StringBuffer s("DeleteSuperFile ('");
     s.append(lsfn).appendf("')");
@@ -1520,19 +1791,31 @@ FILESERVICES_API void FILESERVICES_CALL fsDeleteSuperFile(ICodeContext *ctx, con
     }
     WUmessage(ctx,SeverityInformation,NULL,s.str());
     if (found)
-        AuditMessage(ctx,"DeleteSuperFile",lsfn.str());
+    {
+        // Temporary exception: superfile create/delete still emit here because the DFS
+        // create/remove superfile APIs do not yet accept DFSAuditContext for ownership transfer.
+        AuditMessage(ctx,"SUPER_DELETE",lsfn.str());
+    }
 }
 
 FILESERVICES_API unsigned FILESERVICES_CALL fsGetSuperFileSubCount(ICodeContext *ctx, const char *lsuperfn)
 {
-    Owned<ISimpleSuperFileEnquiry> enq = getSimpleSuperFileEnquiry(ctx, lsuperfn);
-    if (enq)
-        return enq->numSubFiles();
-    CImplicitSuperTransaction implicitTransaction(ctx->querySuperFileTransaction());
-    Owned<IDistributedSuperFile> file;
-    StringBuffer lsfn;
-    lookupSuperFile(ctx, lsuperfn, file, true, lsfn, true);
-    return file->numSubFiles();
+    CDfsLogicalFileName slfn;
+    slfn.set(lsuperfn);
+    std::unique_ptr<CImplicitSuperTransaction> implicitTransaction;
+    Owned<IDistributedSuperFile> superFile;
+    if (slfn.isRemote() || slfn.isForeign())
+        superFile.setown(lookupRemoteOrForeignSuper(ctx, "fsGetSuperFileSubCount", lsuperfn));
+    else
+    {
+        Owned<ISimpleSuperFileEnquiry> enq = getSimpleSuperFileEnquiry(ctx, lsuperfn);
+        if (enq)
+            return enq->numSubFiles();
+        implicitTransaction = std::make_unique<CImplicitSuperTransaction>(ctx->querySuperFileTransaction());
+        StringBuffer lsfn;
+        lookupSuperFile(ctx, lsuperfn, AccessMode::readLogicalMeta, superFile, true, lsfn, true);
+    }
+    return superFile->numSubFiles();
 }
 
 FILESERVICES_API char *  FILESERVICES_CALL fsGetSuperFileSubName(ICodeContext *ctx, const char *lsuperfn,unsigned filenum, bool abspath)
@@ -1540,39 +1823,58 @@ FILESERVICES_API char *  FILESERVICES_CALL fsGetSuperFileSubName(ICodeContext *c
     StringBuffer ret;
     if (abspath)
         ret.append('~');
-    Owned<ISimpleSuperFileEnquiry> enq = getSimpleSuperFileEnquiry(ctx, lsuperfn);
-    if (enq) {
-        if (!filenum||!enq->getSubFileName(filenum-1,ret))
-            return CTXSTRDUP(parentCtx, "");
-        return ret.detach();
+    Owned<IDistributedSuperFile> superFile;
+    std::unique_ptr<CImplicitSuperTransaction> implicitTransaction;
+    CDfsLogicalFileName slfn;
+    slfn.set(lsuperfn);
+    if (slfn.isRemote() || slfn.isForeign())
+        superFile.setown(lookupRemoteOrForeignSuper(ctx, "GetSuperFileSubName", lsuperfn));
+    else
+    {
+        Owned<ISimpleSuperFileEnquiry> enq = getSimpleSuperFileEnquiry(ctx, lsuperfn);
+        if (enq)
+        {
+            if (!filenum||!enq->getSubFileName(filenum-1,ret))
+                return CTXSTRDUP(parentCtx, "");
+            return ret.detach();
+        }
+        implicitTransaction = std::make_unique<CImplicitSuperTransaction>(ctx->querySuperFileTransaction());
+        StringBuffer lsfn;
+        lookupSuperFile(ctx, lsuperfn, AccessMode::readLogicalMeta, superFile, true, lsfn, true);
     }
-    CImplicitSuperTransaction implicitTransaction(ctx->querySuperFileTransaction());
-    Owned<IDistributedSuperFile> file;
-    StringBuffer lsfn;
-    lookupSuperFile(ctx, lsuperfn, file, true, lsfn, true);
-    if (!filenum||filenum>file->numSubFiles())
+    if (!filenum||filenum>superFile->numSubFiles())
         return CTXSTRDUP(parentCtx, "");
-    ret.append(file->querySubFile(filenum-1).queryLogicalName());
+    ret.append(superFile->querySubFile(filenum-1).queryLogicalName());
     return ret.detach();
 }
 
-FILESERVICES_API unsigned FILESERVICES_CALL fsFindSuperFileSubName(ICodeContext *ctx, const char *lsuperfn,const char *_lfn)
+FILESERVICES_API unsigned FILESERVICES_CALL fsFindSuperFileSubName(ICodeContext *ctx, const char *lsuperfn, const char *_lfn)
 {
+    std::unique_ptr<CImplicitSuperTransaction> implicitTransaction;
+    Owned<IDistributedSuperFile> superFile;
+    CDfsLogicalFileName slfn;
+    slfn.set(lsuperfn);
     StringBuffer lfn;
     constructLogicalName(ctx, _lfn, lfn);
-    Owned<ISimpleSuperFileEnquiry> enq = getSimpleSuperFileEnquiry(ctx, lsuperfn);
-    if (enq) {
-        unsigned n = enq->findSubName(lfn.str());
-        return (n==NotFound)?0:n+1;
+    if (slfn.isRemote() || slfn.isForeign())
+        superFile.setown(lookupRemoteOrForeignSuper(ctx, "GetSuperFileSubName", lsuperfn));
+    else
+    {
+        Owned<ISimpleSuperFileEnquiry> enq = getSimpleSuperFileEnquiry(ctx, lsuperfn);
+        if (enq)
+        {
+            unsigned n = enq->findSubName(lfn.str());
+            return (n==NotFound)?0:n+1;
+        }
+        implicitTransaction = std::make_unique<CImplicitSuperTransaction>(ctx->querySuperFileTransaction());
+        StringBuffer lsfn;
+        lookupSuperFile(ctx, lsuperfn, AccessMode::readLogicalMeta, superFile, true, lsfn, true);
     }
-    CImplicitSuperTransaction implicitTransaction(ctx->querySuperFileTransaction());
-    Owned<IDistributedSuperFile> file;
-    StringBuffer lsfn;
-    lookupSuperFile(ctx, lsuperfn, file, true, lsfn, true);
     unsigned n = 0;
     // could do with better version of this TBD
-    Owned<IDistributedFileIterator> iter = file->getSubFileIterator();
-    ForEach(*iter) {
+    Owned<IDistributedFileIterator> iter = superFile->getSubFileIterator();
+    ForEach(*iter)
+    {
         n++;
         if (stricmp(iter->query().queryLogicalName(),lfn.str())==0)
             return n;
@@ -1604,10 +1906,10 @@ FILESERVICES_API void FILESERVICES_CALL fslAddSuperFile(ICodeContext *ctx, const
     Owned<IDistributedSuperFile> file;
     StringBuffer lsfn;
     // NB: if adding contents, tell lookupSuperFile to cache the subfiles in the transaction
-    if (!lookupSuperFile(ctx, lsuperfn, file, strict, lsfn, false, addcontents)) {
+    if (!lookupSuperFile(ctx, lsuperfn, AccessMode::writeLogicalMeta, file, strict, lsfn, false, addcontents)) {
         // auto create
         fsCreateSuperFile(ctx,lsuperfn,false,false);
-        lookupSuperFile(ctx, lsuperfn, file, true, lsfn, false, addcontents);
+        lookupSuperFile(ctx, lsuperfn, AccessMode::writeLogicalMeta, file, true, lsfn, false, addcontents);
     }
     // Never add super file to itself
     StringBuffer lfn;
@@ -1619,7 +1921,7 @@ FILESERVICES_API void FILESERVICES_CALL fslAddSuperFile(ICodeContext *ctx, const
     assertex(transaction);
     if  (strict||addcontents) {
         Owned<IDistributedSuperFile> subfile;
-        subfile.setown(transaction->lookupSuperFile(lfn.str()));
+        subfile.setown(transaction->lookupSuperFile(lfn.str(), AccessMode::writeLogicalMeta));
         if (!subfile.get())
             throw MakeStringException(0, "AddSuperFile%s: Could not locate super file %s", addcontents?"(addcontents)":"",lfn.str());
         if (strict&&(subfile->numSubFiles()<1))
@@ -1646,7 +1948,7 @@ FILESERVICES_API void FILESERVICES_CALL fslAddSuperFile(ICodeContext *ctx, const
     else
         s.append("done");
     WUmessage(ctx,SeverityInformation,NULL,s.str());
-    AuditMessage(ctx,"AddSuperFile",lsfn.str(),lfn.str());
+    AuditMessage(ctx,"SUPER_ADD",lsfn.str(),lfn.str()); // metadata op - keep explicit FileServices audit for now; move to DFS when DFSAuditContext-enabled API exists
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsRemoveSuperFile(IGlobalCodeContext *gctx, const char *lsuperfn,const char *_lfn,bool del,bool remcontents)
@@ -1661,7 +1963,7 @@ FILESERVICES_API void FILESERVICES_CALL fslRemoveSuperFile(ICodeContext *ctx, co
     StringBuffer lfn;
     if (_lfn)
         constructLogicalName(ctx, _lfn, lfn);
-    lookupSuperFile(ctx, lsuperfn, file, true, lsfn, false, true);
+    lookupSuperFile(ctx, lsuperfn, AccessMode::writeLogicalMeta, file, true, lsfn, false, true);
     IDistributedFileTransaction *transaction = ctx->querySuperFileTransaction();
     assertex(transaction);
     {
@@ -1687,7 +1989,7 @@ FILESERVICES_API void FILESERVICES_CALL fslRemoveSuperFile(ICodeContext *ctx, co
     else
         s.append("done");
     WUmessage(ctx,SeverityInformation,NULL,s.str());
-    AuditMessage(ctx,"RemoveSuperFile",lsfn.str(),lfn.str());
+    AuditMessage(ctx,"SUPER_REMOVE",lsfn.str(),lfn.str()); // metadata op - keep explicit FileServices audit for now; move to DFS when DFSAuditContext-enabled API exists
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsClearSuperFile(IGlobalCodeContext *gctx, const char *lsuperfn,bool del)
@@ -1709,7 +2011,7 @@ FILESERVICES_API void FILESERVICES_CALL fslRemoveOwnedSubFiles(ICodeContext *ctx
 {
     Owned<IDistributedSuperFile> file;
     StringBuffer lsfn;
-    lookupSuperFile(ctx, lsuperfn, file, true, lsfn, false, true);
+    lookupSuperFile(ctx, lsuperfn, del ? AccessMode::erase : AccessMode::writeLogicalMeta, file, true, lsfn, false, true);
     IDistributedFileTransaction *transaction = ctx->querySuperFileTransaction();
     assertex(transaction);
     {
@@ -1726,7 +2028,7 @@ FILESERVICES_API void FILESERVICES_CALL fslRemoveOwnedSubFiles(ICodeContext *ctx
     else
         s.append("done");
     WUmessage(ctx,SeverityInformation,NULL,s.str());
-    AuditMessage(ctx,"RemoveOwnedSubFiles",lsfn.str());
+    AuditMessage(ctx,"SUPER_REMOVEOWNEDSUBS",lsfn.str()); // metadata op - keep explicit FileServices audit for now; move to DFS when DFSAuditContext-enabled API exists
 }
 
 FILESERVICES_API void FILESERVICES_CALL fslClearSuperFile(ICodeContext *ctx, const char *lsuperfn,bool del)
@@ -1745,8 +2047,8 @@ FILESERVICES_API void FILESERVICES_CALL fslSwapSuperFile(ICodeContext *ctx, cons
     StringBuffer lsfn2;
     Owned<IDistributedSuperFile> file1;
     Owned<IDistributedSuperFile> file2;
-    lookupSuperFile(ctx, lsuperfn1, file1, true, lsfn1,false);
-    lookupSuperFile(ctx, lsuperfn2, file2, true,lsfn2,false);
+    lookupSuperFile(ctx, lsuperfn1, AccessMode::writeLogicalMeta, file1, true, lsfn1,false);
+    lookupSuperFile(ctx, lsuperfn2, AccessMode::writeLogicalMeta, file2, true,lsfn2,false);
 
     IDistributedFileTransaction *transaction = ctx->querySuperFileTransaction();
     assertex(transaction);
@@ -1765,7 +2067,7 @@ FILESERVICES_API void FILESERVICES_CALL fslSwapSuperFile(ICodeContext *ctx, cons
     else
         s.append("done");
     WUmessage(ctx,SeverityInformation,NULL,s.str());
-    AuditMessage(ctx,"SwapSuperFile",lsfn1.str(),lsfn2.str());
+    AuditMessage(ctx,"SUPER_SWAP",lsfn1.str(),lsfn2.str()); // metadata op - keep explicit FileServices audit for now; move to DFS when DFSAuditContext-enabled API exists
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsReplaceSuperFile(IGlobalCodeContext *gctx, const char *lsuperfn,const char *lfn,const char *bylfn)
@@ -1859,6 +2161,36 @@ FILESERVICES_API char *  FILESERVICES_CALL fsExternalLogicalFileName(const char 
     return lfn.get(ret).detach();
 }
 
+FILESERVICES_API char *  FILESERVICES_CALL fsPlaneLogicalFileName(const char *planeName, const char *path, bool abspath)
+{
+    if (isEmptyString(planeName))
+        throw makeStringException(-1, "Plane name not set");
+    if (isEmptyString(path))
+        throw makeStringException(-1, "Path not set");
+
+    Owned<const IStoragePlane> plane = getStoragePlaneByName(planeName, true);
+    const IPropertyTree * planeConfig = plane->queryConfig(); // cannot be null
+    const char * category = planeConfig->queryProp("@category");
+    if (!strsame(category, "lz"))
+        throw makeStringExceptionV(-1, "Storage plane '%s' is category '%s'; only 'lz' planes are supported", planeName, isEmptyString(category) ? "" : category);
+
+    const char * relativePath = path;
+    if (isAbsolutePath(path))
+    {
+        relativePath = getRelativePath(path, plane->queryPrefix());
+        if (!relativePath)
+            throw makeStringExceptionV(-1, "Absolute path '%s' is not within plane '%s' prefix '%s'", path, plane->queryName(), plane->queryPrefix());
+    }
+
+    StringBuffer ret;
+    if (abspath)
+        ret.append('~');
+
+    CDfsLogicalFileName lfn;
+    lfn.setPlaneExternal(plane->queryName(), relativePath);
+    return lfn.get(ret).detach();
+}
+
 
 FILESERVICES_API char *  FILESERVICES_CALL fsWaitDfuWorkunit(IGlobalCodeContext *gctx, const char *wuid, int timeout, const char * espServerIpPort)
 {
@@ -1894,6 +2226,7 @@ FILESERVICES_API void FILESERVICES_CALL fslAbortDfuWorkunit(ICodeContext *ctx, c
     server.addServiceUrl(getAccessibleEspServerURL(espServerIpPort,wu));
     setServerAccess(server, wu);
     Owned<IClientAbortDFUWorkunit> abortReq = server.createAbortDFUWorkunitRequest();
+    setContainerLocalCertificate(abortReq->rpc());
     abortReq->setWuid(wuid);
     Linked<IClientAbortDFUWorkunitResponse> abortResp = server.AbortDFUWorkunit(abortReq);
     StringBuffer s("DFU Workunit Abort Requested for ");
@@ -1916,19 +2249,32 @@ FILESERVICES_API char *  FILESERVICES_CALL fsfMonitorLogicalFileName(ICodeContex
     constructLogicalName(ctx, _lfn, lfn);
     if (shotcount == 0)
         shotcount = -1;
-    Owned<IClientDfuMonitorRequest> req = server.createDfuMonitorRequest();
-    req->setEventName(eventname);
-    req->setLogicalName(lfn);
-    req->setShotLimit(shotcount);
-    Owned<IClientDfuMonitorResponse> result = server.DfuMonitor(req);
-    StringBuffer res(result->getWuid());
-    StringBuffer s("MonitorLogicalFileName ('");
-    s.append(lfn).append("'): ").append(res);
-    WUmessage(ctx,SeverityInformation,NULL,s.str());
-    wu.clear();
-    if (res.length()!=0)
-        blockUntilComplete("MonitorLogicalFileName",server,ctx,res.str(),1000*60*60,NULL,true);
-    return res.detach();
+
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Monitor Logical Filename");
+    clientSpan->setSpanAttribute("filename", lfn);
+    try
+    {
+        Owned<IClientDfuMonitorRequest> req = server.createDfuMonitorRequest();
+        setContainerLocalCertificate(req->rpc());
+        req->setEventName(eventname);
+        req->setLogicalName(lfn);
+        req->setShotLimit(shotcount);
+        Owned<IClientDfuMonitorResponse> result = server.DfuMonitor(req);
+        StringBuffer wuid(result->getWuid());
+        StringBuffer s("MonitorLogicalFileName ('");
+        s.append(lfn).append("'): ").append(wuid);
+        WUmessage(ctx,SeverityInformation,NULL,s.str());
+        wu.clear();
+        if (wuid.length()!=0)
+        clientSpan->setSpanAttribute("wuid", wuid);
+            blockUntilComplete("MonitorLogicalFileName",server,ctx,wuid.str(),1000*60*60,NULL,true);
+        return wuid.detach();
+    }
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
 FILESERVICES_API void  FILESERVICES_CALL fsMonitorFile(ICodeContext *ctx, const char *eventname,const char *ip, const char *filename, bool sub, int shotcount, const char * espServerIpPort)
@@ -1945,21 +2291,33 @@ FILESERVICES_API char *  FILESERVICES_CALL fsfMonitorFile(ICodeContext *ctx, con
     if (shotcount == 0)
         shotcount = -1;
 
-    Owned<IClientDfuMonitorRequest> req = server.createDfuMonitorRequest();
-    req->setEventName(eventname);
-    req->setIp(ip);
-    req->setFilename(filename);
-    req->setShotLimit(shotcount);
-    Owned<IClientDfuMonitorResponse> result = server.DfuMonitor(req);
-    StringBuffer res(result->getWuid());
-    StringBuffer s("MonitorFile (");
-    s.append(ip).append(", '").append(filename).append("'): '").append(res);
-    WUmessage(ctx,SeverityInformation,NULL,s.str());
-    wu.clear();
-    if (res.length()!=0)
-        blockUntilComplete("MonitorFile",server,ctx,res.str(),1000*60*60,NULL,true);
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Monitor File");
+    clientSpan->setSpanAttribute("filename", filename);
+    try
+    {
+        Owned<IClientDfuMonitorRequest> req = server.createDfuMonitorRequest();
+        setContainerLocalCertificate(req->rpc());
+        req->setEventName(eventname);
+        req->setIp(ip);
+        req->setFilename(filename);
+        req->setShotLimit(shotcount);
+        Owned<IClientDfuMonitorResponse> result = server.DfuMonitor(req);
+        StringBuffer wuid(result->getWuid());
+        StringBuffer s("MonitorFile (");
+        s.append(ip).append(", '").append(filename).append("'): '").append(wuid);
+        WUmessage(ctx,SeverityInformation,NULL,s.str());
+        wu.clear();
+        if (wuid.length()!=0)
+        clientSpan->setSpanAttribute("wuid", wuid);
+            blockUntilComplete("MonitorFile",server,ctx,wuid.str(),1000*60*60,NULL,true);
 
-    return res.detach();
+        return wuid.detach();
+    }
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsSetFileDescription(ICodeContext *ctx, const char *logicalfilename, const char *value)
@@ -1968,7 +2326,7 @@ FILESERVICES_API void FILESERVICES_CALL fsSetFileDescription(ICodeContext *ctx, 
     constructLogicalName(ctx, logicalfilename, lfn);
 
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, false, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, AccessMode::writeLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
     if (df) {
         DistributedFilePropertyLock lock(df);
         lock.queryAttributes().setProp("@description",value);
@@ -1983,7 +2341,7 @@ FILESERVICES_API char *  FILESERVICES_CALL fsGetFileDescription(ICodeContext *ct
     constructLogicalName(ctx, logicalfilename, lfn);
 
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, false, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = wsdfs::lookup(lfn.str(), udesc, AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser, INFINITE);
     if (!df)
         throw MakeStringException(0, "GetFileDescription: Could not locate file %s", lfn.str());
     const char * ret = df->queryAttributes().queryProp("@description");
@@ -1993,18 +2351,9 @@ FILESERVICES_API char *  FILESERVICES_CALL fsGetFileDescription(ICodeContext *ct
         return CTXSTRDUP(parentCtx, "");
 }
 
-FILESERVICES_API void FILESERVICES_CALL fsRemoteDirectory(size32_t & __lenResult,void * & __result, const char *machine, const char *dir, const char *mask, bool sub)
+static void listRemoteDirectoryFiles(RemoteFilename &rfn, const char *mask, bool sub, size32_t &__lenResult, void *&__result)
 {
     MemoryBuffer mb;
-    RemoteFilename rfn;
-    SocketEndpoint ep(machine);
-    if (ep.isNull()){
-        if (machine)
-            throw MakeStringException(-1, "RemoteDirectory: Could not resolve host '%s'", machine);
-        ep.setLocalHost(0);
-    }
-
-    rfn.setPath(ep,dir);
     Owned<IFile> f = createIFile(rfn);
     if (f) {
         StringBuffer s;
@@ -2037,11 +2386,36 @@ FILESERVICES_API void FILESERVICES_CALL fsLogicalFileList(ICodeContext *ctx, siz
         throw e.getClear();
     }
     MemoryBuffer mb;
-    if (!mask||!*mask)
-        mask ="*";
+    if (isEmptyString(mask))
+        mask = "*";
+    else if (*mask == '~')
+        mask++; // Strip leading ~ if present, as internal APIs expect it without
     StringBuffer masklower(mask);
     masklower.toLowerCase();
-    Owned<IDFAttributesIterator> iter = queryDistributedFileDirectory().getForeignDFAttributesIterator(masklower.str(),ctx->queryUserDescriptor(),true,includesuper,foreigndali);
+
+    Owned<INode> foreignNode;
+    if (!isEmptyString(foreigndali))
+    {
+        SocketEndpoint ep(foreigndali);
+        foreignNode.setown(createINode(ep));
+    }
+
+    // NB: This block below, is effectively an expanded version of the legacy getDFAttributesIterator() functionality, with the addition of an optional maxFilesLimit
+    StringBuffer filterBuf;
+    // all non-superfiles
+    if (!includesuper)
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileType).append(DFUQFilterSeparator).append(DFUQFFTnonsuperfileonly).append(DFUQFilterSeparator);
+    filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileNameWithPrefix).append(DFUQFilterSeparator).append(masklower).append(DFUQFilterSeparator);
+    static unsigned maxFileLimit = []()
+    {
+        return getGlobalConfigSP()->getPropInt("expert/@maxLogicalFileList", UINT_MAX);
+    }();
+    if (UINT_MAX != maxFileLimit)
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFMaxFiles).append(DFUQFilterSeparator).append(maxFileLimit).append(DFUQFilterSeparator);
+
+    bool allMatchingFilesReceived;
+    Owned<IPropertyTreeIterator> iter = queryDistributedFileDirectory().getDFAttributesFilteredIterator(filterBuf, nullptr, nullptr, ctx->queryUserDescriptor(), true, allMatchingFilesReceived, nullptr, foreignNode);
+
     if (iter) {
         StringBuffer s;
         ForEach(*iter) {
@@ -2092,16 +2466,662 @@ FILESERVICES_API void FILESERVICES_CALL fsLogicalFileList(ICodeContext *ctx, siz
 
 }
 
+/*
+ * Field source implementation for building file list result rows using IFieldSource pattern.
+ */
+class FileListResultFieldSource : public CInterfaceOf<IFieldSource>
+{
+private:
+    unsigned count = 0;
+    bool limitBreached = false;
+    Owned<IPropertyTreeIterator> iter;
+    IPropertyTree *currentFile;
+    bool unknownsZero = false;
+    StringBuffer tempStr;
+
+public:
+    FileListResultFieldSource(unsigned _count, bool _limitBreached, IPropertyTreeIterator *_iter, bool _unknownsZero)
+        : count(_count), limitBreached(_limitBreached), iter(_iter), currentFile(nullptr), unknownsZero(_unknownsZero)
+    {
+        dbgassertex(iter);
+    }
+    virtual bool getBooleanResult(const RtlFieldInfo *field) override
+    {
+        // Parent level field: limitBreached
+        if (streq(field->name, "limitbreached"))
+            return limitBreached;
+
+        // Child level field: superfile
+        if (streq(field->name, "superfile"))
+        {
+            int numsub = currentFile->getPropInt("@numsubfiles", -1);
+            return numsub >= 0;
+        }
+
+        // Child level field: compressed
+        if (streq(field->name, "compressed"))
+            return currentFile->getPropBool("@compressed", false);
+
+        // Child level field: persistent
+        if (streq(field->name, "persistent"))
+            return currentFile->getPropBool("@persistent", false);
+
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: Unexpected boolean field '%s'", field->name);
+    }
+    virtual void getDataResult(const RtlFieldInfo *field, size32_t &len, void * &result) override
+    {
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: No data fields expected (field '%s')", field->name);
+    }
+    virtual double getRealResult(const RtlFieldInfo *field) override
+    {
+        // Child level field: readcost
+        if (streq(field->name, "readcost"))
+            return currentFile->getPropReal("@readCost", 0.0);
+
+        // Child level field: writecost
+        if (streq(field->name, "writecost"))
+            return currentFile->getPropReal("@writeCost", 0.0);
+
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: Unexpected real field '%s'", field->name);
+    }
+    virtual __int64 getSignedResult(const RtlFieldInfo *field) override
+    {
+        // Child level field: size
+        if (streq(field->name, "size"))
+        {
+            __int64 fsz = currentFile->getPropInt64("@size", -1);
+            int numsub = currentFile->getPropInt("@numsubfiles", -1);
+            if ((fsz == -1) && (unknownsZero || (numsub == 0)))
+                fsz = 0;
+            return fsz;
+        }
+
+        // Child level field: rowcount
+        if (streq(field->name, "rowcount"))
+        {
+            __int64 i64 = currentFile->getPropInt64("@recordCount", -1);
+            if (i64 == -1)
+            {
+                __int64 fsz = currentFile->getPropInt64("@size", -1);
+                if (fsz != -1)
+                {
+                    int rsz = currentFile->getPropInt("@recordSize", 0);
+                    if (rsz > 0)
+                        i64 = fsz / rsz;
+                }
+            }
+            int numsub = currentFile->getPropInt("@numsubfiles", -1);
+            if ((i64 == -1) && (unknownsZero || (numsub == 0)))
+                i64 = 0;
+            return i64;
+        }
+
+        // Child level field: recordsize
+        if (streq(field->name, "recordsize"))
+            return currentFile->getPropInt("@recordSize", 0);
+
+        // Child level field: compressedsize
+        if (streq(field->name, "compressedsize"))
+            return currentFile->getPropInt64("@compressedSize", 0);
+
+        // Child level field: expiredays
+        if (streq(field->name, "expiredays"))
+            return currentFile->getPropInt("@expireDays", 0);
+
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: Unexpected signed field '%s'", field->name);
+    }
+    virtual unsigned __int64 getUnsignedResult(const RtlFieldInfo *field) override
+    {
+        // Parent level field: count
+        if (streq(field->name, "count"))
+            return count;
+
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: Unexpected unsigned field '%s'", field->name);
+    }
+    virtual void getStringResult(const RtlFieldInfo *field, size32_t &len, char * &result) override
+    {
+        tempStr.clear();
+        if (streq(field->name, "name")) // Child level field: name
+        {
+            const char *name = currentFile->queryProp("@name");
+            if (!isEmptyString(name))
+                tempStr.append(name);
+        }
+        else if (streq(field->name, "modified")) // Child level field: modified
+        {
+            currentFile->getProp("@modified", tempStr);
+            tempStr.padTo(19);
+        }
+        else if (streq(field->name, "owner"))
+            currentFile->getProp("@owner", tempStr);
+        else if (streq(field->name, "cluster")) // Child level field: cluster
+            currentFile->getProp("@group", tempStr);
+        else if (streq(field->name, "description"))
+            currentFile->getProp("@description", tempStr);
+        else if (streq(field->name, "workunit"))
+            currentFile->getProp("@workunit", tempStr);
+        else if (streq(field->name, "job"))
+            currentFile->getProp("@job", tempStr);
+        else if (streq(field->name, "directory"))
+            currentFile->getProp("@directory", tempStr);
+        else if (streq(field->name, "kind"))
+            currentFile->getProp("@kind", tempStr);
+        else if (streq(field->name, "protect"))
+            currentFile->getProp("@protect", tempStr);
+        else if (streq(field->name, "accessed"))
+        {
+            currentFile->getProp("@accessed", tempStr);
+            tempStr.padTo(19);
+        }
+        else
+            throw makeStringExceptionV(-1, "FileListResultFieldSource: Unexpected string field '%s'", field->name);
+
+        len = tempStr.length();
+        result = tempStr.detach();
+    }
+    virtual void getUTF8Result(const RtlFieldInfo *field, size32_t &chars, char * &result) override
+    {
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: No UTF8 fields expected (field '%s')", field->name);
+    }
+    virtual void getUnicodeResult(const RtlFieldInfo *field, size32_t &chars, UChar * &result) override
+    {
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: No Unicode fields expected (field '%s')", field->name);
+    }
+    virtual void getDecimalResult(const RtlFieldInfo *field, Decimal &value) override
+    {
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: No decimal fields expected (field '%s')", field->name);
+    }
+    virtual void processBeginSet(const RtlFieldInfo * field, bool &isAll) override
+    {
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: No set fields expected (field '%s')", field->name);
+    }
+    virtual void processBeginDataset(const RtlFieldInfo * field) override
+    {
+        // Starting to iterate the 'files' dataset
+        currentFile = nullptr;
+    }
+    virtual void processBeginRow(const RtlFieldInfo * field) override
+    {
+        // Beginning a new row in the files dataset - currentFile is already set by processNextRow
+    }
+    virtual bool processNextSet(const RtlFieldInfo * field) override
+    {
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: No set fields expected (field '%s')", field->name);
+    }
+    virtual bool processNextRow(const RtlFieldInfo * field) override
+    {
+        // Move to next file in the dataset
+        while (iter->next())
+        {
+            currentFile = &iter->query();
+            const char *name = currentFile->queryProp("@name");
+            // Skip files without names
+            if (!isEmptyString(name)) // probably can never happen
+                return true;
+        }
+        return false;
+    }
+    virtual void processEndSet(const RtlFieldInfo * field) override
+    {
+        throw makeStringExceptionV(-1, "FileListResultFieldSource: No set fields expected (field '%s')", field->name);
+    }
+    virtual void processEndDataset(const RtlFieldInfo * field) override
+    {
+        // Finished iterating the 'files' dataset
+        currentFile = nullptr;
+    }
+    virtual void processEndRow(const RtlFieldInfo * field) override
+    {
+        // Finished processing current row - no cleanup needed
+    }
+};
+
+static bool validateFileField(const char *requestedField, StringBuffer &attrName, DFUQResultField &fieldEnum, DFUQResultFieldType &fieldType)
+{
+    // Map of ECL field name aliases to canonical internal field names
+    // This handles user-friendly names and their mappings
+    static const std::unordered_map<std::string, const char*, CaseInsensitiveHash, CaseInsensitiveEqual> fieldAliases =
+    {
+        {"superfile", "numsubfiles"},  // Derived from numsubfiles
+        {"rowcount", "recordcount"},   // ECL field name is "rowcount" but internal attribute is "recordCount"
+        {"cluster", "group"}           // ECL field name is "cluster" but internal attribute is "group"
+    };
+
+    // Trim whitespace
+    StringBuffer fieldName(requestedField);
+    fieldName.trim();
+    if (isEmptyString(fieldName))
+        return false;
+
+    auto it = fieldAliases.find(fieldName.str());
+    if (it != fieldAliases.end())
+        fieldName.set(it->second);
+
+    return getFileAttributePath(fieldName, attrName, fieldEnum, fieldType);
+}
+
+/*
+ * Parse user-friendly filter syntax and translate to internal DFUQFilter format
+ *
+ * User field names are simple enum-based names (e.g., "name", "size", "owner", "recordcount")
+ * that are validated against the DFUQResultField enum and automatically converted to the
+ * appropriate internal attribute names (e.g., "@name", "@size", "@owner", "@recordCount").
+ * Invalid field names will cause an exception to be thrown.
+ *
+ * Valid user field names include:
+ *   name, description, nodegroups, kind, timemodified, job, owner, recordcount, recordsize,
+ *   size, workunit, nodegroup, numsubfiles, accessed, numparts, compressedsize, directory,
+ *   partmask, superowners, persistent, protect, iscompressed, cost, numDiskReads, numDiskWrites,
+ *   atRestCost, accessCost, maxSkew, minSkew, maxSkewPart, minSkewPart, readCost, writeCost,
+ *   expireDays, subfilenames, blockCompressed, rowCompressed
+ *
+ * User syntax examples:
+ *   owner:jsmith               → WILDCARD|@owner|jsmith|
+ *   owner:*smith               → WILDCARD|@owner|*smith|
+ *   size>1000000               → INTEGER64_RANGE|@size|1000000|9223372036854775807|
+ *   size<1000                  → INTEGER64_RANGE|@size|0|1000|
+ *   size>=1000                 → INTEGER64_RANGE|@size|1000|9223372036854775807|
+ *   rowcount=0                 → INTEGER64_RANGE|@recordCount|0|0|
+ *   has:description            → HAS_PROPERTY|@description|true|
+ *   !has:description           → HAS_PROPERTY|@description|false|
+ *   is:superfile               → SPECIAL|2|2|
+ *   is:normal                  → SPECIAL|2|3|
+ *   timemodified>2024-01-01    → STRING_RANGE|@modified|2024-01-01|9999-12-31|
+ *   timemodified<2024-12-31    → STRING_RANGE|@modified|0000-00-00|2024-12-31|
+ *
+ * Multiple filters separated by commas
+ */
+static void parseUserFilterSyntax(const char *userFilter, StringBuffer &internalFilter)
+{
+    if (isEmptyString(userFilter))
+        return;
+
+    StringArray terms;
+    terms.appendList(userFilter, ",");
+
+    ForEachItemIn(i, terms)
+    {
+        const char *term = terms.item(i);
+        if (isEmptyString(term))
+            continue;
+
+        // Save original term for error messages
+        const char *originalTerm = term;
+
+        // Check for negation prefix
+        bool negate = (term[0] == '!');
+        if (negate)
+        {
+            term++;
+            if (isEmptyString(term))
+                throw makeStringException(-1, "Invalid filter syntax: '!' must be followed by a filter term");
+        }
+
+        // Parse has:property
+        if (strncmp(term, "has:", 4) == 0)
+        {
+            const char *prop = term + 4;
+            if (isEmptyString(prop))
+                throw makeStringException(-1, "Invalid filter syntax: 'has:' requires a property name (e.g., 'has:description')");
+
+            // Validate and convert field name
+            StringBuffer attrName;
+            DFUQResultField field;
+            DFUQResultFieldType fieldType;
+            if (!validateFileField(prop, attrName, field, fieldType))
+                throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - unknown field name '%s'", originalTerm, prop);
+
+            internalFilter.appendf("%u%c%s%c%s%c",
+                DFUQFThasProp, DFUQFilterSeparator,
+                attrName.str(), DFUQFilterSeparator,
+                negate ? "false" : "true", DFUQFilterSeparator);
+        }
+        // Parse is:filetype
+        else if (strncmp(term, "is:", 3) == 0)
+        {
+            if (negate)
+                throw makeStringExceptionV(-1, "Invalid filter syntax: negating 'is:' is not supported");
+
+            const char *fileType = term + 3;
+            if (isEmptyString(fileType))
+                throw makeStringException(-1, "Invalid filter syntax: 'is:' requires a file type (superfile, normal, or any)");
+
+            DFUQFileTypeFilter fileTypeFilter = DFUQFFTall;
+            if (strieq(fileType, "any"))
+                fileTypeFilter = DFUQFFTall;
+            else if (strieq(fileType, "superfile"))
+                fileTypeFilter = DFUQFFTsuperfileonly;
+            else if (strieq(fileType, "normal"))
+                fileTypeFilter = DFUQFFTnonsuperfileonly;
+            else
+                throw makeStringExceptionV(-1, "Invalid filter syntax: 'is:%s' - must be superfile, normal, or any", fileType);
+
+            internalFilter.appendf("%u%c%u%c%u%c",
+                DFUQFTspecial, DFUQFilterSeparator, (char)DFUQSFFileType,
+                DFUQFilterSeparator, (char)fileTypeFilter, DFUQFilterSeparator);
+        }
+        // Parse field:value (wildcard match)
+        else if (const char *colon = strchr(term, ':'))
+        {
+            if (negate)
+                throw makeStringExceptionV(-1, "Invalid filter syntax: negating field:value filters is not supported");
+            StringBuffer fieldName;
+            fieldName.append(colon - term, term).trim();
+            StringBuffer valueStr(colon + 1);
+            valueStr.trim();
+            const char *value = valueStr.str();
+
+            if (fieldName.length() == 0)
+                throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - field name required before ':'", originalTerm);
+            if (isEmptyString(value))
+                throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - value required after ':'", originalTerm);
+
+            // Validate and convert field name
+            StringBuffer attrName;
+            DFUQResultField field;
+            DFUQResultFieldType fieldType;
+            if (!validateFileField(fieldName.str(), attrName, field, fieldType))
+                throw makeStringException(-1, VStringBuffer("Invalid filter syntax: '%s' - unknown field name '%s'", originalTerm, fieldName.str()).str());
+
+            internalFilter.appendf("%u%c%s%c%s%c",
+                DFUQFTwildcardMatch, DFUQFilterSeparator,
+                attrName.str(), DFUQFilterSeparator,
+                value, DFUQFilterSeparator);
+        }
+        // Parse field>value, field<value, field>=value, field<=value
+        else if (const char *op = strpbrk(term, "><"))
+        {
+            if (negate)
+                throw makeStringExceptionV(-1, "Invalid filter syntax: negating comparison filters is not supported");
+            StringBuffer fieldName;
+            fieldName.append(op - term, term).trim();
+
+            if (fieldName.length() == 0)
+                throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - field name required before comparison operator", originalTerm);
+
+            // Validate and convert field name
+            StringBuffer attrName;
+            DFUQResultField field;
+            DFUQResultFieldType fieldType;
+            if (!validateFileField(fieldName.str(), attrName, field, fieldType))
+                throw makeStringException(-1, VStringBuffer("Invalid filter syntax: '%s' - unknown field name '%s'", originalTerm, fieldName.str()).str());
+
+            // Determine operator
+            bool hasEquals = (op[1] == '=');
+            StringBuffer valueStr(hasEquals ? (op + 2) : (op + 1));
+            valueStr.trim();
+            const char *value = valueStr.str();
+
+            if (isEmptyString(value))
+                throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - value required after comparison operator", originalTerm);
+
+            // Check if field is numeric/float type
+            bool isNumeric = (fieldType == DFUQResultFieldType::numericType);
+            bool isFloat = (fieldType == DFUQResultFieldType::floatType);
+
+            if (isNumeric || isFloat)
+            {
+                // Parse numeric range
+                if (op[0] == '>')
+                {
+                    // field > value or field >= value
+                    char *endptr;
+                    __int64 minVal = (__int64) strtoll(value, &endptr, 10);
+                    if (!isEmptyString(endptr))
+                        throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - value '%s' must be an integer", originalTerm, value);
+
+                    if (!hasEquals)
+                    {
+                        if (minVal == I64C(0x7FFFFFFFFFFFFFFF))
+                            throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - value too large for > comparison (would overflow)", originalTerm);
+                        minVal++;
+                    }
+                    internalFilter.appendf("%u%c%s%c%lld%c%lld%c",
+                        DFUQFTinteger64Range, DFUQFilterSeparator,
+                        attrName.str(), DFUQFilterSeparator,
+                        minVal, DFUQFilterSeparator, I64C(0x7FFFFFFFFFFFFFFF), DFUQFilterSeparator);
+                }
+                else // op[0] == '<'
+                {
+                    // field < value or field <= value
+                    char *endptr;
+                    __int64 maxVal = (__int64) strtoll(value, &endptr, 10);
+                    if (!isEmptyString(endptr))
+                        throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - value '%s' must be an integer", originalTerm, value);
+                    if (!hasEquals)
+                    {
+                        if (maxVal == (-I64C(0x7FFFFFFFFFFFFFFF) - 1))
+                            throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - value too small for < comparison (would underflow)", originalTerm);
+                        maxVal--;
+                    }
+                    internalFilter.appendf("%u%c%s%c0%c%lld%c",
+                        DFUQFTinteger64Range, DFUQFilterSeparator,
+                        attrName.str(), DFUQFilterSeparator,
+                        DFUQFilterSeparator, maxVal, DFUQFilterSeparator);
+                }
+            }
+            else
+            {
+                // Parse string range (for dates, text, etc.)
+                // String range filter only supports inclusive bounds (>=, <=)
+                // since the filter uses standard string comparison
+                if (op[0] == '>')
+                {
+                    if (!hasEquals)
+                        throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - exclusive comparison (>) is not supported for string fields; use >= instead", originalTerm);
+                    internalFilter.appendf("%u%c%s%c%s%c~~~~~~~~~~%c",
+                        DFUQFTstringRange, DFUQFilterSeparator,
+                        attrName.str(), DFUQFilterSeparator,
+                        value, DFUQFilterSeparator, DFUQFilterSeparator);
+                }
+                else // op[0] == '<'
+                {
+                    if (!hasEquals)
+                        throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - exclusive comparison (<) is not supported for string fields; use <= instead", originalTerm);
+                    internalFilter.appendf("%u%c%s%c%c%s%c",
+                        DFUQFTstringRange, DFUQFilterSeparator,
+                        attrName.str(), DFUQFilterSeparator,
+                        DFUQFilterSeparator, value, DFUQFilterSeparator);
+                }
+            }
+        }
+        // Parse field=value as exact range match
+        else if (const char *eq = strchr(term, '='))
+        {
+            if (negate)
+                throw makeStringExceptionV(-1, "Invalid filter syntax: negating equality filters is not supported");
+            StringBuffer fieldName;
+            fieldName.append(eq - term, term).trim();
+            StringBuffer valueStr(eq + 1);
+            valueStr.trim();
+            const char *value = valueStr.str();
+
+            if (fieldName.length() == 0)
+                throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - field name required before '='", originalTerm);
+            if (isEmptyString(value))
+                throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - value required after '='", originalTerm);
+
+            // Validate and convert field name
+            StringBuffer attrName;
+            DFUQResultField field;
+            DFUQResultFieldType fieldType;
+            if (!validateFileField(fieldName.str(), attrName, field, fieldType))
+                throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - unknown field name '%s'", originalTerm, fieldName.str());
+
+            // Check if numeric or float field
+            bool isNumeric = (fieldType == DFUQResultFieldType::numericType);
+            bool isFloat = (fieldType == DFUQResultFieldType::floatType);
+
+            if (isNumeric)
+            {
+                __int64 val = _atoi64(value);
+                internalFilter.appendf("%u%c%s%c%lld%c%lld%c",
+                    DFUQFTinteger64Range, DFUQFilterSeparator,
+                    attrName.str(), DFUQFilterSeparator,
+                    val, DFUQFilterSeparator, val, DFUQFilterSeparator);
+            }
+            else if (isFloat)
+            {
+                // Exact string match via range for floating values
+                internalFilter.appendf("%u%c%s%c%s%c%s%c",
+                    DFUQFTstringRange, DFUQFilterSeparator,
+                    attrName.str(), DFUQFilterSeparator,
+                    value, DFUQFilterSeparator, value, DFUQFilterSeparator);
+            }
+            else
+            {
+                // Exact string match via range
+                internalFilter.appendf("%u%c%s%c%s%c%s%c",
+                    DFUQFTstringRange, DFUQFilterSeparator,
+                    attrName.str(), DFUQFilterSeparator,
+                    value, DFUQFilterSeparator, value, DFUQFilterSeparator);
+            }
+        }
+        else
+        {
+            // If nothing matched, throw an error
+            throw makeStringExceptionV(-1, "Invalid filter syntax: '%s' - unrecognized filter format. Use field:value, field>value, field=value, has:property, or is:filetype", originalTerm);
+        }
+    }
+}
+
+FILESERVICES_API const byte * FILESERVICES_CALL fsLogicalFileListFiltered(ICodeContext *ctx, IEngineRowAllocator *_rowAllocator, const char *mask, const char *filters, const char *requestedFields, bool unknownszero, const char *remoteDfs, __int64 maxFileLimit)
+{
+    IEngineContext *engineCtx = ctx->queryEngineContext();
+    if (engineCtx && !engineCtx->allowDaliAccess())
+    {
+        Owned<IException> e = makeStringException(-1, "FileServices.LogicalFileListFiltered cannot access Dali in this context - this normally means it is being called from a thor slave");
+        EXCLOG(e, NULL);
+        throw e.getClear();
+    }
+
+    // Validate client-side max limit (1 million)
+    constexpr __int64 CLIENT_MAX_LIMIT = 1000000;
+    if (maxFileLimit > CLIENT_MAX_LIMIT)
+    {
+        Owned<IException> e = makeStringExceptionV(-1, "FileServices.LogicalFileListFiltered: maxFileLimit (%lld) exceeds client maximum of %lld", maxFileLimit, CLIENT_MAX_LIMIT);
+        EXCLOG(e, NULL);
+        throw e.getClear();
+    }
+
+    if (isEmptyString(mask))
+        mask = "*";
+    else if (*mask == '~')
+        mask++; // Strip leading ~ if present, as internal APIs expect it without
+    StringBuffer masklower(mask);
+    masklower.toLowerCase();
+
+    if (!isEmptyString(remoteDfs))
+        throw makeStringException(-1, "FileServices.LogicalFileListFiltered: remoteDfs is not supported yet");
+
+
+    // Build filter string - translate user-friendly syntax to internal format
+    StringBuffer filterBuf;
+
+    // Parse user-provided filters (using friendly syntax like "owner:jsmith size>1000")
+    parseUserFilterSyntax(filters, filterBuf);
+
+    // Append system filters: name pattern and max files limit
+    filterBuf.appendf("%u%c%u%c%s%c",
+        DFUQFTspecial, DFUQFilterSeparator,
+        DFUQSFFileNameWithPrefix, DFUQFilterSeparator,
+        masklower.str(), DFUQFilterSeparator);
+
+    // Add max files limit if specified (and not -1 which means use server default)
+    if (maxFileLimit > 0)
+    {
+        filterBuf.appendf("%u%c%u%c%lld%c",
+            DFUQFTspecial, DFUQFilterSeparator,
+            DFUQSFMaxFiles, DFUQFilterSeparator,
+            maxFileLimit, DFUQFilterSeparator);
+    }
+
+    // Parse and validate requested fields
+    std::vector<DFUQResultField> fields;
+    StringArray requestedFieldNames;
+
+    if (isEmptyString(requestedFields))
+    {
+        requestedFieldNames.append("name");
+        requestedFieldNames.append("superfile");
+        requestedFieldNames.append("size");
+        requestedFieldNames.append("rowcount");
+        requestedFieldNames.append("modified");
+        requestedFieldNames.append("owner");
+        requestedFieldNames.append("cluster");
+    }
+    else
+    {
+        // Parse comma-separated field list
+        requestedFieldNames.appendList(requestedFields, ",");
+
+        // Ensure "name" is always included (required field)
+        if (!requestedFieldNames.contains("name", true))
+            requestedFieldNames.append("name");
+    }
+
+    // Validate field names and build field list for getDFAttributesFilteredIterator
+    ForEachItemIn(idx, requestedFieldNames)
+    {
+        // Trim whitespace
+        const char *fieldName = requestedFieldNames.item(idx);
+        if (isEmptyString(fieldName))
+            continue;
+
+        // Validate field name using existing validation function
+        StringBuffer attrPath;
+        DFUQResultField field;
+        DFUQResultFieldType fieldType;
+        if (!validateFileField(fieldName, attrPath, field, fieldType))
+            throw makeStringExceptionV(-1, "FileServices.LogicalFileListFiltered: Invalid field name '%s'", fieldName);
+
+        // Add field to list if not already present
+        if (std::find(fields.begin(), fields.end(), field) == fields.end())
+            fields.push_back(field);
+    }
+
+    // Always include numsubfiles for superfile detection
+    if (std::find(fields.begin(), fields.end(), DFUQResultField::numsubfiles) == fields.end())
+        fields.push_back(DFUQResultField::numsubfiles);
+
+    // Add terminator
+    fields.push_back(DFUQResultField::term);
+
+    bool allMatchingFilesReceived = false;
+    unsigned count = 0;
+    Owned<IPropertyTreeIterator> iter = queryDistributedFileDirectory().getDFAttributesFilteredIterator(
+        filterBuf.str(),
+        nullptr,                    // no local filters
+        fields.data(),              // requested fields
+        ctx->queryUserDescriptor(),
+        true,                       // recursive
+        allMatchingFilesReceived,
+        &count
+    );
+
+    // Build result row using IFieldSource pattern
+    RtlDynamicRowBuilder resultBuilder(*_rowAllocator);
+    Owned<FileListResultFieldSource> fieldSource = new FileListResultFieldSource(count, !allMatchingFilesReceived, iter.getClear(), unknownszero);
+
+    const RtlTypeInfo *typeInfo = _rowAllocator->queryOutputMeta()->queryTypeInfo();
+    RtlFieldStrInfo dummyField("<row>", NULL, typeInfo);
+    size32_t len = typeInfo->build(resultBuilder, 0, &dummyField, *fieldSource);
+
+    return (const byte *)resultBuilder.finalizeRowClear(len);
+}
+
 FILESERVICES_API void FILESERVICES_CALL fsSuperFileContents(ICodeContext *ctx, size32_t & __lenResult,void * & __result, const char *lsuperfn, bool recurse)
 {
     MemoryBuffer mb;
     Owned<ISimpleSuperFileEnquiry> enq;
     if (!recurse)
         enq.setown(getSimpleSuperFileEnquiry(ctx, lsuperfn));
-    if (enq) {
+    if (enq)
+    {
         StringArray subs;
         enq->getContents(subs);
-        ForEachItemIn(i,subs) {
+        ForEachItemIn(i,subs)
+        {
             const char *name = subs.item(i);
             size32_t sz = strlen(name);
             if (!sz)
@@ -2109,14 +3129,25 @@ FILESERVICES_API void FILESERVICES_CALL fsSuperFileContents(ICodeContext *ctx, s
             mb.append(sz).append(sz,name);
         }
     }
-    else {
-        CImplicitSuperTransaction implicitTransaction(ctx->querySuperFileTransaction());
-        Owned<IDistributedSuperFile> file;
-        StringBuffer lsfn;
-        lookupSuperFile(ctx, lsuperfn, file, true, lsfn, true);
-        Owned<IDistributedFileIterator> iter = file->getSubFileIterator(recurse);
+    else
+    {
+        Owned<IDistributedSuperFile> superFile;
+
+        CDfsLogicalFileName slfn;
+        slfn.set(lsuperfn);
+        std::unique_ptr<CImplicitSuperTransaction> implicitTransaction;
+        if (slfn.isRemote() || slfn.isForeign())
+            superFile.setown(lookupRemoteOrForeignSuper(ctx, "SuperFileContents", lsuperfn));
+        else
+        {
+            implicitTransaction.reset(new CImplicitSuperTransaction(ctx->querySuperFileTransaction()));
+            StringBuffer lsfn;
+            lookupSuperFile(ctx, lsuperfn, AccessMode::readLogicalMeta, superFile, true, lsfn, true);
+        }
+        Owned<IDistributedFileIterator> iter = superFile->getSubFileIterator(recurse);
         StringBuffer name;
-        ForEach(*iter) {
+        ForEach(*iter)
+        {
             iter->getName(name.clear());
             size32_t sz = name.length();
             if (!sz)
@@ -2145,7 +3176,7 @@ FILESERVICES_API void FILESERVICES_CALL fsLogicalFileSuperOwners(ICodeContext *c
     }
     else {
         Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-        Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc,false,false,true, nullptr, defaultPrivilegedUser); // lock super-owners
+        Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc,AccessMode::readLogicalMeta,false,true, nullptr, defaultPrivilegedUser); // lock super-owners
         if (df) {
             Owned<IDistributedSuperFileIterator> iter = df->getOwningSuperFiles();
             ForEach(*iter) {
@@ -2164,7 +3195,8 @@ FILESERVICES_API void FILESERVICES_CALL fsLogicalFileSuperOwners(ICodeContext *c
 }
 
 
-FILESERVICES_API int  FILESERVICES_CALL fsCompareFiles(ICodeContext *ctx,const char *name1, const char *name2,bool logicalonly, bool usecrcs)
+static constexpr unsigned highTimeout = 1 * 60 * 60 * 1000; // 1 hour
+static int fsCompareFilesImpl(ICodeContext *ctx, const char *name1, const char *name2, bool logicalonly, bool usecrcs, int timeOut)
 {
     StringBuffer lfn1;
     constructLogicalName(ctx, name1, lfn1);
@@ -2172,10 +3204,22 @@ FILESERVICES_API int  FILESERVICES_CALL fsCompareFiles(ICodeContext *ctx,const c
     constructLogicalName(ctx, name2, lfn2);
     StringBuffer retstr;
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    int ret = queryDistributedFileDirectory().fileCompare(lfn1.str(),lfn2.str(),usecrcs?DFS_COMPARE_FILES_PHYSICAL_CRCS:(logicalonly?DFS_COMPARE_FILES_LOGICAL:DFS_COMPARE_FILES_PHYSICAL),retstr,udesc);
+    DistributedFileCompareMode mode = usecrcs ? DFS_COMPARE_FILES_PHYSICAL_CRCS : (logicalonly ? DFS_COMPARE_FILES_LOGICAL : DFS_COMPARE_FILES_PHYSICAL);
+    unsigned timeout = (timeOut >= 0) ? static_cast<unsigned>(timeOut) : highTimeout; // NB: this is for SDS read locks to the files being compared
+    DistributedFileCompareResult ret = wsdfs::fileCompare(lfn1.str(), lfn2.str(), mode, retstr, udesc, timeout);
     if (ret==DFS_COMPARE_RESULT_FAILURE)
         throw MakeStringException(ret,"CompareLogicalFiles: %s",retstr.str());
-    return ret;
+    return static_cast<int>(ret);
+}
+
+FILESERVICES_API int  FILESERVICES_CALL fsCompareFiles(ICodeContext *ctx,const char *name1, const char *name2,bool logicalonly, bool usecrcs)
+{
+    return fsCompareFilesImpl(ctx, name1, name2, logicalonly, usecrcs, -1);
+}
+
+FILESERVICES_API int  FILESERVICES_CALL fsCompareFiles_v2(ICodeContext *ctx,const char *name1, const char *name2,bool logicalonly, bool usecrcs, int timeout)
+{
+    return fsCompareFilesImpl(ctx, name1, name2, logicalonly, usecrcs, timeout);
 }
 
 FILESERVICES_API char *  FILESERVICES_CALL fsVerifyFile(ICodeContext *ctx,const char *name,bool usecrcs)
@@ -2233,6 +3277,7 @@ FILESERVICES_API char * FILESERVICES_CALL fsfRemotePull_impl(ICodeContext *ctx,
     setServerAccess(server, wu);
 
     Owned<IClientCopy> req = server.createCopyRequest();
+    setContainerLocalCertificate(req->rpc());
     if (asSuperfile)
         req->setSuperCopy(true);
 
@@ -2254,7 +3299,7 @@ FILESERVICES_API char * FILESERVICES_CALL fsfRemotePull_impl(ICodeContext *ctx,
     if (wrap)
         req->setWrap(true);
     StringBuffer sourceDali;
-    queryCoven().queryComm().queryGroup().queryNode(0).endpoint().getUrlStr(sourceDali);
+    queryCoven().queryComm().queryGroup().queryNode(0).endpoint().getEndpointHostText(sourceDali);
     req->setSourceDali(sourceDali);
     req->setOverwrite(overwrite);
     req->setReplicate(replicate);
@@ -2277,28 +3322,40 @@ FILESERVICES_API char * FILESERVICES_CALL fsfRemotePull_impl(ICodeContext *ctx,
            req->setSrcpassword(userPw);
     }
 
-    Owned<IClientCopyResponse> result = server.Copy(req);
-
-    StringBuffer wuid(result->getResult());
-    if (!wuid.length())
+    OwnedActiveSpanScope clientSpan = queryThreadedActiveSpan()->createClientSpan("Dfu Remote Pull");
+    clientSpan->setSpanAttribute("sourceFilename", sourceLogicalName);
+    clientSpan->setSpanAttribute("destinationFilename", destinationLogicalName);
+    try
     {
-        const IMultiException* excep = &result->getExceptions();
-        if ((excep != NULL) && (excep->ordinality() > 0))
+        Owned<IClientCopyResponse> result = server.Copy(req);
+
+        StringBuffer wuid(result->getResult());
+        if (!wuid.length())
         {
-            StringBuffer errmsg;
-            excep->errorMessage(errmsg);
-            throw MakeStringExceptionDirect(0, errmsg.str());
+            const IMultiException* excep = &result->getExceptions();
+            if ((excep != NULL) && (excep->ordinality() > 0))
+            {
+                StringBuffer errmsg;
+                excep->errorMessage(errmsg);
+                throw MakeStringExceptionDirect(0, errmsg.str());
+            }
+            else
+            {
+                throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
+            }
         }
-        else
-        {
-            throw MakeStringExceptionDirect(0, "Result's dfu WUID is empty");
-        }
+
+        wu.clear();
+
+        clientSpan->setSpanAttribute("wuid", wuid);
+        blockUntilComplete("RemotePull", server, ctx, wuid, timeOut);
+        return wuid.detach();
     }
-
-    wu.clear();
-
-    blockUntilComplete("RemotePull", server, ctx, wuid, timeOut);
-    return wuid.detach();
+    catch (IException *e)
+    {
+        clientSpan->recordException(e, true, true);
+        throw;
+    }
 }
 
 FILESERVICES_API char * FILESERVICES_CALL fsfRemotePull(ICodeContext *ctx,
@@ -2551,7 +3608,7 @@ FILESERVICES_API void FILESERVICES_CALL fsSetColumnMapping(ICodeContext * ctx,co
 {
     StringBuffer lfn;
     constructLogicalName(ctx, filename, lfn);
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),ctx->queryUserDescriptor(),true,false,false,nullptr,defaultPrivilegedUser);
+    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),ctx->queryUserDescriptor(),AccessMode::writeLogicalMeta,false,false,nullptr,defaultPrivilegedUser);
     if (df)
         df->setColumnMapping(mapping);
     else
@@ -2562,7 +3619,7 @@ FILESERVICES_API char *  FILESERVICES_CALL fsfGetColumnMapping(ICodeContext * ct
 {
     StringBuffer lfn;
     constructLogicalName(ctx, filename, lfn);
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),ctx->queryUserDescriptor(),true,false,false,nullptr,defaultPrivilegedUser);
+    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),ctx->queryUserDescriptor(),AccessMode::readLogicalMeta,false,false,nullptr,defaultPrivilegedUser);
     if (df) {
         StringBuffer mapping;
         df->getColumnMapping(mapping);
@@ -2621,11 +3678,12 @@ FILESERVICES_API char *  FILESERVICES_CALL fsfResolveHostName(const char *hostna
 {
     StringBuffer ret;
     SocketEndpoint ep(hostname);
+    //NB: Get a string for the resolved IP, not the hostname
     ep.getIpText(ret);
     return ret.detach();
 }
 
-static void checkExternalFileRights(ICodeContext *ctx, CDfsLogicalFileName &lfn, bool rd,bool wr)
+static void checkExternalFileRights(ICodeContext *ctx,const char *scope,bool rd,bool wr)
 {
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
     unsigned auditflags = 0;
@@ -2633,34 +3691,90 @@ static void checkExternalFileRights(ICodeContext *ctx, CDfsLogicalFileName &lfn,
         auditflags |= (DALI_LDAP_AUDIT_REPORT|DALI_LDAP_READ_WANTED);
     if (wr)
         auditflags |= (DALI_LDAP_AUDIT_REPORT|DALI_LDAP_WRITE_WANTED);
-    SecAccessFlags perm = queryDistributedFileDirectory().getFilePermissions(lfn.get(),udesc,auditflags);
+    SecAccessFlags perm = queryDistributedFileDirectory().getFScopePermissions(scope,udesc,auditflags);
     if (wr) {
         if (!HASWRITEPERMISSION(perm)) {
-            throw MakeStringException(-1,"Write permission denied for %s", lfn.get());
+            throw makeStringExceptionV(-1,"Write permission denied for scope %s", scope);
         }
     }
     if (rd) {
         if (!HASREADPERMISSION(perm)) {
-            throw MakeStringException(-1,"Read permission denied for %s", lfn.get());
+            throw makeStringExceptionV(-1,"Read permission denied for scope %s", scope);
         }
     }
 }
 
-FILESERVICES_API void  FILESERVICES_CALL fsMoveExternalFile(ICodeContext * ctx,const char *location,const char *frompath,const char *topath)
+static void checkExternalFilePath(ICodeContext *ctx,IPropertyTree *plane,const char *host,
+    const char *path,bool rd,bool wr,RemoteFilename &rfn)
 {
-    SocketEndpoint ep(location);
-    if (ep.isNull())
-        throw MakeStringException(-1,"fsMoveExternalFile: Cannot resolve location %s",location);
-    CDfsLogicalFileName from;
-    from.setExternal(location,frompath);
-    CDfsLogicalFileName to;
-    to.setExternal(location,topath);
-    checkExternalFileRights(ctx,from,true,true);
-    checkExternalFileRights(ctx,to,false,true);
-    RemoteFilename fromrfn;
-    fromrfn.setPath(ep,frompath);
-    RemoteFilename torfn;
-    torfn.setPath(ep,topath);
+    if (containsRelPaths(path)) //Detect a path like: a/../../../f
+        throw makeStringExceptionV(-1,"Invalid file path %s",path);
+
+    CDfsLogicalFileName dlfn;
+    if (plane)
+    {
+        //allow relative path if a plane name is specified.
+        if (isAbsolutePath(path))
+        {
+            const char *relativePath = getRelativePath(path,plane->queryProp("@prefix"));
+            if (nullptr == relativePath)
+                throw makeStringExceptionV(-1,"Invalid plane path %s.",path);
+            path = relativePath;
+        }
+        dlfn.setPlaneExternal(plane->queryProp("@name"),path);
+    }
+    else
+        dlfn.setExternal(host,path); //for backward compatibility
+    dlfn.getExternalFilename(rfn);
+
+    Owned<IFile> f = createIFile(rfn);
+    if (f->exists() && (f->isDirectory()==fileBool::foundYes))
+        checkExternalFileRights(ctx,dlfn.get(),rd,wr);
+    else
+    {
+        StringBuffer scopes;
+        checkExternalFileRights(ctx,dlfn.getScopes(scopes),rd,wr);
+    }
+}
+
+//this function is very similar to getDropZoneAndValidateHostAndPath in TpCommon, and both should be replaced/moved so common.
+static IPropertyTree *checkPlaneOrHost(const char *planeName,const char *host,const char *path)
+{
+    if (!isEmptyString(planeName))
+    {
+        Owned<IPropertyTree> plane = getDropZonePlane(planeName); //Only support DropZone for now.
+        if (!plane)
+            throw makeStringExceptionV(-1,"DropZone %s not found.",planeName);
+        return plane.getClear();
+    }
+
+    if (!isAbsolutePath(path)) //Relative paths permitted, check host only
+        path = nullptr;
+
+    Owned<IPropertyTree> plane = findDropZonePlane(path,host,true,isContainerized());
+    if (plane)
+        return plane.getClear();
+
+#ifndef _CONTAINERIZED
+    Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
+    Owned<IConstEnvironment> env = factory->openEnvironment();
+    if (env->isDropZoneRestrictionEnabled())
+        throw makeStringExceptionV(-1,"DropZone Plane not found for host %s path %s.",host,path);
+
+    LOG(MCdebugInfo, "No matching drop zone path on '%s' to file path: '%s'",host,path);
+#endif
+
+    return nullptr;
+}
+
+static void implementMoveExternalFile(ICodeContext *ctx,const char *location,
+    const char *frompath,const char *topath,const char *planename)
+{
+    Owned<IPropertyTree> plane = checkPlaneOrHost(planename,location,frompath);
+    RemoteFilename fromrfn,torfn;
+    checkExternalFilePath(ctx,plane,location,frompath,true,true,fromrfn);
+    checkExternalFilePath(ctx,plane,location,topath,false,true,torfn);
+
     Owned<IFile> fileto = createIFile(torfn);
     if (fileto->exists())
         throw MakeStringException(-1,"fsMoveExternalFile: Destination %s already exists", topath);
@@ -2670,49 +3784,103 @@ FILESERVICES_API void  FILESERVICES_CALL fsMoveExternalFile(ICodeContext * ctx,c
     StringBuffer s("MoveExternalFile ('");
     s.append(location).append(',').append(frompath).append(',').append(topath).append(") done");
     WUmessage(ctx,SeverityInformation,NULL,s.str());
-    AuditMessage(ctx,"MoveExternalFile",frompath,topath);
+    AuditMessage(ctx,"EXTERNAL_MOVE",frompath,topath);
 }
 
-FILESERVICES_API void  FILESERVICES_CALL fsDeleteExternalFile(ICodeContext * ctx,const char *location,const char *path)
+FILESERVICES_API void  FILESERVICES_CALL fsMoveExternalFile(ICodeContext *ctx,const char *location,const char *frompath,const char *topath)
 {
-    SocketEndpoint ep(location);
-    if (ep.isNull())
-        throw MakeStringException(-1,"fsDeleteExternalFile: Cannot resolve location %s",location);
-    CDfsLogicalFileName lfn;
-    lfn.setExternal(location,path);
-    checkExternalFileRights(ctx,lfn,false,true);
+    implementMoveExternalFile(ctx,location,frompath,topath,nullptr);
+}
+
+FILESERVICES_API void  FILESERVICES_CALL fsMoveExternalFile_v2(ICodeContext *ctx,const char *location,
+    const char *frompath,const char *topath,const char *planename)
+{
+    implementMoveExternalFile(ctx,location,frompath,topath,planename);
+}
+
+static void implementDeleteExternalFile(ICodeContext *ctx,const char *location,const char *path,const char *planename)
+{
+    Owned<IPropertyTree> plane = checkPlaneOrHost(planename,location,path);
     RemoteFilename rfn;
-    rfn.setPath(ep,path);
+    checkExternalFilePath(ctx,plane,location,path,false,true,rfn);
     Owned<IFile> file = createIFile(rfn);
     file->remove();
     StringBuffer s("DeleteExternalFile ('");
     s.append(location).append(',').append(path).append(") done");
     WUmessage(ctx,SeverityInformation,NULL,s.str());
-    AuditMessage(ctx,"DeleteExternalFile",path);
+    AuditMessage(ctx,"EXTERNAL_DELETE",path);
 }
 
-FILESERVICES_API void  FILESERVICES_CALL fsCreateExternalDirectory(ICodeContext * ctx,const char *location,const char *_path)
+FILESERVICES_API void FILESERVICES_CALL fsDeleteExternalFile(ICodeContext *ctx,const char *location,const char *path)
 {
-    SocketEndpoint ep(location);
-    if (ep.isNull())
-        throw MakeStringException(-1, "fsCreateExternalDirectory: Cannot resolve location %s",location);
-    CDfsLogicalFileName lfn;
-    StringBuffer path(_path);
-    if (0 == path.length())
-        throw MakeStringException(-1, "fsCreateExternalDirectory: empty directory");
-    // remove trailing path separator if present to make it look like a regular LFN after lfn.setExternal
-    if (isPathSepChar(path.charAt(path.length()-1)))
-        path.remove(path.length()-1, 1);
-    lfn.setExternal(location,path);
-    checkExternalFileRights(ctx,lfn,false,true);
+    implementDeleteExternalFile(ctx,location,path,nullptr);
+}
+FILESERVICES_API void FILESERVICES_CALL fsDeleteExternalFile_v2(ICodeContext *ctx,const char *location,const char *path,const char *planename)
+{
+    implementDeleteExternalFile(ctx,location,path,planename);
+}
+
+static void implementCreateExternalDirectory(ICodeContext *ctx,const char *location,const char *path,const char *planename)
+{
+    Owned<IPropertyTree> plane = checkPlaneOrHost(planename,location,path);
     RemoteFilename rfn;
-    rfn.setPath(ep,path);
+    checkExternalFilePath(ctx,plane,location,path,false,true,rfn);
     Owned<IFile> file = createIFile(rfn);
     file->createDirectory();
     StringBuffer s("CreateExternalDirectory ('");
     s.append(location).append(',').append(path).append(") done");
     WUmessage(ctx,SeverityInformation,NULL,s.str());
-    AuditMessage(ctx,"CreateExternalDirectory",path);
+    AuditMessage(ctx,"EXTERNAL_CREATEDIRECTORY",path);
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsCreateExternalDirectory(ICodeContext *ctx,const char *location,const char *path)
+{
+    implementCreateExternalDirectory(ctx,location,path,nullptr);
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsCreateExternalDirectory_v2(ICodeContext *ctx,const char *location,const char *path,const char *planename)
+{
+    implementCreateExternalDirectory(ctx,location,path,planename);
+}
+
+static void implementListPlaneDirectory(ICodeContext *ctx,const char *planename,const char *machine,const char *dir,
+    const char *mask,bool sub,size32_t &lenresult,void *&result)
+{
+    Owned<IPropertyTree> plane = checkPlaneOrHost(planename,machine,dir);
+    RemoteFilename rfn;
+
+    // NB: If ctx == null, implies called from a compiled query that predates fsRemoteDirectory_v2
+    // checkExternalFilePath cannot be performed.
+    if (ctx)
+        checkExternalFilePath(ctx,plane,machine,dir,true,false,rfn);
+    else
+    {
+        // for backward compatibility
+
+        // NB: if no ctx, also implies no planename
+        SocketEndpoint ep(machine);
+        if (ep.isNull())
+        {
+            if (machine)
+                throw makeStringExceptionV(-1, "RemoteDirectory: Could not resolve host '%s'", machine);
+            // This should probably throw an error, but keeping this way for backward compatibility (with old compiled queries)
+            ep.setLocalHost(0);
+        }
+        rfn.setPath(ep,dir);
+    }
+    listRemoteDirectoryFiles(rfn,mask,sub,lenresult,result);
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsRemoteDirectory(size32_t &lenresult,
+    void *&result,const char *machine,const char *dir,const char *mask,bool sub)
+{
+    implementListPlaneDirectory(nullptr,nullptr,machine,dir,mask,sub,lenresult,result);
+}
+
+FILESERVICES_API void FILESERVICES_CALL fsRemoteDirectory_v2(ICodeContext *ctx,size32_t &lenresult,
+    void *&result,const char *machine,const char *dir,const char *mask,bool sub,const char *planename)
+{
+    implementListPlaneDirectory(ctx,planename,machine,dir,mask,sub,lenresult,result);
 }
 
 FILESERVICES_API char * FILESERVICES_CALL fsfGetLogicalFileAttribute(ICodeContext * ctx,const char *_lfn,const char *attrname)
@@ -2720,7 +3888,7 @@ FILESERVICES_API char * FILESERVICES_CALL fsfGetLogicalFileAttribute(ICodeContex
     StringBuffer lfn;
     constructLogicalName(ctx, _lfn, lfn);
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, false,false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = wsdfs::lookup(lfn.str(), udesc, AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser, INFINITE);
     StringBuffer ret;
     if (df) {
         if (strcmp(attrname,"ECL")==0)
@@ -2769,7 +3937,7 @@ FILESERVICES_API void FILESERVICES_CALL fsProtectLogicalFile(ICodeContext * ctx,
     StringBuffer lfn;
     constructLogicalName(ctx, _lfn, lfn);
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(), udesc, false, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(), udesc, AccessMode::writeLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
     if (df)
     {
         StringBuffer uname;
@@ -2792,6 +3960,22 @@ static bool build_dfuplus_globals(int argc, const char *argv[], IProperties * gl
     for (int i = 1; i < argc; i++)
         if (strchr(argv[i],'='))
             globals->loadProp(argv[i]);
+
+    // if server is empty we can look up the settings for the default eclservices (eclwatch if eclservices is not found)
+    if (isEmptyString(globals->queryProp("server")))
+    {
+        const char *url = fsGetEspURL(nullptr, nullptr);
+        if (!isEmptyString(url))
+        {
+            if (strncmp("mtls:", url, 5)==0)
+            {
+                if (!globals->hasProp("mtls-secret"))
+                    globals->setProp("mtls-secret", "local");
+                url+=5;
+            }
+            globals->setProp("server", url);
+        }
+    }
 
     StringBuffer tmp;
     if (globals->hasProp("encrypt")) {
@@ -2875,48 +4059,46 @@ FILESERVICES_API void FILESERVICES_CALL fsDfuPlusExec(ICodeContext * ctx,const c
 FILESERVICES_API char * FILESERVICES_CALL fsGetEspURL(const char *username, const char *userPW)
 {
 #ifdef _CONTAINERIZED
-    const char *defaultEsp = queryComponentConfig().queryProp("@defaultEsp");
-    if (isEmptyString(defaultEsp))
-        defaultEsp = queryGlobalConfig().queryProp("@defaultEsp");
-    if (isEmptyString(defaultEsp))
+    const IPropertyTree *match = nullptr;
+    const char *espService = getComponentConfigSP()->queryProp("@defaultEsp");
+    Owned<IPropertyTree> globalConfig = getGlobalConfig();
+    if (isEmptyString(espService))
+        espService = globalConfig->queryProp("@defaultEsp");
+    if (!isEmptyString(espService))
     {
-        Owned<IPropertyTreeIterator> esps = queryGlobalConfig().getElements("esp");
-        ForEach(*esps)
+        VStringBuffer service("services[@name='%s']", espService);
+        match = globalConfig->queryPropTree(service.str());
+    }
+    if (!match)
+    {
+        // Look for 'eclservices' esp service, fallback to 'eclwatch' service.
+        Owned<IPropertyTreeIterator> iter = globalConfig->getElements("services");
+        ForEach(*iter)
         {
-            const char *application = esps->query().queryProp("@application");
-            if (application)
+            const char *type = iter->query().queryProp("@type");
+            if (streq("eclservices", type))
             {
-                if (streq(application, "eclservices"))
-                {
-                    defaultEsp = esps->query().queryProp("@name");
-                    break;
-                }
-                else if (!defaultEsp && streq(application, "eclwatch"))
-                    defaultEsp = esps->query().queryProp("@name");
+                match = &iter->query();
+                break;
             }
+            else if (streq("eclwatch", type))
+                match = &iter->query();
         }
     }
-    if (!isEmptyString(defaultEsp))
+    if (match) // MORE - if not found, we could generate a warning - it implies something misconfigured!
     {
+        if (!espService)
+            espService = match->queryProp("@name");
         StringBuffer credentials;
         if (username && username[0] && userPW && userPW[0])
             credentials.setf("%s:%s@", username, userPW);
         else if (username && username[0])
             credentials.setf("%s@", username);
 
-        VStringBuffer espInfo("esp[@name='%s']", defaultEsp);
-        const char *protocol = "https";
-        unsigned port = 8010;
-        const IPropertyTree *espconfig = queryGlobalConfig().queryPropTree(espInfo);
-        if (espconfig)
-        {
-            if (!espconfig->getPropBool("@tls", true))
-                protocol = "http";
-            port = espconfig->getPropInt("@servicePort", port);
-        }
-        // MORE - if not found, we could generate a warning - it implies something misconfigured!
+        const char *protocol = match->getPropBool("@tls") ? "https" : "http";
+        unsigned port = match->getPropInt("@port", 8010);
 
-        VStringBuffer espURL("%s://%s%s:%u", protocol, credentials.str(), defaultEsp, port);
+        VStringBuffer espURL("mtls:%s://%s%s:%u", protocol, credentials.str(), espService, port);
         return espURL.detach();
     }
 #else
@@ -2964,7 +4146,7 @@ FILESERVICES_API char * FILESERVICES_CALL fsGetEspURL(const char *username, cons
                                         if (streq(instanceAddress.str(),"."))
                                         {
                                             SocketEndpoint ep(instanceAddress.str());
-                                            ep.getIpText(instanceAddress.clear());
+                                            ep.getHostText(instanceAddress.clear());
                                         }
 
                                         espURL.setf("%s://%s%s:%d", bindingProtocol.str(), credentials.str(), instanceAddress.str(), espBindingIter->query().getPropInt("@port",8010));
@@ -2984,44 +4166,81 @@ FILESERVICES_API char * FILESERVICES_CALL fsGetEspURL(const char *username, cons
 
 FILESERVICES_API char * FILESERVICES_CALL fsGetDefaultDropZone()
 {
-    Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
-    Owned<IConstEnvironment> constEnv = envFactory-> openEnvironment();
-    Owned<IConstDropZoneInfoIterator> dropZoneIt = constEnv->getDropZoneIterator();
-    SCMStringBuffer dropZoneDir;
-    if (dropZoneIt->first())
-        dropZoneIt->query().getDirectory(dropZoneDir);
+    StringBuffer dropZonePath;
+    Owned<IPropertyTreeIterator> dropZones = getGlobalConfigSP()->getElements("storage/planes[@category='lz']");
+    if (dropZones->first())
+        dropZones->query().getProp("@prefix", dropZonePath);        // Why the directory? seems a very stange choice
+    return strdup(dropZonePath.str());
+}
 
-    return strdup(dropZoneDir.str());
+FILESERVICES_API char * FILESERVICES_CALL fsGetDefaultDropZoneName()
+{
+    StringBuffer dropZoneName;
+    Owned<IPropertyTreeIterator> dropZones = getGlobalConfigSP()->getElements("storage/planes[@category='lz']");
+    if (dropZones->first())
+        dropZones->query().getProp("@name", dropZoneName);
+    return strdup(dropZoneName.str());
 }
 
 FILESERVICES_API void FILESERVICES_CALL fsGetDropZones(ICodeContext *ctx, size32_t & __lenResult, void * & __result)
 {
     MemoryBuffer mb;
-    Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
-    Owned<IConstEnvironment> constEnv = envFactory-> openEnvironment();
-    Owned<IConstDropZoneInfoIterator> dropZoneIt = constEnv->getDropZoneIterator();
-    ForEach(*dropZoneIt)
+    Owned<IPropertyTreeIterator> dropZones = getGlobalConfigSP()->getElements("storage/planes[@category='lz']");
+    ForEach(*dropZones)
     {
-        SCMStringBuffer dropZoneDir;
-        dropZoneIt->query().getDirectory(dropZoneDir);
-        size32_t sz = dropZoneDir.length();
-        mb.append(sz).append(sz,dropZoneDir.str());
+        const char * directory = dropZones->query().queryProp("@prefix");
+        size32_t sz = strlen(directory);
+        mb.append(sz).append(sz,directory);
     }
-
     __lenResult = mb.length();
     __result = mb.detach();
 }
 
 
+FILESERVICES_API void FILESERVICES_CALL fsGetLandingZones(ICodeContext *ctx, size32_t & __lenResult, void * & __result)
+{
+    MemoryBuffer mb;
+    size32_t sz;
+    Owned<IPropertyTree> global = getGlobalConfig();
+    Owned<IPropertyTreeIterator> dropZones = global->getElements("storage/planes[@category='lz']");
+    ForEach(*dropZones)
+    {
+        const IPropertyTree &dropZone = dropZones->query();
+        const char * name = dropZone.queryProp("@name");
+        const char * directory = dropZone.queryProp("@prefix");
+        const char * hostGroup = dropZone.queryProp("@hostGroup");
+        // field "name"
+        sz = strlen(name);
+        mb.append(sz).append(sz,name);
+
+        // field "prefix"
+        sz = strlen(directory);
+        mb.append(sz).append(sz,directory);
+
+        // field "host"
+        const char * host = nullptr;
+        if (hostGroup)
+        {
+            VStringBuffer xpath("storage/hostGroups[@name='%s']", name);
+            IPropertyTree * match = global->queryPropTree(xpath);
+            if (match)
+                host = match->queryProp("hosts[1]");
+        }
+        sz = host ? strlen(host) : 0;
+        mb.append(sz).append(sz, host);
+    }
+    __lenResult = mb.length();
+    __result = mb.detach();
+}
 
 FILESERVICES_API int FILESERVICES_CALL fsGetExpireDays(ICodeContext * ctx, const char *_lfn)
 {
     StringBuffer lfn;
     constructLogicalName(ctx, _lfn, lfn);
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, false,false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = wsdfs::lookup(lfn.str(), udesc, AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser, INFINITE);
     if (df)
-        return df->getExpire();
+        return df->getExpire(nullptr);
     else
         throw makeStringExceptionV(0, "GetExpireDays: Could not find logical file %s", lfn.str());
 }
@@ -3034,7 +4253,7 @@ FILESERVICES_API void FILESERVICES_CALL fsSetExpireDays(ICodeContext * ctx, cons
     StringBuffer lfn;
     constructLogicalName(ctx, _lfn, lfn);
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, false,false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, AccessMode::writeLogicalMeta,false, false, nullptr, defaultPrivilegedUser);
     if (df)
         df->setExpire(expireDays);
     else
@@ -3046,9 +4265,33 @@ FILESERVICES_API void FILESERVICES_CALL fsClearExpireDays(ICodeContext * ctx, co
     StringBuffer lfn;
     constructLogicalName(ctx, _lfn, lfn);
     Linked<IUserDescriptor> udesc = ctx->queryUserDescriptor();
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, false,false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(lfn.str(),udesc, AccessMode::writeLogicalMeta,false, false, nullptr, defaultPrivilegedUser);
     if (df)
         df->setExpire(-1);
     else
         throw makeStringExceptionV(0, "ClearExpireDays: Could not find logical file %s", lfn.str());
+}
+
+static CriticalSection noCommonDefCrit{SYNC_LOCATION};
+static int noCommonDef = NotFound;
+FILESERVICES_API bool FILESERVICES_CALL fsGetNoCommonDefault()
+{
+    // Returns the boolean value of 'noCommon' property from the Software/Globals if it is defined,
+    // Otherwise it returns with true, the recent default value of 'noCommon'
+#ifdef _CONTAINERIZED
+    return getComponentConfigSP()->getPropBool("@noCommon", true);
+#else
+    CriticalBlock b(noCommonDefCrit);
+    if (NotFound == noCommonDef)
+    {
+        // Default value if it is not defined in environment.xml
+        noCommonDef = true;
+        Owned<IConstEnvironment> daliEnv = openDaliEnvironment();
+        Owned<IPropertyTree> env = getEnvironmentTree(daliEnv);
+
+        if (env.get())
+            noCommonDef = env->getPropBool("@noCommon", noCommonDef);
+    }
+#endif
+    return (bool)noCommonDef;
 }

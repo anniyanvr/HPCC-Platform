@@ -22,6 +22,7 @@
     xmlns:seisint="http://seisint.com" xmlns:exslt="http://exslt.org/common" exclude-result-prefixes="seisint exslt">
 
     <xsl:output method="xml" indent="yes" omit-xml-declaration="no" encoding="UTF-8"/>
+    <xsl:include href="vaults-common.xsl"/>
     <!--xsl:template match="text()"/-->
     <xsl:param name="process" select="'esp'"/>
     <xsl:param name="instance" select="'2wd20'"/>
@@ -65,12 +66,26 @@
         <xsl:copy>
             <Software>
                 <xsl:apply-templates select="$espProcess"/>
-
-        <xsl:copy-of select="/Environment/Software/Directories"/>
-      </Software>
+                <xsl:copy-of select="/Environment/Software/Directories"/>
+            </Software>
+            <!--
+            # Generated for configuration info. accessed by getGlobalConfig()
+            -->
+           <xsl:copy-of select="./protrace"/>
+            <global>
+                <expert>
+                    <xsl:copy-of select="/Environment/Software/Globals/@* | /Environment/Software/Globals/*"/>
+                </expert>
+                <storage>
+                    <xsl:copy-of select="/Environment/Software/RemoteStorage/*"/>
+                    <xsl:copy-of select="/Environment/Software/Globals/storage/*"/>
+                    <xsl:copy-of select="/Environment/Software/Storage/*"/>
+                </storage>
+                <xsl:copy-of select="/Environment/Hardware/cost"/>
+                <xsl:copy-of select="/Environment/Software/tracing"/>
+            </global>
         </xsl:copy>
     </xsl:template>
-
 
     <xsl:template match="/Environment/Software/EspProcess">
         <!-- note that this can only be @name=$process since it is guided by template
@@ -84,6 +99,8 @@
             </xsl:attribute>
 
             <xsl:call-template name="addEnvironmentInfo"/>
+
+            <xsl:call-template name="addMetricsConfig"/>
 
             <xsl:if test="ESPCacheGroup[1]">
                <xsl:value-of disable-output-escaping="yes" select="$break" />
@@ -259,6 +276,8 @@
             </xsl:variable>
             <xsl:apply-templates select="exslt:node-set($importedServiceDefinitionFiles)" mode="processImportedServiceDefinitions"/>
             <xsl:apply-templates select="node()"/>
+            <xsl:call-template name="validateLdapVaultReferences"/>
+            <xsl:call-template name="copyVaultsConfig"/>
         </xsl:copy>
 
     </xsl:template>
@@ -453,6 +472,12 @@
                         <xsl:otherwise/>
                     </xsl:choose>
                 </xsl:for-each>
+                <xsl:attribute name="ldapAdminSecretKey">
+                    <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServer]/@ldapAdminSecretKey"/>
+                </xsl:attribute>
+                <xsl:attribute name="hpccAdminSecretKey">
+                    <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServer]/@hpccAdminSecretKey"/>
+                </xsl:attribute>
             </xsl:element>
         </xsl:for-each>
     </xsl:template>
@@ -633,6 +658,10 @@
             </Environment>
         </xsl:template>
 
+    <xsl:template name="addMetricsConfig">
+        <xsl:copy-of select="/Environment/Software/metrics"/>
+    </xsl:template>
+
      <xsl:template match="/Environment/Software/EspProcess" mode="EclWatch">
         <xsl:for-each select="EspBinding">
             <xsl:variable name="protocol" select="@protocol"/>
@@ -655,6 +684,7 @@
      <xsl:template name="bindAuthentication">
         <xsl:param name="authMethod"/>
         <xsl:param name="bindingNode"/>
+        <xsl:copy-of select="$bindingNode/cors"/>
         <xsl:choose>
            <xsl:when test="$authMethod='basic'">
               <Authenticate type="Basic" method="UserDefined">
@@ -671,7 +701,7 @@
                  </xsl:for-each>
                  <xsl:for-each select="$bindingNode/AuthenticateFeature[@authenticate='Yes']">
                     <Feature name="{@name}" path="{@path}" resource="{@resource}" required="{@access}" description="{@description}"/>
-                 </xsl:for-each>                              
+                 </xsl:for-each>
                  <xsl:for-each select="$bindingNode/AuthenticateSetting[@include='Yes']">
                     <Setting path="{@path}" resource="{@resource}" description="{@description}"/>
                  </xsl:for-each>
@@ -697,7 +727,7 @@
            </xsl:when>
         </xsl:choose>
      </xsl:template>
-   
+
         <xsl:template name="printUniqueTokens">
             <xsl:param name="s"/><!--space delimited string of tokens with space as last char-->
             <xsl:param name="enclosingTagName"/>

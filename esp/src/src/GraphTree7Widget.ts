@@ -1,20 +1,10 @@
-import * as arrayUtil from "dojo/_base/array";
-import * as declare from "dojo/_base/declare";
-import * as lang from "dojo/_base/lang";
-import * as aspect from "dojo/aspect";
-import * as dom from "dojo/dom";
-import * as has from "dojo/has";
-import * as topic from "dojo/topic";
-
-import * as registry from "dijit/registry";
+import { arrayUtil, declare, lang, aspect, dom, has, topic, registry } from "src-dojo/index";
 
 import { ECLGraph, ScopeGraph, Workunit } from "@hpcc-js/comms";
 import { Graph as GraphWidget, Graph2 as Graph2Widget, Subgraph, Vertex } from "@hpcc-js/graph";
 import { hashSum } from "@hpcc-js/util";
 
-// @ts-ignore
-import * as _Widget from "hpcc/_Widget";
-import { declareDecorator } from "./DeclareDecorator";
+import _Widget from "hpcc/_Widget";
 import { Grid, maximizeWidget } from "./ESPUtil";
 import { GraphStore, GraphTreeStore } from "./GraphStore";
 import nlsHPCC from "./nlsHPCC";
@@ -23,24 +13,9 @@ import * as WsWorkunits from "./WsWorkunits";
 import { WUGraphLegend } from "./WUGraphLegend";
 import { WUScopeController, WUScopeController8 } from "./WUScopeController";
 
-// @ts-ignore
-import * as template from "dojo/text!hpcc/templates/GraphTree7Widget.html";
+// @ts-expect-error
+import template from "dojo/text!hpcc/templates/GraphTree7Widget.html";
 
-import "dijit/Fieldset";
-import "dijit/form/Button";
-import "dijit/form/CheckBox";
-import "dijit/form/DropDownButton";
-import "dijit/form/Form";
-import "dijit/form/TextBox";
-import "dijit/form/ToggleButton";
-import "dijit/layout/BorderContainer";
-import "dijit/layout/ContentPane";
-import "dijit/layout/StackContainer";
-import "dijit/layout/StackController";
-import "dijit/layout/TabContainer";
-import "dijit/Toolbar";
-import "dijit/ToolbarSeparator";
-import "dijit/TooltipDialog";
 import "hpcc/TableContainer";
 
 declare const dojoConfig;
@@ -63,14 +38,14 @@ class DataGraph {
 
 class DataGraph2 {
     private _controller: WUScopeController8 = new WUScopeController8();
-    private _widget: Graph2Widget = new Graph2Widget()
+    private _widget = new Graph2Widget()
         .wasmFolder(dojoConfig.urlInfo.fullPath + "/dist")
         ;
 
     constructor() {
     }
 
-    widget(): Graph2Widget {
+    widget() {
         return this._widget;
     }
 
@@ -87,54 +62,55 @@ type _Widget = {
     setDisabled(id: string, disabled: boolean, icon?: string, disabledIcon?: string);
 };
 
-export interface GraphTree7Widget extends _Widget {
-}
+export const GraphTree7Widget = declare("GraphTree7Widget", [_Widget], {
+    templateString: template,
+    i18n: nlsHPCC,
 
-@declareDecorator("GraphTree7Widget", _Widget)
-export class GraphTree7Widget {
-    templateString = template;
-    static baseClass = "GraphTree7Widget";
-    i18n = nlsHPCC;
+    GraphName: undefined as string | undefined,
 
-    GraphName: any;
+    subGraphId: undefined as string | undefined,
+    activityId: undefined as string | undefined,
+    edgeId: undefined as string | undefined,
+    graphTimers: undefined as any | undefined,
+    targetQuery: undefined as any | undefined,
+    queryId: undefined as string | undefined,
 
-    subGraphId: string;
-    activityId: string;
-    edgeId: string;
-    graphTimers: any;
-    targetQuery: any;
-    queryId: any;
+    _hostPage: undefined as any | undefined,
+    wuid: "",
+    graphName: "",
+    optionsDropDown: null,
+    optionsForm: null,
+    OptionsFormLegacyGraph: null,
+    optionsFormLegacyLayout: null,
 
-    _hostPage;
-    wuid = "";
-    graphName = "";
-    optionsDropDown = null;
-    optionsForm = null;
-    OptionsFormLegacyGraph = null;
-    optionsFormLegacyLayout = null;
+    _optionsDefault: null,
+    subgraphsGrid: null,
+    verticesGrid: null,
+    edgesGrid: null,
+    graphStatus: null,
 
-    _optionsDefault = null;
-    subgraphsGrid = null;
-    verticesGrid = null;
-    edgesGrid = null;
-    graphStatus = null;
+    findText: "",
+    found: [],
+    foundIndex: 0,
 
-    findText = "";
-    found = [];
-    foundIndex = 0;
+    _graph: undefined as DataGraph | DataGraph2 | undefined,
+    _legend: undefined as WUGraphLegend | undefined,
+    treeStore: undefined as GraphTreeStore | undefined,
+    subgraphsStore: undefined as GraphStore | undefined,
+    verticesStore: undefined as GraphStore | undefined,
+    edgesStore: undefined as GraphStore | undefined,
+    persist: undefined as Persist | undefined,
 
-    _graph: DataGraph | DataGraph2;
-    protected _legend: WUGraphLegend;
-    protected treeStore = new GraphTreeStore();
-    protected subgraphsStore = new GraphStore("Id");
-    protected verticesStore = new GraphStore("Id");
-    protected edgesStore = new GraphStore("Id");
-    private persist = new Persist("GraphTree7Widget");
-
-    private isIE = has("ie") || has("trident");
+    isIE: null,
 
     constructor() {
-    }
+        this.treeStore = new GraphTreeStore();
+        this.subgraphsStore = new GraphStore("Id");
+        this.verticesStore = new GraphStore("Id");
+        this.edgesStore = new GraphStore("Id");
+        this.persist = new Persist("GraphTree7Widget");
+        this.isIE = has("ie") || has("trident");
+    },
 
     //  Options ---
 
@@ -148,7 +124,7 @@ export class GraphTree7Widget {
             retVal.LegacyLayout = ["on"];
         }
         return retVal;
-    }
+    },
 
     _onOptionsApply() {
         const optionsValues = this.optionsFormValues();
@@ -157,18 +133,18 @@ export class GraphTree7Widget {
         this.initGraph();
         this.refreshData();
         this.refreshActionState();
-    }
+    },
 
     _onOptionsReset() {
         this.optionsForm.setValues(this._optionsDefault);
         this.initGraph();
         this.refreshData();
         this.refreshActionState();
-    }
+    },
 
     //  Data ---
-    private _prevHashSum;
-    private _prevScopeGraph: Promise<ECLGraph[]>;
+    _prevHashSum: undefined as string | undefined,
+    _prevScopeGraph: undefined as Promise<ECLGraph[]> | undefined,
     fetchScopeGraph(wuid: string, graphID: string, subgraphID: string = "", refresh: boolean = false): Promise<ScopeGraph> {
         const hash = hashSum({
             wuid,
@@ -199,15 +175,15 @@ export class GraphTree7Widget {
                 }
             }
         });
-    }
+    },
     //  --- ---
 
-    buildRendering(args) {
-        this.inherited(arguments);
-    }
+    buildRendering: function buildRendering(args) {
+        this.inherited(buildRendering, arguments);
+    },
 
-    postCreate(args) {
-        this.inherited(arguments);
+    postCreate: function postCreate(args) {
+        this.inherited(postCreate, arguments);
         this._initGraphControls();
         const context = this;
         topic.subscribe(this.id + "OverviewTabContainer-selectChild", function (topic) {
@@ -221,26 +197,26 @@ export class GraphTree7Widget {
         this._optionsDefault = this.optionsFormValues();
         const options = this.persist.getObj("options", this._optionsDefault);
         this.optionsForm.setValues(options);
-    }
+    },
 
-    startup(args) {
-        this.inherited(arguments);
+    startup: function startup(args) {
+        this.inherited(startup, arguments);
 
         this.refreshActionState();
-    }
+    },
 
-    resize(s) {
-        this.inherited(arguments);
+    resize: function resize(s) {
+        this.inherited(resize, arguments);
         this.widget.BorderContainer.resize();
-    }
+    },
 
-    layout(args) {
-        this.inherited(arguments);
-    }
+    layout: function layout(args) {
+        this.inherited(layout, arguments);
+    },
 
-    destroy(args) {
-        this.inherited(arguments);
-    }
+    destroy: function destroy(args) {
+        this.inherited(destroy, arguments);
+    },
 
     //  Implementation  ---
     _initGraphControls() {
@@ -252,7 +228,7 @@ export class GraphTree7Widget {
                     ;
             }
         });
-    }
+    },
 
     _initItemGrid(grid) {
         const context = this;
@@ -263,11 +239,11 @@ export class GraphTree7Widget {
             const item = grid.row(evt).data;
             context.centerOn(item.Id);
         });
-    }
+    },
 
     _onRefresh() {
         this.refreshData(true);
-    }
+    },
 
     _onGraphRefresh() {
         if (this._graph instanceof DataGraph) {
@@ -281,7 +257,7 @@ export class GraphTree7Widget {
         this.loadGraph(w => {
             this._graph.widget().zoomToFit();
         });
-    }
+    },
 
     _onPartial(args) {
         if (this._graph instanceof DataGraph) {
@@ -292,7 +268,7 @@ export class GraphTree7Widget {
                 this._graph.widget().zoomToFit();
             });
         }
-    }
+    },
 
     _onMax(args) {
         if (this._graph instanceof DataGraph) {
@@ -303,23 +279,23 @@ export class GraphTree7Widget {
                 this._graph.widget().zoomToFit();
             });
         }
-    }
+    },
 
     _onZoomToFit(args) {
         this._graph.widget().zoomToFit();
-    }
+    },
 
     _onZoomToWidth(args) {
         this._graph.widget().zoomToWidth();
-    }
+    },
 
     _onZoomToPlus(args) {
         this._graph.widget().zoomPlus();
-    }
+    },
 
     _onZoomToMinus(args) {
         this._graph.widget().zoomMinus();
-    }
+    },
 
     _doFind(prev) {
         if (this.findText !== this.widget.FindField.value) {
@@ -340,40 +316,40 @@ export class GraphTree7Widget {
                 this._graph.widget().centerOnItem(item);
             } else {
                 const item = this._graph.controller().item(this.found[this.foundIndex]);
-                this._graph.widget().centerOnItem(item.id);
+                this._graph.widget().centerOnItem("" + item.id);
             }
         }
         this.refreshActionState();
-    }
+    },
 
     _onFind(prev) {
         this.findText = "";
         this._doFind(false);
-    }
+    },
 
     _onFindNext() {
         this._doFind(false);
-    }
+    },
 
     _onFindPrevious() {
         this._doFind(true);
-    }
+    },
 
-    _prevMaxGraph;
+    _prevMaxGraph: undefined,
     _onMaximizeGraph(max) {
         this._prevMaxGraph = maximizeWidget(registry.byId(this.id + "MainBorderContainer"), max, this._prevMaxGraph);
-    }
+    },
 
     isWorkunit() {
         return lang.exists("params.Wuid", this);
-    }
+    },
 
     isQuery() {
         return lang.exists("params.QueryId", this);
-    }
+    },
 
-    init(params) {
-        if (this.inherited(arguments))
+    init: function init(params) {
+        if (this.inherited(init, arguments))
             return;
 
         this.initWidgets();
@@ -384,13 +360,13 @@ export class GraphTree7Widget {
         this.doInit(params);
 
         this.refreshActionState();
-    }
+    },
 
     refresh(params) {
         if (params.SubGraphId) {
             this.syncSelectionFrom(this);
         }
-    }
+    },
 
     doInit(params) {
         this.wuid = params.Wuid;
@@ -411,7 +387,7 @@ export class GraphTree7Widget {
                 this.centerOn(this.subGraphId);
             }
         });
-    }
+    },
 
     refreshData(refresh: boolean = false) {
         if (this.isWorkunit()) {
@@ -419,7 +395,7 @@ export class GraphTree7Widget {
         } else if (this.isQuery()) {
         }
         return Promise.resolve();
-    }
+    },
 
     loadGraphFromWu(wuid, graphName, subGraphId, refresh: boolean = false) {
         this.initGraphController();
@@ -429,7 +405,7 @@ export class GraphTree7Widget {
             this.loadVertices();
             this.loadEdges();
         });
-    }
+    },
 
     initGraph() {
         const options = this.optionsFormValues();
@@ -524,7 +500,7 @@ export class GraphTree7Widget {
         if (this._graph instanceof DataGraph2) {
             this._graph.widget().layout(options.LegacyLayout?.length ? "Hierarchy" : "DOT");
         }
-    }
+    },
 
     initWidgets() {
         this.graphStatus = dom.byId(this.id + "GraphStatus");
@@ -559,7 +535,7 @@ export class GraphTree7Widget {
                 this._graph.widget().highlightVerticies();
             })
             ;
-    }
+    },
 
     initGraphController() {
         const options = this.optionsFormValues();
@@ -580,7 +556,7 @@ export class GraphTree7Widget {
                 .disabled(this._legend.disabled())
                 ;
         }
-    }
+    },
 
     loadGraph(callback?) {
         this.initGraphController();
@@ -598,7 +574,7 @@ export class GraphTree7Widget {
         this._legend
             .render()
             ;
-    }
+    },
 
     formatColumns(columns) {
         columns.forEach((column: any) => {
@@ -609,7 +585,7 @@ export class GraphTree7Widget {
                 };
             }
         });
-    }
+    },
 
     initSubgraphs() {
         this.subgraphsGrid = new declare([Grid(true, true)])({
@@ -622,7 +598,7 @@ export class GraphTree7Widget {
         });
 
         this._initItemGrid(this.subgraphsGrid);
-    }
+    },
 
     loadSubgraphs() {
         const subgraphs = this._graph.controller().subgraphStoreData();
@@ -641,7 +617,7 @@ export class GraphTree7Widget {
         this.formatColumns(columns);
         this.subgraphsGrid.set("columns", columns);
         this.subgraphsGrid.refresh();
-    }
+    },
 
     initVertices() {
         this.verticesGrid = new declare([Grid(true, true)])({
@@ -649,7 +625,7 @@ export class GraphTree7Widget {
         }, this.id + "VerticesGrid");
 
         this._initItemGrid(this.verticesGrid);
-    }
+    },
 
     loadVertices() {
         const vertices = this._graph.controller().activityStoreData();
@@ -668,7 +644,7 @@ export class GraphTree7Widget {
         this.formatColumns(columns);
         this.verticesGrid.set("columns", columns);
         this.verticesGrid.refresh();
-    }
+    },
 
     initEdges() {
         this.edgesGrid = new declare([Grid(true, true)])({
@@ -676,7 +652,7 @@ export class GraphTree7Widget {
         }, this.id + "EdgesGrid");
 
         this._initItemGrid(this.edgesGrid);
-    }
+    },
 
     loadEdges() {
         const edges = this._graph.controller().edgeStoreData();
@@ -688,7 +664,7 @@ export class GraphTree7Widget {
         this.formatColumns(columns);
         this.edgesGrid.set("columns", columns);
         this.edgesGrid.refresh();
-    }
+    },
 
     centerOn(itemID?: string) {
         if (itemID) {
@@ -723,29 +699,27 @@ export class GraphTree7Widget {
                 this._graph.widget().centerOnItem(itemID);
             }
         }
-    }
+    },
 
-    inSyncSelectionFrom = false;
+    inSyncSelectionFrom: false,
     syncSelectionFrom(sourceControl) {
         if (!this.inSyncSelectionFrom) {
             this._syncSelectionFrom(sourceControl, this._graph);
         }
-    }
-
-    _syncSelectionFrom(sourceControl, graphRef) {
-    }
+    },
 
     resetPage() {
-    }
+    },
 
     setMainRootItems(globalIDs) {
-    }
+    },
 
     refreshMainXGMML() {
-    }
+    },
 
     displayGraphs(graphs) {
-    }
+    },
+
 
     refreshActionState() {
         const options = this.optionsFormValues();
@@ -757,91 +731,92 @@ export class GraphTree7Widget {
         this.setDisabled(this.id + "Max", this._graph instanceof DataGraph2, "fa fa-window-maximize", "disabled fa fa-window-maximize");
         this.setDisabled(this.id + "OptionsFormLegacyGraph", this.isIE);
         this.setDisabled(this.id + "OptionsFormLegacyLayout", this.isIE || options.LegacyGraph?.length);
-    }
-}
+    },
 
-GraphTree7Widget.prototype._syncSelectionFrom = debounce(function (this: GraphTree7Widget, sourceControlOrGlobalIDs) {
-    this.inSyncSelectionFrom = true;
-    const sourceControl = sourceControlOrGlobalIDs instanceof Array ? null : sourceControlOrGlobalIDs;
-    let selectedGlobalIDs = sourceControlOrGlobalIDs instanceof Array ? sourceControlOrGlobalIDs : [];
-    if (sourceControl) {
-        //  Get Selected Items  ---
-        if (sourceControl === this) {
-            if (this.edgeId) {
-                selectedGlobalIDs = [this.edgeId];
-            } else if (this.activityId) {
-                selectedGlobalIDs = [this.activityId];
-            } else if (this.subGraphId) {
-                selectedGlobalIDs = [this.subGraphId];
-            }
-        } else if (sourceControl === this._graph) {
-            if (this._graph instanceof DataGraph) {
-                selectedGlobalIDs = this._graph.widget().selection()
-                    .map(w => (this._graph.controller() as WUScopeController).rItem(w as any))
-                    .filter(item => !!item)
-                    .map(item => item._.Id);
+    _syncSelectionFrom: debounce(function (sourceControlOrGlobalIDs) {
+        this.inSyncSelectionFrom = true;
+        const sourceControl = sourceControlOrGlobalIDs instanceof Array ? null : sourceControlOrGlobalIDs;
+        let selectedGlobalIDs = sourceControlOrGlobalIDs instanceof Array ? sourceControlOrGlobalIDs : [];
+        if (sourceControl) {
+            //  Get Selected Items  ---
+            if (sourceControl === this) {
+                if (this.edgeId) {
+                    selectedGlobalIDs = [this.edgeId];
+                } else if (this.activityId) {
+                    selectedGlobalIDs = [this.activityId];
+                } else if (this.subGraphId) {
+                    selectedGlobalIDs = [this.subGraphId];
+                }
+            } else if (sourceControl === this._graph) {
+                if (this._graph instanceof DataGraph) {
+                    selectedGlobalIDs = this._graph.widget().selection()
+                        .map(w => (this._graph.controller() as WUScopeController).rItem(w as any))
+                        .filter(item => !!item)
+                        .map(item => item._.Id);
+                } else {
+                    selectedGlobalIDs = this._graph.widget().selection()
+                        .map(w => (this._graph.controller() as WUScopeController8).rItem("" + w.id))
+                        .filter(item => !!item)
+                        .map(item => item._.Id)
+                        ;
+                }
+            } else if (sourceControl === this.verticesGrid || sourceControl === this.edgesGrid || sourceControl === this.subgraphsGrid) {
+                const items = sourceControl.getSelected();
+                for (let i = 0; i < items.length; ++i) {
+                    if (lang.exists("Id", items[i])) {
+                        selectedGlobalIDs.push(items[i].Id);
+                    }
+                }
+            } else if (sourceControl === this.found) {
+                selectedGlobalIDs = this.found;
             } else {
-                selectedGlobalIDs = this._graph.widget().selection()
-                    .map(w => (this._graph.controller() as WUScopeController8).rItem(w.id))
-                    .filter(item => !!item)
-                    .map(item => item._.Id)
-                    ;
+                selectedGlobalIDs = sourceControl.getSelectionAsGlobalID();
             }
-        } else if (sourceControl === this.verticesGrid || sourceControl === this.edgesGrid || sourceControl === this.subgraphsGrid) {
-            const items = sourceControl.getSelected();
-            for (let i = 0; i < items.length; ++i) {
-                if (lang.exists("Id", items[i])) {
-                    selectedGlobalIDs.push(items[i].Id);
-                }
+        }
+
+        //  Set Selected Items  ---
+        if (sourceControl !== this.subgraphsGrid && this.subgraphsGrid.store) {
+            this.subgraphsGrid.setSelection(selectedGlobalIDs);
+        }
+        if (sourceControl !== this.verticesGrid && this.verticesGrid.store) {
+            this.verticesGrid.setSelection(selectedGlobalIDs);
+        }
+        if (sourceControl !== this.edgesGrid && this.edgesGrid.store) {
+            this.edgesGrid.setSelection(selectedGlobalIDs);
+        }
+
+        //  Refresh Graph Controls  ---
+        if (sourceControl !== this._graph) {
+            if (this._graph instanceof DataGraph) {
+                const items = this._graph.controller().items(selectedGlobalIDs);
+                this._graph.widget().selection(items);
+            } else {
+                const items = this._graph.controller().items(selectedGlobalIDs);
+                this._graph.widget().selection(items);
             }
-        } else if (sourceControl === this.found) {
-            selectedGlobalIDs = this.found;
-        } else {
-            selectedGlobalIDs = sourceControl.getSelectionAsGlobalID();
         }
-    }
 
-    //  Set Selected Items  ---
-    if (sourceControl !== this.subgraphsGrid && this.subgraphsGrid.store) {
-        this.subgraphsGrid.setSelection(selectedGlobalIDs);
-    }
-    if (sourceControl !== this.verticesGrid && this.verticesGrid.store) {
-        this.verticesGrid.setSelection(selectedGlobalIDs);
-    }
-    if (sourceControl !== this.edgesGrid && this.edgesGrid.store) {
-        this.edgesGrid.setSelection(selectedGlobalIDs);
-    }
-
-    //  Refresh Graph Controls  ---
-    if (sourceControl !== this._graph) {
-        if (this._graph instanceof DataGraph) {
-            const items = this._graph.controller().items(selectedGlobalIDs);
-            this._graph.widget().selection(items);
-        } else {
-            const items = this._graph.controller().items(selectedGlobalIDs);
-            this._graph.widget().selection(items);
+        const propertiesDom = dom.byId(this.id + "Properties");
+        propertiesDom.innerHTML = "";
+        let html = "";
+        for (const id of selectedGlobalIDs) {
+            html += this._graph.controller().calcGraphTooltip(id, this.findText);
         }
-    }
-
-    const propertiesDom = dom.byId(this.id + "Properties");
-    propertiesDom.innerHTML = "";
-    let html = "";
-    for (const id of selectedGlobalIDs) {
-        html += this._graph.controller().calcGraphTooltip(id, this.findText);
-    }
-    propertiesDom.innerHTML = html;
-    const context = this;
-    if (selectedGlobalIDs.length) {
-        const edges = arrayUtil.filter(selectedGlobalIDs, function (id) {
-            return id && id.indexOf && id.indexOf("_") >= 0;
-        });
-        if (edges.length === 1) {
-            WsWorkunits.WUCDebug(context.params.Wuid, "<debug:print edgeId='" + edges[0] + "'/>").then(function (response) {
-                if (lang.exists("WUDebugResponse.Result", response)) {
-                    // context.global.displayTrace(response.WUDebugResponse.Result, propertiesDom);
-                }
+        propertiesDom.innerHTML = html;
+        const context = this;
+        if (selectedGlobalIDs.length) {
+            const edges = arrayUtil.filter(selectedGlobalIDs, function (id) {
+                return id && id.indexOf && id.indexOf("_") >= 0;
             });
+            if (edges.length === 1) {
+                WsWorkunits.WUCDebug(context.params.Wuid, "<debug:print edgeId='" + edges[0] + "'/>").then(function (response) {
+                    if (lang.exists("WUDebugResponse.Result", response)) {
+                        // context.global.displayTrace(response.WUDebugResponse.Result, propertiesDom);
+                    }
+                });
+            }
         }
-    }
-    this.inSyncSelectionFrom = false;
-}, 500, false);
+        this.inSyncSelectionFrom = false;
+    }, 500, false),
+
+});

@@ -15,19 +15,22 @@
     limitations under the License.
 ############################################################################## */
 
+#include <string>
 #include "EnvHelper.hpp"
 #include "ConfigEnv.hpp"
 #include "environment.hpp"
 #include "deployutils.hpp"
-#include "build-config.h"
 
 
 namespace ech
 {
 
+static std::string espConfigPath;
+
 ConfigEnv::ConfigEnv(IPropertyTree *config)
 {
    m_envHelper = new EnvHelper(config);
+   espConfigPath = std::string(hpccBuildInfo.configDir) + "/configmgr/esp.xml";
 }
 
 ConfigEnv::~ConfigEnv()
@@ -72,7 +75,7 @@ void ConfigEnv::create(IPropertyTree *params)
          espNodes=1, thorChannelsPerSlave=1, roxieChannelsPerSlave=1;
      bool roxieOnDemand = true;
      MapStringTo<StringAttr, const char *> dirMap;
-     Owned<IPropertyTree> pCfg = createPTreeFromXMLFile(ESP_CONFIG_PATH);
+     Owned<IPropertyTree> pCfg = createPTreeFromXMLFile(espConfigPath.c_str());
      StringArray arrAssignIPRanges;
      StringArray arrBuildSetWithAssignedIPs;
 
@@ -167,7 +170,7 @@ void ConfigEnv::create(IPropertyTree *params)
    pFile.setown(createIFile(envFile));
 
    Owned<IFileIO> pFileIO;
-   pFileIO.setown(pFile->open(IFOcreaterw));
+   pFileIO.setown(pFile->open(IFOcreate));
    pFileIO->write(0, env.length(), env.str());
    */
 

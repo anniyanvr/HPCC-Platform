@@ -12,19 +12,19 @@
       <primary>Email.SendEmailAttachData</primary>
     </indexterm> <indexterm>
       <primary>SendEmailAttachData</primary>
-    </indexterm>( </emphasis> <emphasis>sendto, subject, body, attachment,
-  mimietype, filename, server, port, sender</emphasis> <emphasis role="bold">
-  )</emphasis></para>
+    </indexterm>( </emphasis> <emphasis>to, subject, body, attachment,
+  mimeType, attachmentName, mailServer, port, sender, cc, bcc, highPriority,
+  rptErrAsFail</emphasis> <emphasis role="bold"> )</emphasis></para>
 
   <informaltable colsep="1" frame="all" rowsep="1">
     <tgroup cols="2">
-      <colspec colwidth="80.50pt" />
+      <colspec colwidth="80.50pt"/>
 
-      <colspec />
+      <colspec/>
 
       <tbody>
         <row>
-          <entry><emphasis>sendto</emphasis></entry>
+          <entry><emphasis>to</emphasis></entry>
 
           <entry>A null-terminated string containing a comma-delimited list of
           the addresses of the intended recipients. The validity of the
@@ -54,17 +54,19 @@
         </row>
 
         <row>
-          <entry><emphasis>mimetype</emphasis></entry>
+          <entry><emphasis>mimeType</emphasis></entry>
 
           <entry>A null-terminated string containing the MIME-type of the
-          <emphasis>attachment</emphasis>, which may include entrymeters (such
-          as 'text/plain; charset=ISO-8859-3'). When attaching general binary
-          data for which no specific MIME type exists, use
-          'application/octet-stream'.</entry>
+          <emphasis>attachment</emphasis>, which may include value pairs
+          (type/subtype) such as <literal>'text/plain'</literal>. You can also
+          add optional parameters, such as <literal>'text/plain;
+          charset=ISO-8859-3'</literal>. When attaching general binary data
+          for which no specific MIME type exists, use
+          <literal>'application/octet-stream'</literal>.</entry>
         </row>
 
         <row>
-          <entry><emphasis>filename</emphasis></entry>
+          <entry><emphasis>attachmentName</emphasis></entry>
 
           <entry>A null-terminated string containing the name of the
           <emphasis>attachment</emphasis> for the mail reader to
@@ -72,7 +74,7 @@
         </row>
 
         <row>
-          <entry><emphasis>server</emphasis></entry>
+          <entry><emphasis>mailServer</emphasis></entry>
 
           <entry>Optional. A null-terminated string containing the name of the
           mail server. If omitted, defaults to the value in the SMTPserver
@@ -94,6 +96,36 @@
           the sender. If omitted, defaults to the value in the
           emailSenderAddress environment variable.</entry>
         </row>
+
+        <row>
+          <entry><emphasis>cc</emphasis></entry>
+
+          <entry>Optional. comma-delimited addresses of carbon copy
+          recipients. Defaults to an empty string (none).</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>bcc</emphasis></entry>
+
+          <entry>Optional. comma-delimited addresses of blind carbon copy
+          recipients. Defaults to an empty string (none).</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>highPriority</emphasis></entry>
+
+          <entry>Optional. A boolean TRUE/FALSE flag that, when TRUE, the
+          message is sent with high priority. Defaults to FALSE (normal
+          priority).</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>rptErrAsFail</emphasis></entry>
+
+          <entry>Optional. A boolean TRUE/FALSE flag that, when TRUE, any
+          error while trying to send the email results in an error/exception.
+          Defaults to TRUE.</entry>
+        </row>
       </tbody>
     </tgroup>
   </informaltable>
@@ -103,8 +135,9 @@
 
   <para>Example:</para>
 
-  <programlisting format="linespecific">DATA15 attachment :=  D'test attachment';
-STD.System.Email.SendEmailAttachData( 'me@mydomain.com',
+  <programlisting format="linespecific">IMPORT STD;
+DATA15 attachment :=  D'test attachment';
+<!--#synthpii-->STD.System.Email.SendEmailAttachData( 'me@example.com',
                                   'testing 1,2,3',
                                   'this is a test message',
                                    attachment,

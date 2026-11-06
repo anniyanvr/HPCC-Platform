@@ -25,14 +25,11 @@
 #include "jencrypt.hpp"
 #include "buildset.hpp"
 #include "confighelper.hpp"
-#include "build-config.h"
 
-#define STANDARD_CONFIGXMLDIR COMPONENTFILES_DIR"/configxml/"
-#define STANDARD_CONFIG_DIR CONFIG_DIR
 
 CInstDetails::CInstDetails(const char * compName, const StringArray &ipAssigned) : m_compName(compName)
 {
-    m_ipAssigned.clear();
+    m_ipAssigned.kill();
 
     for (unsigned i = 0; i < ipAssigned.ordinality(); i++)
     {
@@ -47,9 +44,8 @@ CWizardInputs::CWizardInputs(const char* xmlArg,const char *service,
                              IPropertyTree * cfg, 
                              MapStringTo<StringAttr, const char *>* dirMap,
                              StringArray &arrBuildSetsWithAssignedIPs,
-                             StringArray &arrAssignedIPs): m_service(service),
-                             m_cfg(cfg), m_overrideDirs(dirMap), m_roxieOnDemand(true),
-                             m_supportNodes(0), m_arrBuildSetsWithAssignedIPs(arrBuildSetsWithAssignedIPs), m_arrAssignedIPs(arrAssignedIPs)
+                             StringArray &arrAssignedIPs): 
+                             m_arrBuildSetsWithAssignedIPs(arrBuildSetsWithAssignedIPs), m_arrAssignedIPs(arrAssignedIPs), m_supportNodes(0), m_roxieOnDemand(true), m_cfg(cfg), m_service(service), m_overrideDirs(dirMap)
 {
   m_pXml.setown(createPTreeFromXMLString(xmlArg && *xmlArg ? xmlArg : "<XmlArgs/>"));
 }
@@ -175,7 +171,7 @@ void CWizardInputs::setEnvironment()
 
      m_buildSetTree.setown(pBuildSet);
      
-     fileName.clear().append((pEnvParams->queryProp("configs") != NULL ? (sb.clear().append(pEnvParams->queryProp("configs")).append("/")): STANDARD_CONFIG_DIR));
+     fileName.clear().append((pEnvParams->queryProp("configs") != NULL ? (sb.clear().append(pEnvParams->queryProp("configs")).append("/")): hpccBuildInfo.configDir));
      fileName.append((pParams->queryProp("wizardalgorithm") != NULL ? (sb.clear().append(pParams->queryProp("wizardalgorithm"))) : STANDARD_CONFIG_ALGORITHMFILE));
      
      if(fileName.length() && checkFileExists(fileName.str()))
@@ -1328,7 +1324,7 @@ StringArray& CWizardInputs::getIpAddrMap(const char* buildSetName)
         {
             if (stricmp(buildSetName, m_arrBuildSetsWithAssignedIPs.item(i)) == 0)
             {
-                m_sipaddress.clear();
+                m_sipaddress.kill();
                 formIPList(m_arrAssignedIPs.item(i), m_sipaddress);
                 return m_sipaddress;
             }

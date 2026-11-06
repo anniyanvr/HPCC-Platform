@@ -29,77 +29,20 @@
 #include "roxiemem.hpp"
 #include "udplib.hpp"
 
-#define DEFAULT_PULSE_INTERVAL 30
-
-RelaxedAtomic<unsigned> queryCount;
 RoxieQueryStats unknownQueryStats;
 RoxieQueryStats loQueryStats;
 RoxieQueryStats hiQueryStats;
 RoxieQueryStats slaQueryStats;
+RoxieQueryStats bgQueryStats;
 RoxieQueryStats combinedQueryStats;
-RelaxedAtomic<unsigned> retriesIgnoredPrm;
-RelaxedAtomic<unsigned> retriesIgnoredSec;
-RelaxedAtomic<unsigned> retriesNeeded;
-RelaxedAtomic<unsigned> retriesReceivedPrm;
-RelaxedAtomic<unsigned> retriesReceivedSec;
-RelaxedAtomic<unsigned> retriesSent;
-RelaxedAtomic<unsigned> rowsIn;
-RelaxedAtomic<unsigned> ibytiPacketsFromSelf;
-RelaxedAtomic<unsigned> ibytiPacketsSent;
-RelaxedAtomic<unsigned> ibytiPacketsWorked;
-RelaxedAtomic<unsigned> ibytiPacketsHalfWorked;
-RelaxedAtomic<unsigned> ibytiPacketsReceived;
-RelaxedAtomic<unsigned> ibytiPacketsTooLate;
-RelaxedAtomic<unsigned> ibytiPacketsTooEarly;
-RelaxedAtomic<unsigned> ibytiNoDelaysPrm;
-RelaxedAtomic<unsigned> ibytiNoDelaysSec;
-RelaxedAtomic<unsigned> packetsSent;
-RelaxedAtomic<unsigned> packetsReceived;
-RelaxedAtomic<unsigned> resultsReceived;
-RelaxedAtomic<unsigned> indexRecordsRead;
-RelaxedAtomic<unsigned> postFiltered;
-RelaxedAtomic<unsigned> abortsSent;
-RelaxedAtomic<unsigned> activitiesStarted;
-RelaxedAtomic<unsigned> activitiesCompleted;
-RelaxedAtomic<unsigned> diskReadStarted;
-RelaxedAtomic<unsigned> diskReadCompleted;
-RelaxedAtomic<unsigned> globalSignals;
-RelaxedAtomic<unsigned> globalLocks;
-RelaxedAtomic<unsigned> numFilesToProcess;
 
-RelaxedAtomic<unsigned> queueLength;
-RelaxedAtomic<unsigned> maxQueueLength;
-RelaxedAtomic<unsigned> rowsOut;
-RelaxedAtomic<unsigned> maxScanLength;
-RelaxedAtomic<unsigned> totScanLength;
-RelaxedAtomic<unsigned> totScans;
-
-#ifdef TIME_PACKETS
-RelaxedAtomic<unsigned __int64> packetWaitElapsed;
-RelaxedAtomic<unsigned> packetWaitMax;
-RelaxedAtomic<unsigned> packetWaitCount;
-RelaxedAtomic<unsigned __int64> packetRunElapsed;
-RelaxedAtomic<unsigned> packetRunMax;
-RelaxedAtomic<unsigned> packetRunCount;
-#endif
-
-RelaxedAtomic<unsigned> lastQueryDate;
-RelaxedAtomic<unsigned> lastQueryTime;
-RelaxedAtomic<unsigned> agentsActive;
-RelaxedAtomic<unsigned> maxAgentsActive;
-
-#define addMetric(a, b) doAddMetric(a, #a, b)
+#define addMetric(a) doAddMetric(a, #a)
 
 interface INamedMetric : extends IInterface
 {
     virtual long getValue() = 0;
     virtual bool isCumulative() = 0;
     virtual void resetValue() = 0;
-};
-
-interface ITimerCallback : extends IInterface
-{
-    virtual void onTimer() = 0;
 };
 
 class RelaxedAtomicMetric : implements INamedMetric, public CInterface
@@ -174,101 +117,6 @@ public:
 
 };
 
-class TickProvider : public Thread
-{
-    IArrayOf<ITimerCallback> listeners;
-    CriticalSection crit;
-    Semaphore stopped;
-
-    void doTicks()
-    {
-        CriticalBlock c(crit);
-        ForEachItemIn(idx, listeners)
-        {
-            listeners.item(idx).onTimer();
-        }
-    }
-
-public:
-    TickProvider() : Thread("TickProvider") 
-    {
-    }
-    int run()
-    {
-        for (;;)
-        {
-            if (stopped.wait(10000))
-                break;
-            doTicks();
-        }
-        return 0;
-    }
-
-    void addListener(ITimerCallback *l)
-    {
-        CriticalBlock c(crit);
-        listeners.append(*LINK(l));
-    }
-
-    void stop()
-    {
-        stopped.signal();
-        join();
-    }
-};
-
-class IntervalMetric : implements INamedMetric, implements ITimerCallback, public CInterface
-{
-    Linked<INamedMetric> base;
-    CriticalSection crit;
-    unsigned lastSnapshotTime;
-    long lastSnapshotValue;
-    unsigned minInterval;
-    long value;
-
-    void takeSnapshot()
-    {
-        CriticalBlock c(crit);
-        unsigned now = msTick();
-        unsigned period = now - lastSnapshotTime;
-        if (period >= minInterval)
-        {
-            long newValue = base->getValue();
-            value = ((newValue - lastSnapshotValue) * 1000) / period;
-            lastSnapshotTime = now;
-            lastSnapshotValue = newValue;
-        }
-    }
-
-public:
-    IMPLEMENT_IINTERFACE;
-    IntervalMetric(INamedMetric *_base, unsigned _minInterval=1000) : base(_base), minInterval(_minInterval)
-    {
-        lastSnapshotTime = msTick();
-        lastSnapshotValue = 0;
-        value = 0;
-    }
-    virtual void onTimer()
-    {
-        takeSnapshot();
-    }
-    virtual long getValue() 
-    {
-        takeSnapshot();
-        return value;
-    }
-    virtual bool isCumulative() { return false; }
-
-    virtual void resetValue()
-    {
-        CriticalBlock c(crit);
-        lastSnapshotTime = msTick();
-        lastSnapshotValue = 0;
-        value = 0;
-    }
-
-};
-
 class UnsignedRatioMetric : implements INamedMetric, public CInterface
 {
     RelaxedAtomic<unsigned> &counter;
@@ -303,31 +151,27 @@ public:
     ~CRoxieMetricsManager();
 
     virtual long getValue(const char * name);
-    void dumpMetrics();
     StringBuffer &getMetrics(StringBuffer &xml);
     void resetMetrics();
 
-    void doAddMetric(RelaxedAtomic<unsigned> &counter, const char *name, unsigned interval, bool isMinVal = false);
-    void doAddMetric(INamedMetric *n, const char *name, unsigned interval);
-    void doAddMetric(AccessorFunction function, const char *name, unsigned interval);
+    void doAddMetric(RelaxedAtomic<unsigned> &counter, const char *name, bool isMinVal = false);
+    void doAddMetric(INamedMetric *n, const char *name);
+    void doAddMetric(AccessorFunction function, const char *name);
     void addRatioMetric(RelaxedAtomic<unsigned> &counter, const char *name, RelaxedAtomic<unsigned __int64> &elapsed);
     void addUserMetric(const char *name, const char *regex);
 
 private:
     MapStringToMyClassViaBase<INamedMetric, INamedMetric> metricMap;
-    bool started;
-
-    TickProvider ticker;
 };
 
-void RoxieQueryStats::addMetrics(CRoxieMetricsManager *snmpManager, const char *prefix, unsigned interval)
+void RoxieQueryStats::addMetrics(CRoxieMetricsManager *snmpManager, const char *prefix)
 {
     StringBuffer name;
-    snmpManager->doAddMetric(count, name.clear().append(prefix).append("QueryCount"), interval, false);
-    snmpManager->doAddMetric(failedCount, name.clear().append(prefix).append("QueryFailed"), interval, false);
-    snmpManager->doAddMetric(active, name.clear().append(prefix).append("QueryActive"), 0, false);
-    snmpManager->doAddMetric(maxTime, name.clear().append(prefix).append("QueryMaxTime"), 0, false);
-    snmpManager->doAddMetric(minTime, name.clear().append(prefix).append("QueryMinTime"), 0, true);
+    snmpManager->doAddMetric(count, name.clear().append(prefix).append("QueryCount"), false);
+    snmpManager->doAddMetric(failedCount, name.clear().append(prefix).append("QueryFailed"), false);
+    snmpManager->doAddMetric(active, name.clear().append(prefix).append("QueryActive"), false);
+    snmpManager->doAddMetric(maxTime, name.clear().append(prefix).append("QueryMaxTime"), false);
+    snmpManager->doAddMetric(minTime, name.clear().append(prefix).append("QueryMinTime"), true);
     snmpManager->addRatioMetric(count, name.clear().append(prefix).append("QueryAverageTime"), totalTime);
 }
 
@@ -338,115 +182,67 @@ using roxiemem::getDataBuffersActive;
 
 CRoxieMetricsManager::CRoxieMetricsManager()
 {
-    started = false;
-    addMetric(maxQueueLength, 0);
-    addMetric(queryCount, 1000);
-    unknownQueryStats.addMetrics(this, "unknown", 1000);
-    loQueryStats.addMetrics(this, "lo", 1000);
-    hiQueryStats.addMetrics(this, "hi", 1000);
-    slaQueryStats.addMetrics(this, "sla", 1000);
-    combinedQueryStats.addMetrics(this, "all", 1000);
-    addMetric(retriesIgnoredPrm, 1000);
-    addMetric(retriesIgnoredSec, 1000);
-    addMetric(retriesNeeded, 1000);
-    addMetric(retriesReceivedPrm, 1000);
-    addMetric(retriesReceivedSec, 1000);
-    addMetric(retriesSent, 1000);
-    addMetric(rowsIn, 1000);
-    addMetric(rowsOut, 1000);
-    addMetric(ibytiPacketsFromSelf, 1000);
-    addMetric(ibytiPacketsSent, 1000);
-    addMetric(ibytiPacketsWorked, 1000);
-    addMetric(ibytiPacketsHalfWorked, 1000);
-    addMetric(ibytiPacketsReceived, 1000);
-    addMetric(ibytiPacketsTooLate, 1000);
-    addMetric(ibytiPacketsTooEarly, 1000);
-#ifndef NO_IBYTI_DELAYS_COUNT
-    addMetric(ibytiNoDelaysPrm, 1000);
-    addMetric(ibytiNoDelaysSec, 1000);
+    unknownQueryStats.addMetrics(this, "unknown");
+    loQueryStats.addMetrics(this, "lo");
+    hiQueryStats.addMetrics(this, "hi");
+    slaQueryStats.addMetrics(this, "sla");
+    bgQueryStats.addMetrics(this, "bg");
+    combinedQueryStats.addMetrics(this, "all");
+    addMetric(restarts);
+
+    addMetric(nodesLoaded);
+#if 0
+    // If we were actually using these metrics, we'd have to find another way to fetch them.
+    addMetric(blobCacheHits);
+    addMetric(blobCacheAdds);
+    addMetric(blobCacheDups);
+    addMetric(leafCacheHits);
+    addMetric(leafCacheAdds);
+    addMetric(leafCacheDups);
+    addMetric(nodeCacheHits);
+    addMetric(nodeCacheAdds);
+    addMetric(nodeCacheDups);
 #endif
-    addMetric(packetsReceived, 1000);
-    addMetric(packetsSent, 1000);
-    addMetric(resultsReceived, 1000);
-    addMetric(agentsActive, 0);
-    addMetric(maxAgentsActive, 0);
-    addMetric(indexRecordsRead, 1000);
-    addMetric(postFiltered, 1000);
-    addMetric(abortsSent, 0);
-    addMetric(activitiesStarted, 1000);
-    addMetric(activitiesCompleted, 1000);
-    addMetric(diskReadStarted, 0);
-    addMetric(diskReadCompleted, 0);
-    addMetric(globalSignals, 0);
-    addMetric(globalLocks, 0);
-    addMetric(restarts, 0);
+    addMetric(unwantedDiscarded);
 
-    addMetric(nodesLoaded, 1000);
-    addMetric(cacheHits, 1000);
-    addMetric(cacheAdds, 1000);
-    addMetric(leafCacheHits, 1000);
-    addMetric(leafCacheAdds, 1000);
-    addMetric(nodeCacheHits, 1000);
-    addMetric(nodeCacheAdds, 1000);
-    addMetric(preloadCacheHits, 0);
-    addMetric(preloadCacheAdds, 0);
-    addMetric(unwantedDiscarded, 1000);
-
-    addMetric(getHeapAllocated, 0);
-    addMetric(getHeapPercentAllocated, 0);
-    addMetric(getDataBufferPages, 0);
-    addMetric(getDataBuffersActive, 0);
+    addMetric(getHeapAllocated);
+    addMetric(getHeapPercentAllocated);
+    addMetric(getDataBufferPages);
+    addMetric(getDataBuffersActive);
     
-    addMetric(maxScanLength, 0);
-    addMetric(totScanLength, 0);
-    addMetric(totScans, 0);
-    addMetric(lastQueryDate, 0);
-    addMetric(lastQueryTime, 0);
-
-#ifdef TIME_PACKETS
-    addMetric(packetWaitMax, 0);
-    addMetric(packetRunMax, 0);
-    addRatioMetric(packetRunCount, "packetRunAverage", packetRunElapsed);
-    addRatioMetric(packetWaitCount, "packetWaitAverage", packetWaitElapsed);
-#endif
-    addMetric(numFilesToProcess, 0);
-    ticker.start();
+    addMetric(packetsResent);
+    addMetric(flowPermitsSent);
+    addMetric(flowRequestsReceived);
+    addMetric(dataPacketsReceived);
+    addMetric(flowRequestsSent);
+    addMetric(flowPermitsReceived);
+    addMetric(dataPacketsSent);
 }
 
-void CRoxieMetricsManager::doAddMetric(RelaxedAtomic<unsigned> &counter, const char *name, unsigned interval, bool isMinVal)
+void CRoxieMetricsManager::doAddMetric(RelaxedAtomic<unsigned> &counter, const char *name, bool isMinVal)
 {
-    doAddMetric(new RelaxedAtomicMetric(counter, interval != 0, isMinVal), name, interval);
+    doAddMetric(new RelaxedAtomicMetric(counter, false, isMinVal), name);
 }
 
-void CRoxieMetricsManager::doAddMetric(INamedMetric *n, const char *name, unsigned interval)
+void CRoxieMetricsManager::doAddMetric(INamedMetric *n, const char *name)
 {
-    if (interval)
-    {
-        StringBuffer fname(name);
-        fname.append("/s");
-        IntervalMetric *im = new IntervalMetric(n, interval);
-        ticker.addListener(im);
-        metricMap.setValue(fname.str(), im);
-        im->Release();
-    }
     metricMap.setValue(name, n);
     n->Release();
 }
 
-void CRoxieMetricsManager::doAddMetric(AccessorFunction function, const char *name, unsigned interval)
+void CRoxieMetricsManager::doAddMetric(AccessorFunction function, const char *name)
 {
-    assertex(interval==0);
-    doAddMetric(new FunctionMetric(function), name, interval);
+    doAddMetric(new FunctionMetric(function), name);
 }
 
 void CRoxieMetricsManager::addRatioMetric(RelaxedAtomic<unsigned> &counter, const char *name, RelaxedAtomic<unsigned __int64> &elapsed)
 {
-    doAddMetric(new UnsignedRatioMetric(counter, elapsed), name, 0);
+    doAddMetric(new UnsignedRatioMetric(counter, elapsed), name);
 }
 
 void CRoxieMetricsManager::addUserMetric(const char *name, const char *regex)
 {
-    doAddMetric(new UserMetric(name, regex), name, 0);
+    doAddMetric(new UserMetric(name, regex), name);
 }
 
 long CRoxieMetricsManager::getValue(const char * name)
@@ -464,25 +260,6 @@ long CRoxieMetricsManager::getValue(const char * name)
 
 CRoxieMetricsManager::~CRoxieMetricsManager()
 {
-    ticker.stop();
-    if (started)
-        dumpMetrics();
-}
-
-void CRoxieMetricsManager::dumpMetrics()
-{
-    HashIterator metrics(metricMap);
-    ForEach(metrics)
-    {           
-        IMapping &cur = metrics.query();
-        INamedMetric *m = (INamedMetric *) *metricMap.mapToValue(&cur);
-        if (m->isCumulative())
-        {
-            const char *name = (const char *) cur.getKey();
-            long val = m->getValue();
-            DBGLOG("TOTALS: %s = %ld", name, val);
-        }
-    }
 }
 
 StringBuffer &CRoxieMetricsManager::getMetrics(StringBuffer &xml)
@@ -609,7 +386,7 @@ class CQueryStatsAggregator : public CInterface, implements IQueryStatsAggregato
             unsigned *times = (unsigned *) alloca(useStats.size() * sizeof(unsigned));
             QueryStatsAggregateRecord aggregator(from, to);
             unsigned i = 0;
-            for (auto r : useStats)
+            for (auto &r : useStats)
             {
                 aggregator.noteQuery(r.failed, r.elapsedTimeMs, r.memUsed, r.agentsReplyLen, r.bytesOut);
                 times[i++] = r.elapsedTimeMs;
@@ -628,7 +405,7 @@ class CQueryStatsAggregator : public CInterface, implements IQueryStatsAggregato
 
         static void getRawStats(IPropertyTree &result, std::deque<QueryStatsRecord> &useStats)
         {
-            for (auto r : useStats)
+            for (auto &r : useStats)
             {
                 Owned<IPropertyTree> queryStatsRecord = createPTree("QueryStatsRecord", ipt_fast);
                 CDateTime dt;
@@ -821,7 +598,7 @@ class CQueryStatsAggregator : public CInterface, implements IQueryStatsAggregato
 
         static void getRawStats(IPropertyTree &result, std::deque<QueryStatsAggregateRecord> &useStats, time_t from, time_t to)
         {
-            for (auto r : useStats)
+            for (auto &r : useStats)
             {
                 Owned<IPropertyTree> queryStatsAggregateRecord = createPTree("QueryStatsAggregateRecord", ipt_fast);
                 r.getStats(*queryStatsAggregateRecord, true);
@@ -830,7 +607,7 @@ class CQueryStatsAggregator : public CInterface, implements IQueryStatsAggregato
         }
     };
 
-    CriticalSection statsLock;  // Protects multithreaded access to recent and aggregated structures
+    CriticalSection statsLock{SYNC_LOCATION};  // Protects multithreaded access to recent and aggregated structures
     std::deque<QueryStatsRecord> recent;
     std::deque<QueryStatsAggregateRecord> aggregated; // stored with most recent first
     unsigned expirySeconds;  // time to keep exact info (rather than just aggregated)
@@ -994,7 +771,7 @@ public:
             std::deque<QueryStatsRecord> useStats;
             {
                 CriticalBlock b(statsLock);
-                for (auto rec : recent)
+                for (auto &rec : recent)
                 {
                     if (rec.inRange(from, to))
                         useStats.push_back(rec);
@@ -1008,9 +785,9 @@ public:
             QueryStatsAggregateRecord aggregator(from, to);
             {
                 CriticalBlock b(statsLock);
-                for (auto thisSlot: aggregated)
+                for (auto &thisSlot: aggregated)
                 {
-                    if (thisSlot.inRange(from, to))
+                    if (thisSlot.timeOverlap(from, to))
                         aggregator.mergeStats(thisSlot);
                     else if (thisSlot.older(from))
                         break;
@@ -1029,7 +806,7 @@ public:
         std::deque<QueryStatsRecord> useStats;
         {
             CriticalBlock b(statsLock);
-            for (auto rec : recent)
+            for (auto &rec : recent)
             {
                 if (rec.inRange(from, to))
                     useStats.push_back(rec);
@@ -1041,7 +818,7 @@ public:
         std::deque<QueryStatsAggregateRecord> aggregatedStats;
         {
             CriticalBlock b(statsLock);
-            for (auto thisSlot: aggregated)
+            for (auto &thisSlot: aggregated)
             {
                 if (thisSlot.timeOverlap(from, to))
                     aggregatedStats.push_back(thisSlot);
@@ -1060,7 +837,7 @@ public:
     }
 };
 
-ReadWriteLock CQueryStatsAggregator::queryStatsLock;
+ReadWriteLock CQueryStatsAggregator::queryStatsLock{SYNC_LOCATION};
 CIArrayOf<CQueryStatsAggregator> CQueryStatsAggregator::queryStatsAggregators;
 CQueryStatsAggregator CQueryStatsAggregator::globalStatsAggregator(NULL, SLOT_LENGTH);
 

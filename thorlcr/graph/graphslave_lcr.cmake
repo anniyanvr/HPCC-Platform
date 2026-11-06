@@ -51,19 +51,20 @@ set_target_properties(graphslave_lcr PROPERTIES
     COMPILE_FLAGS -D_USRDLL
     DEFINE_SYMBOL GRAPHSLAVE_EXPORTS )
 install ( TARGETS graphslave_lcr RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( graphslave_lcr 
+target_link_libraries ( graphslave_lcr PRIVATE 
          jlib
+         roxiemem
          nbcd 
          eclrtl 
          deftype 
          thorhelper 
          dafsclient 
          dalibase 
-         environment 
          dllserver 
          workunit 
          thorcodectx_lcr 
-         jhtree 
+         jhtree
+         mp
          graph_lcr 
     )
 

@@ -205,7 +205,7 @@ private:
     MapStringToMyClass<REnvironment> preservedScopes;
 }* globalState = NULL;
 
-static CriticalSection RCrit;  // R is single threaded - need to own this before making any call to R
+static CriticalSection RCrit{SYNC_LOCATION};  // R is single threaded - need to own this before making any call to R
 
 void RGlobalState::unregister(const char *key)
 {
@@ -218,7 +218,11 @@ static RGlobalState *queryGlobalState()
 {
     CriticalBlock b(RCrit);
     if (!globalState)
+    {
+        if (!isMainThread())
+            FAIL("R embed support must be loaded or preloaded on main thread");
         globalState = new RGlobalState;
+    }
     return globalState;
 }
 
@@ -1131,7 +1135,7 @@ public:
                 rtlRowBuilder out;
                 byte *outData = NULL;
                 size32_t outBytes = 0;
-                if (elemSize != UNKNOWN_LENGTH)
+                if (!isUnknownLength(elemSize))
                 {
                     outBytes = numResults * elemSize;  // MORE - check for overflow?
                     out.ensureAvailable(outBytes);
@@ -1143,7 +1147,7 @@ public:
                     const char *text = (*iter).data();
                     if (elemType == type_string)
                     {
-                        if (elemSize == UNKNOWN_LENGTH)
+                        if (isUnknownLength(elemSize))
                         {
                             out.ensureAvailable(outBytes + lenBytes + sizeof(size32_t));
                             outData = out.getbytes() + outBytes;
@@ -1159,7 +1163,7 @@ public:
                     }
                     else
                     {
-                        if (elemSize == UNKNOWN_LENGTH)
+                        if (isUnknownLength(elemSize))
                         {
                             out.ensureAvailable(outBytes + lenBytes + 1);
                             outData = out.getbytes() + outBytes;
@@ -1338,7 +1342,7 @@ public:
             while (inData < endData)
             {
                 int thisSize;
-                if (elemSize == UNKNOWN_LENGTH)
+                if (isUnknownLength(elemSize))
                 {
                     if (elemType==type_varstring)
                         thisSize = strlen((const char *) inData) + 1;

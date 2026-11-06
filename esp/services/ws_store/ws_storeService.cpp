@@ -94,13 +94,13 @@ void CwsstoreEx::init(IPropertyTree *_cfg, const char *_process, const char *_se
             VStringBuffer xpath("Stores/Store[%s='%s']", ESP_STORE_NAME_ATT, id.str());
             if (stores && stores->hasProp(xpath.str()))
             {
-                ESPLOG(LogMin, "CwsstoreEx: Creating Store: '%s'%s", id.str(), isDefault ? " - as Default" : "");
-
-                m_storeProvider->createStore(type.str(), id.str(), description.str(), secuser.get(), maxvalsize);
+                ESPLOG(LogMin, "CwsstoreEx: Detected previously created store '%s'.", id.str());
             }
             else
             {
-                ESPLOG(LogMin, "CwsstoreEx: Detected previously created store '%s'.", id.str());
+                ESPLOG(LogMin, "CwsstoreEx: Creating Store: '%s'%s", id.str(), isDefault ? " - as Default" : "");
+
+                m_storeProvider->createStore(type.str(), id.str(), description.str(), secuser.get(), maxvalsize);
             }
 
             if (isDefault)
@@ -271,6 +271,7 @@ bool CwsstoreEx::onListKeys(IEspContext &context, IEspListKeysRequest &req, IEsp
 
     StringArray keys;
     m_storeProvider->fetchKeySet(keys, storename, ns, secuser.get(), !req.getUserSpecific());
+
     resp.setKeySet(keys);
     resp.setNamespace(ns);
     resp.setStoreName(storename);
@@ -312,10 +313,11 @@ bool CwsstoreEx::onFetch(IEspContext &context, IEspFetchRequest &req, IEspFetchR
             storename = m_defaultStore.get();
     }
 
-    m_storeProvider->fetch(storename, req.getNamespace(), req.getKey(), value, secuser.get(), !req.getUserSpecific());
-    resp.setValue(value.str());
+    bool success = m_storeProvider->fetch(storename, req.getNamespace(), req.getKey(), value, secuser.get(), !req.getUserSpecific());
+    if (success)
+        resp.setValue(value.str());
 
-    return true;
+    return success;
 }
 
 bool CwsstoreEx::onFetchKeyMetadata(IEspContext &context, IEspFetchKeyMDRequest &req, IEspFetchKeyMDResponse &resp)
@@ -370,22 +372,28 @@ bool CwsstoreEx::onFetchAll(IEspContext &context, IEspFetchAllRequest &req, IEsp
             storename = m_defaultStore.get();
     }
 
-    Owned<IPropertyTree> nstree = m_storeProvider->getAllPairs(storename, ns, secuser.get(), !req.getUserSpecific());
-
     IArrayOf<IEspKVPair> pairs;
-
-    Owned<IPropertyTreeIterator> iter = nstree->getElements("*");
-    ForEach(*iter)
     {
-        StringBuffer name;
-        StringBuffer value;
-        iter->query().getName(name);
-        nstree->getProp(name.str(), value);
+        Owned<IPropertyTree> nstree = m_storeProvider->getAllPairs(storename, ns, secuser.get(), !req.getUserSpecific());
 
-        Owned<IEspKVPair> kvpair = createKVPair("","");
-        kvpair->setKey(name.str());
-        kvpair->setValue(value.str());
-        pairs.append(*kvpair.getClear());
+        Owned<IPropertyTreeIterator> iter = nstree->getElements("*");
+        ForEach(*iter)
+        {
+            StringBuffer name;
+            StringBuffer value;
+            iter->query().getName(name);
+            nstree->getProp(name.str(), value);
+
+            Owned<IEspKVPair> kvpair = createKVPair("","");
+            
+            //it's possible this has been encoded, so decode it
+            StringBuffer decoded;
+            decodePtreeName(decoded, name.str());
+
+            kvpair->setKey(decoded.str());
+            kvpair->setValue(value.str());
+            pairs.append(*kvpair.getClear());
+        }
     }
 
     resp.setPairs(pairs);

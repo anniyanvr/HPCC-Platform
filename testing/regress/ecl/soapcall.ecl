@@ -16,7 +16,6 @@
 ############################################################################## */
 
 //class=roxieserviceaccess
-//version targetIP='127.0.0.1',goodPort='9876',blacListedPort='9875'
 
 #option('generateGlobalId', true);
 
@@ -49,8 +48,7 @@ output(sort(SOAPCALL(d, targetURL,'soapbase', { unkname }, DATASET(ServiceOutRec
 
 // double query->dataset form
 ServiceOutRecord doError(d l) := TRANSFORM
-  //SELF.name := 'ERROR: \'' + l.unkname + '\'-\'' + failmessage[1..18] + '\''; //if (l.unkname='FRED' AND failmessage[1..18]='blacklisted socket','blacklisted socket', failmessage);
-  SELF.name := 'ERROR: ' + if (l.unkname='FRED' AND (failmessage[1..18]='blacklisted socket' OR failmessage[1..18]='connection failed '),'blacklisted socket', failmessage[1..18]);
+  SELF.name := 'ERROR: ' + failmessage[1..17];
   SELF.pic := x'01020304';
   SELF.id := if (l.unkname='FRED' AND failcode=-3,-1,failcode);
   SELF.novalue := 0;
@@ -72,7 +70,7 @@ END;
 
 // Test some failure cases
 
-output(SORT(SOAPCALL(d, blacklistedTargetURL,'soapbase', { unkname }, DATASET(ServiceOutRecord), onFail(doError(LEFT)),RETRY(0), log('SOAP: ' + unkname),TIMEOUT(1)), record));
+output(SORT(SOAPCALL(d, blacklistedTargetURL,'soapbase', { unkname }, DATASET(ServiceOutRecord), onFail(doError(LEFT)),RETRY(0), log('SOAP: ' + unkname, 'TAIL: ' + unkname),TIMEOUT(1)), record));
 output(SORT(SOAPCALL(targetURL,'soapbase', { string unkname := 'FAIL' }, dataset(ServiceOutRecord),onFail(doError2),RETRY(0), LOG(MIN), HTTPHEADER('Global-Id','12345678900'), HTTPHEADER('Caller-Id','4444')),record));
 output(SORT(SOAPCALL(d, targetURL,'soapbaseNOSUCHQUERY', { unkname }, DATASET(ServiceOutRecord), onFail(doError3(LEFT)),MERGE(25),PARALLEL(1),RETRY(0), LOG(MIN)), record));
 
@@ -91,5 +89,5 @@ FullServiceOutRecord :=
 
 //leak children when linked counted rows are enabled, because not all records are read
 //Use a count so the results are consistent, and nofold to prevent the code generator removing the child dataset...
-output(count(nofold(choosen(SOAPCALL(d, targetURL,'soapbase', { string unkname := d.unkname+'1' }, dataset(FullServiceOutRecord)),1))));
+output(count(nofold(choosen(SOAPCALL(d, targetURL,'soapbase', { string unkname := d.unkname+'1' }, dataset(FullServiceOutRecord), log('start: ' + unkname, 'end: ' + unkname)),1))));
 output(count(nofold(choosen(SOAPCALL(d, targetURL,'soapbase', { string unkname := d.unkname+'1' }, dataset(FullServiceOutRecord), merge(3)),2))));

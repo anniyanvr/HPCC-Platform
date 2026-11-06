@@ -71,7 +71,7 @@ void cvtChooseListToPairs(HqlExprArray & target, IHqlExpression * from, unsigned
 {
     unsigned max = from->numChildren();
     unsigned idx;
-    target.ensure(max);
+    target.ensureSpace(max);
     for (idx = 0; idx < max; idx++)
     {
         IHqlExpression * v1 = createConstant(createIntValue(idx+base, LINK(unsignedType)));
@@ -85,7 +85,7 @@ void cvtIndexListToPairs(HqlExprArray & target, IHqlExpression * from)
 {
     unsigned max = from->numChildren();
     unsigned idx;
-    target.ensure(max);
+    target.ensureSpace(max);
     for (idx = 0; idx < max; idx++)
     {
         IHqlExpression * v1 = from->queryChild(idx);
@@ -101,7 +101,7 @@ void cvtInListToPairs(HqlExprArray & target, IHqlExpression * from, bool valueIf
     unsigned idx;
     IHqlExpression * tValue = queryBoolExpr(valueIfMatch);
     ITypeInfo * type = queryBoolType();
-    target.ensure(max);
+    target.ensureSpace(max);
     for (idx = 0; idx < max; idx++)
     {
         IHqlExpression * v1 = from->queryChild(idx);
@@ -182,7 +182,7 @@ void HqlCppCaseInfo::addPair(IHqlExpression * expr)
 
 void HqlCppCaseInfo::addPairs(HqlExprArray & _pairs)
 {
-    pairs.ensure(_pairs.ordinality());
+    pairs.ensureSpace(_pairs.ordinality());
     ForEachItemIn(idx, _pairs)
         addPair(&_pairs.item(idx));
 }
@@ -415,7 +415,7 @@ IHqlExpression * HqlCppCaseInfo::buildIndexedMap(BuildCtx & ctx, const CHqlBound
     }
     else
     {
-        values.ensure(num);
+        values.ensureSpace(num);
         unsigned idx;
         for (idx = 0; idx < num; idx++)
             values.append(*LINK(dft));
@@ -794,7 +794,10 @@ void HqlCppCaseInfo::buildGeneralAssign(BuildCtx & ctx, IExprProcessor & target)
     Owned<BuildCtx> subctx = new BuildCtx(ctx);
     CHqlBoundExpr pureCond;
     if (cond.get())
-        translator.buildCachedExpr(*subctx, cond, pureCond);
+    {
+        OwnedHqlExpr simpleCond = complexCompare ? getSimplifyCompareArg(cond) : LINK(cond);
+        translator.buildCachedExpr(*subctx, simpleCond, pureCond);
+    }
     
     OwnedHqlExpr testMore;
 
@@ -898,7 +901,7 @@ IHqlExpression * HqlCppCaseInfo::createCompareList()
     }
 
     HqlExprArray values;
-    values.ensure(pairs.ordinality());
+    values.ensureCapacity(pairs.ordinality());
     ForEachItemIn(idx, pairs)
     {
         IHqlExpression & pair = pairs.item(idx);
@@ -960,7 +963,7 @@ IHqlExpression * HqlCppCaseInfo::createResultsExpr(IHqlExpression * matchVar, bo
 
     IHqlExpression * prevValue = NULL;
     HqlExprArray values;
-    values.ensure(pairs.ordinality());
+    values.ensureCapacity(pairs.ordinality());
     ForEachItemIn(idx, pairs)
     {
         IHqlExpression & pair = pairs.item(idx);

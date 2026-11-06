@@ -28,7 +28,6 @@
 #include "XMLTags.h"
 #include "httpclient.hpp"
 #include "jqueue.tpp"
-#include "build-config.h"
 
 typedef enum EnvAction_
 {
@@ -128,7 +127,7 @@ private:
         {
             m_pWorkerThread = new CThreaded("CGenerateJSFactoryThread");
             IThreaded* pIThreaded = this;
-            m_pWorkerThread->init(pIThreaded);
+            m_pWorkerThread->init(pIThreaded, false);
         }
 
         void refresh(IConstEnvironment* pConstEnv)
@@ -175,7 +174,7 @@ private:
     {
     public:
       CConfigFileMonitorThread(unsigned int uCheckInterval, unsigned int uTimeout)
-        : m_pWorkerThread(NULL), m_quitThread(false), m_uCheckInterval(uCheckInterval), m_uTimeout(uTimeout), m_configChangeNotification(this)
+        : m_pWorkerThread(NULL), m_quitThread(false), m_uTimeout(uTimeout), m_uCheckInterval(uCheckInterval), m_configChangeNotification(this)
       {
       };
 
@@ -240,7 +239,7 @@ private:
 
       virtual void threadmain() override
       {
-        Owned<IFile> configFiles = createIFile(CONFIG_SOURCE_DIR);
+        Owned<IFile> configFiles = createIFile(hpccBuildInfo.configSourceDir);
 
         while ( m_quitThread == false )
         {
@@ -259,28 +258,11 @@ private:
         {
           m_pWorkerThread = new CThreaded("CConfigFileMonitorThread");
           IThreaded* pIThreaded = this;
-          m_pWorkerThread->init(pIThreaded);
+          m_pWorkerThread->init(pIThreaded, false);
         }
       };
 
-      static CConfigFileMonitorThread* getInstance()
-      {
-        static Owned<CConfigFileMonitorThread> s_configFileMonitorSingleton;
-        static CSingletonLock slock;
-
-        if (slock.lock() == true)
-        {
-          if (s_configFileMonitorSingleton.get() == NULL)
-          {
-            s_configFileMonitorSingleton.setown(new CWsDeployFileInfo::CConfigFileMonitorThread(CONFIG_MONITOR_CHECK_INTERVAL, CONFIG_MONITOR_TIMEOUT_PERIOD));
-            s_configFileMonitorSingleton->init();
-          }
-
-          slock.unlock();
-        }
-
-        return s_configFileMonitorSingleton.get();
-      };
+      static CConfigFileMonitorThread* getInstance();
 
     protected:
       CThreaded* m_pWorkerThread;
@@ -289,7 +271,7 @@ private:
       unsigned int m_uTimeout;
       unsigned int m_uCheckInterval;
       QueueOf<IConfigFileObserver,false> m_qObservers;
-      CriticalSection m_critsecObserverQueue;
+      CriticalSection m_critsecObserverQueue{SYNC_LOCATION};
       CConfigChangeNotification m_configChangeNotification;
 
     private:
@@ -342,7 +324,7 @@ private:
             m_quitThread = false;
             m_pWorkerThread = new CThreaded("CClientAliveThread");
             IThreaded* pIThreaded = this;
-            m_pWorkerThread->init(pIThreaded);
+            m_pWorkerThread->init(pIThreaded, false);
         }
 
         void signal()
@@ -353,7 +335,7 @@ private:
     private:
         CThreaded* m_pWorkerThread;
         CWsDeployFileInfo* m_pFileInfo;
-        Semaphore m_sem;
+        Semaphore m_sem{SYNC_LOCATION};
         bool m_quitThread;
         unsigned m_brokenConnTimeout;
     };
@@ -394,7 +376,7 @@ private:
       m_quitThread = false;
       m_pWorkerThread = new CThreaded("CLockerAliveThread");
       IThreaded* pIThreaded = this;
-      m_pWorkerThread->init(pIThreaded);
+      m_pWorkerThread->init(pIThreaded, false);
     }
 
     void signal()
@@ -410,12 +392,12 @@ private:
     unsigned m_brokenConnTimeout;
     Owned<IPropertyTree> m_pComputers;
     StringBuffer m_user;
-    Semaphore m_sem;
+    Semaphore m_sem{SYNC_LOCATION};
   };
 
 public:
     IMPLEMENT_IINTERFACE;
-    CWsDeployFileInfo(CWsDeployExCE* pService, const char* pEnvFile, bool bCloud) : m_configChanged(false), m_pService(pService),m_bCloud(bCloud)
+    CWsDeployFileInfo(CWsDeployExCE* pService, const char* pEnvFile, bool bCloud) : m_configChanged(false), m_bCloud(bCloud), m_pService(pService)
     {
         m_envFile.clear().append(pEnvFile);
     }
@@ -547,7 +529,7 @@ private:
     Owned<SCMStringBuffer>    m_pEnvXml;
     Owned<IPropertyTree>      m_pNavTree;
     Owned<SCMStringBuffer>    m_pGraphXml;
-    Mutex                     m_mutex;
+    Mutex m_mutex{SYNC_LOCATION};
     Owned<IEnvironment>       m_Environment;
     StringBuffer              m_userWithLock;
     StringBuffer              m_userIp;
@@ -668,7 +650,7 @@ public:
             if (m_threadPool == NULL)
             {
                 IThreadFactory* pThreadFactory = new CCloudTaskThreadFactory();
-                m_threadPool.setown(createThreadPool("WsDeploy Cloud Task Thread Pool", pThreadFactory, NULL, pComputers->numChildren()));
+                m_threadPool.setown(createThreadPool("WsDeploy Cloud Task Thread Pool", pThreadFactory, false, nullptr, pComputers->numChildren()));
                 pThreadFactory->Release();
             }
             else
@@ -680,7 +662,7 @@ public:
 
             Owned<IPropertyTreeIterator> iter = pComputers->getElements(XML_TAG_COMPUTER);
             StringBuffer localip;
-            queryHostIP().getIpText(localip);
+            queryHostIP().getHostText(localip);
 
             ForEach(*iter)
             {
@@ -793,11 +775,11 @@ public:
     const char* getUser() {return m_user.str();}
     const char* getNewEnv() {return m_newEnv.str();}
     const char* getNewEnvId() {return m_newEnvId.str();}
-    const char* getCurIp(){ if (m_curIp.length() == 0) queryHostIP().getIpText(m_curIp); return m_curIp.str(); }
+    const char* getCurIp(){ if (m_curIp.length() == 0) queryHostIP().getHostText(m_curIp); return m_curIp.str(); }
 
 private:
     CWsDeployFileInfo* m_pFileInfo;
-    Mutex m_mutex;
+    Mutex m_mutex{SYNC_LOCATION};
     bool m_opFailed;
     EnvAction m_eA;
     EnvAction m_cancelEA;
@@ -955,7 +937,7 @@ private:
   virtual void getWizOptions(StringBuffer& sb);
 
 protected:
-    Mutex                     m_mutexSrv;
+    Mutex m_mutexSrv{SYNC_LOCATION};
     StringBuffer              m_envFile;
     StringBuffer              m_backupDir;
     StringBuffer              m_sourceDir;

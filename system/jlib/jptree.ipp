@@ -24,14 +24,57 @@
 #include "jhash.hpp"
 #include "jmutex.hpp"
 #include "jsuperhash.hpp"
-
+#include "jlzw.hpp"
 
 #include "jptree.hpp"
 #include "jbuff.hpp"
 #include "jlog.hpp"
+#include "jstreamhelpers.hpp"
 
 #define ANE_APPEND -1
 #define ANE_SET -2
+
+// Context object for property tree deserialization
+// To be used to avoid repeated allocations during deserialization
+class PTreeDeserializeContext
+{
+public:
+    PTreeDeserializeContext()
+    {
+        // Since most nodes have <= 15 attribute name/value pairs;
+        // reserve space up front to avoid reallocations.
+        constexpr size32_t expectedMaximumAttributeOffsetCount = 15 * 2;
+        matchOffsets.reserve(expectedMaximumAttributeOffsetCount);
+    }
+
+    PTreeDeserializeContext(const MemoryBuffer & mb) : PTreeDeserializeContext()
+    {
+        swapEndian = mb.needSwapEndian();
+    }
+
+    template <class T>
+    void readEndian(IBufferedSerialInputStream &src, T &value) const
+    {
+        if (!swapEndian || sizeof(T) == 1)
+        {
+            ::read(src, value);
+            return;
+        }
+
+        byte temp[sizeof(T)];
+        ::read(src, temp, sizeof(T));
+        auto *dst = reinterpret_cast<byte *>(&value);
+        for (size32_t i = 0; i < sizeof(T); ++i)
+            dst[i] = temp[sizeof(T) - 1 - i];
+    }
+
+public:
+    std::vector<size32_t> matchOffsets;
+
+protected:
+    bool swapEndian = false;
+};
+
 ///////////////////
 class MappingStringToOwned : public MappingStringTo<IInterfacePtr,IInterfacePtr>
 {
@@ -49,11 +92,7 @@ class jlib_decl ChildMap : protected SuperHashTableOf<IPropertyTree, constcharpt
 protected:
 // SuperHashTable definitions
     virtual void onAdd(void *) override {}
-    virtual void onRemove(void *e) override
-    {
-        IPropertyTree &elem = *(IPropertyTree *)e;
-        elem.Release();
-    }
+    virtual void onRemove(void *e) override;
     virtual const void *getFindParam(const void *e) const override
     {
         const IPropertyTree &elem = *(const IPropertyTree *)e;
@@ -62,23 +101,23 @@ protected:
     virtual unsigned getHashFromElement(const void *e) const override;
     virtual unsigned getHashFromFindParam(const void *fp) const override
     {
-        return hashc((const unsigned char *)fp, (size32_t)strlen((const char *)fp), 0);
+        return hashcz_fnv1a((const unsigned char *)fp, fnvInitialHash32);
     }
     virtual bool matchesFindParam(const void *e, const void *fp, unsigned fphash) const override
     {
         return streq(((IPropertyTree *)e)->queryName(), (const char *)fp);
     }
-public: 
+public:
     IMPLEMENT_IINTERFACE;
     IMPLEMENT_SUPERHASHTABLEOF_REF_FIND(IPropertyTree, constcharptr);
 
     inline unsigned count() const { return SuperHashTableOf<IPropertyTree, constcharptr>::count(); }
 
     ChildMap() : SuperHashTableOf<IPropertyTree, constcharptr>(4)
-    { 
+    {
     }
-    ~ChildMap() 
-    { 
+    ~ChildMap()
+    {
         _releaseAll();
     }
     virtual unsigned numChildren() const;
@@ -112,7 +151,7 @@ public:
 // SuperHashTable definitions
     virtual unsigned getHashFromFindParam(const void *fp) const override
     {
-        return hashnc((const unsigned char *)fp, (size32_t)strlen((const char *)fp), 0);
+        return hashncz_fnv1a((const unsigned char *)fp, fnvInitialHash32);
     }
     virtual bool matchesFindParam(const void *e, const void *fp, unsigned fphash) const override
     {
@@ -160,12 +199,15 @@ interface IPTArrayValue
     virtual size32_t queryValueRawSize() const = 0;
     virtual unsigned find(const IPropertyTree *search) const = 0;
     virtual IPropertyTree **getRawArray() const = 0;
+    virtual CompressionMethod getCompressionType() const = 0;
 
+    virtual void serializeToStream(IBufferedSerialOutputStream &tgt) const = 0;
+//serializable
     virtual void serialize(MemoryBuffer &tgt) = 0;
     virtual void deserialize(MemoryBuffer &src) = 0;
 };
 
-class CPTArray : implements IPTArrayValue, private IArray
+class CPTArray final : implements IPTArrayValue, private IArray
 {
     std::atomic<CQualifierMap *> map{nullptr};
 public:
@@ -174,6 +216,7 @@ public:
     virtual CQualifierMap *queryMap() override { return map.load(); }
     virtual CQualifierMap *setMap(CQualifierMap *_map) override;
     virtual bool isCompressed() const override { return false; }
+    virtual CompressionMethod getCompressionType() const override { return COMPRESS_METHOD_NONE; }
     virtual const void *queryValue() const override { UNIMPLEMENTED; }
     virtual MemoryBuffer &getValue(MemoryBuffer &tgt, bool binary) const override { UNIMPLEMENTED; }
     virtual StringBuffer &getValue(StringBuffer &tgt, bool binary) const override { UNIMPLEMENTED; }
@@ -190,25 +233,47 @@ public:
     {
         return (IPropertyTree **)getArray();
     }
+
+    virtual void serializeToStream(IBufferedSerialOutputStream &tgt) const override { UNIMPLEMENTED; }
 // serializable
     virtual void serialize(MemoryBuffer &tgt) override { UNIMPLEMENTED; }
     virtual void deserialize(MemoryBuffer &src) override { UNIMPLEMENTED; }
 };
 
 
-class jlib_decl CPTValue : implements IPTArrayValue, private MemoryAttr
+class jlib_decl CPTValue final : implements IPTArrayValue, private MemoryAttr
 {
 public:
     CPTValue(MemoryBuffer &src)
-    { 
-        deserialize(src); 
+    {
+        deserialize(src);
     }
-    CPTValue(size32_t size, const void *data, bool binary=false, bool raw=false, bool compressed=false);
+    CPTValue(IBufferedSerialInputStream &src, size32_t len)
+    {
+        if (len)
+        {
+            read(src, compressType);
+            if (compressType == COMPRESS_METHOD_LZWLEGACY)
+                compressType = COMPRESS_METHOD_LZW_LITTLE_ENDIAN;
+            MemoryAttr mem(len);
+            src.read(len, mem.bufferBase());
+            setOwn(len, mem.detach());
+        }
+        else
+        {
+            compressType = COMPRESS_METHOD_NONE;
+        }
+    }
+    explicit CPTValue() = default;   //MORE: Should there be a single shared null instance?
+    CPTValue(size32_t size, const void *data) : CPTValue(size, data, false, COMPRESS_METHOD_NONE, COMPRESS_METHOD_DEFAULT)
+    {}
+    CPTValue(size32_t size, const void *data, bool binary, CompressionMethod currentCompressType, CompressionMethod preferredCompressType);
 
     virtual bool isArray() const override { return false; }
     virtual CQualifierMap *queryMap() override { return nullptr; }
     virtual CQualifierMap *setMap(CQualifierMap *_map) { UNIMPLEMENTED; }
-    virtual bool isCompressed() const override { return compressed; }
+    virtual bool isCompressed() const override { return compressType != COMPRESS_METHOD_NONE; }
+    virtual CompressionMethod getCompressionType() const override { assertex(compressType != COMPRESS_METHOD_LZWLEGACY); return (CompressionMethod)compressType; }
     virtual const void *queryValue() const override;
     virtual MemoryBuffer &getValue(MemoryBuffer &tgt, bool binary) const override;
     virtual StringBuffer &getValue(StringBuffer &tgt, bool binary) const override;
@@ -223,12 +288,13 @@ public:
     virtual unsigned find(const IPropertyTree *search) const override { throwUnexpected(); }
     virtual IPropertyTree **getRawArray() const override { throwUnexpected(); }
 
+    virtual void serializeToStream(IBufferedSerialOutputStream &out) const override;
 // serializable
     virtual void serialize(MemoryBuffer &tgt) override;
     virtual void deserialize(MemoryBuffer &src) override;
 
 private:
-    mutable bool compressed;
+    mutable byte compressType = COMPRESS_METHOD_NONE;
 };
 
 #define IptFlagTst(fs, f) (0!=(fs&(f)))
@@ -236,8 +302,8 @@ private:
 #define IptFlagClr(fs, f) (fs &= (~f))
 
 // NOTE - hairy code alert!
-// In order to keep code common between atom and local versions of ptree, we store the atom-specific information BEFORE the this pointer of AttrStr
-// (see class AttrStrAtom below).
+// In order to keep code common between atom and local versions of ptree, we store the atom-specific information BEFORE the this pointer of AtomStr
+// (see class AtomStrAtom below).
 // This requires some care - in particular must use the right method to destroy the objects, and must not add any virtual methods to either class
 
 //#define TRACE_STRING_SIZE
@@ -245,7 +311,7 @@ private:
 //#define TRACE_ALL_STRING
 //#define TRACE_ALL_ATOM
 
-struct AttrStr
+struct AtomStr
 {
     const char *get() const
     {
@@ -253,7 +319,7 @@ struct AttrStr
     }
     char str_DO_NOT_USE_DIRECTLY[1];  // Actually [n] - null terminated
 
-    static AttrStr *create(const char *k)
+    static AtomStr *create(const char *k)
     {
         size32_t kl = k ? strlen(k) : 0;
 #ifdef TRACE_ALL_STRING
@@ -267,18 +333,18 @@ struct AttrStr
             DBGLOG("TRACE_STRING_SIZE: total size now %" I64F "d", maxsize.load());
         }
 #endif
-        AttrStr *ret = (AttrStr *) malloc(kl+1);
+        AtomStr *ret = (AtomStr *) malloc(kl+1);
         memcpy(ret->str_DO_NOT_USE_DIRECTLY, k, kl);
         ret->str_DO_NOT_USE_DIRECTLY[kl] = 0;
         return ret;
     }
-    static inline AttrStr *createNC(const char *k)
+    static inline AtomStr *createNC(const char *k)
     {
         // If we started to use a static hash table for common values, we would probably want to use a different one here for case-insensitive matches
         return create(k);
     }
 
-    static void destroy(AttrStr *a)
+    static void destroy(AtomStr *a)
     {
 #ifdef TRACE_STRING_SIZE
         totsize -= strlen(a->str_DO_NOT_USE_DIRECTLY)+1;
@@ -293,53 +359,103 @@ struct AttrStr
 };
 
 
-// In order to keep code common between atom and local versions of ptree, we store the atom-specific information BEFORE the this pointer of AttrStr
+// In order to keep code common between atom and local versions of ptree, we store the atom-specific information BEFORE the this pointer of AtomStr
 // This requires some care - in particular must use the right method to destroy the objects, and must not add any virtual methods to either class
 // Note that memory usage is significant as we create literally millions of these objects
 
 typedef unsigned hashfunc( const unsigned char *k, unsigned length, unsigned initval);
 
-struct AttrStrAtom
+struct AtomStrAtom
 {
     unsigned hash;
-    unsigned short linkcount;
+    std::atomic<unsigned short> linkcount;
     char str_DO_NOT_USE_DIRECTLY[1];  // Actually N
 
-    static AttrStrAtom *create(const char *k, size32_t kl, hashfunc _hash)
+protected:
+    void *operator new(size_t size, size32_t kl)
+    {
+        // size already includes the 1-byte str_DO_NOT_USE_DIRECTLY[1] member, which
+        // serves as the null terminator slot.  We need kl extra bytes for the string
+        // body, so total = size + kl (no +1 needed).
+        return malloc(size + kl);
+    }
+    void operator delete(void *p, size32_t kl)
+    {
+        free(p);
+    }
+    void operator delete(void *p)
+    {
+        free(p);
+    }
+
+    AtomStrAtom(const char *k, size32_t kl, unsigned _hash) : hash(_hash), linkcount(0)
+    {
+        memcpy(str_DO_NOT_USE_DIRECTLY, k, kl);
+        str_DO_NOT_USE_DIRECTLY[kl] = 0;
+    }
+    ~AtomStrAtom() = default;
+
+    static void traceCreate(const char *k, size_t sz)
     {
 #ifdef TRACE_ALL_ATOM
         DBGLOG("TRACE_ALL_ATOM: %s", k);
 #endif
 #ifdef TRACE_ATOM_SIZE
-        totsize += sizeof(AttrStrAtom)+kl+1;
+        totsize += sz;
         if (totsize > maxsize)
         {
             maxsize.store(totsize);
             DBGLOG("TRACE_ATOM_SIZE: total size now %" I64F "d", maxsize.load());
         }
 #endif
-        AttrStrAtom *ret = (AttrStrAtom *) malloc(offsetof(AttrStrAtom, str_DO_NOT_USE_DIRECTLY)+kl+1);
-        memcpy(ret->str_DO_NOT_USE_DIRECTLY, k, kl);
-        ret->str_DO_NOT_USE_DIRECTLY[kl] = 0;
-        ret->hash = _hash((const unsigned char *) k, kl, 17);
-        ret->linkcount = 0;
-        return ret;
     }
-    static void destroy(AttrStrAtom *a)
+    static void traceDestroy(const char *k, size_t sz)
     {
 #ifdef TRACE_ATOM_SIZE
-        totsize -= sizeof(AttrStrAtom)+strlen(a->str_DO_NOT_USE_DIRECTLY)+1;
+        totsize -= sz;
 #endif
-        free(a);
     }
 
-    AttrStr *toAttrStr()
+public:
+    AtomStr *toAtomStr()
     {
-        return (AttrStr *) &str_DO_NOT_USE_DIRECTLY;
+        return reinterpret_cast<AtomStr *>(&str_DO_NOT_USE_DIRECTLY);
     }
-    static AttrStrAtom *toAtom(AttrStr *a)
+    static AtomStrAtom *toAtom(AtomStr *a)
     {
-        return (AttrStrAtom *)(&a->str_DO_NOT_USE_DIRECTLY - offsetof(AttrStrAtom, str_DO_NOT_USE_DIRECTLY));
+        return reinterpret_cast<AtomStrAtom *>(reinterpret_cast<byte *>(a) - offsetof(AtomStrAtom, str_DO_NOT_USE_DIRECTLY));
+    }
+
+    // Saturating atomic increment.  Once the count reaches (unsigned short)-1 it
+    // sticks there permanently and the atom intentionally leaks rather than overflow.
+    inline bool link()
+    {
+        unsigned short lc = linkcount.load(std::memory_order_relaxed);
+        while (true)
+        {
+            if (unlikely(lc == (unsigned short)-1))
+                return true;
+            if (unlikely(lc == 0))
+                return false;
+            if (linkcount.compare_exchange_weak(lc, lc + 1, std::memory_order_relaxed))
+                return true;
+        }
+    }
+    // Saturating atomic decrement.  Returns true iff this thread performed the final
+    // decrement (1 -> 0), signaling that it now owns removing the atom from its
+    // hash table. Resurrection may occur before the lock is taken, handle carefully.
+    inline bool unlink()
+    {
+        unsigned short lc = linkcount.load(std::memory_order_relaxed);
+        while (true)
+        {
+            // It is possible but unlikely that lc has become 0 (e.g. another thread concurrently
+            // dropped it to 0) or become -1 (permanently leaked atom) at this point.
+            if (unlikely(lc == (unsigned short)-1 || lc == 0))
+                return false;
+            if (linkcount.compare_exchange_weak(lc, lc - 1, std::memory_order_acq_rel, std::memory_order_relaxed))
+                return (lc == 1);
+        }
     }
 #ifdef TRACE_ATOM_SIZE
     static std::atomic<__int64> totsize;
@@ -347,41 +463,78 @@ struct AttrStrAtom
 #endif
  };
 
-struct AttrStrC : public AttrStrAtom
+struct AtomStrC : public AtomStrAtom
 {
+    AtomStrC(const char *k, size32_t kl, unsigned _hash) : AtomStrAtom(k, kl, _hash)
+    {
+    }
     static inline unsigned getHash(const char *k)
     {
-        return hashc((const byte *)k, strlen(k), 17);
+        return hashcz_fnv1a((const byte *)k, fnvInitialHash32);
     }
     inline bool eq(const char *k)
     {
         return streq(k,str_DO_NOT_USE_DIRECTLY);
     }
-    static AttrStrC *create(const char *k)
+    static AtomStrC *createHash(const char *k, size32_t kl, unsigned h)
+    {
+        // sizeof(AtomStrC) already includes the 1-byte str_DO_NOT_USE_DIRECTLY[1]
+        // tail, so the allocation and trace size is sizeof + kl (no +1).
+        traceCreate(k, sizeof(AtomStrC) + kl);
+        return new(kl) AtomStrC(k, kl, h);
+    }
+    static AtomStrC *create(const char *k)
     {
         size32_t kl = k ? strlen(k) : 0;
-        return (AttrStrC *) AttrStrAtom::create(k, kl, hashc);
+        return createHash(k, kl, hashc_fnv1a((const byte *)k, kl, fnvInitialHash32));
+    }
+    static void destroy(AtomStrC *a)
+    {
+        // sizeof(AtomStrC) already includes the 1-byte tail; size matches createHash.
+        traceDestroy(a->str_DO_NOT_USE_DIRECTLY, sizeof(AtomStrC) + strlen(a->str_DO_NOT_USE_DIRECTLY));
+        delete a;
     }
 };
 
-struct AttrStrNC : public AttrStrAtom
+struct AtomStrNC : public AtomStrAtom
 {
+    AtomStrNC(const char *k, size32_t kl, unsigned _hash) : AtomStrAtom(k, kl, _hash)
+    {
+    }
     static inline unsigned getHash(const char *k)
     {
-        return hashnc((const byte *)k, strlen(k), 17);
+        return hashncz_fnv1a((const byte *)k, fnvInitialHash32);
     }
     inline bool eq(const char *k)
     {
         return strieq(k,str_DO_NOT_USE_DIRECTLY);
     }
-    static AttrStrNC *create(const char *k)
+    static AtomStrNC *createHash(const char *k, size32_t kl, unsigned h)
+    {
+        // sizeof(AtomStrNC) already includes the 1-byte str_DO_NOT_USE_DIRECTLY[1]
+        // tail, so the allocation and trace size is sizeof + kl (no +1).
+        traceCreate(k, sizeof(AtomStrNC) + kl);
+        return new(kl) AtomStrNC(k, kl, h);
+    }
+    static AtomStrNC *create(const char *k)
     {
         size32_t kl = k ? strlen(k) : 0;
-        return (AttrStrNC *) AttrStrAtom::create(k, kl, hashnc);
+        return createHash(k, kl, hashnc_fnv1a((const byte *)k, kl, fnvInitialHash32));
+    }
+    static void destroy(AtomStrNC *a)
+    {
+        // sizeof(AtomStrNC) already includes the 1-byte tail; size matches createHash.
+        traceDestroy(a->str_DO_NOT_USE_DIRECTLY, sizeof(AtomStrNC) + strlen(a->str_DO_NOT_USE_DIRECTLY));
+        delete a;
     }
 };
 
-typedef CMinHashTable<AttrStrC> RONameTable;
+// Node-name tables use the standard 16-bit AtomStrAtom/AtomStrC instances.
+// Note: If the number of distinct occurrences of a specific name or attribute
+// exceeds 65534, the linkcount locks at (unsigned short)-1 and the atom
+// will intentionally permanently leak rather than overflow.
+
+typedef CMinHashTable<AtomStrC> RONameTable;
 
 // NOTE - hairy code alert!
 // To save on storage (and contention) we store short string values in same slot as the pointer to longer
@@ -424,7 +577,7 @@ struct PtrStrUnion
 #endif
     };
 
-    inline PtrStrUnion<PTR>() : ptr(nullptr) {}
+    inline PtrStrUnion() : ptr(nullptr) {}
     inline bool isPtr() const
     {
         return (flag&1) == 0;
@@ -503,25 +656,43 @@ struct PtrStrUnion
 #define USE_READONLY_ATOMTABLE
 #endif
 
-typedef PtrStrUnion<AttrStr> AttrStrUnion;
-static_assert(sizeof(AttrStrUnion) == sizeof(AttrStr *), "AttrStrUnion size mismatch");  // Sanity check!
+inline bool hasPTreeEncodedMarker(const char *name)
+{
+    return (name && *name=='~');
+}
+
+inline const char *skipPTreeEncodedMarker(const char *name)
+{
+    if (hasPTreeEncodedMarker(name))
+        name++;
+    return name;
+}
+
+typedef PtrStrUnion<AtomStr> AtomStrUnion;
+static_assert(sizeof(AtomStrUnion) == sizeof(AtomStr *), "AtomStrUnion size mismatch");  // Sanity check!
 
 #ifdef USE_READONLY_ATOMTABLE
-struct AttrStrUnionWithTable : public AttrStrUnion
+struct AtomStrUnionWithTable : public AtomStrUnion
 {
+    inline bool isEncoded() const
+    {
+        if (!isPtr() && flag==3)
+            return (hasPTreeEncodedMarker(roNameTable->getIndex(idx2)->str_DO_NOT_USE_DIRECTLY));
+        return hasPTreeEncodedMarker(AtomStrUnion::get());
+    }
     inline const char *get() const
     {
         if (!isPtr() && flag==3)
-            return roNameTable->getIndex(idx2)->str_DO_NOT_USE_DIRECTLY;  // Should probably rename this back now!
-        return AttrStrUnion::get();
+            return skipPTreeEncodedMarker(roNameTable->getIndex(idx2)->str_DO_NOT_USE_DIRECTLY);  // Should probably rename this back now!
+        return skipPTreeEncodedMarker(AtomStrUnion::get());
     }
     bool set(const char *key)
     {
-        if (AttrStrUnion::set(key))
+        if (AtomStrUnion::set(key))
             return true;
         if (key && key[0]=='@')
         {
-            unsigned idx = roNameTable->findIndex(key, AttrStrC::getHash(key));
+            unsigned idx = roNameTable->findIndex(key, AtomStrC::getHash(key));
             if (idx != (unsigned) -1)
             {
                 assert(idx <= 0xffff);
@@ -535,19 +706,21 @@ struct AttrStrUnionWithTable : public AttrStrUnion
     static RONameTable *roNameTable;
 };
 
-struct AttrStrUnionWithValueTable : public AttrStrUnion
+struct AtomStrUnionWithValueTable : public AtomStrUnion
 {
     inline const char *get() const
     {
         if (flag==3) // no point in also checking !isPtr() afaics
             return roValueTable->getIndex(idx2)->str_DO_NOT_USE_DIRECTLY;  // Should probably rename this back now!
-        return AttrStrUnion::get();
+        return AtomStrUnion::get();
     }
     bool set(const char *key)
     {
+        if (AtomStrUnion::set(key))
+            return true;
         if (key)
         {
-            unsigned idx = roValueTable->findIndex(key, AttrStrC::getHash(key));
+            unsigned idx = roValueTable->findIndex(key, AtomStrC::getHash(key));
             if (idx != (unsigned) -1)
             {
                 assert(idx <= 0xffff);
@@ -563,16 +736,51 @@ struct AttrStrUnionWithValueTable : public AttrStrUnion
     }
     static RONameTable *roValueTable;
 };
+
+// Node-name variant: uses a separate roNameTable populated with common node names.
+// set() takes an nc flag and skips the RO table for nocase trees, since the table
+// stores case-sensitive entries only.
+struct NodeNameStrUnion : public AtomStrUnion
+{
+    inline const char *get() const
+    {
+        if (flag==3)
+            return roNameTable->getIndex(idx2)->str_DO_NOT_USE_DIRECTLY;
+        return AtomStrUnion::get();
+    }
+    bool set(const char *key, bool nc)
+    {
+        if (AtomStrUnion::set(key))
+            return true;
+        if (key && !nc)
+        {
+            unsigned idx = roNameTable->findIndex(key, AtomStrC::getHash(key));
+            if (idx != (unsigned) -1)
+            {
+                assert(idx <= 0xffff);
+                flag = 3;
+                idx2 = idx;
+                return true;
+            }
+        }
+        return false;
+    }
+    static RONameTable *roNameTable;
+};
 #else
-typedef AttrStrUnion AttrStrUnionWithTable;
-typedef AttrStrUnion AttrStrUnionWithValueTable;
+typedef AtomStrUnion AtomStrUnionWithTable;
+typedef AtomStrUnion AtomStrUnionWithValueTable;
+struct NodeNameStrUnion : public AtomStrUnion
+{
+    bool set(const char *key, bool /*nc*/) { return AtomStrUnion::set(key); }
+};
 
 #endif
 
 struct AttrValue
 {
-    AttrStrUnionWithTable key;
-    AttrStrUnionWithValueTable value;
+    AtomStrUnionWithTable key;
+    AtomStrUnionWithValueTable value;
 };
 
 
@@ -602,19 +810,37 @@ public:
     aindex_t findChild(IPropertyTree *child, bool remove=false);
     inline bool isnocase() const { return IptFlagTst(flags, ipt_caseInsensitive); }
     ipt_flags queryFlags() const { return (ipt_flags) flags; }
-    void serializeSelf(MemoryBuffer &tgt);
     void serializeCutOff(MemoryBuffer &tgt, int cutoff=-1, int depth=0);
     void deserializeSelf(MemoryBuffer &src);
     void serializeAttributes(MemoryBuffer &tgt);
-    IPropertyTree *clone(IPropertyTree &srcTree, bool self=false, bool sub=true);
-    void clone(IPropertyTree &srcTree, IPropertyTree &dstTree, bool sub=true);
+
+    void serializeCutOff(IBufferedSerialOutputStream &tgt, int cutoff=-1, int depth=0) const;
+    void deserializeSelf(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx);
+    void serializeAttributes(IBufferedSerialOutputStream &tgt) const;
+
+    void cloneIntoSelf(const IPropertyTree &srcTree, bool sub);     // clone the name and contents of srcTree into "this" tree
+    IPropertyTree * clone(const IPropertyTree &srcTree, bool sub);  // create a node (that matches the type of this) and clone the source
+    void cloneContents(const IPropertyTree &srcTree, bool sub);
+    AttrValue *rawCloneAttributes() const;
+    virtual IPTArrayValue * cloneValue() const;
+
     inline void setOwner(IPTArrayValue *_arrayOwner) { arrayOwner = _arrayOwner; }
     IPropertyTree *queryCreateBranch(IPropertyTree *branch, const char *prop, bool *existing=NULL);
     IPropertyTree *splitBranchProp(const char *xpath, const char *&_prop, bool error=false);
-    IPTArrayValue *queryValue() { return value; }
+    IPTArrayValue *queryValue() const { return value; }
     CQualifierMap *queryMap() { return value ? value->queryMap() : nullptr; }
     IPTArrayValue *detachValue() { IPTArrayValue *v = value; value = NULL; return v; }
-    void setValue(IPTArrayValue *_value, bool binary) { if (value) delete value; value = _value; if (binary) IptFlagSet(flags, ipt_binary); }
+    //This does not need to be virtual, because any remote PTree that the function is called on will already
+    //have the connection locked
+    void setValue(IPTArrayValue *_value, bool binary)
+    {
+        delete value;
+        value = _value;
+        if (binary)
+            IptFlagSet(flags, ipt_binary);
+        else
+            IptFlagClr(flags, ipt_binary);
+    }
     bool checkPattern(const char *&xxpath) const;
     IPropertyTree *detach()
     {
@@ -630,14 +856,28 @@ public:
     }
     virtual void createChildMap() { children = isnocase()?new ChildMapNC():new ChildMap(); }
     virtual void setName(const char *name) = 0;
+    virtual void serializeSelf(MemoryBuffer &tgt);
+    virtual void serializeSelf(IBufferedSerialOutputStream &tgt) const;
+    inline void markNameEncoded() { IptFlagSet(flags, ipt_escaped); }
+    inline bool isNameEncoded() const { return IptFlagTst(flags, ipt_escaped); }
+    inline bool isAttributeNameEncoded(const char *key) const
+    {
+        AttrValue *a = findAttribute(key);
+        if (!a)
+            return false;
+        return a->key.isEncoded();
+    }
+    virtual void setAttribute(const char *attr, const char *val, bool encoded) = 0;
+    virtual void cloneAttributes(const PTree &src) = 0;
 
 // IPropertyTree impl.
     virtual bool hasProp(const char * xpath) const override;
     virtual bool isBinary(const char *xpath=NULL) const override;
     virtual bool isCompressed(const char *xpath=NULL) const override;
+    virtual CompressionMethod getCompressionType() const override;
     virtual bool renameProp(const char *xpath, const char *newName) override;
     virtual bool renameTree(IPropertyTree *tree, const char *newName) override;
-    virtual const char *queryProp(const char *xpath) const override;
+    virtual const char *queryProp(const char *xpath, const char * dft = nullptr) const override;
     virtual bool getProp(const char *xpath, StringBuffer &ret) const override;
     virtual void setProp(const char *xpath, const char *val) override;
     virtual void addProp(const char *xpath, const char *val) override;
@@ -648,12 +888,14 @@ public:
     virtual __int64 getPropInt64(const char *xpath, __int64 dft=0) const override;
     virtual void setPropInt64(const char * xpath, __int64 val) override;
     virtual void addPropInt64(const char *xpath, __int64 val) override;
+    virtual void setPropReal(const char * xpath, double val) override;
+    virtual void addPropReal(const char *xpath, double val) override;
     virtual int getPropInt(const char *xpath, int dft=0) const override;
     virtual void setPropInt(const char *xpath, int val) override;
     virtual void addPropInt(const char *xpath, int val) override;
     virtual double getPropReal(const char *xpath, double dft=0.0) const override;
     virtual bool getPropBin(const char * xpath, MemoryBuffer &ret) const override;
-    virtual void setPropBin(const char * xpath, size32_t size, const void *data) override;
+    virtual void setPropBin(const char * xpath, size32_t size, const void *data, CompressionMethod preferredCompression) override;
     virtual void appendPropBin(const char *xpath, size32_t size, const void *data) override;
     virtual void addPropBin(const char *xpath, size32_t size, const void *data) override;
     virtual IPropertyTree *getPropTree(const char *xpath) const override;
@@ -674,42 +916,54 @@ public:
     virtual bool hasChildren() const override { return children && children->count()?true:false; }
     virtual unsigned numUniq() const override { return checkChildren()?children->count():0; }
     virtual unsigned numChildren() const override;
-    virtual bool isCaseInsensitive() const override { return isnocase(); }
+    virtual bool isCaseInsensitive() const override final { return isnocase(); }
     virtual unsigned getCount(const char *xpath) const override;
     virtual IPropertyTree *addPropTreeArrayItem(const char *xpath, IPropertyTree *val) override;
     virtual bool isArray(const char *xpath=NULL) const override;
-    virtual unsigned getAttributeCount() const override;
-
+    virtual unsigned getAttributeCount() const override final;
+    virtual void serializeToStream(IBufferedSerialOutputStream &out) const override;
+    virtual void deserializeFromStream(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx) override;
 // serializable impl.
     virtual void serialize(MemoryBuffer &tgt) override;
     virtual void deserialize(MemoryBuffer &src) override;
+#ifdef _USE_CPPUNIT
+    virtual bool isOrphaned() const override
+    {
+        return IptFlagTst(flags, ipt_ext5);
+    }
+    void cppunitSetOrphaned() { IptFlagSet(flags, ipt_ext5); }
+#endif
 
 protected:
     aindex_t getChildMatchPos(const char *xpath);
 
+    // Designed to be executed on an empty PTree.
+    virtual void deserializeAttributes(const char *base, PTreeDeserializeContext &ctx) = 0;
+
     virtual ChildMap *checkChildren() const;
     virtual bool isEquivalent(IPropertyTree *tree) const { return (nullptr != QUERYINTERFACE(tree, PTree)); }
-    virtual void setLocal(size32_t l, const void *data, bool binary=false);
+    virtual void setLocal(size32_t l, const void *data, bool binary, CompressionMethod compressType);
     virtual void appendLocal(size32_t l, const void *data, bool binary=false);
     virtual void addingNewElement(IPropertyTree &child, int pos) { }
     virtual void removingElement(IPropertyTree *tree, unsigned pos) { }
     virtual IPropertyTree *create(const char *name=nullptr, IPTArrayValue *value=nullptr, ChildMap *children=nullptr, bool existing=false) = 0;
     virtual IPropertyTree *create(MemoryBuffer &mb) = 0;
+    virtual IPropertyTree *create(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx) = 0;
     virtual IPropertyTree *ownPTree(IPropertyTree *tree);
 
-    virtual void setAttribute(const char *attr, const char *val) = 0;
     virtual bool removeAttribute(const char *k) = 0;
 
     AttrValue *findAttribute(const char *k) const;
-    const char *getAttributeValue(const char *k) const;
+    const char *getAttributeValue(const char *k, const char * dft) const;
     AttrValue *getNextAttribute(AttrValue *cur) const;
+    IPropertyTree *deserializeAddPropTree(IPropertyTree *child);
 
 private:
     void addLocal(size32_t l, const void *data, bool binary=false, int pos=-1);
     void resolveParentChild(const char *xpath, IPropertyTree *&parent, IPropertyTree *&child, StringAttr &path, StringAttr &qualifier);
     void replaceSelf(IPropertyTree *val);
+    IPropertyTree *addPropTree(const char *xpath, IPropertyTree *val, bool alwaysUseArray);
     void addPTreeArrayItem(IPropertyTree *peer, const char *xpath, PTree *val, aindex_t pos = (aindex_t) -1);
-    IPropertyTree *addPropTree(const char *xpath, IPropertyTree *val, bool array);
 
 protected: // data
     /* NB: the order of the members here is important to reduce the size of the objects, because very large numbers of these are created.
@@ -726,68 +980,28 @@ protected: // data
 };
 
 
-class CAttrValHashTable
-{
-    CMinHashTable<AttrStrC>  htc;
-    CMinHashTable<AttrStrNC> htnc;
-    CMinHashTable<AttrStrC>  htv;
-public:
-    inline AttrStr *addkey(const char *v,bool nc)
-    {
-        AttrStrAtom * ret;
-        if (nc)
-            ret = htnc.find(v,true);
-        else
-            ret = htc.find(v,true);
-        if (ret->linkcount!=(unsigned short)-1)
-            ret->linkcount++;
-        return ret->toAttrStr();
-    }
-    inline AttrStr *addval(const char *v)
-    {
-        AttrStrAtom * ret = htv.find(v,true);
-        if (ret->linkcount!=(unsigned short)-1)
-            ret->linkcount++;
-        return ret->toAttrStr();
-    }
-    inline void removekey(AttrStr *_a,bool nc)
-    {
-        AttrStrAtom *a = AttrStrAtom::toAtom(_a);
-        if (a->linkcount!=(unsigned short)-1)
-        {
-            if (--(a->linkcount)==0)
-            {
-                if (nc)
-                    htnc.remove((AttrStrNC *)a);
-                else
-                    htc.remove((AttrStrC *)a);
-            }
-        }
-    }
-    inline void removeval(AttrStr *_a)
-    {
-        AttrStrAtom *a = AttrStrAtom::toAtom(_a);
-        if (a->linkcount!=(unsigned short)-1)
-            if (--(a->linkcount)==0)
-                htv.remove((AttrStrC *)a);
-    }
-};
-
 
 class jlib_decl CAtomPTree : public PTree
 {
-    AttrValue *newAttrArray(unsigned n);
-    void freeAttrArray(AttrValue *a, unsigned n);
-    PtrStrUnion<HashKeyElement> name;
+    NodeNameStrUnion name;
 protected:
-    virtual void setAttribute(const char *attr, const char *val) override;
     virtual bool removeAttribute(const char *k) override;
+    virtual IPropertyTree *create(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx) override
+    {
+        IPropertyTree *tree = new CAtomPTree();
+        tree->deserializeFromStream(in, ctx);
+        return tree;
+    }
+    virtual void deserializeAttributes(const char *base, PTreeDeserializeContext &ctx) override;
 public:
     CAtomPTree(const char *name=nullptr, byte flags=ipt_none, IPTArrayValue *value=nullptr, ChildMap *children=nullptr);
     ~CAtomPTree();
     const char *queryName() const override;
+    virtual bool isLowMemory() const override { return true; }
+    virtual void cloneAttributes(const PTree &src) override;
     virtual unsigned queryHash() const override;
     virtual void setName(const char *_name) override;
+    virtual void setAttribute(const char *attr, const char *val, bool encoded) override;
     virtual bool isEquivalent(IPropertyTree *tree) const override { return (nullptr != QUERYINTERFACE(tree, CAtomPTree)); }
     virtual IPropertyTree *create(const char *name=nullptr, IPTArrayValue *value=nullptr, ChildMap *children=nullptr, bool existing=false) override
     {
@@ -800,29 +1014,37 @@ public:
         return tree;
     }
 };
-
-
 jlib_decl IPropertyTree *createPropBranch(IPropertyTree *tree, const char *xpath, bool createIntermediates=false, IPropertyTree **created=NULL, IPropertyTree **createdParent=NULL);
 
 class jlib_decl LocalPTree : public PTree
 {
 protected:
-    virtual void setAttribute(const char *attr, const char *val) override;
     virtual bool removeAttribute(const char *k) override;
-    AttrStrUnion name;
+    virtual IPropertyTree *create(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx) override
+    {
+        IPropertyTree *tree = new LocalPTree();
+        tree->deserializeFromStream(in, ctx);
+        return tree;
+    }
+    virtual void deserializeAttributes(const char *base, PTreeDeserializeContext &ctx) override;
+    AtomStrUnion name;
 public:
     LocalPTree(const char *name=nullptr, byte flags=ipt_none, IPTArrayValue *value=nullptr, ChildMap *children=nullptr);
     ~LocalPTree();
 
     const char *queryName() const override;
+    virtual bool isLowMemory() const override { return false; }
+    virtual void cloneAttributes(const PTree &src) override;
     virtual unsigned queryHash() const override
     {
         const char *myname = queryName();
         assert(myname);
         size32_t nl = strlen(myname);
-        return isnocase() ? hashnc((const byte *)myname, nl, 0): hashc((const byte *)myname, nl, 0);
+        return hash_fnv1a((const byte *)myname, nl, fnvInitialHash32, isnocase());
+
     }
     virtual void setName(const char *_name) override;
+    virtual void setAttribute(const char *attr, const char *val, bool encoded) override;
     virtual bool isEquivalent(IPropertyTree *tree) const override { return (nullptr != QUERYINTERFACE(tree, LocalPTree)); }
     virtual IPropertyTree *create(const char *name=nullptr, IPTArrayValue *value=nullptr, ChildMap *children=nullptr, bool existing=false) override
     {
@@ -834,6 +1056,7 @@ public:
         tree->deserialize(mb);
         return tree;
     }
+
 };
 
 class SingleIdIterator : public CInterfaceOf<IPropertyTreeIterator>
@@ -920,6 +1143,7 @@ private: // data
 
 class CPTreeMaker : public CInterfaceOf<IPTreeMaker>
 {
+protected:
     bool rootProvided, noRoot;  // pack into the space following the link count
     IPropertyTree *root;
     ICopyArrayOf<IPropertyTree> ptreeStack;
@@ -944,13 +1168,13 @@ public:
         else
             nodeCreator = new CDefaultNodeCreator(flags);
         if (_root)
-        { 
+        {
             root = LINK(_root);
             rootProvided = true;
         }
         else
         {
-            root = NULL;    
+            root = NULL;
             rootProvided = false;
         }
         reset();
@@ -1003,7 +1227,7 @@ public:
         else
             currentNode->setProp(NULL, (const char *)value);
         unsigned c = ptreeStack.ordinality();
-        if (c==1 && !noRoot && currentNode != root) 
+        if (c==1 && !noRoot && currentNode != root)
             ::Release(currentNode);
         ptreeStack.pop();
         currentNode = (c>1) ? &ptreeStack.tos() : NULL;
@@ -1028,5 +1252,78 @@ public:
     }
 };
 
+class CPTreeEncodeNamesMaker : public CPTreeMaker
+{
+public:
+    CPTreeEncodeNamesMaker(byte flags=ipt_none, IPTreeNodeCreator *_nodeCreator=NULL, IPropertyTree *_root=NULL, bool _noRoot=false) : CPTreeMaker(flags, _nodeCreator, _root, _noRoot)
+    {
+    }
+    ~CPTreeEncodeNamesMaker()
+    {
+    }
+
+// IPTreeMaker
+    virtual void beginNode(const char *tag, bool arrayitem, offset_t startOffset) override
+    {
+        if (rootProvided)
+        {
+            currentNode = root;
+            rootProvided = false;
+        }
+        else
+        {
+            //Having to encode is the uncommon case.  Keep overhead low by only using a StringAttr here. If we do have to encode, take the hit then and use an adapter (StringAttrBuilder).
+            StringAttr encoded;
+            const char *startEncoding = findFirstInvalidPTreeNameChar(tag);
+            if (startEncoding)
+            {
+                {
+                    StringAttrBuilder encodingBuilder(encoded);
+                    encodePTreeName(encodingBuilder, tag, startEncoding);
+                }
+                tag = encoded.str();
+            }
+
+            IPropertyTree *parent = currentNode;
+            if (!root)
+            {
+                currentNode = nodeCreator->create(tag);
+                root = currentNode;
+                if (encoded.length())
+                    markPTreeNameEncoded(root);
+            }
+            else
+                currentNode = nodeCreator->create(NULL);
+            if (!parent && noRoot)
+                parent = root;
+            if (parent)
+            {
+                IPropertyTree *added = nullptr;
+                if (arrayitem)
+                    added = parent->addPropTreeArrayItem(tag, currentNode);
+                else
+                    added = parent->addPropTree(tag, currentNode);
+                if (encoded.length())
+                    markPTreeNameEncoded(added);
+            }
+        }
+        ptreeStack.append(*currentNode);
+    }
+    virtual void newAttribute(const char *name, const char *value) override
+    {
+        StringAttr encoded;
+        const char *startEncoding = findFirstInvalidPTreeNameChar(name);
+        if (startEncoding)
+        {
+            {
+                StringAttrBuilder encodingBuilder(encoded);
+                encodingBuilder.append('~'); //used internally for marking the attribute, not used when building xpaths
+                encodePTreeName(encodingBuilder, name, startEncoding);
+            }
+            name = encoded.str();
+        }
+        setPTreeAttribute(currentNode, name, value, !encoded.isEmpty());
+    }
+};
 
 #endif

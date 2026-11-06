@@ -1,6 +1,6 @@
 import { Column } from "@hpcc-js/chart";
 import { ascending as d3Ascending, max as d3Max, scaleLinear as d3ScaleLinear, select as d3Select } from "@hpcc-js/common";
-import { Workunit } from "@hpcc-js/comms";
+import { IScope, Workunit } from "@hpcc-js/comms";
 import { WUTimeline } from "@hpcc-js/eclwatch";
 import { ChartPanel } from "@hpcc-js/layout";
 
@@ -20,15 +20,59 @@ class TimingColumn extends Column {
     }
 }
 
+const columns = ["label", "start", "end", "icon", "color", "series", "depth"];
+
+export interface TimelineTooltipAnchor {
+    left: number;
+    top: number;
+}
+
+type TimelineHoverCallback = (scope: IScope, anchor: TimelineTooltipAnchor) => void;
+
 export class WUTimelinePatched extends WUTimeline {
+
+    private _hoverCallback?: TimelineHoverCallback;
+    private _hoverOutCallback?: () => void;
 
     constructor() {
         super();
-        this._gantt.bucketHeight(16);
+        this
+            .columns(columns)
+            .bucketColumn("icon")
+            ;
+        this._gantt
+            .bucketHeight(22)
+            .gutter(4)
+            .preserveZoom(true)
+            .overlapTolerence(-100)
+            .oddSeriesBackground("transparent")
+            .evenSeriesBackground("transparent")
+            ;
+        this._gantt["_series_idx"] = -1;
         this.strokeWidth(0);
         this.tooltipHTML(d => {
-            return d[d.length - 1].calcTooltip(); 
+            return d[7].__hpcc_id;
         });
+        this._gantt.mouseover = row => {
+            if (this._hoverCallback) {
+                const [left, top] = this._gantt["_tooltip"]?._cursorLoc ?? [0, 0];
+                this._gantt["_tooltip"].visible(false).render();
+                this._hoverCallback(row[7], { left, top });
+            }
+        };
+        this._gantt.mouseout = () => {
+            this._hoverOutCallback?.();
+        };
+    }
+
+    hoverCallback(callback?: TimelineHoverCallback): this {
+        this._hoverCallback = callback;
+        return this;
+    }
+
+    hoverOutCallback(callback?: () => void): this {
+        this._hoverOutCallback = callback;
+        return this;
     }
 
     data(): any;
@@ -39,9 +83,61 @@ export class WUTimelinePatched extends WUTimeline {
             if (row[2] === undefined || row[2] === null) {
                 row[2] = row[1];
             }
+            row[5] = null;
+            row.push(row[6]);
+            row[6] = (row[6]?.ScopeName?.split(":")?.length - 1) || 0;
             return row;
         }));
         return this;
+    }
+}
+
+export class WUTimelineNoFetch extends WUTimelinePatched {
+
+    constructor() {
+        super();
+    }
+
+    protected _scopes: IScope[] = [];
+    scopes(): IScope[];
+    scopes(_: IScope[]): this;
+    scopes(_?: IScope[]): IScope[] | this {
+        if (arguments.length === 0) return this._scopes;
+        this._scopes = _;
+        return this;
+    }
+
+    fetchScopes() {
+        const data = this._scopes.filter(scope => {
+            if (!scope.__hpcc_id) {
+                scope.__hpcc_id = scope.name;
+            }
+            return scope.id &&
+                scope.WhenStarted &&
+                scope.type !== "activity";
+        }).map((scope: IScope) => {
+            let whenFinished = scope.WhenFinished;
+            if (!whenFinished) {
+                if (scope.TimeElapsed) {
+                    const d = new Date(scope.WhenStarted);
+                    d.setMilliseconds(d.getMilliseconds() + scope.TimeElapsed * 1000);
+                    whenFinished = d.toISOString();
+                } else {
+                    // Graph still running — use current time as a placeholder end  
+                    whenFinished = new Date().toISOString();
+                }
+            }
+            return [
+                scope.id,
+                scope.WhenStarted,
+                whenFinished,
+                null,
+                this._palette(scope.type),
+                scope.name.split("::").join(":").split(":").slice(0, 1),
+                scope
+            ];
+        });
+        this.data(data);
     }
 }
 
@@ -260,6 +356,9 @@ export class Timings {
                                 case "cnt":
                                     props[scopeProperty.Name] = +scopeProperty.RawValue;
                                     break;
+                                case "cost":
+                                    props[scopeProperty.Name] = +scopeProperty.RawValue / 1000000;
+                                    break;
                                 case "cpu":
                                 case "skw":
                                 case "node":
@@ -405,6 +504,8 @@ export class WUTimelineEx extends WUTimeline {
 
     constructor() {
         super();
+        this._gantt.bucketHeight(16);
+        this.strokeWidth(0);
     }
 
     data(): any;

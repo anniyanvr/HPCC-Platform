@@ -7,8 +7,8 @@
 #include "mpbase.hpp"
 #include "mpcomm.hpp"
 #include "dasds.hpp"
-#include "saserver.hpp"
 #include "sautil.hpp"
+#include "sacoalescer.hpp"
 #include "dalienv.hpp"
 
 #define DEFAULT_INTERVAL                1       // 1 hour
@@ -18,7 +18,7 @@
 CriticalSection *suspendResumeCrit;
 MODULE_INIT(INIT_PRIORITY_STANDARD)
 {
-    suspendResumeCrit = new CriticalSection;
+    suspendResumeCrit = new CriticalSection(SYNC_LOCATION);
     return true;
 }
 MODULE_EXIT()
@@ -27,40 +27,42 @@ MODULE_EXIT()
 }
 
 
-void coalesceDatastore(bool force)
+void coalesceDatastore(IPropertyTree *coalesceProps, bool force)
 {
+    assertex(coalesceProps);
+
     try
     {
-        Owned<IPropertyTree> coalesceProps = serverConfig->getPropTree("Coalescer");
-        if (!coalesceProps)
-            coalesceProps.setown(createPTree("Coalescer"));
         StringBuffer dataPath, backupPath;
         IPropertyTree &confProps = querySDS().queryProperties();
-        confProps.getProp("@dataPathUrl", dataPath); 
-        confProps.getProp("@backupPathUrl", backupPath); 
+        confProps.getProp("@dataPathUrl", dataPath);
+        confProps.getProp("@backupPathUrl", backupPath);
         unsigned keepStores = confProps.getPropInt("@keepStores");
         if (0 == dataPath.length())
         {
             OERRLOG("COALESCER: No dali data path found.");
             return;
         }
-        
+
         if (backupPath.length())
             addPathSepChar(backupPath);
         addPathSepChar(dataPath);
 
         offset_t minDeltaSize = force?0:coalesceProps->getPropInt64("@minDeltaSize", DEFAULT_MINDELTASIZE);
 
+        bool saveBinary = confProps.getPropBool("Client/@saveBinary", true);
+        bool saveAsync = confProps.getPropBool("Client/@saveAsync", true);
+
         for (;;) {
             PROGLOG("COALESCER: dataPath=%s, backupPath=%s, minDeltaSize = %" I64F "dK", dataPath.str(), backupPath.str(), (unsigned __int64) minDeltaSize);
             unsigned configFlags = SH_External|SH_CheckNewDelta;
             configFlags |= coalesceProps->getPropBool("@recoverFromIncErrors", false) ? SH_RecoverFromIncErrors : 0;
             configFlags |= coalesceProps->getPropBool("@backupErrorFiles", true) ? SH_BackupErrorFiles : 0;
-            bool stopped;
-            Owned<IStoreHelper> iStoreHelper = createStoreHelper(NULL, dataPath, backupPath.str(), configFlags, keepStores, 5000, &stopped);
+            bool stopped = false;
+            Owned<IStoreHelper> iStoreHelper = createStoreHelper(NULL, dataPath, backupPath.str(), configFlags, keepStores, 5000, &stopped, saveBinary, saveAsync);
             unsigned baseEdition = iStoreHelper->queryCurrentEdition();
 
-            if (minDeltaSize) 
+            if (minDeltaSize)
             {
                 StringBuffer detachPath;
                 detachPath.append(dataPath);
@@ -74,34 +76,30 @@ void coalesceDatastore(bool force)
                     if (!deltaIFile->exists())
                         break;
                     offset_t dsz = deltaIFile->size();
-                    if (minDeltaSize > dsz/1024) {
-                        PROGLOG("COALESCER: Delta size %" I64F "d less than minimum, exiting",dsz);
+                    if (minDeltaSize > dsz/1024)
+                    {
+                        PROGLOG("COALESCER: Delta size %" I64F "u less than minimum (%" I64F "u K), exiting", dsz, minDeltaSize);
                         break;
                     }
                 }
             }
 
 
-            StringBuffer storeFilename(dataPath);   
-            iStoreHelper->getCurrentStoreFilename(storeFilename);
             StringBuffer memStr;
             getSystemTraceInfo(memStr.clear());
             MLOG("COALESCE: %s", memStr.str());
-            Owned<IPropertyTree> _root;
-            OwnedIFile storeIFile = createIFile(storeFilename.str());
-            if (storeIFile->exists())
+
+            Owned<IPropertyTree> _root = iStoreHelper->loadStore(nullptr, nullptr);
+
+            if (!_root)
             {
-                PROGLOG("Loading store: %s, size=%" I64F "d", storeFilename.str(), storeIFile->size());
-                _root.setown(createPTreeFromXMLFile(storeFilename.str()));
-                PROGLOG("Loaded: %s", storeFilename.str());
-            }
-            else
-            {
-                if (baseEdition==0) {
+                if (baseEdition==0)
+                {
                     PROGLOG("Creating base store");
                     _root.setown(createPTree("SDS"));
                 }
-                else {
+                else
+                {
                     OERRLOG("Base store %d not found, exiting",baseEdition);
                     break; // don't think much point continuing is there?
                 }
@@ -120,7 +118,7 @@ void coalesceDatastore(bool force)
 
             StringBuffer detachName;
             iStoreHelper->getDetachedDeltaName(detachName);
-            StringBuffer detachPath(dataPath);
+            StringBuffer detachPath(std::move(dataPath));
             detachPath.append(detachName);
             OwnedIFile detachedIFile = createIFile(detachPath.str());
             if (detachedIFile->exists() || iStoreHelper->detachCurrentDelta())
@@ -133,6 +131,8 @@ void coalesceDatastore(bool force)
                 if (!noError && 0 != (SH_BackupErrorFiles & configFlags))
                 {
                     iStoreHelper->backup(detachPath.str());
+                    StringBuffer storeFilename(dataPath);
+                    iStoreHelper->getCurrentStoreFilename(storeFilename, StoreFormat::XML);
                     iStoreHelper->backup(storeFilename.str());
                     if (deltaE.get())
                         throw LINK(deltaE);
@@ -161,7 +161,7 @@ void coalesceDatastore(bool force)
     }
     catch (IException *e)
     {
-        LOG(MCoperatorError, unknownJob, e, "COALESCER: Unexpected exception, coalesce component halted");
+        LOG(MCoperatorError, e, "COALESCER: Unexpected exception, coalesce component halted");
         throw;
     }
 }
@@ -169,16 +169,17 @@ void coalesceDatastore(bool force)
 
 class CSashaSDSCoalescingServer: public ISashaServer, public Thread
 {
-    bool stopped;
-    Semaphore stopsem;
-    CriticalSection suspendResumeCrit;
+    std::atomic<bool> stopped;
+    Semaphore stopsem{SYNC_LOCATION};
+    CriticalSection suspendResumeCrit{SYNC_LOCATION};
+    Linked<IPropertyTree> coalesceProps;
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
 
-    CSashaSDSCoalescingServer()
-        : Thread("CSashaSDSCoalescingServer")
+    CSashaSDSCoalescingServer(IPropertyTree *_config)
+        : Thread("CSashaSDSCoalescingServer"), coalesceProps(_config)
     {
-        stopped = false;
+        stopped.store(false);
     }
 
     ~CSashaSDSCoalescingServer()
@@ -188,19 +189,19 @@ public:
     void start()
     {
         CriticalBlock b(suspendResumeCrit);
-        stopped = false;
-        Thread::start();
+        stopped.store(false);
+        Thread::start(false);
     }
 
     void ready()
     {
     }
-    
+
     void stop()
     {
         CriticalBlock b(suspendResumeCrit);
-        if (!stopped) {
-            stopped = true;
+        if (!stopped.load()) {
+            stopped.store(true);
             stopsem.signal();
         }
         join();
@@ -209,9 +210,9 @@ public:
     void suspend() // stops and resets coalescer (free up memory)
     {
         CriticalBlock b(suspendResumeCrit);
-        if (stopped) return;
+        if (stopped.load()) return;
         PROGLOG("COALESCER: suspend");
-        stopped = true;
+        stopped.store(true);
         stopsem.signal();
         join();
     }
@@ -219,10 +220,10 @@ public:
     void resume()
     {
         CriticalBlock b(suspendResumeCrit);
-        if (!stopped) return;
+        if (!stopped.load()) return;
         PROGLOG("COALESCER: resume");
-        stopped = false;
-        Thread::start();
+        stopped.store(false);
+        Thread::start(false);
         ready();
     }
 
@@ -230,9 +231,6 @@ public:
     {
         do
         {
-            Owned<IPropertyTree> coalesceProps = serverConfig->getPropTree("Coalescer");
-            if (!coalesceProps)
-                coalesceProps.setown(createPTree("Coalescer"));
             unsigned interval = coalesceProps->getPropInt("@interval",DEFAULT_INTERVAL);
             if (!interval)
             {
@@ -243,42 +241,46 @@ public:
             CSashaSchedule schedule;
             schedule.init(coalesceProps,DEFAULT_INTERVAL,DEFAULT_INTERVAL/2);
             stopsem.wait(1000*60*60*DEFAULT_INTERVAL/2); // wait a bit til dali has started
-            while (!stopped)
+            while (!stopped.load())
             {
                 stopsem.wait(1000*60);
-                if (!stopped && schedule.ready())  {
-                    CSuspendAutoStop suspendstop;
+                if (!stopped.load() && schedule.ready())  {
+                    Owned<IInterface> suspendstop = queryServerContext().createAutoStopSuspender();
                     DWORD runcode;
                     HANDLE h;
-                    StringBuffer cmd(sashaProgramName);
-                    cmd.append(" coalesce");
+                    StringBuffer cmd(queryServerContext().getSashaProgramName());
+                    cmd.append(" --coalesce");
+#ifdef _CONTAINERIZED
+                    cmd.append(" --config=").append(coalesceProps->queryProp("@config"));
+                    cmd.append(" --daliServers=").append(coalesceProps->queryProp("@daliServers"));
+#endif
                     char cwd[1024];
                     if (GetCurrentDirectory(1024, cwd))
                         PROGLOG("COALESCE: Running '%s' in '%s'",cmd.str(),cwd);
                     else
                         OERRLOG("COALESCE: Running '%s' in unknown current directory",cmd.str());
-                    if (!invoke_program(cmd.str(), runcode, false, NULL, &h)) 
+                    if (!invoke_program(cmd.str(), runcode, false, NULL, &h))
                         OERRLOG("Could not run saserver in coalesce mode");
                     else {
                         PROGLOG("COALESCE: started pid = %d",(int)h);
                         while (!wait_program(h,runcode,false)) {
                             stopsem.wait(1000*60);
-                            if (stopped) {
+                            if (stopped.load()) {
                                 interrupt_program(h, false);
                                 break;
                             }
-                            PROGLOG("COALESCER running");
+                            PROGLOG("COALESCE running");
                         }
-                        if (stopped)
-                            PROGLOG("COAESCE stopped");
+                        if (stopped.load())
+                            PROGLOG("COALESCE stopped");
                         else
-                            PROGLOG("COAESCE returned %d",(int)runcode);
+                            PROGLOG("COALESCE returned %d",(int)runcode);
                     }
                 }
             }
 
         }
-        while (!stopped);
+        while (!stopped.load());
         return 0;
     }
 } *sashaSDSCoalescingServer = NULL;
@@ -286,7 +288,14 @@ public:
 ISashaServer *createSashaSDSCoalescingServer()
 {
     assertex(!sashaSDSCoalescingServer); // initialization problem
-    sashaSDSCoalescingServer = new CSashaSDSCoalescingServer();
+#ifdef _CONTAINERIZED
+    Owned<IPropertyTree> config = getComponentConfig();
+#else
+    Owned<IPropertyTree> config = getComponentConfigSP()->getPropTree("Coalescer");
+    if (!config)
+        config.setown(createPTree("Coalescer"));
+#endif
+    sashaSDSCoalescingServer = new CSashaSDSCoalescingServer(config);
     return sashaSDSCoalescingServer;
 }
 

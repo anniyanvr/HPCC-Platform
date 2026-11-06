@@ -1,0 +1,136 @@
+name: Auto Close Issues On Protected Branches
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches:
+      - "master"
+      - "candidate-*"
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  auto-close-issues:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true
+
+    steps:
+      - name: "Auto-close referenced issues"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          REQUEST_TIMEOUT_SECONDS = 30
+
+
+          def request(method, path, payload=None):
+              url = f"{os.environ['GITHUB_API_URL']}{path}"
+              headers = {
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              }
+              data = None
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                  body = response.read().decode("utf-8")
+                  return json.loads(body) if body else {}
+
+
+          pr_body = os.environ.get("PR_BODY") or ""
+          if not pr_body.strip():
+              print("Pull request body is empty, nothing to close.")
+              sys.exit(0)
+
+          def filter_directive_text(text):
+              # Strip HTML comments (including multi-line) so hidden directives are ignored
+              text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+
+              filtered_lines = []
+              in_fence = False
+
+              for line in text.splitlines():
+                  trimmed = line.lstrip()
+
+                  if trimmed.startswith("```") or trimmed.startswith("~~~"):
+                      in_fence = not in_fence
+                      continue
+
+                  if in_fence:
+                      continue
+
+                  if trimmed.startswith(">"):
+                      continue
+
+                  filtered_lines.append(line)
+
+              return "\n".join(filtered_lines)
+
+          filtered_pr_body = filter_directive_text(pr_body)
+
+          current_repo = os.environ["GITHUB_REPOSITORY"]
+          # Require issue-closing directives to occupy their own line.
+          # Allow exactly one issue reference per directive line.
+          # Examples:
+          #   Fixes #123
+          #   Resolves: #456
+          clause_pattern = re.compile(
+              r"(?im)^(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\b\s*:?\s*#(?P<number>\d+)\s*$"
+          )
+
+          referenced_issues = []
+          seen = set()
+          for clause in clause_pattern.finditer(filtered_pr_body):
+              issue_number = int(clause.group("number"))
+              if issue_number in seen:
+                  continue
+              seen.add(issue_number)
+              referenced_issues.append(issue_number)
+
+          if not referenced_issues:
+              print("No supported issue-closing directive found in the PR body (for example: 'Fixes #123').")
+              sys.exit(0)
+
+          for issue_number in referenced_issues:
+              issue_path = f"/repos/{current_repo}/issues/{issue_number}"
+              try:
+                  issue = request("GET", issue_path)
+              except urllib.error.HTTPError as error:
+                  print(f"Failed to read issue #{issue_number}: {error.code}")
+                  raise
+
+              if "pull_request" in issue:
+                  print(f"Skipping #{issue_number} because it is a pull request.")
+                  continue
+
+              if issue.get("state") == "closed":
+                  print(f"Skipping #{issue_number} because it is already closed.")
+                  continue
+
+              comment = (
+                  f"Closed automatically by merged pull request #{os.environ['PR_NUMBER']} "
+                  f"into `{os.environ['BASE_REF']}`: {os.environ['PR_URL']}"
+              )
+              request("POST", f"{issue_path}/comments", {"body": comment})
+              request("PATCH", issue_path, {"state": "closed"})
+              print(f"Closed issue #{issue_number}.")

@@ -39,10 +39,17 @@
 #include "danqs.hpp"
 #include "environment.hpp"
 #include "ws_topology.hpp"
+#include "ws_resources.hpp"
 #include <string>
 #include <set>
 #include "sacmd.hpp"
+#include "jsmartsock.ipp"
 
+enum OS_TYPE {
+    OS_WINDOWS,
+    OS_SOLARIS,
+    OS_LINUX
+};
 
 using std::set;
 using std::string;
@@ -92,7 +99,6 @@ using std::string;
 #define eqAgentExec         "AgentExecProcess"
 #define eqEsp                   "EspProcess"
 #define eqDfu                   "DfuServerProcess"
-#define eqDkcSlave          "DKCSlaveProcess"
 #define eqSashaServer      "SashaServerProcess"
 #define eqLdapServer       "LDAPServerProcess"
 #define eqFTSlave          "FTSlaveProcess"
@@ -124,16 +130,17 @@ using std::string;
 #define eqSparkThorProcess      "SparkThorProcess"
 #define eqRoxieServerProcess    "RoxieServerProcess"
 
+constexpr const char* wuArchiverType = "wu-archiver";
+constexpr const char* dfuwuArchiverType = "dfuwu-archiver";
+
 #define SDS_LOCK_TIMEOUT 30000
 
-
-class TPWRAPPER_API CTpWrapper : public CInterface  
+class TPWRAPPER_API CTpWrapper : public CInterface
 {
-    
+
 private:
     void setAttPath(StringBuffer& Path,const char* PathToAppend,const char* AttName,const char* AttValue,StringBuffer& returnStr);
     void getAttPath(const char* Path,StringBuffer& returnStr);
-    bool ContainsProcessDefinition(IPropertyTree& node,const char* clusterName);
     const char* getNodeNameTag(const char* MachineType);
     void fetchInstances(const char* ServiceType, IPropertyTree& service, IArrayOf<IEspTpMachine>& tpMachines);
     bool checkGroupReplicateOutputs(const char* groupName, const char* kind);
@@ -144,18 +151,23 @@ private:
         bool slaveNode, IArrayOf<IEspTpMachine>& machineList);
     void appendThorMachineList(double clientVersion, IConstEnvironment* constEnv, INode& node, const char* clusterName,
          const char* machineType, unsigned& processNumber, unsigned channels, const char* directory, IArrayOf<IEspTpMachine>& machineList);
+    void getRoxieServices(IPropertyTree* environmentRoot, const char* serviceName, IArrayOf<IConstHPCCService>& services);
+    void getRoxieService(IPropertyTree* clusterTree, IArrayOf<IConstHPCCService>& services);
+    void getESPServices(IPropertyTree* environmentRoot, const char* serviceType, const char* serviceName, IArrayOf<IConstHPCCService>& services);
+
+#ifndef _CONTAINERIZED
+    IPropertyTree* getEnvironment(const char* xpath);
+#endif
 
 public:
-    IMPLEMENT_IINTERFACE;
     CTpWrapper() {};
     virtual ~CTpWrapper() {};
     void getClusterInfo(const char* Cluster,StringBuffer& returnStr);
-    bool getClusterLCR(const char* clusterType, const char* clusterName);
     void getClusterProcessList(const char* ClusterType, IArrayOf<IEspTpCluster>& clusters, bool ignoreduplicatqueues=false, bool ignoreduplicategroups=false);
     void getHthorClusterList(IArrayOf<IEspTpCluster>& clusterList);
     void getGroupList(double espVersion, const char* kindReq, IArrayOf<IEspTpGroup> &Groups);
     void getCluster(const char* ClusterType,IPropertyTree& returnRoot);
-    void getClusterMachineList(double clientVersion, const char* ClusterType,const char* ClusterPath, const char* ClusterDirectory, 
+    void getClusterMachineList(double clientVersion, CTpMachineType ClusterType,const char* ClusterPath, const char* ClusterDirectory,
                                         IArrayOf<IEspTpMachine> &MachineList, bool& hasThorSpareProcess, const char* ClusterName = NULL);
     void getMachineList(double clientVersion, const char* MachineType, const char* MachinePath, const char* Status,
         const char* Directory, IArrayOf<IEspTpMachine>& MachineList, set<string>* pMachineNames=nullptr);
@@ -164,7 +176,6 @@ public:
     bool checkMultiSlavesFlag(const char* clusterName);
     void getDropZoneMachineList(double clientVersion, bool ECLWatchVisibleOnly, IArrayOf<IEspTpMachine> &MachineList);
     void setMachineInfo(const char* name,const char* type,IEspTpMachine& machine);
-    void resolveGroupInfo(const char* groupName,StringBuffer& Cluster, StringBuffer& ClusterPrefix);
     void getMachineInfo(IEspTpMachine& machineInfo,IPropertyTree& machine,const char* ParentPath,const char* MachineType,const char* nodenametag);
     void getMachineInfo(double clientVersion, const char* name, const char* netAddress, IEspTpMachine& machineInfo);
     void setTpMachine(IConstMachineInfo* machine, IEspTpMachine& tpMachine);
@@ -182,15 +193,15 @@ public:
     void getTpLdapServers(IArrayOf<IConstTpLdapServer>& list);
     void getTpDropZones(double clientVersion, const char* name, bool ECLWatchVisibleOnly, IArrayOf<IConstTpDropZone>& list);
     void getTpFTSlaves(IArrayOf<IConstTpFTSlave>& list);
-    void getTpDkcSlaves(IArrayOf<IConstTpDkcSlave>& list);
     void getTpGenesisServers(IArrayOf<IConstTpGenesisServer>& list);
     void getTpSparkThors(double clientVersion, const char* name, IArrayOf<IConstTpSparkThor>& list);
 
     void queryTargetClusters(double version, const char* clusterType, const char* clusterName, IArrayOf<IEspTpTargetCluster>& clusterList);
     void getTargetClusterList(IArrayOf<IEspTpLogicalCluster>& clusters, const char* clusterType = NULL, const char* clusterName = NULL);
     void queryTargetClusterProcess(double version, const char* processName, const char* clusterType, IArrayOf<IConstTpCluster>& list);
+    void getServices(double version, const char* serviceType, const char* serviceName, IArrayOf<IConstHPCCService>& list);
+    void listLogFiles(const char* host, const char* path, IArrayOf<IConstLogFileStruct>& files);
 
-    IPropertyTree* getEnvironment(const char* xpath);
 };
 
 
@@ -211,7 +222,44 @@ private:
 };
 
 extern TPWRAPPER_API ISashaCommand* archiveOrRestoreWorkunits(StringArray& wuids, IProperties* params, bool archive, bool dfu);
-extern TPWRAPPER_API IStringIterator *getContainerTargetClusters(const char* processType, const char* processName);
+
+extern TPWRAPPER_API unsigned getContainerWUClusterInfo(CConstWUClusterInfoArray& clusters);
+extern TPWRAPPER_API unsigned getWUClusterInfo(CConstWUClusterInfoArray& clusters);
+extern TPWRAPPER_API IConstWUClusterInfo* getWUClusterInfoByName(const char* clustName);
+
+/**
+ * Get pipe-delimited list of roxie server addresses and TLS config from roxie process `roxieCluster` configuration.
+ * @param env           environment configuration
+ * @param roxieCluster  roxie process configuration to get addresses and TLS config from
+ * @param addrList      pipe-delimited list of roxie server addresses
+ * @param tlsConfig     TLS configuration
+ * @param daliAddress   optional dali address to use for ws_ecl service if `@netAddress` not found in `server` configuration
+ * @return void
+ */
+extern TPWRAPPER_API void getAddressesAndTlsConfigForRoxieProcess(IPropertyTree& env, IPropertyTree& roxieCluster, StringBuffer& addrList, Owned<IPropertyTree> & tlsConfig, const char* daliAddress);
+extern TPWRAPPER_API void initContainerRoxieTargets(MapStringToMyClass<ISmartSocketFactory>& connMap);
+extern TPWRAPPER_API void initBareMetalRoxieTargets(MapStringToMyClass<ISmartSocketFactory>& connMap);
+extern TPWRAPPER_API unsigned getThorClusterNames(StringArray& targetNames, StringArray& queueNames);
+extern TPWRAPPER_API void getRoxieTargetsSupportingPublishedQueries(StringArray& names);
+extern TPWRAPPER_API void validateTargetName(const char* target);
+extern TPWRAPPER_API bool getSashaService(StringBuffer &serviceAddress, const char *service, bool failIfNotFound);
+extern TPWRAPPER_API bool getSashaServiceEP(SocketEndpoint &serviceEndpoint, const char *service, bool failIfNotFound);
+
+extern TPWRAPPER_API StringBuffer & getRoxieDefaultPlane(StringBuffer & plane, const char * roxieName);
+extern TPWRAPPER_API StringArray & getRoxieDirectAccessPlanes(StringArray & planes, StringBuffer &defaultPlane, const char * roxieName, bool includeDefaultPlane);
+
+extern TPWRAPPER_API bool validateDataPlaneName(const char *remoteDali, const char * name);
+extern TPWRAPPER_API bool matchNetAddressRequest(const char* netAddressReg, bool ipReq, IConstTpMachine& tpMachine);
+
+extern TPWRAPPER_API StringBuffer &findDropZonePlaneName(const char* host, const char* path, StringBuffer& planeName);
+extern TPWRAPPER_API IPropertyTree* getDropZoneAndValidateHostAndPath(const char* dropZoneName, const char* host, const char* path);
+extern TPWRAPPER_API void validateDropZoneAccess(IEspContext& context, const char* targetDZNameOrHost, const char* hostReq, SecAccessFlags permissionReq,
+    const char* fileNameWithRelPath, CDfsLogicalFileName& dlfn);
+extern TPWRAPPER_API SecAccessFlags getDZPathScopePermsAndLegacyPhysicalPerms(IEspContext &context, const char *dropZoneName, const char *path,
+    const char *host, SecAccessFlags permissionReq);
+extern TPWRAPPER_API void validateDZPathScopePermsAndLegacyPhysicalPerms(IEspContext &context, const char *dropZoneName, const char *path,
+    const char *host, SecAccessFlags permissionReq);
+extern TPWRAPPER_API void validateDropZoneReq(IEspContext& ctx, const char* dropZoneName, const char* host, const char* path, SecAccessFlags permissionReq);
+extern TPWRAPPER_API void validateDZFileScopePermsAndLegacyPhysicalPerms(IEspContext& context, const char* dropZoneName, const char* path, const char* host, SecAccessFlags permissionReq);
 
 #endif //_ESPWIZ_TpWrapper_HPP__
-

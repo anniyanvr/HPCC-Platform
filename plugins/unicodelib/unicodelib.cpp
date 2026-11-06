@@ -16,6 +16,7 @@
 ############################################################################## */
 
 #include "jlib.hpp"
+#include "jhash.hpp"
 #include "jsem.hpp"
 
 #include <string.h>
@@ -46,7 +47,7 @@ using icu::Normalizer2;
 #endif
 using icu::CharacterIterator;
 
-#define UNICODELIB_VERSION "UNICODELIB 1.1.06"
+#define UNICODELIB_VERSION "UNICODELIB 1.1.07"
 
 static UChar32 const u32comma = ',';
 static UChar32 const u32space = ' ';
@@ -111,6 +112,8 @@ static const char * EclDefinition =
 "  unsigned4 UnicodeLocaleFindCount(const unicode src, const unicode hit, const string form) :c,pure,entrypoint='ulUnicodeLocaleFindCount';\n"
 "  unsigned4 UnicodeLocaleCountWords(const unicode src, const unicode delim, boolean allowBlankItems) : c,pure,entrypoint='ulUnicodeLocaleCountWords';\n"
 "  SET OF UNICODE UnicodeLocaleSplitWords(const unicode src, const unicode delim, boolean allowBlankItems) : c,pure,entrypoint='ulUnicodeLocaleSplitWords';\n"
+"  UNICODE UnicodeCommonPrefix(const UNICODE s1, const UNICODE s2, BOOLEAN nocase) : c, pure,entrypoint='ulUnicodeCommonPrefix'; \n"
+"  UNICODE UnicodeCommonSuffix(const UNICODE s1, const UNICODE s2, BOOLEAN nocase) : c, pure,entrypoint='ulUnicodeCommonSuffix'; \n"
 "END;\n";
 
 static const char * compatibleVersions[] = {
@@ -120,6 +123,7 @@ static const char * compatibleVersions[] = {
     "UNICODELIB 1.1.03", 
     "UNICODELIB 1.1.04", 
     "UNICODELIB 1.1.05",
+    "UNICODELIB 1.1.06",
     NULL };
 
 UNICODELIB_API bool getECLPluginDefinition(ECLPluginDefinitionBlock *pb) 
@@ -143,6 +147,19 @@ UNICODELIB_API bool getECLPluginDefinition(ECLPluginDefinitionBlock *pb)
 static void unicodeEnsureIsNormalized(unsigned inLen, UChar * in)
 {
     UErrorCode err = U_ZERO_ERROR;
+#if U_ICU_VERSION_MAJOR_NUM >= 56
+    const UNormalizer2 * norm2 = unorm2_getNFCInstance(&err);
+    if (!unorm2_isNormalized(norm2, in, inLen, &err))
+    {
+        UChar * buff = (UChar *)malloc(inLen * 2);
+        unsigned len = unorm2_normalize(norm2, in, inLen, buff, inLen, &err);
+        if (len > inLen)
+            len = inLen;
+        memcpy(in, buff, len*sizeof(UChar));
+        while (len < inLen) in[len++] = 0x0020;
+        free(buff);
+    }
+#else
     if (!unorm_isNormalized(in, inLen, UNORM_NFC, &err))
     {
         UChar * buff = (UChar *)malloc(inLen * 2);
@@ -153,6 +170,7 @@ static void unicodeEnsureIsNormalized(unsigned inLen, UChar * in)
         while (len < inLen) in[len++] = 0x0020;
         free(buff);
     }
+#endif
 }
 
 
@@ -228,10 +246,21 @@ bool extract(UnicodeString & out, UnicodeString const & in, unsigned instance)
 }
 
 
-int doUnicodeCompareAtStrength(unsigned src1Len, UChar const * src1, unsigned src2Len, UChar const * src2, Collator::ECollationStrength strength)
+static Collator * createCollator(const Locale & locale)
 {
     UErrorCode error = U_ZERO_ERROR;
-    Collator * coll = Collator::createInstance(error);
+    Collator * coll = Collator::createInstance(locale, error);
+    if (U_FAILURE(error) || !coll)
+    {
+        delete coll;
+        throw makeStringExceptionV(-1, "UnicodeLib: failed to create ICU collator: %s", u_errorName(error));
+    }
+    return coll;
+}
+
+int doUnicodeCompareAtStrength(unsigned src1Len, UChar const * src1, unsigned src2Len, UChar const * src2, Collator::ECollationStrength strength)
+{
+    Collator * coll = createCollator(Locale::getRoot());
     coll->setStrength(strength);
 #if U_ICU_VERSION_MAJOR_NUM>=59
     Collator::EComparisonResult ret = coll->compare((char16_t *)src1, src1Len, (char16_t *)src2, src2Len);
@@ -244,9 +273,8 @@ int doUnicodeCompareAtStrength(unsigned src1Len, UChar const * src1, unsigned sr
 
 int doUnicodeLocaleCompareAtStrength(unsigned src1Len, UChar const * src1, unsigned src2Len, UChar const * src2, char const * localename, Collator::ECollationStrength strength)
 {
-    UErrorCode error = U_ZERO_ERROR;
     Locale locale(localename);
-    Collator * coll = Collator::createInstance(locale, error);
+    Collator * coll = createCollator(locale);
     coll->setStrength(strength);
 #if U_ICU_VERSION_MAJOR_NUM>=59
     Collator::EComparisonResult ret = coll->compare((char16_t *)src1, src1Len, (char16_t *)src2, src2Len);
@@ -318,7 +346,7 @@ inline UChar u16toupper(UChar c)
 }
 
 static icu::Transliterator* deAccenter = NULL;
-static CriticalSection accenterCrit;
+static CriticalSection accenterCrit{SYNC_LOCATION};
 
 inline unsigned char min3(unsigned char a, unsigned char b, unsigned char c)
 {
@@ -375,7 +403,7 @@ private:
 
 public:
     UPCList(BreakIterator* cbi, const UnicodeString & source, uint32_t capacity=0)
-        : length_(0), capacity_(capacity),ustring_(source), invalid_(false)
+        : ustring_(source), length_(0), capacity_(capacity), invalid_(false)
     {
         !cbi?doCreateUPCList():doCreateUPCList(*cbi);
     }
@@ -446,7 +474,7 @@ private:
 
 public:
     CEList(RuleBasedCollator& rbc, const UnicodeString & source, uint32_t capacity=0)
-        : length_(0), capacity_(capacity), ustring_(source), invalid(false)
+        : ustring_(source), length_(0), capacity_(capacity), invalid(false)
     {
         doCreateCEList(rbc);
     }
@@ -571,6 +599,13 @@ unsigned unicodeEditDistanceV3(UnicodeString & left, UnicodeString & right, unsi
     CEList   rightCEs(rbc, right, rightLen);
     leftLen = leftCEs.length();
     rightLen = rightCEs.length();
+
+    // Check lengths again in case some pathological characters cause codepoints to be skipped/ignored
+    if (leftLen == 0)
+        return rightLen;
+
+    if (rightLen == 0)
+        return leftLen;
 
     /*
     This function applies two optimizations over the function above.
@@ -1082,6 +1117,78 @@ void splitWords(MemoryBuffer & result, const UnicodeString & source, unsigned de
         appendUnicode(result, source, startWord, source.length() - startWord);
 }
 
+void commonPrefix(UnicodeString & target, const UnicodeString & string1, UnicodeString & string2, bool nocase)
+{
+    // Checks for empty strings should be done before calling this function
+
+    int32_t string1Len = string1.countChar32();
+    int32_t string2Len = string2.countChar32();
+    int32_t maxLen = (string1Len < string2Len) ? string1Len : string2Len;
+    int32_t i = 0;
+
+    if (nocase)
+    {
+        // Make a copy of string1 because we'll be using the original
+        // as a source for the result
+        UnicodeString string1Copy(string1);
+
+        string1Copy.foldCase();
+        string2.foldCase();
+
+        for (i = 0; i < maxLen; i++)
+        {
+            if (string1Copy.char32At(i) != string2.char32At(i))
+                break;
+        }
+    }
+    else
+    {
+        for (i = 0; i < maxLen; i++)
+        {
+            if (string1.char32At(i) != string2.char32At(i))
+                break;
+        }
+    }
+
+    target.append(string1, 0, i);
+}
+
+void commonSuffix(UnicodeString & target, const UnicodeString & string1, UnicodeString & string2, bool nocase)
+{
+    // Checks for empty strings should be done before calling this function
+
+    int32_t string1Len = string1.countChar32();
+    int32_t string2Len = string2.countChar32();
+    int32_t maxLen = (string1Len < string2Len) ? string1Len : string2Len;
+    int32_t i = 0;
+
+    if (nocase)
+    {
+        // Make a copy of string1 because we'll be using the original
+        // as a source for the result
+        UnicodeString string1Copy(string1);
+
+        string1Copy.foldCase();
+        string2.foldCase();
+
+        for (i = 0; i < maxLen; i++)
+        {
+            if (string1Copy.char32At(string1Len - 1 - i) != string2.char32At(string2Len - 1 - i))
+                break;
+        }
+    }
+    else
+    {
+        for (i = 0; i < maxLen; i++)
+        {
+            if (string1.char32At(string1Len - 1 - i) != string2.char32At(string2Len - 1 - i))
+                break;
+        }
+    }
+
+    target.append(string1, string1Len - i, i);
+}
+
 
 void excludeNthWord(RuleBasedBreakIterator& bi, UnicodeString & source, unsigned n)
 {
@@ -1197,7 +1304,7 @@ private:
 
 typedef MapStringTo<CBILocale, char const *> MapStrToCBI;
 static MapStrToCBI * localeCBiMap;
-static CriticalSection localeCBiCrit;
+static CriticalSection localeCBiCrit{SYNC_LOCATION};
 
 static BreakIterator * queryCharacterBreakIterator(const char * localename)
 {
@@ -1248,7 +1355,7 @@ private:
 
 typedef MapStringTo<RBCLocale, char const *> MapStrToRBC;
 static MapStrToRBC * localeMap;
-static CriticalSection localeCrit;
+static CriticalSection localeCrit{SYNC_LOCATION};
 
 static RuleBasedCollator * queryRBCollator(const char * localename)
 {
@@ -1998,4 +2105,56 @@ UNICODELIB_API void UNICODELIB_CALL ulUnicodeLocaleSplitWords(bool & isAllResult
     isAllResult = false;
     lenResult = out.length();
     result = out.detach();
+}
+
+UNICODELIB_API void UNICODELIB_CALL ulUnicodeCommonPrefix(unsigned & tgtLen, UChar * & tgt, unsigned s1Len, UChar const * s1, unsigned s2Len, UChar const * s2, bool nocase)
+{
+    if (s1Len == 0 || s2Len == 0)
+    {
+        tgtLen = 0;
+        tgt = nullptr;
+        return;
+    }
+
+    UnicodeString string1(s1, s1Len);
+    UnicodeString string2(s2, s2Len);
+    UnicodeString out;
+
+    commonPrefix(out, string1, string2, nocase);
+    tgtLen = out.length();
+    if (tgtLen > 0)
+    {
+        tgt = (UChar *)CTXMALLOC(parentCtx, tgtLen * 2);
+        out.extract(0, tgtLen, tgt);
+    }
+    else
+    {
+        tgt = nullptr;
+    }
+}
+
+UNICODELIB_API void UNICODELIB_CALL ulUnicodeCommonSuffix(unsigned & tgtLen, UChar * & tgt, unsigned s1Len, UChar const * s1, unsigned s2Len, UChar const * s2, bool nocase)
+{
+    if (s1Len == 0 || s2Len == 0)
+    {
+        tgtLen = 0;
+        tgt = nullptr;
+        return;
+    }
+
+    UnicodeString string1(s1, s1Len);
+    UnicodeString string2(s2, s2Len);
+    UnicodeString out;
+
+    commonSuffix(out, string1, string2, nocase);
+    tgtLen = out.length();
+    if (tgtLen > 0)
+    {
+        tgt = (UChar *)CTXMALLOC(parentCtx, tgtLen * 2);
+        out.extract(0, tgtLen, tgt);
+    }
+    else
+    {
+        tgt = nullptr;
+    }
 }

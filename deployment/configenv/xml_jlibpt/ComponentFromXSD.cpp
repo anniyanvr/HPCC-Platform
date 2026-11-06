@@ -22,7 +22,6 @@
 //#include "xslprocessor.hpp"
 //#include "jwrapper.hpp"
 //#include "wizardInputs.hpp"
-#include "build-config.h"
 //#include "confighelper.hpp"
 #include "ComponentFromXSD.hpp"
 #include "EnvHelper.hpp"
@@ -32,14 +31,9 @@ namespace ech
 {
 #define TRACE_SCHEMA_NODE(msg, schemaNode)
 
-//#define CONFIGMGR_JSPATH "./"
-#define STANDARD_COMPFILESDIR INSTALL_DIR
 
-#define STANDARD_CONFIGXMLDIR COMPONENTFILES_DIR"/configxml"
-
-
-ComponentFromXSD::ComponentFromXSD(EnvHelper* peh):m_eh(peh), m_pCompTree(NULL),m_pDefTree(NULL),
-  m_pSchemaRoot(NULL),m_numAttrs(0),m_allSubTypes(true),m_genOptional(true),m_wizFlag(true)
+ComponentFromXSD::ComponentFromXSD(EnvHelper* peh):m_pSchemaRoot(NULL), m_pCompTree(NULL),m_pDefTree(NULL),
+  m_numAttrs(0),m_allSubTypes(true),m_wizFlag(true),m_genOptional(true),m_eh(peh)
 {
    m_pEnv.set(peh->getEnvTree());
 }
@@ -443,7 +437,7 @@ void ComponentFromXSD::getValueForTypeInXSD(IPropertyTree& attr,
       tempPath.clear().append("EnvSettings/path");
       wizDefVal.clear().append(m_pEnv->queryProp(tempPath.str()));
       if (!wizDefVal.length())
-        wizDefVal.append(STANDARD_COMPFILESDIR);
+        wizDefVal.append(hpccBuildInfo.installDir);
 
       wizDefVal.append(PATHSEPSTR"componentfiles");
     }

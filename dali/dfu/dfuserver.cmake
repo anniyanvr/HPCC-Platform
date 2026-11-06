@@ -46,20 +46,19 @@ include_directories (
          ./../../common/environment 
          ./../../common/workunit
          ./../../system/security/shared
+         ./../../esp/clients/ws_dfsclient
     )
 
 HPCC_ADD_EXECUTABLE ( dfuserver ${SRCS} )
 set_target_properties ( dfuserver PROPERTIES 
         COMPILE_FLAGS "-D_CONSOLE -D_DFUSERVER"
         )
-install ( TARGETS dfuserver RUNTIME DESTINATION ${EXEC_DIR} )
-target_link_libraries ( dfuserver 
+install ( TARGETS dfuserver RUNTIME DESTINATION ${EXEC_DIR})
+target_link_libraries ( dfuserver PRIVATE 
          jlib
          mp 
-         hrpc 
          dafsclient 
          dalibase 
-         environment 
          dllserver 
          nbcd 
          eclrtl 
@@ -68,5 +67,10 @@ target_link_libraries ( dfuserver
          schedulectrl 
          dalift 
          jhtree 
-         dfuwu 
+         dfuwu
+         ws_dfsclient
     )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( dfuserver PRIVATE environment )
+endif()

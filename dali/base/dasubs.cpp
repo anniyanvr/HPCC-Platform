@@ -15,7 +15,6 @@
     limitations under the License.
 ############################################################################## */
 
-#define da_decl DECL_EXPORT
 #include "platform.h"
 #include "jlib.hpp"
 #include "jmisc.hpp"
@@ -92,7 +91,7 @@ public:
                 // Kludge to avoid locking SDS on blocked client
                 hasaborted = true;
                 StringBuffer tmp;
-                throw MakeStringException(-1,"Subscription notification to %s timed out",dst->endpoint().getUrlStr(tmp).str());
+                throw MakeStringException(-1,"Subscription notification to %s timed out",dst->endpoint().getEndpointHostText(tmp).str());
                 return;
             }
 
@@ -124,45 +123,46 @@ public:
     StringBuffer &getDetails(StringBuffer &buf)
     {
         StringBuffer ep;
-        return buf.appendf("%16" I64F "X: %s %s",sid,dst->endpoint().getUrlStr(ep).str(),hasaborted?"aborted":"");
+        return buf.appendf("%16" I64F "X: %s %s",sid,dst->endpoint().getEndpointHostText(ep).str(),hasaborted?"aborted":"");
     }
 };
 
 static class CDaliPublisher
 {
+protected:
+    std::atomic<bool> running{false};
 public:
     virtual ISubscriptionManager *queryManager(unsigned tag) = 0;
     virtual void stop() = 0;
     virtual ~CDaliPublisher() {}
 } *DaliPublisher;
 
-class CDaliPublisherServer: public IDaliServer, public Thread, implements CDaliPublisher, implements IConnectionMonitor
+class CDaliPublisherServer: public IDaliServer, public Thread, public CDaliPublisher, implements IConnectionMonitor
 {
     ICopyArrayOf<CSubscriptionStub> stubs;
     IArrayOf<ISubscriptionManager> managers;
     UnsignedArray tags;
-    CheckedCriticalSection tagsect;
-    CheckedCriticalSection stubsect;
-    bool stopped;
-    ReadWriteLock processlock;
+    CheckedCriticalSection tagsect{SYNC_LOCATION};
+    CheckedCriticalSection stubsect{SYNC_LOCATION};
+    ReadWriteLock processlock{SYNC_LOCATION};
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
 
     CDaliPublisherServer()
         : Thread("CDaliPublisherServer")
     {
-        stopped = true;
     }
 
     ~CDaliPublisherServer()
     {
-        stopped = true;
+        running = false;
         managers.kill();
     }
 
     void start()
     {
-        Thread::start();
+        running = true;
+        Thread::start(false);
     }
     void ready()
     {
@@ -179,8 +179,9 @@ public:
 
     void stop()
     {
-        if (!stopped) {
-            stopped = true;
+        if (running)
+        {
+            running = false;
             queryCoven().cancel(RANK_ALL,MPTAG_DALI_SUBSCRIPTION_REQUEST);
         }
         processlock.unlockWrite();
@@ -190,11 +191,14 @@ public:
     int run()
     {
         ICoven &coven=queryCoven();
-        CMessageHandler<CDaliPublisherServer> handler("CDaliPublisherServer",this,&CDaliPublisherServer::processMessage,NULL, 100);
+        unsigned maxThreads = 100; // NB: can exceed with up to 1s delay
+        maxThreads = getComponentConfigSP()->getPropInt("expert/@daliPublisherServerPoolLimit", maxThreads);
+        CMessageHandler<CDaliPublisherServer> handler("CDaliPublisherServer", this, &CDaliPublisherServer::processMessage, nullptr, maxThreads);
         CMessageBuffer mb;
-        stopped = false;
-        while (!stopped) {
-            try {
+        while (running)
+        {
+            try
+            {
                 mb.clear();
 #ifdef TRACE_QWAITING
                 unsigned waiting = coven.probe(RANK_ALL,MPTAG_DALI_SUBSCRIPTION_REQUEST,NULL);
@@ -204,7 +208,7 @@ public:
                 if (coven.recv(mb,RANK_ALL,MPTAG_DALI_SUBSCRIPTION_REQUEST,NULL))
                     handler.handleMessage(mb);
                 else
-                    stopped = true;
+                    running = false;
             }
             catch (IException *e)
             {
@@ -218,7 +222,7 @@ public:
     void processMessage(CMessageBuffer &mb)
     {
         ReadLockBlock block(processlock);
-        if (stopped)
+        if (!running)
             return;
         ICoven &coven=queryCoven();
         int fn;
@@ -273,7 +277,7 @@ public:
                     serializeException(exception, mb);
                 while (!coven.reply(mb,60000)) {
                         StringBuffer eps;
-                        DBGLOG("MSR_ADD_SUBSCRIPTION_PRIMARY reply timed out to %s try %d",mb.getSender().getUrlStr(eps).str(),retry+1);
+                        DBGLOG("MSR_ADD_SUBSCRIPTION_PRIMARY reply timed out to %s try %d",mb.getSender().getEndpointHostText(eps).str(),retry+1);
                         if (retry++==3)
                             return;
                 }
@@ -440,7 +444,7 @@ class CDaliSubscriptionManagerStub: implements ISubscriptionManager, public CInt
     unsigned tag;
     IArrayOf<ISubscription> subscriptions;
     Int64Array ids;
-    CriticalSection subscriptionsect;
+    CriticalSection subscriptionsect{SYNC_LOCATION};
 public:
     IMPLEMENT_IINTERFACE;
     CDaliSubscriptionManagerStub(unsigned _tag)
@@ -542,17 +546,15 @@ class CDaliPublisherClient: public Thread, public CDaliPublisher
 
     CIArrayOf<CDaliSubscriptionManagerStub> managers;
     UnsignedArray tags;
-    CheckedCriticalSection tagsect;
-    bool stopped;
-
+    CheckedCriticalSection tagsect{SYNC_LOCATION};
 
 public:
 
     CDaliPublisherClient()
         :   Thread("CDaliPublisherClient")
     {
-        stopped = true;
-        start();
+        running = true;
+        start(false);
     }
 
     ~CDaliPublisherClient()
@@ -575,13 +577,15 @@ public:
     int run()
     {
         ICoven &coven=queryCoven();
-        CMessageHandler<CDaliPublisherClient> handler("CDaliPublisherClientMessages",this,&CDaliPublisherClient::processMessage);
-        stopped = false;
+        unsigned maxThreads = 100; // NB: can exceed with up to 1s delay
+        maxThreads = getComponentConfigSP()->getPropInt("expert/@daliPublisherClientPoolLimit", maxThreads);
+        CMessageHandler<CDaliPublisherClient> handler("CDaliPublisherClientMessages", this, &CDaliPublisherClient::processMessage, nullptr, maxThreads);
         CMessageBuffer mb;
-        stopped = false;
-        while (!stopped) {
+        while (running)
+        {
             mb.clear();
-            try {
+            try
+            {
 #ifdef TRACE_QWAITING
                 unsigned waiting = coven.probe(RANK_ALL,MPTAG_DALI_SUBSCRIPTION_FULFILL,NULL);
                 if ((waiting!=0)&&(waiting%10==0))
@@ -590,12 +594,13 @@ public:
                 if (coven.recv(mb,RANK_ALL,MPTAG_DALI_SUBSCRIPTION_FULFILL,NULL))
                     handler.handleMessage(mb);
                 else
-                    stopped = true;
+                    running = false;
             }
-            catch (IException *e) {
+            catch (IException *e)
+            {
                 EXCLOG(e,"CDaliPublisherClient::run");
                 e->Release();
-                stopped = true;
+                running = false;
             }
         }
         return 0;
@@ -623,16 +628,15 @@ public:
     {
     }
 
-
     void stop()
     {
-        if (!stopped) {
-            stopped = true;
+        if (running)
+        {
+            running = false;
             queryCoven().cancel(RANK_ALL,MPTAG_DALI_SUBSCRIPTION_FULFILL);
         }
         join();
     }
-
 };
 
 
@@ -644,7 +648,7 @@ IDaliServer *createDaliPublisherServer()
     return daliPublisherServer;
 }
 
-static CriticalSection subscriptionCrit;
+static CriticalSection subscriptionCrit{SYNC_LOCATION};
 
 
 ISubscriptionManager *querySubscriptionManager(unsigned tag)

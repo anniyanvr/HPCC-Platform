@@ -33,6 +33,8 @@
 #include "zcrypt.hpp"
 #include "persistent.hpp"
 
+#include <memory>
+
 using roxiemem::OwnedRoxieString;
 
 #ifndef _WIN32
@@ -43,10 +45,203 @@ using roxiemem::OwnedRoxieString;
 
 #define CONTENT_LENGTH "Content-Length: "
 #define CONTENT_ENCODING "Content-Encoding"
+#define CONTENT_TYPE "Content-Type"
 #define ACCEPT_ENCODING "Accept-Encoding"
 #define CONNECTION "Connection"
 
 unsigned soapTraceLevel = 1;
+unsigned soapAuthTraceLevel = 1;
+static StringBuffer soapSepString;
+
+void setSoapSepString(const char *_soapSepString)
+{
+    soapSepString.set(_soapSepString);
+}
+
+static void multiLineAppendReplace(StringBuffer &origStr, StringBuffer &newStr)
+{
+    if (origStr.isEmpty())
+        return;
+
+    newStr.ensureCapacity(origStr.length());
+
+    const char *cursor = origStr;
+    while (*cursor)
+    {
+        switch (*cursor)
+        {
+            case '\r':
+                newStr.append(soapSepString);
+                if ('\n' == *(cursor+1))
+                    cursor++;
+                break;
+            case '\n':
+                newStr.append(soapSepString);
+                break;
+            default:
+                newStr.append(*cursor);
+                break;
+        }
+        ++cursor;
+    }
+}
+
+static bool isAuthorizationHeaderName(const char *name, size32_t length)
+{
+    constexpr char authorizationHeader[] = "Authorization";
+    constexpr size32_t authorizationHeaderLength = sizeof(authorizationHeader) - 1;
+    constexpr char proxyAuthorizationHeader[] = "Proxy-Authorization";
+    constexpr size32_t proxyAuthorizationHeaderLength = sizeof(proxyAuthorizationHeader) - 1;
+    return (length == authorizationHeaderLength && !strnicmp(name, authorizationHeader, authorizationHeaderLength)) ||
+           (length == proxyAuthorizationHeaderLength && !strnicmp(name, proxyAuthorizationHeader, proxyAuthorizationHeaderLength));
+}
+
+static bool isAuthorizationHeader(const char *line, size32_t length)
+{
+    const char *colon = static_cast<const char *>(memchr(line, ':', length));
+    return colon && isAuthorizationHeaderName(line, colon - line);
+}
+
+static IException *makeInvalidHttpHeaderValueException(const char *name, const char *value, unsigned authLevel)
+{
+    if (authLevel == 0 && name && isAuthorizationHeaderName(name, strlen(name)))
+        return makeStringExceptionV(-1, "HTTPHEADER %s value (hidden) is not valid", name);
+    return makeStringExceptionV(-1, "HTTPHEADER value contained illegal characters: %s", value);
+}
+
+static void appendHeadersForLogging(StringBuffer &output, const char *input, size32_t length, unsigned authLevel)
+{
+    if (authLevel > 0)
+    {
+        output.append(length, input);
+        return;
+    }
+
+    const char *cursor = input;
+    const char *end = input + length;
+    bool hideContinuation = false;
+    while (cursor < end)
+    {
+        const char *lineEnd = static_cast<const char *>(memchr(cursor, '\n', end - cursor));
+        const char *next = lineEnd ? lineEnd + 1 : end;
+        const char *contentEnd = lineEnd ? lineEnd : end;
+        if (contentEnd > cursor && contentEnd[-1] == '\r')
+            --contentEnd;
+        size32_t lineLength = contentEnd - cursor;
+        if (!lineLength)
+        {
+            output.append(end - cursor, cursor);
+            return;
+        }
+
+        bool isContinuation = *cursor == ' ' || *cursor == '\t';
+        if (hideContinuation && isContinuation)
+        {
+            cursor = next;
+            continue;
+        }
+
+        hideContinuation = false;
+        if (isAuthorizationHeader(cursor, lineLength))
+        {
+            const char *colon = static_cast<const char *>(memchr(cursor, ':', lineLength));
+            const char *scheme = colon + 1;
+            while (scheme < contentEnd && (*scheme == ' ' || *scheme == '\t'))
+                ++scheme;
+            const char *schemeEnd = scheme;
+            while (schemeEnd < contentEnd && *schemeEnd != ' ' && *schemeEnd != '\t')
+                ++schemeEnd;
+            const char *credentials = schemeEnd;
+            while (credentials < contentEnd && (*credentials == ' ' || *credentials == '\t'))
+                ++credentials;
+
+            output.append(colon + 1 - cursor, cursor).append(' ');
+            if (credentials < contentEnd)
+                output.append(schemeEnd - scheme, scheme).append(' ');
+            output.append("(hidden)").append(next - contentEnd, contentEnd);
+            hideContinuation = true;
+        }
+        else
+            output.append(next - cursor, cursor);
+        cursor = next;
+    }
+}
+
+#ifdef _USE_CPPUNIT
+#include "unittests.hpp"
+
+namespace thorsoapcalltests
+{
+class SoapCallHeaderLoggingTests : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(SoapCallHeaderLoggingTests);
+        CPPUNIT_TEST(testAuthorizationHeadersHidden);
+        CPPUNIT_TEST(testAuthorizationHeadersPreserved);
+        CPPUNIT_TEST(testInvalidAuthorizationValueMessages);
+    CPPUNIT_TEST_SUITE_END();
+
+    void assertHeaders(const char *expected, const char *input, unsigned authLevel)
+    {
+        StringBuffer output;
+        appendHeadersForLogging(output, input, strlen(input), authLevel);
+        CPPUNIT_ASSERT_EQUAL(std::string(expected), std::string(output.str()));
+    }
+
+    void assertExceptionMessage(const char *expected, const char *name, const char *value, unsigned authLevel)
+    {
+        Owned<IException> exception = makeInvalidHttpHeaderValueException(name, value, authLevel);
+        StringBuffer message;
+        exception->errorMessage(message);
+        CPPUNIT_ASSERT_EQUAL(std::string(expected), std::string(message.str()));
+    }
+
+public:
+    void testAuthorizationHeadersHidden()
+    {
+        constexpr const char *input =
+            "Host: example.com\r\n"
+            "authorization: Basic secret\r\n"
+            "\tcontinued-secret\r\n"
+            "Proxy-Authorization: proxy-token\n"
+            "Authorization-Foo: visible\r\n"
+            "\r\n"
+            "Authorization: body-content";
+        constexpr const char *expected =
+            "Host: example.com\r\n"
+            "authorization: Basic (hidden)\r\n"
+            "Proxy-Authorization: (hidden)\n"
+            "Authorization-Foo: visible\r\n"
+            "\r\n"
+            "Authorization: body-content";
+
+        assertHeaders(expected, input, 0);
+    }
+
+    void testAuthorizationHeadersPreserved()
+    {
+        constexpr const char *input =
+            "Authorization: Basic secret\r\n"
+            "Proxy-Authorization: Bearer proxy-secret\r\n";
+
+        assertHeaders(input, input, 1);
+    }
+
+    void testInvalidAuthorizationValueMessages()
+    {
+        constexpr const char *invalidValue = "Basic secret\r\nInjected: value";
+        constexpr const char *detailedMessage = "HTTPHEADER value contained illegal characters: Basic secret\r\nInjected: value";
+
+        assertExceptionMessage("HTTPHEADER Authorization value (hidden) is not valid", "Authorization", invalidValue, 0);
+        assertExceptionMessage("HTTPHEADER Proxy-Authorization value (hidden) is not valid", "Proxy-Authorization", invalidValue, 0);
+        assertExceptionMessage(detailedMessage, "Authorization", invalidValue, 1);
+        assertExceptionMessage(detailedMessage, "X-Custom-Header", invalidValue, 0);
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(SoapCallHeaderLoggingTests);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(SoapCallHeaderLoggingTests, "SoapCallHeaderLoggingTests");
+}
+#endif
 
 #define WSCBUFFERSIZE 0x10000
 #define MAXWSCTHREADS 50    //Max Web Service Call Threads
@@ -101,6 +296,11 @@ public:
     StringBuffer &getUrlString(StringBuffer &url) const
     {
         return url.append(method).append("://").append(host).append(":").append(port).append(path);
+    }
+
+    StringBuffer &getDynamicUrlSecretName(StringBuffer &secretName) const
+    {
+        return generateDynamicUrlSecretName(secretName, method, userPasswordPair, host, port, path);
     }
 
     IException *getUrlException(IException *e) const
@@ -246,6 +446,24 @@ public:
     }
 };
 
+//if Url was globally accessible we could define this in jtrace instead
+//http span standards documented here: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+void setSpanURLAttributes(ISpan * clientSpan, const Url & url)
+{
+    if (clientSpan == nullptr)
+        return;
+
+    clientSpan->setSpanAttribute("http.request.method", "POST"); //apparently hardcoded to post
+                                                                 //Even though a "service" and 
+                                                                 //a "method" are tracked and sometimes
+                                                                 //the target service name is used
+                                                                 //and there's code and comments suggesting only
+                                                                 //GET is supported...
+    clientSpan->setSpanAttribute("network.peer.address", url.host.get());
+    clientSpan->setSpanAttribute("network.peer.port", url.port);
+    clientSpan->setSpanAttribute("network.protocol.name", url.method.get());
+}
+
 typedef IArrayOf<Url> UrlArray;
 
 //=================================================================================================
@@ -292,15 +510,22 @@ private:
 
 //=================================================================================================
 
-#define BLACKLIST_RETRIES 10
 #define ROXIE_ABORT_EVENT  1407
 #define TIMELIMIT_EXCEEDED 1408
 
 class BlackLister : public CInterface, implements IThreadFactory
 {
-    SocketEndpointArray list;
+    SocketEndpointArray list;  // MORE - should match the options too? Should use a hash table?
     Owned<IThreadPool> pool;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
+
+    struct DeblacklisterParams
+    {
+        SocketEndpoint ep;
+        unsigned delay = DEBLACKLIST_RETRY_DELAY;
+        unsigned retries = DEBLACKLIST_RETRIES;
+        unsigned timeout = DEBLACKLIST_CONNECT_TIMEOUT;
+    };
 
 private:
     inline void checkRoxieAbortMonitor(IRoxieAbortMonitor * roxieAbortMonitor)
@@ -330,39 +555,57 @@ public:
             if (soapTraceLevel > 3)
             {
                 StringBuffer s;
-                logctx.CTXLOG("socket %s is blacklisted", ep.getUrlStr(s).str());
+                logctx.CTXLOG("endpoint %s is blacklisted", ep.getEndpointHostText(s).str());
             }
             return true;
         }
         return false;
 
     }
-    void blacklist(SocketEndpoint &ep, const IContextLogger &logctx)
+    void blacklist(DeblacklisterParams &p, const IContextLogger &logctx)
     {
-        CriticalBlock b(crit);
-        if (list.find(ep)==NotFound)
+        unsigned match;
+        {
+            CriticalBlock b(crit);
+            match = list.find(p.ep);
+            if (match == NotFound)
+            {
+                list.append(p.ep);
+                pool->start(&p);
+            }
+        }
+        if (match == NotFound)
         {
             if (soapTraceLevel > 0)
             {
                 StringBuffer s;
-                logctx.CTXLOG("Blacklisting socket %s", ep.getUrlStr(s).str());
+                logctx.CTXLOG("Blacklisting endpoint %s", p.ep.getEndpointHostText(s).str());
             }
-            list.append(ep);
-            pool->start(&ep);
         }
+        else
+        {
+            if (soapTraceLevel > 3)
+            {
+                StringBuffer s;
+                logctx.CTXLOG("Endpoint %s is already blacklisted", p.ep.getEndpointHostText(s).str());
+            }
+
+        }
+
     }
     void deblacklist(SocketEndpoint &ep)
     {
-        CriticalBlock b(crit);
-        unsigned idx = list.find(ep);
-        if (idx!=NotFound)
+        unsigned match;
         {
-            if (soapTraceLevel > 0)
-            {
-                StringBuffer s;
-                DBGLOG("De-blacklisting socket %s", ep.getUrlStr(s).str());
-            }
-            list.remove(idx);
+            CriticalBlock b(crit);
+            match = list.find(ep);
+            if (match != NotFound)
+                list.remove(match);
+        }
+        if ((match != NotFound) && (soapTraceLevel > 0))
+        {
+            StringBuffer s;
+            DBGLOG("De-blacklisting endpoint %s", ep.getEndpointHostText(s).str());
         }
     }
 
@@ -371,49 +614,78 @@ public:
 
     BlackLister()
     {
-        pool.setown(createThreadPool("SocketBlacklistPool", this, NULL, 0, 0));
+        pool.setown(createThreadPool("SocketBlacklistPool", this, false, nullptr, 0, 0));
     }
 
     ISocket* connect(SocketEndpoint &ep,
                      const IContextLogger &logctx,
                      unsigned retries,
                      unsigned timeoutMS,
-                     IRoxieAbortMonitor * roxieAbortMonitor)
+                     IRoxieAbortMonitor * roxieAbortMonitor,
+                     const IWSCRowProvider *blOptions)
     {
-        if (lookup(ep, logctx))
+        bool useBlacklister = blOptions->useBlacklister();
+        if (useBlacklister && lookup(ep, logctx))
         {
             StringBuffer s;
-            ep.getUrlStr(s);
-            throw MakeStringException(-1, "blacklisted socket %s", s.str());
+            ep.getEndpointHostText(s);
+            throw MakeStringException(JSOCKERR_connection_failed, "%s %s", blOptions->getBLerror(), s.str());
         }
         Owned<IException> exc;
-        try
+
+        unsigned numAttemptsRemaining = retries+1;
+        if (!numAttemptsRemaining)
+            numAttemptsRemaining++;
+
+        unsigned connectTimeMS = timeoutMS;
+        if (timeoutMS == WAIT_FOREVER)
+            connectTimeMS = 60000 / numAttemptsRemaining;
+
+        while(numAttemptsRemaining-- > 0)
         {
-            checkRoxieAbortMonitor(roxieAbortMonitor);
-            Owned<ISocket> sock;
-            Owned<ISocketConnectWait> scw = nonBlockingConnect(ep, timeoutMS == WAIT_FOREVER ? 60000 : timeoutMS*(retries+1));
-            for (;;)
+            try
             {
-                sock.setown(scw->wait(1000));//throws if connect fails or timeoutMS
                 checkRoxieAbortMonitor(roxieAbortMonitor);
-                if (sock)
-                    return sock.getLink();
+                Owned<ISocket> sock;
+                Owned<ISocketConnectWait> scw = nonBlockingConnect(ep, connectTimeMS);
+                for (;;)
+                {
+                    sock.setown(scw->wait(1000)); //throws if connect fails or timeoutMS
+                    checkRoxieAbortMonitor(roxieAbortMonitor);
+                    if (sock)
+                        return sock.getLink();
+                }
+            }
+            catch (IException *e)
+            {
+                if (e->errorCode() == ROXIE_ABORT_EVENT)
+                    throw;
+                // TODO: do we checkTimeLimitExceeded(&remainingMS) and possibly error out if timelimit exceeded ?
+                if (numAttemptsRemaining > 0)
+                {
+                    e->Release();
+                }
+                else
+                {
+                    EXCLOG(e, nullptr);
+                    exc.setownIfNull(e);
+                    break;
+                }
             }
         }
 
-        catch (IJSOCK_Exception *e)
+        if (useBlacklister)
         {
-            EXCLOG(e,"BlackLister::connect");
-            if (exc)
-                e->Release();
-            else
-                exc.setown(e);
+            DeblacklisterParams params;
+            params.ep = ep;
+            params.delay = blOptions->getBLDelay();
+            params.retries = blOptions->getBLRetries();
+            params.timeout = blOptions->getBLConnectTimeout();
+            blacklist(params, logctx);
         }
-
-        blacklist(ep, logctx);
         if (exc->errorCode()==JSOCKERR_connection_failed) {
             StringBuffer s;
-            ep.getUrlStr(s);
+            ep.getEndpointHostText(s);
             throw MakeStringException(JSOCKERR_connection_failed, "connection failed %s", s.str());
         }
         throw exc.getClear();
@@ -423,6 +695,7 @@ public:
     bool blacklisted (unsigned short port, char const* host)
     {
         SocketEndpoint ep(host, port);
+        CriticalBlock b(crit);
         return (list.find(ep)!=NotFound);
     }
 
@@ -431,19 +704,20 @@ public:
                      const IContextLogger &logctx,
                      unsigned retries,
                      unsigned timeoutMS,
-                     IRoxieAbortMonitor * roxieAbortMonitor )
+                     IRoxieAbortMonitor * roxieAbortMonitor,
+                     const IWSCRowProvider *blOptions)
     {
         SocketEndpoint ep(host, port);
-        return connect(ep, logctx, retries, timeoutMS, roxieAbortMonitor);
+        return connect(ep, logctx, retries, timeoutMS, roxieAbortMonitor, blOptions);
     }
 
     virtual IPooledThread *createNew()
     {
         class SocketDeblacklister : public CInterface, implements IPooledThread
         {
-            SocketEndpoint ep;
             BlackLister &parent;
-            Semaphore stopped;
+            Semaphore stopped{SYNC_LOCATION};
+            DeblacklisterParams p;
         public:
             IMPLEMENT_IINTERFACE;
             SocketDeblacklister(BlackLister &_parent): parent(_parent)
@@ -455,29 +729,26 @@ public:
 
             virtual void init(void *param) override
             {
-                ep.set(*(SocketEndpoint *) param);
+                p = *(DeblacklisterParams *) param;
             }
             virtual void threadmain() override
             {
-                unsigned delay = 5000;
-                for (unsigned i = 0; i < BLACKLIST_RETRIES; i++)
+                for (unsigned i = 0; i < p.retries; i++)
                 {
                     try
                     {
-                        Owned<ISocket> s = ISocket::connect_timeout(ep, 10000);
+                        Owned<ISocket> s = ISocket::connect_timeout(p.ep, p.timeout);
                         s->close();
                         break;
                     }
                     catch (IJSOCK_Exception *E)
                     {
-                        // EXCLOG(E, "While updating socket blacklist");  // MORE - may need to downgrade if this fires traps
                         E->Release();
-                        if (stopped.wait(delay))
+                        if (stopped.wait(p.delay))
                             return;
-                        delay += delay;
                     }
                 }
-                parent.deblacklist(ep);
+                parent.deblacklist(p.ep);
             }
             virtual bool stop() override
             {
@@ -495,25 +766,40 @@ public:
     }
 } *blacklist;
 
+static bool defaultUsePersistConnections = false;
 static IPersistentHandler* persistentHandler = nullptr;
-static CriticalSection persistentCrit;
-static std::atomic<bool> persistentInitDone{false};
+static CriticalSection globalFeatureCrit{SYNC_LOCATION};
+static std::atomic<bool> globalFeaturesInitDone{false};
+static std::atomic<bool> mapUrlsToSecrets{false};
+static std::atomic<bool> warnIfUrlNotMappedToSecret{false};
+static std::atomic<bool> requireUrlsMappedToSecrets{false};
 
-void initPersistentHandler()
+void initGlobalFeatures()
 {
-    CriticalBlock block(persistentCrit);
-    if (!persistentInitDone)
+    CriticalBlock block(globalFeatureCrit);
+    if (!globalFeaturesInitDone)
     {
-#ifndef _CONTAINERIZED
-        const IProperties &conf = queryEnvironmentConf();
-        int maxPersistentRequests = conf.getPropInt("maxPersistentRequests", DEFAULT_MAX_PERSISTENT_REQUESTS);
-#else
-        const IPropertyTree& conf = queryComponentConfig();
-        int maxPersistentRequests = conf.getPropInt("@maxPersistentRequests", DEFAULT_MAX_PERSISTENT_REQUESTS);
-#endif
+        int maxPersistentRequests = 100;
+        defaultUsePersistConnections = false;
+        if (!isContainerized())
+        {
+            defaultUsePersistConnections = queryEnvironmentConf().getPropBool("useHttpCallPersistentRequests", defaultUsePersistConnections);
+            maxPersistentRequests = queryEnvironmentConf().getPropInt("maxHttpCallPersistentRequests", maxPersistentRequests); //global (backward compatible)
+        }
+
+        Owned<IPropertyTree> conf = getComponentConfig();
+        defaultUsePersistConnections = conf->getPropBool("@useHttpCallPersistentRequests", defaultUsePersistConnections);
+        maxPersistentRequests = conf->getPropInt("@maxHttpCallPersistentRequests", maxPersistentRequests); //component config wins
+        mapUrlsToSecrets = conf->getPropBool("@mapHttpCallUrlsToSecrets", false);
+        warnIfUrlNotMappedToSecret = conf->getPropBool("@warnIfUrlNotMappedToSecret", mapUrlsToSecrets);
+        requireUrlsMappedToSecrets = conf->getPropBool("@requireUrlsMappedToSecrets", false);
+
         if (maxPersistentRequests != 0)
             persistentHandler = createPersistentHandler(nullptr, DEFAULT_MAX_PERSISTENT_IDLE_TIME, maxPersistentRequests, PersistentLogLevel::PLogMin, true);
-        persistentInitDone = true;
+        else
+            defaultUsePersistConnections = false;
+
+        globalFeaturesInitDone = true;
     }
 }
 
@@ -533,6 +819,7 @@ MODULE_EXIT()
     {
         persistentHandler->stop(true);
         ::Release(persistentHandler);
+        persistentHandler = nullptr;
     }
 }
 
@@ -541,7 +828,7 @@ MODULE_EXIT()
 class ColumnProvider : public IColumnProvider, public CInterface
 {
 public:
-    ColumnProvider(unsigned _callLatencyMs) : callLatencyMs(_callLatencyMs), base(NULL) {}
+    ColumnProvider(unsigned _callLatencyMs) : base(NULL), callLatencyMs(_callLatencyMs) {}
     IMPLEMENT_IINTERFACE;
     virtual bool        getBool(const char * path) { return base->getBool(path); }
     virtual void        getData(size32_t len, void * text, const char * path) { base->getData(len, text, path); }
@@ -652,6 +939,8 @@ IColumnProvider * CreateColumnProvider(unsigned _callLatencyMs, bool _encoding)
 
 enum WSCType{STsoap, SThttp} ;  //web service call type
 
+static const char * getWsCallTypeName(WSCType wscType) { return wscType == STsoap ? "SOAPCALL" : "HTTPCALL"; }
+
 //Web Services Call Asynchronous For
 interface IWSCAsyncFor: public IInterface
 {
@@ -659,9 +948,9 @@ interface IWSCAsyncFor: public IInterface
     virtual void processException(const Url &url, ConstPointerArray &inputRows, IException *e) = 0;
     virtual void checkTimeLimitExceeded(unsigned * _remainingMS) = 0;
 
-    virtual void createHttpRequest(Url &url, StringBuffer &request) = 0;
-    virtual int readHttpResponse(StringBuffer &response, ISocket *socket, bool &keepAlive) = 0;
-    virtual void processResponse(Url &url, StringBuffer &response, ColumnProvider * meta) = 0;
+    virtual void createHttpRequest(StringBuffer &request, const Url &url, const IProperties * traceHeaders, StringBuffer &proxyHeaders) = 0;
+    virtual int readHttpResponse(StringBuffer &response, ISocket *socket, bool &keepAlive, StringBuffer &contentType) = 0;
+    virtual void processResponse(Url &url, StringBuffer &response, ColumnProvider * meta, const char *contentType) = 0;
 
     virtual const char *getResponsePath() = 0;
     virtual ConstPointerArray & getInputRows() = 0;
@@ -692,7 +981,7 @@ class CMatchCB : implements IXMLSelect, public CInterface
 public:
     IMPLEMENT_IINTERFACE;
 
-    CMatchCB(IWSCAsyncFor &_parent, const Url &_url, const char *_tail, ColumnProvider * _meta, const char *_excPath, unsigned _excFlags) : parent(_parent), url(_url), tail(_tail), meta(_meta), excFlags(_excFlags), excPath(_excPath)
+    CMatchCB(IWSCAsyncFor &_parent, const Url &_url, const char *_tail, ColumnProvider * _meta, const char *_excPath, unsigned _excFlags) : parent(_parent), url(_url), tail(_tail), meta(_meta), excPath(_excPath), excFlags(_excFlags)
     {
     }
 
@@ -806,38 +1095,97 @@ public:
     }
 };
 
+bool loadConnectSecret(const char *vaultId, const char *secretName, UrlArray &urlArray, StringBuffer &issuer, StringBuffer &proxyAddress, bool & persistEnabled, unsigned & persistMaxRequests, bool required, WSCType wscType)
+{
+    Owned<const IPropertyTree> secret;
+    if (!isEmptyString(secretName))
+        secret.setown(getSecret("ecl", secretName, vaultId, nullptr));
+    if (!secret)
+    {
+        if (required)
+            throw MakeStringException(0, "%s %s SECRET not found", getWsCallTypeName(wscType), secretName);
+        return false;
+    }
+
+    StringBuffer url;
+    getSecretKeyValue(url, secret, "url");
+    if (url.isEmpty())
+        throw MakeStringException(0, "%s %s HTTP SECRET must contain url", getWsCallTypeName(wscType), secretName);
+    UrlListParser urlListParser(url);
+    StringBuffer usernamePasswordPair;
+    getSecretKeyValue(usernamePasswordPair, secret, "username");
+    if (usernamePasswordPair.length())
+    {
+        if (strchr(usernamePasswordPair, ':'))
+            throw MakeStringException(0, "%s HTTP-CONNECT SECRET username contains illegal colon", getWsCallTypeName(wscType));
+        StringBuffer password;
+        getSecretKeyValue(password, secret, "password");
+        if (password.length())
+            usernamePasswordPair.append(':').append(password);
+    }
+    urlListParser.getUrls(urlArray, usernamePasswordPair);
+    getSecretKeyValue(proxyAddress.clear(), secret, "proxy");
+    getSecretKeyValue(issuer, secret, "issuer");
+
+    //Options defined in the secret override the defaults and the values specified in ECL
+    StringBuffer persist;
+    if (getSecretKeyValue(persist, secret, "persist"))
+        persistEnabled = strToBool(persist.str());
+
+    if (getSecretKeyValue(persist.clear(), secret, "persistMaxRequests"))
+        persistMaxRequests = atoi(persist);
+
+    return true;
+}
+
+
 //=================================================================================================
 
 class CWSCHelper : implements IWSCHelper, public CInterface
 {
 private:
     SimpleInterThreadQueueOf<const void, true> outputQ;
-    SpinLock outputQLock;
-    CriticalSection toXmlCrit, transformCrit, onfailCrit, timeoutCrit;
+    SpinLock outputQLock{SYNC_LOCATION};
+    CriticalSection toXmlCrit{SYNC_LOCATION};
+    CriticalSection transformCrit{SYNC_LOCATION};
+    CriticalSection onfailCrit{SYNC_LOCATION};
     unsigned done;
     Owned<IPropertyTree> xpathHints;
     Linked<ClientCertificate> clientCert;
 
     static CriticalSection secureContextCrit;
-    static Owned<ISecureSocketContext> secureContext;
+    static Owned<ISecureSocketContext> tlsSecureContext;
+    static Owned<ISecureSocketContext> localMtlsSecureContext;
+    static Owned<ISecureSocketContext> remoteMtlsSecureContext;
 
     Owned<ISecureSocketContext> customSecureContext;
 
     CTimeMon timeLimitMon;
-    bool complete, timeLimitExceeded;
+    bool complete;
+    std::atomic_bool timeLimitExceeded{false};
     bool customClientCert = false;
+    bool persistEnabled = false;
+    unsigned persistMaxRequests = 0;
+    StringAttr clientCertIssuer;
     IRoxieAbortMonitor * roxieAbortMonitor;
+    StringBuffer issuer; //TBD sync up with other PR, it will benefit from this being able to come from the secret
 
 protected:
-    CIArrayOf<CWSCHelperThread> threads;
+    IArrayOf<CWSCHelperThread> threads;
     WSCType wscType;
 
 public:
+    Owned<ISpan> activitySpanScope;
     IMPLEMENT_IINTERFACE;
 
-    CWSCHelper(IWSCRowProvider *_rowProvider, IEngineRowAllocator * _outputAllocator, const char *_authToken, WSCMode _wscMode, ClientCertificate *_clientCert, const IContextLogger &_logctx, IRoxieAbortMonitor *_roxieAbortMonitor, WSCType _wscType)
-        : logctx(_logctx), outputAllocator(_outputAllocator), clientCert(_clientCert), roxieAbortMonitor(_roxieAbortMonitor)
+    CWSCHelper(IWSCRowProvider *_rowProvider, IEngineRowAllocator * _outputAllocator, const char *_authToken, WSCMode _wscMode, ClientCertificate *_clientCert,
+               const IContextLogger &_logctx, IRoxieAbortMonitor *_roxieAbortMonitor, WSCType _wscType)
+        : clientCert(_clientCert), roxieAbortMonitor(_roxieAbortMonitor), outputAllocator(_outputAllocator), logctx(_logctx)
     {
+        VStringBuffer activityName(_wscType == STsoap ? "SoapCall Activity": "HTTPCall Activity");
+        activityName.append(" - ").append(_rowProvider->queryActivityId());
+        activitySpanScope.setown(logctx.queryActiveSpan()->createInternalSpan(activityName));
+        activitySpanScope->setSpanAttribute("activity_id", _rowProvider->queryActivityId());
         wscMode = _wscMode;
         wscType = _wscType;
         done = 0;
@@ -857,10 +1205,14 @@ public:
         else
             maxRetries = helper->numRetries();
 
+        activitySpanScope->setSpanAttribute("max_retries", maxRetries);
+
         //Allow all of these options to be specified separately.  Possibly useful, and the code is cleaner.
         logMin = (flags & SOAPFlogmin) != 0;
         logXML = (flags & SOAPFlog) != 0;
         logUserMsg = (flags & SOAPFlogusermsg) != 0;
+        logUserTailMsg = (flags & SOAPFlogusertail) != 0;
+        authTraceLevel = rowProvider->getSoapAuthTraceLevel();
 
         double dval = helper->getTimeout(); // In seconds, but may include fractions of a second...
         if (dval < 0.0) //not provided, or out of range
@@ -870,11 +1222,34 @@ public:
         else
             timeoutMS = (unsigned)(dval * 1000);
 
+        activitySpanScope->setSpanAttribute("timeout_ms", timeoutMS);
+
         dval = helper->getTimeLimit();
         if (dval <= 0.0)
             timeLimitMS = WAIT_FOREVER;
         else
             timeLimitMS = (unsigned)(dval * 1000);
+
+        persistEnabled = defaultUsePersistConnections;
+        persistMaxRequests = 0; // 0 implies do not override the default pool size
+        if (flags & SOAPFpersist)
+        {
+            if (flags & SOAPFpersistMax)
+            {
+                unsigned maxRequests = helper->getPersistMaxRequests();
+                if (maxRequests != 0)
+                {
+                    persistEnabled = true;
+                    persistMaxRequests = maxRequests;
+                }
+                else
+                    persistEnabled = false;
+            }
+            else
+                persistEnabled = true;
+            activitySpanScope->setSpanAttribute("persist_enabled", persistEnabled);
+            activitySpanScope->setSpanAttribute("persist_max_requests", persistMaxRequests);
+        }
 
         if (flags & SOAPFhttpheaders)
             httpHeaders.set(s.setown(helper->getHttpHeaders()));
@@ -883,7 +1258,6 @@ public:
             s.setown(helper->getXpathHintsXml());
             xpathHints.setown(createPTreeFromXMLString(s.get()));
         }
-
         if (wscType == STsoap)
         {
             soapaction.set(s.setown(helper->getSoapAction()));
@@ -896,7 +1270,7 @@ public:
 
             httpHeaderValue.set(s.setown(helper->getHttpHeaderValue()));
             if(httpHeaderValue.get() && !isValidHttpValue(httpHeaderValue.get()))
-                throw MakeStringException(-1, "HTTPHEADER value contained illegal characters: %s", httpHeaderValue.get());
+                throw makeInvalidHttpHeaderValueException(httpHeaderName.get(), httpHeaderValue.get(), authTraceLevel);
 
             if ((flags & SOAPFliteral) && (flags & SOAPFencoding))
                 throw MakeStringException(0, "SOAPCALL 'LITERAL' and 'ENCODING' options are mutually exclusive");
@@ -935,6 +1309,8 @@ public:
         service.set(s.setown(helper->getService()));
         service.trim();
 
+        activitySpanScope->setSpanAttribute("target_service", service.str());
+
         if (wscType == SThttp)
         {
             service.toUpperCase();  //GET/PUT/POST
@@ -954,16 +1330,33 @@ public:
         StringBuffer proxyAddress;
         proxyAddress.set(s.setown(helper->getProxyAddress()));
 
-        OwnedRoxieString hosts(helper->getHosts());
+        OwnedRoxieString hostsString(helper->getHosts());
+        const char *hosts = hostsString.get();
+
         if (isEmptyString(hosts))
-            throw MakeStringException(0, "%sCALL specified no URLs",wscType == STsoap ? "SOAP" : "HTTP");
+            throw MakeStringException(0, "%s specified no URLs", getWsCallTypeName(wscType));
+
+        activitySpanScope->setSpanAttribute("hosts", hosts);
+
+        if (0==strncmp(hosts, "mtls:", 5))
+        {
+            clientCertIssuer.set("local");
+            hosts += 5;
+            activitySpanScope->setSpanAttribute("client_cert_issuer", "local");
+        }
+        else if (0==strncmp(hosts, "remote-mtls:", 12))
+        {
+            clientCertIssuer.set("remote");
+            hosts += 12;
+            activitySpanScope->setSpanAttribute("client_cert_issuer", "remote");
+        }
         if (0==strncmp(hosts, "secret:", 7))
         {
-            const char *finger = hosts.get()+7;
+            const char *finger = hosts+7;
             if (isEmptyString(finger))
-                throw MakeStringException(0, "%sCALL HTTP-CONNECT SECRET specified with no name", wscType == STsoap ? "SOAP" : "HTTP");
+                throw MakeStringException(0, "%s HTTP-CONNECT SECRET specified with no name", getWsCallTypeName(wscType));
             if (!proxyAddress.isEmpty())
-                throw MakeStringException(0, "%sCALL PROXYADDRESS can't be used with HTTP-CONNECT secrets", wscType == STsoap ? "SOAP" : "HTTP");
+                throw MakeStringException(0, "%s PROXYADDRESS can't be used with HTTP-CONNECT secrets", getWsCallTypeName(wscType));
             StringAttr vaultId;
             const char *thumb = strchr(finger, ':');
             if (thumb)
@@ -973,44 +1366,52 @@ public:
             }
             StringBuffer secretName("http-connect-");
             secretName.append(finger);
-            Owned<IPropertyTree> secret = (vaultId.isEmpty()) ? getSecret("ecl", secretName) : getVaultSecret("ecl", vaultId, secretName, nullptr);
-            if (!secret)
-                throw MakeStringException(0, "%sCALL %s SECRET not found", wscType == STsoap ? "SOAP" : "HTTP", secretName.str());
 
-            StringBuffer url;
-            getSecretKeyValue(url, secret, "url");
-            if (url.isEmpty())
-                throw MakeStringException(0, "%sCALL %s HTTP SECRET must contain url", wscType == STsoap ? "SOAP" : "HTTP", secretName.str());
-            UrlListParser urlListParser(url);
-            StringBuffer auth;
-            getSecretKeyValue(auth, secret, "username");
-            if (auth.length())
-            {
-                if (strchr(auth, ':'))
-                    throw MakeStringException(0, "%sCALL HTTP-CONNECT SECRET username contains illegal colon", wscType == STsoap ? "SOAP" : "HTTP");
-                auth.append(':');
-                getSecretKeyValue(auth, secret, "password");
-            }
-            urlListParser.getUrls(urlArray, auth);
-            proxyAddress.set(secret->queryProp("proxy"));
-            getSecretKeyValue(proxyAddress.clear(), secret, "proxy");
+            loadConnectSecret(vaultId, secretName, urlArray, issuer, proxyAddress, persistEnabled, persistMaxRequests, true, wscType);
         }
         else
         {
             UrlListParser urlListParser(hosts);
             urlListParser.getUrls(urlArray);
+            if (mapUrlsToSecrets && urlArray.length())
+            {
+                StringBuffer secretName;
+                UrlArray tempArray;
+                //TBD: If this is a list of URLs do we A. not check for a mapped secret, B. check the first one, C. Use long secret name including entire list
+                Url &url = urlArray.item(0);
+                url.getDynamicUrlSecretName(secretName);
+                if (secretName.length())
+                {
+                    if (loadConnectSecret(nullptr, secretName, tempArray, issuer, proxyAddress, persistEnabled, persistMaxRequests, requireUrlsMappedToSecrets, wscType))
+                    {
+                        logctx.CTXLOG("Mapped %s URL!", wscCallTypeText());
+                        if (tempArray.length())
+                            urlArray.swapWith(tempArray);
+                    }
+                    else if (warnIfUrlNotMappedToSecret)
+                    {
+                        //should we warn even if the url doesn't have credentials embedded?  If HTTPHEADER is being used to pass credentials, we still prefer connect secrets be used instead.
+                        logctx.CTXLOG("Security Warning: %s not using a connection secret (auto secret = %s)", wscCallTypeText(), secretName.str());
+                    }
+                }
+            }
         }
 
         numUrls = urlArray.ordinality();
         if (numUrls == 0)
-            throw MakeStringException(0, "%sCALL specified no URLs",wscType == STsoap ? "SOAP" : "HTTP");
+            throw MakeStringException(0, "%s specified no URLs", getWsCallTypeName(wscType));
+
+        if (!persistentHandler)
+            persistEnabled = false;
 
         if (!proxyAddress.isEmpty())
         {
             UrlListParser proxyUrlListParser(proxyAddress);
             if (0 == proxyUrlListParser.getUrls(proxyUrlArray))
-                throw MakeStringException(0, "%sCALL proxy address specified no URLs",wscType == STsoap ? "SOAP" : "HTTP");
+                throw MakeStringException(0, "%s proxy address specified no URLs", getWsCallTypeName(wscType));
         }
+
+        activitySpanScope->setSpanAttribute("proxy_urls", proxyAddress.str());
 
         if (wscMode == SCrow)
         {
@@ -1076,7 +1477,7 @@ public:
         complete = aborted = timeLimitExceeded = false;
 
         ForEachItemIn(i,threads)
-            threads.item(i).start();
+            threads.item(i).start(true); // inherit context because the threads always have a shorter lifetime than the caller.
     }
     void abort()
     {
@@ -1116,7 +1517,12 @@ public:
         if (!ownedSC)
         {
             if (clientCert != NULL)
-                ownedSC.setown(createSecureSocketContextEx(clientCert->certificate, clientCert->privateKey, clientCert->passphrase, ClientSocket));
+            {
+                Owned<IPropertyTree> config = createSecureSocketConfig(clientCert->certificate, clientCert->privateKey, clientCert->passphrase, true);
+                ownedSC.setown(createSecureSocketContextEx2(config, ClientSocket));
+            }
+            else if (clientCertIssuer.length())
+                ownedSC.setown(createSecureSocketContextSecret(clientCertIssuer.str(), ClientSocket));
             else
                 ownedSC.setown(createSecureSocketContext(ClientSocket));
         }
@@ -1125,20 +1531,34 @@ public:
     ISecureSocketContext *ensureStaticSecureContext()
     {
         CriticalBlock b(secureContextCrit);
-        return ensureSecureContext(secureContext);
+        if (clientCertIssuer.length())
+        {
+            if (strieq(clientCertIssuer.str(), "local"))
+                return ensureSecureContext(localMtlsSecureContext);
+            if (strieq(clientCertIssuer.str(), "remote"))
+                return ensureSecureContext(remoteMtlsSecureContext);
+        }
+        return ensureSecureContext(tlsSecureContext);
     }
-    ISecureSocket *createSecureSocket(ISocket *sock)
+    ISecureSocket *createSecureSocket(ISocket *sock, const char *fqdn = nullptr)
     {
         ISecureSocketContext *sc = (customClientCert) ? ensureSecureContext(customSecureContext) : ensureStaticSecureContext();
-        return sc->createSecureSocket(sock);
+        return sc->createSecureSocket(sock, SSLogNormal, fqdn);
     }
 #endif
     bool isTimeLimitExceeded(unsigned *_remainingMS)
     {
         if (timeLimitMS != WAIT_FOREVER)
         {
-            CriticalBlock block(timeoutCrit);
-            if (timeLimitExceeded || timeLimitMon.timedout(_remainingMS))
+            //No need to protect with a critical section because it does not matter if more than one thread calls timedout
+            if (timeLimitExceeded)
+            {
+                if (_remainingMS)
+                    *_remainingMS = 0;
+                return true;
+            }
+
+            if (timeLimitMon.timedout(_remainingMS))
             {
                 timeLimitExceeded = true;
                 return true;
@@ -1159,8 +1579,20 @@ public:
             logctx.CTXLOG("%s: %.*s", wscCallTypeText(), lenText, text.getstr());
         }
     }
+    void addUserLogTailMsg(const byte * row, unsigned timeTaken)
+    {
+        if (logUserTailMsg)
+        {
+            size32_t lenText;
+            rtlDataAttr text;
+            helper->getLogTailText(lenText, text.refstr(), row);
+            logctx.CTXLOG("%s [time=%u]: %.*s", wscCallTypeText(), timeTaken, lenText, text.getstr());
+        }
+    }
     inline IXmlToRowTransformer * getRowTransformer() { return rowTransformer; }
-    inline const char * wscCallTypeText() const { return wscType == STsoap ? "SOAPCALL" : "HTTPCALL"; }
+    inline const char * wscCallTypeText() const { return getWsCallTypeName(wscType); }
+    inline bool usePersistConnections() const { return persistEnabled; }
+    inline unsigned getPersistMaxRequests() const { return persistMaxRequests; }
 
 protected:
     friend class CWSCHelperThread;
@@ -1220,9 +1652,11 @@ protected:
     unsigned maxRetries;
     unsigned timeoutMS;
     unsigned timeLimitMS;
+    unsigned authTraceLevel;
     bool logXML;
     bool logMin;
     bool logUserMsg;
+    bool logUserTailMsg = false;
     bool aborted;
     const IContextLogger &logctx;
     unsigned flags;
@@ -1241,8 +1675,11 @@ protected:
     IXmlToRowTransformer * rowTransformer;
 };
 
-CriticalSection CWSCHelper::secureContextCrit;
-Owned<ISecureSocketContext> CWSCHelper::secureContext; // created on first use
+CriticalSection CWSCHelper::secureContextCrit(SYNC_LOCATION);
+Owned<ISecureSocketContext> CWSCHelper::tlsSecureContext; // created on first use
+Owned<ISecureSocketContext> CWSCHelper::localMtlsSecureContext; // created on first use
+Owned<ISecureSocketContext> CWSCHelper::remoteMtlsSecureContext; // created on first use
+
 
 //=================================================================================================
 
@@ -1376,8 +1813,30 @@ void CWSCHelperThread::createXmlSoapQuery(IXmlWriterExt &xmlWriter, ConstPointer
     xmlWriter.outputEndNested("soap:Envelope");
 }
 
+class CWSUserLogCompletor
+{
+public:
+    CWSUserLogCompletor(CWSCHelper &wshelper, ConstPointerArray &rows) : inputRows(rows), helper(wshelper) {}
+    ~CWSUserLogCompletor()
+    {
+        //user log entries were output for the whole batch in the createXXXQuery routine above
+        //need to match each with a query complete log entry
+        unsigned timeTaken = msTick()-start;
+        ForEachItemIn(idx, inputRows)
+            helper.addUserLogTailMsg((const byte *)inputRows.item(idx), timeTaken);
+    }
+private:
+    unsigned start = msTick();
+    ConstPointerArray &inputRows;
+    CWSCHelper &helper;
+};
+
 void CWSCHelperThread::processQuery(ConstPointerArray &inputRows)
 {
+    std::unique_ptr<CWSUserLogCompletor> log;
+    if (master->logUserTailMsg)
+        log.reset(new CWSUserLogCompletor(*master, inputRows));
+
     unsigned xmlWriteFlags = 0;
     unsigned xmlReadFlags = ptr_ignoreNameSpaces;
     if (master->flags & SOAPFtrim)
@@ -1390,11 +1849,27 @@ void CWSCHelperThread::processQuery(ConstPointerArray &inputRows)
     XMLWriterType xmlType = WTStandard;
     if (useMarkup && (master->flags & SOAPFjson))
         xmlType = (master->flags & SOAPFnoroot) ? WTJSONRootless : WTJSONObject;
+    else if (master->flags & SOAPFformEncoded)
+    {
+        xmlType = WTFormUrlEncoded;
+        if (master->xpathHints)
+        {
+            const char *notation = master->xpathHints->queryProp("formnotation");
+            if (!isEmptyString(notation))
+            {
+                //default is "dot" which is of the form a[1].b=22
+                if (strieq(notation, "bracket")) //which is of the form a[1][b]=22
+                    xmlWriteFlags |= XWFbracketformenc;
+                else if (strieq(notation, "esp")) //which is of the form a.1.b=22
+                    xmlWriteFlags |= XWFhpccformenc;
+            }
+        }
+    }
     else if (master->flags & SOAPFencoding)
         xmlType = WTEncodingData64;
 
     Owned<IXmlWriterExt> xmlWriter = createIXmlWriterExt(xmlWriteFlags, 0, nullptr, xmlType);
-    if (useMarkup)
+    if (useMarkup || xmlType == WTFormUrlEncoded)
         createHttpPostQuery(*xmlWriter, inputRows, false, false);
     else if (master->wscType == STsoap )
         createXmlSoapQuery(*xmlWriter, inputRows);
@@ -1465,24 +1940,42 @@ int CWSCHelperThread::run()
 
 IWSCHelper * createSoapCallHelper(IWSCRowProvider *r, IEngineRowAllocator * outputAllocator, const char *authToken, WSCMode wscMode, ClientCertificate *clientCert, const IContextLogger &logctx, IRoxieAbortMonitor * roxieAbortMonitor)
 {
+    if (!globalFeaturesInitDone)
+        initGlobalFeatures();
     return new CWSCHelper(r, outputAllocator, authToken, wscMode, clientCert, logctx, roxieAbortMonitor, STsoap);
 }
 
 IWSCHelper * createHttpCallHelper(IWSCRowProvider *r, IEngineRowAllocator * outputAllocator, const char *authToken, WSCMode wscMode, ClientCertificate *clientCert, const IContextLogger &logctx, IRoxieAbortMonitor * roxieAbortMonitor)
 {
+    if (!globalFeaturesInitDone)
+        initGlobalFeatures();
     return new CWSCHelper(r, outputAllocator, authToken, wscMode, clientCert, logctx, roxieAbortMonitor, SThttp);
 }
 
 //=================================================================================================
+
+const char * queryAlternativeHeader(const char * header)
+{
+    if (strieq(header, kGlobalIdHttpHeaderName))
+        return kLegacyGlobalIdHttpHeaderName;
+    if (strieq(header, kLegacyGlobalIdHttpHeaderName))
+        return kGlobalIdHttpHeaderName;
+    if (strieq(header, kCallerIdHttpHeaderName))
+        return kLegacyCallerIdHttpHeaderName;
+    if (strieq(header, kLegacyCallerIdHttpHeaderName))
+        return kCallerIdHttpHeaderName;
+    return nullptr;
+}
+
 bool httpHeaderBlockContainsHeader(const char *httpheaders, const char *header)
 {
     if (!httpheaders || !*httpheaders)
         return false;
     VStringBuffer match("\n%s:", header);
     const char *matchStart = match.str()+1;
-    if (!strncmp(httpheaders, matchStart, strlen(matchStart)))
+    if (!strnicmp(httpheaders, matchStart, strlen(matchStart)))
         return true;
-    if (strstr(httpheaders, match))
+    if (stristr(httpheaders, match))
         return true;
     return false;
 }
@@ -1492,7 +1985,7 @@ bool getHTTPHeader(const char *httpheaders, const char *header, StringBuffer& va
     if (!httpheaders || !*httpheaders || !header || !*header)
         return false;
 
-    const char* pHeader = strstr(httpheaders, header);
+    const char* pHeader = stristr(httpheaders, header);
     if (!pHeader)
         return false;
 
@@ -1535,27 +2028,16 @@ class CWSCAsyncFor : implements IWSCAsyncFor, public CInterface, public CAsyncFo
             }
             else if (curPosn >= currLen)
             {   //nothing in buffer, read from socket
-                size32_t bytesRead=0;
-                count = 0;
-                do
-                {
-                    socket->readtms(buf + count, 0, len - count, bytesRead, timeoutMS);
-                    count += bytesRead;
-                } while (count != len);
+                socket->readtms(buf, len, len, count, timeoutMS);
                 currLen = curPosn = 0;
             }
             else
             {   //only some is in buffer, read rest from socket
-                size32_t bytesRead=0;
                 size32_t avail = currLen - curPosn;
                 memcpy(buf, (buffer + curPosn), avail);
                 count = avail;
-                do
-                {
-                    size32_t read;
-                    socket->readtms(buf+avail+bytesRead, 0, len-avail-bytesRead, read, timeoutMS);
-                    bytesRead += read;
-                } while (len != (bytesRead + avail));
+                size32_t bytesRead;
+                socket->readtms(buf+avail, len-avail, len-avail, bytesRead, timeoutMS);
                 count += bytesRead;
                 currLen = curPosn = 0;
             }
@@ -1568,7 +2050,7 @@ private:
     ConstPointerArray &inputRows;
     IXmlWriterExt &xmlWriter;
     IEngineRowAllocator * outputAllocator;
-    CriticalSection processExceptionCrit;
+    CriticalSection processExceptionCrit{SYNC_LOCATION};
     StringBuffer responsePath;
     Owned<CSocketDataProvider> dataProvider;
     PTreeReaderOptions options;
@@ -1672,26 +2154,50 @@ private:
     {
         if (soapTraceLevel > 6 || master->logXML)
         {
-            if (!contentEncoded)
-                master->logctx.mCTXLOG("%s: request(%s)", master->wscCallTypeText(), request.str());
+            StringBuffer contentStr;
+            bool filterAuthorization = (master->authTraceLevel == 0);
+            StringBuffer filteredRequest;
+            if (filterAuthorization)
+                appendHeadersForLogging(filteredRequest, request.str(), request.length(), master->authTraceLevel);
+            StringBuffer &loggableRequest = filterAuthorization ? filteredRequest : request;
+            if (contentEncoded)
+                contentStr.append(", content encoded.");
+            // Only do translation if soapcall LOG option set and soapSepString defined
+            if ( (master->logXML) && (soapSepString.length() > 0) )
+            {
+                StringBuffer request2;
+                multiLineAppendReplace(loggableRequest, request2);
+                master->logctx.CTXLOG("%s: request(%s)%s", master->wscCallTypeText(), request2.str(), contentStr.str());
+            }
             else
-                master->logctx.mCTXLOG("%s: request(%s), content encoded.", master->wscCallTypeText(), request.str());
+                master->logctx.mCTXLOG("%s: request(%s)%s", master->wscCallTypeText(), loggableRequest.str(), contentStr.str());
         }
     }
 
-    void createHttpRequest(Url &url, StringBuffer &request)
+    void createHttpRequest(StringBuffer &request, const Url &url, const IProperties * traceHeaders, StringBuffer &proxyHeaders)
     {
-        // Create the HTTP POST request
-        if (master->wscType == STsoap)
-            request.clear().append("POST ").append(url.path).append(" HTTP/1.1\r\n");
+        request.clear();
+
+        if (!proxyHeaders.isEmpty())
+            request.append(proxyHeaders);
         else
-            request.clear().append(master->service).append(" ").append(url.path).append(" HTTP/1.1\r\n");
+        {
+            // Create the HTTP POST request
+            if (master->wscType == STsoap)
+                request.append("POST ").append(url.path).append(" HTTP/1.1\r\n");
+            else
+                request.append(master->service).append(" ").append(url.path).append(" HTTP/1.1\r\n");
+        }
 
         const char *httpheaders = master->httpHeaders.get();
         if (httpheaders && *httpheaders)
         {
             if (soapTraceLevel > 6 || master->logXML)
-                master->logctx.mCTXLOG("%s: Adding HTTP Headers(%s)",  master->wscCallTypeText(), httpheaders);
+            {
+                StringBuffer loggableHeaders;
+                appendHeadersForLogging(loggableHeaders, httpheaders, strlen(httpheaders), master->authTraceLevel);
+                master->logctx.mCTXLOG("%s: Adding HTTP Headers(%s)", master->wscCallTypeText(), loggableHeaders.str());
+            }
             request.append(httpheaders);
         }
 
@@ -1713,13 +2219,26 @@ private:
         if (!httpHeaderBlockContainsHeader(httpheaders, ACCEPT_ENCODING))
             request.appendf("%s: gzip, deflate\r\n", ACCEPT_ENCODING);
 #endif
-        if (!isEmptyString(master->logctx.queryGlobalId()))
+        if (traceHeaders)
         {
-            if (!httpHeaderBlockContainsHeader(httpheaders, master->logctx.queryGlobalIdHttpHeader()))
-                request.append(master->logctx.queryGlobalIdHttpHeader()).append(": ").append(master->logctx.queryGlobalId()).append("\r\n");
-
-            if (!isEmptyString(master->logctx.queryLocalId()) && !httpHeaderBlockContainsHeader(httpheaders, master->logctx.queryCallerIdHttpHeader()))
-                request.append(master->logctx.queryCallerIdHttpHeader()).append(": ").append(master->logctx.queryLocalId()).append("\r\n");  //our localId is reciever's callerId
+            Owned<IPropertyIterator> iter = traceHeaders->getIterator();
+            ForEach(*iter)
+            {
+                const char * key = iter->getPropKey();
+                bool hasHeader = httpHeaderBlockContainsHeader(httpheaders, key);
+                if (!hasHeader)
+                {
+                    //If this header is http-global-id, check that global-id hasn't been explicitly added already
+                    const char * altHeader = queryAlternativeHeader(key);
+                    bool hasAltHeader = altHeader && httpHeaderBlockContainsHeader(httpheaders, altHeader);
+                    if (!hasAltHeader)
+                    {
+                        const char * value = iter->queryPropValue();
+                        if (!isEmptyString(value))
+                            request.append(key).append(": ").append(value).append("\r\n");
+                    }
+                }
+            }
         }
 
         if (master->wscType == STsoap)
@@ -1732,14 +2251,19 @@ private:
                 StringBuffer hdr(master->httpHeaderName.get());
                 hdr.append(": ").append(master->httpHeaderValue);
                 if (soapTraceLevel > 6 || master->logXML)
-                    master->logctx.mCTXLOG("SOAPCALL: Adding HTTP Header(%s)", hdr.str());
+                {
+                    StringBuffer loggableHeader;
+                    appendHeadersForLogging(loggableHeader, hdr.str(), hdr.length(), master->authTraceLevel);
+                    master->logctx.mCTXLOG("SOAPCALL: Adding HTTP Header(%s)", loggableHeader.str());
+                }
                 request.append(hdr.append("\r\n"));
             }
             if (!httpHeaderBlockContainsHeader(httpheaders, "Content-Type"))
             {
-                bool isJson = ((master->flags & SOAPFmarkupinfo) && (master->flags & SOAPFjson));
-                if (isJson)
+                if ((master->flags & SOAPFmarkupinfo) && (master->flags & SOAPFjson))
                     request.append("Content-Type: application/json\r\n");
+                else if (master->flags & SOAPFformEncoded)
+                    request.append("Content-Type: application/x-www-form-urlencoded\r\n");
                 else
                     request.append("Content-Type: text/xml\r\n");
             }
@@ -1783,7 +2307,7 @@ private:
             master->logctx.CTXLOG("%s: request(%s:%u)", master->wscCallTypeText(), url.host.str(), url.port);
     }
 
-    int readHttpResponse(StringBuffer &response, ISocket *socket, bool &keepAlive)
+    int readHttpResponse(StringBuffer &response, ISocket *socket, bool &keepAlive, StringBuffer &contentType)
     {
         // Read the POST reply
         // not doesn't *assume* is valid HTTP post format but if it is takes advantage of
@@ -1800,10 +2324,11 @@ private:
         StringBuffer dbgheader, contentEncoding;
         bool chunked = false;
         size32_t read = 0;
+        bool sockClosed = false;
         do {
             checkTimeLimitExceeded(&remainingMS);
             checkRoxieAbortMonitor(master->roxieAbortMonitor);
-            socket->readtms(buffer+read, 0, WSCBUFFERSIZE-read, bytesRead, MIN(master->timeoutMS,remainingMS));
+            sockClosed = readtmsAllowClose(socket, buffer+read, 1, WSCBUFFERSIZE-read, bytesRead, MIN(master->timeoutMS, remainingMS));
             checkTimeLimitExceeded(&remainingMS);
             checkRoxieAbortMonitor(master->roxieAbortMonitor);
 
@@ -1817,10 +2342,10 @@ private:
                     s = strstr(buffer, " ");
                     if (s)
                         rval = atoi(s+1);
-                    if (!strstr(buffer,"Transfer-Encoding: chunked"))
+                    if (!stristr(buffer,"Transfer-Encoding: chunked"))
                     {
                         chunked = false;
-                        s = strstr(buffer,CONTENT_LENGTH);
+                        s = stristr(buffer,CONTENT_LENGTH);
                         if (s) {
                             s += strlen(CONTENT_LENGTH);
                             if ((size32_t)(s-buffer) < payloadofs)
@@ -1858,7 +2383,7 @@ private:
                                 chunkSize = (chunkSize*16) + 10 + (toupper(ch) - 'A');
                             dataProvider->getBytes(&ch, 1);
                         }
-                        while (chunkSize && ch != '\n')//consume chunk-extension and CRLF
+                        while (ch != '\n')//consume chunk-extension and CRLF
                             dataProvider->getBytes(&ch, 1);
                         while (chunkSize)
                         {
@@ -1885,14 +2410,25 @@ private:
                                     chunkSize = (chunkSize*16) + 10 + (toupper(ch) - 'A');
                                 dataProvider->getBytes(&ch, 1);
                             }
-                            while(chunkSize && ch != '\n')//consume chunk-extension and CRLF
+                            while(ch != '\n')//consume chunk-extension and CRLF
                                 dataProvider->getBytes(&ch, 1);
                         }
+                        //to support persistent connections we need to consume all trailing bytes for each message
+                        dataProvider->getBytes(&ch, 1);
+                        //the standard allows trailing HTTP headers to be included at the of the chunked message, the following loop will consume those
+                        while ( ch != '\r' ) //if there is content before the CRLF it is a trailing HTTP header
+                        {
+                            while (ch != '\n')//consume the CRLF of the trailing header
+                                dataProvider->getBytes(&ch, 1);
+                            dataProvider->getBytes(&ch, 1);
+                        }
+                        while (ch != '\n') //consume final CRLF
+                            dataProvider->getBytes(&ch, 1);
                     }
                     break;
                 }
             }
-            if (bytesRead == 0)         // socket closed
+            if ( (bytesRead == 0) || (sockClosed) )   // socket closed
                 break;
         } while (bytesRead&&(read<WSCBUFFERSIZE));
         if (!chunked)
@@ -1908,44 +2444,68 @@ private:
             }
             if (read)
                 response.append(read,payload);
-            if (payloadsize) {  // read directly into response
-                while (read<payloadsize) {
-                    checkTimeLimitExceeded(&remainingMS);
-                    checkRoxieAbortMonitor(master->roxieAbortMonitor);
-                    socket->readtms(response.reserve(payloadsize-read), 0, payloadsize-read, bytesRead, MIN(master->timeoutMS,remainingMS));
-                    checkTimeLimitExceeded(&remainingMS);
-                    checkRoxieAbortMonitor(master->roxieAbortMonitor);
-
-                    read += bytesRead;
-                    response.setLength(read);
-                    if (bytesRead==0) {
-                        master->logctx.CTXLOG("%sCALL: Warning %sHTTP response terminated prematurely",master->wscType == STsoap ? "SOAP" : "HTTP",chunked?"CHUNKED ":"");
+            if (payloadsize) // read directly into response
+            {
+                while (read<payloadsize)
+                {
+                    bytesRead = 0;
+                    if (!sockClosed)
+                    {
+                        checkTimeLimitExceeded(&remainingMS);
+                        checkRoxieAbortMonitor(master->roxieAbortMonitor);
+                        sockClosed = readtmsAllowClose(socket, response.reserve(payloadsize-read), 1, payloadsize-read, bytesRead, MIN(master->timeoutMS, remainingMS));
+                        checkTimeLimitExceeded(&remainingMS);
+                        checkRoxieAbortMonitor(master->roxieAbortMonitor);
+                        read += bytesRead;
+                        response.setLength(read);
+                    }
+                    if ( (bytesRead==0) || (sockClosed && (read < payloadsize)) )
+                    {
+                        master->logctx.CTXLOG("%s: Warning %sHTTP response terminated prematurely", getWsCallTypeName(master->wscType),chunked?"CHUNKED ":"");
                         break; // oops  looks likesocket closed early
                     }
                 }
             }
-            else {
-                for (;;) {
+            else if (!sockClosed)
+            {
+                for (;;)
+                {
                     checkTimeLimitExceeded(&remainingMS);
                     checkRoxieAbortMonitor(master->roxieAbortMonitor);
-                    socket->readtms(buffer, 0, WSCBUFFERSIZE, bytesRead, MIN(master->timeoutMS,remainingMS));
+                    sockClosed = readtmsAllowClose(socket, buffer, 1, WSCBUFFERSIZE, bytesRead, MIN(master->timeoutMS, remainingMS));
                     checkTimeLimitExceeded(&remainingMS);
                     checkRoxieAbortMonitor(master->roxieAbortMonitor);
 
                     if (bytesRead==0)
                         break;              // rely on socket closing to terminate message
                     response.append(bytesRead,buffer);
+                    if (sockClosed)
+                        break;
                 }
             }
         }
         if (rval == 200 && response.length() > 0)
+        {
             keepAlive = checkKeepAlive(dbgheader);
+            getHTTPHeader(dbgheader, CONTENT_TYPE, contentType);
+        }
         if (checkContentDecoding(dbgheader, response, contentEncoding))
             decodeContent(contentEncoding.str(), response);
         if (soapTraceLevel > 6 || master->logXML)
-            master->logctx.mCTXLOG("%sCALL: LEN=%d %sresponse(%s%s)", master->wscType == STsoap ? "SOAP" : "HTTP",response.length(),chunked?"CHUNKED ":"", dbgheader.str(), response.str());
-        else if (soapTraceLevel > 8)
-            master->logctx.mCTXLOG("%sCALL: LEN=%d %sresponse(%s)", master->wscType == STsoap ? "SOAP" : "HTTP",response.length(),chunked?"CHUNKED ":"", response.str()); // not sure this is that useful but...
+        {
+            StringBuffer loggableHeader;
+            appendHeadersForLogging(loggableHeader, dbgheader.str(), dbgheader.length(), master->authTraceLevel);
+            // Only do translation if soapcall LOG option set and soapSepString defined
+            if ( (master->logXML) && (soapSepString.length() > 0) )
+            {
+                StringBuffer response2;
+                multiLineAppendReplace(loggableHeader, response2);
+                multiLineAppendReplace(response, response2);
+                master->logctx.CTXLOG("%s: LEN=%d %sresponse(%s)", getWsCallTypeName(master->wscType),response.length(),chunked?"CHUNKED ":"", response2.str());
+            }
+            else
+                master->logctx.mCTXLOG("%s: LEN=%d %sresponse(%s%s)", getWsCallTypeName(master->wscType),response.length(),chunked?"CHUNKED ":"", loggableHeader.str(), response.str());
+        }
         return rval;
     }
 
@@ -1996,7 +2556,7 @@ private:
         while (xmlParser->next());
     }
 
-    void processHttpResponse(Url &url, StringBuffer &response, ColumnProvider * meta)
+    void processHttpResponse(Url &url, StringBuffer &response, ColumnProvider * meta, const char *contentType)
     {
         const char *path = nullptr;
         const char *tail = nullptr;
@@ -2011,15 +2571,24 @@ private:
         Owned<IXMLParse> xmlParser;
         if (strieq(master->acceptType.str(), "application/json") || (master->flags & SOAPFjson))
             xmlParser.setown(createJSONParse((const void *)response.str(), (unsigned)response.length(), path, matchCB, options, (master->flags&SOAPFusescontents)!=0, true));
+        else if (master->flags & SOAPFformEncoded)
+        {
+            //currently only use content-type for form url encoded formats,.. to avoid any backward compatability issues for existing calls
+            //  users can control what the server returns by setting the "Accepts" header using the HTTPHEADER option on HTTPCALL and SOAPCALL
+            if (strnicmp(contentType, "application/json", 16)==0)
+                xmlParser.setown(createJSONParse((const void *)response.str(), (unsigned)response.length(), path, matchCB, options, (master->flags&SOAPFusescontents)!=0, true));
+            else
+                xmlParser.setown(createXMLParse((const void *)response.str(), (unsigned)response.length(), path, matchCB, options, (master->flags&SOAPFusescontents)!=0));
+        }
         else
             xmlParser.setown(createXMLParse((const void *)response.str(), (unsigned)response.length(), path, matchCB, options, (master->flags&SOAPFusescontents)!=0));
         while (xmlParser->next());
     }
 
-    void processResponse(Url &url, StringBuffer &response, ColumnProvider * meta)
+    void processResponse(Url &url, StringBuffer &response, ColumnProvider * meta, const char *contentType)
     {
-        if (master->wscType == SThttp || master->flags & SOAPFmarkupinfo)
-            processHttpResponse(url, response, meta);
+        if (master->wscType == SThttp || master->flags & (SOAPFmarkupinfo | SOAPFformEncoded))
+            processHttpResponse(url, response, meta, contentType);
         else if (master->flags & SOAPFliteral)
             processLiteralResponse(url, response, meta);
         else if (master->flags & SOAPFencoding)
@@ -2083,7 +2652,7 @@ private:
     inline void checkTimeLimitExceeded(unsigned * remainingMS)
     {
         if (master->isTimeLimitExceeded(remainingMS))
-            throw MakeStringException(TIMELIMIT_EXCEEDED, "%sCALL TIMELIMIT(%ums) exceeded", master->wscType == STsoap ? "SOAP" : "HTTP", master->timeLimitMS);
+            throw MakeStringException(TIMELIMIT_EXCEEDED, "%s TIMELIMIT(%ums) exceeded", getWsCallTypeName(master->wscType), master->timeLimitMS);
     }
 
     inline bool checkKeepAlive(StringBuffer& headers)
@@ -2101,7 +2670,8 @@ private:
     }
 
 public:
-    CWSCAsyncFor(CWSCHelper * _master, IXmlWriterExt &_xmlWriter, ConstPointerArray &_inputRows, PTreeReaderOptions _options): xmlWriter(_xmlWriter), inputRows(_inputRows), options(_options)
+    CWSCAsyncFor(CWSCHelper * _master, IXmlWriterExt &_xmlWriter, ConstPointerArray &_inputRows, PTreeReaderOptions _options)
+    : CAsyncFor("CWSCAsyncFor"), inputRows(_inputRows), xmlWriter(_xmlWriter), options(_options)
     {
         master = _master;
         outputAllocator = master->queryOutputAllocator();
@@ -2137,7 +2707,6 @@ public:
         unsigned retryInterval = 0;
 
         Url &url = master->urlArray.item(idx);
-        createHttpRequest(url, request);
         unsigned startidx = idx;
         while (!master->aborted)
         {
@@ -2147,17 +2716,37 @@ public:
             SocketEndpoint ep;
             Owned<ISocket> socket;
             CCycleTimer timer;
+            StringBuffer proxyHeaders;
             for (;;)
             {
+                proxyHeaders.clear();
                 try
                 {
                     checkTimeLimitExceeded(&remainingMS);
                     Url &connUrl = master->proxyUrlArray.empty() ? url : master->proxyUrlArray.item(0);
-                    ep.set(connUrl.host.get(), connUrl.port);
+
+                    bool useProxy = false;
+                    if (!master->proxyUrlArray.empty())
+                        useProxy = true;
+
+                    CCycleTimer dnsTimer;
+
+                    // TODO: for DNS, do we use timeoutMS or remainingMS or remainingMS / maxRetries+1 or ?
+                    ep.set(connUrl.host.get(), connUrl.port, master->timeoutMS);
+
+                    unsigned __int64 dnsNs = dnsTimer.elapsedNs();
+                    master->logctx.noteStatistic(StTimeSoapcallDNS, dnsNs);
+                    master->activitySpanScope->setSpanAttribute("SoapcallDNSTimeNs", dnsNs);
+
+                    if (ep.isNull())
+                        throw MakeStringException(-1, "Failed to resolve host '%s'", nullText(connUrl.host.get()));
+
+                    checkTimeLimitExceeded(&remainingMS);  // after ep.set which might make a potentially long getaddrinfo lookup ...
                     if (strieq(url.method, "https"))
                         proto = PersistentProtocol::ProtoTLS;
+
                     bool shouldClose = false;
-                    Owned<ISocket> psock = persistentHandler?persistentHandler->getAvailable(&ep, &shouldClose, proto):nullptr;
+                    Owned<ISocket> psock = master->usePersistConnections() ? persistentHandler->getAvailable(&ep, &shouldClose, proto) : nullptr;
                     if (psock)
                     {
                         isReused = true;
@@ -2168,11 +2757,63 @@ public:
                     {
                         isReused = false;
                         keepAlive = true;
-                        socket.setown(blacklist->connect(connUrl.port, connUrl.host, master->logctx, (unsigned)master->maxRetries, master->timeoutMS, master->roxieAbortMonitor));
+
+                        CCycleTimer connTimer;
+
+                        // TODO: for each connect attempt, do we use timeoutMS or remainingMS or remainingMS / maxRetries or ?
+                        socket.setown(blacklist->connect(ep, master->logctx, (unsigned)master->maxRetries, master->timeoutMS, master->roxieAbortMonitor, master->rowProvider));
+
                         if (proto == PersistentProtocol::ProtoTLS)
                         {
 #ifdef _USE_OPENSSL
-                            Owned<ISecureSocket> ssock = master->createSecureSocket(socket.getClear());
+                            if (useProxy && strieq(connUrl.method.str(), "http"))
+                            {
+                                StringBuffer urlHost;
+                                if (streq(url.host.str(), "."))
+                                    urlHost.append(GetCachedHostName());
+                                else
+                                    urlHost.append(url.host.str());
+                                StringBuffer proxyText;
+                                proxyText.appendf("CONNECT %s:%d HTTP/1.1\r\n", urlHost.str(), url.port);
+                                proxyText.append("Proxy-Connection: Keep-Alive\r\n\r\n");
+                                socket->write(proxyText.str(),proxyText.length());
+
+                                checkTimeLimitExceeded(&remainingMS);
+                                unsigned proxyTimeout = MIN(remainingMS, master->timeoutMS);
+                                char proxyResponse[MAX_HTTP_HEADERSIZE + 1];
+                                unsigned proxyRemaining = proxyTimeout;
+                                CTimeMon tm(proxyTimeout);
+                                unsigned totalRead = 0;
+                                unsigned bytesRead = 0;
+                                bool sockClosed = false;
+                                while (!sockClosed && !tm.timedout(&proxyRemaining))
+                                {
+                                    unsigned maxPoss = MAX_HTTP_HEADERSIZE - totalRead;
+                                    sockClosed = readtmsAllowClose(socket, &proxyResponse[totalRead], 1, maxPoss, bytesRead, proxyRemaining);
+                                    totalRead += bytesRead;
+                                    proxyResponse[totalRead] = 0;
+
+                                    if (strstr(proxyResponse, "\r\n\r\n"))
+                                        break;
+                                    if (totalRead >= MAX_HTTP_HEADERSIZE)
+                                        break;
+                                }
+
+                                if (tm.timedout(&proxyRemaining))
+                                    throw makeStringException(-1, "Timed out waiting for proxy response");
+
+                                bool proxyTunnelOK = false;
+                                const char *okResp = strstr(proxyResponse, "HTTP/");
+                                if (okResp)
+                                {
+                                    if (strstr(okResp, " 200 "))
+                                        proxyTunnelOK = true;
+                                }
+                                if (!proxyTunnelOK)
+                                    throw makeStringException(-1, "Invalid response from proxy");
+                            }
+
+                            Owned<ISecureSocket> ssock = master->createSecureSocket(socket.getClear(), url.host);
                             if (ssock)
                             {
                                 checkTimeLimitExceeded(&remainingMS);
@@ -2194,24 +2835,45 @@ public:
                             err.append(": OpenSSL disabled in build");
                             throw makeStringException(0, err.str());
 #endif
-
                         }
+                        else if (useProxy && strieq(connUrl.method.str(), "http"))
+                        {
+                            StringBuffer urlHost;
+                            if (streq(url.host.str(), "."))
+                                urlHost.append(GetCachedHostName());
+                            else
+                                urlHost.append(url.host.str());
+
+                            if (master->wscType == STsoap)
+                                proxyHeaders.append("POST http://").appendf("%s:%d", urlHost.str(), url.port).append(url.path).append(" HTTP/1.1\r\n");
+                            else
+                                proxyHeaders.append(master->service).append(" http://").appendf("%s:%d", urlHost.str(), url.port).append(url.path).append(" HTTP/1.1\r\n");
+                            proxyHeaders.append("Proxy-Connection: Keep-Alive\r\n");
+                        }
+
+                        unsigned __int64 connNs = connTimer.elapsedNs();
+                        master->logctx.noteStatistic(StTimeSoapcallConnect, connNs);
+                        master->activitySpanScope->setSpanAttribute("SoapcallConnectTimeNs", connNs);
                     }
                     break;
                 }
                 catch (IException *e)
                 {
+                    master->logctx.noteStatistic(StNumSoapcallConnectFailures, 1);
+
                     if (master->timeLimitExceeded)
                     {
-                        master->logctx.CTXLOG("%sCALL exiting: time limit (%ums) exceeded",master->wscType == STsoap ? "SOAP" : "HTTP", master->timeLimitMS);
+                        master->activitySpanScope->recordError(SpanError("Time Limit Exceeded", e->errorCode(), true, true));
+                        master->logctx.CTXLOG("%s exiting: time limit (%ums) exceeded", getWsCallTypeName(master->wscType), master->timeLimitMS);
                         processException(url, inputRows, e);
                         return;
                     }
 
                     if (e->errorCode() == ROXIE_ABORT_EVENT)
                     {
+                        master->activitySpanScope->recordError(SpanError("Aborted", e->errorCode(), true, true));
                         StringBuffer s;
-                        master->logctx.CTXLOG("%sCALL exiting: Roxie Abort : %s",master->wscType == STsoap ? "SOAP" : "HTTP",e->errorMessage(s).str());
+                        master->logctx.CTXLOG("%s exiting: Roxie Abort : %s", getWsCallTypeName(master->wscType),e->errorMessage(s).str());
                         throw;
                     }
 
@@ -2222,62 +2884,88 @@ public:
                             idx = 0;
                         if (idx==startidx)
                         {
+                            master->activitySpanScope->recordException(e, true, true);
                             StringBuffer s;
                             master->logctx.CTXLOG("Exception %s", e->errorMessage(s).str());
                             processException(url, inputRows, e);
                             return;
                         }
                     } while (blacklist->blacklisted(url.port, url.host));
+
+                    master->activitySpanScope->recordException(e, false, false); //Record the exception, but don't set failure
                 }
             }
             try
             {
                 checkTimeLimitExceeded(&remainingMS);
                 checkRoxieAbortMonitor(master->roxieAbortMonitor);
+
+                StringBuffer spanName;
+                spanName.appendf("%s %s %s:%d", getWsCallTypeName(master->wscType), master->service.str(), url.host.str(), url.port);
+                OwnedActiveSpanScope requestSpan = master->activitySpanScope->createClientSpan(spanName.str());
+
+                setSpanURLAttributes(requestSpan, url);
+                requestSpan->setSpanAttribute("request.type", getWsCallTypeName(master->wscType));
+                requestSpan->setSpanAttribute("service.name", master->service.str());
+
+                Owned<IProperties> traceHeaders = ::getClientHeaders(requestSpan);
+                createHttpRequest(request, url, traceHeaders, proxyHeaders);
+
                 socket->write(request.str(), request.length());
+
                 if (soapTraceLevel > 4)
-                    master->logctx.CTXLOG("%sCALL: sent request (%s) to %s:%d", master->wscType == STsoap ? "SOAP" : "HTTP",master->service.str(), url.host.str(), url.port);
+                    master->logctx.CTXLOG("%s: sent request (%s) to %s:%d", getWsCallTypeName(master->wscType),master->service.str(), url.host.str(), url.port);
                 checkTimeLimitExceeded(&remainingMS);
                 checkRoxieAbortMonitor(master->roxieAbortMonitor);
 
                 bool keepAlive2;
-                int rval = readHttpResponse(response, socket, keepAlive2);
+                StringBuffer contentType;
+                int rval = readHttpResponse(response, socket, keepAlive2, contentType);
+                requestSpan->setSpanAttribute("http.response.status_code", (int64_t)rval);
                 keepAlive = keepAlive && keepAlive2;
 
                 if (soapTraceLevel > 4)
-                    master->logctx.CTXLOG("%sCALL: received response (%s) from %s:%d", master->wscType == STsoap ? "SOAP" : "HTTP",master->service.str(), url.host.str(), url.port);
+                    master->logctx.CTXLOG("%s: received response (%s) from %s:%d", getWsCallTypeName(master->wscType),master->service.str(), url.host.str(), url.port);
 
                 if (rval != 200)
                 {
+                    requestSpan->setSpanStatusSuccess(false);
                     if (rval == 503)
+                    {
+                        requestSpan->recordError(SpanError("Server Too Busy", 1001, true, true));
                         throw new ReceivedRoxieException(1001, "Server Too Busy");
+                    }
 
                     StringBuffer text;
                     text.appendf("HTTP error (%d) in processQuery",rval);
                     rtlAddExceptionTag(text, "soapresponse", response.str());
+                    requestSpan->recordError(SpanError(text.str(), -1, true, true));
                     throw MakeStringExceptionDirect(-1, text.str());
                 }
                 if (response.length() == 0)
                 {
+                    requestSpan->recordError(SpanError("Zero length response in processQuery", -1, true, true));
                     throw MakeStringException(-1, "Zero length response in processQuery");
                 }
                 checkTimeLimitExceeded(&remainingMS);
                 ColumnProvider * meta = (ColumnProvider*)CreateColumnProvider((unsigned)nanoToMilli(timer.elapsedNs()), master->flags&SOAPFencoding?true:false);
-                processResponse(url, response, meta);
+                processResponse(url, response, meta, contentType);
                 delete meta;
 
-                if (persistentHandler)
+                if (master->usePersistConnections())
                 {
                     if (isReused)
-                        persistentHandler->doneUsing(socket, keepAlive);
+                        persistentHandler->doneUsing(socket, keepAlive, master->getPersistMaxRequests());
                     else if (keepAlive)
                         persistentHandler->add(socket, &ep, proto);
                 }
+
+                requestSpan->setSpanStatusSuccess(true);
                 break;
             }
             catch (IReceivedRoxieException *e)
             {
-                if (persistentHandler && isReused)
+                if (master->usePersistConnections() && isReused)
                     persistentHandler->doneUsing(socket, false);
                 // server busy ... Sleep and retry
                 if (e->errorCode() == 1001)
@@ -2300,6 +2988,7 @@ public:
                 {
                     // other roxie exception ...
                     master->logctx.CTXLOG("Exiting: received Roxie exception");
+                    master->activitySpanScope->recordException(e, true, true);
                     if (e->errorRow())
                         processException(url, e->errorRow(), e);
                     else
@@ -2309,19 +2998,22 @@ public:
             }
             catch (IException *e)
             {
-                if (persistentHandler && isReused)
+                if (master->usePersistConnections() && isReused)
                     persistentHandler->doneUsing(socket, false);
                 if (master->timeLimitExceeded)
                 {
+                    VStringBuffer msg("%s exiting: time limit (%ums) exceeded", getWsCallTypeName(master->wscType), master->timeLimitMS);
+                    master->logctx.CTXLOG("%s", msg.str());
+                    master->activitySpanScope->recordError(SpanError(msg.str(), e->errorCode(), true, true));
                     processException(url, inputRows, e);
-                    master->logctx.CTXLOG("%sCALL exiting: time limit (%ums) exceeded", master->wscType == STsoap ? "SOAP" : "HTTP", master->timeLimitMS);
                     break;
                 }
 
                 if (e->errorCode() == ROXIE_ABORT_EVENT)
                 {
                     StringBuffer s;
-                    master->logctx.CTXLOG("%sCALL exiting: Roxie Abort : %s",master->wscType == STsoap ? "SOAP" : "HTTP",e->errorMessage(s).str());
+                    master->logctx.CTXLOG("%s exiting: Roxie Abort : %s", getWsCallTypeName(master->wscType),e->errorMessage(s).str());
+                    master->activitySpanScope->recordError(SpanError("Aborted", e->errorCode(), true, true));
                     throw;
                 }
 
@@ -2332,26 +3024,37 @@ public:
                 if (numRetries >= master->maxRetries)
                 {
                     // error affects all inputRows
-                    master->logctx.CTXLOG("Exiting: maxRetries %d exceeded", master->maxRetries);
+                    VStringBuffer msg("Exiting: maxRetries %d exceeded", master->maxRetries);
+                    master->logctx.CTXLOG("%s", msg.str());
+                    master->activitySpanScope->recordError(SpanError(msg.str(), e->errorCode(), true, true));
                     processException(url, inputRows, e);
                     break;
                 }
                 numRetries++;
+                master->logctx.noteStatistic(StNumSoapcallRetries, 1);
                 master->logctx.CTXLOG("Retrying: attempt %d of %d", numRetries, master->maxRetries);
+                master->activitySpanScope->recordException(e, false, false);
                 e->Release();
             }
             catch (std::exception & es)
             {
-                if (persistentHandler && isReused)
+                if (master->usePersistConnections() && isReused)
                     persistentHandler->doneUsing(socket, false);
                 if(dynamic_cast<std::bad_alloc *>(&es))
+                {
+                    master->activitySpanScope->recordError("std::exception: out of memory (std::bad_alloc) in CWSCAsyncFor processQuery");
                     throw MakeStringException(-1, "std::exception: out of memory (std::bad_alloc) in CWSCAsyncFor processQuery");
+                }
+
+                master->activitySpanScope->recordError(es.what());
                 throw MakeStringException(-1, "std::exception: standard library exception (%s) in CWSCAsyncFor processQuery",es.what());
             }
             catch (...)
             {
-                if (persistentHandler && isReused)
+                if (master->usePersistConnections() && isReused)
                     persistentHandler->doneUsing(socket, false);
+
+                master->activitySpanScope->recordError(SpanError("Unknown exception in processQuery", -1, true, true));
                 throw MakeStringException(-1, "Unknown exception in processQuery");
             }
         }
@@ -2364,7 +3067,5 @@ public:
 
 IWSCAsyncFor * createWSCAsyncFor(CWSCHelper * _master, IXmlWriterExt &_xmlWriter, ConstPointerArray &_inputRows, PTreeReaderOptions _options)
 {
-    if (!persistentInitDone)
-        initPersistentHandler();
     return new CWSCAsyncFor(_master, _xmlWriter, _inputRows, _options);
 }

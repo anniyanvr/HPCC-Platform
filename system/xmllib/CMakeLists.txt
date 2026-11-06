@@ -14,7 +14,7 @@
 #    limitations under the License.
 ################################################################################
 
-# Component: xmllib 
+# Component: xmllib
 #####################################################
 # Description:
 # ------------
@@ -33,8 +33,9 @@ if ( USE_XALAN )
         xerces_validator.cpp
     )
 elseif (USE_LIBXSLT)
-    set(LIB_INCLUDE_DIR ${LIBXSLT_INCLUDE_DIR} ${LIBEXSLT_INCLUDE_DIR} ${LIBXML2_INCLUDE_DIR})
-    set(LIB_LIBRARIES ${LIBXSLT_LIBRARIES} ${LIBEXSLT_LIBRARIES} ${LIBXML2_LIBRARIES})
+    set(LIB_INCLUDE_DIR ${LIBXSLT_INCLUDE_DIR} ${LIBXSLT_EXSLT_INCLUDE_DIR} ${LIBXML2_INCLUDE_DIR})
+    set(LIB_LIBRARIES ${LIBXSLT_LIBRARIES} ${LIBEXSLT_LIBRARIES} ${LIBXSLT_EXSLT_LIBRARIES} ${LIBXML2_LIBRARIES})
+    list(REMOVE_DUPLICATES LIB_LIBRARIES)
     set (SRCS
         xsdparser.cpp
         xslcache.cpp
@@ -56,14 +57,22 @@ include_directories (
          ./../../system/include
          ./../../system/jlib
          ./../../ecl/hql
+         ./../../rtl/include
+         ./../../rtl/eclrtl
          ${LIB_INCLUDE_DIR}
+         ${HPCC_SOURCE_DIR}/testing/unittests
     )
 
 ADD_DEFINITIONS( -D_USRDLL -DXMLLIB_EXPORTS )
 
 HPCC_ADD_LIBRARY( xmllib SHARED ${SRCS} )
-install ( TARGETS xmllib RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( xmllib
+install ( TARGETS xmllib RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} CALC_DEPS)
+target_link_libraries ( xmllib PRIVATE
          ${LIB_LIBRARIES}
+         eclrtl
          jlib
     )
+
+IF (USE_CPPUNIT)
+    target_link_libraries (xmllib PRIVATE ${CppUnit_LIBRARIES})
+ENDIF()

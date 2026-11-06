@@ -38,7 +38,6 @@ include_directories (
          ${HPCC_SOURCE_DIR}/esp/esplib
          ${HPCC_SOURCE_DIR}/esp/platform
          ${HPCC_SOURCE_DIR}/system/jlib
-         ${HPCC_SOURCE_DIR}/common/environment
          ${HPCC_SOURCE_DIR}/esp/services
          ${HPCC_SOURCE_DIR}/common
          ${HPCC_SOURCE_DIR}/system/security/securesocket
@@ -60,7 +59,7 @@ include_directories (
          ${HPCC_SOURCE_DIR}/common/thorhelper
     )
 
-ADD_DEFINITIONS( -D_USRDLL )
+ADD_DEFINITIONS( -D_USRDLL -Dws_elk_API_LOCAL )
 
 HPCC_ADD_LIBRARY( ws_elk SHARED ${SRCS}  )
 add_dependencies (ws_elk espscm )
@@ -70,7 +69,6 @@ target_link_libraries ( ws_elk
          xmllib
          esphttp
          dalibase
-         environment
          dllserver
-         SMCLib
+         ${COMMON_ESP_SERVICE_LIBS}
     )

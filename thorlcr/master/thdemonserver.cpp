@@ -30,88 +30,103 @@
 #include "thwatchdog.hpp"
 
 
-class DeMonServer : public CSimpleInterface, implements IDeMonServer
+/**
+ * GraphStatsCollection collects stats from graph hierarchies and writes them to the 
+ * workunit.  It also calls StatisticAggregator to extract statistic kinds for aggregation.
+ */
+namespace GraphStatsCollection
 {
-private:
-    Mutex mutex;
-    unsigned lastReport;
-    unsigned reportRate;
-    CIArrayOf<CGraphBase> activeGraphs;
-    UnsignedArray graphStarts;
-    double thorManagerRate = 0;
-    double thorWorkerRate = 0;
-    cost_type costLimit = 0;
-    cost_type workunitCost = 0;
+    void gatherScopedGraphStats(IStatisticGatherer & stats, CGraphBase *graph);
 
-    
-    void doReportGraph(IStatisticGatherer & stats, CGraphBase *graph)
+    // Recursively gathers statistics from a graph and all its child graphs.
+    void gatherGraphContents(IStatisticGatherer & stats, CGraphBase *graph)
     {
-        ((CMasterGraph *)graph)->getStats(stats);
-    }
-    void reportGraphContents(IStatisticGatherer & stats, CGraphBase *graph)
-    {
-        if (graph->hasProgress()) // if there have ever been any progress, ensure they are republished
-            doReportGraph(stats, graph);
+        // Gather the subgraph stats when there has been progress
+        if (graph->hasProgress())
+            ((CMasterGraph *)graph)->getStats(stats);
+
+        // Gather the child graph stats recursively
         Owned<IThorGraphIterator> graphIter = graph->getChildGraphIterator();
         ForEach (*graphIter)
-            reportGraph(stats, &graphIter->query());
+            gatherScopedGraphStats(stats, &graphIter->query());
     }
-    void reportGraph(IStatisticGatherer & stats, CGraphBase *graph)
+
+    // Gathers statistics from a graph with appropriate scoping context.
+    void gatherScopedGraphStats(IStatisticGatherer & stats, CGraphBase *graph)
     {
         try
         {
+            // If graph has a parent activity but no activities of its own,
+            // scope it as a child graph under that activity
             if (graph->queryParentActivityId() && !graph->containsActivities())
             {
                 StatsActivityScope activity(stats, graph->queryParentActivityId());
                 StatsChildGraphScope subgraph(stats, graph->queryGraphId());
-                reportGraphContents(stats, graph);
+                gatherGraphContents(stats, graph);
             }
             else
             {
+                // Otherwise, scope it as a regular subgraph
                 StatsSubgraphScope subgraph(stats, graph->queryGraphId());
-                reportGraphContents(stats, graph);
+                gatherGraphContents(stats, graph);
             }
         }
         catch (IException *e)
         {
             StringBuffer s;
-            LOG(MCwarning, thorJob, "Failed to update progress information: %s", e->errorMessage(s).str());
+            IWARNLOG("Failed to update progress information: %s", e->errorMessage(s).str());
             e->Release();
         }
     }
-    void reportStatus(IWorkUnit *wu, CGraphBase &graph, unsigned startTime, bool finished, bool success=true)
+
+    // Gather statistics from graph hierarchies into wuGraphStats
+    // StatisticsAggregator imports any stats in the aggregation kind from statistics gatherer
+    void updateGraphStats(IConstWorkUnit & currentWU, const char *graphName, unsigned wfid, CGraphBase & graph, StatisticsAggregator & statsAggregator)
     {
-        const char *graphname = graph.queryJob().queryGraphName();
+        // Graph statistics are written when IWUGraphStats is destroyed
+        Owned<IWUGraphStats> wuGraphStats = currentWU.updateStats(graphName, SCTthor, queryStatisticsComponentName(), wfid, graph.queryGraphId(), false);
+        IStatisticGatherer & statsBuilder = wuGraphStats->queryStatsBuilder();
+        gatherScopedGraphStats(statsBuilder, &graph);
+
+        Owned<IStatisticCollection> statsCollection = statsBuilder.getResult();
+        // Merge any statistic kinds that are in the aggregation list into StatisticsAggregator
+        statsAggregator.recordStats(statsCollection, wfid, graphName, graph.queryGraphId());
+    }
+};
+
+
+class DeMonServer : public CSimpleInterface, implements IDeMonServer
+{
+private:
+    Mutex mutex{SYNC_LOCATION};
+    unsigned lastReportedMsTick;
+    unsigned reportRateMSecs;
+    CIArrayOf<CGraphBase> activeGraphs;
+    cost_type costLimit = 0;
+    cost_type previousExecutionCost = 0;
+    StatisticsAggregator statsAggregator;
+
+    void reportStatus(IWorkUnit *wu, CGraphBase &graph, bool finished, bool success)
+    {
+        const char *graphName = graph.queryJob().queryGraphName();
         unsigned wfid = graph.queryJob().getWfid();
         StringBuffer timer, graphScope;
-        formatGraphTimerLabel(timer, graphname, 0, graph.queryGraphId());
-        formatGraphTimerScope(graphScope, wfid, graphname, 0, graph.queryGraphId());
-        unsigned duration = msTick()-startTime;
-        updateWorkunitStat(wu, SSTsubgraph, graphScope, StTimeElapsed, timer, milliToNano(duration));
-        if (costLimit || finished)
-        {
-            const unsigned clusterWidth = queryNodeClusterWidth();
-            const cost_type sgCost = money2cost_type(calcCost(thorManagerRate, duration) + calcCost(thorWorkerRate, duration) * clusterWidth);
-            if (finished)
-                wu->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTsubgraph, graphScope, StCostExecute, NULL, sgCost, 1, 0, StatsMergeReplace);
-
-            const cost_type totalCost = workunitCost + sgCost;
-            if (costLimit>0.0 && totalCost > costLimit)
-            {
-                LOG(MCwarning, thorJob, "ABORT job cost exceeds limit");
-                graph.fireException(MakeThorException(TE_CostExceeded, "Job cost exceeds limit"));
-            }
-        }
+        formatGraphTimerLabel(timer, graphName, 0, graph.queryGraphId());
+        formatGraphTimerScope(graphScope, wfid, graphName, 0, graph.queryGraphId());
+        // Use the elapsed time tracked in CMasterGraph (using ::getLastElapsedCycles) as the cost calculated for
+        // subgraph was based on that elapsed time
+        unsigned __int64 durationNs = cycle_to_nanosec(graph.getLastElapsedCycles());
+        updateWorkunitStat(wu, SSTsubgraph, graphScope, StTimeElapsed, timer, durationNs);
+        unsigned duration = (unsigned)nanoToMilli(durationNs); // Convert to milliseconds for audit log
         if (finished)
         {
-            if (memcmp(graphname,"graph",5)==0)
-                graphname+=5;
-            LOG(MCauditInfo,",Timing,ThorGraph,%s,%s,%s,%u,1,%d,%s,%s,%s",
+            const char * graphId = (memcmp(graphName,"graph",5)==0) ? graphName+5 : graphName;
+            LOG(MCauditInfo,",Timing,ThorGraph,%s,%s,%s,%u,1,%u,%s,%s,%s",
                 queryServerStatus().queryProperties()->queryProp("@thorname"),
                 wu->queryWuid(),
-                graphname,
+                graphId,
                 (unsigned)graph.queryGraphId(),
-                duration,
+                (unsigned)duration,
                 success?"SUCCESS":"FAILED",
                 queryServerStatus().queryProperties()->queryProp("@nodeGroup"),
                 queryServerStatus().queryProperties()->queryProp("@queue"));
@@ -121,12 +136,37 @@ private:
         }
         else
         {
-            queryServerStatus().queryProperties()->setProp("@graph", graph.queryJob().queryGraphName());
-            queryServerStatus().queryProperties()->setPropInt("@subgraph", (int)graph.queryGraphId());
+            queryServerStatus().queryProperties()->setProp("@graph", graphName);
+            queryServerStatus().queryProperties()->setPropInt("@subgraph", graph.queryGraphId());
             queryServerStatus().queryProperties()->setPropInt("@sg_duration", (duration+59999)/60000); // round it up
         }
     }
-
+    void checkCostLimit(CGraphBase &graph)
+    {
+        if (costLimit)
+        {
+            const cost_type totalCost = previousExecutionCost + graph.getTotalCost();
+            if (totalCost > costLimit)
+            {
+                WARNLOG("ABORT job cost exceeds limit");
+                graph.fireException(MakeThorException(TE_CostExceeded, "Job cost exceeds limit"));
+            }
+        }
+    }
+    void updateGraphStats(IConstWorkUnit &wu, const char *graphName, unsigned wfid, CGraphBase & graph)
+    {
+        GraphStatsCollection::updateGraphStats(wu, graphName, wfid, graph, statsAggregator);
+    }
+    void recordWhenStarted(CGraphBase *graph)
+    {
+        const CJobBase &job = graph->queryJob();
+        Owned<IWorkUnit> wu = &(job.queryWorkUnit().lock());
+        StringBuffer graphScope;
+        formatGraphTimerScope(graphScope, job.getWfid(), job.queryGraphName(), 0, graph->queryGraphId());
+        wu->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTsubgraph, graphScope, StWhenStarted, NULL, getTimeStampNowValue(), 1, 0, StatsMergeAppend);
+        reportStatus(wu, *graph, false, true);
+        queryServerStatus().commitProperties();
+    }
     void reportActiveGraphs(bool finished, bool success=true)
     {
         if (activeGraphs.ordinality())
@@ -140,75 +180,64 @@ private:
                 ForEachItemIn (g, activeGraphs)
                 {
                     CGraphBase &graph = activeGraphs.item(g);
-                    Owned<IWUGraphStats> stats = currentWU.updateStats(graphName, SCTthor, queryStatisticsComponentName(), wfid, graph.queryGraphId());
-                    reportGraph(stats->queryStatsBuilder(), &graph);
+                    graph.updateLastElapsedCycles();
+                    updateGraphStats(currentWU, graphName, wfid, graph);
                 }
                 Owned<IWorkUnit> wu = &currentWU.lock();
                 ForEachItemIn (g2, activeGraphs)
                 {
                     CGraphBase &graph = activeGraphs.item(g2);
-                    unsigned startTime = graphStarts.item(g2);
-                    reportStatus(wu, graph, startTime, finished, success);
+                    reportStatus(wu, graph, finished, success);
+                    checkCostLimit(graph);
                 }
+                updateAggregates(wu);
                 queryServerStatus().commitProperties();
             }
             catch (IException *E)
             {
-                StringBuffer s;
-                LOG(MCwarning, thorJob, "Failed to update progress information: %s", E->errorMessage(s).str());
+                IWARNLOG(E, "Failed to update progress information");
                 E->Release();
             }
         }
     }
-    void reportGraph(CGraphBase *graph, bool finished, bool success, unsigned startTime, unsigned __int64 startTimeStamp)
+    void reportGraph(CGraphBase *graph, bool finished, bool success)
     {
+        // note: it is not necessary (and would be inefficient) to call updateAggregates here as the
+        // workflow engine/agent will call it anyway after a graph has finished
         try
         {
-            IConstWorkUnit &currentWU = graph->queryJob().queryWorkUnit();
-            const char *graphName = ((CJobMaster &)activeGraphs.item(0).queryJob()).queryGraphName();
-            unsigned wfid = graph->queryJob().getWfid();
-            {
-                Owned<IWUGraphStats> stats = currentWU.updateStats(graphName, SCTthor, queryStatisticsComponentName(), wfid, graph->queryGraphId());
-                reportGraph(stats->queryStatsBuilder(), graph);
-            }
-
+            const CJobBase &job = graph->queryJob();
+            IConstWorkUnit &currentWU = job.queryWorkUnit();
+            graph->updateLastElapsedCycles();
+            updateGraphStats(currentWU, job.queryGraphName(), job.getWfid(), *graph);
             Owned<IWorkUnit> wu = &currentWU.lock();
-            if (startTimeStamp)
-            {
-                StringBuffer graphScope;
-                const char *graphname = graph->queryJob().queryGraphName();
-                formatGraphTimerScope(graphScope, wfid, graphname, 0, graph->queryGraphId());
-                wu->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTsubgraph, graphScope, StWhenStarted, NULL, getTimeStampNowValue(), 1, 0, StatsMergeAppend);
-            }
-            reportStatus(wu, *graph, startTime, finished, success);
-
+            reportStatus(wu, *graph, finished, success);
+            checkCostLimit(*graph);
             queryServerStatus().commitProperties();
         }
         catch (IException *e)
         {
             StringBuffer s;
-            LOG(MCwarning, thorJob, "Failed to update progress information: %s", e->errorMessage(s).str());
+            IWARNLOG(e, "Failed to update progress information");
             e->Release();
         }
     }
 public:
     IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
 
-    DeMonServer()
+    DeMonServer() : statsAggregator(stdAggregateKindStatistics)
     {
-        lastReport = msTick();
-        reportRate = globals->getPropInt("@watchdogProgressInterval", 30);
-        thorManagerRate = getThorManagerRate();
-        thorWorkerRate = getThorWorkerRate();
+        lastReportedMsTick = msTick();
+        reportRateMSecs = globals->getPropInt("@watchdogProgressInterval", 30) * 1000;
     }
 
-    virtual void takeHeartBeat(MemoryBuffer &progressMb)
+    virtual void takeHeartBeat(MemoryBuffer &progressMb) override
     {
         synchronized block(mutex);
         if (0 == activeGraphs.ordinality())
         {
             StringBuffer urlStr;
-            LOG(MCdebugProgress, thorJob, "heartbeat packet received with no active graphs");
+            IWARNLOG("heartbeat packet received with no active graphs");
             return;
         }
         size32_t compressedProgressSz = progressMb.remaining();
@@ -226,73 +255,59 @@ public:
                 ForEachItemIn(g, activeGraphs) if (activeGraphs.item(g).queryGraphId() == graphId) graph = (CMasterGraph *)&activeGraphs.item(g);
                 if (!graph)
                 {
-                    LOG(MCdebugProgress, thorJob, "heartbeat received from unknown graph %" GIDPF "d", graphId);
+                    IWARNLOG("heartbeat received from unknown graph %" GIDPF "d", graphId);
                     break;
                 }
                 if (!graph->deserializeStats(slave, uncompressedMb))
                 {
-                    LOG(MCdebugProgress, thorJob, "heartbeat error in graph %" GIDPF "d", graphId);
+                    IWARNLOG("heartbeat error in graph %" GIDPF "d", graphId);
                     break;
                 }
             }
             while (uncompressedMb.remaining());
         }
         unsigned now=msTick();
-        if (now-lastReport > 1000*reportRate)
+        if (now-lastReportedMsTick > reportRateMSecs)
         {
             reportActiveGraphs(false);
-            lastReport = msTick();
+            lastReportedMsTick = msTick();
         }
     }
-    void startGraph(CGraphBase *graph)
+    virtual void startGraph(CGraphBase *graph) override
     {
         synchronized block(mutex);
 
         IConstWorkUnit & wu =  graph->queryJob().queryWorkUnit();
-        workunitCost = aggregateCost(&wu);
+        recordWhenStarted(graph);
+        previousExecutionCost = aggregateCost(&wu, nullptr, StCostExecute, 3);
 
-        const IPropertyTree *costs = queryCostsConfiguration();
-        double softLimit = 0.0, hardLimit = 0.0;
-        if (costs)
-        {
-            softLimit = costs->getPropReal("@limit");
-            hardLimit = costs->getPropReal("@hardlimit");
-        }
-        double tmpcostLimit = wu.getDebugValueReal("maxCost", softLimit);
-        if (hardLimit && ((tmpcostLimit == 0) || (tmpcostLimit > hardLimit)))
-            costLimit = money2cost_type(hardLimit);
-        else
-            costLimit = money2cost_type(tmpcostLimit);
+        costLimit = getGuillotineCost(&wu);
         activeGraphs.append(*LINK(graph));
-        unsigned startTime = msTick();
-        graphStarts.append(startTime);
-        reportGraph(graph, false, true, startTime, getTimeStampNowValue());
-        const char *graphname = graph->queryJob().queryGraphName();
-        if (memcmp(graphname,"graph",5)==0)
-            graphname+=5;
-        LOG(MCauditInfo,",Progress,Thor,StartSubgraph,%s,%s,%s,%u,%s,%s",
-                queryServerStatus().queryProperties()->queryProp("@thorname"),
-                graph->queryJob().queryWuid(),
-                graphname,
-                (unsigned)graph->queryGraphId(), queryServerStatus().queryProperties()->queryProp("@nodeGroup"), queryServerStatus().queryProperties()->queryProp("@queue"));
-    }   
-    void endGraph(CGraphBase *graph, bool success)
+    }
+    virtual void endGraph(CGraphBase *graph, bool success) override
     {
         synchronized block(mutex);
         unsigned g = activeGraphs.find(*graph);
         if (NotFound != g)
         {
-            unsigned startTime = graphStarts.item(g);
-            reportGraph(graph, true, success, startTime, 0);
+            reportGraph(graph, true, success);
             activeGraphs.remove(g);
-            graphStarts.remove(g);
         }
     }
-    void endGraphs()
+    virtual void endGraphs() override
     {
         synchronized block(mutex);
         reportActiveGraphs(true, false);
         activeGraphs.kill();
+    }
+    // Generates aggregates and writes any modified aggregates to workunit
+    virtual void updateAggregates(IWorkUnit * lockedWu) override
+    {
+        statsAggregator.updateAggregates(lockedWu);
+    }
+    virtual void loadExistingAggregates(IConstWorkUnit &workunit) override
+    {
+        statsAggregator.loadExistingAggregates(workunit);
     }
 };
 

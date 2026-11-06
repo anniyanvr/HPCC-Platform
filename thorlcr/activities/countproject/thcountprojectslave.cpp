@@ -103,7 +103,7 @@ class CountProjectActivity : public BaseCountProjectActivity, implements ILookAh
 {
     typedef BaseCountProjectActivity PARENT;
     bool first = false; // until start
-    Semaphore prevRecCountSem;
+    Semaphore prevRecCountSem{SYNC_LOCATION};
     rowcount_t prevRecCount = 0;
     std::atomic<rowcount_t> localRecCount = {RCUNSET};
     bool onInputFinishSends = false;
@@ -153,7 +153,7 @@ public:
     virtual void setInputStream(unsigned index, CThorInput &_input, bool consumerOrdered) override
     {
         PARENT::setInputStream(index, _input, consumerOrdered);
-        setLookAhead(0, createRowStreamLookAhead(this, inputStream, queryRowInterfaces(input), COUNTPROJECT_SMART_BUFFER_SIZE, true, false, RCUNBOUND, this, &container.queryJob().queryIDiskUsage()), true); // could spot disk write output here?
+        setLookAhead(0, createRowStreamLookAhead(this, inputStream, queryRowInterfaces(input), COUNTPROJECT_SMART_BUFFER_SIZE, true, false, RCUNBOUND, this), true); // could spot disk write output here?
     }
     virtual void start()
     {
@@ -177,6 +177,7 @@ public:
     {
         if (first) // nextRow, therefore getPrevCount()/sendCount() never called
         {
+            first = false;
             prevRecCount = count = getPrevCount();
             signalNext();
         }
@@ -234,7 +235,7 @@ public:
     virtual void getMetaInfo(ThorDataLinkMetaInfo &info) const override
     {
         initMetaInfo(info);
-        info.buffersInput = true;
+        info.canBufferInput = true;
         info.isSequential = true;
         calcMetaInfoSize(info, queryInput(0));
     }

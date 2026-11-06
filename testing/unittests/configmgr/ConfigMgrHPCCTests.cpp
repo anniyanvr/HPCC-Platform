@@ -30,7 +30,6 @@
 #include "mod_template_support/TemplateException.hpp"
 #include "mod_template_support/TemplateExecutionException.hpp"
 #include "EnvironmentMgr.hpp"
-#include "build-config.h"
 #include <string>
 #include <iterator>
 #include <algorithm>
@@ -40,6 +39,13 @@
 class ConfigMgrHPCCTests : public CppUnit::TestFixture
 {
     public:
+        ConfigMgrHPCCTests()
+        {
+            m_templateDir = std::string(hpccBuildInfo.installDir) + PATHSEPSTR + "testing/configmgr/templates/";
+            CFG2_CONFIG_DIR = std::string(hpccBuildInfo.componentDir) + PATHSEPSTR + "configschema" + PATHSEPSTR + "xsd" + PATHSEPSTR;
+            CFG2_SOURCE_DIR = hpccBuildInfo.configDir;
+            m_xmlEnvDir = std::string(hpccBuildInfo.installDir) + PATHSEPSTR + "testing/configmgr/schema/environments/";
+        }
 
         CPPUNIT_TEST_SUITE(ConfigMgrHPCCTests);
             CPPUNIT_TEST(duplicatePortSameService);
@@ -47,9 +53,7 @@ class ConfigMgrHPCCTests : public CppUnit::TestFixture
             CPPUNIT_TEST(portConflictAccrossProcesses);
         CPPUNIT_TEST_SUITE_END();
 
-
     protected:
-
         bool loadEnvironment(const std::string &envFile)
         {
             bool rc;
@@ -71,7 +75,7 @@ class ConfigMgrHPCCTests : public CppUnit::TestFixture
 
         void duplicatePortSameService()
         {
-            printf("\nTesting binding two ESP Services of the same type on the same port as invalid...");
+            // Testing binding two ESP Services of the same type on the same port as invalid
             if (loadEnvironment(m_xmlEnvDir + "hpcc_port_conflict_test1.xml"))
             {
                 Status status;
@@ -79,9 +83,7 @@ class ConfigMgrHPCCTests : public CppUnit::TestFixture
                 auto msgs = status.getMessages(statusMsg::error, false, "", "port");
                 CPPUNIT_ASSERT_MESSAGE("Port conflict was NOT detected", !msgs.empty());
             }
-            printf("Test Complete.\n");
 
-            printf("\n\nTesting binding two ESP Services of the same type on different ports as valid...");
             if (loadEnvironment(m_xmlEnvDir + "hpcc_port_conflict_test2.xml"))
             {
                 Status status;
@@ -89,12 +91,11 @@ class ConfigMgrHPCCTests : public CppUnit::TestFixture
                 auto msgs = status.getMessages(statusMsg::error, false, "", "port");
                 CPPUNIT_ASSERT_MESSAGE("Port conflict was detected when there are none", msgs.empty());
             }
-            printf("Test Complete.\n");
         }
 
         void portConflictSameHWInstance()
         {
-            printf("\nTesting two ESP processes with a port collision on an instance...");
+            // Testing two ESP processes with a port collision on an instance
             if (loadEnvironment(m_xmlEnvDir + "hpcc_port_conflict_test3.xml"))
             {
                 Status status;
@@ -102,12 +103,11 @@ class ConfigMgrHPCCTests : public CppUnit::TestFixture
                 auto msgs = status.getMessages(statusMsg::error, false, "", "");
                 CPPUNIT_ASSERT_MESSAGE("Port conflict was NOT detected", !msgs.empty());
             }
-            printf("Test Complete.\n");
         }
 
         void portConflictAccrossProcesses()
         {
-            printf("\nTesting two processes with a port collision on an instance...");
+            // Testing two processes with a port collision on an instance
             if (loadEnvironment(m_xmlEnvDir + "hpcc_port_conflict_test4.xml"))
             {
                 Status status;
@@ -115,7 +115,6 @@ class ConfigMgrHPCCTests : public CppUnit::TestFixture
                 auto msgs = status.getMessages(statusMsg::error, false, "", "");
                 CPPUNIT_ASSERT_MESSAGE("Port conflict was NOT detected", !msgs.empty());
             }
-            printf("Test Complete.\n");
         }
 
 
@@ -123,11 +122,11 @@ class ConfigMgrHPCCTests : public CppUnit::TestFixture
     private:
 
         EnvironmentMgr  *m_pEnvMgr = nullptr;
-        std::string m_templateDir = INSTALL_DIR PATHSEPSTR "testing/configmgr/templates/";
+        std::string m_templateDir;
         std::string CFG2_MASTER_CONFIG_FILE = "environment.xsd";
-        std::string CFG2_CONFIG_DIR = COMPONENTFILES_DIR  PATHSEPSTR "configschema" PATHSEPSTR "xsd" PATHSEPSTR;
-        std::string CFG2_SOURCE_DIR = CONFIG_SOURCE_DIR;
-        std::string m_xmlEnvDir = INSTALL_DIR PATHSEPSTR "testing/configmgr/schema/environments/";
+        std::string CFG2_CONFIG_DIR;
+        std::string CFG2_SOURCE_DIR;
+        std::string m_xmlEnvDir;
 
 };
 

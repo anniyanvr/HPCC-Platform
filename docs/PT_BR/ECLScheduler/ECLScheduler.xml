@@ -9,7 +9,7 @@
 
     <mediaobject>
       <imageobject>
-        <imagedata fileref="images/redswooshWithLogo3.jpg"/>
+        <imagedata fileref="images/redswooshWithLogo3.jpg" />
       </imageobject>
     </mediaobject>
 
@@ -40,26 +40,26 @@
       fictícios. Qualquer semelhança com pessoas reais, vivas ou mortas, é
       mera coincidência.</para>
 
-      <para/>
+      <para></para>
     </legalnotice>
 
     <xi:include href="common/Version.xml"
                 xpointer="xpointer(//*[@id='FooterInfo'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
 
     <xi:include href="common/Version.xml"
                 xpointer="xpointer(//*[@id='DateVer'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
 
     <corpname>HPCC Systems</corpname>
 
     <xi:include href="common/Version.xml"
                 xpointer="xpointer(//*[@id='Copyright'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
 
     <mediaobject role="logo">
       <imageobject>
-        <imagedata fileref="images/LN_Rightjustified.jpg"/>
+        <imagedata fileref="images/LN_Rightjustified.jpg" />
       </imageobject>
     </mediaobject>
   </bookinfo>
@@ -122,11 +122,11 @@
 
   <xi:include href="ECLScheduler/ECLSched-Mods/ECLSchedComp.xml"
               xpointer="xpointer(//*[@id='ECLSched_comp'])"
-              xmlns:xi="http://www.w3.org/2001/XInclude"/>
+              xmlns:xi="http://www.w3.org/2001/XInclude" />
 
   <xi:include href="ECLScheduler/ECLSched-Mods/ECLSchedAdmin.xml"
               xpointer="xpointer(//*[@id='ECLSched-Admin'])"
-              xmlns:xi="http://www.w3.org/2001/XInclude"/>
+              xmlns:xi="http://www.w3.org/2001/XInclude" />
 
   <chapter>
     <title>Uso do ECL</title>
@@ -141,7 +141,7 @@
 
       <xi:include href="ECLLanguageReference/ECLR_mods/BltInFunc-WHEN.xml"
                   xpointer="xpointer(//*[@id='SchWhen'])"
-                  xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                  xmlns:xi="http://www.w3.org/2001/XInclude" />
     </sect1>
 
     <sect1 id="NOTIFY">
@@ -149,7 +149,7 @@
 
       <xi:include href="ECLLanguageReference/ECLR_mods/BltInFunc-NOTIFY.xml"
                   xpointer="xpointer(//*[@id='SchNOTIFY'])"
-                  xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                  xmlns:xi="http://www.w3.org/2001/XInclude" />
     </sect1>
 
     <sect1>
@@ -157,7 +157,7 @@
 
       <xi:include href="ECLLanguageReference/ECLR_mods/BltInFunc-EVENT.xml"
                   xpointer="xpointer(//*[@id='SchEvent'])"
-                  xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                  xmlns:xi="http://www.w3.org/2001/XInclude" />
     </sect1>
 
     <sect1>
@@ -165,7 +165,7 @@
 
       <xi:include href="ECLLanguageReference/ECLR_mods/BltInFunc-CRON.xml"
                   xpointer="xpointer(//*[@id='SchCRON'])"
-                  xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                  xmlns:xi="http://www.w3.org/2001/XInclude" />
     </sect1>
 
     <sect1>
@@ -173,7 +173,7 @@
 
       <xi:include href="ECLLanguageReference/ECLR_mods/BltInFunc-WAIT.xml"
                   xpointer="xpointer(//*[@id='SchWAIT'])"
-                  xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                  xmlns:xi="http://www.w3.org/2001/XInclude" />
     </sect1>
   </chapter>
 
@@ -186,10 +186,10 @@
 
     <xi:include href="ECLStandardLibraryReference/SLR-Mods/MonitorFile.xml"
                 xpointer="xpointer(//*[@id='MonitorFile'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
 
     <xi:include href="ECLStandardLibraryReference/SLR-Mods/MonitorLogicalFileName.xml"
                 xpointer="xpointer(//*[@id='MonitorLogicalFileName'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
   </chapter>
 </book>

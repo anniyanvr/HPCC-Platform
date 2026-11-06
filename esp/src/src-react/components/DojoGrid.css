@@ -1,66 +1,127 @@
 :root {
-    --grid-font-family: "Segoe WPC", "Segoe UI", sans-serif;
     --header-font-size: 14px;
     --row-font-size: 13px;
-    --grid-background: transparent;
-    --grid-selectionForeground: rgb(50, 49, 48);
-    --grid-selectionBackground: rgb(235, 235, 235);
-    --grid-hoverBackground: rgb(247, 245, 243);
-    --grid-selectionHoverBackground: rgb(227, 225, 223);
 }
 
 .flat .dojo-component.dgrid.dgrid-grid {
-    font-family: var(--grid-font-family);
     border-style: hidden;
 }
 
-.flat .dojo-component.dgrid .dgrid-header-row {
-    background-color: var(--grid-background);
+.flat .dgrid-header-row {
+    background-color: transparent;
     font-size: var(--header-font-size);
     line-height: 32px;
 }
 
-.flat .dojo-component.dgrid .dgrid-header-row .dgrid-cell {
-    border-bottom-color: var(--grid-selectionBackground);
+.flat .dgrid-header-row .dgrid-cell {
+    border-bottom-color: var(--colorNeutralBackground1Selected);
 }
 
-.flat .dojo-component.dgrid .dgrid-header-row:focus {
+.flat .dgrid-header-row:focus {
     outline-width: 0px;
 }
 
-.flat .dojo-component.dgrid .dgrid-header.dgrid-header-scroll {
-    background-color: var(--grid-background);
+.flat .dgrid-header.dgrid-header-scroll {
+    background-color: transparent;
 }
 
-.flat .dojo-component.dgrid .dgrid-row {
-    font-family: var(--grid-font-family);
+.flat .dgrid-row {
     font-size: var(--row-font-size);
     line-height: 22px;
 }
 
-.flat .dojo-component.dgrid .dgrid-row:hover {
-    background-color: var(--grid-hoverBackground);
+.flat .dgrid-row:hover {
+    background-color: var(--colorNeutralBackground1Hover);
 }
 
-.flat .dojo-component.dgrid .dgrid-row.dgrid-selected:hover {
-    background-color: var(--grid-selectionHoverBackground);
+.flat-dark .dgrid-row:hover {
+    background-color: var(--colorNeutralBackground1Hover);
 }
 
-.flat .dojo-component.dgrid .dgrid-row .dgrid-selected {
-    background-color: var(--grid-selectionBackground);
-    color: var(--grid-selectionForeground);
-    border-color: var(--grid-background);
+.flat .dgrid-row.dgrid-selected:hover {
+    background-color: var(--colorNeutralBackground1Hover);
 }
 
-.flat .dojo-component.dgrid .dgrid-cell {
-    border-color: var(--grid-background);
+.flat-dark .dgrid-row.dgrid-selected:hover {
+    background-color: var(--colorNeutralBackground1Hover);
 }
 
-.flat .dojo-component.dgrid .dgrid-focus:focus {
+.flat .dgrid-row.dgrid-selected {
+    background-color: var(--colorNeutralBackground1Selected);
+    color: var(--colorNeutralForeground1Selected);
+    border-color: transparent;
+}
+
+.flat-dark .dgrid-row.dgrid-selected {
+    background-color: var(--colorNeutralBackground1Selected);
+    color: var(--colorNeutralForeground1Selected);
+}
+
+.flat .dgrid-cell {
+    border-color: transparent;
+}
+
+.flat .dgrid-focus:focus {
     outline-width: 0px;
 }
 
-.flat .dojo-component.dgrid .dgrid-fakeline {
+.flat .dgrid-fakeline {
     border: 0px;
     margin: 2px;
+}
+
+.flat .dgrid-footer {
+    background-color: var(--colorNeutralStroke1);
+}
+
+.flat .dgrid-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 14px;
+    line-height: 14px;
+    padding: 4px 8px;
+}
+
+.flat .dgrid-pagination .dgrid-status {
+    flex-grow: 1;
+    padding: 0;
+}
+
+.flat .dgrid-pagination .dgrid-page-size {
+    margin: 0 10px 0 0;
+    padding: 2px;
+    width: 46px;
+    -webkit-box-shadow: none;
+    box-shadow: none;
+}
+
+.flat .dgrid-pagination .dgrid-navigation .dgrid-page-input {
+    padding: 0;
+    margin: 0;
+    background: var(--colorNeutralStroke1);
+    border-style: solid;
+    border-width: 1px;
+    color: inherit;
+}
+
+.dgrid-selector .dgrid-resize-header-container {
+    display: flex;
+    height: auto;
+}
+
+.dgrid-cell .dgrid-sort-arrow {
+    margin-top: 9px;
+}
+
+.dgrid-header .dgrid-cell {
+    vertical-align: middle;
+}
+
+.dgrid-cell .iconAlign {
+    vertical-align: text-bottom;
+}
+
+th.dgrid-cell [type="checkbox"] {
+    vertical-align: text-bottom;
 }

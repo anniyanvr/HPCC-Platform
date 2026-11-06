@@ -1,67 +1,77 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE sect2 PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+<!DOCTYPE book PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
 "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <sect2 id="wutool" role="brk">
-  <title><emphasis role="bold">Utilizando o wutool </emphasis></title>
+  <title><emphasis role="bold">Utilizando wutool </emphasis></title>
 
   <para><emphasis role="bold">wutool <indexterm>
       <primary>wutool</primary>
     </indexterm></emphasis><emphasis>action </emphasis><emphasis
-  role="bold">[WUID=nnn </emphasis><emphasis role="bold">] [ DALISERVER=ip |
-  CASSANDRASERVER=ip] [option=value]</emphasis></para>
+  role="bold">[WUID=nnn </emphasis><emphasis role="bold">] [ DALISERVER=ip ]
+  [option=value]</emphasis></para>
 
-  <para>A wutool é um utilitário de linha de comando usado para manter seu
-  armazenamento das workunits. Ela pode ser encontrada em
-  /opt/HPCCSystems/bin/ em qualquer servidor onde a plataforma tenha sido
-  instalada. É possível usar esse utilitário para exportar suas Workunits de
-  um servidor Dali e depois importar para um data storage do Cassandra Também
-  é possível usá-la para importar workunits arquivadas em um servidor
-  Sasha.</para>
+  <para>O wutool é um utilitário de linha de comando usado para manter o
+  armazenamento de Workunit. Ele pode ser encontrado em /opt/HPCCSystems/bin/
+  em qualquer servidor onde a plataforma foi instalada. Você pode usá-lo para
+  importar workunits arquivadas em um servidor Sasha.</para>
 
   <informaltable colsep="1" frame="all" rowsep="1">
     <tgroup cols="2">
-      <colspec align="left" colwidth="125.55pt"/>
+      <colspec align="left" colwidth="175.55pt"/>
 
       <colspec/>
 
       <tbody>
         <row>
-          <entry><emphasis role="bold">Ações</emphasis></entry>
+          <entry colsep="0"><emphasis role="bold">Actions</emphasis></entry>
 
-          <entry><ns:textPlaceholder
-          xmlns:ns="http://www.xmlmind.com/xmleditor/namespace/clipboard"/></entry>
+          <entry/>
         </row>
 
         <row>
           <entry>list &lt;workunits&gt;</entry>
 
-          <entry>Listar Workunits</entry>
+          <entry>Lista workunits.</entry>
         </row>
 
         <row>
           <entry>dump &lt;workunits&gt;</entry>
 
-          <entry>Descarregar o xml para Workunits especificadas.</entry>
+          <entry>Dump de xml para workunits específicas.</entry>
         </row>
 
         <row>
           <entry>delete &lt;workunits&gt;</entry>
 
-          <entry>Remover Workunits.</entry>
+          <entry>Exclui workunits.</entry>
         </row>
 
         <row>
           <entry>results &lt;workunits&gt;</entry>
 
-          <entry>Descarregar resultados para as workunits
-          especificadas.</entry>
+          <entry>Dump de resultados de uma workunit específica.</entry>
+        </row>
+
+        <row>
+          <entry>info &lt;workunits&gt; &lt;filter&gt;</entry>
+
+          <entry>Este comando fornece acesso filtrado a estatísticas e outras
+          informações de uma workunit.<para>Consulte a tabela seguinte para
+          obter informações adicionais sobre o parâmetro info. </para></entry>
+        </row>
+
+        <row>
+          <entry>analyze &lt;workunit&gt;</entry>
+
+          <entry>Analisa a workunit para destacar possíveis economias de
+          custos.</entry>
         </row>
 
         <row>
           <entry>archive &lt;workunits&gt;</entry>
 
-          <entry>Arquivar Workunits especificadas em arquivos xml. Há suporte
-          para as seguintes opções: <para>[TO=&lt;directory&gt;]
+          <entry>Arquiva as workunits especificadas em arquivos xml. As
+          seguintes opções são suportadas:<para>[TO=&lt;directory&gt;]
           </para><para>[DEL=1] </para><para>[DELETERESULTS=1]
           </para><para>[INCLUDEFILES=1]</para></entry>
         </row>
@@ -69,95 +79,283 @@
         <row>
           <entry>restore &lt;filenames&gt;</entry>
 
-          <entry>Restaurar a partir de arquivos xml. [INCLUDEFILES=1]</entry>
+          <entry>Restaura de arquivos xml. [INCLUDEFILES=1]</entry>
+        </row>
+
+        <row>
+          <entry>importzap</entry>
+
+          <entry>Importa um relatório ZAP para permitir recriar uma workunit
+          e replicar o problema relatado. <para>Importzap exige os seguintes
+          parâmetros.
+          </para><para>&lt;zapreport-filename&gt;</para><para>&lt;output-helper-directory&gt;
+          diretório temporário para descompactar o relatório zap
+          em</para><para>&lt;zapreport-password&gt; [optional]
+          </para></entry>
+        </row>
+
+        <row>
+          <entry>postmortem &lt;workunit&gt;</entry>
+
+          <entry>&lt;workunit&gt; PMD=&lt;dir&gt; - Add post-mortem
+          info</entry>
         </row>
 
         <row>
           <entry>orphans</entry>
 
-          <entry>Remover informações órfãs do armazenamento</entry>
+          <entry>Exclui informações isoladas do armazenamento</entry>
         </row>
 
         <row>
           <entry>cleanup [days=NN]</entry>
 
-          <entry>Remover Workunits com mais de NN dias</entry>
+          <entry>Exclui workunits mais velhas que NN dias</entry>
         </row>
 
         <row>
-          <entry>validate</entry>
+          <entry>validate [FIX=1]</entry>
 
-          <entry>Verificar se há erros no conteúdo do repositório de
-          Workunits. [FIX=1] tentará reparar quaisquer problemas
-          encontrados.</entry>
+          <entry>Verifique o conteúdo do repositório da workunit quanto a
+          erros. [FIX=1] irá reparar qualquer ocorrência encontrada.</entry>
         </row>
 
         <row>
           <entry>clear</entry>
 
-          <entry>Remover todo o repositório da workunit (exige entire=1
+          <entry>Exclui todo o repositório de workunit (requerees entire=1
           repository=1)</entry>
         </row>
 
         <row>
           <entry>initialize</entry>
 
-          <entry>Inicializar o novo repositório de workunit</entry>
+          <entry>Inicializa o respositório de uma nova workunit</entry>
+        </row>
+
+        <row>
+          <entry>graph &lt;wu&gt;</entry>
+
+          <entry>Gera uma representação alternativa do graph com detalhes da
+          execução</entry>
+        </row>
+
+        <row>
+          <entry>activity &lt;wu&gt;</entry>
+
+          <entry><para>Quais atividades estão em execução em um determinado
+          intervalo de tempo (em ordem cronológica)</para><para>&lt;wu&gt;
+          ["&gt;scope|mintime"] ["&lt;scope|maxtime"]
+          [threshold=n%]</para></entry>
+        </row>
+
+        <row>
+          <entry>hotspot &lt;wu&gt; [&lt;activity&gt;]</entry>
+
+          <entry>Localiza hotspots para workunit (ou uma atividade em
+          particular)</entry>
+        </row>
+
+        <row>
+          <entry>critical &lt;wu&gt; &lt;activity&gt;</entry>
+
+          <entry>Quais atividades estão em execução em ordem de
+          execução</entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">depend &lt;wu&gt; &lt;activity&gt; 
+&lt;activity&gt;</programlisting></entry>
+
+          <entry>Localiza padrões entre duas atividades</entry>
+        </row>
+
+        <row>
+          <entry>depend &lt;wu&gt; ?&lt;activity&gt;:startTime</entry>
+
+          <entry>Quais depedências consomem um grande % no início da
+          atividade</entry>
+        </row>
+
+        <row>
+          <entry>help &lt;command&gt;</entry>
+
+          <entry>Mais ajuda por meio de comando</entry>
         </row>
       </tbody>
     </tgroup>
   </informaltable>
 
-  <para>&lt;workunits&gt; pode ser especificado na linha de comando ou usando
-  um filter owner=XXXX. Se omitido, todas as workunits são
-  selecionadas.</para>
+  <para>A tabela a seguir fornece mais informações para a utilidade wutool
+  emitida com o parâmetro action=info:</para>
 
-  <para><informaltable colsep="1" frame="all" rowsep="1">
-      <tgroup cols="2">
-        <colspec align="left" colwidth="300pt"/>
+  <informaltable colsep="1" frame="all" rowsep="1">
+    <tgroup cols="2">
+      <colspec align="left" colwidth="175.55pt"/>
 
-        <colspec/>
+      <colspec/>
 
-        <tbody>
-          <row>
-            <entry><emphasis role="bold">Opções </emphasis><para>(Essas opções
-            são válidas se o CASSANDRASERVER estiver
-            especificado)</para></entry>
+      <tbody>
+        <row>
+          <entry colsep="0"><emphasis role="bold">info
+          parâmetros</emphasis></entry>
 
-            <entry><ns:textPlaceholder
-            xmlns:ns="http://www.xmlmind.com/xmleditor/namespace/clipboard"/></entry>
-          </row>
+          <entry/>
+        </row>
 
-          <row>
-            <entry>CASSANDRA_KEYSPACE<para><ns:textPlaceholder
-            xmlns:ns="http://www.xmlmind.com/xmleditor/namespace/clipboard"/></para></entry>
+        <row>
+          <entry>info &lt;workunits&gt; &lt;filter&gt;</entry>
 
-            <entry>Keyspace do Cassandra, o padrão é HPCC.</entry>
-          </row>
+          <entry>Este comando fornece acesso filtrado às estatísticas e outras
+          informações de uma workunit.<para>O filtro pode incluir os seguintes
+          elementos (aqueles indicados por * podem ser repetidos):
+          </para></entry>
+        </row>
 
-          <row>
-            <entry>CASSANDRA_USER</entry>
+        <row>
+          <entry colsep="0"/>
 
-            <entry>Nome de usuário do Cassandra a ser usado (se
-            necessário).</entry>
-          </row>
+          <entry><emphasis role="bold">Quais escopos
+          correspondem:</emphasis></entry>
+        </row>
 
-          <row>
-            <entry>CASSANDRA_PASSWORD</entry>
+        <row>
+          <entry><programlisting role="tab">  
+          scope[&lt;scope-id&gt;]*</programlisting></entry>
 
-            <entry>Senha do Cassandra a ser usada (se necessário).</entry>
-          </row>
+          <entry>escope para correspodência</entry>
+        </row>
 
-          <row>
-            <entry>TRACELEVEL</entry>
+        <row>
+          <entry><programlisting role="tab">  
+          stype[&lt;scope-type&gt;]*</programlisting></entry>
 
-            <entry>Trace level (1-10)</entry>
-          </row>
-        </tbody>
-      </tgroup>
-    </informaltable>Exemplos:</para>
+          <entry>escope do tipo de correspondência</entry>
+        </row>
+
+        <row rowsep="0">
+          <entry><programlisting role="tab">  id[&lt;id&gt;]*</programlisting></entry>
+
+          <entry>o id do escopo para correspondência</entry>
+        </row>
+
+        <row>
+          <entry/>
+
+          <entry><emphasis role="bold">NOTA</emphasis>: escopo, stype e id não
+          podem ser especificados no mesmo filtro</entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  depth[n |
+          low..high]</programlisting></entry>
+
+          <entry>intervalo de profundidades para buscar uma
+          correspondência.</entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  source[global|stats|graph|all]*</programlisting></entry>
+
+          <entry>quais fontes dentro da workunit a pesquisar. O padrão são as
+          melhores fontes para o resto do filtro.</entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  where[&lt;statistickind&gt; | &lt;statistickind&gt; 
+(=|&lt;|&lt;=|&gt;|&gt;=) value | 
+&lt;statistickind&gt;=low..high]</programlisting></entry>
+
+          <entry>filtrar pela existência de estatística ou intervalo de
+          valores. </entry>
+        </row>
+
+        <row rowsep="0">
+          <entry colsep="0"/>
+
+          <entry><emphasis role="bold">Quais escopos estão inclusos nos
+          resultados:</emphasis></entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  matched[true|false]</programlisting></entry>
+
+          <entry>os escopos correspondentes são retornados?</entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  nested[&lt;depth&gt;|all]</programlisting></entry>
+
+          <entry>qual aninhamento de escopos dentro de um escopo
+          correspondente estão nos resultados (padrão para '0' se
+          correspondente[true] e 'todos' se correspondente[false]).</entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  includetype[&lt;scope-type&gt;]*</programlisting></entry>
+
+          <entry>quais tipos de escopo devem ser incluídos?</entry>
+        </row>
+
+        <row>
+          <entry colsep="0"/>
+
+          <entry><emphasis role="bold">Qual informação sobre o escopo é
+          reportado:</emphasis></entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  properties[statistics|hints|
+attributes|scope|all]*</programlisting></entry>
+
+          <entry/>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  statistic[&lt;statistic-kind&gt;|none|all]*</programlisting></entry>
+
+          <entry/>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  attribute[&lt;attribute-name&gt;|none|all]*</programlisting></entry>
+
+          <entry/>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  hint[&lt;hint-name&gt;]*</programlisting></entry>
+
+          <entry/>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  property[&lt;statistic-kind&gt;|
+&lt;attribute-name&gt;|&lt;hint-name&gt;]*</programlisting></entry>
+
+          <entry>incluir propriedade (categoria é deduzida)</entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  measure[&lt;measure&gt;]</programlisting></entry>
+
+          <entry>todas as estatísticas com medidas específicas.</entry>
+        </row>
+
+        <row>
+          <entry><programlisting role="tab">  version[&lt;version&gt;]</programlisting></entry>
+
+          <entry>versão mínima para retornar</entry>
+        </row>
+      </tbody>
+    </tgroup>
+  </informaltable>
+
+  <para>&lt;workunits&gt; pode ser especificado por linha de comando ou por
+  meio do filtro=XXXX. Se omitido, todas as workunits são selecionadas.</para>
+
+  <para>Exemplo:</para>
 
   <para><programlisting>/opt/HPCCSystems/bin/wutool archive DALISERVER=. del=1
-
-/opt/HPCCSystems/bin/wutool restore *.xml CASSANDRASERVER=192.168.56.120 CASSANDRA_KEYSPACE=hpcc2 </programlisting></para>
+</programlisting></para>
 </sect2>

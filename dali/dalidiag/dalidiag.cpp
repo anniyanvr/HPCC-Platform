@@ -65,7 +65,7 @@ void usage(const char *exe)
     printf("-disconnect <ip>:<port> -- forcably disconnect a clients connection\n");
     printf("-permissions <logicalname> <user> <password> -- get file permissions\n");
     printf("-unlock <connection_id> [close] -- forcibly disconnect an sds lock\n"); 
-    printf("                                   (use id's given by '-locks'\n");
+    printf("                                   (use the ConnectionId in hex given by '-locks'\n");
     printf("-settracetransactions    -- trace dali transactions\n");
     printf("-settraceslowtransactions <millisecond-threshold> -- trace slow dali transactions\n");
     printf("-cleartracetransactions  -- stop tracing dali transactions\n");
@@ -79,7 +79,7 @@ void usage(const char *exe)
 class CTestSDSSubscription : public CInterface, implements ISDSSubscription
 {
 public:
-    Semaphore notifysem;
+    Semaphore notifysem{SYNC_LOCATION};
     IMPLEMENT_IINTERFACE;
     virtual void notify(SubscriptionId id, const char *xpath, SDSNotifyFlags flags, unsigned valueLen, const void *valueData)
     {
@@ -119,7 +119,7 @@ void timeQorSDS(bool timeq)
 
     if (timeq) {
         StringBuffer qname("TESTINGQ_");
-        ep.getUrlStr(qname);
+        ep.getEndpointHostText(qname);
         qconn.setown(createNamedQueueConnection(0));
         channel.setown(qconn->open(qname.str()));
         while (channel->probe()) {
@@ -132,7 +132,7 @@ void timeQorSDS(bool timeq)
     }
     else {
         subname.append("TESTSDS_");
-        ep.getUrlStr(subname);
+        ep.getEndpointHostText(subname);
         StringBuffer fullname("TESTING/");
         fullname.append(subname);
         sdssubid = querySDS().subscribe(fullname.str(), testsdssub);
@@ -279,7 +279,7 @@ void dirParts(const char *ip,const char *dir)
 
 void partInfo(const char *name,unsigned copy)
 {
-    Owned<IDistributedFile> f = queryDistributedFileDirectory().lookup(name,UNKNOWN_USER, false, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> f = queryDistributedFileDirectory().lookup(name, UNKNOWN_USER, AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
     if (f) {
         Owned<IDistributedFilePartIterator> parts = f->getIterator();
         unsigned partno = 0;
@@ -302,6 +302,7 @@ void partInfo(const char *name,unsigned copy)
 
 void nodeInfo(const char *ip)
 {
+#ifndef _CONTAINERIZED
     Owned<IEnvironmentFactory> factory = getEnvironmentFactory(false);
     Owned<IConstEnvironment> env = factory->openEnvironment();
 
@@ -331,6 +332,7 @@ void nodeInfo(const char *ip)
     }
     else
         printf("ERROR: cannot find '%s' in Dali Environment\n",ip);
+#endif
 }
 
 void slaveNode(const char *thor,unsigned n)
@@ -377,9 +379,9 @@ void backupList(const char *cluster)
         rank_t r;
         StringBuffer str;
         for (r=0;r<n;r++) {
-            group->queryNode(r).endpoint().getUrlStr(str.clear());
+            group->queryNode(r).endpoint().getEndpointHostText(str.clear());
             str.append(' ');
-            group->queryNode((r+1)%n).endpoint().getUrlStr(str);
+            group->queryNode((r+1)%n).endpoint().getEndpointHostText(str);
             printf("%s\n",str.str());
         }
     }
@@ -422,6 +424,10 @@ void nqPingPong(const char *q,const char *q2)
     class cThread: public Thread
     {
     public:
+    cThread() : Thread("cThread")
+    {
+    }
+
         const char *q;
         int num;
         int run() {
@@ -453,8 +459,8 @@ void nqPingPong(const char *q,const char *q2)
     threads[0].num = 1;
     threads[1].q = q;
     threads[1].num = 2;
-    threads[0].start();
-    threads[1].start();
+    threads[0].start(false);
+    threads[1].start(false);
     threads[0].join();
     threads[1].join();
 }
@@ -467,42 +473,6 @@ static bool begins(const char *&ln,const char *pat)
         return true;
     }
     return false;
-}
-
-// NB: there's strtoll under Linux
-static unsigned __int64 hextoll(const char *str, bool *error=NULL)
-{
-    unsigned len = strlen(str);
-    if (!len) return 0;
-
-    unsigned __int64 factor = 1;
-    unsigned __int64 rolling = 0;
-    char *ptr = (char *)str+len-1;
-    for (;;)
-    {
-        char c = *ptr;
-        unsigned v;
-        if (isdigit(c))
-            v = c-'0';
-        else if (c>='A' && c<='F')
-            v = 10+(c-'A');
-        else if (c>='a' && c<='f')
-            v = 10+(c-'a');
-        else
-        {
-            if (error)
-                *error = true;
-            return 0;
-        }
-        rolling += v * factor;
-        factor <<= 4;
-        if (ptr == str)
-            break;
-        --ptr;
-    }
-    if (error)
-        *error = false;
-    return rolling;
 }
 
 int main(int _argc, char* argv[])
@@ -530,6 +500,8 @@ int main(int _argc, char* argv[])
     }
 
     try {
+        initNullConfiguration();
+
         Owned<IGroup> group = createIGroup(epa);
         assertex(group);
         initClientProcess(group, DCR_DaliDiag, 0, NULL, NULL, MP_WAIT_FOREVER);
@@ -610,7 +582,7 @@ int main(int _argc, char* argv[])
                 if ((i+1<argc)&&(stricmp(arg,"unlock")==0)) {
                     MemoryBuffer mb;
                     __int64 connectionId;
-                    connectionId = hextoll(argv[i+1]);
+                    connectionId = strtoll(argv[i+1], nullptr, 16);
                     bool disconnect = (i+2<argc && 0==stricmp("close", argv[i+2]));
                     mb.append("unlock").append(connectionId).append(disconnect);
                     getDaliDiagnosticValue(mb);
@@ -672,7 +644,16 @@ int main(int _argc, char* argv[])
                     MemoryBuffer mb;
                     mb.append("save");
                     getDaliDiagnosticValue(mb);
-                    PROGLOG("SDS store saved");
+                    Owned<IException> exception;
+                    if (mb.length())
+                        exception.setown(deserializeException(mb));
+                    if (exception)
+                    {
+                        StringBuffer errMsg;
+                        PROGLOG("Dali SDS save failed: [%d, %s]", exception->errorCode(), exception->errorMessage(errMsg).str());
+                    }
+                    else
+                        PROGLOG("SDS store saved");
                     break;
                 }
                 if (0 == stricmp(arg, "locks")) {

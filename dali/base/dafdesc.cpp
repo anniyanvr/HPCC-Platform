@@ -15,8 +15,8 @@
     limitations under the License.
 ############################################################################## */
 
-#define da_decl DECL_EXPORT
 #include "platform.h"
+#include <algorithm>
 #include "portlist.h"
 #include "jlib.hpp"
 #include "jfile.hpp"
@@ -25,6 +25,7 @@
 #include "jexcept.hpp"
 #include "jptree.hpp"
 #include "jlzw.hpp"
+#include "jplane.hpp"
 #include "dafdesc.hpp"
 #include "rmtclient.hpp"
 #include "dautils.hpp"
@@ -32,6 +33,14 @@
 
 #include "dafdesc.hpp"
 #include "dadfs.hpp"
+#include "dameta.hpp"
+#include "jsecrets.hpp"
+#include "rmtfile.hpp"
+
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <vector>
 
 #define INCLUDE_1_OF_1    // whether to use 1_of_1 for single part files
 
@@ -101,7 +110,10 @@ void ClusterPartDiskMapSpec::setRoxie (unsigned redundancy, unsigned channelsPer
 {
     flags = 0;
     replicateOffset = _replicateOffset?_replicateOffset:1;
-    defaultCopies = redundancy+1;
+#ifdef _CONTAINERIZED
+    // NB: in containerized mode the cluster spec. redundancy isn't used.
+    redundancy = 0;
+#endif
     if ((channelsPerNode>1)&&(redundancy==0)) {
         flags |= CPDMSF_wrapToNextDrv;
         flags |= CPDMSF_overloadedConfig;
@@ -199,6 +211,7 @@ void ClusterPartDiskMapSpec::toProp(IPropertyTree *tree)
     setPropDef(tree,"@interleave",interleave,0);
     setPropDef(tree,"@mapFlags",flags,0);
     setPropDef(tree,"@repeatedPart",repeatedPart,(int)CPDMSRP_notRepeated);
+    setPropDef(tree, "@numStripedDevices", numStripedDevices, 1);
     if (defaultBaseDir.isEmpty())
         tree->removeProp("@defaultBaseDir");
     else
@@ -215,18 +228,24 @@ void ClusterPartDiskMapSpec::fromProp(IPropertyTree *tree)
     // if directory is specified then must match default base to be default replicated
     StringBuffer dir;
     if (tree&&tree->getProp("@directory",dir)) {
-        const char * base = queryBaseDirectory(grp_unknown, 0, SepCharBaseOs(getPathSepChar(dir.str())));
+        const char * base = queryUnknownBaseDirectory(0, SepCharBaseOs(getPathSepChar(dir.str())));
         size32_t l = strlen(base);
         if ((memcmp(base,dir.str(),l)!=0)||((l!=dir.length())&&!isPathSepChar(dir.charAt(l))))
             defrep = 0;
     }
     replicateOffset = getPropDef(tree,"@replicateOffset",1);
     defaultCopies = getPropDef(tree,"@redundancy",defrep)+1;
+#ifdef _CONTAINERIZED
+    // NB: in containerized mode the cluster spec. redundancy isn't used.
+    // Force number of copies to 1 here (on deserialization) to avoid code paths that would look at redundant copies.
+    defaultCopies = 1;
+#endif
     maxDrvs = (byte)getPropDef(tree,"@maxDrvs",2);
     startDrv = (byte)getPropDef(tree,"@startDrv",defrep?0:getPathDrive(dir.str()));
     interleave = getPropDef(tree,"@interleave",0);
     flags = (byte)getPropDef(tree,"@mapFlags",0);
     repeatedPart = (unsigned)getPropDef(tree,"@repeatedPart",(int)CPDMSRP_notRepeated);
+    numStripedDevices = (unsigned)getPropDef(tree, "@numStripedDevices", 1);
     setDefaultBaseDir(tree->queryProp("@defaultBaseDir"));
     setDefaultReplicateDir(tree->queryProp("@defaultReplicateDir"));
 }
@@ -245,6 +264,8 @@ void ClusterPartDiskMapSpec::serialize(MemoryBuffer &mb)
         mb.append(defaultBaseDir);
     if (flags&CPDMSF_defaultReplicateDir)
         mb.append(defaultReplicateDir);
+    if (flags&CPDMSF_striped)
+        mb.append(numStripedDevices);
 }
 
 void ClusterPartDiskMapSpec::deserialize(MemoryBuffer &mb)
@@ -252,6 +273,11 @@ void ClusterPartDiskMapSpec::deserialize(MemoryBuffer &mb)
     mb.read(flags);
     mb.read(replicateOffset);
     mb.read(defaultCopies);
+#ifdef _CONTAINERIZED
+    // NB: in containerized mode the cluster spec. redundancy isn't used.
+    // Force number of copies to 1 here (on deserialization) to avoid code paths that would look at redundant copies.
+    defaultCopies = 1;
+#endif
     mb.read(startDrv);
     mb.read(maxDrvs);
     mb.read(interleave);
@@ -267,6 +293,8 @@ void ClusterPartDiskMapSpec::deserialize(MemoryBuffer &mb)
         mb.read(defaultReplicateDir);
     else
         defaultReplicateDir.clear();
+    if (flags&CPDMSF_striped)
+        mb.read(numStripedDevices);
 }
 
 
@@ -340,6 +368,7 @@ ClusterPartDiskMapSpec & ClusterPartDiskMapSpec::operator=(const ClusterPartDisk
     repeatedPart = other.repeatedPart;
     setDefaultBaseDir(other.defaultBaseDir);
     setDefaultReplicateDir(other.defaultReplicateDir);
+    numStripedDevices = other.numStripedDevices;
     return *this;
 }
 
@@ -370,6 +399,7 @@ struct CClusterInfo: implements IClusterInfo, public CInterface
     Linked<IGroup> group;
     StringAttr name; // group name
     ClusterPartDiskMapSpec mspec;
+    bool foreignGroup = false;
     void checkClusterName(INamedGroupStore *resolver)
     {
         // check name matches group
@@ -386,18 +416,34 @@ struct CClusterInfo: implements IClusterInfo, public CInterface
                     }
                     if (mspec.defaultCopies>1 && mspec.defaultReplicateDir.isEmpty())
                     {
-                        mspec.setDefaultReplicateDir(queryBaseDirectory(groupType, 1));  // MORE - not sure this is strictly correct
+                        Owned<const IStoragePlane> plane = getStoragePlaneByName(name, false);
+                        if (plane)
+                            mspec.setDefaultReplicateDir(plane->queryMirrorPrefix());
                     }
                     return; // ok
                 }
                 name.clear();
             }
             StringBuffer gname;
-            if (resolver->find(group,gname,true)||(group->ordinality()>1))
+            if (resolver->find(group,gname,!foreignGroup)||(group->ordinality()>1))
                 name.set(gname);
         }
     }
+    void checkStriped()
+    {
+        if (!name.isEmpty())
+        {
+            mspec.numStripedDevices = 1;
+            Owned<const IStoragePlane> plane = getDataStoragePlane(name, false);
+            if (plane && plane->isStriped())
+                mspec.numStripedDevices = plane->numDevices();
 
+            if (mspec.numStripedDevices>1)
+                mspec.flags |= CPDMSF_striped;
+            else
+                mspec.flags &= ~CPDMSF_striped;
+        }
+    }
 public:
     IMPLEMENT_IINTERFACE;
     CClusterInfo(MemoryBuffer &mb,INamedGroupStore *resolver)
@@ -411,12 +457,18 @@ public:
         checkClusterName(resolver);
     }
 
-    CClusterInfo(const char *_name,IGroup *_group,const ClusterPartDiskMapSpec &_mspec,INamedGroupStore *resolver)
-        : name(_name),group(_group)
+    CClusterInfo(const char *_name,IGroup *_group,const ClusterPartDiskMapSpec &_mspec,INamedGroupStore *resolver,unsigned flags)
+        : group(_group), name(_name)
     {
         name.toLowerCase();
         mspec =_mspec;
-        checkClusterName(resolver);
+        if (flags & IFDSF_FOREIGN_GROUP)
+            foreignGroup = true;
+        else
+        {
+            checkClusterName(resolver);
+            checkStriped();
+        }
     }
     CClusterInfo(IPropertyTree *pt,INamedGroupStore *resolver,unsigned flags)
     {
@@ -424,23 +476,36 @@ public:
             return;
         name.set(pt->queryProp("@name"));
         mspec.fromProp(pt);
+        if (0 != (flags & IFDSF_FOREIGN_GROUP))
+            foreignGroup = true;
+        else if (pt->getPropBool("@foreign"))
+            foreignGroup = true;
+
         if ((((flags&IFDSF_EXCLUDE_GROUPS)==0)||name.isEmpty())&&pt->hasProp("Group"))
             group.setown(createIGroup(pt->queryProp("Group")));
-        if (!name.isEmpty()&&!group.get()&&resolver)
+        if (!foreignGroup)
         {
-            StringBuffer defaultDir;
-            GroupType groupType;
-            group.setown(resolver->lookup(name.get(), defaultDir, groupType));
-            // MORE - common some of this with checkClusterName?
-            bool baseDirChanged = mspec.defaultBaseDir.isEmpty() || !strsame(mspec.defaultBaseDir, defaultDir);
-            if (baseDirChanged)
-                mspec.setDefaultBaseDir(defaultDir);   // MORE - should possibly set up the rest of the mspec info from the group info here
+            if (!name.isEmpty()&&!group.get()&&resolver)
+            {
+                StringBuffer defaultDir;
+                GroupType groupType;
+                group.setown(resolver->lookup(name.get(), defaultDir, groupType));
+                // MORE - common some of this with checkClusterName?
+                bool baseDirChanged = mspec.defaultBaseDir.isEmpty() || !strsame(mspec.defaultBaseDir, defaultDir);
+                if (baseDirChanged)
+                    mspec.setDefaultBaseDir(defaultDir);   // MORE - should possibly set up the rest of the mspec info from the group info here
 
-            if (mspec.defaultCopies>1 && (mspec.defaultReplicateDir.isEmpty() || baseDirChanged))
-                mspec.setDefaultReplicateDir(queryBaseDirectory(groupType, 1));  // MORE - not sure this is strictly correct
+                if (mspec.defaultCopies>1 && (mspec.defaultReplicateDir.isEmpty() || baseDirChanged))
+                {
+                    Owned<const IStoragePlane> plane = getStoragePlaneByName(name, false);
+                    if (plane)
+                        mspec.setDefaultReplicateDir(plane->queryMirrorPrefix());
+                }
+            }
+            else
+                checkClusterName(resolver);
+            checkStriped();
         }
-        else
-            checkClusterName(resolver);
     }
 
     const char *queryGroupName()
@@ -455,7 +520,7 @@ public:
         return group.get();
     }
 
-    StringBuffer &getGroupName(StringBuffer &ret,IGroupResolver *resolver)
+    StringBuffer &getGroupName(StringBuffer &ret,IGroupResolver *resolver) const
     {
         if (name.isEmpty()) {
             if (group)
@@ -503,10 +568,13 @@ public:
     void serializeTree(IPropertyTree *pt,unsigned flags)
     {
         mspec.toProp(pt);
-        if (group&&(((flags&IFDSF_EXCLUDE_GROUPS)==0)||name.isEmpty())) {
+        if (group && (foreignGroup || ((flags&IFDSF_EXCLUDE_GROUPS)==0) || name.isEmpty()))
+        {
             StringBuffer gs;
             group->getText(gs);
             pt->setProp("Group",gs.str());
+            if (foreignGroup)
+                pt->setPropBool("@foreign", true);
         }
         if (!name.isEmpty()&&((flags&IFDSF_EXCLUDE_CLUSTERNAMES)==0))
             pt->setProp("@name",name);
@@ -536,7 +604,7 @@ public:
     void getBaseDir(StringBuffer &basedir,DFD_OS os)
     {
         if (mspec.defaultBaseDir.isEmpty())  // assume current platform's default
-            basedir.append(queryBaseDirectory(grp_unknown, 0, os));
+            basedir.append(queryUnknownBaseDirectory(0, os));
         else
             basedir.append(mspec.defaultBaseDir);
     }
@@ -544,24 +612,33 @@ public:
     void getReplicateDir(StringBuffer &basedir,DFD_OS os)
     {
         if (mspec.defaultReplicateDir.isEmpty())  // assume current platform's default
-            basedir.append(queryBaseDirectory(grp_unknown, 1, os));
+            basedir.append(queryUnknownBaseDirectory(1, os));
         else
             basedir.append(mspec.defaultReplicateDir);
     }
 
-    StringBuffer &getClusterLabel(StringBuffer &ret)
+    StringBuffer &getClusterLabel(StringBuffer &ret) const
     {
         return getGroupName(ret, NULL);
     }
 
+    void applyPlane(IStoragePlane *plane)
+    {
+        mspec.numStripedDevices = plane ? plane->numDevices() : 1;
+        if (mspec.numStripedDevices>1)
+            mspec.flags |= CPDMSF_striped;
+        else
+            mspec.flags &= ~CPDMSF_striped;
+    }
 };
 
 IClusterInfo *createClusterInfo(const char *name,
                                 IGroup *grp,
                                 const ClusterPartDiskMapSpec &mspec,
-                                INamedGroupStore *resolver)
+                                INamedGroupStore *resolver,
+                                unsigned flags)
 {
-    return new CClusterInfo(name,grp,mspec,resolver);
+    return new CClusterInfo(name,grp,mspec,resolver,flags);
 }
 IClusterInfo *deserializeClusterInfo(MemoryBuffer &mb,
                                 INamedGroupStore *resolver)
@@ -585,11 +662,14 @@ protected:
 public:
 
     StringAttr tracename;
+    unsigned lfnHash = 0;
     IArrayOf<IClusterInfo> clusters;
 
     Owned<IPropertyTree> attr;
     StringAttr directory;
     StringAttr partmask;
+    FileDescriptorFlags fileFlags = FileDescriptorFlags::none;
+    AccessMode accessMode = AccessMode::none;
     virtual unsigned numParts() = 0;                                            // number of parts
     virtual unsigned numCopies(unsigned partnum) = 0;                           // number of copies
     virtual INode *doQueryNode(unsigned partidx, unsigned copy, unsigned rn) = 0;               // query machine node
@@ -601,9 +681,13 @@ public:
     virtual IFileDescriptor &querySelf() = 0;
     virtual unsigned copyClusterNum(unsigned partidx, unsigned copy,unsigned *replicate=NULL) = 0;
 
+    IPropertyTree & queryAttributes() const
+    {
+        return *attr;
+    }
 };
 
-class CPartDescriptor : implements IPartDescriptor
+class CPartDescriptor final : implements IPartDescriptor
 {
 protected: friend class CFileDescriptor;
 
@@ -632,7 +716,7 @@ public:
     {
         partIndex = idx;
         ismulti = false;
-        if (!isEmptyPTree(pt)) {
+        if (pt && !isEmptyPTree(pt)) {
             if (pt->getPropInt("@num",idx+1)-1!=idx)
                 IERRLOG("CPartDescriptor part index mismatch");
             overridename.set(pt->queryProp("@name"));
@@ -755,6 +839,74 @@ public:
         return ismulti;
     }
 
+    IPropertyTree & queryAttributes() const
+    {
+        return *props;
+    }
+
+    offset_t getFileSize(bool allowphysical,bool forcephysical)
+    {
+        offset_t ret = (offset_t)((forcephysical&&allowphysical)?-1:queryAttributes().getPropInt64("@size", -1));
+        if (allowphysical&&(ret==(offset_t)-1))
+            ret = getSize(true);
+        return ret;
+    }
+
+    offset_t getDiskSize(bool allowphysical,bool forcephysical)
+    {
+        if (!::isCompressed(parent.queryAttributes()))
+            return getFileSize(allowphysical, forcephysical);
+
+        if (forcephysical && allowphysical)
+            return getSize(false); // i.e. only if force, because all compressed should have @compressedSize attribute
+
+        // NB: compressSize is disk size
+        return queryAttributes().getPropInt64("@compressedSize", -1);
+    }
+
+    offset_t getSize(bool checkCompressed)
+    {
+        offset_t ret = (offset_t)-1;
+        StringBuffer firstname;
+        bool compressed = ::isCompressed(parent.queryAttributes());
+        unsigned nc=parent.numCopies(partIndex);
+        for (unsigned copy=0;copy<nc;copy++)
+        {
+            RemoteFilename rfn;
+            try
+            {
+                Owned<IFile> partfile = createIFile(getFilename(copy, rfn));
+                if (checkCompressed && compressed)
+                {
+                    Owned<IFileIO> partFileIO = partfile->open(IFOread);
+                    if (partFileIO)
+                    {
+                        Owned<IFileIO> compressedIO = createCompressedFileReader(partFileIO, nullptr, useDefaultIoBufferSize);
+                        if (compressedIO)
+                            ret = compressedIO->size();
+                        else
+                            throw makeStringExceptionV(DFSERR_PhysicalCompressedPartInvalid, "Compressed part is not in the valid format: %s", partfile->queryFilename());
+                    }
+                }
+                else
+                    ret = partfile->size();
+                if (ret!=(offset_t)-1)
+                    return ret;
+            }
+            catch (IException *e)
+            {
+                StringBuffer s("CDistributedFilePart::getSize ");
+                rfn.getRemotePath(s);
+                EXCLOG(e, s.str());
+                e->Release();
+            }
+            if (copy==0)
+                rfn.getRemotePath(firstname);
+        }
+        throw makeStringExceptionV(DFSERR_CannotFindPartFileSize, "Cannot find physical file size for %s", firstname.str());;
+    }
+
+
     RemoteMultiFilename &getMultiFilename(unsigned copy, RemoteMultiFilename &rmfn)
     {
         if (ismulti) {
@@ -808,7 +960,11 @@ public:
             SocketEndpoint ep = queryNode(0)->endpoint();
             StringBuffer tmp;
             if (!ep.isNull())
-                pt->setProp("@node",ep.getUrlStr(tmp).str());
+                pt->setProp("@node",ep.getEndpointHostText(tmp).str());
+
+            // JCSMORE - this makes little sense. @name -> overridename
+            // It is being set here specifically for a 1 part file, but without it (tested) it will construct
+            // the name from the mask as normal.
             if (overridename.isEmpty()&&!parent.partmask.isEmpty()) {
                 expandMask(tmp.clear(), parent.partmask, 0, 1);
                 pt->setProp("@name",tmp.str());
@@ -885,35 +1041,38 @@ void getClusterInfo(IPropertyTree &pt, INamedGroupStore *resolver, unsigned flag
                 cgroup.setown(resolver->lookup(grp));
             // get nodes from parts if complete (and group 0)
             if (gi==0) { // don't assume lookup name correct!
-                SocketEndpoint *eps = (SocketEndpoint *)calloc(np?np:1,sizeof(SocketEndpoint));
                 MemoryBuffer mb;
                 Owned<IPropertyTreeIterator> piter;
                 if (pt.getPropBin("Parts",mb))
                     piter.setown(deserializePartAttrIterator(mb));
                 else
                     piter.setown(pt.getElements("Part"));
+
                 ForEach(*piter) {
                     IPropertyTree &cpt = piter->query();
                     unsigned num = cpt.getPropInt("@num");
-                    if (num>np) {
-                        eps = (SocketEndpoint *)checked_realloc(eps,num*sizeof(SocketEndpoint),np*sizeof(SocketEndpoint),-21);
-                        memset(eps+np,0,(num-np)*sizeof(SocketEndpoint));
+                    if (num>np)
                         np = num;
-                    }
+                }
+
+                std::unique_ptr<SocketEndpoint[]> eps(new SocketEndpoint[np?np:1]);
+                ForEach(*piter) {
+                    IPropertyTree &cpt = piter->query();
+                    unsigned num = cpt.getPropInt("@num");
                     const char *node = cpt.queryProp("@node");
                     if (node&&*node)
-                        eps[num-1].set(node);
+                        eps.get()[num-1].set(node);
                 }
                 unsigned i=0;
                 for (i=0;i<np;i++)
                     if (eps[i].isNull())
                         break;
                 if (i==np) {
-                    Owned<IGroup> ngrp = createIGroup(np,eps);
+                    Owned<IGroup> ngrp = createIGroup(np,eps.get());
                     if (!cgroup.get()||(ngrp->compare(cgroup)!=GRbasesubset))
                         cgroup.setown(ngrp.getClear());
                 }
-                free(eps);
+
             }
             ClusterPartDiskMapSpec mspec;
             IClusterInfo *cluster = createClusterInfo(grp,cgroup,mspec,resolver);
@@ -928,11 +1087,55 @@ void getClusterInfo(IPropertyTree &pt, INamedGroupStore *resolver, unsigned flag
     }
 }
 
+inline const char *skipRoot(const char *lname)
+{
+    for (;;) {
+        while (*lname==' ')
+            lname++;
+        if (*lname!='.')
+            break;
+        const char *s = lname+1;
+        while (*s==' ')
+            s++;
+        if (!*s)
+            lname = s;
+        else if ((s[0]==':')&&(s[1]==':'))
+            lname = s+2;
+        else
+            break;
+    }
+    return lname;
+}
+
+// returns position in result buffer of tail lfn name
+static size32_t translateLFNToPath(StringBuffer &result, const char *lname, char pathSep)
+{
+    lname = skipRoot(lname);
+    char c;
+    size32_t l = result.length();
+    while ((c=*(lname++))!=0)
+    {
+        if ((c==':')&&(*lname==':'))
+        {
+            lname++;
+            result.clip().append(pathSep);
+            l = result.length();
+            lname = skipRoot(lname);
+        }
+        else if (validFNameChar(c))
+            result.append((char)tolower(c));
+        else
+            result.appendf("%%%.2X", (int) c);
+    }
+    return l;
+}
 
 class CFileDescriptor:  public CFileDescriptorBase, implements ISuperFileDescriptor
 {
 
     SocketEndpointArray *pending;   // for constructing cluster group
+    Owned<IStoragePlane> remoteStoragePlane;
+    std::vector<std::string> dafileSrvEndpoints;
     bool setupdone;
     byte version;
 
@@ -946,14 +1149,21 @@ class CFileDescriptor:  public CFileDescriptorBase, implements ISuperFileDescrip
     {
         if (!pending) {
             pending = new SocketEndpointArray;
+
+            // NB: deliberately not using setFlags, which as a side-effect calls closePending()
+            fileFlags |= FileDescriptorFlags::absoluteparts;
+            // NB: attr guaranteed to be non-null here
+            attr->setPropInt("@flags", static_cast<int>(fileFlags));
+
             if (setupdone)
                 throw MakeStringException(-1,"IFileDescriptor - setup already done");
             setupdone = true;
             ClusterPartDiskMapSpec mspec;
-            clusters.append(*createClusterInfo(NULL,NULL,mspec));
+            unsigned clusterFlags = 0;
+            if (FileDescriptorFlags::none != (fileFlags & FileDescriptorFlags::foreign))
+                clusterFlags = IFDSF_FOREIGN_GROUP;
+            clusters.append(*createClusterInfo(nullptr, nullptr, mspec, nullptr, clusterFlags));
         }
-
-
     }
 
     void doClosePending()
@@ -1125,14 +1335,17 @@ class CFileDescriptor:  public CFileDescriptorBase, implements ISuperFileDescrip
     StringBuffer &getPartDirectory(StringBuffer &buf,unsigned idx,unsigned copy)
     {
         unsigned n = numParts();
-        if (idx<n) {
+        if (idx<n)
+        {
             StringBuffer fullpath;
             StringBuffer tmp1;
             CPartDescriptor &pt = *part(idx);
-            if (!pt.overridename.isEmpty()) {
+            if (!pt.overridename.isEmpty())
+            {
                 if (isSpecialPath(pt.overridename))
                     return buf;
-                if (pt.isMulti()) {
+                if (pt.isMulti())
+                {
                     StringBuffer tmpon; // bit messy but need to ensure dir put back on before removing!
                     const char *on = pt.overridename.get();
                     if (on&&*on&&!isAbsolutePath(on)&&!directory.isEmpty())
@@ -1144,16 +1357,19 @@ class CFileDescriptor:  public CFileDescriptorBase, implements ISuperFileDescrip
                     splitDirTail(pt.overridename,tmp1);
                 if (directory.isEmpty()||(isAbsolutePath(tmp1.str())||(stdIoHandle(tmp1.str())>=0)))
                     fullpath.swapWith(tmp1);
-                else {
+                else
+                {
                     fullpath.append(directory);
                     if (fullpath.length())
                         addPathSepChar(fullpath);
                     fullpath.append(tmp1);
                 }
             }
-            else if (!partmask.isEmpty()) {
+            else if (!partmask.isEmpty())
+            {
                 fullpath.append(directory);
-                if (containsPathSepChar(partmask)) {
+                if (containsPathSepChar(partmask))
+                {
                     if (fullpath.length())
                         addPathSepChar(fullpath);
                     splitDirTail(partmask,fullpath);
@@ -1162,22 +1378,75 @@ class CFileDescriptor:  public CFileDescriptorBase, implements ISuperFileDescrip
             else
                 fullpath.append(directory);
             replaceClusterDir(idx,copy, fullpath);
-            StringBuffer baseDir, repDir;
+
             unsigned lcopy;
             IClusterInfo * cluster = queryCluster(idx,copy,lcopy);
             if (cluster)
             {
+                StringBuffer baseDir, repDir;
                 DFD_OS os = SepCharBaseOs(getPathSepChar(fullpath));
                 cluster->getBaseDir(baseDir, os);
                 cluster->getReplicateDir(repDir, os);
+                setReplicateFilename(fullpath,queryDrive(idx,copy),baseDir.str(),repDir.str());
             }
-            setReplicateFilename(fullpath,queryDrive(idx,copy),baseDir.str(),repDir.str());
+            // NB: 'cluster' can be null if 'copy' does not map to an existing cluster in this file descriptor
+            // To maintain long standing previous behaviour, continue based on base directory
+
+            // Adding striping and/or aliasing to path unless this is a IFileDescriptor constructed with absolute paths
+            if (!hasMask(fileFlags, FileDescriptorFlags::absoluteparts))
+            {
+                // The following code manipulates the directory for striping and aliasing if necessary.
+                // To do so, it needs the plane details.
+                // Normally, the plane name is obtained from IClusterInfo, however, if this file is foreign,
+                // then the IClusterInfo's will have no resolved names (aka groups) because the remote groups
+                // don't exist in the client environment. Instead, if the foreign file came from k8s, it will
+                // have remoteStoragePlane serialized/set.
+                Owned<const IStoragePlane> plane;
+                if (remoteStoragePlane)
+                    plane.set(remoteStoragePlane);
+                else if (cluster)
+                {
+                    const char *planeName = cluster->queryGroupName();
+                    if (!isEmptyString(planeName))
+                        plane.setown(getDataStoragePlane(planeName, false));
+                }
+                if (plane)
+                {
+                    StringBuffer planePrefix(plane->queryPrefix());
+                    Owned<IStoragePlaneAlias> alias = plane->getAliasMatch(accessMode);
+                    if (alias)
+                    {
+                        StringBuffer tmp;
+                        StringBuffer newPlanePrefix(alias->queryPrefix());
+                        if (setReplicateDir(fullpath, tmp, false, planePrefix, newPlanePrefix))
+                        {
+                            planePrefix.swapWith(newPlanePrefix);
+                            fullpath.swapWith(tmp);
+                        }
+                    }
+                    StringBuffer stripeDir;
+                    // 'cluster' might be null if 'copy' is >0 and doesn't exist in this file descriptor
+                    // NB: if cluster is exists, numStripedDevices should match the number of devices in the plane 
+                    unsigned numDevices = cluster ? cluster->queryPartDiskMapping().numStripedDevices : plane->numDevices();
+                    addStripeDirectory(stripeDir, fullpath, planePrefix, idx, lfnHash, numDevices);
+                    if (!stripeDir.isEmpty())
+                        fullpath.swapWith(stripeDir);
+                }
+            }
+
             if ((fullpath.length()>3)&&isPathSepChar(fullpath.charAt(fullpath.length()-1)))
                 fullpath.setLength(fullpath.length()-1);
             if (buf.length())
                 buf.append(fullpath);
             else
                 buf.swapWith(fullpath);
+
+            // Adding dir-per-part directory unless this is a IFileDescriptor constructed with absolute paths
+            if (!hasMask(fileFlags, FileDescriptorFlags::absoluteparts))
+            {
+                if (FileDescriptorFlags::none != (fileFlags & FileDescriptorFlags::dirperpart))
+                    addPathSepChar(buf).append(idx+1); // part subdir 1 based
+            }
         }
         return buf;
     }
@@ -1212,6 +1481,11 @@ class CFileDescriptor:  public CFileDescriptorBase, implements ISuperFileDescrip
                 return &clusters.item(c);
         }
         return NULL;
+    }
+
+    virtual IClusterInfo *queryClusterNum(unsigned idx) override
+    {
+        return &clusters.item(idx);
     }
 
     void replaceClusterDir(unsigned partno,unsigned copy, StringBuffer &path)
@@ -1253,6 +1527,41 @@ class CFileDescriptor:  public CFileDescriptorBase, implements ISuperFileDescrip
         }
     }
 
+    // mapDafileSrvSecrets is a CFileDescriptor is created if it is associated with a remoteStoragePlane.
+    // Identify the target dafilesrv location urls a secret based connections in the dafilesrv hook
+    // NB: the expectation is that they'll only be 1 target service dafilesrv URL
+    // These will remain associated in the hook, until this CFileDescriptor object is destroyed, and removeMappedDafileSrvSecrets is called.
+    // 'optSecret' is supplied if an explicit secret was defined for the remote service (if blank, "<TLS>" is used as a placeholder by the caller)
+    void mapDafileSrvSecrets(IClusterInfo &cluster, const char *optSecret)
+    {
+        Owned<INodeIterator> groupIter = cluster.queryGroup()->getIterator();
+
+        ForEach(*groupIter)
+        {
+            INode &node = groupIter->query();
+            StringBuffer endpointString;
+            node.endpoint().getEndpointHostText(endpointString);
+            auto it = std::find(dafileSrvEndpoints.begin(), dafileSrvEndpoints.end(), endpointString.str());
+            if (it == dafileSrvEndpoints.end())
+                dafileSrvEndpoints.push_back(endpointString.str());
+        }
+        for (auto &dafileSrvEp: dafileSrvEndpoints)
+            queryDaFileSrvHook()->addSecretEndpoint(dafileSrvEp.c_str(), optSecret);
+    }
+    void removeMappedDafileSrvSecrets()
+    {
+        for (auto &dafileSrvEp: dafileSrvEndpoints)
+            queryDaFileSrvHook()->removeSecretEndpoint(dafileSrvEp.c_str());
+    }
+
+    void mapSecrets()
+    {
+        if (attr->getPropBool("@_remoteSecure"))
+        {
+            const char *remoteSecret = attr->queryProp("@_remoteSecret");
+            mapDafileSrvSecrets(clusters.item(0), remoteSecret);
+        }
+    }
 public:
     IMPLEMENT_IINTERFACE;
 
@@ -1328,8 +1637,22 @@ public:
             }
         }
         attr.setown(createPTree(mb));
-        if (!attr)
+        if (attr)
+        {
+            lfnHash = attr->getPropInt("@lfnHash");
+            // NB: for remote useDafilesrv use case
+            IPropertyTree *remoteStoragePlaneMeta = attr->queryPropTree("_remoteStoragePlane");
+            if (remoteStoragePlaneMeta)
+            {
+                assertex(1 == clusters.ordinality()); // only one cluster per logical remote file supported/will have resolved to 1
+                remoteStoragePlane.setown(createStoragePlane(remoteStoragePlaneMeta));
+                mapSecrets();
+            }
+        }
+        else
             attr.setown(createPTree("Attr")); // doubt can happen
+        fileFlags = static_cast<FileDescriptorFlags>(attr->getPropInt("@flags"));
+        accessMode = static_cast<AccessMode>(attr->getPropInt("@accessMode"));
         if (version == SERIALIZATION_VERSION2)
         {
             if (subcounts)
@@ -1349,11 +1672,123 @@ public:
             if (_interleaved)
                 *_interleaved = interleaved;
         }
+        noteWriteSyncVisibility();
     }
 
     void ensureRequiredStructuresExist()
     {
         if (!attr) attr.setown(createPTree("Attr"));
+    }
+
+    // Record each part in the jfile write-sync visibility cache if this file carries a modified time and lives
+    // on a plane with a write-sync margin. Called from both descriptor constructors so that manager lookups
+    // (tree) and worker deserialization (MemoryBuffer) each populate their process cache. Each part copy is keyed
+    // by its full physical path (the path a reader will open), and the part's published on-disk size is recorded
+    // alongside, so the reader's retry can wait for the part both to exist and to reach its expected size (the
+    // cross-AZ blobnfs scenario this targets).
+    void noteWriteSyncVisibility()
+    {
+        // For now this cache is only needed in containerized/cloud deployments where cross-AZ
+        // storage propagation lag can make newly published parts briefly invisible or stale.
+        // Bare-metal deployments are not susceptible to this class of issue.
+        if (!isContainerized())
+            return;
+
+        const char *modifiedStr = attr ? attr->queryProp("@modified") : nullptr;
+        if (isEmptyString(modifiedStr))
+            return;
+
+        // Resolve write-sync margin from plane metadata.
+        unsigned marginMs = 0;
+        if (remoteStoragePlane)
+            marginMs = (unsigned)remoteStoragePlane->getAttribute(WriteSyncMarginMs, 0);
+        else
+        {
+            // Most files are expected to have a single cluster/group/plane,
+            // but where multiple clusters exist use the largest configured margin as a
+            // conservative deadline.
+            ForEachItemIn(ci, clusters)
+            {
+                const char *planeName = clusters.item(ci).queryGroupName();
+                if (isEmptyString(planeName))
+                    continue;
+                Owned<const IStoragePlane> plane = getDataStoragePlane(planeName, false);
+                if (!plane)
+                    continue;
+                unsigned planeMarginMs = (unsigned)plane->getAttribute(WriteSyncMarginMs, 0);
+                if (planeMarginMs > marginMs)
+                    marginMs = planeMarginMs;
+            }
+        }
+        if (0 == marginMs) // NB: margin adjustment (below) only applies if plane writeSyncMarginMs is non-zero.
+            return;
+
+        int marginDeltaMs = 0;
+        bool hasMarginDelta = getWriteSyncMarginDeltaMs(marginDeltaMs);
+        if (hasMarginDelta)
+        {
+            marginMs = (unsigned)std::clamp((int64_t)marginMs + marginDeltaMs, (int64_t)0, (int64_t)(unsigned)-1);
+            if (0 == marginMs)
+                return;
+        }
+
+        // The file-level @modified time is used as a single baseline for every part's retry threshold. Each
+        // part can carry its own @modified, which would give a tighter per-part deadline, but the file-level
+        // value is a good enough lower bound for the propagation margin - and per-part @modified is not always
+        // present, so relying on it would complicate this for little benefit.
+        CDateTime modified;
+        modified.setString(modifiedStr);
+        time_t modifiedTime = modified.getSimple();
+        if (0 == modifiedTime)
+            return;
+        unsigned hour, min, sec, nano;
+        modified.getTime(hour, min, sec, nano);
+        // @modified is normally published at whole-second precision; treat a zero fraction as the end of that second, and round non-zero fractions up to the next millisecond.
+        int64_t modifiedMs = (int64_t)modifiedTime * 1000 + (nano ? (nano + 999999) / 1000000 : 1000);
+
+        // A part modified at modifiedMs should have propagated to all readers by modifiedMs + margin.
+        // Sample wall-clock and monotonic clocks back-to-back so the monotonic deadline matches the wall-clock deadline.
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); // epoch milliseconds
+        int64_t remainingMs = modifiedMs + marginMs - nowMs;
+        if (remainingMs <= 0) // already past the visibility margin - nothing to track
+            return;
+        remainingMs = std::min(remainingMs, (int64_t)UINT_MAX);
+        unsigned __int64 deadlineMs = writeSyncNowMs() + (unsigned __int64)remainingMs;
+
+        // Compression is a file-level property; resolve it once so the reader can apply the same empty-part
+        // size tolerance that doesPhysicalMatchMeta uses (an empty compressed part may legitimately be 0 bytes
+        // or a small header rather than the published @compressedSize).
+        bool compressed = ::isCompressed(queryAttributes());
+        std::vector<WriteSyncFileInfo> files;
+        unsigned n = numParts();
+        files.reserve(n);
+        for (unsigned i=0; i<n; i++)
+        {
+            // Only register parts whose descriptor is actually present. On workers a subset of parts are
+            // deserialized and the remainder are NULL placeholders
+            if (!parts.item(i))
+                continue;
+
+            IPartDescriptor *pd = queryPart(i);
+            // The published on-disk size (compressed size for compressed parts) lets the reader's write-sync
+            // retry also wait until the part's physical size matches the meta size, not just until it exists.
+            // This is a meta-only lookup (no physical access); -1 means unknown / do not validate size.
+            offset_t expectedSize = pd->getDiskSize(false, false);
+            // Register every copy's physical path: a reader may open any copy.
+            // In the containerized/cloud target scenario there is normally a single copy (storage redundancy
+            // is provided by the plane), so this is usually 1 pass.
+            unsigned numcopies = numCopies(i);
+            for (unsigned copy=0; copy<numcopies; copy++)
+            {
+                StringBuffer fullPath;
+                pd->getPath(fullPath, copy);
+                if (fullPath.length())
+                    files.push_back({fullPath.str(), expectedSize, compressed});
+            }
+        }
+        // Record the whole file's parts in a single locked batch (one mutex acquisition, one prune pass).
+        if (!files.empty())
+            noteWriteSyncFiles(files, deadlineMs);
     }
 
     CFileDescriptor(IPropertyTree *tree, INamedGroupStore *resolver, unsigned flags)
@@ -1373,6 +1808,8 @@ public:
         directory.set(pt.queryProp("@directory"));
         partmask.set(pt.queryProp("@partmask"));
         unsigned np = pt.getPropInt("@numparts");
+        fileFlags = static_cast<FileDescriptorFlags>(pt.getPropInt("Attr/@flags"));
+        accessMode = static_cast<AccessMode>(pt.getPropInt("Attr/@accessMode"));
         StringBuffer query;
         IPropertyTree **trees = NULL;
         Owned<IPropertyTreeIterator> piter;
@@ -1436,9 +1873,51 @@ public:
             attr.setown(createPTreeFromIPT(at));
         else
             attr.setown(createPTree("Attr"));
-
+        // @modified is a file-level property held on the file root, not under <Attr>, so it would not normally
+        // be carried into the serialized descriptor (and would therefore be unavailable on the slaves). Copy it
+        // into <Attr> so it survives serialization and is readable via queryProperties() for write-sync.
+        // The hasProp guard is belt-and-braces: <Attr> is not expected to already carry @modified, but if a
+        // future caller has set it we must not overwrite that value.
+        if (!attr->hasProp("@modified"))
+        {
+            const char *modified = pt.queryProp("@modified");
+            if (!isEmptyString(modified))
+                attr->setProp("@modified", modified);
+        }
+        if (flags & IFDSF_FOREIGN_GROUP)
+            setFlags(static_cast<FileDescriptorFlags>(fileFlags | FileDescriptorFlags::foreign));
+        if (attr->hasProp("@lfnHash")) // potentially missing for meta coming from a legacy Dali
+            lfnHash = attr->getPropInt("@lfnHash");
+        else if (tracename.length())
+        {
+            lfnHash = getFilenameHash(tracename.length(), tracename.str());
+            attr->setPropInt("@lfnHash", lfnHash);
+        }
+        else // it really should have an lfnHash!, but if missing (likely due to a bug elsewhere), we can create from OrigName
+        {
+            const char *origName = tree->queryProp("OrigName");
+            if (!isEmptyString(origName))
+            {
+                lfnHash = getFilenameHash(origName);
+                attr->setPropInt("@lfnHash", lfnHash);
+            }
+        }
         if (totalsize!=(offset_t)-1)
             attr->setPropInt64("@size",totalsize);
+
+        // NB: for remote useDafilesrv use case
+        IPropertyTree *remoteStoragePlaneMeta = at ? at->queryPropTree("_remoteStoragePlane") : nullptr;
+        if (remoteStoragePlaneMeta)
+        {
+            assertex(1 == clusters.ordinality()); // only one cluster per logical remote file supported/will have resolved to 1
+            remoteStoragePlane.setown(createStoragePlane(remoteStoragePlaneMeta));
+            clusters.item(0).applyPlane(remoteStoragePlane);
+            mapSecrets();
+        }
+
+        // Track this file for write-sync visibility, so physical access to a freshly published file (e.g. one
+        // written in another AZ) can transparently wait out propagation lag rather than failing.
+        noteWriteSyncVisibility();
     }
 
     void serializePart(MemoryBuffer &mb,unsigned partidx)
@@ -1461,8 +1940,8 @@ public:
     void serializeTree(IPropertyTree &pt,unsigned flags)
     {
         closePending();
-//      if (!tracename.isEmpty())
-//          pt.setProp("@trace",tracename);             // don't include trace name in tree (may revisit later)
+        if (!tracename.isEmpty())
+            pt.setProp("@trace",tracename);
         if (!directory.isEmpty())
             pt.setProp("@directory",directory);
         if (!partmask.isEmpty())
@@ -1532,6 +2011,7 @@ public:
 
     virtual ~CFileDescriptor()
     {
+        removeMappedDafileSrvSecrets();
         closePending();             // not sure strictly needed
         ForEachItemInRev(p, parts)
             delpart(p);
@@ -1551,7 +2031,10 @@ public:
             if (!sc)
                 sc = getPathSepChar(dirname);
             StringBuffer tmp;
-            tmp.append(queryBaseDirectory(grp_unknown, 0, SepCharBaseOs(sc))).append(sc).append(s);
+            tmp.append(queryUnknownBaseDirectory(0, SepCharBaseOs(sc)));
+            if (sc != tmp.charAt(tmp.length()-1))
+                tmp.append(sc);
+            tmp.append(s);
             directory.set(tmp.str());
         }
         else
@@ -1626,11 +2109,22 @@ public:
         doSetPart(idx,ep,localname.str(),pt);
     }
 
-
-
-    void setTraceName(const char *trc)
+    void setTraceName(const char *trc, bool normalize)
     {
-        tracename.set(trc);
+        if (normalize)
+        {
+            CDfsLogicalFileName logicalName;
+            logicalName.setAllowWild(true); // for cases where IFileDescriptor used to point to external files (e.g. during spraying)
+            logicalName.set(trc); // normalize
+            tracename.set(logicalName.get());
+        }
+        else
+            tracename.set(trc);
+        if (!queryProperties().hasProp("@lfnHash"))
+        {
+            lfnHash = getFilenameHash(tracename.length(), tracename.str());
+            queryProperties().setPropInt("@lfnHash", lfnHash);
+        }
     }
 
     unsigned numClusterCopies(unsigned cnum,unsigned partnum)
@@ -1833,6 +2327,16 @@ public:
             parts.append(new CPartDescriptor(*this,parts.ordinality(),NULL));
         while (parts.ordinality()>numparts)
             delpart(parts.ordinality()-1);
+        if (::isMulti(partmask))
+        {
+            StringBuffer path;
+            for (unsigned p=0; p<parts.ordinality(); p++)
+            {
+                CPartDescriptor *pt = (CPartDescriptor *)parts.item(p);
+                pt->getPath(path.clear(), 0);
+                pt->setOverrideName(path); // NB: override = 1st copy, getPartDirectory handles manipulating for other copies
+            }
+        }
     }
 
     unsigned numClusters()
@@ -1974,6 +2478,17 @@ public:
     {
         UNIMPLEMENTED_X("querySubFiles called from CFileDescriptor!");
     }
+
+    virtual void setFlags(FileDescriptorFlags flags) override
+    {
+        queryProperties().setPropInt("@flags", static_cast<int>(flags));
+        fileFlags = flags;
+    }
+
+    virtual FileDescriptorFlags getFlags() override
+    {
+        return static_cast<FileDescriptorFlags>(queryProperties().getPropInt("@flags"));
+    }
 };
 
 class CSuperFileDescriptor:  public CFileDescriptor
@@ -1987,10 +2502,11 @@ public:
     {
     }
 
-    CSuperFileDescriptor(IPropertyTree *attr)
+    CSuperFileDescriptor(IPropertyTree *attr, FileDescriptorFlags _fileFlags)
         : CFileDescriptor(attr,NULL,IFDSF_ATTR_ONLY)    // only support attr here
     {
         subfilecounts = NULL;
+        fileFlags = _fileFlags;
     }
 
     virtual ~CSuperFileDescriptor()
@@ -2127,9 +2643,9 @@ IFileDescriptor *createFileDescriptor(IPropertyTree *tree)
     return new CFileDescriptor(tree,NULL,IFDSF_ATTR_ONLY);
 }
 
-ISuperFileDescriptor *createSuperFileDescriptor(IPropertyTree *tree)
+ISuperFileDescriptor *createSuperFileDescriptor(IPropertyTree *tree, FileDescriptorFlags fileFlags)
 {
-    return new CSuperFileDescriptor(tree);
+    return new CSuperFileDescriptor(tree, fileFlags);
 }
 
 
@@ -2191,8 +2707,7 @@ static IFileDescriptor *_createExternalFileDescriptor(const char *_logicalname, 
     fileDesc->setDefaultDir(dir.str());
     unsigned n = group.get()?group->ordinality():1;
     StringBuffer partname;
-    CDateTime modTime;
-    StringBuffer modTimeStr;
+    CDateTime newestModTime;
     for (unsigned i=0;i<n;i++)
     {
         if (group.get())
@@ -2225,19 +2740,18 @@ static IFileDescriptor *_createExternalFileDescriptor(const char *_logicalname, 
             ep.port = getDaliServixPort();
         RemoteFilename rfn;
         rfn.setPath(ep,partname.str());
+        CDateTime partModTime;
+        StringBuffer partModTimeStr;
         if (!isspecial&&(memcmp(partname.str(),"/$/",3)!=0)&&(memcmp(partname.str(),"\\$\\",3)!=0)) // don't get date on external data
         {
             try
             {
                 Owned<IFile> file = createIFile(rfn);
-                CDateTime dt;
-                if (file&&file->getTime(NULL,&dt,NULL))
+                if (file&&file->getTime(NULL,&partModTime,NULL))
                 {
-                    if ((0 == modTimeStr.length())||(dt.compareDate(modTime)>0))
-                    {
-                        modTime.set(dt);
-                        modTime.getString(modTimeStr);
-                    }
+                    partModTime.getString(partModTimeStr);
+                    if (newestModTime.isNull() || (partModTime.compare(newestModTime)>0))
+                        newestModTime.set(partModTime);
                 }
             }
             catch (IException *e)
@@ -2252,15 +2766,19 @@ static IFileDescriptor *_createExternalFileDescriptor(const char *_logicalname, 
             if (!iFile->exists())
                 return NULL; // >=1 part does not exist.
         }
-        if (modTimeStr.length())
+        if (partModTimeStr.length())
         {
             Owned<IPropertyTree> part = createPTree("Part");
-            part->setProp("@modified", modTimeStr.str());
+            part->setProp("@modified", partModTimeStr.str());
             fileDesc->setPart(i, rfn, part);
         }
         else
             fileDesc->setPart(i, rfn);
     }
+    if (newestModTime.isNull())
+        newestModTime.setNow();
+    StringBuffer newestModTimeStr;
+    fileDesc->queryProperties().setProp("@modified", newestModTime.getString(newestModTimeStr).str());
     fileDesc->queryPartDiskMapping(0).defaultCopies = DFD_NoCopies;
     return fileDesc.getClear();
 }
@@ -2312,30 +2830,6 @@ IPartDescriptor *deserializePartFileDescriptor(MemoryBuffer &mb)
     return LINK(&parts.item(0));
 }
 
-
-IFileDescriptor *createFileDescriptor(const char *lname,IGroup *grp,IPropertyTree *tree,DFD_OS os,unsigned width)
-{
-    // only handles 1 copy
-    IFileDescriptor *res = createFileDescriptor(tree);
-    res->setTraceName(lname);
-    StringBuffer dir;
-    makePhysicalPartName(lname, 0, 0, dir,false,os);
-    res->setDefaultDir(dir.str());
-    if (width==0)
-        width = grp->ordinality();
-    StringBuffer s;
-    for (unsigned i=0;i<width;i++) {
-        makePhysicalPartName(lname, i+1, width, s.clear(),false,os);
-        RemoteFilename rfn;
-        rfn.setPath(grp->queryNode(i%grp->ordinality()).endpoint(),s.str());
-        res->setPart(i,rfn,NULL);
-    }
-    ClusterPartDiskMapSpec map; // use defaults
-    map.defaultCopies = DFD_DefaultCopies;
-    res->endCluster(map);
-    return res;
-}
-
 IFileDescriptor *createFileDescriptor(const char *lname, const char *clusterType, const char *groupName, IGroup *group)
 {
     StringBuffer partMask;
@@ -2344,18 +2838,53 @@ IFileDescriptor *createFileDescriptor(const char *lname, const char *clusterType
 
     StringBuffer curDir, defaultDir;
     if (!getConfigurationDirectory(nullptr, "data", clusterType, groupName, defaultDir))
-        makePhysicalPartName(lname, 0, 0, curDir, false, DFD_OSdefault); // legacy
+        getLFNDirectoryUsingDefaultBaseDir(curDir, lname, DFD_OSdefault); // legacy
     else
-        makePhysicalPartName(lname, 0, 0, curDir, false, SepCharBaseOs(getPathSepChar(defaultDir)), defaultDir.str());
+        getLFNDirectoryUsingBaseDir(curDir, lname, defaultDir.str());
 
     Owned<IFileDescriptor> fileDesc = createFileDescriptor();
+    fileDesc->setTraceName(lname);
     fileDesc->setNumParts(parts);
     fileDesc->setPartMask(partMask);
     fileDesc->setDefaultDir(curDir);
 
+    Owned<const IStoragePlane> plane = getStoragePlaneByName(groupName, false);
     ClusterPartDiskMapSpec mspec;
-    mspec.defaultCopies = DFD_DefaultCopies;
+    if (plane)
+    {
+        mspec.defaultCopies = plane->queryDefaultCopies();
+        if (plane->isStriped())
+        {
+            mspec.numStripedDevices = plane->numDevices();
+            mspec.flags |= CPDMSF_striped;
+        }
+    }
+    else
+        mspec.defaultCopies = DFD_DefaultCopies;
     fileDesc->addCluster(groupName, group, mspec);
+    return fileDesc.getClear();
+}
+
+IFileDescriptor *createFileDescriptor(const char *lname, const char *planeName, unsigned numParts)
+{
+    Owned<const IStoragePlane> plane = getDataStoragePlane(planeName, true);
+    if (!numParts)
+        numParts = plane->numDefaultSprayParts();
+
+    StringBuffer partMask, dir;
+    getPartMask(partMask, lname, numParts);
+    getLFNDirectoryUsingBaseDir(dir, lname, plane->queryPrefix());
+
+    Owned<IFileDescriptor> fileDesc = createFileDescriptor();
+    fileDesc->setTraceName(lname);
+    fileDesc->setNumParts(numParts);
+    fileDesc->setPartMask(partMask);
+    fileDesc->setDefaultDir(dir);
+
+    ClusterPartDiskMapSpec mspec;
+    mspec.defaultCopies = DFD_NoCopies;
+    Owned<IGroup> group = queryNamedGroupStore().lookup(planeName);
+    fileDesc->addCluster(planeName, group, mspec);
 
     return fileDesc.getClear();
 }
@@ -2370,27 +2899,17 @@ IFileDescriptor *deserializeFileDescriptorTree(IPropertyTree *tree, INamedGroupS
     return new CFileDescriptor(tree, resolver, flags);
 }
 
-inline bool validFNameChar(char c)
-{
-    static const char *invalids = "*\"/:<>?\\|";
-    return (c>=32 && c<127 && !strchr(invalids, c));
-}
-
-static const char * defaultWindowsBaseDirectories[__grp_size][MAX_REPLICATION_LEVELS] =
+static const char * defaultWindowsBaseDirectories[MAX_REPLICATION_LEVELS] =
     {
-            { "c:\\thordata", "d:\\thordata" },
-            { "c:\\thordata", "d:\\thordata" },
-            { "c:\\roxiedata", "d:\\roxiedata" },
-            { "c:\\hthordata", "d:\\hthordata" },
-            { "c:\\hthordata", "d:\\hthordata" },
+            "c:\\thordata", "d:\\thordata"
     };
-static const char * defaultUnixBaseDirectories[__grp_size][MAX_REPLICATION_LEVELS] =
+static const char * defaultUnixBaseDirectories[MAX_REPLICATION_LEVELS] =
     {
-        { "/var/lib/HPCCSystems/hpcc-data/thor", "/var/lib/HPCCSystems/hpcc-mirror/thor" },
-        { "/var/lib/HPCCSystems/hpcc-data/thor", "/var/lib/HPCCSystems/hpcc-mirror/thor" },
-        { "/var/lib/HPCCSystems/hpcc-data/roxie", "/var/lib/HPCCSystems/hpcc-data2/roxie", "/var/lib/HPCCSystems/hpcc-data3/roxie", "/var/lib/HPCCSystems/hpcc-data4/roxie" },
-        { "/var/lib/HPCCSystems/hpcc-data/eclagent", "/var/lib/HPCCSystems/hpcc-mirror/eclagent" },
-        { "/var/lib/HPCCSystems/hpcc-data/unknown", "/var/lib/HPCCSystems/hpcc-mirror/unknown" },
+#ifdef _CONTAINERIZED
+        "/var/lib/HPCCSystems/hpcc-data", "/var/lib/HPCCSystems/hpcc-mirror"
+#else
+        "/var/lib/HPCCSystems/hpcc-data/unknown", "/var/lib/HPCCSystems/hpcc-mirror/unknown"
+#endif
     };
 static const char *componentNames[__grp_size] =
     {
@@ -2401,12 +2920,12 @@ static const char *dirTypeNames[MAX_REPLICATION_LEVELS] =
         "data", "data2", "data3", "data4"
     };
 
-static StringAttr windowsBaseDirectories[__grp_size][MAX_REPLICATION_LEVELS];
-static StringAttr unixBaseDirectories[__grp_size][MAX_REPLICATION_LEVELS];
+static StringAttr windowsBaseDirectories[MAX_REPLICATION_LEVELS];
+static StringAttr unixBaseDirectories[MAX_REPLICATION_LEVELS];
 
 static StringAttr defaultpartmask("$L$._$P$_of_$N$");
 
-static CriticalSection ldbCs;
+static CriticalSection ldbCs{SYNC_LOCATION};
 static std::atomic<bool> ldbDone{false};
 static void loadDefaultBases()
 {
@@ -2418,41 +2937,55 @@ static void loadDefaultBases()
         return;
     ldbDone = true;
 
-    SessionId mysessid = myProcessSession();
-    if (mysessid)
+    // If this code is override the default directories is used on a containerized build it will fail - because
+    // it will try and resolve a storage plane called "dummy", which will not exist.
+    // The concept of a directory for a storage plane of unknown type should be removed - for future refactoring HPCC-35813
+    if (!isContainerized())
     {
-        Owned<IRemoteConnection> conn = querySDS().connect("/Environment/Software/Directories", mysessid, RTM_LOCK_READ, SDS_CONNECT_TIMEOUT);
-        if (conn) {
-            IPropertyTree* dirs = conn->queryRoot();
-            for (unsigned groupType = 0; groupType < __grp_size; groupType++)
-            {
-                const char *component = componentNames[groupType];
-                for (unsigned replicationLevel = 0; replicationLevel < MAX_REPLICATION_LEVELS; replicationLevel++)
-                {
-                    StringBuffer dirout;
-                    const char *dirType = dirTypeNames[replicationLevel];
-                    if (replicationLevel==1 && groupType!=grp_roxie)
-                        dirType = "mirror";
-                    if (getConfigurationDirectory(dirs, dirType, component,
-                        "dummy",   // NB this is dummy value (but actually hopefully not used anyway)
-                        dirout))
-                       unixBaseDirectories[groupType][replicationLevel].set(dirout.str());
-                }
-            }
+        SessionId mysessid = myProcessSession();
+        Owned<IPropertyTree> dirs;
+        // If connected to dali, then use the configuration from there, otherwise fall back to using the local config file)
+        if (mysessid)
+        {
+            Owned<IRemoteConnection> conn = querySDS().connect("/Environment/Software/Directories", mysessid, RTM_LOCK_READ, SDS_CONNECT_TIMEOUT);
+            if (conn)
+                dirs.set(conn->queryRoot());
+        }
+
+        const char *component = "unknown";
+        for (unsigned replicateLevel = 0; replicateLevel < MAX_REPLICATION_LEVELS; replicateLevel++)
+        {
+            StringBuffer dirout;
+            const char *dirType = dirTypeNames[replicateLevel];
+            if (replicateLevel == 1)
+                dirType = "mirror";
+            if (getConfigurationDirectory(dirs, dirType, component,
+                "dummy",   // NB this is dummy value (but actually hopefully not used anyway)
+                dirout))
+                unixBaseDirectories[replicateLevel].set(dirout.str());
         }
     }
-    for (unsigned groupType = 0; groupType < __grp_size; groupType++)
-        for (unsigned replicationLevel = 0; replicationLevel < MAX_REPLICATION_LEVELS; replicationLevel++)
-        {
-            if (unixBaseDirectories[groupType][replicationLevel].isEmpty())
-                unixBaseDirectories[groupType][replicationLevel].set(defaultUnixBaseDirectories[groupType][replicationLevel]);
-            if (windowsBaseDirectories[groupType][replicationLevel].isEmpty())
-                windowsBaseDirectories[groupType][replicationLevel].set(defaultWindowsBaseDirectories[groupType][replicationLevel]);
-        }
+
+    for (unsigned replicateLevel = 0; replicateLevel < MAX_REPLICATION_LEVELS; replicateLevel++)
+    {
+        if (unixBaseDirectories[replicateLevel].isEmpty())
+            unixBaseDirectories[replicateLevel].set(defaultUnixBaseDirectories[replicateLevel]);
+        if (windowsBaseDirectories[replicateLevel].isEmpty())
+            windowsBaseDirectories[replicateLevel].set(defaultWindowsBaseDirectories[replicateLevel]);
+    }
 }
 
 
-const char *queryBaseDirectory(GroupType groupType, unsigned replicateLevel, DFD_OS os)
+bool getConfigurationDirectory(StringBuffer & result, GroupType groupType, unsigned replicateLevel, const char *instance)
+{
+    const char *dirType = dirTypeNames[replicateLevel];
+    if ((replicateLevel == 1) && groupType!=grp_roxie)
+        dirType = "mirror";
+
+    return getConfigurationDirectory(nullptr, dirType, componentNames[groupType], instance, result);
+}
+
+const char *queryUnknownBaseDirectory(unsigned replicateLevel, DFD_OS os)
 {
     if (os==DFD_OSdefault)
 #ifdef _WIN32
@@ -2465,9 +2998,9 @@ const char *queryBaseDirectory(GroupType groupType, unsigned replicateLevel, DFD
     switch (os)
     {
     case DFD_OSwindows:
-        return windowsBaseDirectories[groupType][replicateLevel];
+        return windowsBaseDirectories[replicateLevel];
     case DFD_OSunix:
-        return unixBaseDirectories[groupType][replicateLevel];
+        return unixBaseDirectories[replicateLevel];
     }
     return NULL;
 }
@@ -2493,10 +3026,10 @@ void setBaseDirectory(const char * dir, unsigned replicateLevel, DFD_OS os)
         l--;
     switch (os) {
     case DFD_OSwindows:
-        windowsBaseDirectories[grp_unknown][replicateLevel].set(dir,l);
+        windowsBaseDirectories[replicateLevel].set(dir,l);
         break;
     case DFD_OSunix:
-        unixBaseDirectories[grp_unknown][replicateLevel].set(dir,l);
+        unixBaseDirectories[replicateLevel].set(dir,l);
         break;
     }
 }
@@ -2593,29 +3126,7 @@ StringBuffer &getPartMask(StringBuffer &ret,const char *lname,unsigned partmax)
     return ret;
 }
 
-inline const char *skipRoot(const char *lname)
-{
-    for (;;) {
-        while (*lname==' ')
-            lname++;
-        if (*lname!='.')
-            break;
-        const char *s = lname+1;
-        while (*s==' ')
-            s++;
-        if (!*s)
-            lname = s;
-        else if ((s[0]==':')&&(s[1]==':'))
-            lname = s+2;
-        else
-            break;
-    }
-    return lname;
-}
-
-
-
-StringBuffer &makePhysicalPartName(const char *lname, unsigned partno, unsigned partmax, StringBuffer &result, unsigned replicateLevel, DFD_OS os,const char *diroverride)
+StringBuffer &makePhysicalPartName(const char *lname, unsigned partno, unsigned partmax, StringBuffer &result, unsigned replicateLevel, DFD_OS os,const char *diroverride,unsigned dirPerPartNum,unsigned stripeNum)
 {
     assertex(lname);
     if (strstr(lname,"::>")) { // probably query
@@ -2650,7 +3161,7 @@ StringBuffer &makePhysicalPartName(const char *lname, unsigned partno, unsigned 
         result.append(diroverride);
     }
     else
-        result.append(queryBaseDirectory(grp_unknown, replicateLevel, os));
+        result.append(queryUnknownBaseDirectory(replicateLevel, os));
 
     size32_t l = result.length();
     if ((l>3)&&(result.charAt(l-1)!=OsSepChar(os))) {
@@ -2658,24 +3169,16 @@ StringBuffer &makePhysicalPartName(const char *lname, unsigned partno, unsigned 
         l++;
     }
 
-    lname = skipRoot(lname);
+    if (stripeNum)
+        result.append('d').append(stripeNum).append(OsSepChar(os));
+
+    l = translateLFNToPath(result, lname, OsSepChar(os));
+
     char c;
-    while ((c=*(lname++))!=0) {
-        if ((c==':')&&(*lname==':')) {
-            lname++;
-            result.clip().append(OsSepChar(os));
-            l = result.length();
-            lname = skipRoot(lname);
-        }
-        else if (validFNameChar(c))
-            result.append((char)tolower(c));
-        else
-            result.appendf("%%%.2X", (int) c);
-    }
-    if (partno==0) { // just return directory (with trailing PATHSEP)
+    if (partno==0) // just return directory (with trailing PATHSEP)
         result.setLength(l);
-    }
-    else {
+    else
+    {
 #ifndef INCLUDE_1_OF_1
         if (partmax>1)  // avoid 1_of_1
 #endif
@@ -2683,6 +3186,8 @@ StringBuffer &makePhysicalPartName(const char *lname, unsigned partno, unsigned 
             StringBuffer tail(result.str()+l);
             tail.trim();
             result.setLength(l);
+            if (dirPerPartNum)
+                result.append(dirPerPartNum).append(OsSepChar(os));
             const char *m = queryPartMask();
             while ((c=*(m++))!=0) {
                 if (c=='$') {
@@ -2711,12 +3216,44 @@ StringBuffer &makePhysicalPartName(const char *lname, unsigned partno, unsigned 
     return result.clip();
 }
 
+StringBuffer &makePhysicalDirectory(StringBuffer &result, const char *lname, unsigned replicateLevel, DFD_OS os,const char *diroverride)
+{
+    return makePhysicalPartName(lname, 0, 0, result, replicateLevel, os, diroverride, 0, 0);
+}
+
+
 StringBuffer &makeSinglePhysicalPartName(const char *lname, StringBuffer &result, bool allowospath, bool &wasdfs,const char *diroverride)
 {
     wasdfs = !(allowospath&&(isAbsolutePath(lname)||(stdIoHandle(lname)>=0)));
     if (wasdfs)
-        return makePhysicalPartName(lname, 1, 1, result, false, DFD_OSdefault,diroverride);
+        return makePhysicalPartName(lname, 1, 1, result, 0, DFD_OSdefault, diroverride, 0, 0);
     return result.append(lname);
+}
+
+StringBuffer &getLFNDirectoryUsingBaseDir(StringBuffer &result, const char *lname, const char *baseDir)
+{
+    assertex(lname);
+    if (isEmptyString(baseDir))
+        baseDir = queryUnknownBaseDirectory(0, DFD_OSdefault);
+
+    result.append(baseDir);
+    char pathSep = getPathSepChar(baseDir);
+    size32_t l = result.length();
+    if ((l>3) && (pathSep != result.charAt(l-1)))
+    {
+        result.append(pathSep);
+        l++;
+    }
+
+    l = translateLFNToPath(result, lname, pathSep);
+    result.setLength(l);
+    return result.clip();
+}
+
+StringBuffer &getLFNDirectoryUsingDefaultBaseDir(StringBuffer &result, const char *lname, DFD_OS os)
+{
+    const char *baseDir = queryUnknownBaseDirectory(0, os);
+    return getLFNDirectoryUsingBaseDir(result, lname, baseDir);
 }
 
 bool setReplicateDir(const char *dir,StringBuffer &out,bool isrep,const char *baseDir,const char *repDir)
@@ -2728,30 +3265,59 @@ bool setReplicateDir(const char *dir,StringBuffer &out,bool isrep,const char *ba
     if (!sep)
         return false;
     DFD_OS os = SepCharBaseOs(*sep);
-    const char *d = baseDir?baseDir:queryBaseDirectory(grp_unknown, isrep ? 0 : 1,os);
+    const char *d = baseDir?baseDir:queryUnknownBaseDirectory(isrep ? 0 : 1,os);
     if (!d)
         return false;
     unsigned match = 0;
     unsigned count = 0;
     unsigned i;
     for (i=0;d[i]&&dir[i]&&(d[i]==dir[i]);i++)
-        if (isPathSepChar(dir[i])) {
+    {
+        if (isPathSepChar(dir[i]))
+        {
             match = i;
             count++;
         }
-    const char *r = repDir?repDir:queryBaseDirectory(grp_unknown, isrep ? 1 : 0,os);
-    if (d[i]==0) {
-        if ((dir[i]==0)||isPathSepChar(dir[i])) {
-            out.append(r).append(dir+i);
+    }
+    const char *r = repDir?repDir:queryUnknownBaseDirectory(isrep ? 1 : 0,os);
+    if (d[i]==0)
+    {
+        if (dir[i]==0)
+        {
+            // dir was an exact match for the base directory, return replica directory in output
+            out.append(r);
+            return true;
+        }
+        else if (isPathSepChar(dir[i]))
+        {
+            // dir matched the prefix of the base directory and the remaining part leads with a path separator
+            // replace the base directory with the replica directory in the output, and append the remaining part of dir
+            out.append(r);
+            if (isPathSepChar(out.charAt(out.length()-1))) // if r has trailing path separator, skip the leading one in dir
+                i++;
+            out.append(dir+i);
+            return true;
+        }
+        else if (i>0 && isPathSepChar(d[i-1])) // implies dir[i-1] is also a pathsepchar
+        {
+            // dir matched the prefix of the base directory, including the trailing path separator
+            // replace the base directory with the replica directory in the output, and append the remaining part of dir
+            out.append(r);
+            addPathSepChar(out); // NB: this is an ensure-has-trailing-path-separator
+            out.append(dir+i); // NB: dir+i is beyond a path separator in dir
             return true;
         }
     }
-    else if (count) { // this is a bit of a kludge to handle roxie backup
+    else if (count) // this is a bit of a kludge to handle roxie backup
+    {
         const char *s = r;
         const char *b = s;
-        while (s&&*s) {
-            if (isPathSepChar(*s)) {
-                if (--count==0) {
+        while (s&&*s)
+        {
+            if (isPathSepChar(*s))
+            {
+                if (--count==0)
+                {
                     out.append(s-b,b).append(dir+match);
                     return true;
                 }
@@ -2793,7 +3359,7 @@ void removePartFiles(IFileDescriptor *desc,IMultiException *mexcept)
 {
     if (!desc)
         return;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     class casyncfor: public CAsyncFor
     {
         CriticalSection &crit;
@@ -2801,7 +3367,7 @@ void removePartFiles(IFileDescriptor *desc,IMultiException *mexcept)
         IFileDescriptor *parent;
     public:
         casyncfor(IFileDescriptor *_parent,IMultiException *_mexcept,CriticalSection &_crit)
-            : crit(_crit)
+            : CAsyncFor(SYNC_LOCATION), crit(_crit)
         {
             parent = _parent;
             mexcept = _mexcept;
@@ -2823,10 +3389,10 @@ void removePartFiles(IFileDescriptor *desc,IMultiException *mexcept)
 //                          PROGLOG("Removed '%s'",partfile->queryFilename());
                         unsigned t = msTick()-start;
                         if (t>60*1000)
-                            OWARNLOG("Removing %s from %s took %ds", partfile->queryFilename(), rfn.queryEndpoint().getUrlStr(eps).str(), t/1000);
+                            OWARNLOG("Removing %s from %s took %ds", partfile->queryFilename(), rfn.queryEndpoint().getEndpointHostText(eps).str(), t/1000);
                     }
 //                      else
-//                          OWARNLOG("Failed to remove file part %s from %s", partfile->queryFilename(),rfn.queryEndpoint().getUrlStr(eps).str());
+//                          OWARNLOG("Failed to remove file part %s from %s", partfile->queryFilename(),rfn.queryEndpoint().getEndpointHostText(eps).str());
                 }
                 catch (IException *e)
                 {
@@ -2835,7 +3401,7 @@ void removePartFiles(IFileDescriptor *desc,IMultiException *mexcept)
                     else {
                         StringBuffer s("Failed to remove file part ");
                         s.append(partfile->queryFilename()).append(" from ");
-                        rfn.queryEndpoint().getUrlStr(s);
+                        rfn.queryEndpoint().getEndpointHostText(s);
                         EXCLOG(e, s.str());
                         e->Release();
                     }
@@ -2945,14 +3511,12 @@ IFileDescriptor *createFileDescriptorFromRoxieXML(IPropertyTree *tree,const char
                     throw MakeStringException(-1,"createFileDescriptorFromRoxie: %s missing part %d loc path",id,p);
                 RemoteFilename rfn;
                 rfn.setRemotePath(path);
-                bool found = false;
                 ForEachItemIn(d,locdirs) {
                     if (strcmp(rfn.getLocalPath(locpath.clear()).str(),locdirs.item(d))==0) {
                         SocketEndpoint ep = rfn.queryEndpoint();
                         if (ep.port==DAFILESRV_PORT || ep.port==SECURE_DAFILESRV_PORT)
                             ep.port = 0;
                         epa[d].append(ep);
-                        found = true;
                         break;
                     }
                 }
@@ -3107,7 +3671,7 @@ void extractFilePartInfo(IPropertyTree &info, IFileDescriptor &file)
 
             IPropertyTree *copyTree = partTree->addPropTree("Copy", createPTree());
             copyTree->setProp("@filePath", rfn.getLocalPath(path.clear()));
-            copyTree->setProp("@host", rfn.queryEndpoint().getUrlStr(host.clear()));
+            copyTree->setProp("@host", rfn.queryEndpoint().getEndpointHostText(host.clear()));
         }
     }
 }
@@ -3116,7 +3680,7 @@ static void setupContainerizedStorageLocations()
 {
     try
     {
-        IPropertyTree * storage = queryGlobalConfig().queryPropTree("storage");
+        Owned<IPropertyTree> storage = getGlobalConfigSP()->getPropTree("storage");
         if (storage)
         {
             IPropertyTree * defaults = storage->queryPropTree("default");
@@ -3153,7 +3717,7 @@ public:
     unsigned ordinality() const { return hosts.ordinality(); }
 
     bool checkIsSubset(const GroupInformation & other); // save information if it is a subset of other
-    void createStoragePlane(IPropertyTree * storage, unsigned copy) const;
+    void createStoragePlane(IPropertyTree * storage, unsigned defaultCopies) const;
 
 public:
     StringBuffer name;
@@ -3162,7 +3726,7 @@ public:
     const GroupInformation * container = nullptr;
     unsigned containerOffset = 0;
     GroupType groupType = grp_unknown;
-    bool dropZone = false;
+    unsigned dropZoneIndex = 0;
 };
 
 using GroupInfoArray = CIArrayOf<GroupInformation>;
@@ -3172,7 +3736,12 @@ bool GroupInformation::checkIsSubset(const GroupInformation & other)
     //Find the first ip that matches, and then check the next ips within the other list also match
     unsigned thisSize = hosts.ordinality();
     unsigned otherSize = other.hosts.ordinality();
-    assertex(thisSize <= otherSize);
+    if (thisSize > otherSize)
+    {
+        if (dropZoneIndex)
+            return false;
+        throwUnexpected();
+    }
     for (unsigned i=0; i <= otherSize-thisSize; i++)
     {
         bool match = true;
@@ -3195,48 +3764,88 @@ bool GroupInformation::checkIsSubset(const GroupInformation & other)
     return false;
 }
 
-void GroupInformation::createStoragePlane(IPropertyTree * storage, unsigned copy) const
+void GroupInformation::createStoragePlane(IPropertyTree * storage, unsigned defaultCopies) const
 {
-    IPropertyTree * plane = storage->addPropTree("planes");
-    if (copy == 0)
+    StringBuffer mirrorname;
+    const char * planeName = name;
+
+    // Check that storage plane does not already have a definition
+    VStringBuffer xpath("planes[@name='%s']", planeName);
+    IPropertyTree * plane = storage->queryPropTree(xpath);
+    if (!plane)
     {
-        plane->setProp("@name", name);
+        plane = storage->addPropTree("planes");
+        plane->setProp("@name", planeName);
+        plane->setPropBool("@fromGroup", true);
     }
-    else
-    {
-        StringBuffer mirrorname;
-        mirrorname.append(name).append("_mirror").append(copy);
-        plane->setProp("@name", mirrorname);
-    }
+
+    // Revisit: Ignore hthor planes when running XRef in bare metal
+    if (groupType == grp_hthor)
+        plane->setPropBool("@hthorplane", true);
 
     //URL style drop zones don't generate a host entry, and will have a single device
     if (ordinality() != 0)
     {
-        if (container)
+        if (!plane->hasProp("@hostGroup"))
         {
-            plane->setProp("@hosts", container->name);
-            if (containerOffset)
-                plane->setPropInt("@start", containerOffset);
-            if (ordinality() != container->ordinality())
-                plane->setPropInt("@size", ordinality());
+            if (container)
+            {
+                const char * containerName = container->name;
+                //hosts will be expanded by normalizeHostGroups
+                plane->setProp("@hostGroup", containerName);
+            }
+            else
+            {
+                //Host group has been created that matches the name of the storage plane
+                plane->setProp("@hostGroup", planeName);
+            }
         }
-        else
-            plane->setProp("@hosts", name);
 
-        if (ordinality() > 1)
-            plane->setPropInt("@numDevices", ordinality());
+        if (!plane->hasProp("@numDevices"))
+        {
+            if (ordinality() > 1)
+            {
+                plane->setPropInt("@numDevices", ordinality());
+                if (dropZoneIndex == 0)
+                    plane->setPropInt("@defaultSprayParts", ordinality());
+            }
+        }
     }
 
-    if (copy)
-        plane->setPropInt("@offset", copy);
+    const char * storageApiType = plane->queryProp("storageapi/@type");
+    if (!plane->hasProp("@prefix"))
+    {
+        // If a storage plane does not have a prefix, but a storage api type is defined, then generate a prefix
+        if (storageApiType)
+        {
+            // @prefix is set later in applyPlaneTransformations
+        }
+        else if (dir.length())
+            plane->setProp("@prefix", dir);
+        else
+        {
+            //Creating a storage plane from a group - do not use getStoragePlaneByName()
+            StringBuffer dir;
+            getConfigurationDirectory(dir, groupType, 0, planeName);
+            plane->setProp("@prefix", dir);
+        }
+    }
+    if (!storageApiType && !plane->hasProp("@mirrorPrefix") && (defaultCopies == 2))
+    {
+        // Creating a storage plane from a group - do not use getStoragePlaneByName()
+        StringBuffer dir;
+        getConfigurationDirectory(dir, groupType, 1, planeName);
+        plane->setProp("@mirrorPrefix", dir);
+    }
 
-    if (dir.length())
-        plane->setProp("@prefix", dir);
-    else
-        plane->setProp("@prefix", queryBaseDirectory(groupType, copy));
+    if (!plane->hasProp("@category"))
+    {
+        const char * category = (dropZoneIndex != 0) ? "lz" : "data";
+        plane->setProp("@category", category);
+    }
 
-    if (dropZone)
-        plane->setPropBool("@dropZone", true);
+    if (!plane->hasProp("@redundancy"))
+        plane->setPropInt("@redundancy", defaultCopies-1);
 
     //MORE: If container is identical to this except for the name we could generate an information tag @alias
 }
@@ -3268,9 +3877,19 @@ static int compareGroupSize(CInterface * const * _left, CInterface * const * _ri
 {
     const GroupInformation * left = static_cast<const GroupInformation *>(*_left);
     const GroupInformation * right = static_cast<const GroupInformation *>(*_right);
+    //Ensure drop zones come after non drop zones, and the drop zone order is preserved
+    if (left->dropZoneIndex || right->dropZoneIndex)
+        return (int)(left->dropZoneIndex - right->dropZoneIndex);
+
     int ret = (int) (right->hosts.ordinality() - left->hosts.ordinality());
     if (ret)
         return ret;
+    //Ensure thor groups come before non thor groups - so that a mirror host group will always be created
+    if (left->groupType == grp_thor)
+        return -1;
+    if (right->groupType == grp_thor)
+        return +1;
+
     return stricmp(left->name, right->name);
 }
 
@@ -3282,6 +3901,9 @@ static void generateHosts(IPropertyTree * storage, GroupInfoArray & groups)
     ForEachItemIn(i, groups)
     {
         GroupInformation & cur = groups.item(i);
+        if (cur.ordinality() == 0)
+            continue;
+
         GroupInformation * container = nullptr;
         for (unsigned j=0; j < i; j++)
         {
@@ -3291,34 +3913,94 @@ static void generateHosts(IPropertyTree * storage, GroupInfoArray & groups)
         }
 
         // No containing hostGroup found, so generate a new entry for this set of hosts
-        if (!cur.container && cur.ordinality())
+        if (!cur.container)
         {
             IPropertyTree * plane = storage->addPropTree("hostGroups");
             plane->setProp("@name", cur.name);
             StringBuffer host;
             ForEachItemIn(i, cur.hosts)
+                addPTreeItem(plane, "hosts", cur.hosts.item(i));
+        }
+        else if (cur.containerOffset || cur.ordinality() != cur.container->ordinality())
+        {
+            IPropertyTree * plane = storage->addPropTree("hostGroups");
+            plane->setProp("@name", cur.name);
+            plane->setProp("@hostGroup", cur.container->name);
+            if (cur.containerOffset)
+                plane->setPropInt("@offset", cur.containerOffset);
+            if (cur.ordinality() != cur.container->ordinality())
+                plane->setPropInt("@count", cur.ordinality());
+            cur.container = nullptr;
+        }
+
+        //If this is a thor group, create a host group for the replicas - same list of ips, but offset by 1
+        //If container is not null then there is already a hostGroup for an identical set of ips.  There will
+        //also be a corresponding mirror because thor groups are sorted first.
+        if (cur.groupType == grp_thor && !cur.container)
+        {
+            VStringBuffer mirrorName("%s_mirror", cur.name.str());
+
+            IPropertyTree * plane = storage->addPropTree("hostGroups");
+            plane->setProp("@name", mirrorName);
+            plane->setProp("@hostGroup", cur.name);
+            plane->setPropInt("@delta", 1);
+        }
+    }
+}
+
+void applyPlaneTransformations(IPropertyTree * storage)
+{
+    IPropertyTree * defaults = storage->queryPropTree("defaults");
+    Owned<IPropertyTreeIterator> planes = storage->getElements("planes");
+    ForEach(*planes)
+    {
+        IPropertyTree & plane = planes->query();
+        // If a storage plane does not have a prefix, but a storage api type is defined, then generate a prefix
+        const char * prefix = plane.queryProp("@prefix");
+        const char * name = plane.queryProp("@name");
+        if (!prefix)
+        {
+            const char * storageApiType = plane.queryProp("storageapi/@type");
+            if (storageApiType)
             {
-                IPropertyTree * entry2 = createPTree("host");
-                IPropertyTree * entry = plane->addPropTreeArrayItem("hosts", entry2);
-                entry->setProp("", cur.hosts.item(i));
+                StringBuffer newPrefix;
+                newPrefix.append(storageApiType).append(":").append(name).append("/data");
+                plane.setProp("@prefix", newPrefix.str());
+            }
+        }
+
+        // Clone any interesting defaults into the plane - fill out at a later date
+        if (defaults)
+        {
+            const char * category = plane.queryProp("@category");
+            if (strsame(category, "data"))
+            {
+                const char * compression = defaults->queryProp("@compression");
+                if (!plane.hasProp("@compression") && compression)
+                    plane.setProp("@compression", compression);
             }
         }
     }
-
 }
 
-static CriticalSection storageCS;
-void initializeStorageGroups(bool createPlanesFromGroups)
+static CConfigUpdateHook configUpdateHook;
+static std::atomic<unsigned> normalizeHostGroupUpdateCBId{(unsigned)-1};
+static CriticalSection storageCS{SYNC_LOCATION};
+static void doInitializeStorageGroups(bool createPlanesFromGroups, IPropertyTree * newGlobalConfiguration)
 {
     CriticalBlock block(storageCS);
-    IPropertyTree * storage = queryGlobalConfig().queryPropTree("storage");
+    IPropertyTree * storage = newGlobalConfiguration->queryPropTree("storage");
     if (!storage)
-        storage = queryGlobalConfig().addPropTree("storage");
+        storage = newGlobalConfiguration->addPropTree("storage");
 
-#ifndef _CONTAINERIZED
-    if (createPlanesFromGroups && !storage->hasProp("planes"))
+    if (!isContainerized() && createPlanesFromGroups)
     {
+        // Remove old planes created from groups
+        while (storage->removeProp("planes[@fromGroup='1']"));
+        storage->removeProp("hostGroups"); // generateHosts will recreate host groups for all planes
+
         GroupInfoArray allGroups;
+        unsigned numDropZones = 0;
 
         //Create information about the storage planes from the groups published in dali
         //Use the Groups section directly, rather than queryNamedGroupStore(), so that hostnames are preserved
@@ -3329,39 +4011,22 @@ void initializeStorageGroups(bool createPlanesFromGroups)
             {
                 IPropertyTree & group = groups->query();
                 Owned<GroupInformation> next = new GroupInformation(group.queryProp("@name"));
-                Owned<IPropertyTreeIterator> nodes = group.getElements("Node");
-                ForEach(*nodes)
-                {
-                    next->hosts.append(nodes->query().queryProp("@ip"));
-                }
                 next->groupType = translateGroupType(group.queryProp("@kind"));
-
-                appendGroup(allGroups, next.getClear());
-            }
-        }
-
-        //Walk the drop zones, and add them as storage groups if they have no servers configured, or "."
-        Owned<IRemoteConnection> conn = querySDS().connect("/Environment/Software", myProcessSession(), 0, 2000);
-        if (conn)
-        {
-            Owned<IPropertyTreeIterator> dropzones = conn->queryRoot()->getElements("DropZone");
-            ForEach(*dropzones)
-            {
-                IPropertyTree & cur = dropzones->query();
-                unsigned numServers = cur.getCount("ServerList");
-
-                //Allow url style drop zones, and drop zones with a single node.  Not sure what >1 would mean in legacy.
-                if (numServers <= 1)
+                if (grp_dropzone == next->groupType)
                 {
-                    Owned<GroupInformation> next = new GroupInformation(cur.queryProp("@name"));
-                    const char * ip = cur.queryProp("ServerList[1]/@server");
-
-                    next->dir.set(cur.queryProp("@directory"));
-                    next->dropZone= true;
-                    if (ip)
+                    next->dir.set(group.queryProp("@dir"));
+                    next->dropZoneIndex = ++numDropZones;
+                    const char *ip = group.queryProp("Node[1]/@ip");
+                    if (ip && !strieq(ip, "localhost"))
                         next->hosts.append(ip);
-                    appendGroup(allGroups, next.getClear());
                 }
+                else
+                {
+                    Owned<IPropertyTreeIterator> nodes = group.getElements("Node");
+                    ForEach(*nodes)
+                        next->hosts.append(nodes->query().queryProp("@ip"));
+                }
+                appendGroup(allGroups, next.getClear());
             }
         }
 
@@ -3375,95 +4040,78 @@ void initializeStorageGroups(bool createPlanesFromGroups)
         ForEachItemIn(i, allGroups)
         {
             const GroupInformation & cur = allGroups.item(i);
-            cur.createStoragePlane(storage, 0);
-            if (cur.groupType == grp_thor)
-                cur.createStoragePlane(storage, 1);
+            unsigned defaultCopies = !isContainerized() ? 2 : 1;
+            cur.createStoragePlane(storage, defaultCopies);
         }
 
         //Uncomment the following to trace the values that been generated
         //printYAML(storage);
     }
-#endif
 
-    //Groups are case insensitve, so add an extra key to the storage items to allow them to be
-    //searched by group name, and also check for duplicates.
-    Owned<IPropertyTreeIterator> iter = storage->getElements("planes");
-    StringBuffer group;
-    ForEach(*iter)
-    {
-        IPropertyTree & cur = iter->query();
-        //Check if this has already been done - so the function is safe to call more than once
-        const char * oldgroup = cur.queryProp("@group");
-        if (oldgroup)
-            continue;
+    //Ensure that host groups that are defined in terms of other host groups are expanded out so they have an explicit list of hosts
+    normalizeHostGroups(newGlobalConfiguration);
 
-        const char * name = cur.queryProp("@name");
-        group.clear().append(name).toLowerCase();
-
-        //Check the storage plane does not match another one case-insensitiviely. (It is unlikely the Helm chart will have installed.)
-        VStringBuffer xpath("plane[@group='%s']", group.str());
-        IPropertyTree * match = storage->queryPropTree(xpath);
-        if (match)
-            throwStringExceptionV(DALI_DUPLICATE_STORAGE_PLANE, "Duplicate storage planes %s,%s (case insensitive)", name, match->queryProp("@name"));
-
-        cur.setProp("@group", group);
-    }
+    applyPlaneTransformations(storage);
 
     //The following can be removed once the storage planes have better integration
     setupContainerizedStorageLocations();
 }
 
-const char * queryDefaultStoragePlane()
+/*
+ * This function is used to:
+ *
+ * (a) create storage planes from bare-metal groups
+ * (b) to expand out host groups that are defined in terms of other host groups
+ * (c) to setup the base directory for the storage planes.  (GH->JCS is this threadsafe?)
+ *
+ * For most components this init function is called only once - the exception is roxie (called when it connects and disconnects from dali).
+ * In thor it is important that the update of the global config does not clone the property trees
+ * In containerized mode, the update function can be called whenever the config file changes (but it will not be creating planes from groups)
+ * In bare-metal mode the update function may be called whenever the environment changes in dali.  (see initClientProcess)
+ *
+ * Because of the requirement that thor does not clone the property trees, thor cannot support any background update - via the environment in
+ * bare-metal, or config files in containerized.  If it was to support it the code in the master would need to change, and updates would
+ * need to be synchronized to the workers.  To support this requiremnt a threadSafe parameter is provided to avoid the normal clone.
+ *
+ * For roxie, which dynamically connects and disconnects from dali, there are different problems.  The code needs to retain whether or not roxie
+ * is connected to dali - and only create planes from groups if it is connected.  There is another potential problem, which I don't think will
+ * actually be hit:
+ * Say roxie connects, updates planes from groups and disconnects.  If the update functions were called again those storage planes would be lost,
+ * but in bare-metal only a change to the environment will trigger an update, and that update will not happen if roxie is not connected to dali.
+ */
+
+static bool savedConnectedToDali = false; // Store in a global so it can be used by the callback without having to reregister
+static bool lastUpdateConnectedToDali = false;
+void initializeStoragePlanes(bool connectedToDali, bool threadSafe)
 {
-    // If the plane is specified for the component, then use that
-    IPropertyTree & config = queryComponentConfig();
-    const char * plane = config.queryProp("storagePlane");
-    if (plane)
-        return plane;
-
-    //Otherwise check what the default plane for data storage is configured to be
-    plane = queryGlobalConfig().queryProp("storage/@dataPlane");
-    if (plane)
-        return plane;
-
-#ifdef _CONTAINERIZED
-    throwUnexpectedX("Default data plane not specified"); // The default should always have been configured by the helm charts
-#else
-    return nullptr;
-#endif
-}
-
-//---------------------------------------------------------------------------------------------------------------------
-
-class CStoragePlane : public CInterfaceOf<IStoragePlane>
-{
-public:
-    CStoragePlane(IPropertyTree * _xml) : xml(_xml) {}
-
-    virtual const char * queryPrefix() const override { return xml->queryProp("@prefix"); }
-    virtual unsigned numDevices() const override { return xml->getPropInt("@numDevices", 1); }
-    virtual const char * queryHosts() const override { return xml->queryProp("@hosts"); }
-    virtual const char * querySingleHost() const override { return xml->queryProp("@host"); }   // MORE: Likely to be changed to resolve hosts
-
-private:
-    Linked<IPropertyTree> xml;
-};
-
-
-//MORE: This could be cached
-IStoragePlane * getStoragePlane(const char * name, bool required)
-{
-    StringBuffer group;
-    group.append(name).toLowerCase();
-
-    VStringBuffer xpath("storage/planes[@group='%s']", group.str());
-    IPropertyTree * match = queryGlobalConfig().queryPropTree(xpath);
-    if (!match)
     {
-        if (required)
-            throw makeStringExceptionV(-1, "Scope contains unknown storage plane '%s'", name);
-        return nullptr;
+        //If the createPlanesFromGroups parameter is now true, and was previously false, force an update
+        CriticalBlock block(storageCS);
+        if (!lastUpdateConnectedToDali && connectedToDali)
+            configUpdateHook.clear();
+        savedConnectedToDali = connectedToDali;
     }
 
-    return new CStoragePlane(match);
+    auto updateFunc = [](IPropertyTree * newComponentConfiguration, IPropertyTree * newGlobalConfiguration)
+    {
+        bool connectedToDali = savedConnectedToDali;
+        lastUpdateConnectedToDali = connectedToDali;
+        PROGLOG("initializeStoragePlanes update");
+        doInitializeStorageGroups(connectedToDali, newGlobalConfiguration);
+    };
+
+    configUpdateHook.installModifierOnce(updateFunc, threadSafe);
+}
+
+void disableStoragePlanesDaliUpdates()
+{
+    savedConnectedToDali = false;
+}
+
+IndexReadOptions getPartPlaneReadOptions(IPartDescriptor &part, unsigned copy)
+{
+    unsigned clusterNum = part.copyClusterNum(copy);
+    StringBuffer planeName;
+    part.queryOwner().getClusterLabel(clusterNum, planeName);
+    return getIndexReadOptions(planeName);
 }

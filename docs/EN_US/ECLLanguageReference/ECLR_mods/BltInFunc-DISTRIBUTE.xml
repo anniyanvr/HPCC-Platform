@@ -8,34 +8,65 @@
 
   <para><emphasis role="bold">DISTRIBUTE<indexterm>
       <primary>DISTRIBUTE function</primary>
-    </indexterm>(</emphasis><emphasis>recordset </emphasis> <emphasis role="bold">[, UNORDERED | ORDERED(</emphasis> <emphasis>bool </emphasis><emphasis role="bold">) ] [, STABLE | UNSTABLE ] [, PARALLEL [ (</emphasis> <emphasis>numthreads </emphasis><emphasis role="bold">) ] ] [, ALGORITHM(</emphasis> <emphasis>name </emphasis><emphasis role="bold">) ] )</emphasis></para>
+    </indexterm>(</emphasis><emphasis>recordset </emphasis> <emphasis
+  role="bold">[, UNORDERED | ORDERED(</emphasis> <emphasis>bool
+  </emphasis><emphasis role="bold">) ] [, STABLE | UNSTABLE ] [, PARALLEL [
+  (</emphasis> <emphasis>numthreads </emphasis><emphasis role="bold">) ] ] [,
+  ALGORITHM(</emphasis> <emphasis>name </emphasis><emphasis role="bold">) ]
+  )</emphasis></para>
+
+  <para><emphasis role="bold">DISTRIBUTE(</emphasis><emphasis>recordset,
+  </emphasis><emphasis role="bold">ALL<indexterm>
+      <primary>ALL</primary>
+    </indexterm> )</emphasis></para>
 
   <para><emphasis role="bold">DISTRIBUTE(</emphasis><emphasis>recordset,
   expression </emphasis><emphasis role="bold"> [<emphasis>,</emphasis>
-  MERGE(</emphasis><emphasis> sorts </emphasis><emphasis role="bold">) ] </emphasis><emphasis role="bold">[, UNORDERED | ORDERED(</emphasis> <emphasis>bool </emphasis><emphasis role="bold">) ] [, STABLE | UNSTABLE ] [, PARALLEL [ (</emphasis> <emphasis>numthreads </emphasis><emphasis role="bold">) ] ] [, ALGORITHM(</emphasis> <emphasis>name </emphasis><emphasis role="bold">) ] )</emphasis></para>
+  MERGE(</emphasis><emphasis> sorts </emphasis><emphasis role="bold">) ]
+  </emphasis><emphasis role="bold">[, UNORDERED | ORDERED(</emphasis>
+  <emphasis>bool </emphasis><emphasis role="bold">) ] [, STABLE | UNSTABLE ]
+  [, PARALLEL [ (</emphasis> <emphasis>numthreads </emphasis><emphasis
+  role="bold">) ] ] [, ALGORITHM(</emphasis> <emphasis>name
+  </emphasis><emphasis role="bold">) ] )</emphasis></para>
 
   <para><emphasis role="bold">DISTRIBUTE(</emphasis><emphasis>recordset, index
   </emphasis><emphasis role="bold">[</emphasis><emphasis>, joincondition
-  </emphasis><emphasis role="bold">] </emphasis><emphasis role="bold">[, UNORDERED | ORDERED(</emphasis> <emphasis>bool </emphasis><emphasis role="bold">) ] [, STABLE | UNSTABLE ] [, PARALLEL [ (</emphasis> <emphasis>numthreads </emphasis><emphasis role="bold">) ] ] [, ALGORITHM(</emphasis> <emphasis>name </emphasis><emphasis role="bold">) ] )</emphasis></para>
+  </emphasis><emphasis role="bold">] </emphasis><emphasis role="bold">[,
+  UNORDERED | ORDERED(</emphasis> <emphasis>bool </emphasis><emphasis
+  role="bold">) ] [, STABLE | UNSTABLE ] [, PARALLEL [ (</emphasis>
+  <emphasis>numthreads </emphasis><emphasis role="bold">) ] ] [,
+  ALGORITHM(</emphasis> <emphasis>name </emphasis><emphasis role="bold">) ]
+  )</emphasis></para>
 
   <para><emphasis role="bold">DISTRIBUTE(</emphasis><emphasis>recordset,
   </emphasis><emphasis role="bold"> SKEW<indexterm>
       <primary>SKEW</primary>
     </indexterm>(</emphasis><emphasis> maxskew </emphasis><emphasis
   role="bold">[</emphasis><emphasis>, skewlimit</emphasis><emphasis
-  role="bold"> ] ) </emphasis><emphasis role="bold">[, UNORDERED | ORDERED(</emphasis> <emphasis>bool </emphasis><emphasis role="bold">) ] [, STABLE | UNSTABLE ] [, PARALLEL [ (</emphasis> <emphasis>numthreads </emphasis><emphasis role="bold">) ] ] [, ALGORITHM(</emphasis> <emphasis>name </emphasis><emphasis role="bold">) ] )</emphasis></para>
+  role="bold"> ] ) </emphasis><emphasis role="bold">[, UNORDERED |
+  ORDERED(</emphasis> <emphasis>bool </emphasis><emphasis role="bold">) ] [,
+  STABLE | UNSTABLE ] [, PARALLEL [ (</emphasis> <emphasis>numthreads
+  </emphasis><emphasis role="bold">) ] ] [, ALGORITHM(</emphasis>
+  <emphasis>name </emphasis><emphasis role="bold">) ] )</emphasis></para>
 
   <para><informaltable colsep="1" frame="all" rowsep="1">
       <tgroup cols="2">
-        <colspec colwidth="82.20pt" />
+        <colspec colwidth="82.20pt"/>
 
-        <colspec />
+        <colspec/>
 
         <tbody>
           <row>
             <entry><emphasis>recordset</emphasis></entry>
 
             <entry>The set of records to distribute.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold">ALL</emphasis></entry>
+
+            <entry>Specifies each record is sent to all nodes in the
+            cluster.</entry>
           </row>
 
           <row>
@@ -85,61 +116,84 @@
           <row>
             <entry><emphasis>maxskew</emphasis></entry>
 
-            <entry>A floating point number in the range of zero (0.0) to one
-            (1.0) specifying the minimum skew to allow (0.1=10%).</entry>
+            <entry>A value between zero (0) and one (1.0 = 100%) indicating
+            the maximum percentage of skew to allow before the job fails (the
+            default skew is 1.0 / &lt;number of worker nodes on
+            cluster&gt;).</entry>
           </row>
 
           <row>
             <entry><emphasis>skewlimit</emphasis></entry>
 
-            <entry>Optional. A floating point number in the range of zero
-            (0.0) to one (1.0) specifying the maximum skew to allow
-            (0.1=10%).</entry>
+            <entry>Optional. A value between zero (0) and one (1.0 = 100%)
+            indicating the desired maximum percentage of skew to allow (the
+            default skew is 1.0 / &lt;number of worker nodes on
+            cluster&gt;).</entry>
           </row>
+
           <row>
             <entry><emphasis role="bold">UNORDERED</emphasis></entry>
 
-            <entry>Optional. Specifies the output record order is not significant.</entry>
+            <entry>Optional. Specifies the output record order is not
+            significant.</entry>
           </row>
+
           <row>
             <entry><emphasis role="bold">ORDERED</emphasis></entry>
 
-            <entry>Specifies the significance of the output record order.</entry>
+            <entry>Specifies the significance of the output record
+            order.</entry>
           </row>
+
           <row>
             <entry><emphasis>bool</emphasis></entry>
 
-            <entry>When False, specifies the output record order is not significant. When True, specifies the default output record order.</entry>
+            <entry>When False, specifies the output record order is not
+            significant. When True, specifies the default output record
+            order.</entry>
           </row>
+
           <row>
             <entry><emphasis role="bold">STABLE</emphasis></entry>
 
-            <entry>Optional. Specifies the input record order is significant.</entry>
+            <entry>Optional. Specifies the input record order is
+            significant.</entry>
           </row>
+
           <row>
             <entry><emphasis role="bold">UNSTABLE</emphasis></entry>
 
-            <entry>Optional. Specifies the input record order is not significant.</entry>
+            <entry>Optional. Specifies the input record order is not
+            significant.</entry>
           </row>
+
           <row>
             <entry><emphasis role="bold">PARALLEL</emphasis></entry>
 
-            <entry>Optional. Try to evaluate this activity in parallel.</entry>
+            <entry>Optional. Try to evaluate this activity in
+            parallel.</entry>
           </row>
+
           <row>
             <entry><emphasis>numthreads</emphasis></entry>
 
-            <entry>Optional. Try to evaluate this activity using <emphasis>numthreads</emphasis> threads.</entry>
+            <entry>Optional. Try to evaluate this activity using
+            <emphasis>numthreads</emphasis> threads.</entry>
           </row>
+
           <row>
             <entry><emphasis role="bold">ALGORITHM</emphasis></entry>
 
-            <entry>Optional. Override the algorithm used for this activity.</entry>
+            <entry>Optional. Override the algorithm used for this
+            activity.</entry>
           </row>
+
           <row>
             <entry><emphasis>name</emphasis></entry>
 
-            <entry>The algorithm to use for this activity. Must be from the list of supported algorithms for the SORT function's STABLE and UNSTABLE options.</entry>
+            <entry>The algorithm to use for this activity. Must be from the
+            list of supported algorithms for the SORT function's STABLE and
+            UNSTABLE options.</entry>
           </row>
 
           <row>
@@ -165,6 +219,21 @@
     "randomly" so there is no data skew across nodes, but without the
     disadvantages the RANDOM() function could introduce. This is functionally
     equivalent to distributing by a hash of the entire record.</para>
+  </sect2>
+
+  <sect2 id="All_DISTRIBUTE">
+    <title>ALL DISTRIBUTE</title>
+
+    <para><emphasis role="bold">DISTRIBUTE(</emphasis><emphasis>recordset,
+    </emphasis><emphasis role="bold">ALL )</emphasis></para>
+
+    <para>This form redistributes the <emphasis>recordset</emphasis> to all
+    nodes. Each input record is duplicated on every node in the
+    cluster.</para>
+
+    <para>This is useful when subsequent LOCAL processing requires a full copy
+    of the same data on each node (for example, LOCAL joins against a shared
+    lookup dataset).</para>
   </sect2>
 
   <sect2 id="Expression_DISTRIBUTE">
@@ -231,15 +300,17 @@
 
     <para>Example:</para>
 
-    <programlisting>MySet1 := DISTRIBUTE(Person); //"random" distribution - no skew
+    <programlisting lang="ECL">MySet1 := DISTRIBUTE(Person); //"random" distribution - no skew
+  //ALL example:
+MySetAll := DISTRIBUTE(Person, ALL); //duplicate every record to every node
+ //Example where all people with the same SSN end up on the same node
 MySet2 := DISTRIBUTE(Person,HASH32(Person.per_ssn));
- //all people with the same SSN end up on the same node
  //INDEX example:
 mainRecord := RECORD
   INTEGER8 sequence;
   STRING20 forename; 
   STRING20 surname;
-  UNSIGNED8 filepos{virtual(fileposition)};
+  UNSIGNED8 filepos{VIRTUAL(fileposition)};
 END;
 mainTable := DATASET('~keyed.d00',mainRecord,THOR);
 nameKey := INDEX(mainTable, {surname,forename,filepos}, 'name.idx');

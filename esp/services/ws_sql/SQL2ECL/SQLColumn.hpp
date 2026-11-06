@@ -124,6 +124,7 @@ private:
     int decimalDigits;
     StringBuffer columnType;
     bool keyedField;
+    IArrayOf<HPCCColumnMetaData> childColumns;
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -133,12 +134,12 @@ public:
         return new HPCCColumnMetaData(name);
     }
 
-    HPCCColumnMetaData() : keyedField(false), decimalDigits(0), index(-1)
+    HPCCColumnMetaData() : index(-1), decimalDigits(0), keyedField(false)
     {
         columnName.clear();
     }
 
-    HPCCColumnMetaData(const char * colname) : keyedField(false), decimalDigits(0), index(-1)
+    HPCCColumnMetaData(const char * colname) : index(-1), decimalDigits(0), keyedField(false)
     {
         columnName.set(colname);
     }
@@ -146,8 +147,9 @@ public:
     virtual ~HPCCColumnMetaData()
     {
 #ifdef _DEBUG
-        fprintf(stderr, "leaving columnmetadata.");
+        fprintf(stderr, "leaving %s columnmetadata.\n", columnName.str());
 #endif
+        childColumns.kill(false);
     }
 
     StringBuffer &toEclRecString(StringBuffer &result)
@@ -166,7 +168,21 @@ public:
 
     void setColumnType(const char* columnType)
     {
-        this->columnType.set(columnType);
+        if (strncmp(columnType, "table of", 8)==0)
+        {
+            StringBuffer result;
+            result.append("DATASET({");
+            ForEachItemIn(childIndex, childColumns)
+            {
+               this->childColumns.item(childIndex).toEclRecString(result);
+               if (childIndex < childColumns.length()-1)
+                   result.append(", ");
+            }
+            result.append("})");
+            this->columnType.set(result);
+        }
+        else
+            this->columnType.set(columnType);
     }
 
     int getDecimalDigits() const
@@ -213,6 +229,17 @@ public:
     {
         return columnName.str();
     }
+
+    void setChildCol(HPCCColumnMetaData * child)
+    {
+        childColumns.append(*LINK(child));
+    }
+
+    IArrayOf<HPCCColumnMetaData> * getChildColumns()
+    {
+        return &childColumns;
+    }
+
 };
 
 #endif /* SQLCOLUMN_HPP_ */

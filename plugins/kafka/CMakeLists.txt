@@ -27,52 +27,7 @@ project(kafka)
 if(KAFKA)
     ADD_PLUGIN(kafka)
     if(MAKE_KAFKA)
-        # librdkafka packages do not include everything we need to properly
-        # build against it; until/if they are ever fixed we will need to build
-        # our own version of librdkafka from source and include it ourselves
-
-        if(NOT EXISTS "${PROJECT_SOURCE_DIR}/librdkafka/configure")
-            message(FATAL_ERROR
-"   The librdkafka submodule is not available.
-   This normally indicates that the git submodule has not been fetched.
-   Please run git submodule update --init --recursive")
-        endif()
-
-        if(APPLE)
-            set(LIBRDKAFKA_LIB ${PROJECT_BINARY_DIR}/lib/librdkafka.dylib)
-            set(LIBRDKAFKA_LIB_REAL ${PROJECT_BINARY_DIR}/lib/librdkafka.1.dylib)
-            set(LIBRDKAFKACPP_LIB ${PROJECT_BINARY_DIR}/lib/librdkafka++.dylib)
-            set(LIBRDKAFKACPP_LIB_REAL ${PROJECT_BINARY_DIR}/lib/librdkafka++.1.dylib)
-        else()
-            set(LIBRDKAFKA_LIB ${PROJECT_BINARY_DIR}/lib/librdkafka.so)
-            set(LIBRDKAFKA_LIB_REAL ${PROJECT_BINARY_DIR}/lib/librdkafka.so.1)
-            set(LIBRDKAFKACPP_LIB ${PROJECT_BINARY_DIR}/lib/librdkafka++.so)
-            set(LIBRDKAFKACPP_LIB_REAL ${PROJECT_BINARY_DIR}/lib/librdkafka++.so.1)
-        endif()
-
-        # librdkafka does not support out-of-source builds, so let's copy all
-        # of its source code to our binary directory and build there; further,
-        # we need to pull some working directory shenanigans for each command
-        # in order to make the built scripts function correctly
-
-        add_custom_command(
-		OUTPUT ${LIBRDKAFKA_LIB}
-		COMMAND cp -r ${PROJECT_SOURCE_DIR}/librdkafka ${PROJECT_BINARY_DIR}/src
-		COMMAND cd ${PROJECT_BINARY_DIR}/src && ./configure --prefix=${PROJECT_BINARY_DIR}
-		COMMAND cd ${PROJECT_BINARY_DIR}/src && make && make install
-		COMMENT Copying and building librdkafka)
-
-	add_custom_target(librdkafka-build ALL DEPENDS ${LIBRDKAFKA_LIB})
-
-        install(CODE "set(ENV{LD_LIBRARY_PATH} \"\$ENV{LD_LIBRARY_PATH}:${PROJECT_BINARY_DIR}/lib\")")
-	
-        add_library(librdkafka SHARED IMPORTED)
-	set_property(TARGET librdkafka PROPERTY IMPORTED_LOCATION ${LIBRDKAFKA_LIB})
-	add_dependencies(librdkafka librdkafka-build)
-
-	add_library(librdkafkacpp SHARED IMPORTED)
-	set_property(TARGET librdkafkacpp PROPERTY IMPORTED_LOCATION ${LIBRDKAFKACPP_LIB})
-	add_dependencies(librdkafkacpp librdkafka-build)
+        find_package(RdKafka REQUIRED)
 
         set(
             SRCS
@@ -85,7 +40,7 @@ if(KAFKA)
             ./../../rtl/include
             ./../../common/deftype
             ./../../system/jlib
-            ${PROJECT_BINARY_DIR}/include
+            ${LOCAL_LIBRDKAFKA_INCLUDE}
             ${CMAKE_BINARY_DIR}
             ${CMAKE_BINARY_DIR}/oss)
 
@@ -100,7 +55,7 @@ if(KAFKA)
 
         install(
             TARGETS kafka
-            DESTINATION plugins)
+            DESTINATION plugins CALC_DEPS)
 
         install(
             FILES ${LIBRDKAFKA_LIB_REAL} ${LIBRDKAFKACPP_LIB_REAL}
@@ -113,13 +68,10 @@ if(KAFKA)
             DESTINATION ${LIB_DIR}
             COMPONENT Runtime)
 
-        target_link_libraries(
-            kafka
-            librdkafka
-            librdkafkacpp
+        target_link_libraries(kafka PRIVATE
             eclrtl
             jlib
-            ${ZLIB_LIBRARIES}) 
+            RdKafka::rdkafka++)
     endif()
 endif()
 

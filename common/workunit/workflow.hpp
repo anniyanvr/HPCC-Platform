@@ -36,6 +36,8 @@
 #define WFERR_NoParentItemFound         5103
 #define WFERR_NoReqdItemFound           5104
 
+#define DEFAULT_PERSIST_COPIES (-1)
+
 class WORKUNIT_API WorkflowException : public IException, public CInterface
 {
 public:
@@ -76,6 +78,16 @@ private:
   *  - Support once, stored, persist workflow items.
   *
   */
+class WORKUNIT_API PersistVersion : public CInterface
+{
+public:
+    PersistVersion(char const * _logicalName, unsigned _eclCRC, unsigned __int64 _allCRC, bool _isFile) : logicalName(_logicalName), eclCRC(_eclCRC), allCRC(_allCRC), isFile(_isFile) {}
+    StringAttr logicalName;
+    unsigned eclCRC;
+    unsigned __int64 allCRC;
+    bool isFile;
+};
+
 class CCloneWorkflowItem;
 class WORKUNIT_API WorkflowMachine : public CInterface
 {
@@ -143,7 +155,7 @@ protected:
     //This new runtime item is a logical predecessor - one that may activate the successor.
     //The logical predecessor can also activate any of the successor's children.
     //The pointer to the runtime item is returned.
-    unsigned insertLogicalPredecessor(unsigned successorWfid);
+    CCloneWorkflowItem & insertLogicalPredecessor(unsigned successorWfid);
 
     void performParallel(IGlobalCodeContext *_ctx, IEclProcess *_process);
     void processWfItems();
@@ -158,6 +170,17 @@ protected:
     void checkAbort(CCloneWorkflowItem & item, bool depFailed);
     void startContingency();
     void endContingency();
+
+    virtual IRemoteConnection *startPersist(const char * logicalName) = 0;
+    virtual void finishPersist(const char * persistName, IRemoteConnection *persistLock) = 0;
+    virtual void deleteLRUPersists(const char * logicalName, unsigned keep) = 0;
+    virtual void updatePersist(IRemoteConnection *persistLock, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC) = 0;
+    virtual bool checkFreezePersists(const char *logicalName, unsigned eclCRC) = 0;
+    virtual bool isPersistUptoDate(Owned<IRemoteConnection> &persistLock, IRuntimeWorkflowItem & item, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC, bool isFile) = 0;
+    virtual void checkPersistSupported() = 0;
+    virtual bool isPersistAlreadyLocked(const char * logicalName) = 0;
+    void doExecutePersistItemParallel(CCloneWorkflowItem & item);
+    void doExecutePersistActivator(CCloneWorkflowItem & item);
 
     void processDependentSuccessors(CCloneWorkflowItem &item);
     void processLogicalSuccessors(CCloneWorkflowItem &item);
@@ -175,12 +198,17 @@ protected:
 protected:
     const IContextLogger &logctx;
     Owned<IWorkflowItemArray> workflow;
+    Owned<PersistVersion> persist;
+    //this protects the global persist variable
+    CriticalSection persistCritSec{SYNC_LOCATION};
+    //this protects the persist lock array from race conditions
+    CriticalSection finishPersistCritSec{SYNC_LOCATION};
     //contains extra workflow items that are created at runtime. These support logical successorships
     std::vector<Shared<IRuntimeWorkflowItem>> logicalWorkflow;
     std::queue<unsigned> wfItemQueue;
-    Semaphore wfItemQueueSem;
+    Semaphore wfItemQueueSem{SYNC_LOCATION};
     //used to pop/add items to the queue
-    CriticalSection queueCritSec;
+    CriticalSection queueCritSec{SYNC_LOCATION};
     //optional debug value "parallelThreads" to select number of threads
     unsigned numThreads = 1U;
     //the wfid of the parent item. It has no successors, only dependents.
@@ -195,9 +223,9 @@ protected:
     //flag is set when a workflowItem fails and is not successfully recovered
     std::atomic<bool> abort{false};
     //This protects against a race condition between activate() and deactivate()
-    CriticalSection activationCritSec;
+    CriticalSection activationCritSec{SYNC_LOCATION};
     //This protects each item from having its exception set twice, in a race condition
-    CriticalSection exceptionCritSec;
+    CriticalSection exceptionCritSec{SYNC_LOCATION};
     //This counts the active contingency clauses (that haven't finished being executed)
     //This ensures that the query doesn't finish without completing the contingencies.
     std::atomic<unsigned> activeContingencies{0U};
@@ -219,7 +247,7 @@ protected:
     unsigned itemsUnblocked;
 
     //allows the condition result to be returned from a process in a thread-safe way
-    CriticalSection conditionCritSec;
+    CriticalSection conditionCritSec{SYNC_LOCATION};
     unsigned condition;
 };
 

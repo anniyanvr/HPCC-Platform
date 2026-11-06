@@ -85,7 +85,9 @@ define([
             this.wu.update({
                 JobName: dom.byId(context.id + "JobName").value,
                 isProtected: protectedCheckbox.get("value")
-            }, null);
+            }, null).then(() => {
+                this.wu.refresh();
+            });
         },
         _onDelete: function (event) {
             if (confirm(this.i18n.YouAreAboutToDeleteThisWorkunit)) {
@@ -265,6 +267,18 @@ define([
                             NodeGroup: this.wu.DestGroupName,
                             Name: this.wu.DestLogicalName
                         });
+                    }
+                    if (this.wu.SourceFormatMessage === "csv") {
+                        dom.byId(this.id + "SourceType").innerText = "(" + nlsHPCC.CSV + ")";
+                    } else if (this.wu.SourceFormatMessage === "fixed") {
+                        dom.byId(this.id + "SourceType").innerText = "(" + nlsHPCC.Fixed + ")";
+                    } else if (!!this.wu.RowTag) {
+                        dom.byId(this.id + "SourceType").innerText = "(" + nlsHPCC.XML + "/" + nlsHPCC.JSON + ")";
+                    }
+                    if (this.wu.DestFormatMessage === "csv") {
+                        dom.byId(this.id + "TargetType").innerText = "(" + nlsHPCC.CSV + ")";
+                    } else if (this.wu.DestFormatMessage === "fixed") {
+                        dom.byId(this.id + "TargetType").innerText = "(" + nlsHPCC.Fixed + ")";
                     }
                     break;
             }

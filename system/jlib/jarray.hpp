@@ -21,6 +21,7 @@
 #define JARRAY_HPP
 
 #include <new>
+#include <utility>
 
 #include "platform.h"
 #include "jiface.hpp"
@@ -66,6 +67,10 @@ typedef int (* StdCompare)(const void *_e1, const void *_e2);
 class jlib_decl Allocator
 {
 public:
+    Allocator() = default;
+    Allocator(const Allocator & ) = delete;
+    Allocator & operator = (const Allocator & ) = delete;
+
     void  kill();
     inline bool isItem(aindex_t pos = 0) const    { return pos < used; }      /* Is there an item at pos */
     inline aindex_t length() const                 { return used; } /* Return number of items  */
@@ -77,9 +82,10 @@ protected:
     void * _doBAdd(void *, size32_t size, StdCompare compare, bool & isNew);
     void * _doBSearch(const void *, size32_t size, StdCompare compare) const;
     void _doSort(size32_t size, StdCompare compare);
-    void _ensure(aindex_t, size32_t);
+    void _ensure(aindex_t req, size32_t iSize);
     inline void _init() { max=0; _head=0; used=0; }                                 // inline because it is called a lot
     void _reallocate(aindex_t newlen, size32_t iSize);
+    void _reallocateExact(aindex_t newLen, size32_t itemSize);
     void _doRotateR(aindex_t pos1, aindex_t pos2, size32_t iSize, aindex_t num);
     void _doRotateL(aindex_t pos1, aindex_t pos2, size32_t iSize, aindex_t num);
     void _space(size32_t iSize);
@@ -97,13 +103,15 @@ protected:
 template <unsigned SIZE> class AllocatorOf : public Allocator
 {
 public:
-    inline void ensure(aindex_t num)                        { _ensure(num, SIZE); }
+    inline void ensureCapacity(aindex_t num)                 { _ensure(num, SIZE); }                // never shrink, reallocate exactly
+    inline void ensureSpace(aindex_t num)                    { _reallocateExact(used+num, SIZE); }  // reallocate exactly
     inline void rotateR(aindex_t pos1, aindex_t pos2)        { _doRotateR(pos1, pos2, SIZE, 1); }
     inline void rotateL(aindex_t pos1, aindex_t pos2)        { _doRotateL(pos1, pos2, SIZE, 1); }
     inline void rotateRN(aindex_t pos1, aindex_t pos2, aindex_t num)        { _doRotateR(pos1, pos2, SIZE, num); }
     inline void rotateLN(aindex_t pos1, aindex_t pos2, aindex_t num)        { _doRotateL(pos1, pos2, SIZE, num); }
     inline void swap(aindex_t pos1, aindex_t pos2)           { _doSwap(pos1, pos2, SIZE); }
     inline void transfer(aindex_t to, aindex_t from)         { _doTransfer(to, from, SIZE); }
+    inline void trimMemory()                                 { _reallocateExact(used, SIZE); }
 
 protected:
     inline void _space(void)                                { Allocator::_space(SIZE); }
@@ -146,7 +154,7 @@ protected:
     typedef int (*CompareFunc)(const MEMBER *, const MEMBER *);   // Should really be const, as should the original array functions
 
 public:
-    ~ArrayOf<MEMBER,PARAM,MAPPER>() { kill(); }
+    ~ArrayOf() { kill(); }
 
     MEMBER & operator[](size_t pos) { return element((aindex_t)pos); }
     const MEMBER & operator[](size_t pos) const { return element((aindex_t)pos); }
@@ -234,11 +242,7 @@ public:
     {
         SELF::doSwapWith(other);
     }
-    void clear()
-    {
-        SELF::used = 0;
-    }
-    void kill(bool nodestruct = false)
+    void clear(bool nodestruct = false)
     {
         aindex_t count = SELF::used;
         SELF::used = 0;
@@ -247,6 +251,10 @@ public:
             for (aindex_t i=0; i<count; i++)
                  SELF::destruct(i);
         }
+    }
+    void kill(bool nodestruct = false)
+    {
+        clear(nodestruct);
         PARENT::kill();
     }
     MEMBER & element(aindex_t pos)
@@ -274,6 +282,18 @@ public:
         if (!nodestruct) SELF::destruct(pos);
         SELF::_move( pos, pos + 1, ( SELF::used - pos ) );
     }
+    //Remove the element at pos and move the last element to pos - to avoid moving all elements
+    void removeAndSwapLast(aindex_t pos, bool nodestruct = false)
+    {
+        assertex(pos < SELF::used);
+        SELF::used --;
+        if (!nodestruct) SELF::destruct(pos);
+        if (pos != SELF::used)
+        {
+            MEMBER * head = (MEMBER *)SELF::_head;
+            head[pos] = std::move(head[SELF::used]);
+        }
+    }   
     void removen(aindex_t pos, aindex_t num, bool nodestruct = false)
     {
         assertex(pos + num <= SELF::used);

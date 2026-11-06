@@ -37,6 +37,8 @@
 #define ROXIEMM_HEAP_ERROR                ROXIEMM_ERROR_START+3
 #define ROXIEMM_TOO_MUCH_MEMORY           ROXIEMM_ERROR_START+4
 #define ROXIEMM_RELEASE_ALL_SHARED_HEAP   ROXIEMM_ERROR_START+5
+#define ROXIEMM_BLOCKED_MULTI_THREAD      ROXIEMM_ERROR_START+6
+
 // NB: max ROXIEMM_* error is ROXIEMM_ERROR_END (see errorlist.h)
 
 #ifdef __64BIT__
@@ -62,8 +64,14 @@
 #define MAX_SIZE_DIRECT_BUCKET          2048                    // Sizes below this are directly mapped to a particular bucket
 #define ALLOC_ALIGNMENT                 sizeof(void *)          // Minimum alignment of data allocated from the heap manager
 #define PACKED_ALIGNMENT                4                       // Minimum alignment of packed blocks
+#define EXACT_ALIGNMENT                 8                       // Minimum alignment of exact blocks - similar to packed, but allocator id is duplicated
 
 #define MAX_FRAC_ALLOCATOR              20
+
+#define TRACK_DATABUFF_STATE
+
+// Opaque type to avoid too many includes
+interface IAsyncProcessor;
 
 //================================================================================
 // Roxie heap
@@ -143,9 +151,20 @@ protected:
     virtual void _internalFreeNoDestructor(const void *ptr) = 0;
 
 public:
-    inline bool isAlive() const
+    inline bool isAliveAndLink() const
     {
-        return count.load(std::memory_order_relaxed) < DEAD_PSEUDO_COUNT;        //only safe if Link() is called first
+        unsigned expected = count.load(std::memory_order_acquire);
+        for (;;)
+        {
+            //If count is 0, or count >= DEAD_PSEUDO_COUNT then return false - combine both into a single test
+            if ((expected-1) >= (DEAD_PSEUDO_COUNT-1))
+                return false;
+
+            //Avoid incrementing the link count if xxcount=0, otherwise it introduces a race condition
+            //so use compare and exchange to increment it only if it hasn't changed
+            if (count.compare_exchange_weak(expected, expected+1, std::memory_order_acq_rel))
+                return true;
+        }
     }
 
     static void release(const void *ptr);
@@ -187,7 +206,7 @@ public:
     }
 };
 
-extern roxiemem_decl unsigned DATA_ALIGNMENT_SIZE;  // Permissible values are 0x400 and 0x2000
+extern roxiemem_decl unsigned DATA_ALIGNMENT_SIZE;  // Permissible values are powers of two between 0x400 and 0x2000
 
 #define DATA_ALIGNMENT_MASK ((~((memsize_t) DATA_ALIGNMENT_SIZE)) + 1)
 
@@ -195,6 +214,7 @@ class DataBuffer;
 interface IDataBufferManager;
 interface IRowManager;
 
+enum class DBState : unsigned { zero, unowned, queued, attached, freed, max };
 class roxiemem_decl DataBuffer
 {
     friend class CDataBufferManager;
@@ -203,7 +223,7 @@ private:
     void released();
 
 protected:
-    DataBuffer() : count(1)
+    DataBuffer() : count(1), nextDataId(0)
     {
     }
 public:
@@ -215,34 +235,50 @@ public:
     void Release();
     inline unsigned queryCount() const
     {
-        return count.load(std::memory_order_relaxed);
+        return count.load(std::memory_order_acquire);
     }
-    void noteReleased(const void *ptr);
+    inline void noteReleased(const void *ptr) { Release(); }
     void noteLinked(const void *ptr);
+    bool attachToRowMgr(IRowManager *rowMgr);
+
+#ifdef TRACK_DATABUFF_STATE
+    void initState(DBState newState) { state = newState; }
+    void changeState(DBState oldState, DBState newState, const char * func);
+#else
+    void initState(DBState newState) { }
+    void changeState(DBState oldState, DBState newState, const char * func) {}
+#endif
+
 public:
     std::atomic_uint count;
+#ifdef TRACK_DATABUFF_STATE
+    DBState state = DBState::unowned;
+#else
+    unsigned filler = 0; // keeps valgrind happy
+#endif
     IRowManager *mgr = nullptr;
-    DataBuffer *next = nullptr;   // Used when chaining them together in rowMgr
+    union
+    {
+        std::atomic<memsize_t> nextDataId;  // Used when chaining freeblocks within a DataBufferBottom
+        DataBuffer * nextActive;        // Used when attached to an RowManager
+    };
     DataBuffer *msgNext = nullptr;    // Next databuffer in same slave message
-    bool attachToRowMgr(IRowManager *rowMgr);
+
+    /* data */
     char data[1]; // actually DATA_PAYLOAD
 };
 
-#define DATA_PAYLOAD (roxiemem::DATA_ALIGNMENT_SIZE - sizeof(roxiemem::DataBuffer)) // actually should be offsetof(DataBuffer, data)
+#define DATA_PAYLOAD (roxiemem::DATA_ALIGNMENT_SIZE - offsetof(roxiemem::DataBuffer, data))
 
 class CDataBufferManager;
 class roxiemem_decl DataBufferBottom : public HeapletBase
 {
 private:
     friend class CDataBufferManager;
-    CDataBufferManager * volatile owner;
-    std::atomic_uint okToFree;      // use uint since it is more efficient on some architectures
-    DataBufferBottom *nextBottom;   // Used when chaining them together in CDataBufferManager 
-    DataBufferBottom *prevBottom;   // Used when chaining them together in CDataBufferManager 
-    DataBuffer *freeChain;
-    CriticalSection crit;
-
-    void released();
+    std::atomic<CDataBufferManager *> owner;
+    DataBufferBottom *nextBottom = nullptr; // Used when chaining them together in CDataBufferManager
+    DataBufferBottom *prevBottom = nullptr; // Used when chaining them together in CDataBufferManager
+    std::atomic<memsize_t> freeHeadId{0};               // a chain of freed DataBuffers, implemented as a lock free list bottom bits are a sequence number
 
     virtual void noteReleased(const void *ptr) override;
     virtual void noteReleased(unsigned count, const byte * * rowset) override;
@@ -388,6 +424,30 @@ private:
     const char * ptr;
 };
 
+class OwnedDataBuffer
+{
+public:
+    inline OwnedDataBuffer()                              { ptr = NULL; }
+    inline OwnedDataBuffer(DataBuffer * _ptr)             { ptr = _ptr; }
+    inline OwnedDataBuffer(const OwnedDataBuffer & other) { ptr = other.getLink(); }
+
+    inline ~OwnedDataBuffer() { if (ptr) ptr->Release(); }
+
+    inline operator DataBuffer *() const { return ptr; }
+    inline DataBuffer * get() const { return ptr; }
+    inline DataBuffer * getLink() const { if (ptr) ptr->Link(); return ptr; }
+    inline DataBuffer * set(DataBuffer * _ptr) { DataBuffer * temp = ptr; if (_ptr) _ptr->Link(); ptr = _ptr; if (temp) temp->Release(); return ptr; }
+    inline DataBuffer * setown(DataBuffer * _ptr) { DataBuffer * temp = ptr; ptr = _ptr; if (temp) temp->Release(); return ptr; }
+    inline void clear() { DataBuffer * temp = ptr; ptr = NULL; if (temp) temp->Release();  }
+private:
+    /* Disable use of some constructs that often cause memory leaks by creating private members */
+    void operator = (const void * _ptr)              {  }
+    void operator = (const OwnedDataBuffer & other) { }
+    void setown(const OwnedDataBuffer &other) {  }
+
+private:
+    DataBuffer * ptr;
+};
 
 interface IRowHeap : extends IInterface
 {
@@ -420,6 +480,8 @@ enum RoxieHeapFlags
     RHFblocked          = 0x0040,  // allocate blocks of rows
     RHFscanning         = 0x0080,  // scan the heaplet for free items instead of using a free list
     RHFdelayrelease     = 0x0100,
+    RHFlimitedcount     = 0x0200,  // only share a heap a limited number of times
+    RHFexactsize        = 0x0400,  // align rather than round up the size of the allocation
 
     //internal flags
     RHFhuge             = 0x40000000,   // only used for tracing
@@ -471,6 +533,8 @@ interface IRowManager : extends IInterface
     virtual memsize_t getExpectedCapacity(memsize_t size, unsigned heapFlags) = 0; // what is the expected capacity for a given size allocation
     virtual memsize_t getExpectedFootprint(memsize_t size, unsigned heapFlags) = 0; // how much memory will a given size allocation actually use.
     virtual void reportPeakStatistics(IStatisticTarget & target, unsigned detail) = 0;
+    virtual void reportSummaryStatistics(CRuntimeStatisticCollection & target) = 0;
+    virtual void resetPeakMemory() = 0;
 
 //Allow various options to be configured
     virtual void setActivityTracking(bool val) = 0;
@@ -519,9 +583,10 @@ interface IDataBufferManager : extends IInterface
     virtual void poolStats(StringBuffer &memStats) = 0;
 };
 
-extern roxiemem_decl IDataBufferManager *createDataBufferManager(size32_t size);
+extern roxiemem_decl IDataBufferManager *createDataBufferManager();
 extern roxiemem_decl void setMemoryStatsInterval(unsigned secs);
-extern roxiemem_decl void setTotalMemoryLimit(bool allowHugePages, bool allowTransparentHugePages, bool retainMemory, memsize_t max, memsize_t largeBlockSize, const unsigned * allocSizes, ILargeMemCallback * largeBlockCallback);
+extern roxiemem_decl void setTotalMemoryLimit(bool allowHugePages, bool allowTransparentHugePages, bool retainMemory, bool lockMemory, memsize_t max, memsize_t largeBlockSize, const unsigned * allocSizes, ILargeMemCallback * largeBlockCallback);
+extern roxiemem_decl void setMemoryOptions(IPropertyTree * options);
 extern roxiemem_decl memsize_t getTotalMemoryLimit();
 extern roxiemem_decl void releaseRoxieHeap();
 extern roxiemem_decl bool memPoolExhausted();
@@ -534,7 +599,10 @@ extern roxiemem_decl unsigned getDataBuffersActive();
 
 extern roxiemem_decl void setMemTraceLevel(unsigned value);
 extern roxiemem_decl void setMemTraceSizeLimit(memsize_t value);
+extern roxiemem_decl bool memTraceInconsistencies;
 
+extern roxiemem_decl int lockRoxieMem(bool lock);
+extern roxiemem_decl bool getRoxieMemLocked();
 
 #define ALLOCATE(a) allocate(a, activityId)
 #define CLONE(a,b) clone(a, b, activityId)
@@ -543,6 +611,8 @@ extern roxiemem_decl StringBuffer &memstats(StringBuffer &stats);
 extern roxiemem_decl void memstats(unsigned &totalpg, unsigned &freepg, unsigned &maxblk);
 extern roxiemem_decl IPerfMonHook *createRoxieMemStatsPerfMonHook(IPerfMonHook *chain=NULL); // for passing to jdebug startPerformanceMonitor
 extern roxiemem_decl size_t getRelativeRoxiePtr(const void *_ptr); // Useful for debugging - to provide a value that is consistent from run to run
+
+extern roxiemem_decl void registerRoxieMemory(IAsyncProcessor & processor);
 
 } // namespace roxiemem
 #endif

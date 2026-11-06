@@ -26,7 +26,9 @@
 #ifndef DADFS_HPP
 #define DADFS_HPP
 
-#ifndef da_decl
+#ifdef DALI_EXPORTS
+#define da_decl DECL_EXPORT
+#else
 #define da_decl DECL_IMPORT
 #endif
 
@@ -39,9 +41,11 @@
 #include "dafdesc.hpp"
 #include "seclib.hpp"
 #include "errorlist.h"
+#include "jlog.hpp"
 
 #include <vector>
 #include <string>
+#include "dafsaudit.hpp"
 
 enum : unsigned {
     DALI_DUPLICATE_STORAGE_PLANE = DALI_ERROR_START
@@ -68,7 +72,6 @@ public:
     virtual StringBuffer &getName(StringBuffer &name) = 0;
 };
 
-typedef IIteratorOf<IPropertyTree> IDFAttributesIterator;
 
 
 interface IDFScopeIterator: public IInterface
@@ -162,7 +165,8 @@ interface IDistributedFilePart: implements IInterface
                                                         // note does not affect cluster order
 
     virtual unsigned copyClusterNum(unsigned copy,unsigned *replicate=NULL)=0;      // map copy number to cluster (and optionally replicate number)
-
+    virtual StringBuffer &getStorageFilePath(StringBuffer & path, unsigned copy)=0;
+    virtual unsigned getStripeNum(unsigned copy)=0;
 };
 
 
@@ -187,7 +191,8 @@ enum DFUQFilterType
     DFUQFTintegerRange,
     DFUQFTinteger64Range,
     DFUQFTspecial,
-    DFUQFTincludeFileAttr
+    DFUQFTincludeFileAttr,
+    DFUQFTinverseWildcardMatch
 };
 
 enum DFUQSerializeFileAttrOption
@@ -246,47 +251,92 @@ enum DFUQFilterField
     DFUQFFsubfilenum = 31,
     DFUQFFkind = 32,
     DFUQFFaccessed = 33,
-    DFUQFFterm = 34,
+    DFUQFFattrmaxskew = 34,
+    DFUQFFattrminskew = 35,
+    DFUQFFexpiredays = 36,
+    DFUQFFterm = 37,
     DFUQFFreverse = 256,
     DFUQFFnocase = 512,
     DFUQFFnumeric = 1024,
     DFUQFFwild = 2048
 };
 
-enum DFUQResultField
-{
-    DFUQRFname = 0,
-    DFUQRFdescription = 1,
-    DFUQRFnodegroups = 2,
-    DFUQRFkind = 3,
-    DFUQRFtimemodified = 4,
-    DFUQRFjob = 5,
-    DFUQRFowner = 6,
-    DFUQRFrecordcount = 7,
-    DFUQRForigrecordcount = 8,
-    DFUQRFrecordsize = 9,
-    DFUQRFsize = 10,
-    DFUQRForigsize = 11,
-    DFUQRFworkunit = 12,
-    DFUQRFnodegroup = 13,
-    DFUQRFnumsubfiles = 14,
-    DFUQRFaccessed = 15,
-    DFUQRFnumparts = 16,
-    DFUQRFcompressedsize = 17,
-    DFUQRFdirectory = 18,
-    DFUQRFpartmask = 19,
-    DFUQRFsuperowners = 20,
-    DFUQRFpersistent = 21,
-    DFUQRFprotect = 22,
-    DFUQRFiscompressed = 23,
-    DFUQRFterm = 24,
-    DFUQRFreverse = 256,
-    DFUQRFnocase = 512,
-    DFUQRFnumeric = 1024
-};
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <cctype>
 
-extern da_decl const char* getDFUQFilterFieldName(DFUQFilterField feild);
-extern da_decl const char* getDFUQResultFieldName(DFUQResultField feild);
+// NB: these are not serialized / are only used by the client.
+// They are mapped to string equivalent before being transmitted to the server.
+// Therefore their order is not important, but must be kept in sync with the order in dfuqFieldInfos (dadfs.cpp)
+enum class DFUQResultField : unsigned
+{
+    name,               // some code will assume this is the first field (and all other up to 'term' follow in order)
+    description,
+    nodegroups,
+    kind,
+    timemodified,
+    job,
+    owner,
+    recordcount,
+    origrecordcount,
+    recordsize,
+    size,
+    origsize,
+    workunit,
+    nodegroup,
+    numsubfiles,
+    accessed,
+    numparts,
+    compressedsize,
+    directory,
+    partmask,
+    superowners,
+    persistent,
+    protect,
+    iscompressed,
+    cost,
+    numDiskReads,
+    numDiskWrites,
+    atRestCost,
+    accessCost,
+    maxSkew,
+    minSkew,
+    maxSkewPart,
+    minSkewPart,
+    readCost,
+    writeCost,
+    expireDays,
+    subfilenames,
+    blockCompressed,    // blockCompressed and rowCompressed need to be included for use
+    rowCompressed,      // by the dafdesc.cpp isCompressed function
+    includeAll,
+    term,               // NB: only used by client code, not passed to server. Signifies end of a list of fields
+    fieldMask = 0xff,
+    stringType = 1<<8,
+    numericType = 1<<9,
+    floatType = 1<<10,
+    boolType = 1<<11,
+    typeMask = 0x0f<<8, // Masks bits 8-11 (type flags). Could compact the type bits into 2 bits if really wanted to save space
+    reverse = 1<<12,
+    nocase = 1<<13,
+// for field filtering
+    include = 1<<14,
+    exclude = 1<<15,
+    unknown = 0xffffffff
+};
+BITMASK_ENUM(DFUQResultField);
+
+typedef DFUQResultField DFUQResultFieldType;
+
+extern da_decl const char* getDFUQFilterFieldName(DFUQFilterField field);
+extern da_decl const char* getDFUQResultFieldName(DFUQResultField field);
+extern da_decl DFUQResultFieldType getDFUQResultFieldType(DFUQResultField field);
+extern da_decl DFUQResultField getDFUQResultField(const char *fieldName);
+extern da_decl DFUQResultField getDFUQResultFieldAndType(const char *fieldName);
+extern da_decl const char* getDFUQResultFieldTypeName(DFUQResultField field);
+extern da_decl bool getFileAttributePath(const char *fieldName, StringBuffer &attributePath, DFUQResultField &field, DFUQResultFieldType &type);
+
 
 /**
  * File operations can be included in a transaction to ensure that multiple
@@ -301,8 +351,8 @@ interface IDistributedFileTransaction: extends IInterface
     virtual void rollback()=0;
     virtual bool active()=0;
 // TBD: shouldn't really be necessary, lookups should auto-add to transaction
-    virtual IDistributedFile *lookupFile(const char *lfn,unsigned timeout=INFINITE)=0;
-    virtual IDistributedSuperFile *lookupSuperFile(const char *slfn,unsigned timeout=INFINITE)=0;
+    virtual IDistributedFile *lookupFile(const char *lfn, AccessMode accessMode, unsigned timeout=INFINITE)=0;
+    virtual IDistributedSuperFile *lookupSuperFile(const char *slfn, AccessMode accessMode, unsigned timeout=INFINITE)=0;
 };
 
 interface IDistributedSuperFileIterator: extends IIteratorOf<IDistributedSuperFile>
@@ -314,6 +364,12 @@ interface ICodeContext;
 /**
  * A distributed file, composed of one or more DistributedFileParts.
  */
+typedef std::pair<const char*, unsigned __int64> AttrValuePair;
+inline AttrValuePair makeAttrValuePair(const char * attr, unsigned __int64 val)
+{
+    return std::make_pair(attr, val);
+}
+
 interface IDistributedFile: extends IInterface
 {
     virtual unsigned numParts() = 0;
@@ -325,7 +381,7 @@ interface IDistributedFile: extends IInterface
 
     virtual IDistributedFilePartIterator *getIterator(IDFPartFilter *filter=NULL) = 0;
 
-    virtual void rename(const char *logicalname,IUserDescriptor *user) = 0;     // simple rename (no file copy)
+    virtual void rename(const char *logicalname,IUserDescriptor *user, const DFSAuditContext &auditCtx = DFSAuditContext{}) = 0;     // simple rename (no file copy)
 
     virtual IFileDescriptor *getFileDescriptor(const char *clustername=NULL) = 0;   // get file descriptor used for file system access
                                                                                 // if clustername specified makes filedesc for only that cluster
@@ -333,8 +389,8 @@ interface IDistributedFile: extends IInterface
     virtual const char *queryDefaultDir() = 0;                                  // default directory (note primary dir)
     virtual const char *queryPartMask() = 0;                                    // default part name mask
 
-    virtual void attach(const char *logicalname,IUserDescriptor *user) = 0;     // attach to name in DFS
-    virtual void detach(unsigned timeoutms=INFINITE, ICodeContext *ctx=NULL) = 0; // no longer attached to name in DFS
+    virtual void attach(const char *logicalname, IUserDescriptor *user, const DFSAuditContext &auditCtx = DFSAuditContext{}) = 0;     // attach to name in DFS
+    virtual void detach(unsigned timeoutms=INFINITE, ICodeContext *ctx=NULL, const DFSAuditContext &auditCtx = DFSAuditContext{}) = 0; // no longer attached to name in DFS
 
     virtual IPropertyTree &queryAttributes() = 0;                               // DFile attributes
 
@@ -348,7 +404,8 @@ interface IDistributedFile: extends IInterface
     virtual bool getAccessedTime(CDateTime &dt) = 0;                            // get date and time last accessed (returns false if not set)
     virtual void setAccessedTime(const CDateTime &dt) = 0;                      // set date and time last accessed
     virtual void setAccessed() = 0;                                             // set date and time last accessed to now (local time)
-
+    virtual void addAttrValue(const char *attr, unsigned __int64 value) = 0;    // atomic add to attribute value
+    virtual void addAttrValues(std::initializer_list<AttrValuePair> attrs) = 0; // for each pair of attribute name and value, atomic add to attribute value
     virtual unsigned numCopies(unsigned partno) = 0;                            // number of copies
 
     virtual bool existsPhysicalPartFiles(unsigned short port) = 0;              // returns true if physical patrs all exist (on primary OR secondary)
@@ -366,7 +423,7 @@ interface IDistributedFile: extends IInterface
     virtual IDistributedSuperFileIterator *getOwningSuperFiles(IDistributedFileTransaction *_transaction=NULL)=0;           // returns iterator for all parents
     virtual bool isCompressed(bool *blocked=NULL)=0;
 
-    virtual StringBuffer &getClusterName(unsigned clusternum,StringBuffer &name) = 0;
+    virtual StringBuffer &getClusterName(unsigned clusternum,StringBuffer &name) const = 0;
     virtual unsigned getClusterNames(StringArray &clusters)=0;                  // returns ordinality
                                                                                       // (use findCluster)
     virtual unsigned numClusters()=0;
@@ -413,9 +470,18 @@ interface IDistributedFile: extends IInterface
     virtual void resetHistory() = 0;
     virtual bool isExternal() const = 0;
     virtual bool getSkewInfo(unsigned &maxSkew, unsigned &minSkew, unsigned &maxSkewPart, unsigned &minSkewPart, bool calculateIfMissing) = 0;
-    virtual int  getExpire() = 0;
+    virtual int  getExpire(StringBuffer *expirationDate) = 0;
     virtual void setExpire(int expireDays) = 0;
+    virtual void getCost(const char * cluster, cost_type & atRestCost, cost_type & accessCost) = 0;
+    virtual bool getNumReads(stat_type &numReads) const = 0;
+    virtual bool getNumWrites(stat_type &numWrites) const = 0;
+    virtual bool getReadCost(cost_type &cost, bool calculateIfMissing=false) const = 0;
+    virtual bool getWriteCost(cost_type &cost, bool calculateIfMissing=false) const = 0;
+
+    virtual IUserDescriptor *queryUser() const = 0;
 };
+
+extern da_decl IndexReadOptions getIndexReadOptionsForPart(IDistributedFile &file, IDistributedFilePart &keyFile);
 
 
 // ==SUPER FILES===================================================================================================
@@ -480,31 +546,41 @@ interface ISimpleSuperFileEnquiry: extends IInterface // lightweight local
  * Use this instead of locking/unlocking manually. Manual lock is deprecated and will
  * disappear soon.
  */
-class DistributedFilePropertyLock {
+class DistributedFilePropertyLock
+{
 protected:
-    IDistributedFile *file;
-    bool reload;
-    bool unlocked;
+    IDistributedFile *file = nullptr;
+    bool reload = false;
 public:
-    DistributedFilePropertyLock(IDistributedFile *_file)
-        : file(_file), reload(false), unlocked(false)
+    DistributedFilePropertyLock()
     {
-        reload = file->lockProperties();
+    }
+    DistributedFilePropertyLock(IDistributedFile *_file)
+    {
+        lock(_file, INFINITE);
     }
     ~DistributedFilePropertyLock()
     {
-        if (!unlocked)
+        if (file)
             unlock();
+    }
+    void lock(IDistributedFile *_file, unsigned timeoutMs)
+    {
+        assertex(!file && _file);
+        reload = _file->lockProperties(timeoutMs);
+        file = _file;
     }
     void unlock()
     {
+        assertex(file);
         file->unlockProperties(TAS_NONE);
-        unlocked = true;
+        file = nullptr;
     }
     void commit()
     {
+        assertex(file);
         file->unlockProperties(TAS_SUCCESS);
-        unlocked = true;
+        file = nullptr;
     }
     // MORE: Implement rollback when necessary
     IPropertyTree &queryAttributes()
@@ -560,64 +636,78 @@ typedef IIteratorOf<IFileRelationship> IFileRelationshipIterator;
 /**
  * A distributed directory. Can created, access and delete files, super-files and logic-files.
  */
+
+enum class GetFileTreeOpts
+{
+    none                          = 0x0,
+    expandNodes                   = 0x1,
+    appendForeign                 = 0x2,
+    remapToService                = 0x4,
+    suppressForeignRemapToService = 0x8
+};
+BITMASK_ENUM(GetFileTreeOpts);
+
 interface IDistributedFileDirectory: extends IInterface
 {
     virtual IDistributedFile *lookup(   const char *logicalname,
                                         IUserDescriptor *user,
-                                        bool writeaccess,
+                                        AccessMode accessMode,
                                         bool hold,
                                         bool lockSuperOwner,
                                         IDistributedFileTransaction *transaction, // transaction only used for looking up superfile sub file
                                         bool privilegedUser,
-                                        unsigned timeout=INFINITE
+                                        unsigned timeout=INFINITE,
+                                        const DFSAuditContext &auditCtx = DFSAuditContext{}
                                     ) = 0;  // links, returns NULL if not found
 
     virtual IDistributedFile *lookup(   CDfsLogicalFileName &logicalname,
                                         IUserDescriptor *user,
-                                        bool writeaccess,
+                                        AccessMode accessMode,
                                         bool hold,
                                         bool lockSuperOwner,
                                         IDistributedFileTransaction *transaction, // transaction only used for looking up superfile sub files
                                         bool privilegedUser,
-                                        unsigned timeout=INFINITE
+                                        unsigned timeout=INFINITE,
+                                        const DFSAuditContext &auditCtx = DFSAuditContext{}
                                     ) = 0;  // links, returns NULL if not found
 
-    virtual IDistributedFile *createNew(IFileDescriptor *desc) = 0;
+    virtual IDistributedFile *createNew(IFileDescriptor *desc, const char *optName=nullptr) = 0;
     virtual IDistributedFile *createExternal(IFileDescriptor *desc, const char *name) = 0;
 
-    virtual IDistributedFileIterator *getIterator(const char *wildname, bool includesuper, IUserDescriptor *user,bool isPrivilegedUser) = 0;
-            // wildname is in form scope/name and may contain wild components for either
-    virtual IDFAttributesIterator *getDFAttributesIterator(const char *wildname, IUserDescriptor *user, bool recursive=true, bool includesuper=false, INode *foreigndali=NULL, unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT) = 0;
-    virtual IPropertyTreeIterator *getDFAttributesTreeIterator(const char *filters, DFUQResultField* localFilters,
-        const char *localFilterBuf, IUserDescriptor *user, bool recursive, bool& allMatchingFilesReceived, INode *foreigndali=NULL, unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT) = 0;
-    virtual IDFAttributesIterator *getForeignDFAttributesIterator(const char *wildname, IUserDescriptor *user, bool recursive=true, bool includesuper=false, const char *foreigndali="", unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT) = 0;
+    virtual IDistributedFileIterator *getIterator(const char *wildname, bool includesuper, IUserDescriptor *user, bool isPrivilegedUser, AccessMode accessMode = AccessMode::readLogicalMeta) = 0;
+    // wildname is in form scope/name and may contain wild components for either
+    // NB: getDFAttributesIterator is just a wrapper onto of getDFAttributesFilteredIterator
+    virtual IPropertyTreeIterator *getDFAttributesIterator(const char *wildname, IUserDescriptor *user, bool recursive=true, bool includesuper=false, INode *foreigndali=nullptr, unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT) = 0;
+    virtual IPropertyTreeIterator *getDFAttributesFilteredIterator(const char *filters, const char *localFilters, const DFUQResultField *fields,
+        IUserDescriptor *user, bool recursive, bool& allMatchingFilesReceived, unsigned *total, INode *foreigndali=nullptr, unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT) = 0;
 
     virtual IDFScopeIterator *getScopeIterator(IUserDescriptor *user, const char *subscope=NULL,bool recursive=true,bool includeempty=false)=0;
 
     // Removes files and super-files with format: context/file@cluster
-    virtual bool removeEntry(const char *name, IUserDescriptor *user, IDistributedFileTransaction *transaction=NULL, unsigned timeoutms=INFINITE, bool throwException=false) = 0;
-    virtual void renamePhysical(const char *oldname,const char *newname,IUserDescriptor *user,IDistributedFileTransaction *transaction) = 0;                         // renames the physical parts as well as entry
+    virtual bool removeEntry(const char *name, IUserDescriptor *user, IDistributedFileTransaction *transaction=NULL, unsigned timeoutms=INFINITE, bool throwException=false, const DFSAuditContext &auditCtx = DFSAuditContext{}) = 0;
+    virtual void renamePhysical(const char *oldname, const char *newname, IUserDescriptor *user, IDistributedFileTransaction *transaction, const DFSAuditContext &auditCtx = DFSAuditContext{}) = 0;  // renames the physical parts as well as entry
     virtual void removeEmptyScope(const char *scope) = 0;   // does nothing if called on non-empty scope
 
 
     virtual bool exists(const char *logicalname,IUserDescriptor *user,bool notsuper=false,bool superonly=false) = 0;                           // logical name exists
     virtual bool existsPhysical(const char *logicalname,IUserDescriptor *user) = 0;                                                    // physical parts exists
 
-    virtual IPropertyTree *getFileTree(const char *lname, IUserDescriptor *user, const INode *foreigndali=NULL, unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT, bool expandnodes=true, bool appendForeign=true) =0;
-    virtual IFileDescriptor *getFileDescriptor(const char *lname,IUserDescriptor *user,const INode *foreigndali=NULL, unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT) =0;
+    virtual IPropertyTree *getFileTree(const char *lname, IUserDescriptor *user, AccessMode accessMode, const INode *foreigndali=NULL, unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT, GetFileTreeOpts opts = GetFileTreeOpts::expandNodes|GetFileTreeOpts::appendForeign) =0;
 
     virtual IDistributedSuperFile *createSuperFile(const char *logicalname,IUserDescriptor *user,bool interleaved,bool ifdoesnotexist=false,IDistributedFileTransaction *transaction=NULL) = 0;
-    virtual IDistributedSuperFile *createNewSuperFile(IPropertyTree *tree, const char *optionamName=nullptr) = 0;
-    virtual IDistributedSuperFile *lookupSuperFile(const char *logicalname,IUserDescriptor *user,
+    virtual IDistributedSuperFile *createNewSuperFile(IPropertyTree *tree, const char *optionamName=nullptr, IArrayOf<IDistributedFile> *subFiles=nullptr) = 0;
+    virtual IDistributedSuperFile *lookupSuperFile(const char *logicalname, IUserDescriptor *user, AccessMode accessMode,
                                                     IDistributedFileTransaction *transaction=NULL, // transaction only used for looking up sub files
                                                     unsigned timeout=INFINITE) = 0;  // NB lookup will also return superfiles
     virtual void removeSuperFile(const char *_logicalname, bool delSubs=false, IUserDescriptor *user=NULL, IDistributedFileTransaction *transaction=NULL)=0;
 
     virtual SecAccessFlags getFilePermissions(const char *lname,IUserDescriptor *user,unsigned auditflags=0)=0; // see dasess for auditflags values
+    virtual SecAccessFlags getFScopePermissions(const char *scope,IUserDescriptor *user,unsigned auditflags=0)=0; // see dasess for auditflags values
     virtual void setDefaultUser(IUserDescriptor *user)=0;
     virtual IUserDescriptor* queryDefaultUser()=0;
-    virtual SecAccessFlags getNodePermissions(const IpAddress &ip,IUserDescriptor *user,unsigned auditflags=0)=0;
     virtual SecAccessFlags getFDescPermissions(IFileDescriptor *,IUserDescriptor *user,unsigned auditflags=0)=0;
+    virtual SecAccessFlags getDLFNPermissions(CDfsLogicalFileName &dlfn,IUserDescriptor *user,unsigned auditflags=0)=0;
+    virtual SecAccessFlags getDropZoneScopePermissions(const char *dropZoneName,const char *dropZonePath,IUserDescriptor *user,unsigned auditflags=0)=0;
 
     virtual DistributedFileCompareResult fileCompare(const char *lfn1,const char *lfn2,DistributedFileCompareMode mode,StringBuffer &errstr,IUserDescriptor *user)=0;
     virtual bool filePhysicalVerify(const char *lfn1,IUserDescriptor *user,bool includecrc,StringBuffer &errstr)=0;
@@ -679,27 +769,29 @@ interface IDistributedFileDirectory: extends IInterface
                                    bool includeemptyscopes=false
                                 ) = 0; // if scope returns subfiles and subdirs
 
-    virtual bool publishMetaFileXML(const CDfsLogicalFileName &logicalname,
-                                    IUserDescriptor *user) = 0;
-
     virtual bool isProtectedFile( // needs no lock on file
                                       const CDfsLogicalFileName &logicalname,
                                       unsigned timeout=0                // 0 = return state immediately, >0 waits until false or timed-out
                                      ) = 0;
 
     virtual IDFProtectedIterator *lookupProtectedFiles(const char *owner=NULL,bool notsuper=false,bool superonly=false)=0; // if owner = NULL then all
-    virtual IDFAttributesIterator* getLogicalFilesSorted(IUserDescriptor* udesc, DFUQResultField *sortOrder, const void* filters, DFUQResultField *localFilters,
-            const void *specialFilterBuf, unsigned startOffset, unsigned maxNum, __int64 *cacheHint, unsigned *total, bool *allMatchingFilesReceived) = 0;
-    virtual IDFAttributesIterator* getLogicalFiles(IUserDescriptor* udesc, DFUQResultField *sortOrder, const void* filters, DFUQResultField *localFilters,
-            const void *specialFilterBuf, unsigned startOffset, unsigned maxNum, __int64 *cacheHint, unsigned *total, bool *allMatchingFilesReceived, bool recursive, bool sorted) = 0;
+    virtual IPropertyTreeIterator* getLogicalFilesSorted(IUserDescriptor* udesc, DFUQResultField *sortOrder, const void* filters, const char *localFilters,
+            DFUQResultField *fields, unsigned startOffset, unsigned maxNum, __int64 *cacheHint, unsigned *total, bool *allMatchingFilesReceived) = 0;
+    virtual IPropertyTreeIterator* getLogicalFiles(IUserDescriptor* udesc, DFUQResultField *sortOrder, const void* filters, const char *localFilters,
+            DFUQResultField *fields, unsigned startOffset, unsigned maxNum, __int64 *cacheHint, unsigned *total, bool *allMatchingFilesReceived, bool recursive, bool sorted) = 0;
 
     virtual unsigned setDefaultTimeout(unsigned timems) = 0;                                // sets default timeout for SDS connections and locking
                                                                                             // returns previous value
 
     // useful to clearup after temporary unpublished file.
     virtual bool removePhysicalPartFiles(const char *logicalName, IFileDescriptor *fileDesc, IMultiException *mexcept, unsigned numParallelDeletes=0) = 0;
+
+    virtual void setFileAccessed(IUserDescriptor* udesc, const char *logicalName, const CDateTime &dt, const INode *foreigndali=nullptr, unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT) = 0;
 };
 
+// Standalone comparison function that works on already-resolved IDistributedFile objects.
+// Can be used by both Dali-direct and wsdfs paths.
+extern da_decl DistributedFileCompareResult compareDistributedFiles(IDistributedFile *file1, IDistributedFile *file2, DistributedFileCompareMode mode, StringBuffer &errstr);
 
 
 extern da_decl IDistributedFileDirectory &queryDistributedFileDirectory();
@@ -768,19 +860,26 @@ enum DistributedFileSystemError
     DFSERR_LookupConnectionTimout,       // only raised if timeout specified on lookup etc.
     DFSERR_FailedToDeleteFile,
     DFSERR_PassIterateFilesLimit,
-    DFSERR_RestrictedFileAccessDenied
+    DFSERR_RestrictedFileAccessDenied,
+    DFSERR_EmptyStoragePlane,
+    DFSERR_MissingStoragePlane,
+    DFSERR_PhysicalCompressedPartInvalid,
+    DFSERR_InvalidRemoteFileContext,
+    DFSERR_MissingStoragePlaneName
 };
 
 
 // utility routines (used by xref and dfu)
-extern da_decl RemoteFilename &constructPartFilename(IGroup *grp,unsigned partno,unsigned partmax,const char *name,const char *partmask,const char *partdir,unsigned copy,ClusterPartDiskMapSpec &mspec,RemoteFilename &rfn);
+extern da_decl RemoteFilename &constructPartFilename(IGroup *grp,unsigned partNo,unsigned copy,unsigned max,unsigned lfnHash,int replicateOffset,bool dirPerPart,const char *lname,const char *prefix,const char *pmask,unsigned numDevices,RemoteFilename &rfn);
+extern da_decl RemoteFilename &constructPartFilename(IGroup *grp,unsigned partNo,unsigned max,unsigned node,unsigned replicateLevel,unsigned dirPerPartNum,const char *lname,const char *prefix,const char *pmask,unsigned stripeNum,RemoteFilename &rfn);
+extern da_decl RemoteFilename &deprecatedConstructPartFilename(IGroup *grp,unsigned partno,unsigned partmax,const char *name,const char *partmask,const char *partdir,unsigned copy,ClusterPartDiskMapSpec &mspec,RemoteFilename &rfn);
 // legacy version
-inline RemoteFilename &constructPartFilename(IGroup *grp,unsigned partno,unsigned partmax,const char *name,const char *partmask,const char *partdir,bool replicate,int replicateoffset,RemoteFilename &rfn,bool localmount=false)
+inline RemoteFilename &deprecatedConstructPartFilename(IGroup *grp,unsigned partno,unsigned partmax,const char *name,const char *partmask,const char *partdir,bool replicate,int replicateoffset,RemoteFilename &rfn,bool localmount=false)
 {
     // local mount ignored!
     ClusterPartDiskMapSpec mspec;
     mspec.replicateOffset = replicateoffset;
-    return constructPartFilename(grp,partno,partmax,name,partmask,partdir,replicate?1:0,mspec,rfn);
+    return deprecatedConstructPartFilename(grp,partno,partmax,name,partmask,partdir,replicate?1:0,mspec,rfn);
 }
 
 extern da_decl IDFPartFilter *createPartFilter(const char *filter);
@@ -790,16 +889,12 @@ extern da_decl IDFPartFilter *createPartFilter(const char *filter);
               |    <part_number> '-' <part_number>
 */
 
-extern da_decl bool removePhysicalFiles(IGroup *grp,const char *_filemask,unsigned short port, ClusterPartDiskMapSpec &mspec,IMultiException *mexcept);
-// for removing orphaned files
-
 // for server use
 interface IDaliServer;
-extern da_decl IDaliServer *createDaliDFSServer(IPropertyTree *config); // called for coven members
+extern da_decl IDaliServer *createDaliDFSServer(); // called for coven members
 
 // to initialize clustergroups after clusters change in the environment
-extern da_decl void initClusterGroups(bool force, StringBuffer &response, IPropertyTree *oldEnvironment, unsigned timems=INFINITE);
-extern da_decl void initClusterAndStoragePlaneGroups(bool force, IPropertyTree *oldEnvironment, unsigned timems=INFINITE);
+extern da_decl void initClusterAndStoragePlaneGroups(StringBuffer &response, bool force, IPropertyTree *oldEnvironment, unsigned timems=INFINITE);
 extern da_decl bool resetClusterGroup(const char *clusterName, const char *type, bool spares, StringBuffer &response, unsigned timems=INFINITE);
 extern da_decl bool addClusterSpares(const char *clusterName, const char *type, const std::vector<std::string> &hosts, StringBuffer &response, unsigned timems=INFINITE);
 extern da_decl bool removeClusterSpares(const char *clusterName, const char *type, const std::vector<std::string> &hosts, StringBuffer &response, unsigned timems=INFINITE);
@@ -814,7 +909,7 @@ extern da_decl IDistributedFileTransaction *createDistributedFileTransaction(IUs
 
 extern da_decl const char *normalizeLFN(const char *s, StringBuffer &normalized);
 
-extern da_decl IDFAttributesIterator *createSubFileFilter(IDFAttributesIterator *_iter,IUserDescriptor* _user, bool includesub, unsigned timems=INFINITE); // takes ownership of iter
+extern da_decl IPropertyTreeIterator *createSubFileFilter(IPropertyTreeIterator *_iter,IUserDescriptor* _user, bool includesub, unsigned timems=INFINITE); // takes ownership of iter
 
 extern da_decl GroupType translateGroupType(const char *groupType);
 
@@ -825,7 +920,7 @@ extern da_decl GroupType translateGroupType(const char *groupType);
 
 // Useful property query functions
 
-inline bool isFileKey(IPropertyTree &pt) { const char *kind = pt.queryProp("@kind"); return kind&&strieq(kind,"key"); }
+inline bool isFileKey(const IPropertyTree &pt) { const char *kind = pt.queryProp("@kind"); return kind&&strieq(kind,"key"); }
 inline bool isFileKey(IDistributedFile *f) { return isFileKey(f->queryAttributes()); }
 inline bool isFileKey(IFileDescriptor *f) { return isFileKey(f->queryProperties()); }
 
@@ -841,6 +936,8 @@ inline bool isPartTLK(IPropertyTree &pt) { const char *kind = pt.queryProp("@kin
 inline bool isPartTLK(IDistributedFilePart *p) { return isPartTLK(p->queryAttributes()); }
 inline bool isPartTLK(IPartDescriptor *p) { return isPartTLK(p->queryProperties()); }
 
+da_decl bool hasTLK(IDistributedFile *f);
+
 inline const char *queryFileKind(IPropertyTree &pt) { return pt.queryProp("@kind"); }
 inline const char *queryFileKind(IDistributedFile *f) { return queryFileKind(f->queryAttributes()); }
 inline const char *queryFileKind(IFileDescriptor *f) { return queryFileKind(f->queryProperties()); }
@@ -849,9 +946,96 @@ extern da_decl void ensureFileScope(const CDfsLogicalFileName &dlfn, unsigned ti
 
 extern da_decl bool checkLogicalName(const char *lfn,IUserDescriptor *user,bool readreq,bool createreq,bool allowquery,const char *specialnotallowedmsg);
 
+extern da_decl bool isLocalDali(const INode *foreigndali);
+
+extern da_decl cost_type calcFileAtRestCost(const char * cluster, double sizeGB, double fileAgeDays);
+extern da_decl cost_type calcFileAccessCost(const char * cluster, __int64 numDiskWrites, __int64 numDiskReads);
+extern da_decl cost_type calcFileAccessCost(IDistributedFile *f, __int64 numDiskWrites, __int64 numDiskReads);
+extern da_decl cost_type calcDiskWriteCost(const StringArray & clusters, stat_type numDiskWrites);
+extern da_decl cost_type updateCostAndNumReads(IDistributedFile *file, stat_type numDiskReads, cost_type curReadCost); // Update readCost and numDiskReads - return calculated read cost
 constexpr bool defaultPrivilegedUser = true;
 constexpr bool defaultNonPrivilegedUser = false;
 
+extern da_decl void configurePreferredPlanes();
+
+template<typename Source>
+inline cost_type calcLegacyReadCost(const IPropertyTree & fileAttr, Source source)
+{
+    // Calculate legacy read cost from numDiskReads
+    // (However, it is not possible to accurately calculate read cost for key
+    // files, as the reads may have been from page cache and not from disk.)
+    if (!isFileKey(fileAttr) && source)
+    {
+        stat_type numDiskReads = fileAttr.getPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskReads), 0);
+        return calcFileAccessCost(source, 0, numDiskReads);
+    }
+    return 0;
+}
+
+// Get read cost from readCost field or calculate legacy read cost
+// - migrateLegacyCost: if true, update readCost field with legacy read cost
+template<typename Source>
+inline cost_type getReadCost(IPropertyTree & fileAttr, Source source, bool migrateLegacyCost = false)
+{
+    if (fileAttr.hasProp(getDFUQResultFieldName(DFUQResultField::readCost)))
+        return fileAttr.getPropInt64(getDFUQResultFieldName(DFUQResultField::readCost), 0);
+    else
+    {
+        cost_type readCost = calcLegacyReadCost(fileAttr, source);
+        if (migrateLegacyCost)
+            fileAttr.setPropInt64(getDFUQResultFieldName(DFUQResultField::readCost), readCost);
+        return readCost;
+    }
+}
+
+// Get read cost from readCost field or calculate legacy read cost
+template<typename Source>
+inline cost_type getReadCost(const IPropertyTree & fileAttr, Source source)
+{
+    if (fileAttr.hasProp(getDFUQResultFieldName(DFUQResultField::readCost)))
+        return fileAttr.getPropInt64(getDFUQResultFieldName(DFUQResultField::readCost), 0);
+    else
+        return calcLegacyReadCost(fileAttr, source);
+}
+
+template<typename Source>
+inline cost_type calcLegacyWriteCost(const IPropertyTree & fileAttr, Source source)
+{
+    if (source)
+    {
+        stat_type numDiskWrites = fileAttr.getPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskWrites), 0);
+        return calcFileAccessCost(source, numDiskWrites, 0);
+    }
+    return 0;
+}
+
+// Get write cost from writeCost field or calculate legacy write cost
+// - migrateLegacyCost: if true, update writeCost field with legacy write cost
+template<typename Source>
+inline cost_type getWriteCost(IPropertyTree & fileAttr, Source source, bool migrateLegacyCost = false)
+{
+    if (fileAttr.hasProp(getDFUQResultFieldName(DFUQResultField::writeCost)))
+        return fileAttr.getPropInt64(getDFUQResultFieldName(DFUQResultField::writeCost), 0);
+    else
+    {
+        cost_type writeCost = calcLegacyWriteCost(fileAttr, source);
+        if (migrateLegacyCost)
+            fileAttr.setPropInt64(getDFUQResultFieldName(DFUQResultField::writeCost), writeCost);
+        return writeCost;
+    }
+}
+
+// Get write cost from writeCost field or calculate legacy write cost
+template<typename Source>
+inline cost_type getWriteCost(const IPropertyTree & fileAttr, Source source)
+{
+    if (fileAttr.hasProp(getDFUQResultFieldName(DFUQResultField::writeCost)))
+        return fileAttr.getPropInt64(getDFUQResultFieldName(DFUQResultField::writeCost), 0);
+    else
+        return calcLegacyWriteCost(fileAttr, source);
+}
+
+extern da_decl bool doesPhysicalMatchMeta(IPartDescriptor &partDesc, IFile &iFile, offset_t &expectedSize, offset_t &actualSize);
+extern da_decl bool doesPhysicalMatchMeta(IDistributedFilePart &partDesc, IFile &iFile, offset_t &expectedSize, offset_t &actualSize);
+
 #endif
-
-

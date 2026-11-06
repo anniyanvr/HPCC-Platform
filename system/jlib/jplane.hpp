@@ -1,0 +1,255 @@
+/*##############################################################################
+
+    HPCC SYSTEMS software Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#ifndef JPLANE_HPP
+#define JPLANE_HPP
+
+#include "jiface.hpp"
+#include "jlib.hpp"
+#include "jstring.hpp"
+#include "jdebug.hpp"
+#include "jutil.hpp"
+
+#include <time.h>
+#include <algorithm>
+#include <climits>
+#include <limits>
+#include <string>
+#include <vector>
+
+//---- Storage plane related functions ----------------------------------------------------
+
+interface IPropertyTree;
+interface IPropertyTreeIterator;
+
+extern jlib_decl IPropertyTree * getHostGroup(const char * name, bool required);
+extern jlib_decl const IPropertyTree * getStoragePlaneConfig(const char * name, bool required);
+extern jlib_decl IPropertyTree * getRemoteStorage(const char * name);
+extern jlib_decl IPropertyTreeIterator * getRemoteStoragesIterator();
+extern jlib_decl IPropertyTreeIterator * getPlanesIterator(const char * category, const char *name);
+
+//MORE: Should use enum class to avoid potential symbol clashes
+enum PlaneAttributeType // remember to update planeAttributeInfo in jplane.cpp
+{
+    BlockedSequentialIO,
+    BlockedRandomIO,
+    FileSyncWriteClose,
+    ConcurrentWriteSupport,
+    WriteSyncMarginMs,
+    RenameSupported,
+    ReadAheadThreads,
+    PlaneAttributeCount
+};
+
+struct IndexReadOptions
+{
+    size32_t randomReadSize = 0;
+    size32_t sequentialReadSize = 0;
+};
+
+extern jlib_decl const char *getPlaneAttributeString(PlaneAttributeType attr);
+extern jlib_decl unsigned __int64 getPlaneAttributeValue(const char *planeName, PlaneAttributeType planeAttrType, unsigned __int64 defaultValue);
+extern jlib_decl const char *findPlaneFromPath(const char *filePath, StringBuffer &result);
+//returns true if plane exists, fills resultValue with defaultValue if attribute is unset
+extern jlib_decl bool findPlaneAttrFromPath(const char *filePath, PlaneAttributeType planeAttrType, unsigned __int64 defaultValue, unsigned __int64 &resultValue);
+extern jlib_decl size32_t getBlockedFileIOSize(const char *planeName, size32_t defaultSize=0);
+extern jlib_decl size32_t getBlockedRandomIOSize(const char *planeName, size32_t defaultSize=0);
+extern jlib_decl IndexReadOptions getForeignIndexReadOptions();
+extern jlib_decl IndexReadOptions getIndexReadOptions(const char *planeName);
+extern jlib_decl bool getRenameSupportedFromPath(const char *filePath);
+
+constexpr int noWriteSyncMarginDeltaMs = (std::numeric_limits<int>::min)();
+constexpr int forceWriteSyncWaitDeltaMs = 1; // stop-gap: size-checking write-sync waits (safeStat checkSize, read opens, CFileIO::size) wait out the full remaining margin for tracked parts
+extern jlib_decl void setWriteSyncMarginDeltaMs(int deltaMs); // A value of noWriteSyncMarginDeltaMs means "not set".
+extern jlib_decl void setJobWriteSyncMarginDeltaMs(int deltaMs); // Overrides the configured value until reset to noWriteSyncMarginDeltaMs.
+extern jlib_decl bool getWriteSyncMarginDeltaMs(int &deltaMs); // Returns true if a delta is set, and fills deltaMs with its value (which may be 0).
+
+// Write-sync visibility cache: tracks recently published file parts that may not yet be visible
+// due to eventual consistency. See jplane.cpp for full semantics, reasoning, and concurrency design.
+//
+// noteWriteSyncFiles is called with all of a file's part copies - each pairing the physical path a reader will
+// open with that part's published on-disk size ((offset_t)-1 means unknown/do-not-validate) and whether the
+// part is compressed - and a single precomputed visibility deadline, when a file's descriptor is created
+// (master lookup or slave deserialization); the whole batch is recorded under one lock.
+//
+// getFileWriteSyncDetails is consulted by jfile, with the same physical path, returning the visibility
+// deadline, the published size to validate against ((offset_t)-1 if none), and whether it is a compressed part
+// (which affects how an empty part is validated).
+struct WriteSyncFileInfo
+{
+    std::string path;                     // full physical path the reader will open
+    offset_t expectedSize = (offset_t)-1; // published on-disk size, or (offset_t)-1 if unknown / do not validate
+    bool compressed = false;              // part is compressed - affects how an empty (size 0) part is validated
+};
+// Monotonic (CLOCK_MONOTONIC) milliseconds; 64-bit so deadlines never wrap.
+inline unsigned __int64 writeSyncNowMs() { return nsTick() / 1000000; }
+struct WriteSyncDetails
+{
+    unsigned __int64 deadlineMs = 0;      // writeSyncNowMs() based visibility deadline; 0 if not tracked
+    offset_t expectedSize = (offset_t)-1;
+    bool compressed = false;
+
+    bool isTracked() const { return 0 != deadlineMs; }
+    unsigned queryRemainingMs() const
+    {
+        if (!deadlineMs)
+            return 0;
+        unsigned __int64 now = writeSyncNowMs();
+        if (now >= deadlineMs)
+            return 0;
+        // Defensive cap; configured write-sync margins should be far below UINT_MAX milliseconds.
+        return (unsigned)(std::min)(deadlineMs - now, (unsigned __int64)UINT_MAX);
+    }
+};
+extern jlib_decl void noteWriteSyncFiles(const std::vector<WriteSyncFileInfo> &files, unsigned __int64 deadlineMs);
+// Leaves writeSync untracked if the path was never mapped, or if its mapping has expired.
+extern jlib_decl void getFileWriteSyncDetails(const char *physicalPath, WriteSyncDetails &writeSync);
+#ifdef _USE_CPPUNIT
+extern jlib_decl void resetWriteSyncStateForTest();
+#endif
+
+//---------------------------------------------------------------------------------------------
+
+enum class AccessMode : unsigned
+{
+    // read | write - the access type required for this use of the file
+    // meta | physicalMeta | physical - which aspect of the data is going to be accessed.
+    // sequential | random - how is the physical data going to be accessed.
+
+    none            = 0x00000000,
+    read            = 0x00000001,           // read access required (additional flags specify whether logical,physical,meta,random/sequential)
+    write           = 0x00000002,           // write access required (additional flags specify whether logical,physical,meta,random/sequential)
+    sequential      = 0x00000004,           // sequential read or write required
+    random          = 0x00000008,           // corresponds to "random" reason in alias reasons
+    meta            = 0x00000010,           // meta data access (use if reading/writing to a logical file)
+    physicalMeta    = 0x00000020,           // physical meta data access (e.g. stat/exists)
+    physical        = 0x00000040,           // physical file access (use if reading/writing to a physical file)
+    extend          = 0x00000080,           // physically extend a file
+    external        = 0x00000100,           // the logical file is looked up here, but its physical parts may be accessed directly by an external client (e.g. hpcc4j) rather than through this process
+    noMount         = 0x01000000,           // corresponds to "api" reason in alias reasons
+
+    readLogicalMeta   = read | meta,          // read access - may not actually read the contents
+    writeLogicalMeta  = write | meta,         // write access - may also be used for delete
+    readPhysicalMeta  = read | physicalMeta,  // read access - may not actually read the contents
+    writePhysicalMeta = write | physicalMeta, // write access - may also be used
+
+    readMeta        = read | meta | physicalMeta,  // read logical + physical meta info
+    writeMeta       = write | meta | physicalMeta, // write logical + physical meta info
+    erase           = writeMeta,                   // alias for writeMeta - used for delete operations
+
+    // physical read patterns
+    readRandom      = readLogicalMeta | readPhysicalMeta | physical | random,
+    readSequential  = readLogicalMeta | readPhysicalMeta | physical | sequential,
+    readNoMount     = readLogicalMeta | readPhysicalMeta | physical | noMount,
+    readExternal    = readLogicalMeta | readPhysicalMeta | physical | external,
+
+    // physical write patterns
+    writeRandom     = writeLogicalMeta | writePhysicalMeta | physical | random,
+    writeSequential = writeLogicalMeta | writePhysicalMeta | physical | sequential,
+    writeExternal   = writeLogicalMeta | writePhysicalMeta | physical | external,
+};
+BITMASK_ENUM(AccessMode);
+inline bool isWrite(AccessMode mode) { return (mode & AccessMode::write) != AccessMode::none; }
+inline bool isPhysicalAccessMode(AccessMode accessMode) { return (accessMode & AccessMode::physical) != AccessMode::none; } // physically reading data
+inline bool isExternalAccess(AccessMode mode) { return (mode & AccessMode::external) != AccessMode::none; }
+
+extern jlib_decl AccessMode getAccessModeFromString(const char *access); // single access mode
+
+
+//---------------------------------------------------------------------------------------------
+
+interface IStoragePlane;
+interface IStoragePlaneAlias: extends IInterface
+{
+    virtual AccessMode queryModes() const = 0;
+    virtual const char *queryPrefix() const = 0 ;
+    virtual bool isAccessible() const = 0;
+};
+
+//I'm not sure if this should be used in place of an IGroup, probably as system gradually changes
+interface IStorageApiInfo;
+
+struct StorageApiConfig
+{
+    static constexpr bool defaultTraceEnabled = false;                                    // tracing disabled
+    static constexpr unsigned __int64 defaultParallelThresholdBytes = 16 * 1024 * 1024;   // 16MB in bytes
+    static constexpr unsigned defaultParallelConcurrency = 16;                            // 16 concurrent connections
+    static constexpr unsigned __int64 defaultParallelChunkBytes = 4 * 1024 * 1024;        // 4MB in bytes
+    static constexpr unsigned __int64 defaultParallelInitialChunkBytes = 4 * 1024 * 1024; // 4MB in bytes
+    static constexpr unsigned defaultConnectionTimeoutMs = 10000;                         // 10 seconds
+    static constexpr unsigned defaultMaxRetries = 5;                                      // 5 retries after the initial request
+    static constexpr unsigned defaultRetryDelayMs = 1000;                                 // 1 second
+    static constexpr unsigned defaultMaxRetryDelayMs = 30000;                             // 30 seconds
+
+    bool traceEnabled = defaultTraceEnabled;
+    unsigned __int64 parallelThresholdBytes = defaultParallelThresholdBytes;
+    unsigned parallelConcurrency = defaultParallelConcurrency;
+    unsigned __int64 parallelChunkBytes = defaultParallelChunkBytes;
+    unsigned __int64 parallelInitialChunkBytes = defaultParallelInitialChunkBytes;
+    unsigned maxRetries = defaultMaxRetries;
+    unsigned retryDelayMs = defaultRetryDelayMs;
+    unsigned maxRetryDelayMs = defaultMaxRetryDelayMs;
+};
+
+// This interface should only have specialized methods for accessing the plane information, rather a general function to return a property tree
+interface IStoragePlane: extends IInterface
+{
+    virtual const char * queryName() const = 0;
+    virtual const char * queryPrefix() const = 0;
+    virtual const char * queryMirrorPrefix() const = 0;
+    virtual unsigned numDevices() const = 0;
+    virtual const std::vector<std::string> &queryHosts() const = 0;
+    virtual unsigned numDefaultSprayParts() const = 0 ;
+    virtual bool queryDirPerPart() const = 0;
+    virtual unsigned queryNumStripes() const = 0;
+    virtual unsigned queryDefaultCopies() const = 0;
+    virtual IStoragePlaneAlias *getAliasMatch(AccessMode desiredModes) const = 0;
+    virtual IStorageApiInfo *getStorageApiInfo() const = 0;
+    virtual bool isAccessible() const = 0;
+    virtual bool isStriped() const = 0;
+    virtual unsigned __int64 getAttribute(PlaneAttributeType attr, unsigned __int64 defaultValue) const = 0;
+    virtual bool isAnyDeviceLocal() const = 0;
+    virtual bool compressOnWrite() const = 0;
+    virtual const char * queryCompression() const = 0;
+    virtual const IPropertyTree * queryConfig() const = 0; // More specific functions strongly preferred
+};
+
+using StoragePlaneArray = IConstArrayOf<IStoragePlane>;
+
+extern jlib_decl const IStoragePlane * getStoragePlaneByName(const char * name, bool required);
+extern jlib_decl const IStoragePlane * getStoragePlaneFromPath(const char *filePath, bool required);
+extern jlib_decl const IStoragePlane * getDataStoragePlane(const char * name, bool required);
+extern jlib_decl const IStoragePlane * getRemoteStoragePlane(const char * name, bool required);
+extern jlib_decl IStoragePlane * createStoragePlane(IPropertyTree *meta);
+extern jlib_decl void getDataStoragePlanes(StoragePlaneArray &planes);
+extern jlib_decl unsigned getGlobalConnectionTimeoutMs();
+
+extern jlib_decl bool getDefaultStoragePlane(StringBuffer &ret);
+extern jlib_decl bool getDefaultSpillPlane(StringBuffer &ret);
+extern jlib_decl bool getDefaultIndexBuildStoragePlane(StringBuffer &ret);
+extern jlib_decl bool getDefaultPersistPlane(StringBuffer &ret);
+extern jlib_decl bool getDefaultJobTempPlane(StringBuffer &ret);
+extern jlib_decl bool getRenameSupportedFromPlane(const IStoragePlane * plane); // NB: no default
+
+
+extern jlib_decl unsigned getNumPlaneStripes(const char *clusterName);
+extern jlib_decl bool isHostInPlane(IPropertyTree *plane, const char *host, bool ipMatch);
+extern jlib_decl bool getPlaneHost(StringBuffer &host, const IPropertyTree *plane, unsigned which);
+extern jlib_decl void getPlaneHosts(StringArray &hosts, const IPropertyTree *plane);
+extern jlib_decl bool isPathInPlane(IPropertyTree *plane, const char *path);
+
+#endif

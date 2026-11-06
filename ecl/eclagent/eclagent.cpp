@@ -15,13 +15,19 @@
     limitations under the License.
 ############################################################################## */
 
-#include "build-config.h"
+#include <algorithm>
+#include <limits>
+#include <memory>
+#include <new>
+
 #include "jlib.hpp"
+#include "jcontainerized.hpp"
 #include "jmisc.hpp"
 #include "jdebug.hpp"
 #include "jptree.hpp"
 #include "jprop.hpp"
 #include "jfile.hpp"
+#include "jplane.hpp"
 #include "jsocket.hpp"
 #include "jregexp.hpp"
 #include "mplog.hpp"
@@ -40,7 +46,6 @@
 #include "rtlds_imp.hpp"
 #include "rtlcommon.hpp"
 #include "rtldynfield.hpp"
-#include "workunit.hpp"
 #include "eventqueue.hpp"
 #include "schedulectrl.hpp"
 #include "jhtree.hpp"
@@ -54,16 +59,17 @@
 #include "roxiehelper.hpp"
 #include "jlzw.hpp"
 #include "anawu.hpp"
+#include "hpccconfig.hpp"
 
-using roxiemem::OwnedRoxieString;
-
-#include <memory>
-#include <new>
+#include "ws_dfsclient.hpp"
+#include "wfcontext.hpp"
 
 #ifdef _USE_CPPUNIT
 #include <cppunit/extensions/TestFactoryRegistry.h>
 #include <cppunit/ui/text/TestRunner.h>
 #endif
+
+using roxiemem::OwnedRoxieString;
 
 
 //#define LEAK_FILE         "c:\\leaks.txt"
@@ -85,7 +91,6 @@ typedef IEclProcess* (* EclProcessFactory)();
 
 constexpr LogMsgCategory MCsetresult = MCprogress(100);     // Category used to inform when setting result
 constexpr LogMsgCategory MCgetresult = MCprogress(200);     // Category used to inform when getting result
-constexpr LogMsgCategory MCresolve = MCprogress(100);       // Category used to inform during name resolution
 constexpr LogMsgCategory MCrunlock = MCprogress(100);      // Category used to inform about run lock progress
 
 Owned<IPropertyTree> agentTopology;
@@ -125,14 +130,14 @@ static const char * getResultText(StringBuffer & s, const char * stepname, unsig
 
 void logGetResult(const char * name, const char * stepname, unsigned sequence)
 {
-    LOG(MCgetresult, unknownJob, "getResult%s(%s,%d)", name, nullText(stepname), sequence);
+    LOG(MCgetresult, "getResult%s(%s,%d)", name, nullText(stepname), sequence);
 }
 
 //=======================================================================================
 
 interface IHThorDebugSocketListener : extends IInterface
 {
-    virtual void start() = 0;
+    virtual void start(bool inheritThreadContext) = 0;
     virtual bool stop(unsigned timeout) = 0;
     virtual void stopListening() = 0;
     virtual unsigned queryPort() const = 0;
@@ -142,18 +147,18 @@ interface IHThorDebugSocketListener : extends IInterface
 class CHThorDebugSocketListener : public Thread, implements IHThorDebugSocketListener, implements IThreadFactory
 {
     unsigned port;
-    bool running;
+    std::atomic<bool> running;
     bool suspended;
-    Semaphore started;
+    Semaphore started{SYNC_LOCATION};
     Owned<ISocket> socket;
     Owned<IThreadPool> pool;
     Owned<CHThorDebugContext> debugContext;
     SocketEndpoint ep;
 
-    CriticalSection activeCrit;
+    CriticalSection activeCrit{SYNC_LOCATION};
 
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
     CHThorDebugSocketListener(CHThorDebugContext * _debugContext)
         : Thread("CHThorDebugSocketListener"), debugContext(_debugContext)
     {
@@ -163,13 +168,13 @@ public:
         unsigned poolSize = 10;//MORE : What is a good threadcoutn?
 
         // Note we allow a few additional threads than requested - these are the threads that return "Too many active queries" responses
-        pool.setown(createThreadPool("HThorSocketWorkerPool", this, NULL, poolSize+5, INFINITE));
+        pool.setown(createThreadPool("HThorSocketWorkerPool", this, false, nullptr, poolSize+5, INFINITE));
     }
 
-    virtual void start()
+    virtual void start(bool inheritThreadContext) override
     {
         assertex(!running);
-        Thread::start();
+        Thread::start(inheritThreadContext);
         started.wait();
     }
 
@@ -233,6 +238,7 @@ public:
         while (running)
         {
             ISocket *client = socket->accept(true);
+            // TLS TODO: secure_accept() on hThor debug socket if globally configured for mtls ...
             if (client)
             {
                 client->set_linger(-1);
@@ -336,15 +342,12 @@ public:
     virtual void threadmain() override
     {
         StringBuffer rawText;
-        unsigned priority = (unsigned) -2;
-        unsigned memused = 0;
         IpAddress peer;
         bool continuationNeeded;
         bool isStatus;
 
         Owned<IDebuggerContext> debuggerContext;
-        unsigned slavesReplyLen = 0;
-        HttpHelper httpHelper(NULL);
+        HttpHelper httpHelper(nullptr, nullptr);
         try
         {
             client->querySocket()->getPeerAddress(peer);
@@ -373,13 +376,12 @@ public:
             return;
         }
 
-        bool isRaw = false;
         bool isHTTP = false;
         Owned<IPropertyTree> queryXml;
         StringBuffer sanitizedText;
         StringAttr queryName;
         StringBuffer peerStr;
-        peer.getIpText(peerStr);
+        peer.getHostText(peerStr);
         const char *uid = "-";
         StringBuffer ctxstr;
         try
@@ -397,8 +399,6 @@ public:
             }
             bool isRequest = false;
             bool isRequestArray = false;
-            bool isBlind = false;
-            bool isDebug = false;
 
             sanitizeQuery(queryXml, queryName, sanitizedText, isHTTP, uid, isRequest, isRequestArray);
             DBGLOG("Received debug query %s", sanitizedText.str());
@@ -456,7 +456,7 @@ void CHThorDebugContext::debugInitialize(const char *_id, const char *_queryName
 
     //Start debug socket listener thread
     listener.setown(new CHThorDebugSocketListener(this));
-    listener->start();
+    listener->start(false);
 }
 
 void CHThorDebugContext::debugInterrupt(IXmlWriter *output)
@@ -512,7 +512,7 @@ public:
 //=======================================================================================
 
 EclAgent::EclAgent(IConstWorkUnit *wu, const char *_wuid, bool _checkVersion, bool _resetWorkflow, bool _noRetry, char const * _logname, const char *_allowedPipeProgs, IPropertyTree *_queryXML, ILogMsgHandler * _logMsgHandler)
-    : wuRead(wu), wuid(_wuid), checkVersion(_checkVersion), resetWorkflow(_resetWorkflow), noRetry(_noRetry), allowedPipeProgs(_allowedPipeProgs), logMsgHandler(_logMsgHandler)
+    : wuRead(wu), wuid(_wuid), checkVersion(_checkVersion), resetWorkflow(_resetWorkflow), noRetry(_noRetry), allowedPipeProgs(_allowedPipeProgs), logMsgHandler(_logMsgHandler), statsAggregator(stdAggregateKindStatistics)
 {
     isAborting = false;
     isStandAloneExe = false;
@@ -526,7 +526,7 @@ EclAgent::EclAgent(IConstWorkUnit *wu, const char *_wuid, bool _checkVersion, bo
     clusterNames.append(wuRead->queryClusterName());
     clusterWidth = -1;
     abortmonitor = new cAbortMonitor(*this);
-    abortmonitor->start();
+    abortmonitor->start(false);
     EnableSEHtoExceptionMapping();
     setSEHtoExceptionHandler(abortmonitor);
     retcode = 0;
@@ -550,7 +550,7 @@ EclAgent::EclAgent(IConstWorkUnit *wu, const char *_wuid, bool _checkVersion, bo
             Owned<IPropertyTree> graphTree = createPTree("Graph");
             graphTree->addProp("@id", graphName.str());
             Owned<IPropertyTree> xgmmlTree = createPTree("xgmml");
-            Owned<IPropertyTree> graphXgmml = graphs->query().getXGMMLTree(false);
+            Owned<IPropertyTree> graphXgmml = graphs->query().getXGMMLTree(false, false);
             xgmmlTree->addPropTree("graph", graphXgmml.getClear());
             graphTree->addPropTree("xgmml", xgmmlTree.getClear());
             destTree->addPropTree("Graph", graphTree.getClear());
@@ -565,21 +565,12 @@ EclAgent::EclAgent(IConstWorkUnit *wu, const char *_wuid, bool _checkVersion, bo
             w->setXmlParams(_queryXML);
         updateSuppliedXmlParams(w);
     }
+    abortmonitor->setGuillotineCost(getGuillotineCost(wu));
+    configurePreferredPlanes();
     agentMachineCost = getMachineCostRate();
-    if (agentMachineCost > 0.0)
-    {
-        IPropertyTree *costs = queryCostsConfiguration();
-        if (costs)
-        {
-            double softCostLimit = costs->getPropReal("@limit");
-            double guillotineCost = wu->getDebugValueReal("maxCost", softCostLimit);
-            double hardCostLimit = costs->getPropReal("@hardlimit");
-            if (hardCostLimit && ((guillotineCost == 0) || (guillotineCost > hardCostLimit)))
-                guillotineCost = hardCostLimit;
-            abortmonitor->setGuillotineCost(money2cost_type(guillotineCost));
-        }
-    }
-
+    baseAuditContext = queryDefaultDFSAuditContext();
+    baseAuditContext.setValue("user", wuRead->queryUser());
+    baseAuditContext.setValue("wuid", _wuid);
 }
 
 EclAgent::~EclAgent()
@@ -619,57 +610,91 @@ const char *EclAgent::queryTempfilePath()
     if (agentTempDir.isEmpty())
     {
         StringBuffer dir;
-        getTempFilePath(dir, "eclagent", agentTopology);
+        getSpillFilePath(dir, "eclagent", agentTopology);
         agentTempDir.set(dir.str());
     }
     return agentTempDir.str();
 }
 
-StringBuffer & EclAgent::getTempfileBase(StringBuffer & buff)
+StringBuffer &EclAgent::getTempfileBase(StringBuffer &buff)
 {
-    return buff.append(queryTempfilePath()).append(PATHSEPCHAR).append(wuid);
+    return buff.append(queryTempfilePath()).append(PATHSEPCHAR).appendLower(wuid);
 }
 
-const char *EclAgent::queryTemporaryFile(const char *fname)
+void EclAgent::buildTempFilename(StringBuffer &tempFilename, const char *name)
 {
-    StringBuffer tempfilename;
-    getTempfileBase(tempfilename).append(PATHSEPCHAR).append(fname);
-    CriticalBlock crit(tfsect);
-    ForEachItemIn(idx, tempFiles)
+    getTempfileBase(tempFilename).append(PATHSEPCHAR).append(name);
+}
+
+const char *EclAgent::queryTemporaryFile(const char *name)
+{
+    dbgassertex(!isEmptyString(name));
+
+    StringBuffer tempFilename;
+    buildTempFilename(tempFilename, name);
+
     {
-        if (strcmp(tempFiles.item(idx), tempfilename.str())==0)
-            return tempFiles.item(idx);
+        CriticalBlock crit(tfsect);
+
+        auto it = tempFileSet.find(tempFilename.str());
+        if (it != tempFileSet.end())
+            return it->c_str();
     }
-    StringBuffer errmsg;
-    errmsg.append("Attempt to read temp file that has not yet been registered: ").append(tempfilename);
+
+    VStringBuffer errmsg("Attempt to read temp file that has not yet been registered: %s", name);
     fail(0, errmsg.str());
-    return 0;
+    return nullptr;
 }
 
-const char *EclAgent::noteTemporaryFile(const char *fname)
+const char *EclAgent::noteTemporaryFile(const char *name)
 {
-    StringBuffer tempfilename;
-    getTempfileBase(tempfilename).append(PATHSEPCHAR).append(fname);
-    CriticalBlock crit(tfsect);
-    tempFiles.append(tempfilename.str());
-    return tempFiles.item(tempFiles.length()-1);
+    dbgassertex(!isEmptyString(name));
+
+    StringBuffer tempFilename;
+    buildTempFilename(tempFilename, name);
+
+    std::pair<std::set<std::string>::iterator, bool> inserted;
+    {
+        CriticalBlock crit(tfsect);
+
+        inserted = tempFileSet.emplace(tempFilename.str());
+    }
+
+    // The returned pointer refers to the std::string stored in tempFileSet and
+    // is only valid while that entry remains in the set.
+
+    if (!inserted.second)
+    {
+        VStringBuffer errmsg("Temp file already registered: %s", name);
+        fail(0, errmsg.str());
+        return nullptr;
+    }
+
+    return inserted.first->c_str();
 }
 
-const char *EclAgent::noteTemporaryFilespec(const char *fspec)
+void EclAgent::removeTemporaryFile(const char *fname)
 {
+    dbgassertex(!isEmptyString(fname));
+
     CriticalBlock crit(tfsect);
-    tempFiles.append(fspec);
-    return tempFiles.item(tempFiles.length()-1);
+
+    auto it = tempFileSet.find(std::string(fname));
+    dbgassertex(it != tempFileSet.end());
+    if (it != tempFileSet.end())
+    {
+        remove(it->c_str());
+        tempFileSet.erase(it);
+    }
 }
 
 void EclAgent::deleteTempFiles()
 {
     CriticalBlock crit(tfsect);
-    ForEachItemIn(idx, tempFiles)
-    {
-        remove(tempFiles.item(idx));
-    }
-    tempFiles.kill();
+
+    for (const auto& f : tempFileSet)
+        remove(f.c_str());
+    tempFileSet.clear();
 }
 
 const char *EclAgent::loadResource(unsigned id)
@@ -727,7 +752,7 @@ IConstWUResult *EclAgent::getResultForGet(const char *name, unsigned sequence)
 
 IConstWUResult *EclAgent::getExternalResult(const char * wuid, const char *name, unsigned sequence)
 {
-    LOG(MCsetresult, unknownJob, "EclAgent::getExternalResult(wuid:'%s',name='%s',sequence:%d)", nullText(wuid), nullText(name), sequence);
+    LOG(MCsetresult, "EclAgent::getExternalResult(wuid:'%s',name='%s',sequence:%d)", nullText(wuid), nullText(name), sequence);
     Owned<IWorkUnitFactory> factory = getWorkUnitFactory();
     Owned<IConstWorkUnit> externalWU = factory->openWorkUnit(wuid);
     if (externalWU)
@@ -776,7 +801,7 @@ void EclAgent::outputFormattedResult(const char * name, unsigned sequence, bool 
 
 void EclAgent::setResultInt(const char * name, unsigned sequence, __int64 val, unsigned size)
 {
-    LOG(MCsetresult, unknownJob, "setResultInt(%s,%d,%" I64F "d)", nullText(name), sequence, val);
+    LOG(MCsetresult, "setResultInt(%s,%d,%" I64F "d)", nullText(name), sequence, val);
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> r = updateWorkUnitResult(w, name, sequence);
     if (r)
@@ -800,7 +825,7 @@ void EclAgent::setResultInt(const char * name, unsigned sequence, __int64 val, u
 
 void EclAgent::setResultUInt(const char * name, unsigned sequence, unsigned __int64 val, unsigned size)
 {
-    LOG(MCsetresult, unknownJob, "setResultUInt(%s,%d,%" I64F "u)", nullText(name), sequence, val);
+    LOG(MCsetresult, "setResultUInt(%s,%d,%" I64F "u)", nullText(name), sequence, val);
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> r = updateWorkUnitResult(w, name, sequence);
     if (r)
@@ -825,7 +850,7 @@ void EclAgent::setResultUInt(const char * name, unsigned sequence, unsigned __in
 void EclAgent::setResultReal(const char *name, unsigned sequence, double val)
 {
     // Still a bit of a mess - variables vs results
-    LOG(MCsetresult, unknownJob, "setResultReal(%s,%d,%6f)", nullText(name), sequence, val);
+    LOG(MCsetresult, "setResultReal(%s,%d,%6f)", nullText(name), sequence, val);
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> r = updateWorkUnitResult(w, name, sequence);
     if (r)
@@ -919,7 +944,6 @@ UChar *EclAgent::getResultVarUnicode(const char * stepname, unsigned sequence)
     PROTECTED_GETRESULT(stepname, sequence, "VarUnicode", "unicode",
         MemoryBuffer result;
         r->getResultUnicode(MemoryBuffer2IDataVal(result));
-        unsigned tlen = result.length()/2;
         result.append((UChar)0);
         return (UChar *)result.detach();
     );
@@ -1126,7 +1150,7 @@ void EclAgent::setResultData(const char * stepname, unsigned sequence, int len, 
 
 void EclAgent::doSetResultString(type_t type, const char *name, unsigned sequence, int len, const char *val)
 {
-    LOG(MCsetresult, unknownJob, "setResultString(%s,%d,(%d bytes))", nullText(name), sequence, len);
+    LOG(MCsetresult, "setResultString(%s,%d,(%d bytes))", nullText(name), sequence, len);
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> r = updateWorkUnitResult(w, name, sequence);
     if (r)
@@ -1151,7 +1175,7 @@ void EclAgent::doSetResultString(type_t type, const char *name, unsigned sequenc
 //used to output a row
 void EclAgent::setResultRaw(const char * name, unsigned sequence, int len, const void *val)
 {
-    LOG(MCsetresult, unknownJob, "setResultRaw(%s,%d,(%d bytes))", nullText(name), sequence, len);
+    LOG(MCsetresult, "setResultRaw(%s,%d,(%d bytes))", nullText(name), sequence, len);
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> r = updateWorkUnitResult(w, name, sequence);
     if (r)
@@ -1175,7 +1199,7 @@ void EclAgent::setResultRaw(const char * name, unsigned sequence, int len, const
 
 void EclAgent::setResultSet(const char * name, unsigned sequence, bool isAll, size32_t len, const void *val, ISetToXmlTransformer *xform)
 {
-    LOG(MCsetresult, unknownJob, "setResultSet(%s,%d)", nullText(name), sequence);
+    LOG(MCsetresult, "setResultSet(%s,%d)", nullText(name), sequence);
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> r = updateWorkUnitResult(w, name, sequence);
     if (r)
@@ -1235,7 +1259,7 @@ void EclAgent::setResultSet(const char * name, unsigned sequence, bool isAll, si
 
 void EclAgent::setResultUnicode(const char * name, unsigned sequence, int len, UChar const * val)
 {
-    LOG(MCsetresult, unknownJob, "setResultUnicode(%s,%d)", nullText(name), sequence);
+    LOG(MCsetresult, "setResultUnicode(%s,%d)", nullText(name), sequence);
 
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> r = updateWorkUnitResult(w, name, sequence);
@@ -1263,7 +1287,7 @@ void EclAgent::setResultUnicode(const char * name, unsigned sequence, int len, U
 
 void EclAgent::setResultBool(const char *name, unsigned sequence, bool val)
 {
-    LOG(MCsetresult, unknownJob, "setResultBool(%s,%d,%s)", nullText(name), sequence, val ? "true" : "false");
+    LOG(MCsetresult, "setResultBool(%s,%d,%s)", nullText(name), sequence, val ? "true" : "false");
 
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> r = updateWorkUnitResult(w, name, sequence);
@@ -1288,7 +1312,7 @@ void EclAgent::setResultBool(const char *name, unsigned sequence, bool val)
 
 void EclAgent::setResultDecimal(const char *name, unsigned sequence, int len, int precision, bool isSigned, const void *val)
 {
-    LOG(MCsetresult, unknownJob, "setResultDecimal(%s,%d)", nullText(name), sequence);
+    LOG(MCsetresult, "setResultDecimal(%s,%d)", nullText(name), sequence);
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> r = updateWorkUnitResult(w, name, sequence);
     if (r)
@@ -1317,7 +1341,7 @@ void EclAgent::setResultDecimal(const char *name, unsigned sequence, int len, in
 
 void EclAgent::setResultDataset(const char * name, unsigned sequence, size32_t len, const void *val, unsigned numRows, bool extend)
 {
-    LOG(MCsetresult, unknownJob, "setResultDataset(%s,%d)", nullText(name), sequence);
+    LOG(MCsetresult, "setResultDataset(%s,%d)", nullText(name), sequence);
     WorkunitUpdate w = updateWorkUnit();
     Owned<IWUResult> result = updateWorkUnitResult(w, name, sequence);
     if (!result)
@@ -1344,18 +1368,9 @@ char * EclAgent::resolveName(const char *in, char *out, unsigned outlen)
     return NULL;
 }
 
-void EclAgent::logFileAccess(IDistributedFile * file, char const * component, char const * type, EclGraph & activeGraph)
+const DFSAuditContext & EclAgent::queryBaseAuditContext() const
 {
-    const char * cluster = clusterNames.item(clusterNames.length()-1);
-    LOG(MCauditInfo,
-        ",FileAccess,%s,%s,%s,%s,%s,%s,%s",
-        component,
-        type,
-        ensureText(cluster),
-        ensureText(userid.get()),
-        file->queryLogicalName(),
-        wuid.get(),
-        activeGraph.queryGraphName());
+    return baseAuditContext;
 }
 
 bool EclAgent::expandLogicalName(StringBuffer & fullname, const char * logicalName)
@@ -1383,7 +1398,7 @@ bool EclAgent::expandLogicalName(StringBuffer & fullname, const char * logicalNa
     return useScope;
 }
 
-ILocalOrDistributedFile *EclAgent::resolveLFN(const char *fname, const char *errorTxt, bool optional, bool noteRead, bool isWrite, StringBuffer * expandedlfn, bool isPrivilegedUser)
+ILocalOrDistributedFile *EclAgent::resolveLFN(const char *fname, const char *errorTxt, bool optional, bool noteRead, AccessMode accessMode, StringBuffer * expandedlfn, bool isPrivilegedUser, IDistributedFileTransaction * transaction)
 {
     StringBuffer lfn;
     expandLogicalFilename(lfn, fname, queryWorkUnit(), resolveFilesLocally, false);
@@ -1403,7 +1418,12 @@ ILocalOrDistributedFile *EclAgent::resolveLFN(const char *fname, const char *err
     }
     if (expandedlfn)
         *expandedlfn = lfn;
-    Owned<ILocalOrDistributedFile> ldFile = createLocalOrDistributedFile(lfn.str(), queryUserDescriptor(), resolveFilesLocally, !resolveFilesLocally, isWrite, isPrivilegedUser);
+    /*
+     * NB: this code and ILocalOrDistributedFile should be revisited when DFS is refactored
+     * hthor doesn't use it to write, but instead uses createClusterWriteHandler to handle cluster writing.
+     * See code in e.g.: CHThorDiskWriteActivity::resolve
+     */
+    Owned<ILocalOrDistributedFile> ldFile = createLocalOrDistributedFile(lfn.str(), queryUserDescriptor(), resolveFilesLocally, !resolveFilesLocally, accessMode, isPrivilegedUser, nullptr, baseAuditContext, transaction);
     if (ldFile)
     {
         IDistributedFile * dFile = ldFile->queryDistributedFile();
@@ -1437,11 +1457,10 @@ ILocalOrDistributedFile *EclAgent::resolveLFN(const char *fname, const char *err
 
 bool EclAgent::fileExists(const char *name)
 {
-    unsigned __int64 size = 0;
     StringBuffer lfn;
     expandLogicalName(lfn, name);
 
-    Owned<IDistributedFile> f = queryDistributedFileDirectory().lookup(lfn.str(),queryUserDescriptor(), false, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> f = wsdfs::lookup(lfn.str(), queryUserDescriptor(), AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser, INFINITE);
     if (f)
         return true;
     return false;
@@ -1572,24 +1591,25 @@ char *EclAgent::getPlatform()
 char *EclAgent::getEnv(const char *name, const char *defaultValue) const
 {
     const char *val = cmdLineArgs->queryProp(name);
-    if (!val)
-        val = getenv(name);
     if (val)
         return strdup(val);
-    else if (defaultValue)
-        return strdup(defaultValue);
     else
-        return strdup("");
+        return getHPCCEnvVal(name, defaultValue);
 }
 
 void EclAgent::selectCluster(const char *newCluster)
 {
-    const char *oldCluster = queryWorkUnit()->queryClusterName();
+    StringAttr oldCluster = queryWorkUnit()->queryClusterName();
     if (getClusterType(clusterType)==HThorCluster)
     {
-        // If the current cluster is an hthor cluster, it's an error to change it...
-        if (!streq(oldCluster, newCluster))
+        // If the current cluster is an hthor cluster and cluster hopping is not enabled, it's an error to change clusters...
+        if (!streq(oldCluster, newCluster) && !wuRead->getDebugValueBool("usingClusterHopping", false))
             throw MakeStringException(-1, "Error - cannot switch cluster in hthor jobs");
+    }
+    else if (getClusterType(clusterType) == RoxieCluster)
+    {
+        if (!streq(oldCluster, newCluster))
+            throw MakeStringException(-1, "Error - cannot switch cluster in roxie jobs");
     }
     if (!streq(oldCluster, newCluster))
     {
@@ -1619,7 +1639,7 @@ void EclAgent::restoreCluster(IWorkUnit *wu)
 
 unsigned EclAgent::getNodes()//retrieve node count for current cluster
 {
-    if (clusterWidth == -1)
+    if (clusterWidth == (unsigned)-1)
     {
         if (!isStandAloneExe)
         {
@@ -1647,10 +1667,13 @@ unsigned EclAgent::getNodes()//retrieve node count for current cluster
     return clusterWidth;
 }
 
-void EclAgent::setBlocked()
+void EclAgent::setBlocked(const char *reason)
 {
+    if (isEmptyString(reason))
+        throw makeStringException(-1, "EclAgent::setBlocked requires a non-empty reason");
+
     WorkunitUpdate w = updateWorkUnit();
-    w->setState(WUStateBlocked);
+    setBlockedState(w, reason);
 }
 
 void EclAgent::setRunning()
@@ -1860,28 +1883,51 @@ void EclAgent::doProcess()
     CCycleTimer elapsedTimer;
     try
     {
-        LOG(MCrunlock, unknownJob, "Waiting for workunit lock");
+        LOG(MCrunlock, "Waiting for workunit lock");
         unsigned eclccCodeVersion;
         {
             WorkunitUpdate w = updateWorkUnit();
-            LOG(MCrunlock, unknownJob, "Obtained workunit lock");
+            LOG(MCrunlock, "Obtained workunit lock");
             if (w->hasDebugValue("traceLevel"))
                 traceLevel = w->getDebugValueInt("traceLevel", 10);
-            w->setTracingValue("EclAgentBuild", BUILD_TAG);
+            w->setTracingValue("EclAgentBuild", hpccBuildInfo.buildTag);
             if (agentTopology->hasProp("@name"))
-                w->addProcess("EclAgent", agentTopology->queryProp("@name"), GetCurrentProcessId(), 0, nullptr, false, logname.str());
+            {
+                if (isContainerized())
+                    w->setContainerizedProcessInfo("EclAgent", agentTopology->queryProp("@name"), k8s::queryMyPodName(), k8s::queryMyContainerName(), nullptr, nullptr);
+                else
+                    w->addProcess("EclAgent", agentTopology->queryProp("@name"), GetCurrentProcessId(), 0, nullptr, false, logname.str());
+            }
 
             eclccCodeVersion = w->getCodeVersion();
             if (eclccCodeVersion == 0)
                 throw makeStringException(0, "Attempting to execute a workunit that hasn't been compiled");
             if (checkVersion && ((eclccCodeVersion > ACTIVITY_INTERFACE_VERSION) || (eclccCodeVersion < MIN_ACTIVITY_INTERFACE_VERSION)))
                 failv(0, "Workunit was compiled for eclagent interface version %d, this eclagent requires version %d..%d", eclccCodeVersion, MIN_ACTIVITY_INTERFACE_VERSION, ACTIVITY_INTERFACE_VERSION);
+            if (checkVersion && eclccCodeVersion == 652)
+            {
+                // Any workunit compiled using eclcc 7.12.0-7.12.18 is not compatible
+                StringBuffer buildVersion, eclVersion;
+                w->getBuildVersion(StringBufferAdaptor(buildVersion), StringBufferAdaptor(eclVersion));
+                const char *version = strstr(buildVersion, "7.12.");
+
+                //Avoid matching a version number in the path that was used to build (enclosed in [] at the end)
+                const char *extra = strchr(buildVersion, '[');
+                if (version && (!extra || version < extra))
+                {
+                    const char *point = version + strlen("7.12.");
+                    unsigned pointVer = atoi(point);
+                    if (pointVer <= 18)
+                        failv(0, "Workunit was compiled by eclcc version %s which is not compatible with this runtime", buildVersion.str());
+                }
+            }
             if(noRetry && (w->getState() == WUStateFailed))
                 throw MakeStringException(0, "Ecl agent started in 'no retry' mode for failed workunit, so failing");
             w->setState(WUStateRunning);
             addTimeStamp(w, SSTglobal, NULL, StWhenStarted);
             if (isRemoteWorkunit)
             {
+                w->setEngineSession(-1); // Clear stale engine session on startup.
                 w->setAgentSession(myProcessSession());
                 w->clearGraphProgress();  // Should Roxie do this too??
             }
@@ -1890,7 +1936,7 @@ void EclAgent::doProcess()
                 w->setDebugAgentListenerPort(debugContext->queryPort());
 
                 StringBuffer sb;
-                queryHostIP().getIpText(sb);
+                queryHostIP().getHostText(sb);
                 w->setDebugAgentListenerIP(sb);
             }
             if(resetWorkflow)
@@ -1940,11 +1986,6 @@ void EclAgent::doProcess()
         logException((IException *) NULL);
     }
 
-#ifdef _CONTAINERIZED
-    // signal to any lingering Thor's that job is complete and they can quit before timeout.
-    executeGraphOnLingeringThor(*wuRead, nullptr, nullptr);
-#endif
-
     DBGLOG("Process complete");
     // Add some timing stats
     bool deleteJobTemps = true;
@@ -1958,9 +1999,12 @@ void EclAgent::doProcess()
         const __int64 elapsedNs = elapsedTimer.elapsedNs();
         updateWorkunitStat(w, SSTglobal, NULL, StTimeElapsed, nullptr, elapsedNs);
 
-        const cost_type cost = aggregateCost(w, nullptr, false);
+        const cost_type cost = aggregateCost(w, nullptr, StCostExecute, 3, false);
         if (cost)
             w->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTglobal, "", StCostExecute, NULL, cost, 1, 0, StatsMergeReplace);
+        cost_type costSavingPotential = aggregateCost(w, nullptr, StCostSavingPotential, 2);
+        if (costSavingPotential)
+            w->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTglobal, "", StCostSavingPotential, nullptr, costSavingPotential, 1, 0, StatsMergeSum);
 
         addTimings(w);
 
@@ -1996,14 +2040,6 @@ void EclAgent::doProcess()
             break;
         }
 
-        if (w->getState() == WUStateCompleted && getClusterType(clusterType)==ThorLCRCluster)
-        {
-            if (w->getDebugValueBool("analyzeWorkunit", agentTopology->getPropBool("@analyzeWorkunit", true)))
-            {
-                IPropertyTree *analyzerOptions = agentTopology->queryPropTree("analyzerOptions");
-                analyseWorkunit(w.get(), analyzerOptions);
-            }
-        }
         if(w->queryEventScheduledCount() > 0)
             switch(w->getState())
             {
@@ -2052,6 +2088,8 @@ void EclAgent::doProcess()
                 UWARNLOG(errCode, "%s", rmMsg.str());
         }
 
+        w->setAgentSession(-1);
+        w->setEngineSession(-1); // also clear engine session, the engine should have done so if clean, but this is a fail safe. (leaving it behind can cause false abort problems if the workunit is resubmitted)
     }
     catch (IException *e)
     {
@@ -2099,44 +2137,48 @@ void EclAgent::runProcess(IEclProcess *process)
     assertex(rowManager==NULL);
     allocatorMetaCache.setown(createRowAllocatorCache(this));
 
-    //Get memory limit. Workunit specified value takes precedence over config file
-    int memLimitMB = agentTopology->getPropInt("@defaultMemoryLimitMB", DEFAULT_MEM_LIMIT);
-    memLimitMB = queryWorkUnit()->getDebugValueInt("hthorMemoryLimit", memLimitMB);
+    Owned<IProperties> traceHeaders = extractTraceDebugOptions(queryWorkUnit());
+    OwnedActiveSpanScope requestSpan = queryTraceManager().createServerSpan("run_workunit", traceHeaders);
+    ContextSpanScope spanScope(updateDummyContextLogger(), requestSpan);
+    requestSpan->setSpanAttribute("hpcc.wuid", queryWorkUnit()->queryWuid());
+    COnScopeExit clearWriteSyncMarginDelta([] { setJobWriteSyncMarginDeltaMs(noWriteSyncMarginDeltaMs); });
 
-    bool allowHugePages = agentTopology->getPropBool("@heapUseHugePages", false);
+    // Clamp to int range so an out-of-range option value cannot silently wrap/truncate (it is a ms adjustment).
+    int writeSyncMarginDelta = (int)std::clamp<__int64>(queryWorkUnit()->getDebugValueInt64("writeSyncMarginDeltaMs", noWriteSyncMarginDeltaMs),
+        std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
 
-    bool allowTransparentHugePages = agentTopology->getPropBool("@heapUseTransparentHugePages", true);
-
-    bool retainMemory = agentTopology->getPropBool("@heapRetainMemory", false);
-
-    if (agentTopology->hasProp("@httpGlobalIdHeader"))
-        updateDummyContextLogger().setHttpIdHeaders(agentTopology->queryProp("@httpGlobalIdHeader"), agentTopology->queryProp("@httpCallerIdHeader"));
-
-    if (queryWorkUnit()->hasDebugValue("GlobalId"))
+    if (noWriteSyncMarginDeltaMs != writeSyncMarginDelta)
     {
-        SCMStringBuffer globalId;
-        queryWorkUnit()->getDebugValue("GlobalId", globalId);
-        if (globalId.length())
-        {
-            SocketEndpoint thorEp;
-            thorEp.setLocalHost(0);
-            updateDummyContextLogger().setGlobalId(globalId.str(), thorEp, GetCurrentProcessId());
-
-            VStringBuffer msg("GlobalId: %s", globalId.str());
-            SCMStringBuffer txId;
-            queryWorkUnit()->getDebugValue("CallerId", txId);
-            if (txId.length())
-            {
-                updateDummyContextLogger().setCallerId(txId.str());
-                msg.append(", CallerId: ").append(txId.str());
-            }
-            txId.set(updateDummyContextLogger().queryLocalId());
-            if (txId.length())
-                msg.append(", LocalId: ").append(txId.str());
-            updateDummyContextLogger().CTXLOG("%s", msg.str());
-        }
+        setJobWriteSyncMarginDeltaMs(writeSyncMarginDelta);
+        WARNLOG("hthor write-sync margin delta active: writeSyncMarginDeltaMs=%d", writeSyncMarginDelta);
     }
 
+    // a component may specify an alternate name for the agent/workflow memory area,
+    // e.g. Thor specifies in "eclAgentMemory"
+    const char *jobMemorySectionName = agentTopology->queryProp("@jobMemorySectionName");
+    if (isEmptyString(jobMemorySectionName))
+        jobMemorySectionName = "jobMemory";
+    //Get memory limit. Workunit specified value takes precedence over config
+    unsigned memLimitMB = queryWorkUnit()->getDebugValueInt("hthorMemoryLimit", 0);
+    if (0 == memLimitMB)
+    {
+        if (isContainerized())
+        {
+            const char *resourcedMemory = agentTopology->queryProp("resources/@memory");
+            if (!isEmptyString(resourcedMemory))
+            {
+                offset_t sizeBytes = friendlyStringToSize(resourcedMemory);
+                memLimitMB = (unsigned)(sizeBytes / 0x100000);
+            }
+            else
+                memLimitMB = DEFAULT_MEM_LIMIT;
+            static constexpr float defaultPctSysMemForRoxie = 90.0;
+            if (!agentTopology->hasProp(VStringBuffer("%s/@maxMemPercentage", jobMemorySectionName)))
+                ensurePTree(agentTopology, jobMemorySectionName)->setPropReal("@maxMemPercentage", defaultPctSysMemForRoxie);
+        }
+        else
+            memLimitMB = (unsigned)agentTopology->getPropInt("@defaultMemoryLimitMB", DEFAULT_MEM_LIMIT);
+    }
 #ifndef __64BIT__
     if (memLimitMB > 4096)
     {
@@ -2145,12 +2187,65 @@ void EclAgent::runProcess(IEclProcess *process)
         fail(0, errmsg.str());
     }
 #endif
-    memsize_t memLimitBytes = (memsize_t)memLimitMB * 1024 * 1024;
-    roxiemem::setTotalMemoryLimit(allowHugePages, allowTransparentHugePages, retainMemory, memLimitBytes, 0, NULL, NULL);
+
+    auto getWorkUnitValueFunc = [this](const char *prop, StringBuffer &result)
+    {
+        SCMStringBuffer value;
+        queryWorkUnit()->getDebugValue(prop, value);
+        if (0 == value.length())
+            return false;
+        result.append(value.str());
+        return true;
+    };
+    std::unordered_map<std::string, __uint64> memorySpecifications;
+    getMemorySpecifications(memorySpecifications, agentTopology, jobMemorySectionName, memLimitMB, getWorkUnitValueFunc);
+
+    unsigned queryMemoryMB = (unsigned)(memorySpecifications["query"] / 0x100000);
+
+    if (0 == queryMemoryMB)
+    {
+        unsigned totalRequirementsMB = (unsigned)(memorySpecifications["total"] / 0x100000);
+        unsigned recommendedMaxMB = (unsigned)(memorySpecifications["recommendedMaxMemory"] / 0x100000);
+        unsigned remainingMemoryMB = recommendedMaxMB - totalRequirementsMB;
+        if (agentTopology->getPropBool("@useChildProcesses"))
+        {
+            /* If using child proceses and there is no per query specification of memory usage
+             * divide up the available memory between the maxAcive instances
+             * if < than the historical default, use that and hence over commit.
+             */
+            unsigned maxActive = agentTopology->getPropInt("@maxActive");
+            queryMemoryMB = remainingMemoryMB / maxActive;
+            if (queryMemoryMB < DEFAULT_MEM_LIMIT)
+                queryMemoryMB = DEFAULT_MEM_LIMIT;
+        }
+        else
+            queryMemoryMB = remainingMemoryMB;
+    }
+
+    // a simple helper used below, to fetch bool from workunit, or 'jobMemory/' or legacy location
+    auto getBoolSetting = [&](const char *setting, bool defaultValue)
+    {
+        VStringBuffer attrSetting("@%s", setting);
+        return queryWorkUnit()->getDebugValueBool(setting,
+            agentTopology->getPropBool(VStringBuffer("jobMemory/%s", attrSetting.str()),
+            agentTopology->getPropBool(attrSetting,
+            defaultValue
+                                 )));
+    };
+
+    bool allowHugePages = getBoolSetting("heapUseHugePages", false);
+    bool allowTransparentHugePages = getBoolSetting("heapUseTransparentHugePages", true);
+    bool retainMemory = getBoolSetting("heapRetainMemory", false);
+    bool lockMemory = getBoolSetting("heapLockMemory", false);
+
+    memsize_t memLimitBytes = (memsize_t)queryMemoryMB * 1024 * 1024;
+    roxiemem::setTotalMemoryLimit(allowHugePages, allowTransparentHugePages, retainMemory, lockMemory, memLimitBytes, 0, NULL, NULL);
+
+    PROGLOG("Total memory = %u MB, query memory = %u MB", memLimitMB, queryMemoryMB);
 
     rowManager.setown(roxiemem::createRowManager(0, NULL, queryDummyContextLogger(), allocatorMetaCache, false));
     setHThorRowManager(rowManager.get());
-    rowManager->setActivityTracking(queryWorkUnit()->getDebugValueBool("traceRoxiePeakMemory", false));
+    rowManager->setActivityTracking(getBoolSetting("traceRoxiePeakMemory", false));
 
     if (debugContext)
         debugContext->checkBreakpoint(DebugStateReady, NULL, NULL);
@@ -2161,7 +2256,10 @@ void EclAgent::runProcess(IEclProcess *process)
         workflow->perform(this, process);
     }
     else
-        process->perform(this, 0);
+    {
+        GlobalCodeContextExtra gctx(this, 0);
+        process->perform(&gctx, 0);
+    }
 
     ForEachItemIn(i, queryLibraries)
         queryLibraries.item(i).updateProgress();
@@ -2169,12 +2267,15 @@ void EclAgent::runProcess(IEclProcess *process)
     ForEachItemIn(i2, queryLibraries)
         queryLibraries.item(i2).destroyGraph();
 
-    if (rowManager)
     {
         WorkunitUpdate wu = updateWorkUnit();
-        WuStatisticTarget statsTarget(wu, "eclagent");
-        rowManager->reportPeakStatistics(statsTarget, 0);
-        rowManager->getMemoryUsage();//Causes statistics to be written to logfile
+        updateAggregates(wu);
+        if (rowManager)
+        {
+            WuStatisticTarget statsTarget(wu, "eclagent");
+            rowManager->reportPeakStatistics(statsTarget, 0);
+            rowManager->getMemoryUsage();//Causes statistics to be written to logfile
+        }
     }
 
     rowManager.clear(); // Must go before the allocatorCache
@@ -2186,12 +2287,12 @@ void EclAgent::runProcess(IEclProcess *process)
         debugContext->checkBreakpoint(DebugStateFinished, NULL, NULL);
         debugContext->debugTerminate();
     }
-    LOG(MCrunlock, unknownJob, "Releasing persist read locks");
+    LOG(MCrunlock, "Releasing persist read locks");
     persistReadLocks.kill();
-    LOG(MCrunlock, unknownJob, "Released persist read locks");
+    LOG(MCrunlock, "Released persist read locks");
 }
 
-unsigned EclAgent::getWorkflowId()
+unsigned EclAgent::getWorkflowIdDeprecated()
 {
     throwUnexpected();
 }
@@ -2212,10 +2313,72 @@ void EclAgentWorkflowMachine::begin()
     if(agent.queryWorkUnit()->getDebugValueBool("prelockpersists", false))
         prelockPersists();
 }
+
+IRemoteConnection *EclAgentWorkflowMachine::startPersist(const char * logicalName)
+{
+    CriticalBlock block(finishPersistCritSec);
+    IRemoteConnection * persistLock;
+    if(persistsPrelocked)
+    {
+        persistLock = persistCache.getValue(logicalName);
+        persistCache.setValue(logicalName, NULL);
+        LOG(MCrunlock, "Decached persist read lock for %s", logicalName);
+    }
+    else
+        persistLock = agent.startPersist(logicalName);
+    return persistLock;
+}
+
+void EclAgentWorkflowMachine::finishPersist(const char * persistName, IRemoteConnection *persistLock)
+{
+    //this protects lock list from race conditions
+    CriticalBlock block(finishPersistCritSec);
+    agent.finishPersist(persistName, persistLock);
+}
+
+void EclAgentWorkflowMachine::deleteLRUPersists(const char *logicalName, unsigned keep)
+{
+    agent.deleteLRUPersists(logicalName, keep);
+}
+
+void EclAgentWorkflowMachine::updatePersist(IRemoteConnection *persistLock, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC)
+{
+    agent.updatePersist(persistLock, logicalName, eclCRC, allCRC);
+}
+
+bool EclAgentWorkflowMachine::checkFreezePersists(const char *logicalName, unsigned eclCRC)
+{
+    bool freeze = agent.arePersistsFrozen();
+    if (freeze)
+        agent.checkPersistMatches(logicalName, eclCRC);
+    return freeze;
+}
+
+bool EclAgentWorkflowMachine::isPersistUptoDate(Owned<IRemoteConnection> &persistLock, IRuntimeWorkflowItem & item, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC, bool isFile)
+{
+    return agent.isPersistUptoDate(persistLock, item, logicalName, eclCRC, allCRC, isFile);
+}
+
+void EclAgentWorkflowMachine::checkPersistSupported()
+{
+    if (agent.isStandAloneExe)
+    {
+        throw MakeStringException(0, "PERSIST not supported when running standalone");
+    }
+}
+
+bool EclAgentWorkflowMachine::isPersistAlreadyLocked(const char * logicalName)
+{
+    //this makes sure that the lock array is up to date
+    CriticalBlock thisBlock(finishPersistCritSec);
+    return agent.alreadyLockedPersist(logicalName);
+}
+
 bool EclAgentWorkflowMachine::getParallelFlag() const
 {
     return agent.queryWorkUnit()->getDebugValueBool("parallelWorkflow", false);
 }
+
 unsigned EclAgentWorkflowMachine::getThreadNumFlag() const
 {
     return agent.queryWorkUnit()->getDebugValueInt("numWorkflowThreads", 4);
@@ -2241,7 +2404,7 @@ void EclAgentWorkflowMachine::prelockPersists()
         char const * name = names.item(idx);
         Owned<IRemoteConnection> persistLock = agent.startPersist(name);
         persistCache.setValue(name, persistLock);
-        LOG(MCrunlock, unknownJob, "Cached persist read lock for %s", name);
+        LOG(MCrunlock, "Cached persist read lock for %s", name);
     }
     persistsPrelocked = true;
 }
@@ -2282,16 +2445,16 @@ void EclAgentWorkflowMachine::obtainRunlock()
 {
     StringBuffer xpath;
     xpath.append("/WorkUnitRunLocks/").append(agent.wuid.get());
-    LOG(MCrunlock, unknownJob, "Waiting for run lock");
+    LOG(MCrunlock, "Waiting for run lock");
     runlock.setown(querySDS().connect(xpath.str(), myProcessSession(), RTM_CREATE | RTM_LOCK_WRITE | RTM_DELETE_ON_DISCONNECT, INFINITE));
-    LOG(MCrunlock, unknownJob, "Obtained run lock");
+    LOG(MCrunlock, "Obtained run lock");
     if(!runlock)
         agent.fail(0, "EclAgent could not get a lock to run the workunit");
 }
 
 void EclAgentWorkflowMachine::releaseRunlock()
 {
-    LOG(MCrunlock, unknownJob, "Releasing run lock");
+    LOG(MCrunlock, "Releasing run lock");
     if(runlock && queryDaliServerVersion().compare("1.3") < 0)
         runlock->close(true);
     runlock.clear();
@@ -2306,7 +2469,7 @@ IRemoteConnection *EclAgentWorkflowMachine::obtainCriticalLock(const char *name)
 
 void EclAgentWorkflowMachine::releaseCriticalLock(IRemoteConnection *criticalLock)
 {
-    LOG(MCrunlock, unknownJob, "Releasing critical lock");
+    LOG(MCrunlock, "Releasing critical lock");
     if(criticalLock && queryDaliServerVersion().compare("1.3") < 0)
         criticalLock->close(true);
 }
@@ -2371,7 +2534,8 @@ void EclAgentWorkflowMachine::noteTiming(unsigned wfid, timestamp_type startTime
     updateWorkunitStat(wu, SSTworkflow, scope, StWhenStarted, nullptr, startTime, 0);
     updateWorkunitStat(wu, SSTworkflow, scope, StTimeElapsed, nullptr, elapsedNs, 0);
 
-    const cost_type cost = money2cost_type(calcCost(agent.queryAgentMachineCost(), nanoToMilli(elapsedNs))) + aggregateCost(wu, scope, true);
+    // Note: costs are aggregated when the timings are recording
+    const cost_type cost = money2cost_type(calcCost(agent.queryAgentMachineCost(), nanoToMilli(elapsedNs))) + aggregateCost(wu, scope, StCostExecute, 3, true);
     if (cost)
         wu->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTworkflow, scope, StCostExecute, NULL, cost, 1, 0, StatsMergeReplace);
 }
@@ -2403,7 +2567,7 @@ void EclAgentWorkflowMachine::doExecutePersistItem(IRuntimeWorkflowItem & item)
     {
         persistLock.set(persistCache.getValue(logicalName));
         persistCache.setValue(logicalName, NULL);
-        LOG(MCrunlock, unknownJob, "Decached persist read lock for %s", logicalName);
+        LOG(MCrunlock, "Decached persist read lock for %s", logicalName);
     }
     else
         persistLock.setown(agent.startPersist(logicalName));
@@ -2588,15 +2752,6 @@ void EclAgent::logException(std::exception & e)
     logException(SeverityError, MSGAUD_programmer, 0, m.str(), false);
 }
 
-static unsigned __int64 crcLogicalFileTime(IDistributedFile * file, unsigned __int64 crc, const char * filename)
-{
-    CDateTime dt;
-    file->getModificationTime(dt);
-    unsigned __int64 modifiedTime = dt.getSimple();
-    IERRLOG("getDatasetHash adding crc %" I64F "u for file %s", modifiedTime, filename);
-    return rtlHash64Data(sizeof(modifiedTime), &modifiedTime, crc);
-}
-
 unsigned __int64 EclAgent::getDatasetHash(const char * logicalName, unsigned __int64 crc)
 {
     IERRLOG("getDatasetHash initial crc %" I64F "x", crc);
@@ -2616,25 +2771,12 @@ unsigned __int64 EclAgent::getDatasetHash(const char * logicalName, unsigned __i
         return crc;
     }
 
-    Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(fullname.str(),queryUserDescriptor(), false, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> file = wsdfs::lookup(fullname.str(),queryUserDescriptor(), AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser, INFINITE);
     if (file)
     {
         WorkunitUpdate wu = updateWorkUnit();
         wu->noteFileRead(file);
-        IDistributedSuperFile * super = file->querySuperFile();
-        if (super)
-        {
-            Owned<IDistributedFileIterator> iter = super->getSubFileIterator(true);
-            ForEach(*iter)
-            {
-                IDistributedFile & cur = iter->query();
-                const char * name = cur.queryLogicalName();
-                crc = rtlHash64Data(strlen(name), name, crc);
-                crc = crcLogicalFileTime(&cur, crc, name);
-            }
-        }
-        else
-            crc = crcLogicalFileTime(file, crc, fullname.str());
+        crc = crcLogicalFileTime(file, crc, fullname);
     }
     else
         IERRLOG("getDatasetHash did not find file %s", fullname.str());
@@ -2683,7 +2825,7 @@ bool EclAgent::checkPersistUptoDate(IRuntimeWorkflowItem & item, const char * lo
 
 bool EclAgent::changePersistLockMode(IRemoteConnection *persistLock, unsigned mode, const char * name, bool repeat)
 {
-    LOG(MCrunlock, unknownJob, "Waiting to change persist lock to %s for %s", (mode == RTM_LOCK_WRITE) ? "write" : "read", name);
+    LOG(MCrunlock, "Waiting to change persist lock to %s for %s", (mode == RTM_LOCK_WRITE) ? "write" : "read", name);
     //When converting a read lock to a write lock so the persist can be rebuilt hold onto the lock as short as
     //possible.  Otherwise lots of workunits each trying to convert read locks to write locks will mean
     //that the read lock is never released by all the workunits at the same time, so no workunit can progress.
@@ -2729,7 +2871,7 @@ IRemoteConnection *EclAgent::getPersistReadLock(const char * logicalName)
     for (const char * cur = name;*cur;cur++)
         xpath.append(isalnum(*cur) ? *cur : '_');
 
-    LOG(MCrunlock, unknownJob, "Waiting for persist read lock for %s", name);
+    LOG(MCrunlock, "Waiting for persist read lock for %s", name);
     Owned<IRemoteConnection> persistLock;
     for (;;)
     {
@@ -2757,11 +2899,7 @@ IRemoteConnection *EclAgent::getPersistReadLock(const char * logicalName)
 
 void EclAgent::setBlockedOnPersist(const char * logicalName)
 {
-    StringBuffer s;
-    s.append("Waiting for persist ").append(logicalName);
-    WorkunitUpdate w = updateWorkUnit();
-    w->setState(WUStateBlocked);
-    w->setStateEx(s.str());
+    setBlocked(VStringBuffer("Waiting for persist ").append(logicalName).str());
 }
 
 bool EclAgent::isPersistUptoDate(Owned<IRemoteConnection> &persistLock, IRuntimeWorkflowItem & item, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC, bool isFile)
@@ -2851,7 +2989,7 @@ bool EclAgent::alreadyLockedPersist(const char * persistName)
 
 void EclAgent::finishPersist(const char * persistName, IRemoteConnection *persistLock)
 {
-    LOG(MCrunlock, unknownJob, "Finished persists - add to read lock list");
+    LOG(MCrunlock, "Finished persists - add to read lock list");
     processedPersists.append(persistName);
     persistReadLocks.append(*persistLock);
 }
@@ -2900,7 +3038,7 @@ void EclAgent::deleteLRUPersists(const char * logicalName, unsigned keep)
     head.append("p*");                                  // Multi-mode persist names end with __pNNNNNNN
 restart:     // If things change beneath us as we are deleting, repeat the process
     IArrayOf<IPropertyTree> persists;
-    Owned<IDFAttributesIterator> iter = queryDistributedFileDirectory().getDFAttributesIterator(head,queryUserDescriptor(),false,false,NULL);
+    Owned<IPropertyTreeIterator> iter = queryDistributedFileDirectory().getDFAttributesIterator(head,queryUserDescriptor(), false, false, nullptr);
     ForEach(*iter)
     {
         IPropertyTree &pt = iter->query();
@@ -2939,7 +3077,7 @@ restart:     // If things change beneath us as we are deleting, repeat the proce
                 MilliSleep(PERSIST_LOCK_SLEEP + (getRandom()%PERSIST_LOCK_SLEEP));
                 persistLock.setown(getPersistReadLock(goer));
             }
-            Owned<IDistributedFile> f = queryDistributedFileDirectory().lookup(goer, queryUserDescriptor(), true, false, false, nullptr, defaultPrivilegedUser);
+            Owned<IDistributedFile> f = wsdfs::lookup(goer, queryUserDescriptor(), AccessMode::erase, false, false, nullptr, defaultPrivilegedUser, INFINITE);
             if (!f)
                 goto restart; // Persist has been deleted since last checked - repeat the whole process
             const char *newAccessTime = f->queryAttributes().queryProp("@accessed");
@@ -2983,9 +3121,12 @@ char * EclAgent::getClusterName()
 char * EclAgent::getGroupName()
 {
 #ifdef _CONTAINERIZED
-    // in a containerized setup, the group is moving..
-    return strdup("unknown");
-#endif
+    // In containerized there is no associated cluster group.
+    // Return an empty result instead, which if used for destinationGroup
+    // via Thorlib.group() as part of a fileservices call, will be interpreted
+    // as targeting the default data plane
+    return strdup("");
+#else
     StringBuffer groupName;
     if (!isStandAloneExe)
     {
@@ -3029,11 +3170,14 @@ char * EclAgent::getGroupName()
         }
     }
     return groupName.detach();
+#endif
 }
 
 char * EclAgent::queryIndexMetaData(char const * lfn, char const * xpath)
 {
-    Owned<ILocalOrDistributedFile> ldFile = resolveLFN(lfn, "IndexMetaData", false, true, false, nullptr, defaultPrivilegedUser);
+    // The index file is opened only to read its embedded metadata node (key->getMetadata()); no index
+    // entries/data rows are ever read, so this is physical part inspection, not a data content read.
+    Owned<ILocalOrDistributedFile> ldFile = resolveLFN(lfn, "IndexMetaData", false, true, AccessMode::readMeta, nullptr, defaultPrivilegedUser);
     IDistributedFile * dFile = ldFile->queryDistributedFile();
     if (!dFile)
         return NULL;
@@ -3049,14 +3193,14 @@ char * EclAgent::queryIndexMetaData(char const * lfn, char const * xpath)
         try
         {
             OwnedIFile file = createIFile(part->getFilename(rfn, copy));
-            unsigned __int64 thissize = file->size();
-            if(thissize != -1)
+            offset_t thissize = file->size();
+            if(thissize != (offset_t)-1)
             {
                 StringBuffer remotePath;
                 rfn.getPath(remotePath);
                 unsigned crc;
                 part->getCrc(crc);
-                key.setown(createKeyIndex(remotePath.str(), crc, false, false));
+                key.setown(createKeyIndex(remotePath.str(), crc, false, {}));
                 break;
             }
         }
@@ -3108,7 +3252,7 @@ char *EclAgent::getFilePart(const char *lfn, bool create)
         expandLogicalName(full_lfn, lfn);
 
         StringBuffer physical;
-        makePhysicalPartName(full_lfn.str(), 1, 1, physical, false);//MORE: What do we do if local ?
+        makePhysicalPartName(full_lfn.str(), 1, 1, physical, 0, DFD_OSdefault, nullptr, 0, 0);//MORE: What do we do if local ?
 
         StringBuffer dir,base;
         splitFilename(physical.str(), &dir, &dir, &base, &base);
@@ -3122,7 +3266,7 @@ char *EclAgent::getFilePart(const char *lfn, bool create)
     }
     else
     {
-        Owned<ILocalOrDistributedFile> ldFile = resolveLFN(lfn, "l2p", false, false, false, nullptr, defaultPrivilegedUser);
+        Owned<ILocalOrDistributedFile> ldFile = resolveLFN(lfn, "l2p", false, false, AccessMode::readMeta, nullptr, defaultPrivilegedUser);
         if (!ldFile)
             return NULL;
         unsigned numParts = ldFile->numParts();
@@ -3164,7 +3308,7 @@ void EclAgent::reportProgress(const char *progress, unsigned flags)
     if (progress)
     {
         // MORE - think about how to best do this
-        LOG(MCdebugProgress, unknownJob,"%s", progress);
+        LOG(MCdebugProgress, "%s", progress);
 //      WorkunitUpdate wu = updateWorkUnit();
 //      wu->reportProgress(progress, flags);
     }
@@ -3192,7 +3336,7 @@ char * EclAgent::getDaliServers()
             first = false;
         else
             dali.append(',');
-        coven->query().endpoint().getUrlStr(dali);
+        coven->query().endpoint().getEndpointHostText(dali);
     }
     return dali.detach();
 }
@@ -3259,7 +3403,7 @@ void EclAgent::abortMonitor()
         {
             if (checkCostInterval<=waittime)
             {
-                cost_type totalCost = aggregateCost(queryWorkUnit());
+                cost_type totalCost = aggregateCost(queryWorkUnit(), nullptr, StCostExecute, 3);
                 if (totalCost > abortmonitor->guillotineCost)
                 {
                     errorText.appendf("Workunit cost limit exceeded");
@@ -3284,7 +3428,13 @@ void EclAgent::fatalAbort(bool userabort,const char *excepttext)
         if (userabort)
             w->setState(WUStateAborted);
         if (excepttext&&*excepttext)
+        {
             addExceptionEx(SeverityError, MSGAUD_programmer, "eclagent", 1000, excepttext, NULL, 0, 0, true, false);
+            // Record the reason why the job was aborted (e.g., time/cost guillotine) for easy retrieval
+            // User aborts are already recorded
+            if (!userabort)
+                w->recordAbortDetails(excepttext, nullptr);
+        }
         w->deleteTempFiles(NULL, false, true);
         wuRead.clear();
         w->commit();
@@ -3387,12 +3537,11 @@ hthor:
     name: hthor
     analyzeWorkunit: true
     defaultMemoryLimitMB: 300
-    thorConnectTimeout: 600
     traceLevel: 0
 )!!";
 
 
-extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * wuXML, bool standAloneExe)
+extern int HTHOR_API eclagent_main(int argc, const char *argv[], Owned<ILocalWorkUnit> & standAloneWorkUnit, bool standAloneExe)
 {
 #ifdef _DEBUG
 #ifdef _WIN32
@@ -3419,7 +3568,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
         }
         try
         {
-            agentTopology.setown(loadConfiguration(defaultYaml, argv, "hthor", "ECLAGENT", "agentexec.xml", nullptr));
+            agentTopology.setown(loadConfiguration(defaultYaml, argv, "hthor", "ECLAGENT", "agentexec.xml", nullptr, nullptr, false));
         }
         catch (IException *E)
         {
@@ -3428,7 +3577,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
         }
     }
     else
-        agentTopology.setown(loadConfiguration(defaultYaml, argv, "hthor", "ECLAGENT", nullptr, nullptr));
+        agentTopology.setown(loadConfiguration(defaultYaml, argv, "hthor", "ECLAGENT", nullptr, nullptr, nullptr, false));
 
     installDefaultFileHooks(agentTopology);
 
@@ -3466,8 +3615,9 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
     if (traceLevel)
     {
         printStart(argc, argv);
-        DBGLOG("Build %s", BUILD_TAG);
+        DBGLOG("Build %s", hpccBuildInfo.buildTag);
     }
+    workunitGraphCacheEnabled = agentTopology->getPropBool("expert/@workunitGraphCacheEnabled", workunitGraphCacheEnabled);
 
     // Extract any params into stored - primarily for standalone case but handy for debugging eclagent sometimes too
     Owned<IPropertyTree> query;
@@ -3489,7 +3639,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
             {
                 if (!query)
                     query.setown(createPTree("Query"));
-                const char *val = cmdLineArgs->queryProp(key);
+                const char *val = it->queryPropValue();
                 if (val[0]=='<')
                 {
                     Owned<IPropertyTree> valtree = createPTreeFromXMLString(val);
@@ -3526,14 +3676,6 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
 #ifdef MONITOR_ECLAGENT_STATUS
         std::unique_ptr<CSDSServerStatus> serverstatus;
 #endif
-        Owned<ILocalWorkUnit> standAloneWorkUnit;
-        if (wuXML)
-        {
-            //Create workunit from XML
-            standAloneWorkUnit.setown(createLocalWorkUnit(wuXML->str()));
-            wuXML->kill();  // free up text as soon as possible.
-        }
-
         Owned<IUserDescriptor> standAloneUDesc;
         if (daliServers)
         {
@@ -3550,7 +3692,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
             class CDaliDownMonitor : public CSimpleInterfaceOf<IConnectionMonitor>
             {
                 const SocketEndpoint &daliEp;
-                Semaphore sem;
+                Semaphore sem{SYNC_LOCATION};
             public:
                 CDaliDownMonitor(const SocketEndpoint &_daliEp) : daliEp(_daliEp)
                 {
@@ -3583,6 +3725,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
             startLogMsgParentReceiver();
             connectLogMsgManagerToDali();
 
+#ifndef _CONTAINERIZED
             StringBuffer baseDir;
             if (getConfigurationDirectory(agentTopology->queryPropTree("Directories"),"data","eclagent",agentTopology->queryProp("@name"),baseDir.clear()))
                 setBaseDirectory(baseDir.str(), false);
@@ -3591,6 +3734,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
 
             if (agentTopology->getPropBool("@useNASTranslation", true))
                 envInstallNASHooks();
+#endif
 
             if (standAloneWorkUnit)
             {
@@ -3621,7 +3765,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
                 }
 
                 const char * appName = argv[0];
-                for (int finger=0; argv[0][finger] != (const char)NULL; finger++)
+                for (int finger=0; argv[0][finger] != '\0'; finger++)
                 {
                     if (argv[0][finger] == PATHSEPCHAR)
                         appName = (const char *)(argv[0] + finger + 1);
@@ -3638,7 +3782,7 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
             }
         }
 
-        initializeStorageGroups(daliClientActive());
+        initializeStoragePlanes(daliClientActive(), true);
 
         if (!standAloneWorkUnit)
         {
@@ -3653,8 +3797,8 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
             uid.append("WLOCAL_").append((unsigned)GetCurrentProcessId());
             wuid.set(uid);
         }
-        setDefaultJobId(wuid.str());
-        LOG(MCoperatorInfo, "hthor build %s", BUILD_TAG);
+        setDefaultJobName(wuid.str());
+        LOG(MCoperatorInfo, "hthor build %s", hpccBuildInfo.buildTag);
 
 #ifdef MONITOR_ECLAGENT_STATUS
         if (serverstatus)
@@ -3675,14 +3819,22 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
                 factory->setTracingLevel(10);
 #endif
                 w = factory->openWorkUnit(wuid.str());
+
+                if (agentTopology->getPropBool("@k8sJob"))
+                {
+                    Owned<IWorkUnit> workunit = &w->lock();
+                    addTimeStamp(workunit, SSTglobal, "", StWhenK8sStarted, 0);
+                }
             }
             else
                 w = standAloneWorkUnit.getClear();
 
             if (w)
             {
+                StringBuffer allowedPipePrograms;
+                getAllowedPipePrograms(allowedPipePrograms, true);
                 EclAgent agent(w, wuid.str(), agentTopology->getPropBool("@ignoreVersion", false), agentTopology->getPropBool("@resetWorkflow", false), agentTopology->getPropBool("@noRetry", false), logfilespec.str(),
-                               agentTopology->queryProp("@allowedPipePrograms"), query.getClear(), logMsgHandler);
+                               allowedPipePrograms, query.getClear(), logMsgHandler);
                 const bool isRemoteWorkunit = !isEmptyString(daliServers);
                 const bool resolveFilesLocally = standAloneExe && (!isRemoteWorkunit || agentTopology->getPropBool("@useLocalFiles", false));
                 const bool writeResultsToStdout = standAloneExe && (!isRemoteWorkunit || agentTopology->getPropBool("@resultsToStdout", true));
@@ -3758,6 +3910,12 @@ extern int HTHOR_API eclagent_main(int argc, const char *argv[], StringBuffer * 
     return retcode;
 }
 
+extern int HTHOR_API eclagent_main(int argc, const char *argv[])
+{
+    Owned<ILocalWorkUnit> nullWu;
+    return eclagent_main(argc, argv, nullWu, false);
+}
+
 //=======================================================================================
 
 void standalone_usage(const char * exeName)
@@ -3801,11 +3959,11 @@ int STARTQUERY_API start_query(int argc, const char *argv[])
     try
     {
         Owned<ILoadedDllEntry> exeEntry = createExeDllEntry(argv[0]);
-        StringBuffer wuXML;
-        if (!getEmbeddedWorkUnitXML(exeEntry, wuXML))
+        Owned<ILocalWorkUnit> localWu = createLocalWorkUnit(exeEntry);
+        if (!localWu)
             throw MakeStringException(0, "Could not locate workunit resource");
 
-        ret = eclagent_main(argc, argv, &wuXML, true);
+        ret = eclagent_main(argc, argv, localWu, true);
     }
     catch (IException *E)
     {
@@ -3997,7 +4155,7 @@ class DebugProbe : public InputProbe, implements IActivityDebugContext
 public:
     DebugProbe(IHThorInput *_in, IEngineRowStream *_stream, unsigned _sourceId, unsigned _sourceIdx, DebugActivityRecord *_sourceAct, unsigned _targetId, unsigned _targetIdx, DebugActivityRecord *_targetAct, unsigned _iteration, unsigned _channel, IDebuggableContext *_debugContext)
         : InputProbe(_in, _stream, _sourceId, _sourceIdx, _targetId, _targetIdx, _iteration, _channel),
-          sourceAct(_sourceAct), targetAct(_targetAct), debugContext(_debugContext)
+          debugContext(_debugContext), sourceAct(_sourceAct), targetAct(_targetAct)
     {
         historyCapacity = debugContext->getDefaultHistoryCapacity();
         nextHistorySlot = 0;
@@ -4377,6 +4535,10 @@ public:
             in->updateProgress(progress);
     }
 
+    virtual stat_type queryTotalCycles() const override
+    {
+        return in->queryTotalCycles();
+    }
 };
 
 //=======================================================================================

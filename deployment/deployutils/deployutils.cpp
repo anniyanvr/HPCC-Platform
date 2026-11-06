@@ -26,15 +26,11 @@
 #include "xslprocessor.hpp"
 #include "jwrapper.hpp"
 #include "wizardInputs.hpp"
-#include "build-config.h"
 #include "confighelper.hpp"
 
 #define TRACE_SCHEMA_NODE(msg, schemaNode)
 
 #define CONFIGMGR_JSPATH "./"
-#define STANDARD_COMPFILESDIR INSTALL_DIR
-
-#define STANDARD_CONFIGXMLDIR COMPONENTFILES_DIR"/configxml"
 
 bool schemaNodeHasAttributes(IPropertyTree* pNode)
 {
@@ -63,7 +59,7 @@ bool writeToFile(const char* fileName, const char * sb)
   StringBuffer jsName(fileName);
   recursiveCreateDirectoryForFile(fileName);
   Owned<IFile> pFile = createIFile(jsName);
-  Owned<IFileIO> pFileIO = pFile->open(IFOcreaterw);
+  Owned<IFileIO> pFileIO = pFile->open(IFOcreate);
   pFileIO->write(0, strlen(sb), sb);
 
   return true;
@@ -125,7 +121,7 @@ void getInstalledComponents(const char* pszInstallDir, StringBuffer& sbOutComps,
   if (pszInstallDir && *pszInstallDir)
     sbDir.append(pszInstallDir);
   else
-    sbDir.append(COMPONENTFILES_DIR"/configxml");
+    sbDir.append(hpccBuildInfo.componentDir).append("/configxml");
 
   bool getFromDirs = false;
   if (getFromDirs)
@@ -475,14 +471,14 @@ class CGenerateJSFromXSD
 {
 public:
   CGenerateJSFromXSD(const IPropertyTree* pEnv, const char* xsdName, const char* jsName):
-      m_xsdName(xsdName), m_jsName(jsName), m_pCompTree(NULL), m_pSchemaRoot(NULL),m_pDefTree(NULL),m_numAttrs(0),m_allSubTypes(true),m_genOptional(true)
+      m_pSchemaRoot(NULL), m_pCompTree(NULL), m_pDefTree(NULL), m_xsdName(xsdName), m_jsName(jsName), m_numAttrs(0), m_allSubTypes(true), m_genOptional(true)
       {
         m_pEnv.set(pEnv);
         m_colIndex.append("var colIndex = new Array();");
         m_columns.append("var tabCols = new Array();");
       }
       CGenerateJSFromXSD(const IPropertyTree* pEnv, IPropertyTree* pSchemaRoot, const char* jsName, const char* compName):
-      m_pSchemaRoot(pSchemaRoot), m_jsName(jsName), m_compName(compName),m_pCompTree(NULL), m_pDefTree(NULL),m_numAttrs(0),m_allSubTypes(true),m_wizFlag(false),m_wizard(NULL),m_genOptional(true)
+      m_pSchemaRoot(pSchemaRoot), m_pCompTree(NULL), m_pDefTree(NULL), m_jsName(jsName), m_compName(compName), m_numAttrs(0), m_allSubTypes(true), m_wizFlag(false), m_genOptional(true), m_wizard(NULL)
       {
         m_pEnv.set(pEnv);
         m_colIndex.append("var colIndex = new Array();");
@@ -1575,7 +1571,7 @@ public:
              tempPath.clear().append("EnvSettings/path");
              wizDefVal.clear().append(m_pEnv->queryProp(tempPath.str()));
              if(!wizDefVal.length())
-                wizDefVal.append(STANDARD_COMPFILESDIR);
+                wizDefVal.append(hpccBuildInfo.installDir);
 
              wizDefVal.append(PATHSEPSTR"componentfiles");
            }
@@ -1909,7 +1905,7 @@ IPropertyTree* generateTreeFromXsd(const IPropertyTree* pEnv, IPropertyTree* pSc
       const char* cfgpath = pEnvParams->queryProp("configs");
 
       if (!cfgpath || !*cfgpath)
-        cfgpath = CONFIG_DIR;
+        cfgpath = hpccBuildInfo.configDir;
 
       genEnvConf.clear().append(cfgpath);
 
@@ -2008,6 +2004,21 @@ bool generateHardwareHeaders(const IPropertyTree* pEnv, StringBuffer& sbDefn, bo
       xpath.clear().append(XML_ATTR_TRACE);
       pNAS->addProp(xpath, sbdefaultValue.str());
     }
+
+    //<cost currencyCode="en_US.UTF-8" perCpu="0.113" storageAtRest="0.0135" storageReads="0.0485" storageWrites="0.0038"/>
+
+    IPropertyTree* pCost = pCompTree->addPropTree("cost", createPTree());
+    xpath.clear().append("@currencyCode");
+    pDomain->addProp(xpath, sbdefaultValue.str());
+    xpath.clear().append("@perCpu");
+    pDomain->addProp(xpath, sbdefaultValue.str());
+    xpath.clear().append("@storageAtRest");
+    pDomain->addProp(xpath, sbdefaultValue.str());
+    xpath.clear().append("@storageReads");
+    pDomain->addProp(xpath, sbdefaultValue.str());
+    xpath.clear().append("@storageWrites");
+    pDomain->addProp(xpath, sbdefaultValue.str());
+
   }
   else
   {
@@ -2035,16 +2046,25 @@ bool generateHardwareHeaders(const IPropertyTree* pEnv, StringBuffer& sbDefn, bo
     addItem(jsStrBuf, pEnv, XML_TAG_NAS,       TAG_DIRECTORY,       "", 0, 1, "", 1);
     addItem(jsStrBuf, pEnv, XML_TAG_NAS,       TAG_MASK,       "", 0, 1, "", 1);
     addItem(jsStrBuf, pEnv, XML_TAG_NAS,       TAG_TRACE,       "", 0, 1, "", 1);
+
+    addItem(jsStrBuf, pEnv, "cost",  "currencyCode", "", 0, 0, "", 1);
+    addItem(jsStrBuf, pEnv, "cost",  "perCpu", "", 0, 0, "", 1);
+    addItem(jsStrBuf, pEnv, "cost",  "storageAtRest", "", 0, 0, "", 1);
+    addItem(jsStrBuf, pEnv, "cost",  "storageReads", "", 0, 0, "", 1);
+    addItem(jsStrBuf, pEnv, "cost",  "storageWrites", "", 0, 0, "", 1);
+
     jsStrBuf.append("compTabs['Hardware'][compTabs['Hardware'].length]= 'Computer Types';");
     jsStrBuf.append("compTabs['Hardware'][compTabs['Hardware'].length]= 'Switches';");
     jsStrBuf.append("compTabs['Hardware'][compTabs['Hardware'].length]= 'Domains';");
     jsStrBuf.append("compTabs['Hardware'][compTabs['Hardware'].length]= 'Computers';");
     jsStrBuf.append("compTabs['Hardware'][compTabs['Hardware'].length]= 'NAS';");
+    jsStrBuf.append("compTabs['Hardware'][compTabs['Hardware'].length]= 'cost';");
     jsStrBuf.append("compTabToNode['Computer Types']= 'ComputerType';");
     jsStrBuf.append("compTabToNode['Switches']= 'Switch';");
     jsStrBuf.append("compTabToNode['Domains']= 'Domain';");
     jsStrBuf.append("compTabToNode['Computers']= 'Computer';");
     jsStrBuf.append("compTabToNode['NAS']= 'NAS';");
+    jsStrBuf.append("compTabToNode['cost']= 'cost';");
 
     int index = 0;
     jsStrBuf.append("var colIndex = new Array();");
@@ -2069,6 +2089,13 @@ bool generateHardwareHeaders(const IPropertyTree* pEnv, StringBuffer& sbDefn, bo
     jsStrBuf.appendf("colIndex['subnetNAS']=%d;", index++);
     jsStrBuf.appendf("colIndex['directoryNAS']=%d;", index++);
     jsStrBuf.appendf("colIndex['traceNAS']=%d;", index++);
+
+    index=0;
+    jsStrBuf.appendf("colIndex['currencyCodecost']=%d;", index++);
+    jsStrBuf.appendf("colIndex['perCpucost']=%d;", index++);
+    jsStrBuf.appendf("colIndex['storageAtRestcost']=%d;", index++);
+    jsStrBuf.appendf("colIndex['storageReadscost']=%d;", index++);
+    jsStrBuf.appendf("colIndex['storageWritescost']=%d;", index++);
 
     sbDefn.clear().append(jsStrBuf);
 
@@ -2845,12 +2872,9 @@ bool checkComponentReferences(const IPropertyTree* pEnv, IPropertyTree* pNode, c
   {
     xpathArray.append(XML_TAG_ESPSERVICE); 
     attribs.append("@eclWatch");          //ws_ecl
-    attribs.append("@attributeServer");//ws_ecl and ws_roxieconfig
+    attribs.append("@attributeServer");//ws_ecl
 
     xpathArray.append("EspService/WsEcl");//ws_facts and ws_distrix
-    attribArray[numXpaths++].append("@espBinding"); 
-
-    xpathArray.append("EspService/SourceAttributeServer");//ws_roxieconfig
     attribArray[numXpaths++].append("@espBinding"); 
 
     xpathArray.append(XML_TAG_ECLSERVERPROCESS);
@@ -3054,7 +3078,7 @@ IPropertyTree* getNewRange(const IPropertyTree* pEnv, const char* prefix, const 
    
    while (count--)
    {
-     range.getIpText(sIP.clear());
+     range.getHostText(sIP.clear());
 
      unsigned x;
      range.getNetAddress(sizeof(x),&x);
@@ -3367,7 +3391,7 @@ void addInstanceToCompTree(const IPropertyTree* pEnvRoot,const IPropertyTree* pI
         {
           StringBuffer rundir;
           if (!getConfigurationDirectory(pEnvRoot->queryPropTree("Software/Directories"), "run", processName, compName, rundir))
-            sb.clear().appendf(RUNTIME_DIR"/%s", compName);
+            sb.clear().append(hpccBuildInfo.runtimeDir).appendf("/%s", compName);
           else
             sb.clear().append(rundir);
 
@@ -3945,10 +3969,13 @@ bool validateEnv(IConstEnvironment* pConstEnv, bool abortOnException)
     CConfigEngCallback callback(false, abortOnException);
     Owned<IEnvDeploymentEngine> configGenMgr;
     Owned<IPropertyTree> pEnvRoot = &pConstEnv->getPTree();
+    StringBuffer sb;
     const char* inDir = pEnvRoot->queryProp(XML_TAG_ENVSETTINGS"/path");
-    StringBuffer sb(inDir);
-    sb.append("/componentfiles/configxml");
-    configGenMgr.setown(createConfigGenMgr(*pConstEnv, callback, NULL, inDir?sb.str():STANDARD_CONFIGXMLDIR, tempdir, NULL, NULL, NULL));
+    if (inDir)
+      sb.append(inDir).append("/componentfiles/configxml");
+    else
+      sb.append(hpccBuildInfo.componentDir).append("/configxml");
+    configGenMgr.setown(createConfigGenMgr(*pConstEnv, callback, NULL, sb.str(), tempdir, NULL, NULL, NULL));
     configGenMgr->deploy(DEFLAGS_CONFIGFILES, DEBACKUP_NONE, false, false);
     deleteRecursive(tempdir);
     const char* msg = callback.getErrorMsg();

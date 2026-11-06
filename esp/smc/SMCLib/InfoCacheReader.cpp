@@ -17,6 +17,7 @@
 
 #pragma warning (disable : 4786)
 #include "InfoCacheReader.hpp"
+#include "esptrace.h"
 
 bool CInfoCache::isCachedInfoValid(unsigned timeOutSeconds)
 {
@@ -27,17 +28,36 @@ bool CInfoCache::isCachedInfoValid(unsigned timeOutSeconds)
 
 void CInfoCacheReaderThread::threadmain()
 {
-    PROGLOG("CInfoCacheReaderThread %s started.", name.get());
-    unsigned int autoRebuildMillSeconds = 1000*autoRebuildSeconds;
+    unsigned int autoRebuildMillSeconds;
+    VStringBuffer message("CInfoCacheReaderThread %s started, ", name.get());
+    if (enableAutoRebuild)
+    {
+        message.appendf("rebuilding every %ds.", autoRebuildSeconds);
+        autoRebuildMillSeconds = 1000*autoRebuildSeconds;
+    }
+    else
+    {
+        message.appendf("rebuilding on demand when %ds stale.", forceRebuildSeconds);
+        autoRebuildMillSeconds = INFINITE;
+    }
+    PROGLOG("%s", message.str());
+    StringBuffer spanName(name.get());
+    spanName.replaceString(" ", "").append("Rebuild");
+
     while (!stopping)
     {
         if (active)
         {
             try
             {
-                CCycleTimer timer;
-                Owned<CInfoCache> info = infoCacheReader->read();
-                PROGLOG("CInfoCacheReaderThread %s: InfoCache collected (%u seconds).", name.get(), timer.elapsedMs()/1000);
+                Owned<CInfoCache> info;
+                if (doTrace(traceEspInfoCacheBuild))
+                {
+                    OwnedActiveSpanScope rebuildSpan(queryTraceManager().createServerSpan(spanName.str(), nullptr));
+                    info.setown(infoCacheReader->read());
+                }
+                else
+                    info.setown(infoCacheReader->read());
 
                 CriticalBlock b(crit);
                 infoCache.setown(info.getClear());
@@ -67,9 +87,6 @@ void CInfoCacheReaderThread::threadmain()
 
         waiting = true;
         if (!sem.wait(autoRebuildMillSeconds))
-        {
-            bool expected = true;
-            waiting.compare_exchange_strong(expected, false);
-        }
+            waiting = false;
     }
 }

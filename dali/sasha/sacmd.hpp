@@ -1,6 +1,8 @@
 #ifndef SACMD_HPP
 #define SACMD_HPP
 
+#include "sautil.hpp"
+
 enum SashaCommandAction
 {
     SCA_null,
@@ -47,6 +49,8 @@ interface ISashaCommand: extends IInterface
     virtual void setOwner(const char *val) = 0;         
     virtual const char *queryCluster() = 0;
     virtual void setCluster(const char *val) = 0;
+    virtual const char *queryFilterScopes() = 0;
+    virtual void setFilterScopes(const char *val) = 0;
     virtual const char *queryJobName() = 0;
     virtual void setJobName(const char *val) = 0;
     virtual const char *queryOutputFormat() = 0;
@@ -97,6 +101,6 @@ interface ISashaCommand: extends IInterface
 
 #define WUS_STATUS_OK           ((byte)0)
 
-extern ISashaCommand *createSashaCommand();
+extern sashalib_decl ISashaCommand *createSashaCommand();
 
 #endif

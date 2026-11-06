@@ -1,0 +1,685 @@
+import * as React from "react";
+import { useConst, useForceUpdate } from "@fluentui/react-hooks";
+import { WsWorkunits, WorkunitsService, IScope } from "@hpcc-js/comms";
+import { scopedLogger } from "@hpcc-js/util";
+import { userKeyValStore } from "src/KeyValStore";
+import { decodeHTML } from "src/Utility";
+import { DockPanelLayout } from "../layouts/DockPanel";
+import { singletonDebounce } from "../util/throttle";
+import { isGraphvizWorkerResponse, layoutCache, LayoutStatus } from "../util/metricGraph";
+import { signal, useSignal } from "../hooks/signal";
+import { useWorkunit } from "./workunit";
+import { useQuery } from "./query";
+import { useCounter } from "./util";
+import { useUserStore } from "./store";
+
+const logger = scopedLogger("src-react/hooks/metrics.ts");
+
+const METRIC_OPTIONS_2 = "MetricOptions-2";
+const METRIC_OPTIONS_3 = "MetricOptions-3";
+const METRIC_OPTIONS_4 = "MetricOptions-4";
+const METRIC_OPTIONS_5 = "MetricOptions-5";
+export const GLOBAL_FAKE_ID = "<global>";
+
+export const METRICS_GRAPH_TRACK_SELECTION = "metrics_graph_trackSelection";
+export const METRICS_GRAPH_SHOW_TOOLTIP = "metrics_graph_showTooltip";
+export const METRICS_UNIFORM_TIME_UNITS = "metrics_uniform_time_units";
+
+export function resetMetricsViews() {
+    const store = userKeyValStore();
+    return Promise.all([
+        store?.delete(METRIC_OPTIONS_2),
+        store?.delete(METRIC_OPTIONS_3),
+        store?.delete(METRIC_OPTIONS_4),
+        store?.delete(METRIC_OPTIONS_5),
+        store?.delete(METRICS_GRAPH_TRACK_SELECTION),
+        store?.delete(METRICS_GRAPH_SHOW_TOOLTIP),
+        store?.delete(METRICS_UNIFORM_TIME_UNITS)
+    ]);
+}
+
+export interface MetricsView {
+    scopeTypes: string[];
+    properties: string[];
+    concentrateEdges: boolean;
+    ignoreGlobalStoreOutEdges: boolean;
+    ignoreOutputInternalOutEdges: boolean;
+    subgraphTpl;
+    activityTpl;
+    edgeTpl;
+    sql: string;
+    layout?: DockPanelLayout;
+}
+export type StringMetricsViewMap = { [id: string]: MetricsView };
+
+interface UserMetricsView {
+    viewId: string;
+    views: StringMetricsViewMap;
+}
+
+// When changing the default view - update the store ID (METRIC_OPTIONS_5) to a new version...
+const DefaultMetricsViews: StringMetricsViewMap = {
+    Default: {
+        scopeTypes: ["workflow", "graph", "subgraph", "activity"],
+        properties: ["CostExecute", "TimeElapsed"],
+        concentrateEdges: false,
+        ignoreGlobalStoreOutEdges: true,
+        ignoreOutputInternalOutEdges: false,
+        subgraphTpl: "%id% - %TimeElapsed%",
+        activityTpl: "%Label%",
+        edgeTpl: "%Label%\n%NumRowsProcessed%\n%SkewMinRowsProcessed% / %SkewMaxRowsProcessed%",
+        sql: `\
+SELECT type, name, CostExecute, TimeElapsed, id
+    FROM metrics`,
+        layout: undefined
+    },
+    Graphs: {
+        scopeTypes: ["graph", "subgraph"],
+        properties: ["CostExecute", "TimeElapsed"],
+        concentrateEdges: false,
+        ignoreGlobalStoreOutEdges: true,
+        ignoreOutputInternalOutEdges: false,
+        subgraphTpl: "%id% - %TimeElapsed%",
+        activityTpl: "%Label%",
+        edgeTpl: "%Label%\n%NumRowsProcessed%\n%SkewMinRowsProcessed% / %SkewMaxRowsProcessed%",
+        sql: `\
+SELECT type, name, CostExecute, TimeElapsed, id
+    FROM metrics
+    WHERE type = 'graph' OR type = 'subgraph'`,
+        layout: undefined
+    },
+    Activities: {
+        scopeTypes: ["activity"],
+        properties: ["TimeLocalExecute", "SizeDiskRead", "NumDiskRead"],
+        concentrateEdges: false,
+        ignoreGlobalStoreOutEdges: true,
+        ignoreOutputInternalOutEdges: false,
+        subgraphTpl: "%id% - %TimeElapsed%",
+        activityTpl: "%Label%",
+        edgeTpl: "%Label%\n%NumRowsProcessed%\n%SkewMinRowsProcessed% / %SkewMaxRowsProcessed%",
+        sql: `\
+SELECT type, name, TimeLocalExecute, SizeDiskRead, NumDiskRead, id
+    FROM metrics
+    WHERE type = 'activity'`,
+        layout: undefined
+    },
+    Operations: {
+        scopeTypes: ["operation"],
+        properties: ["TimeElapsed"],
+        concentrateEdges: false,
+        ignoreGlobalStoreOutEdges: true,
+        ignoreOutputInternalOutEdges: false,
+        subgraphTpl: "%id%",
+        activityTpl: "%Label%",
+        edgeTpl: "%Label%",
+        sql: `\
+SELECT type, name, TimeElapsed, id
+    FROM metrics
+    WHERE type = 'operation'`,
+        layout: undefined
+    },
+    Peaks: {
+        scopeTypes: ["subgraph"],
+        properties: ["NodeMaxPeakMemory", "NodeMaxPeakRowMemory", "NodeMinPeakMemory", "NodeMinPeakRowMemory", "SizeAvgPeakMemory", "SizeAvgPeakRowMemory", "SizeDeltaPeakMemory", "SizeDeltaPeakRowMemory", "SizeMaxPeakMemory", "SizeMaxPeakRowMemory", "SizeMinPeakMemory", "SizeMinPeakRowMemory", "SizePeakMemory", "SizeStdDevPeakMemory", "SizeStdDevPeakRowMemory", "SkewMaxPeakMemory", "SkewMaxPeakRowMemory", "SkewMinPeakMemory", "SkewMinPeakRowMemory"],
+        concentrateEdges: false,
+        ignoreGlobalStoreOutEdges: true,
+        ignoreOutputInternalOutEdges: false,
+        subgraphTpl: "%id% - %TimeElapsed%",
+        activityTpl: "%Label%",
+        edgeTpl: "%Label%\n%NumRowsProcessed%\n%SkewMinRowsProcessed% / %SkewMaxRowsProcessed%",
+        sql: `\
+SELECT type, name, NodeMaxPeakMemory, NodeMaxPeakRowMemory, NodeMinPeakMemory, NodeMinPeakRowMemory, SizeAvgPeakMemory, SizeAvgPeakRowMemory, SizeDeltaPeakMemory, SizeDeltaPeakRowMemory, SizeMaxPeakMemory, SizeMaxPeakRowMemory, SizeMinPeakMemory, SizeMinPeakRowMemory, SizePeakMemory, SizeStdDevPeakMemory, SizeStdDevPeakRowMemory, SkewMaxPeakMemory, SkewMaxPeakRowMemory, SkewMinPeakMemory, SkewMinPeakRowMemory, id
+    FROM metrics
+    WHERE type = 'subgraph'`,
+        layout: undefined
+    }
+};
+
+// const _defaultUserViews = JSON.stringify({ viewId: _viewId.value, views: _views.value });
+
+export function clone<T>(_: T): T {
+    return JSON.parse(JSON.stringify(_));
+}
+
+function stripShowTimelineFromViews(views: StringMetricsViewMap): StringMetricsViewMap {
+    const sanitizedViews: StringMetricsViewMap = {};
+    for (const viewId in views) {
+        const { showTimeline: _showTimeline, ...rest } = views[viewId] as MetricsView & { showTimeline?: boolean };
+        sanitizedViews[viewId] = rest as MetricsView;
+    }
+    return sanitizedViews;
+}
+
+// function checkLayout(options: MetricsView): boolean {
+//     if (options?.layout && !options?.layout?.["main"]) {
+//         delete options.layout;
+//     }
+//     return !!options?.layout;
+// }
+
+export interface useMetricsViewsResult {
+    loaded: boolean;
+    viewIds: string[];
+    viewId: string;
+    setViewId: (id: string, forceRefresh?: boolean) => void;
+    view: MetricsView;
+    addView: (label: string, view: Partial<MetricsView>) => void;
+    deleteView: (id: string) => void;
+    renameView: (oldId: string, newId: string) => void;
+    isDefaultView: (id: string) => boolean;
+    updateView: (view: Partial<MetricsView>, forceRefresh?: boolean) => void;
+    resetView: (forceRefresh?: boolean) => void;
+    save: () => void;
+}
+
+const defaultUserMetricViews = JSON.stringify({ viewId: "Default", views: DefaultMetricsViews });
+
+const logicalGraphView: MetricsView = {
+    scopeTypes: ["workflow", "graph", "subgraph", "child", "activity", "operation"],
+    properties: ["Kind", "Label", "Filename", "EclNameList", "EclText", "DefinitionList"],
+    concentrateEdges: false,
+    ignoreGlobalStoreOutEdges: false,
+    ignoreOutputInternalOutEdges: false,
+    subgraphTpl: "%id%",
+    activityTpl: "%Label%",
+    edgeTpl: "%Label%",
+    sql: `\
+SELECT type, name, id, Kind, Label, EclNameList, EclText
+    FROM metrics`,
+    layout: undefined
+};
+
+const logicalGraphResult: useMetricsViewsResult = {
+    loaded: true,
+    viewIds: ["LogicalGraph"],
+    viewId: "LogicalGraph",
+    setViewId: () => { },
+    view: logicalGraphView,
+    addView: () => { },
+    deleteView: () => { },
+    renameView: () => { },
+    isDefaultView: () => true,
+    updateView: () => { },
+    resetView: () => { },
+    save: () => { }
+};
+
+const _loaded = signal(false);
+const _origViews = signal<StringMetricsViewMap>(clone(DefaultMetricsViews));
+const _views = signal<StringMetricsViewMap>(clone(DefaultMetricsViews));
+const _viewIds = signal<string[]>(Object.keys(_views.get()));
+const _viewId = signal<string>(_viewIds.get()[0]);
+const _view = signal<MetricsView>(_views.get()[_viewId.get()]);
+
+export function useMetricsViews(logicalGraph: boolean): useMetricsViewsResult {
+    const loaded = useSignal(_loaded);
+    const origViews = useSignal(_origViews);
+    const views = useSignal(_views);
+    const viewIds = useSignal(_viewIds);
+    const viewId = useSignal(_viewId);
+    const view = useSignal(_view);
+
+    const refresh = useForceUpdate();
+
+    const setViewId = React.useCallback((id: string) => {
+        _viewId.set(id);
+    }, []);
+
+    const [metricViewStr, setMetricViewStr, _resetMetricsViewStr] = useUserStore<string>(METRIC_OPTIONS_5, defaultUserMetricViews);
+    React.useEffect(() => {
+        if (metricViewStr && !loaded) {
+            try {
+                const userView: UserMetricsView = JSON.parse(metricViewStr);
+                const sanitizedViews = stripShowTimelineFromViews(userView.views);
+                _origViews.set(clone(sanitizedViews));
+                _views.set(sanitizedViews);
+                _viewIds.set(Object.keys(sanitizedViews));
+                setViewId(userView.viewId);
+                _loaded.set(true);
+            } catch (e) {
+                logger.error(e);
+                const def = clone(DefaultMetricsViews);
+                const keys = Object.keys(def);
+                _views.set(def);
+                _viewIds.set(keys);
+                setViewId(keys[0]);
+                _loaded.set(true);
+            }
+        }
+    }, [loaded, metricViewStr, setViewId]);
+
+    React.useEffect(() => {
+        _view.set(views[viewId]);
+    }, [viewId, views]);
+
+    const addView = React.useCallback((label: string, _: Partial<MetricsView>) => {
+        if (label in views) return;
+        const newView = clone(view);
+        for (const key in _) {
+            newView[key] = _[key];
+        }
+        const updatedViews = { ...views, [label]: newView };
+        const updatedOrigViews = { ...origViews, [label]: clone(newView) };
+        _views.set(updatedViews);
+        _origViews.set(updatedOrigViews);
+        _viewIds.set(Object.keys(updatedViews));
+        setViewId(label);
+        setMetricViewStr(JSON.stringify({ viewId: label, views: updatedViews }));
+        refresh();
+    }, [origViews, refresh, setMetricViewStr, setViewId, view, views]);
+
+    const deleteView = React.useCallback((id: string) => {
+        if (id in DefaultMetricsViews) return;
+        const updatedViews = { ...views };
+        delete updatedViews[id];
+        const updatedOrigViews = { ...origViews };
+        delete updatedOrigViews[id];
+        _views.set(updatedViews);
+        _origViews.set(updatedOrigViews);
+        _viewIds.set(Object.keys(updatedViews));
+        setViewId("Default");
+        setMetricViewStr(JSON.stringify({ viewId: "Default", views: updatedViews }));
+        refresh();
+    }, [origViews, refresh, setMetricViewStr, setViewId, views]);
+
+    const renameView = React.useCallback((oldId: string, newId: string) => {
+        if (oldId in DefaultMetricsViews) return;
+        if (oldId === newId || !newId) return;
+        if (newId in views) return;
+        const updatedViews = { ...views, [newId]: views[oldId] };
+        delete updatedViews[oldId];
+        const updatedOrigViews = { ...origViews, [newId]: origViews[oldId] };
+        delete updatedOrigViews[oldId];
+        _views.set(updatedViews);
+        _origViews.set(updatedOrigViews);
+        _viewIds.set(Object.keys(updatedViews));
+        setViewId(newId);
+        setMetricViewStr(JSON.stringify({ viewId: newId, views: updatedViews }));
+        refresh();
+    }, [origViews, refresh, setMetricViewStr, setViewId, views]);
+
+    const isDefaultView = React.useCallback((id: string) => {
+        return id in DefaultMetricsViews;
+    }, []);
+
+    const updateView = React.useCallback((_: Partial<MetricsView>, forceRefresh = false) => {
+        const updatedView = { ...view };
+        for (const key in _) {
+            updatedView[key] = _[key];
+        }
+        _view.set(updatedView);
+        _views.set({ ...views, [viewId]: updatedView });
+        if (forceRefresh) {
+            refresh();
+        }
+    }, [refresh, view, viewId, views]);
+
+    const resetView = React.useCallback((forceRefresh = false) => {
+        const def = DefaultMetricsViews[viewId] ?? DefaultMetricsViews["Default"];
+        const updatedView = { ...view };
+        for (const key in def) {
+            updatedView[key] = def[key];
+        }
+        _view.set(updatedView);
+        _views.set({ ...views, [viewId]: updatedView });
+        if (forceRefresh) {
+            refresh();
+        }
+    }, [refresh, view, viewId, views]);
+
+    const save = React.useCallback(() => {
+        return setMetricViewStr(JSON.stringify({ viewId, views: stripShowTimelineFromViews(views) }));
+    }, [viewId, views, setMetricViewStr]);
+
+    if (logicalGraph) {
+        return logicalGraphResult;
+    }
+
+    return {
+        loaded,
+        viewIds,
+        viewId,
+        setViewId,
+        view,
+        addView,
+        deleteView,
+        renameView,
+        isDefaultView,
+        updateView,
+        resetView,
+        save
+    };
+}
+
+let wuDetailsMetaResponse: Promise<WsWorkunits.WUDetailsMetaResponse>;
+
+export function useMetricMeta(): [string[], string[]] {
+
+    const service = useConst(() => new WorkunitsService({ baseUrl: "" }));
+    const [scopeTypes, setScopeTypes] = React.useState<string[]>([]);
+    const [properties, setProperties] = React.useState<string[]>([]);
+
+    React.useEffect(() => {
+        if (!wuDetailsMetaResponse && service) {
+            wuDetailsMetaResponse = service.WUDetailsMeta({});
+        }
+        wuDetailsMetaResponse?.then(response => {
+            setScopeTypes(response?.ScopeTypes?.ScopeType || []);
+            setProperties((response?.Properties?.Property.map(p => p.Name) || []).sort());
+        });
+    }, [service]);
+
+    return [scopeTypes, properties];
+}
+
+export enum FetchStatus {
+    UNKNOWN,
+    STARTED,
+    COMPLETE
+}
+
+export enum ScopeType {
+    none = "none",
+    all = "all",
+    global = "global",
+    graph = "graph",
+    subgraph = "subgraph",
+    activity = "activity",
+    allocator = "allocator",
+    section = "section",
+    operation = "operation",
+    edge = "edge",
+    function = "function",
+    workflow = "workflow",
+    file = "file",
+    channel = "channel",
+    unknown = "unknown",
+    max = "max"
+}
+
+export const WURootScopeTypes = [
+    ScopeType.all
+];
+
+export const WULogicalRootScopeTypes = [
+    ScopeType.graph
+];
+
+export const scopeFilterMetrics: Partial<WsWorkunits.ScopeFilter> = {
+    MaxDepth: 1,
+    ScopeTypes: WURootScopeTypes
+};
+
+export const scopeFilterLogicalGraph: Partial<WsWorkunits.ScopeFilter> = {
+    MaxDepth: 1,
+    ScopeTypes: WULogicalRootScopeTypes
+};
+
+const nestedFilterDefault: WsWorkunits.NestedFilter = {
+    Depth: 999999,
+    ScopeTypes: []
+};
+
+export interface useMetricsResult {
+    metrics: IScope[];
+    columns: { [id: string]: any };
+    activities: WsWorkunits.Activity2[];
+    properties: WsWorkunits.Property2[];
+    measures: string[];
+    scopeTypes: string[];
+    status: FetchStatus;
+    refresh: () => void;
+}
+
+export interface IScopeEx extends IScope {
+    __exceptions?: WsWorkunits.ECLException[],
+}
+
+function decodeStringsInPlace(value: unknown): void {
+    if (!value || typeof value !== "object") {
+        return;
+    }
+    if (Array.isArray(value)) {
+        value.forEach(item => decodeStringsInPlace(item));
+        return;
+    }
+
+    const obj = value as Record<string, unknown>;
+    for (const key in obj) {
+        const next = obj[key];
+        if (typeof next === "string") {
+            obj[key] = decodeHTML(next);
+        } else if (next && typeof next === "object") {
+            decodeStringsInPlace(next);
+        }
+    }
+}
+
+function normalizeMetricScope(row: IScopeEx, exceptionsMap?: { [scope: string]: WsWorkunits.ECLException[] }): IScopeEx {
+    decodeStringsInPlace(row);
+    if (exceptionsMap?.[row.name]) {
+        row.__exceptions = exceptionsMap[row.name];
+    }
+    if (row.id === "") {
+        row.id = GLOBAL_FAKE_ID;
+    }
+    return row;
+}
+
+export function useWorkunitMetrics(
+    wuid: string,
+    scopeFilter: Partial<WsWorkunits.ScopeFilter> = scopeFilterMetrics,
+    nestedFilter: WsWorkunits.NestedFilter = nestedFilterDefault
+): useMetricsResult {
+
+    const { workunit, state } = useWorkunit(wuid);
+    const [data, setData] = React.useState<IScopeEx[]>([]);
+    const [columns, setColumns] = React.useState<{ [id: string]: any }>([]);
+    const [activities, setActivities] = React.useState<WsWorkunits.Activity2[]>([]);
+    const [properties, setProperties] = React.useState<WsWorkunits.Property2[]>([]);
+    const [measures, setMeasures] = React.useState<string[]>([]);
+    const [scopeTypes, setScopeTypes] = React.useState<string[]>([]);
+    const [status, setStatus] = React.useState<FetchStatus>(FetchStatus.COMPLETE);
+    const [count, increment] = useCounter();
+
+    React.useEffect(() => {
+        if (!wuid || !workunit || workunit.Wuid !== wuid) {
+            setData([]);
+            setColumns({});
+            setActivities([]);
+            setProperties([]);
+            setMeasures([]);
+            setScopeTypes([]);
+            setStatus(FetchStatus.COMPLETE);
+            return;
+        }
+
+        let cancelled = false;
+        const fetchInfo = singletonDebounce(workunit, "fetchInfo");
+        const fetchDetailsNormalized = singletonDebounce(workunit, "fetchDetailsNormalized");
+        setStatus(FetchStatus.STARTED);
+        Promise.all([
+            fetchInfo({ IncludeExceptions: true }),
+            fetchDetailsNormalized({
+                ScopeFilter: scopeFilter,
+                NestedFilter: nestedFilter,
+                PropertiesToReturn: {
+                    AllScopes: true,
+                    AllAttributes: true,
+                    AllProperties: true,
+                    AllNotes: true,
+                    AllStatistics: true,
+                    AllHints: true
+                },
+                ScopeOptions: {
+                    IncludeId: true,
+                    IncludeScope: true,
+                    IncludeScopeType: true,
+                    IncludeMatchedScopesInResults: true
+                },
+                PropertyOptions: {
+                    IncludeName: true,
+                    IncludeRawValue: true,
+                    IncludeFormatted: true,
+                    IncludeMeasure: true,
+                    IncludeCreator: false,
+                    IncludeCreatorType: false
+                }
+            })
+        ]).then(([info, response]) => {
+            if (cancelled) return;
+
+            const exceptionsMap: { [scope: string]: WsWorkunits.ECLException[] } = {};
+            for (const exception of info?.Workunit?.Exceptions?.ECLException ?? []) {
+                if (exception.Scope) {
+                    if (!exceptionsMap[exception.Scope]) {
+                        exceptionsMap[exception.Scope] = [];
+                    }
+                    exceptionsMap[exception.Scope].push(exception);
+                }
+            }
+            setData(response?.data.map(row => normalizeMetricScope(row, exceptionsMap)) ?? []);
+            setColumns(response?.columns ?? {});
+            setActivities(response?.meta?.Activities?.Activity ?? []);
+            setProperties(response?.meta?.Properties?.Property ?? []);
+            setMeasures(response?.meta?.Measures?.Measure ?? []);
+            setScopeTypes(response?.meta?.ScopeTypes?.ScopeType ?? []);
+        }).catch(e => {
+            if (!cancelled) {
+                logger.error(e);
+            }
+        }).finally(() => {
+            if (!cancelled) {
+                setStatus(FetchStatus.COMPLETE);
+            }
+        });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [workunit, state, count, scopeFilter, nestedFilter, wuid]);
+
+    return { metrics: data, columns, activities, properties, measures, scopeTypes, status, refresh: increment };
+}
+
+export function useQueryMetrics(
+    querySet: string,
+    queryId: string,
+    scopeFilter: Partial<WsWorkunits.ScopeFilter> = scopeFilterMetrics,
+    nestedFilter: WsWorkunits.NestedFilter = nestedFilterDefault
+): useMetricsResult {
+
+    const [query, state, _refresh] = useQuery(querySet, queryId);
+    const [data, setData] = React.useState<IScope[]>([]);
+    const [columns, setColumns] = React.useState<{ [id: string]: any }>([]);
+    const [activities, setActivities] = React.useState<WsWorkunits.Activity2[]>([]);
+    const [properties, setProperties] = React.useState<WsWorkunits.Property2[]>([]);
+    const [measures, setMeasures] = React.useState<string[]>([]);
+    const [scopeTypes, setScopeTypes] = React.useState<string[]>([]);
+    const [status, setStatus] = React.useState<FetchStatus>(FetchStatus.COMPLETE);
+    const [count, increment] = useCounter();
+
+    React.useEffect(() => {
+        if (querySet && queryId && query) {
+            const fetchDetailsNormalized = singletonDebounce(query, "fetchDetailsNormalized");
+            setStatus(FetchStatus.STARTED);
+            fetchDetailsNormalized({
+                ScopeFilter: scopeFilter,
+                NestedFilter: nestedFilter,
+                PropertiesToReturn: {
+                    AllScopes: true,
+                    AllAttributes: true,
+                    AllProperties: true,
+                    AllNotes: true,
+                    AllStatistics: true,
+                    AllHints: true
+                },
+                ScopeOptions: {
+                    IncludeId: true,
+                    IncludeScope: true,
+                    IncludeScopeType: true,
+                    IncludeMatchedScopesInResults: true
+                },
+                PropertyOptions: {
+                    IncludeName: true,
+                    IncludeRawValue: true,
+                    IncludeFormatted: true,
+                    IncludeMeasure: true,
+                    IncludeCreator: false,
+                    IncludeCreatorType: false
+                }
+            }).then(response => {
+                setData(response?.data.map(row => normalizeMetricScope(row)));
+                setColumns(response?.columns);
+                setActivities(response?.meta?.Activities?.Activity || []);
+                setProperties(response?.meta?.Properties?.Property || []);
+                setMeasures(response?.meta?.Measures?.Measure || []);
+                setScopeTypes(response?.meta?.ScopeTypes?.ScopeType || []);
+            }).catch(e => {
+                logger.error(e);
+            }).finally(() => {
+                setStatus(FetchStatus.COMPLETE);
+            });
+        }
+    }, [query, state, count, scopeFilter, nestedFilter, querySet, queryId]);
+
+    return { metrics: data, columns, activities, properties, measures, scopeTypes, status, refresh: increment };
+}
+
+export function useWUQueryMetrics(
+    wuid: string,
+    querySet: string,
+    queryId: string,
+    scopeFilter: Partial<WsWorkunits.ScopeFilter> = scopeFilterMetrics,
+    nestedFilter: WsWorkunits.NestedFilter = nestedFilterDefault
+): useMetricsResult {
+    const isQuery = querySet && queryId;
+    const wuMetrics = useWorkunitMetrics(isQuery ? "" : wuid, scopeFilter, nestedFilter);
+    const queryMetrics = useQueryMetrics(isQuery ? querySet : "", isQuery ? queryId : "", scopeFilter, nestedFilter);
+    return isQuery ? { ...queryMetrics } : { ...wuMetrics };
+}
+
+export function useMetricsGraphLayout(dot: string): { svg: string, layoutStatus: LayoutStatus } {
+    const [svg, setSvg] = React.useState<string>(layoutCache.svg(dot));
+    const [layoutStatus, setLayoutStatus] = React.useState<LayoutStatus>(LayoutStatus.UNKNOWN);
+
+    React.useEffect(() => {
+        if (!dot) {
+            setSvg("");
+            setLayoutStatus(LayoutStatus.UNKNOWN);
+            return;
+        }
+
+        let completedOrCancelled = false;
+        setLayoutStatus(layoutCache.status(dot));
+
+        setTimeout(() => {
+            if (!completedOrCancelled) {
+                setLayoutStatus(LayoutStatus.LONG_RUNNING);
+            }
+        }, 15000);
+
+        layoutCache.calcSVG(dot).then(response => {
+            if (isGraphvizWorkerResponse(response)) {
+                if (!completedOrCancelled) {
+                    setSvg(response.svg);
+                }
+            } else {
+                throw new Error(response.error);
+            }
+        }).catch(err => {
+            logger.error(err);
+        }).finally(() => {
+            if (!completedOrCancelled) {
+                setLayoutStatus(layoutCache.status(dot));
+                completedOrCancelled = true;
+            }
+        });
+
+        return () => {
+            completedOrCancelled = true;
+        };
+    }, [dot]);
+
+    return { svg, layoutStatus };
+}

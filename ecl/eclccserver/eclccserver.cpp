@@ -16,11 +16,14 @@
 ############################################################################## */
 
 #include "jlib.hpp"
+#include "jcontainerized.hpp"
 #include "jmisc.hpp"
 #include "jisem.hpp"
 #include "jfile.hpp"
 #include "jencrypt.hpp"
 #include "jregexp.hpp"
+#include "jcomp.hpp"
+#include "jutil.hpp"
 #include "mpbase.hpp"
 #include "daclient.hpp"
 #include "dasess.hpp"
@@ -30,13 +33,16 @@
 #include "dllserver.hpp"
 #include "thorplugin.hpp"
 #include "daqueue.hpp"
+#include "dastats.hpp"
 #ifndef _CONTAINERIZED
 #include "dalienv.hpp"
 #endif
+#include <cmath>
+#include <limits>
 #include <unordered_map>
 #include <string>
+#include "codesigner.hpp"
 
-static Owned<IPropertyTree> globals;
 static const char * * globalArgv = nullptr;
 
 //------------------------------------------------------------------------------------------------------------------
@@ -130,26 +136,42 @@ private:
 // Check for aborts of the workunit as it is compiling
 //------------------------------------------------------------------------------------------------------------------
 
+static bool useChildProcesses = false;      // Use k8s jobs for compile tasks
+
 class AbortWaiter : public Thread
 {
 public:
-    AbortWaiter(IPipeProcess *_pipe, IConstWorkUnit *_wu)
-        : Thread("EclccCompileThread::AbortWaiter"), pipe(_pipe), wu(_wu)
+    AbortWaiter(IConstWorkUnit *_wu, unsigned _timeLimit)
+        : Thread("EclccCompileThread::AbortWaiter"), timeLimit(_timeLimit), wu(_wu)
     {
+    }
+
+    virtual ~AbortWaiter() override
+    {
+        stop();
     }
 
     virtual int run()
     {
         wu->subscribe(SubscribeOptionAbort);
+        unsigned start = msTick();
+        timedOut = false;
         try
         {
             for (;;)
             {
-                if (sem.wait(2000))
+                if (sem.wait(1000))
                     break;
-                if (wu->aborting())
+                timedOut = (timeLimit && (msTick() - start >= timeLimit*1000));
+                if (timedOut || wu->aborting())
                 {
-                    pipe->abort();
+                    CriticalBlock b(crit);
+                    DBGLOG("Aborting compilation after %ums (%s)", msTick() - start, timedOut ? "timed out" : "aborted");
+                    ForEachItemIn(idx, pipes)
+                    {
+                        IPipeProcess *pipe = pipes.item(idx);
+                        pipe->abort();
+                    }
                     break;
                 }
             }
@@ -161,15 +183,47 @@ public:
         return 0;
     }
 
-    void stop()
+    bool stop()
     {
         sem.interrupt(NULL);
         join();
+        return timedOut;
+    }
+
+    void addPipe(IPipeProcess *pipe)
+    {
+        CriticalBlock b(crit);
+        pipes.append(LINK(pipe));
+        if (timedOut)
+            pipe->abort();
+    }
+    void removePipe(IPipeProcess *pipe)
+    {
+        CriticalBlock b(crit);
+        pipes.zap(pipe);
     }
 private:
-    IPipeProcess *pipe;
+    CriticalSection crit{SYNC_LOCATION};
+    unsigned timeLimit = 0;
+    bool timedOut = false;
+    IPointerArrayOf<IPipeProcess> pipes;
     IConstWorkUnit *wu;
-    InterruptableSemaphore sem;
+    InterruptableSemaphore sem{SYNC_LOCATION};
+};
+
+class AbortPipeWaiter
+{
+    AbortWaiter &waiter;
+    IPipeProcess *pipe;
+public:
+    AbortPipeWaiter(AbortWaiter &_waiter, IPipeProcess *_pipe) : waiter(_waiter), pipe(_pipe)
+    {
+        waiter.addPipe(pipe);
+    }
+    ~AbortPipeWaiter()
+    {
+        waiter.removePipe(pipe);
+    }
 };
 
 //------------------------------------------------------------------------------------------------------------------
@@ -177,17 +231,220 @@ private:
 // A threadpool is used to allow multiple compiles to be submitted at once. Threads are reused when compilation completes.
 //------------------------------------------------------------------------------------------------------------------
 
-class EclccCompileThread : implements IPooledThread, implements IErrorReporter, public CInterface
+
+static bool guardGitUpdates = false;
+static StringBuffer gitLockKey;
+
+static bool architectureMismatchAllowed(const IPropertyTree *config)
 {
+    return config && config->getPropBool("@allowTargetArchitectureMismatch", false);
+}
+
+static bool includeQueueForArchitecture(const char *targetName, const char *serverArchitecture, const char *targetArchitecture, bool allowMismatch)
+{
+    if (targetArchitecturesMatch(serverArchitecture, targetArchitecture))
+        return true;
+
+    VStringBuffer message("Target '%s' architecture '%s' does not match eclccserver architecture '%s'", targetName, targetArchitecture, serverArchitecture);
+    if (!allowMismatch)
+        throwStringExceptionV(0, "%s", message.str());
+    UWARNLOG("%s; skipping queue", message.str());
+    return false;
+}
+
+static void appendTargetQueue(StringBuffer &queueNames, const char *targetName)
+{
+    if (queueNames.length())
+        queueNames.append(',');
+    getClusterEclCCServerQueueName(queueNames, targetName);
+}
+
+#ifndef _CONTAINERIZED
+static IPropertyTree *queryNamedProcess(IPropertyTree &root, const char *processType, const char *processName)
+{
+    if (isEmptyString(processName))
+        return nullptr;
+    VStringBuffer xpath("Software/%s[@name=\"%s\"]", processType, processName);
+    return root.queryPropTree(xpath.str());
+}
+
+static StringBuffer &getTargetArchitecture(StringBuffer &processArchitecture, const char *processType, const char *processName, IPropertyTree &root)
+{
+    IPropertyTree *process = queryNamedProcess(root, processType, processName);
+    processArchitecture.clear();
+    getProcessTargetArchitecture(processArchitecture, process);
+    return processArchitecture;
+}
+
+static void checkConsistentTargetArchitecture(StringBuffer &targetArchitecture, const char *targetName, const char *processType, const char *processName, const char *processArchitecture)
+{
+    if (targetArchitecture.isEmpty())
+    {
+        targetArchitecture.set(processArchitecture);
+        return;
+    }
+    if (!targetArchitecturesMatch(targetArchitecture.str(), processArchitecture))
+        throwStringExceptionV(0, "Target '%s' references mixed target architectures '%s' and '%s' from %s process '%s'",
+                              targetName, targetArchitecture.str(), processArchitecture, processType, processName);
+}
+
+static StringBuffer &getTargetRuntimeArchitecture(StringBuffer &targetArchitecture, IPropertyTree &root, IPropertyTree &target)
+{
+    targetArchitecture.clear();
+    const char *targetName = target.queryProp("@name");
+
+    Owned<IPropertyTreeIterator> thorClusters = target.getElements("ThorCluster");
+    ForEach(*thorClusters)
+    {
+        const char *thorName = thorClusters->query().queryProp("@process");
+        StringBuffer processArchitecture;
+        getTargetArchitecture(processArchitecture, "ThorCluster", thorName, root);
+        checkConsistentTargetArchitecture(targetArchitecture, targetName, "ThorCluster", thorName, processArchitecture.str());
+    }
+
+    const char *roxieName = target.queryProp("RoxieCluster/@process");
+    if (!isEmptyString(roxieName))
+    {
+        StringBuffer processArchitecture;
+        getTargetArchitecture(processArchitecture, "RoxieCluster", roxieName, root);
+        checkConsistentTargetArchitecture(targetArchitecture, targetName, "RoxieCluster", roxieName, processArchitecture.str());
+    }
+
+    if (targetArchitecture.isEmpty())
+        normalizeTargetArchitecture(targetArchitecture, nullptr);
+    return targetArchitecture;
+}
+#endif
+
+static void configGitLock()
+{
+    Owned<IPropertyTree> config = getComponentConfig();
+    if (config->getPropBool("@enableEclccDali", true))
+    {
+        if (config->getPropBool("@guardGitUpdates", true))
+        {
+            if (isContainerized())
+            {
+                //Containerized: each git plane needs to be protected independently
+                gitLockKey.append(config->queryProp("@gitPlane"));
+            }
+            else
+            {
+                //Bare metal - git repos are fetched locally, so protect per host-ip
+                const char * hostname = GetCachedHostName();
+                if (hostname)
+                {
+                    gitLockKey.append("host");
+
+                    for (const byte * cur = (const byte *)hostname; *cur; cur++)
+                    {
+                        //remove '.' and other unsupported characters from the key name
+                        if (isalnum(*cur))
+                            gitLockKey.append(*cur);
+                        else
+                            gitLockKey.append("_");
+                    }
+                }
+            }
+
+            if (!gitLockKey.isEmpty())
+                guardGitUpdates = true;
+        }
+    }
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+static StringBuffer &getQueues(StringBuffer &queueNames, bool isLingeringServer)
+{
+    Owned<IPropertyTree> config = getComponentConfig();
+    const char * processName = config->queryProp("@name");
+    StringBuffer serverArchitecture;
+    getProcessTargetArchitecture(serverArchitecture, config);
+    bool allowMismatch = architectureMismatchAllowed(config);
+#ifdef _CONTAINERIZED
+    bool filtered = false;
+    std::unordered_map<std::string, bool> listenQueues;
+    Owned<IPTreeIterator> listening = config->getElements("listen");
+    ForEach (*listening)
+    {
+        const char *lq = listening->query().queryProp(".");
+        if (lq)
+        {
+            listenQueues[lq] = true;
+            filtered = true;
+        }
+    }
+    Owned<IPTreeIterator> queues = config->getElements("queues");
+    ForEach(*queues)
+    {
+        IPTree &queue = queues->query();
+        const char *qname = queue.queryProp("@name");
+        if (!isEmptyString(qname) && (!filtered || listenQueues.count(qname)))
+        {
+            StringBuffer targetArchitecture;
+            getProcessTargetArchitecture(targetArchitecture, &queue);
+            if (includeQueueForArchitecture(qname, serverArchitecture.str(), targetArchitecture.str(), allowMismatch))
+                appendTargetQueue(queueNames, qname);
+        }
+    }
+    if (isLingeringServer)
+    {
+        if (queueNames.length())
+        {
+            queueNames.append(",");
+            getClusterEclCCServerCompileQueueName(queueNames, processName);
+        }
+    }
+#else
+    Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
+    Owned<IConstEnvironment> env = factory->openEnvironment();
+    Owned<IPropertyTree> root = &env->getPTree();
+    IPropertyTree *serverProcess = queryNamedProcess(*root, "EclCCServerProcess", processName);
+    if (serverProcess)
+        getProcessTargetArchitecture(serverArchitecture, serverProcess);
+
+    VStringBuffer xpath("EclCCServerProcess[@process=\"%s\"]", processName);
+    Owned<IPropertyTreeIterator> targets = root->getElements("Software/Topology/Cluster");
+    ForEach(*targets)
+    {
+        IPropertyTree &target = targets->query();
+        const char *targetName = target.queryProp("@name");
+        if (!isEmptyString(targetName) && target.hasProp(xpath.str()))
+        {
+            StringBuffer targetArchitecture;
+            getTargetRuntimeArchitecture(targetArchitecture, *root, target);
+            if (includeQueueForArchitecture(targetName, serverArchitecture.str(), targetArchitecture.str(), allowMismatch))
+                appendTargetQueue(queueNames, targetName);
+        }
+    }
+#endif
+    PROGLOG("eclccserver '%s' architecture '%s' listening queue(s): %s", processName, serverArchitecture.str(), queueNames.str());
+    return queueNames;
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+class EclccCompiler : implements IErrorReporter
+{
+    StringAttr instanceName;
     StringAttr wuid;
     Owned<IWorkUnit> workunit;
     StringBuffer idxStr;
     StringArray filesSeen;
+    StringBuffer repoRootPath;
+    unsigned instanceNumber;
+    unsigned defaultMaxCompileThreads = 0;
+    bool saveTemps = false;
 
+//interface IErrorReporter:
     virtual void reportError(IException *e)
     {
         StringBuffer s;
-        reportError(e->errorMessage(s).str(), 2);
+        e->errorMessage(s);
+        Owned<IError> error = createError(CategoryError, SeverityError, e->errorCode(), s.str(), 0, nullptr);
+        addWorkunitException(workunit, error, false);
+        IERRLOG("%s", s.str());
     }
 
     virtual void reportError(const char *errStr, unsigned retcode)
@@ -242,7 +499,7 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
             const char * finger = (*start=='-') ? start+1 : start; //support leading double dash
             const char * dash = strrchr(finger, '-');     // position of trailing dash, if present
             StringAttr optName;
-            if (dash && (dash != start))
+            if (dash && (dash != start) && isdigit(dash[1]))
                 optName.set(start, dash-start);
             else
                 optName.set(start);
@@ -289,7 +546,237 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
             pipe.setenv(envVar, value);
         }
         else
+        {
+            if (strieq(option, "maxCompileThreads"))
+            {
+                if (!isLocal)
+                {
+                    int requestedMaxThreads = atoi(value);
+                    defaultMaxCompileThreads = requestedMaxThreads > 0 ? requestedMaxThreads : 1;
+                }
+            }
+            else if (strieq(option, "saveEclTempFiles"))
+                saveTemps = strToBool(value);
             eclccCmd.appendf(" -f%s=%s", option, value);
+        }
+    }
+
+    unsigned doRunCompileCommand(AbortWaiter &abortWaiter, StringBuffer &output, const char *cmd)
+    {
+        try
+        {
+            Owned<IPipeProcess> pipe = createPipeProcess();
+            AbortPipeWaiter aborter(abortWaiter, pipe);
+            bool timeCompiles = workunit->getDebugValueBool("timeCompiles", true);
+            CCycleTimer compileTimer(timeCompiles);
+            int ret = START_FAILURE;
+            if (pipe->run(nullptr, cmd, ".", false, true, true, 1024*1024))
+            {
+                char buf[1024];
+                while (true)
+                {
+                    size32_t read = pipe->read(sizeof(buf), buf);
+                    if (!read)
+                        break;
+                    output.append(read, buf);
+                }
+                ret = pipe->wait();
+                while (true)
+                {
+                    size32_t read = pipe->readError(sizeof(buf), buf);
+                    if (!read)
+                        break;
+                    output.append(read, buf);
+                }
+            }
+
+            if (timeCompiles)
+            {
+                StringBuffer scope;
+                const char * source = strchr(cmd, '"');
+                const char * end = nullptr;
+                if (source)
+                    source = strchr(source+1, '"');
+                if (source)
+                    source = strchr(source+1, '"');
+                if (source)
+                    end = strchr(source+1, '"');
+
+                //Extract the name of the file being compiled - and spot the link step because the input is a .o.
+                StringBuffer filename;
+                if (end)
+                    filename.append((end - source) - 1, source+1);
+                const char * extension = strrchr(filename, '.');
+                if (!extension || strncmp(extension, ".o", 2) == 0)
+                    filename.set("link");
+
+                scope.append(">compile:>compile c++:").append(filename);
+                workunit->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSToperation, scope, StTimeElapsed, NULL, compileTimer.elapsedNs(), 1, 0, StatsMergeReplace);
+            }
+
+            return ret;
+        }
+        catch (IException *E)
+        {
+            E->Release();
+            output.clear();
+            return START_FAILURE;
+        }
+    }
+
+    unsigned executeLine(AbortWaiter &abortWaiter, const char *line, StringBuffer &output, bool alreadyFailed)
+    {
+        if (isEmptyString(line))
+            return 0;
+        if (line[0] == '#')
+        {
+            return 0;
+        }
+        else if (startsWith(line, "rmdir "))
+        {
+            DBGLOG("Removing directory %s", line+6);
+            Owned<IFile> tempDir = createIFile(line+6);
+            if (tempDir)
+                recursiveRemoveDirectory(tempDir);
+            return 0;
+        }
+        else if (startsWith(line , "rm "))
+        {
+            DBGLOG("Removing file %s", line+3);
+            remove(line + 3);
+            return 0;
+        }
+        else if (!alreadyFailed)
+        {
+            DBGLOG("Executing %s", line);
+            unsigned retcode = doRunCompileCommand(abortWaiter, output, line);
+            if (retcode)
+                DBGLOG("Error: retcode=%u executing %s", retcode, line);
+            return retcode;
+        }
+        return 0;
+    }
+
+    unsigned doCompileCpp(AbortWaiter &abortWaiter, const char *wuid, unsigned maxThreads)
+    {
+        RelaxedAtomic<unsigned> numFailed = { 0 };
+        VStringBuffer ccfileName("%s.cc", wuid);
+        VStringBuffer cclogfileName("%s.cc.log", wuid);
+        char dir[_MAX_PATH];
+        if (!GetCurrentDirectory(sizeof(dir), dir))
+            strcpy(dir, "unknown");
+        DBGLOG("Compiling generated file list from %s, current directory %s", ccfileName.str(), dir);
+        StringBuffer ccfileContents;
+        ccfileContents.loadFile(ccfileName, false);
+        StringArray lines;
+        lines.appendList(ccfileContents, "\n", false);
+        // We expect #compile, then a bunch of compiles that we may do in parallel, followed by #link and/or #cleanup, after which we go back to sequential again
+        if (!lines.length())
+        {
+            DBGLOG("Invalid compiler batch file %s - 0 lines found", ccfileName.str());
+            return 1;
+        }
+        unsigned lineIdx = 0;
+        StringBuffer output;
+        if (streq(lines.item(lineIdx), "#compile"))
+        {
+            lineIdx++;
+            unsigned firstCompile = lineIdx;
+            while (lines.isItem(lineIdx) && lines.item(lineIdx)[0] != '#')
+                lineIdx++;
+            unsigned numCppFiles = lineIdx - firstCompile;
+            unsigned numCpus = getAffinityCpus();
+            try
+            {
+                double resourcedCpus = getResourcedCpus("resources");
+                if (resourcedCpus > 0 && std::isfinite(resourcedCpus) && resourcedCpus <= std::numeric_limits<unsigned>::max())
+                    numCpus = static_cast<unsigned>(std::ceil(resourcedCpus));
+                else if (resourcedCpus != 0)
+                    OWARNLOG("Ignoring invalid resources CPU value %g; using affinity CPU count %u", resourcedCpus, numCpus);
+            }
+            catch (IException *e)
+            {
+                EXCLOG(e, "Invalid resources CPU value; using affinity CPU count");
+                e->Release();
+            }
+            catch (const std::exception &e)
+            {
+                OWARNLOG("Invalid resources CPU value; using affinity CPU count %u: %s", numCpus, e.what());
+            }
+            maxThreads = queryMaxCompileThreads(maxThreads, numCppFiles, numCpus);
+            CriticalSection crit{SYNC_LOCATION};
+            DBGLOG("Compiling %u files, %u at once", numCppFiles, maxThreads);
+            asyncFor(SYNC_LOCATION, numCppFiles, maxThreads, [this, firstCompile, &lines, &numFailed, &crit, &output, &abortWaiter](unsigned i)
+            {
+                try
+                {
+                    StringBuffer loutput;
+                    if (executeLine(abortWaiter, lines.item(i+firstCompile), loutput, (numFailed != 0)))
+                        numFailed++;
+                    CriticalBlock b(crit);
+                    output.append(loutput);
+                }
+                catch (...)
+                {
+                    numFailed++;
+                    throw;
+                }
+            });
+        }
+        while (lines.isItem(lineIdx))
+        {
+            const char *line = lines.item(lineIdx);
+            unsigned retcode = executeLine(abortWaiter, line, output, (numFailed != 0));
+            if (retcode)
+                numFailed++;
+            lineIdx++;
+        }
+        if (!saveTemps)
+            removeFileTraceIfFail(ccfileName);
+
+        Owned <IFile> dstfile = createIFile(cclogfileName);
+        dstfile->remove();
+        if (output.length())
+        {
+            Owned<IFileIO> dstIO = dstfile->open(IFOwrite);
+            dstIO->write(0, output.length(), output.str());
+            dstIO->close();
+
+            IArrayOf<IError> errors;
+            extractErrorsFromCppLog(errors, output.str(), numFailed != 0);
+            ForEachItemIn(i, errors)
+                addWorkunitException(workunit, &errors.item(i), false);
+
+            Owned<IWUException> msg = workunit->createException();
+            msg->setExceptionSource("eclccserver");
+            msg->setExceptionCode(3000);
+            if (numFailed != 0)
+            {
+                VStringBuffer failText("Compile/Link failed for %s (see %s for details)",wuid,cclogfileName.str());
+                msg->setExceptionMessage(failText);
+                msg->setSeverity(SeverityError);
+            }
+            else
+            {
+                VStringBuffer failText("Compile/Link for %s generated warnings (see %s for details)",wuid,cclogfileName.str());
+                msg->setExceptionMessage(failText);
+                msg->setSeverity(SeverityWarning);
+            }
+        }
+        return numFailed;
+    }
+
+    void removeGeneratedFiles(const char *wuid)
+    {
+#ifdef _CONTAINERIZED
+        // Remove the files we generated into /tmp - any we want to retain will have been moved to dllserver dir when registered with workunit
+        VStringBuffer temp("*%s.*", wuid);
+        Owned<IDirectoryIterator> tempfiles = createDirectoryIterator(".", temp.str());
+        ForEach(*tempfiles)
+        {
+            removeFileTraceIfFail(tempfiles->getName(temp.clear()).str());
+        }
+#endif
     }
 
     bool compile(const char *wuid, const char *target, const char *targetCluster)
@@ -327,7 +814,9 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
         StringBuffer eclccProgName;
         splitDirTail(queryCurrentProcessPath(), eclccProgName);
         eclccProgName.append("eclcc");
-        StringBuffer eclccCmd(" -shared");
+        StringBuffer eclccCmd(" --xml -shared");
+        eclccCmd.appendf(" --jobid=%s", workunit->queryWuid());
+
         //Clone all the options that were passed to eclccserver (but not the filename) and also pass them to eclcc
         for (const char * * pArg = globalArgv+1; *pArg; pArg++)
             eclccCmd.append(' ').append(*pArg);
@@ -336,17 +825,29 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
             eclccCmd.append(" -");
         if (mainDefinition.length())
             eclccCmd.append(" -main \"").append(mainDefinition).append("\"");
-        eclccCmd.append(" --timings --xml");
+        eclccCmd.append(" --timings");
         eclccCmd.append(" --nostdinc");
         eclccCmd.append(" --metacache=");
+
         VStringBuffer logfile("%s.eclcc.log", workunit->queryWuid());
-        eclccCmd.appendf(" --logfile=%s", logfile.str());
+        if (isContainerized())
+        {
+            /* stderr is reserved for actual errors, and is consumed by this (parent) process
+            * stdout is unused and will be captured by container logging mechanism */
+            eclccCmd.append(" --logtostdout");
+        }
+        else
+        {
+            eclccCmd.appendf(" --logfile=%s", logfile.str());
+        }
+
         if (syntaxCheck)
             eclccCmd.appendf(" -syntax");
 
-        if (globals->getPropBool("@enableEclccDali", true))
+        Owned<IPropertyTree> config = getComponentConfig();
+        if (config->getPropBool("@enableEclccDali", true))
         {
-            const char *daliServers = globals->queryProp("@daliServers");
+            const char *daliServers = config->queryProp("@daliServers");
             if (!daliServers)
                 daliServers = ".";
             eclccCmd.appendf(" -dfs=%s", daliServers);
@@ -359,9 +860,38 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
             if (token.length())
                 eclccCmd.appendf(" -wuid=%s -token=%s", workunit->queryWuid(), token.str());
         }
+
+        //Ensure that each child compile has a separate directory for the cloned git repositories.
+        //It means the caches are not shared, but avoids the clones/fetches from affecting each other
+        if (!repoRootPath.isEmpty())
+            eclccCmd.appendf(" \"--repocachepath=%s\"", repoRootPath.str());
+
+        if (guardGitUpdates)
+            eclccCmd.appendf(" \"--gitlock=%s\"", gitLockKey.str());
+
+        stat_type requestTimeStamp = 0;
+        // Use the time workunit was created as the git request time.
+        // This means that a resubmit will NOT trigger a refetch of the git repositories.
+        if (workunit->getStatistic(requestTimeStamp, nullptr, StWhenCreated))
+            eclccCmd.appendf(" --gitrequesttime=%llu", (unsigned long long)requestTimeStamp);
+        if (config->hasProp("@gitFetchTolerance"))
+            eclccCmd.appendf(" --gitfetchtolerance=%s", config->queryProp("@gitFetchTolerance"));
+        if (config->getPropBool("@gitLsRemote", true))
+            eclccCmd.append(" --gitlsremote");
+        if (config->getPropBool("@gitApi", false))
+            eclccCmd.append(" --gitapi");
+
+        if (config->queryProp("@defaultRepo"))
+            eclccCmd.appendf(" --defaultrepo=%s", config->queryProp("@defaultRepo"));
+        if (config->queryProp("@defaultRepoVersion"))
+            eclccCmd.appendf(" --defaultrepoversion=%s", config->queryProp("@defaultRepoVersion"));
+
+        if (config->hasProp("@gitUsername"))
+            eclccCmd.appendf(" --gituser=%s", config->queryProp("@gitUsername"));
+
         Owned<IPipeProcess> pipe = createPipeProcess();
         pipe->setenv("ECLCCSERVER_THREAD_INDEX", idxStr.str());
-        Owned<IPropertyTreeIterator> options = globals->getElements("./Option");
+        Owned<IPropertyTreeIterator> options = config->getElements(isContainerized() ? "./options" : "./Option");
         ForEach(*options)
         {
             IPropertyTree &option = options->query();
@@ -374,6 +904,12 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
         eclccCmd.appendf(" -o%s", wuid);
         eclccCmd.appendf(" -platform=%s", target);
         eclccCmd.appendf(" --component=%s", queryStatisticsComponentName());
+        eclccCmd.appendf(" --fetchrepos=1 --updaterepos=1");  // Default these options on in eclccserver (can be overridden in debug options)
+
+        if (workunit->getDebugValueBool("createQueryArchive", config->getPropBool("@createQueryArchive", true)))
+            eclccCmd.appendf(" -q -qa");
+        else
+            eclccCmd.appendf(" -qa=0");
 
         Owned<IStringIterator> debugValues = &workunit->getDebugValues();
         ForEach (*debugValues)
@@ -383,6 +919,12 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
             workunit->getDebugValue(debugStr.str(), valueStr);
             processOption(debugStr.str(), valueStr.str(), eclccCmd, eclccProgName, *pipe, true);
         }
+        bool compileCppSeparately = config->getPropBool("@compileCppSeparately", true);
+        if (compileCppSeparately)
+        {
+            workunit->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSToperation, ">compile", StWhenStarted, NULL, getTimeStampNowValue(), 1, 0, StatsMergeAppend);
+            eclccCmd.appendf(" -Sx %s.cc", wuid);
+        }
         if (workunit->getResultLimit())
         {
             eclccCmd.appendf(" -fapplyInstantEclTransformations=1 -fapplyInstantEclTransformationsLimit=%u", workunit->getResultLimit());
@@ -390,12 +932,16 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
         try
         {
             Owned<ErrorReader> errorReader = new ErrorReader(pipe, this);
-            Owned<AbortWaiter> abortWaiter = new AbortWaiter(pipe, workunit);
+            AbortWaiter abortWaiter(workunit, 0);
+            AbortPipeWaiter aborter(abortWaiter, pipe);
+
             eclccCmd.insert(0, eclccProgName);
+            cycle_t startCompile = get_cycles_now();
             if (!pipe->run(eclccProgName, eclccCmd, ".", true, false, true, 0, true))
                 throw makeStringExceptionV(999, "Failed to run eclcc command %s", eclccCmd.str());
-            errorReader->start();
-            abortWaiter->start();
+            HANDLE pipeProcessHandle = pipe->getProcessHandle();
+            errorReader->start(true);
+            abortWaiter.start(true);
             try
             {
                 pipe->write(eclQuery.s.length(), eclQuery.s.str());
@@ -408,50 +954,113 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
             }
             unsigned retcode = pipe->wait();
             errorReader->join();
-            abortWaiter->stop();
-            if (retcode == 0)
+            if (retcode == 0 && compileCppSeparately)
             {
-                StringBuffer realdllname, dllurl;
-                realdllname.append(SharedObjectPrefix).append(wuid).append(SharedObjectExtension);
-
-                StringBuffer realdllfilename;
-                realdllfilename.append(SharedObjectPrefix).append(wuid).append(SharedObjectExtension);
-
-                StringBuffer wuXML;
-                if (!getWorkunitXMLFromFile(realdllfilename, wuXML))
-                    throw makeStringException(999, "Failed to extract workunit from query dll");
-
-                Owned<ILocalWorkUnit> embeddedWU = createLocalWorkUnit(wuXML);
-                queryExtendedWU(workunit)->copyWorkUnit(embeddedWU, false, true);
-                workunit->setIsClone(false);
-                const char *jobname = embeddedWU->queryJobName();
-                if (jobname && *jobname) //let ECL win naming job during initial compile
-                    workunit->setJobName(jobname);
-                if (!workunit->getDebugValueBool("obfuscateOutput", false))
+                cycle_t startCompileCpp = get_cycles_now();
+                workunit->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSToperation, ">compile:>compile c++", StWhenStarted, NULL, getTimeStampNowValue(), 1, 0, StatsMergeAppend);
+                unsigned maxCompileThreads = defaultMaxCompileThreads;
+                if (workunit->hasDebugValue("maxCompileThreads"))
                 {
-                    Owned<IWUQuery> query = workunit->updateQuery();
-                    if (getArchiveXMLFromFile(realdllfilename, wuXML.clear()))  // MORE - if what was submitted was an archive, this is probably pointless?
-                        query->setQueryText(wuXML.str());
+                    int requestedMaxThreads = workunit->getDebugValueInt("maxCompileThreads", 1);
+                    maxCompileThreads = requestedMaxThreads > 0 ? requestedMaxThreads : 1;
+                }
+                retcode = doCompileCpp(abortWaiter, wuid, maxCompileThreads);
+                unsigned __int64 elapsed_compilecpp = cycle_to_nanosec(get_cycles_now() - startCompileCpp);
+                workunit->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSToperation, ">compile:>compile c++", StTimeElapsed, NULL, elapsed_compilecpp, 1, 0, StatsMergeReplace);
+            }
+            if (compileCppSeparately)
+            {
+                unsigned __int64 elapsed_compile = cycle_to_nanosec(get_cycles_now() - startCompile);
+                workunit->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSToperation, ">compile", StTimeElapsed, NULL, elapsed_compile, 1, 0, StatsMergeReplace);
+            }
+            bool processKilled = (retcode >= 128);
+            if (processKilled && isContainerized())
+            {
+                StringBuffer postMortemFilename;
+
+                if (getDebugInstanceDir(postMortemFilename, "eclccserver", workunit->queryWuid()))
+                {
+                    k8s::addInstanceContextPaths(postMortemFilename);
+                    addPathSepChar(postMortemFilename);
+                    postMortemFilename.append("eclcc.postmortem.log");
+                    copyPortMortemPIDFiles(pipeProcessHandle, postMortemFilename, true);
+                    Owned<IWUQuery> qw = workunit->updateQuery();
+                    qw->addAssociatedFile(FileTypePostMortem, postMortemFilename, "localhost", "eclcc log", 0, 0, 0);
+                }
+            }
+            //If the process is killed it is probably because it ran out of memory - so try to compile as a K8s job
+            bool timedOut = abortWaiter.stop() || (isContainerized() && !config->getPropBool("@k8sJob") && processKilled);
+            if (!timedOut)
+            {
+                if (retcode == 0)
+                {
+                    StringBuffer realdllname, dllurl;
+                    realdllname.append(SharedObjectPrefix).append(wuid).append(SharedObjectExtension);
+
+                    StringBuffer realdllfilename;
+                    realdllfilename.append(SharedObjectPrefix).append(wuid).append(SharedObjectExtension);
+
+                    Owned<ILocalWorkUnit> embeddedWU = createLocalWorkUnitFromFile(realdllfilename);
+                    if (!embeddedWU)
+                        throw makeStringException(999, "Failed to extract workunit from query dll");
+
+                    queryExtendedWU(workunit)->copyWorkUnit(embeddedWU, false, true);
+                    workunit->setIsClone(false);
+                    const char *jobname = embeddedWU->queryJobName();
+                    if (jobname && *jobname) //let ECL win naming job during initial compile
+                        workunit->setJobName(jobname);
+                    if (!workunit->getDebugValueBool("obfuscateOutput", false))
+                    {
+                        StringBuffer wuXML; // Not sure this is a good idea.... better to always get it from the dll resource
+                        Owned<IWUQuery> query = workunit->updateQuery();
+                        if (isArchiveQuery(eclQuery.s.str()))
+                            query->setQueryText(eclQuery.s.str());
+                        else if (getArchiveXMLFromFile(realdllfilename, wuXML.clear()))
+                            query->setQueryText(wuXML.str());
+                        else
+                            query->setQueryText(eclQuery.s.str());
+                    }
                     else
-                        query->setQueryText(eclQuery.s.str());
+                    {
+                        Owned<IWUQuery> query = workunit->updateQuery();
+                        query->setQueryText(nullptr);
+                    }
+
+                    createUNCFilename(realdllfilename.str(), dllurl);
+                    unsigned crc = crc_file(realdllfilename.str());
+                    Owned<IWUQuery> query = workunit->updateQuery();
+                    if (!isContainerized())
+                        associateLocalFile(query, FileTypeLog, logfile, "Compiler log", 0);
+                    associateLocalFile(query, FileTypeDll, realdllfilename, "Workunit DLL", crc);
+                    removeGeneratedFiles(wuid);
+                    queryDllServer().registerDll(realdllname.str(), "Workunit DLL", dllurl.str());
+                }
+                else
+                {
+                    if (processKilled && !workunit->aborting())
+                        addExceptionToWorkunit(workunit, SeverityError, "eclccserver", 9999, "eclcc exited - could be because out of memory - see compile log for details", nullptr, 0, 0, 0);
+
+                    if (!isContainerized())
+                    {
+                        Owned<IWUQuery> query = workunit->updateQuery();
+                        associateLocalFile(query, FileTypeLog, logfile, "Compiler log", 0);
+                    }
                 }
 
-                createUNCFilename(realdllfilename.str(), dllurl);
-                unsigned crc = crc_file(realdllfilename.str());
-                Owned<IWUQuery> query = workunit->updateQuery();
-                associateLocalFile(query, FileTypeLog, logfile, "Compiler log", 0);
-                associateLocalFile(query, FileTypeDll, realdllfilename, "Workunit DLL", crc);
-                queryDllServer().registerDll(realdllname.str(), "Workunit DLL", dllurl.str());
-                workunit->commit();
-                return true;
+                if (compileCppSeparately)
+                {
+                    //Files need to be added after the workunit has been cloned - otherwise they are overwritten
+                    Owned<IWUQuery> query = workunit->updateQuery();
+                    VStringBuffer ccfileName("%s.cc", wuid);
+                    VStringBuffer cclogfileName("%s.cc.log", wuid);
+                    if (checkFileExists(cclogfileName))
+                        associateLocalFile(query, FileTypeLog, cclogfileName, "CPP log", 0);
+                    if (saveTemps && checkFileExists(ccfileName))
+                        associateLocalFile(query, FileTypeLog, ccfileName, "compile actions log", 0);
+                }
             }
-            else
-            {
-                Owned<IWUQuery> query = workunit->updateQuery();
-                associateLocalFile(query, FileTypeLog, logfile, "Compiler log", 0);
-                workunit->commit();
-                return false;
-            }
+            workunit->commit();
+            return (retcode == 0);
         }
         catch (IException * e)
         {
@@ -471,78 +1080,174 @@ class EclccCompileThread : implements IPooledThread, implements IErrorReporter, 
     }
 
 public:
-    IMPLEMENT_IINTERFACE;
-    EclccCompileThread(unsigned _idx)
+    EclccCompiler(const char * _instanceName, unsigned _idx) : instanceName(_instanceName)
     {
+        instanceNumber = _idx+1;
         idxStr.append(_idx);
+
+        const char * repoPathOption = getenv("ECLCC_ECLREPO_PATH");
+        if (repoPathOption)
+        {
+            repoRootPath.append(repoPathOption);
+        }
+        else
+        {
+            char dir[_MAX_PATH];
+            if (GetCurrentDirectory(sizeof(dir), dir))
+                repoRootPath.append(dir);
+        }
+
+        if (guardGitUpdates)
+        {
+            addPathSepChar(repoRootPath).append("repos");
+            recursiveCreateDirectory(repoRootPath.str());
+        }
+        else if (repoRootPath.length())
+        {
+            addPathSepChar(repoRootPath).append("repos_").append(idxStr);
+            recursiveCreateDirectory(repoRootPath.str());
+        }
+        else
+            OWARNLOG("Could not deduce the directory to store cached git repositories");
     }
 
-    virtual void init(void *param) override
+    void compileViaK8sJob(const char * wuid)
     {
-        wuid.set((const char *) param);
-    }
-    virtual void threadmain() override
-    {
-        DBGLOG("Compile request processing for workunit %s", wuid.get());
 #ifdef _CONTAINERIZED
-        if (!globals->getPropBool("@useChildProcesses", false) && !globals->hasProp("@workunit"))
+        Owned<IException> error;
+        try
         {
-            Owned<IException> error;
-            try
-            {
-                runK8sJob("compile", wuid, wuid);
-            }
-            catch (IException *E)
-            {
-                error.setown(E);
-            }
-            if (error)
+            // Add the item onto a queue that only lingering eclccservers listen to.
+            // This prevents other threads picking up the item if it was placed back
+            // onto one of the other queues.
+            // Push it before starting the eclserver job - so that completing servers can
+            // pick it up early
+            StringBuffer internalQueueName;
+            getClusterEclCCServerCompileQueueName(internalQueueName, instanceName);
+
+            Owned<IJobQueue> queue = createJobQueue(internalQueueName);
+            Owned<IJobQueueItem> item = createJobQueueItem(wuid);
+            queue->enqueue(item.getClear());
+
+            SCMStringBuffer optPlatformVersion;
             {
                 Owned<IWorkUnitFactory> factory = getWorkUnitFactory();
-                workunit.setown(factory->updateWorkUnit(wuid.get()));
-                if (workunit)
-                {
-                    if (workunit->aborting())
-                        workunit->setState(WUStateAborted);
-                    else if (workunit->getState()!=WUStateAborted)
-                    {
-                        StringBuffer msg;
-                        error->errorMessage(msg);
-                        addExceptionToWorkunit(workunit, SeverityError, "eclccserver", error->errorCode(), msg.str(), NULL, 0, 0, 0);
-                        workunit->setState(WUStateFailed);
-                    }
-                }
-                workunit->commit();
-                workunit.clear();
+                Owned<IWorkUnit> wu = factory->updateWorkUnit(wuid);
+                if (!wu)
+                    throw makeStringExceptionV(0, "Workunit %s no longer exists", wuid);
+                wu->getDebugValue("platformVersion", optPlatformVersion);
+                addTimeStamp(wu, SSToperation, ">compile", StWhenDequeued, 0);
+                addTimeStamp(wu, SSToperation, ">compile", StWhenK8sLaunched, 0);
             }
-            return;
+            std::list<std::pair<std::string, std::string>> params = { };
+            if (optPlatformVersion.length())
+                params.push_back({ "_HPCC_JOB_VERSION_", optPlatformVersion.str() });
+
+            // The job name structure:
+            // <deployment-name>-<replicaset-hash>-<pod-hash>-<instance-number>
+            StringBuffer jobName;
+            jobName.append("eclcc-").append(instanceName).append("-").append(k8s::queryPodSuffix()).append("-").append(instanceNumber);
+
+            bool wasScheduled = false;
+            // TBD: eclccserver does not yet wire an abort callback into runJob.
+            k8s::runJob("compile", nullptr, jobName, params, nullptr, wasScheduled);
+        }
+        catch (IException *E)
+        {
+            OERRLOG(E);
+            error.setown(E);
+        }
+        if (error)
+        {
+            Owned<IWorkUnitFactory> factory = getWorkUnitFactory();
+            workunit.setown(factory->updateWorkUnit(wuid));
+
+            // A failure to start a compile will not stop this compile from happening
+            // (Another eclccserver instance will pick it off the queue and compile it.)
+            // But if it is still waiting to compile add a non-fatal error into the workunit.
+            if (workunit)
+            {
+                if (workunit->aborting())
+                {
+                    workunit->setState(WUStateAborted);
+                    workunit->commit();
+                }
+                else if (workunit->getState() == WUStateSubmitted )
+                {
+                    StringBuffer msg;
+                    error->errorMessage(msg);
+                    addExceptionToWorkunit(workunit, SeverityWarning, "eclccserver", error->errorCode(), msg.str(), NULL, 0, 0, 0);
+                    workunit->commit();
+                    //Do not fail it because as soon as a compile server is available it will be picked up and compiled
+                }
+            }
+            workunit.clear();
         }
 #endif
+    }
+
+    WUState compileWorkunit(StringBuffer * username, const char * _wuid, bool compileLocal)
+    {
+        wuid.set(_wuid);
+        setDefaultJobName(wuid);
+
+        DBGLOG("Compile request processing for workunit %s", wuid.get());
+        Owned<IPropertyTree> config = getComponentConfig();
+
         Owned<IWorkUnitFactory> factory = getWorkUnitFactory();
         workunit.setown(factory->updateWorkUnit(wuid.get()));
         if (!workunit)
         {
             DBGLOG("Workunit %s no longer exists", wuid.get());
-            return;
+            return WUStateUnknown;
         }
+
+        if (username)
+            username->append(workunit->queryUser());
+
+        if (isContainerized())
+        {
+            if (!useChildProcesses && !compileLocal)
+            {
+                //NOTE: This call does not modify the workunit itself, so no need to commit afterwards
+                workunit->setContainerizedProcessInfo("EclCCServer", getComponentConfigSP()->queryProp("@name"), k8s::queryMyPodName(), k8s::queryMyContainerName(), nullptr, nullptr);
+                workunit.clear();
+                compileViaK8sJob(wuid);
+                return WUStateUnknown;
+            }
+        }
+
+        if (isContainerized())
+            workunit->setContainerizedProcessInfo("EclCC", getComponentConfigSP()->queryProp("@name"), k8s::queryMyPodName(), k8s::queryMyContainerName(), nullptr, nullptr);
+
         if (workunit->aborting() || workunit->getState()==WUStateAborted)
         {
             workunit->setState(WUStateAborted);
             DBGLOG("Workunit %s aborted", wuid.get());
             workunit->commit();
-            workunit.clear();
-            return;
+            return WUStateAborted;
         }
+
+        if (isContainerized())
+        {
+            if (config->getPropBool("@k8sJob"))
+                addTimeStamp(workunit, SSToperation, ">compile", StWhenK8sStarted, 0);
+            else
+                addTimeStamp(workunit, SSToperation, ">compile", StWhenDequeued, 0);
+        }
+        else
+            addTimeStamp(workunit, SSToperation, ">compile", StWhenDequeued, 0);
+
         CSDSServerStatus serverstatus("ECLCCserverThread");
-        serverstatus.queryProperties()->setProp("@cluster",globals->queryProp("@name"));
+        serverstatus.queryProperties()->setProp("@cluster", config->queryProp("@name"));
         serverstatus.queryProperties()->setProp("@thread", idxStr.str());
-        serverstatus.queryProperties()->setProp("WorkUnit",wuid.get());
+        serverstatus.queryProperties()->setProp("WorkUnit", wuid.get());
         serverstatus.commitProperties();
         workunit->setAgentSession(myProcessSession());
         StringAttr clusterName(workunit->queryClusterName());
 #ifdef _CONTAINERIZED
         VStringBuffer xpath("queues[@name='%s']", clusterName.str());
-        Owned<IPropertyTree> queueInfo = globals->getBranch(xpath);
+        Owned<IPropertyTree> queueInfo = config->getBranch(xpath);
         assertex(queueInfo);
         const char *platformName = queueInfo->queryProp("@type");
 #else
@@ -551,7 +1256,7 @@ public:
         {
             VStringBuffer errStr("Cluster %s not recognized", clusterName.str());
             failCompilation(errStr);
-            return;
+            return WUStateFailed;
         }
         ClusterType platform = clusterInfo->getPlatform();
         const char *platformName = clusterTypeString(platform, true);
@@ -560,6 +1265,7 @@ public:
         workunit->setState(WUStateCompiling);
         workunit->commit();
         bool ok = false;
+        WUState result = WUStateFailed;
         try
         {
             ok = compile(wuid, platformName, clusterName.str());
@@ -571,6 +1277,9 @@ public:
             addExceptionToWorkunit(workunit, SeverityError, "eclccserver", e->errorCode(), msg.str(), NULL, 0, 0, 0);
             e->Release();
         }
+
+        //If this server instance dies from this point onwards, do not terminate the workunit
+        workunit->setAgentSession(-1);
         if (ok)
         {
             workunit->setState(WUStateCompiled);
@@ -588,13 +1297,13 @@ public:
                 {
                     VStringBuffer errStr("Cluster %s by #workunit not recognized", newClusterName.str());
                     failCompilation(errStr);
-                    return;
+                    return WUStateFailed;
                 }
                 if (platform != clusterInfo->getPlatform())
                 {
                     VStringBuffer errStr("Cluster %s specified by #workunit is wrong type for this queue", newClusterName.str());
                     failCompilation(errStr);
-                    return;
+                    return WUStateFailed;
                 }
                 clusterInfo.clear();
 #endif
@@ -607,6 +1316,7 @@ public:
                 }
                 else
                 {
+                    result = WUStateCompiled;
                     workunit->schedule();
                     SCMStringBuffer dllBuff;
                     Owned<IConstWUQuery> wuQuery = workunit->getQuery();
@@ -634,9 +1344,39 @@ public:
         }
         else if (workunit->getState() != WUStateAborted)
             workunit->setState(WUStateFailed);
+
         if (workunit)
+        {
+            result = workunit->getState();
             workunit->commit();
-        workunit.clear();
+            workunit.clear();
+        }
+
+        wuid.clear();
+        return result;
+    }
+};
+
+//---------------------------------------------------------------------------------------------------------------------
+class EclccCompileThread : implements IPooledThread, public CInterface
+{
+    StringAttr wuid;
+    EclccCompiler compiler;
+
+public:
+    IMPLEMENT_IINTERFACE;
+    EclccCompileThread(const char * _instanceName, unsigned _idx) : compiler(_instanceName, _idx)
+    {
+    }
+
+    virtual void init(void *param) override
+    {
+        wuid.set((const char *) param);
+    }
+
+    virtual void threadmain() override
+    {
+        compiler.compileWorkunit(nullptr, wuid, false);
     }
 
     virtual bool stop() override
@@ -649,6 +1389,76 @@ public:
     }
 };
 
+
+//---------------------------------------------------------------------------------------------------------------------
+
+class EclccLingeringCompiler
+{
+    const char * instanceName;
+    EclccCompiler compiler;
+    Owned<IJobQueue> queue;
+    unsigned lingerTimeMs;
+    double costPerHour;
+
+public:
+    EclccLingeringCompiler(IPropertyTree * globals, unsigned _idx)
+    : instanceName(globals->queryProp("@name")), compiler(instanceName, _idx)
+    {
+        const unsigned defaultLingerSeconds = 30;
+        lingerTimeMs = globals->getPropInt("@lingerPeriod", defaultLingerSeconds) * 1000;
+        costPerHour = getMachineCostRate();
+
+        //This could spot updates to the queues, but if they change, the lingering compile servers
+        //should exit and then eclccseverver will start new instances with the updated queues.
+        StringBuffer queueNames;
+        getQueues(queueNames, true);
+        if (!queueNames.length())
+            throw MakeStringException(0, "No queues found to listen on");
+        queue.setown(createJobQueue(queueNames));
+        queue->connect(true);
+    }
+
+    void run()
+    {
+        __uint64 startupElapsedTimeNs = 0; // MORE
+        cost_type costStart = money2cost_type(calcCostNs(costPerHour, startupElapsedTimeNs));
+
+        recordGlobalMetrics("Queue", { {"component", "eclccserver" }, { "name", instanceName } }, { StNumStarts, StTimeStart, StCostStart }, { 1ULL, startupElapsedTimeNs, costStart });
+        for (;;)
+        {
+            __uint64 priority = getTimeStampNowValue();
+            CCycleTimer waitTimer;
+
+            Owned<IJobQueueItem> item = queue->dequeuePriority(priority, lingerTimeMs);
+            __uint64 waitTimeNs = waitTimer.elapsedNs();
+            cost_type costWait = money2cost_type(calcCostNs(costPerHour, waitTimeNs));
+
+            if (!item)
+            {
+                recordGlobalMetrics("Queue", { {"component", "eclccserver" }, { "name", instanceName } }, { StNumWaits, StNumStops, StTimeWaitFailure, StCostWait }, { 1, 1, waitTimeNs, costWait });
+                break;
+            }
+
+            recordGlobalMetrics("Queue", { {"component", "eclccserver" }, { "name", instanceName } }, { StNumAccepts, StNumWaits, StTimeWaitSuccess, StCostWait }, { 1, 1, waitTimeNs, costWait });
+
+            StringBuffer username;
+            WUState state = compiler.compileWorkunit(&username, item->queryWUID(), true);
+
+            __uint64 executeTimeNs = waitTimer.elapsedNs() - waitTimeNs;
+            cost_type costExecute = money2cost_type(calcCostNs(costPerHour, executeTimeNs));
+
+            if (state == WUStateAborted)
+                recordGlobalMetrics("Queue", { {"component", "eclccserver" }, { "name", instanceName }, { "user", username.str() } }, { StNumAborts, StTimeLocalExecute, StCostAbort }, { 1, executeTimeNs, costExecute });
+            else if (state == WUStateFailed)
+                recordGlobalMetrics("Queue", { {"component", "eclccserver" }, { "name", instanceName }, { "user", username.str() } }, { StNumFailures, StTimeLocalExecute, StCostExecute, StCostFailed }, { 1, executeTimeNs, costExecute, costExecute });
+            else if (state != WUStateUnknown)
+                recordGlobalMetrics("Queue", { {"component", "eclccserver" }, { "name", instanceName }, { "user", username.str() } }, { StNumSuccesses, StTimeLocalExecute, StCostExecute }, { 1, executeTimeNs, costExecute });
+        }
+    }
+};
+
+
+#ifndef _CONTAINERIZED
 #ifndef _WIN32
 static void generatePrecompiledHeader()
 {
@@ -661,7 +1471,7 @@ static void generatePrecompiledHeader()
         cmd.append("eclcc -pch");
         if (pipe->run("eclcc", cmd, ".", false, false, true, 0))
         {
-            errorReader->start();
+            errorReader->start(true);
             unsigned retcode = pipe->wait();
             errorReader->join();
             if (retcode != 0 || errorReader->errCount() != 0)
@@ -681,6 +1491,7 @@ static void removePrecompiledHeader()
     removeFileTraceIfFail("eclinclude4.hpp.gch");
 }
 #endif
+#endif
 
 //------------------------------------------------------------------------------------------------------------------
 // Class EclccServer manages a pool of compile threads
@@ -688,48 +1499,91 @@ static void removePrecompiledHeader()
 
 class EclccServer : public CInterface, implements IThreadFactory, implements IAbortHandler
 {
+    StringAttr instanceName;
     StringAttr queueNames;
     unsigned poolSize;
     Owned<IThreadPool> pool;
 
     unsigned threadsActive;
-    CriticalSection threadActiveCrit;
-    bool running;
+    CriticalSection threadActiveCrit{SYNC_LOCATION};
+    std::atomic<bool> running;
     CSDSServerStatus serverstatus;
     Owned<IJobQueue> queue;
+    CriticalSection queueUpdateCS{SYNC_LOCATION};
+    StringAttr updatedQueueNames;
+    CConfigUpdateHook reloadConfigHook;
 
+
+    void configUpdate()
+    {
+        StringBuffer newQueueNames;
+        getQueues(newQueueNames, false);
+        if (!newQueueNames.length())
+            ERRLOG("No queues found to listen on");
+        Linked<IJobQueue> currentQueue;
+        {
+            CriticalBlock b(queueUpdateCS);
+            if (strsame(queueNames, newQueueNames))
+                return;
+            updatedQueueNames.set(newQueueNames);
+            currentQueue.set(queue);
+            PROGLOG("Updating queue due to queue names change from '%s' to '%s'", queueNames.str(), newQueueNames.str());
+        }
+        if (currentQueue)
+            currentQueue->cancelAcceptConversation();
+    }
 public:
     IMPLEMENT_IINTERFACE;
-    EclccServer(const char *_queueName, unsigned _poolSize)
-        : queueNames(_queueName), poolSize(_poolSize), serverstatus("ECLCCserver")
+    EclccServer(const char * _instanceName, const char *_queueName, unsigned _poolSize)
+        : instanceName(_instanceName), poolSize(_poolSize), serverstatus("ECLCCserver"), updatedQueueNames(_queueName)
     {
         threadsActive = 0;
         running = false;
-        pool.setown(createThreadPool("eclccServerPool", this, NULL, poolSize, INFINITE));
-        serverstatus.queryProperties()->setProp("@cluster", globals->queryProp("@name"));
-        serverstatus.queryProperties()->setProp("@queue", queueNames.get());
+        pool.setown(createThreadPool("eclccServerPool", this, false, nullptr, poolSize, INFINITE));
+        serverstatus.queryProperties()->setProp("@cluster", getComponentConfigSP()->queryProp("@name"));
         serverstatus.commitProperties();
+        reloadConfigHook.installOnce(std::bind(&EclccServer::configUpdate, this), false);
     }
 
     ~EclccServer()
     {
+        reloadConfigHook.clear();
         pool->joinAll(false, INFINITE);
     }
 
     void run()
     {
-        DBGLOG("eclccServer (%d threads) waiting for requests on queue(s) %s", poolSize, queueNames.get());
-        queue.setown(createJobQueue(queueNames.get()));
-        queue->connect(false);
         running = true;
         LocalIAbortHandler abortHandler(*this);
         while (running)
         {
             try
             {
+                bool newQueues = false;
+                {
+                    CriticalBlock b(queueUpdateCS);
+                    if (updatedQueueNames)
+                    {
+                        queueNames.set(updatedQueueNames);
+                        updatedQueueNames.clear();
+                        queue.clear();
+                        queue.setown(createJobQueue(queueNames.get()));
+                        newQueues = true;
+                    }
+                    // onAbort could have triggered before or during the above switch, if so, we do no want to connect/block on new queue
+                    if (!running)
+                        break;
+                }
+                if (newQueues)
+                {
+                    queue->connect(true);
+                    serverstatus.queryProperties()->setProp("@queue", queueNames.get());
+                    serverstatus.commitProperties();
+                    DBGLOG("eclccServer (%d threads) waiting for requests on queue(s) %s", poolSize, queueNames.get());
+                }
                 if (!pool->waitAvailable(10000))
                 {
-                    if (globals->getPropInt("@traceLevel", 0) > 2)
+                    if (getComponentConfigSP()->getPropInt("@traceLevel", 0) > 2)
                         DBGLOG("Blocked for 10 seconds waiting for an available compiler thread");
                     continue;
                 }
@@ -773,14 +1627,20 @@ public:
     virtual IPooledThread *createNew()
     {
         CriticalBlock b(threadActiveCrit);
-        return new EclccCompileThread(threadsActive++);
+        return new EclccCompileThread(instanceName, threadsActive++);
     }
 
-    virtual bool onAbort() 
+    virtual bool onAbort()
     {
         running = false;
-        if (queue)
-            queue->cancelAcceptConversation();
+        Linked<IJobQueue> currentQueue;
+        {
+            CriticalBlock b(queueUpdateCS);
+            if (queue)
+                currentQueue.set(queue);
+        }
+        if (currentQueue)
+            currentQueue->cancelAcceptConversation();
         return false;
     }
 };
@@ -789,9 +1649,11 @@ void openLogFile()
 {
 #ifndef _CONTAINERIZED
     StringBuffer logname;
-    envGetConfigurationDirectory("log","eclccserver",globals->queryProp("@name"),logname);
+    getConfigurationDirectory(nullptr, "log","eclccserver", getComponentConfigSP()->queryProp("@name"),logname);
     Owned<IComponentLogFileCreator> lf = createComponentLogFileCreator(logname.str(), "eclccserver");
     lf->beginLogging();
+#else
+    setupContainerizedLogMsgHandler();
 #endif
 }
 
@@ -835,20 +1697,38 @@ eclccserver:
 )!!";
 
 
+static IPropertyTree * translateOptions(IPropertyTree * legacy)
+{
+    Owned<IPropertyTreeIterator> options = legacy->getElements("./Option");
+    unsigned id = 1000; // start with a large number so it is unlikely to clash with any specified by the user
+    ForEach(*options)
+    {
+        IPropertyTree &option = options->query();
+        const char *name = option.queryProp("@name");
+        //Ensure that any repeated options of the form -x=a -x=y are retained, rather than being deduped, by appending a unique number.
+        //Used for --alowsigned=...
+        if (name && ((memicmp(name, "eclcc-", 6) == 0) || *name=='-'))
+        {
+            const char * start = name + (*name=='-' ? 1 : 6);
+            const char * dash = strrchr(start, '-');     // position of trailing dash, if present
+
+            //Do not add a unique number on the end if it already has a unique number on the end
+            if (!dash || !isdigit(dash[1]))
+            {
+                VStringBuffer newname("%s-%d", name, id++);
+                option.setProp("@name", newname.str());
+            }
+        }
+    }
+    return LINK(legacy);
+}
+
 
 int main(int argc, const char *argv[])
 {
-#ifndef _CONTAINERIZED
-    for (unsigned i=0;i<(unsigned)argc;i++) {
-        if (streq(argv[i],"--daemon") || streq(argv[i],"-d")) {
-            if (daemon(1,0) || write_pidfile(argv[++i])) {
-                perror("Failed to daemonize");
-                return EXIT_FAILURE;
-            }
-            break;
-        }
-    }
-#endif
+    if (!checkCreateDaemon(argc, argv))
+        return EXIT_FAILURE;
+
     InitModuleObjects();
     initSignals();
     NoQuickEditSection x;
@@ -857,10 +1737,11 @@ int main(int argc, const char *argv[])
     // We remove any existing sentinel until we have validated that we can successfully start (i.e. all options are valid...)
     removeSentinelFile(sentinelFile);
 
+    Owned<IPropertyTree> globals;
     try
     {
         globalArgv = argv;
-        globals.setown(loadConfiguration(defaultYaml, argv, "eclccserver", "ECLCCSERVER", "eclccserver.xml", nullptr));
+        globals.setown(loadConfiguration(defaultYaml, argv, "eclccserver", "ECLCCSERVER", "eclccserver.xml", translateOptions));
     }
     catch (IException * e)
     {
@@ -897,64 +1778,38 @@ int main(int argc, const char *argv[])
     {
         initClientProcess(serverGroup, DCR_EclCCServer);
         openLogFile();
-        const char *wuid = globals->queryProp("@workunit");
-        if (wuid)
+        configGitLock();
+        if (globals->getPropBool("@k8sJob", false))
         {
             // One shot mode
-            EclccCompileThread compiler(0);
-            compiler.init(const_cast<char *>(wuid));
-            compiler.threadmain();
+            EclccLingeringCompiler compiler(globals, 0);
+            compiler.run();
         }
         else
         {
-#ifndef _CONTAINERIZED
-            unsigned optMonitorInterval = globals->getPropInt("@monitorInterval", 60);
-            if (optMonitorInterval)
-                startPerformanceMonitor(optMonitorInterval*1000, PerfMonStandard, nullptr);
-#endif
-
-#ifdef _CONTAINERIZED
-            bool filtered = false;
-            std::unordered_map<std::string, bool> listenQueues;
-            Owned<IPTreeIterator> listening = globals->getElements("listen");
-            ForEach (*listening)
+            if (!isContainerized())
             {
-                const char *lq = listening->query().queryProp(".");
-                if (lq)
-                {
-                    listenQueues[lq] = true;
-                    filtered = true;
-                }
+                unsigned optMonitorInterval = globals->getPropInt("@monitorInterval", 60);
+                if (optMonitorInterval)
+                    startPerformanceMonitor(optMonitorInterval*1000, PerfMonStandard, nullptr);
             }
 
             StringBuffer queueNames;
-            Owned<IPTreeIterator> queues = globals->getElements("queues");
-            ForEach(*queues)
-            {
-                IPTree &queue = queues->query();
-                const char *qname = queue.queryProp("@name");
-                if (!filtered || listenQueues.count(qname))
-                {
-                    if (queueNames.length())
-                        queueNames.append(",");
-                    getClusterEclCCServerQueueName(queueNames, qname);
-                }
-            }
-#else
-            SCMStringBuffer queueNames;
-            getEclCCServerQueueNames(queueNames, processName);
-#endif
+            getQueues(queueNames, false);
             if (!queueNames.length())
                 throw MakeStringException(0, "No queues found to listen on");
+
 #ifdef _CONTAINERIZED
-            bool useChildProcesses = globals->getPropInt("@useChildProcesses", false);
+            queryCodeSigner().initForContainer();
+
+            useChildProcesses = globals->getPropBool("@useChildProcesses", false);
             unsigned maxThreads = globals->getPropInt("@maxActive", 4);
 #else
             // The option has been renamed to avoid confusion with the similarly-named eclcc option, but
             // still accept the old name if the new one is not present.
             unsigned maxThreads = globals->getPropInt("@maxEclccProcesses", globals->getPropInt("@maxCompileThreads", 4));
 #endif
-            EclccServer server(queueNames.str(), maxThreads);
+            EclccServer server(globals->queryProp("@name"), queueNames.str(), maxThreads);
             // if we got here, eclserver is successfully started and all options are good, so create the "sentinel file" for re-runs from the script
             // put in its own "scope" to force the flush
             writeSentinelFile(sentinelFile);
@@ -970,10 +1825,10 @@ int main(int argc, const char *argv[])
     {
         IERRLOG("Terminating unexpectedly");
     }
-#ifndef _CONTAINERIZED
-    stopPerformanceMonitor();
-#endif
-    globals.clear();
+
+    if (!isContainerized())
+        stopPerformanceMonitor();
+
     UseSysLogForOperatorMessages(false);
     ::closedownClientProcess(); // dali client closedown
     releaseAtoms();

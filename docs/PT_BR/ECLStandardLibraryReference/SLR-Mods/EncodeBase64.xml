@@ -11,7 +11,9 @@
     </indexterm><indexterm>
       <primary>EncodeBase64</primary>
     </indexterm>(</emphasis> <emphasis>value</emphasis> <emphasis
-  role="bold">)</emphasis> <emphasis role="bold"/></para>
+  role="bold">[</emphasis> <emphasis>, insertLF </emphasis> <emphasis
+  role="bold">]</emphasis> <emphasis
+  role="bold">)</emphasis> <emphasis role="bold"></emphasis></para>
 
   <informaltable colsep="1" frame="all" rowsep="1">
     <tgroup cols="2">
@@ -28,9 +30,18 @@
         </row>
 
         <row>
-          <entry>Return:<emphasis> </emphasis></entry>
+          <entry><emphasis>insertLF</emphasis></entry>
 
-          <entry>EncodeBase64 returns a STRING value.</entry>
+          <entry>Opcional. Uma flag booleano TRUE/FALSE indicando que, quando
+          TRUE, faz com que feeds de linha sejam inseridos periodicamente na
+          saída, possivelmente resultando em uma string de várias linhas. Se
+          omitido, o padrão é TRUE.</entry>
+        </row>
+
+        <row>
+          <entry>Retorno:<emphasis> </emphasis></entry>
+
+          <entry>EncodeBase64 retorna um valor STRING.</entry>
         </row>
       </tbody>
     </tgroup>

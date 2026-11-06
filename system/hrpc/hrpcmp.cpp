@@ -85,7 +85,7 @@ public:
 
 };
 
-CriticalSection MpTransportStateCommon::critsect;
+CriticalSection MpTransportStateCommon::critsect(SYNC_LOCATION);
 
 class MpIntraClientState: public MpTransportStateCommon
 {
@@ -392,7 +392,7 @@ protected:
 
     int                         timeoutms;          
     int                         connecttimeoutms;           
-    Mutex                       mx;
+    Mutex mx{SYNC_LOCATION};
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -481,7 +481,7 @@ public:
             return false;
         }
         StringBuffer str;
-        ep.getUrlStr(str).appendf("{%d}",(int)tag); // we'll use proper tag name when available
+        ep.getEndpointHostText(str).appendf("{%d}",(int)tag); // we'll use proper tag name when available
         size32_t l = str.length();
         if (l>=namemax)
             l = namemax-1;

@@ -23,19 +23,27 @@
   );</emphasis></para>
 
   <para><emphasis role="bold">[</emphasis><emphasis>attrname</emphasis>
-  :=<emphasis role="bold"> ] BUILD(</emphasis><emphasis> indexdef
-  </emphasis><emphasis role="bold">[, </emphasis><emphasis>options
-  </emphasis><emphasis role="bold">] );</emphasis></para>
+  :=<emphasis role="bold"> ] BUILD(</emphasis><emphasis> indexdef</emphasis>
+  <emphasis role="bold">[,</emphasis><emphasis>indexfile</emphasis><emphasis
+  role="bold">]</emphasis> <emphasis role="bold">[,
+  </emphasis><emphasis>options </emphasis><emphasis role="bold">]
+  );</emphasis></para>
 
   <para><emphasis role="bold">[</emphasis><emphasis>attrname</emphasis>
   :=<emphasis role="bold"> ] BUILD(</emphasis><emphasis> indexdef, dataset,
   </emphasis><emphasis role="bold">[, </emphasis><emphasis>options
   </emphasis><emphasis role="bold">] );</emphasis></para>
 
-  <para><emphasis role="bold">BUILD(</emphasis><emphasis> library
-  </emphasis><emphasis role="bold">);</emphasis></para>
+  <para>
+    <emphasis role="bold">BUILD(</emphasis>
 
-  <para><informaltable colsep="1" frame="all" rowsep="1">
+    <emphasis>library</emphasis>
+
+    <emphasis role="bold">);</emphasis>
+  </para>
+
+  <para>
+    <informaltable colsep="1" frame="all" rowsep="1">
       <tgroup cols="2">
         <colspec colwidth="78.50pt"/>
 
@@ -43,7 +51,9 @@
 
         <tbody>
           <row>
-            <entry><emphasis>attrname</emphasis></entry>
+            <entry>
+              <emphasis>attrname</emphasis>
+            </entry>
 
             <entry>Opcional. O nome da ação, que transforma a ação em
             definição de atributo, consequentemente não é executado até que
@@ -51,7 +61,9 @@
           </row>
 
           <row>
-            <entry><emphasis>baserecset</emphasis></entry>
+            <entry>
+              <emphasis>baserecset</emphasis>
+            </entry>
 
             <entry>O conjunto de registro de dados para qual o arquivo de
             índice será criado. Pode ser um conjunto de registros derivado dos
@@ -60,50 +72,75 @@
           </row>
 
           <row>
-            <entry><emphasis>indexrec</emphasis></entry>
+            <entry>
+              <emphasis>indexrec</emphasis>
+            </entry>
 
-            <entry>Opcional. A estrutura RECORD dos campos no indexfile que
-            contém informações-chave e de posição do arquivo a serem
-            mencionadas no <emphasis>baserecset</emphasis>. Os nomes e tipos
-            de campos devem corresponder aos campos de <emphasis>baserecset
-            </emphasis> (os tipos de campos REAL e DECIMAL não são
-            permitidos). Também pode conter campos adicionais que não estejam
-            presentes no <emphasis>baserecset</emphasis> Se omitido, todos os
-            campos em <emphasis>baserecset</emphasis> serão usados. O último
-            campo deve ter o nome de um campo UNSIGNED8 definido usando a
-            função {virtual(filepposition)} na declaração DATASET do
+            <entry>opcional. A estrutura RECORD dos campos no arquivo
+            <emphasis>indexfile</emphasis> que contém informações de posição e
+            chave para referência no <emphasis>baserecset</emphasis>. Os nomes
+            e tipos de campos devem corresponder aos campos
+            <emphasis>baserecset</emphasis> (campos de tipo de valor REAL e
+            DECIMAL não são suportados). Também pode conter campos adicionais
+            não presentes no <emphasis>baserecset</emphasis> (campos
+            computados). Se omitido, todos os campos do
+            <emphasis>baserecset</emphasis> serão usados. O último campo deve
+            ser o nome de um campo UNSIGNED8 definido usando o modificador de
+            campo {VIRTUAL(filepposition)} na declaração DATASET do
             <emphasis>baserecset</emphasis>.</entry>
           </row>
 
           <row>
-            <entry><emphasis>keys</emphasis></entry>
+            <entry>
+              <emphasis>keys</emphasis>
+            </entry>
 
-            <entry>A estrutura RECORD dos campos no
-            <emphasis>indexfile</emphasis> que contém informações-chave e de
-            posição do arquivo a serem mencionadas no
-            <emphasis>baserecset</emphasis>. Os nomes e tipos de campos devem
-            corresponder aos campos de <emphasis>baserecset</emphasis> (os
-            tipos de campos REAL e DECIMAL não são permitidos). Também pode
-            conter campos adicionais que não estejam presentes no
-            <emphasis>baserecset</emphasis>. Se omitido, todos os campos em
-            <emphasis>baserecset</emphasis> serão usados.</entry>
+            <entry>A estrutura RECORD de campos-chave que fazem referência ao
+            <emphasis>baserecset</emphasis> (os "termos de pesquisa" para o
+            INDEX). Os campos-chave podem ser campos
+            <emphasis>baserecset</emphasis> ou campos computados. Os tipos
+            REAL e DECIMAL não são suportados como campos de "termo de
+            pesquisa". Se omitido, todos os campos do
+            <emphasis>baserecset</emphasis> serão usados. Essa estrutura
+            RECORD normalmente é definida inline no BUILD usando chaves ({}),
+            mas também pode ser uma estrutura RECORD definida separadamente.
+            Se a estrutura RECORD for definida separadamente, ela deverá
+            atender aos mesmos requisitos usados pela função TABLE() (a
+            estrutura RECORD deve definir o tipo, nome e fonte dos dados para
+            cada campo), caso contrário, a ação BUILD não verificará a
+            sintaxe.</entry>
           </row>
 
           <row>
-            <entry><emphasis>payload</emphasis></entry>
+            <entry>
+              <emphasis>payload</emphasis>
+            </entry>
 
-            <entry>A estrutura RECORD do <emphasis>indexfile</emphasis> que
-            contém campos adicionais não usados como chaves. Se o nome do
-            <emphasis>baserecset</emphasis> estiver na estrutura, especificará
-            "todos os outros campos ainda não nomeados no parâmetro Keys".
-            Pode conter campos que não estejam presentes no
-            <emphasis>baserecset</emphasis> Esses campos não ocupam espaço nos
-            nós não folha do índice e não podem ser citados em uma cláusula de
-            filtro KEYED()</entry>
+            <entry>A estrutura RECORD do <emphasis>indexfile </emphasis>que
+            contém campos adicionais não usados como "termos de busca". Isso
+            pode conter campos do <emphasis>baserecordset</emphasis> e/ou
+            campos computados. Se o nome do <emphasis>baserecset</emphasis>
+            está nesta estrutura, especifica "todos os outros campos ainda não
+            nomeados nas chaves parâmetro" são adicionados. Os campos de carga
+            útil não ocupam espaço em nós non-leaf do índice e não podem ser
+            referenciados em uma Cláusula de filtro KEYED(). Qualquer campo
+            com o modificador {BLOB} (para permitir mais de 32K de dados por
+            entrada de índice) é armazenado dentro do
+            <emphasis>indexfile</emphasis>, mas não com o resto do registro;
+            acessar os dados BLOB requer uma busca adicional. Essa estrutura
+            RECORD é normalmente definida em linha dentro do INDEX usando
+            chaves ({}), mas também pode ser uma estrutura REGISTRO definida
+            separadamente. Se a estrutura RECORD for definida separadamente,
+            ela deve atender aos mesmos requisitos usados pela função TABLE()
+            (a estrutura RECORD deve definir o tipo, nome e fonte dos dados de
+            cada campo), caso contrário a ação BUILD não verificará a
+            sintaxe.</entry>
           </row>
 
           <row>
-            <entry><emphasis>indexfile</emphasis></entry>
+            <entry>
+              <emphasis>indexfile</emphasis>
+            </entry>
 
             <entry>Uma constante da string que contém o nome do arquivo lógico
             do índice a ser criado. Consulte a seção Escopo e Nomes de
@@ -112,25 +149,41 @@
           </row>
 
           <row>
-            <entry><emphasis>options</emphasis></entry>
+            <entry>
+              <emphasis>options</emphasis>
+            </entry>
 
             <entry>Opcional. Uma ou mais das opções listadas abaixo.</entry>
           </row>
 
           <row>
-            <entry><emphasis>indexdef</emphasis></entry>
+            <entry>
+              <emphasis>indexdef</emphasis>
+            </entry>
 
             <entry>O nome do atributo INDEX a ser compilado.</entry>
           </row>
 
           <row>
-            <entry><emphasis>library</emphasis></entry>
+            <entry>
+              <emphasis>dataset</emphasis>
+            </entry>
+
+            <entry>O nome do DATASET a ser usado quando você omite a base
+            parâmetro do conjunto de dados da definição INDEX.</entry>
+          </row>
+
+          <row>
+            <entry>
+              <emphasis>library</emphasis>
+            </entry>
 
             <entry>O nome de um atributo MODULE com a opção LIBRARY .</entry>
           </row>
         </tbody>
       </tgroup>
-    </informaltable></para>
+    </informaltable>
+  </para>
 
   <para>As primeiras quatro formas da ação <emphasis role="bold">BUILD
   </emphasis> criam arquivos de índice. Os índices são compactados
@@ -150,71 +203,113 @@
     <para>As opções a seguir estão disponíveis em todas as três formas BUILD
     de INDEX (apenas):</para>
 
-    <para><emphasis role="bold">[, CLUSTER<indexterm>
-        <primary>CLUSTER</primary>
-      </indexterm>(</emphasis><emphasis> target </emphasis><emphasis
-    role="bold">)] [, SORTED<indexterm>
-        <primary>SORTED</primary>
-      </indexterm>] [, DISTRIBUTE<indexterm>
-        <primary>DISTRIBUTE</primary>
-      </indexterm>( </emphasis><emphasis>key</emphasis><emphasis role="bold">
-    ) [ , MERGE<indexterm>
-        <primary>MERGE</primary>
-      </indexterm> ] ]</emphasis><emphasis role="bold">[, DATASET<indexterm>
-        <primary>DATASET</primary>
-      </indexterm>( </emphasis><emphasis>basedataset</emphasis><emphasis
-    role="bold"> )] [, OVERWRITE<indexterm>
-        <primary>OVERWRITE</primary>
-      </indexterm>]</emphasis><emphasis role="bold"> [, UPDATE<indexterm>
-        <primary>UPDATE</primary>
-      </indexterm>]<emphasis
-    role="bold">[</emphasis><emphasis>,</emphasis><emphasis
-    role="bold">EXPIRE<indexterm>
-        <primary>EXPIRE</primary>
-      </indexterm>( [</emphasis><emphasis>days</emphasis><emphasis
-    role="bold">] ) ]</emphasis>[, FEW<indexterm>
-        <primary>FEW</primary>
-      </indexterm>] [, FILEPOSITION(<emphasis>false</emphasis>)<indexterm>
-        <primary>FILEPOSITION</primary>
-      </indexterm>] [, LOCAL<indexterm>
-        <primary>LOCAL</primary>
-      </indexterm>] [, NOROOT<indexterm>
-        <primary>NOROOT</primary>
-      </indexterm>] [, DISTRIBUTED<indexterm>
-        <primary>DISTRIBUTED</primary>
-      </indexterm>]</emphasis><emphasis role="bold">[, COMPRESSED<indexterm>
-        <primary>COMPRESSION</primary>
-      </indexterm>( LZW<indexterm>
-        <primary>LZW</primary>
-      </indexterm> | ROW<indexterm>
-        <primary>ROW</primary>
-      </indexterm> | FIRST<indexterm>
-        <primary>FIRST</primary>
-      </indexterm>) ] [, WIDTH<indexterm>
-        <primary>WIDTH</primary>
-      </indexterm>(</emphasis><emphasis> nodes </emphasis><emphasis
-    role="bold">) ] [, DEDUP<indexterm>
-        <primary>DEDUP</primary>
-      </indexterm>]<emphasis role="bold">[</emphasis>,<emphasis
-    role="bold">SKEW<indexterm>
-        <primary>SKEW</primary>
-      </indexterm>(</emphasis><emphasis>limit</emphasis><emphasis
-    role="bold">[</emphasis><emphasis>, target</emphasis><emphasis
-    role="bold">] ) [, THRESHOLD<indexterm>
-        <primary>THRESHOLD</primary>
-      </indexterm>(</emphasis><emphasis>size</emphasis><emphasis role="bold">)
-    ] ] <emphasis role="bold">[, MAXLENGTH<indexterm>
-        <primary>MAXLENGTH</primary>
-      </indexterm>[(</emphasis><emphasis>value</emphasis><emphasis
-    role="bold">)] ] ]</emphasis></emphasis></emphasis><emphasis
-    role="bold">[, UNORDERED | ORDERED(</emphasis> <emphasis>bool
-    </emphasis><emphasis role="bold">) ] [, STABLE | UNSTABLE ] [, PARALLEL [
-    (</emphasis> <emphasis>numthreads </emphasis><emphasis role="bold">) ] ]
-    [, ALGORITHM(</emphasis> <emphasis>name </emphasis><emphasis role="bold">)
-    ][, SET (</emphasis> <emphasis>option, value </emphasis><emphasis
-    role="bold">) ]</emphasis></para>
+    <para>
+      <emphasis role="bold">[, CLUSTER <indexterm>
+          <primary>CLUSTER</primary>
+        </indexterm>(</emphasis>
 
-    <para><informaltable colsep="1" frame="all" rowsep="1">
+      <emphasis>target</emphasis>
+
+      <emphasis role="bold">) ] | [ , PLANE <indexterm>
+          <primary>PLANE</primary>
+        </indexterm>(</emphasis>
+
+      <emphasis>targetPlane</emphasis>
+
+      <emphasis role="bold">)] [, SORTED<indexterm>
+          <primary>SORTED</primary>
+        </indexterm>] [, DISTRIBUTE<indexterm>
+          <primary>DISTRIBUTE</primary>
+        </indexterm>(</emphasis>
+
+      <emphasis>key</emphasis>
+
+      <emphasis role="bold">) [ , MERGE<indexterm>
+          <primary>MERGE</primary>
+        </indexterm> ] ]</emphasis>
+
+      <emphasis role="bold">[, DATASET<indexterm>
+          <primary>DATASET</primary>
+        </indexterm>(</emphasis>
+
+      <emphasis>basedataset</emphasis>
+
+      <emphasis role="bold">)] [, OVERWRITE<indexterm>
+          <primary>OVERWRITE</primary>
+        </indexterm>]</emphasis>
+
+      <emphasis role="bold">[, UPDATE<indexterm>
+          <primary>UPDATE</primary>
+        </indexterm>]<emphasis
+      role="bold">[</emphasis><emphasis>,</emphasis><emphasis
+      role="bold">EXPIRE<indexterm>
+          <primary>EXPIRE</primary>
+        </indexterm>( [</emphasis><emphasis>days</emphasis><emphasis
+      role="bold">] ) ]</emphasis>[, FEW<indexterm>
+          <primary>FEW</primary>
+        </indexterm>] [, FILEPOSITION(<emphasis>false</emphasis>)<indexterm>
+          <primary>FILEPOSITION</primary>
+        </indexterm>] [, LOCAL<indexterm>
+          <primary>LOCAL</primary>
+        </indexterm>] [, NOROOT<indexterm>
+          <primary>NOROOT</primary>
+        </indexterm>] [, DISTRIBUTED<indexterm>
+          <primary>DISTRIBUTED</primary>
+        </indexterm>]</emphasis>
+
+      <emphasis role="bold">[, COMPRESSED<indexterm>
+          <primary>COMPRESSION</primary>
+        </indexterm>( <emphasis>option</emphasis><indexterm>
+          <primary>LZW</primary>
+        </indexterm><indexterm>
+          <primary>ROW</primary>
+        </indexterm> <indexterm>
+          <primary>FIRST</primary>
+        </indexterm>) ] [, WIDTH<indexterm>
+          <primary>WIDTH</primary>
+        </indexterm>(</emphasis>
+
+      <emphasis>nodes</emphasis>
+
+      <emphasis role="bold">) ] [, DEDUP<indexterm>
+          <primary>DEDUP</primary>
+        </indexterm>]<emphasis role="bold">[</emphasis>,<emphasis
+      role="bold">SKEW<indexterm>
+          <primary>SKEW</primary>
+        </indexterm>(</emphasis><emphasis>limit</emphasis><emphasis
+      role="bold">[</emphasis><emphasis>, target</emphasis><emphasis
+      role="bold">] ) [, THRESHOLD<indexterm>
+          <primary>THRESHOLD</primary>
+        </indexterm>(</emphasis><emphasis>size</emphasis><emphasis
+      role="bold">) ] ] <emphasis role="bold">[, MAXLENGTH<indexterm>
+          <primary>MAXLENGTH</primary>
+        </indexterm>[(</emphasis><emphasis>value</emphasis><emphasis
+      role="bold">)] ] ]</emphasis></emphasis></emphasis>
+
+      <emphasis role="bold">[, UNORDERED | ORDERED(</emphasis>
+
+      <emphasis>bool</emphasis>
+
+      <emphasis role="bold">) ] [, STABLE | UNSTABLE ] [, PARALLEL [
+      (</emphasis>
+
+      <emphasis>numthreads</emphasis>
+
+      <emphasis role="bold">) ] ] [, ALGORITHM(</emphasis>
+
+      <emphasis>name</emphasis>
+
+      <emphasis role="bold">) ][, SET (</emphasis>
+
+      <emphasis>option, value</emphasis>
+
+      <emphasis role="bold">) ] [,TRIM<indexterm>
+          <primary>TRIM</primary>
+        </indexterm>]</emphasis>
+    </para>
+
+    <para>
+      <informaltable colsep="1" frame="all" rowsep="1">
         <tgroup cols="2">
           <colspec colwidth="125pt"/>
 
@@ -222,7 +317,9 @@
 
           <tbody>
             <row>
-              <entry><emphasis role="bold">CLUSTER</emphasis></entry>
+              <entry>
+                <emphasis role="bold">CLUSTER</emphasis>
+              </entry>
 
               <entry>Especifica o uso da <emphasis>indexfile</emphasis>
               especifica a gravação do nome de arquivo para a lista
@@ -232,26 +329,55 @@
               em disco sempre é determinado pelo número de nós no cluster onde
               a workunit é executada, independentemente do número de nós nos
               clusters de destino – a menos que a opção WIDTH também tenha
-              sido especificada.</entry>
+              sido especificada. Use esta opção para implantações
+              bare-metal.</entry>
             </row>
 
             <row>
-              <entry><emphasis>target</emphasis></entry>
+              <entry>
+                <emphasis>target</emphasis>
+              </entry>
 
-              <entry>Uma lista de constantes de string delimitada por vírgulas
-              que contém os nomes dos clusters no qual o arquivo
-              <emphasis>indexfile</emphasis> será gravado. Os nomes devem
-              estar listados como aparecem na página de Atividade do ECL
-              Watch, ou como são retornados pela função
-              Std.System.Thorlib.Group(); opcionalmente, podem apresentar
-              colchetes contendo uma lista delimitada por vírgula dos números
-              dos nós (baseado em 1) e/ou dos intervalos (especificados com um
-              traço, como p.ex., n-m) para indicar o conjunto específico de
-              nós para gravar.</entry>
+              <entry>Uma lista delimitada por vírgulas de constantes de string
+              contendo os nomes dos clusters para os quais escrever o
+              indexfile. Os nomes devem ser listados conforme aparecem na
+              página ECL Watch Activity ou retornados pela função
+              Std.System.Thorlib.Group(), opcionalmente com colchetes contendo
+              uma lista delimitada por vírgulas de números de nós (base 1)
+              e/ou intervalos (especificados com um traço, como em n-m) para
+              indicar o conjunto específico de nós para escrever.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">SORTED</emphasis></entry>
+              <entry>
+                <emphasis role="bold">PLANE</emphasis>
+              </entry>
+
+              <entry>Especifica a escrita do <emphasis>indexfile</emphasis>
+              para a lista especificada de planos de destino. Se omitido, o
+              <emphasis>indexfile</emphasis> é escrito no plano padrão. Planos
+              são usados por sistemas conteinerizados, mas como clusters
+              bare-metal são implicitamente suportados por um plano com o
+              mesmo nome, você pode usar PLANE('nomedocluster') para
+              implantações bare-metal.</entry>
+            </row>
+
+            <row>
+              <entry>
+                <emphasis>targetPlane</emphasis>
+              </entry>
+
+              <entry>Uma lista delimitada por vírgulas de constantes de string
+              contendo os nomes dos planos para os quais escrever o
+              <emphasis>indexfile</emphasis>. Os nomes dos
+              <emphasis>targetPlane</emphasis> devem ser listados conforme
+              definidos na implantação.</entry>
+            </row>
+
+            <row>
+              <entry>
+                <emphasis role="bold">SORTED</emphasis>
+              </entry>
 
               <entry>Especifica que <emphasis>baserecset</emphasis> já foi
               classificado, significando que a classificação automática com
@@ -260,28 +386,36 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">DISTRIBUTE</emphasis></entry>
+              <entry>
+                <emphasis role="bold">DISTRIBUTE</emphasis>
+              </entry>
 
               <entry>Especifica a compilação do <emphasis>indexfile
               </emphasis> com base na distribuição da chave.</entry>
             </row>
 
             <row>
-              <entry><emphasis>key</emphasis></entry>
+              <entry>
+                <emphasis>key</emphasis>
+              </entry>
 
               <entry>O nome de uma definição do atributo INDEX
               existente.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">MERGE</emphasis></entry>
+              <entry>
+                <emphasis role="bold">MERGE</emphasis>
+              </entry>
 
               <entry>Opcional. Especifica a fusão do índice resultante na
               chave especificada.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">DATASET</emphasis></entry>
+              <entry>
+                <emphasis role="bold">DATASET</emphasis>
+              </entry>
 
               <entry>Necessário apenas quando <emphasis>baserecset</emphasis>
               for o resultado de uma operação (como um JOIN) cujo resultado a
@@ -293,28 +427,36 @@
             </row>
 
             <row>
-              <entry><emphasis>basedataset</emphasis></entry>
+              <entry>
+                <emphasis>basedataset</emphasis>
+              </entry>
 
               <entry>O nome do atributo DATASET a partir do qual
               <emphasis>baserecset</emphasis> é derivado.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">OVERWRITE</emphasis></entry>
+              <entry>
+                <emphasis role="bold">OVERWRITE</emphasis>
+              </entry>
 
               <entry>Especifica a substituição do
               <emphasis>indexfile</emphasis> caso ele exista.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">UPDATE</emphasis></entry>
+              <entry>
+                <emphasis role="bold">UPDATE</emphasis>
+              </entry>
 
               <entry>specifica que o arquivo deve ser regravado apenas se
               houver alteração nos dados de código ou de entrada.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">EXPIRE</emphasis></entry>
+              <entry>
+                <emphasis role="bold">EXPIRE</emphasis>
+              </entry>
 
               <entry>Opcional. Especifica que se trata de um arquivo
               temporário que pode ser removido automaticamente após um
@@ -323,7 +465,9 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">FILEPOSITION</emphasis></entry>
+              <entry>
+                <emphasis role="bold">FILEPOSITION</emphasis>
+              </entry>
 
               <entry>Opcional. Se o <emphasis>indicador</emphasis> for FALSE,
               impede que o campo “fileposition” implícito seja criado e não
@@ -332,14 +476,18 @@
             </row>
 
             <row>
-              <entry><emphasis>flag</emphasis></entry>
+              <entry>
+                <emphasis>flag</emphasis>
+              </entry>
 
               <entry>Opcional. TRUE ou FALSE, indicando se o campo
               “fileposition” implícito será ou não criado.</entry>
             </row>
 
             <row>
-              <entry><emphasis>days</emphasis></entry>
+              <entry>
+                <emphasis>days</emphasis>
+              </entry>
 
               <entry>Opcional. O número de dias contados a partir da última
               leitura do arquivo em que o arquivo será automaticamente
@@ -347,7 +495,9 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">FEW</emphasis></entry>
+              <entry>
+                <emphasis role="bold">FEW</emphasis>
+              </entry>
 
               <entry>Especifica que <emphasis>o osindexfile</emphasis> foi
               criado como um só arquivo de parte única. Usado apenas para
@@ -357,7 +507,9 @@
             </row>
 
             <row>
-              <entry><emphasis>indexdef</emphasis></entry>
+              <entry>
+                <emphasis>indexdef</emphasis>
+              </entry>
 
               <entry>O nome de uma definição do atributo INDEX existente que
               fornece os parâmetros <emphasis>baserecset</emphasis>,
@@ -366,7 +518,9 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">LOCAL</emphasis></entry>
+              <entry>
+                <emphasis role="bold">LOCAL</emphasis>
+              </entry>
 
               <entry>Especifica que a operação é realizada em cada nó de
               supercomputador de forma independente, sem exigir interação com
@@ -375,7 +529,9 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">NOROOT</emphasis></entry>
+              <entry>
+                <emphasis role="bold">NOROOT</emphasis>
+              </entry>
 
               <entry>Especifica que o índice não é classificado em nível
               global e que não há índice de raiz para indicar qual parte do
@@ -384,7 +540,9 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">DISTRIBUTED</emphasis></entry>
+              <entry>
+                <emphasis role="bold">DISTRIBUTED</emphasis>
+              </entry>
 
               <entry>Especifica ambas as opções LOCAL e NOROOT (congruentes
               com a opção DISTRIBUTED em uma declaração INDEX, a qual
@@ -393,22 +551,27 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">COMPRESSED</emphasis></entry>
+              <entry>
+                <emphasis role="bold">COMPRESSED</emphasis>
+              </entry>
 
-              <entry>Especifica o tipo de compactação usado. Se omitido, o
-              padrão usado é LZW, uma variante do algoritimo Lempel-Ziv-Welch.
-              A especificação de ROW compacta as entradas do índice com base
-              nas diferenças entre linhas contíguas (usadas apenas com
-              registros de comprimento fixo), e é recomendada para uso em
-              situações onde o tempo mais rápido de descompactação é mais
-              importante do que a quantidade de compactação alcançada. FIRST
-              compacta os elementos principais comuns da chave (recomendado
-              apenas para uso na comparação de cronometragem de
-              tempo).</entry>
+              <entry><para>Opcional. Especifica que o índice deve ser
+              compactado usando o tipo de compactação especificado. Se
+              omitido, o padrão é <emphasis role="bold">LZW</emphasis>, uma
+              variante do algoritmo Lempel-Ziv-Welch. </para></entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">WIDTH</emphasis></entry>
+              <entry><emphasis>option</emphasis></entry>
+
+              <entry>Consulte <link linkend="IDXCOMP2">Indexes and
+              Compression</link> para ver as opções.</entry>
+            </row>
+
+            <row>
+              <entry>
+                <emphasis role="bold">WIDTH</emphasis>
+              </entry>
 
               <entry>Especifica a gravação do <emphasis> indexfile</emphasis>
               para um número diferente de partes de arquivos físicos que o
@@ -421,7 +584,9 @@
             </row>
 
             <row>
-              <entry><emphasis>nodes</emphasis></entry>
+              <entry>
+                <emphasis>nodes</emphasis>
+              </entry>
 
               <entry>O número de partes do arquivo físico a serem gravadas. Se
               estiver definido para (1), essa opção operará exatamente da
@@ -429,14 +594,18 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">DEDUP</emphasis></entry>
+              <entry>
+                <emphasis role="bold">DEDUP</emphasis>
+              </entry>
 
               <entry>Especifica que as entradas duplicadas são eliminadas do
               INDEX.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">SKEW</emphasis></entry>
+              <entry>
+                <emphasis role="bold">SKEW</emphasis>
+              </entry>
 
               <entry>Indica que você sabe que os dados não serão espalhados
               uniformemente entre os nós (serão distorcidos e você opta por
@@ -445,39 +614,49 @@
             </row>
 
             <row>
-              <entry><emphasis>limit</emphasis></entry>
+              <entry>
+                <emphasis>limit</emphasis>
+              </entry>
 
               <entry>Um valor entre zero (0) e um (1,0 = 100%) indicando a
               porcentagem máxima de distorção a ser permitida antes que a
-              tarefa falhe (a distorção padrão é 1,0 / &lt;número de escravos
+              tarefa falhe (a distorção padrão é 1,0 / &lt;número de
+              secundários no cluster&gt;).</entry>
+            </row>
+
+            <row>
+              <entry>
+                <emphasis>target</emphasis>
+              </entry>
+
+              <entry>Opcional. Um valor entre zero (0) e um (1,0 = 100%)
+              indicando a porcentagem máxima de distorção desejada a ser
+              permitida (a distorção padrão é 1,0 / &lt;número de secundários
               no cluster&gt;).</entry>
             </row>
 
             <row>
-              <entry><emphasis>target</emphasis></entry>
-
-              <entry>Opcional. Um valor entre zero (0) e um (1,0 = 100%)
-              indicando a porcentagem máxima de distorção desejada a ser
-              permitida (a distorção padrão é 1,0 / &lt;número de escravos no
-              cluster&gt;).</entry>
-            </row>
-
-            <row>
-              <entry><emphasis role="bold">THRESHOLD</emphasis></entry>
+              <entry>
+                <emphasis role="bold">THRESHOLD</emphasis>
+              </entry>
 
               <entry>Indica o tamanho mínimo de uma única parte antes que o
               limite SKEW seja aplicado.</entry>
             </row>
 
             <row>
-              <entry><emphasis>size</emphasis></entry>
+              <entry>
+                <emphasis>size</emphasis>
+              </entry>
 
               <entry>Um valor inteiro indicando o número mínimo de bytes para
               uma parte única. O padrão é 1.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">MAXLENGTH</emphasis></entry>
+              <entry>
+                <emphasis role="bold">MAXLENGTH</emphasis>
+              </entry>
 
               <entry>Opcional. Esta opção é usada para criar índices que são
               compatíveis com versões anteriores às versões 3.0. Especifica o
@@ -489,7 +668,9 @@
             </row>
 
             <row>
-              <entry><emphasis>value</emphasis></entry>
+              <entry>
+                <emphasis>value</emphasis>
+              </entry>
 
               <entry>Opcional. Um valor inteiro que indica o comprimento
               máximo. Se omitido, o tamanho máximo será calculado a partir da
@@ -499,21 +680,27 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">UNORDERED</emphasis></entry>
+              <entry>
+                <emphasis role="bold">UNORDERED</emphasis>
+              </entry>
 
               <entry>Opcional. Especifica que a ordem do registro de resultado
               não é importante.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">ORDERED</emphasis></entry>
+              <entry>
+                <emphasis role="bold">ORDERED</emphasis>
+              </entry>
 
               <entry>Especifica a importância da ordem do registro de
               resultado.</entry>
             </row>
 
             <row>
-              <entry><emphasis>bool</emphasis></entry>
+              <entry>
+                <emphasis>bool</emphasis>
+              </entry>
 
               <entry>Quando for “False” (Falso), especifica que a ordem do
               registro de resultado não é importante. Quando for “True’
@@ -522,42 +709,54 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">STABLE</emphasis></entry>
+              <entry>
+                <emphasis role="bold">STABLE</emphasis>
+              </entry>
 
               <entry>Opcional. Especifica que a ordem do registro de entrada é
               importante.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">UNSTABLE</emphasis></entry>
+              <entry>
+                <emphasis role="bold">UNSTABLE</emphasis>
+              </entry>
 
               <entry>Opcional. Especifica que a ordem do registro de entrada
               não é importante.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">PARALLEL</emphasis></entry>
+              <entry>
+                <emphasis role="bold">PARALLEL</emphasis>
+              </entry>
 
               <entry>Opcional. Tenta avaliar essa atividade em
               paralelo.</entry>
             </row>
 
             <row>
-              <entry><emphasis>numthreads</emphasis></entry>
+              <entry>
+                <emphasis>numthreads</emphasis>
+              </entry>
 
               <entry>Opcional. Tenta avaliar essa atividade usando as
               <emphasis>threads</emphasis> numthreads.</entry>
             </row>
 
             <row>
-              <entry><emphasis role="bold">ALGORITHM</emphasis></entry>
+              <entry>
+                <emphasis role="bold">ALGORITHM</emphasis>
+              </entry>
 
               <entry>Opcional. Substitui o algoritmo usado para essa
               atividade.</entry>
             </row>
 
             <row>
-              <entry><emphasis>name</emphasis></entry>
+              <entry>
+                <emphasis>name</emphasis>
+              </entry>
 
               <entry>O algoritmo a ser usado para essa atividade. Precisa
               fazer parte da lista de algoritmos compatíveis com as opções
@@ -565,7 +764,9 @@
             </row>
 
             <row>
-              <entry><emphasis role="bold">SET</emphasis></entry>
+              <entry>
+                <emphasis role="bold">SET</emphasis>
+              </entry>
 
               <entry>Opcional. SET é usado para definir um valor para uma
               opção de metadata nomeada. Isso permite que você defina
@@ -581,7 +782,9 @@
             </row>
 
             <row>
-              <entry><emphasis>option</emphasis></entry>
+              <entry>
+                <emphasis>option</emphasis>
+              </entry>
 
               <entry>Uma constante de string – que faz distinção entre
               maiúsculas e minúsculas – que contém o nome da opção a ser
@@ -589,17 +792,25 @@
             </row>
 
             <row>
-              <entry><emphasis>value</emphasis></entry>
+              <entry>
+                <emphasis>value</emphasis>
+              </entry>
 
               <entry>O valor para o qual a opção será definida. Pode ser
               qualquer tipo de valor, dependendo do tipo esperado pela
               opção.</entry>
             </row>
+
+            <row>
+              <entry><emphasis role="bold">TRIM</emphasis></entry>
+
+              <entry>Opcional. Esta opção especifica aparar strings de
+              comprimento variável antes de criar o índice.</entry>
+            </row>
           </tbody>
         </tgroup>
-      </informaltable></para>
-
-    <para/>
+      </informaltable>
+    </para>
   </sect2>
 
   <sect2 id="BUILD_an_Access_Index">
@@ -623,7 +834,7 @@
      {STRING2 st,
       STRING20 city,
       STRING20 lname,
-      UNSIGNED8 filepos{virtual(fileposition)}},
+      UNSIGNED8 filepos{VIRTUAL(fileposition)}},
      FLAT);
 BUILD(Vehicles,{lname,filepos},'vkey::lname');
  //build key into Vehicles dataset on last name
@@ -661,88 +872,136 @@ BUILD(Vehicles,{lname,filepos},'vkey::lname');
      {STRING2 st,
       STRING20 city,
       STRING20 lname,
-      UNSIGNED8 filepos{virtual(fileposition)}},
+      UNSIGNED8 filepos{VIRTUAL(fileposition)}},
       FLAT);
-BUILD(Vehicles,{st,city},{lname},'vkey::st.city');
- //build key into Vehicles dataset on state and city
- //payload the last name</programlisting>
+BUILD(Vehicles,{st,city},{lname},'vkey::st.city1');
+//build key into Vehicles dataset on state and city
+//payload the last name
+
+//same index build using non-inline RECORD structures
+
+SearchTerms := RECORD
+  Vehicles.st;
+  Vehicles.city;
+END; 
+Payload := RECORD
+  Vehicles.lname;
+END; 
+BUILD(Vehicles,SearchTerms,Payload,'vkey::st.city2');
+</programlisting>
   </sect2>
 
   <sect2 id="BUILD_from_an_INDEX_Definition">
     <title>BUILD a partir de uma definição INDEX</title>
 
     <para><emphasis role="bold">[</emphasis><emphasis>attrname</emphasis>
-    :=<emphasis role="bold"> ] BUILD(</emphasis><emphasis> indexdef
-    </emphasis><emphasis role="bold">[, </emphasis><emphasis>options
-    </emphasis><emphasis role="bold">] );</emphasis></para>
+    :=<emphasis role="bold"> ] BUILD(</emphasis><emphasis> indexdef</emphasis>
+    <emphasis role="bold">[,</emphasis><emphasis>indexfile</emphasis><emphasis
+    role="bold">]</emphasis> <emphasis role="bold">[,
+    </emphasis><emphasis>options </emphasis><emphasis role="bold">]
+    );</emphasis></para>
 
     <para>A forma 3 cria um arquivo de índice usando uma definição INDEX
     previamente especificada.</para>
 
+    <para>Você também pode usar esta forma para criar um índice baseado em
+    dois índices submetidos a MERGE. Para gravar um índice submetido a MERGE
+    em disco, você deve usar a ação BUILD e incluir o parâmetro opcional
+    <emphasis>indexfile</emphasis>.</para>
+
     <para>Exemplo:</para>
 
-    <programlisting>nameKey := INDEX(mainTable,{surname,forename,filepos},'name.idx');
+    <programlisting lang="ECL" role="NOTrunnable">nameKey := INDEX(mainTable,{surname,forename,filepos},'name.idx');
 BUILD(nameKey); //gets all info from the INDEX definition
+
+// BUILDing a MERGEd index
+BUILD(MERGE(idx1,idx2,'~idx::MergedIndex');
 </programlisting>
 
+    <para>Ver também: <link linkend="MERGE">MERGE</link></para>
+  </sect2>
+
+  <sect2 id="SepIndexFromDS" role="brk">
+    <title>Separando INDEX de DATASET</title>
+
     <para><emphasis role="bold">[</emphasis><emphasis>attrname</emphasis>
-    :=<emphasis role="bold"> ] BUILD(</emphasis><emphasis> indexdef, dataset
+    :=<emphasis role="bold"> ] BUILD(</emphasis><emphasis> indexdef, dataset,
     </emphasis><emphasis role="bold">[, </emphasis><emphasis>options
     </emphasis><emphasis role="bold">] );</emphasis></para>
 
-    <para>A forma 4 cria um arquivo de índice em um dataset usando uma
-    definição INDEX previamente especificada.</para>
+    <para>A forma 4 permite separar o índice do dataset, facilitando o uso da
+    forma de INDEX que não exige um dataset como primeiro parâmetro.</para>
 
-    <para>Isso é usado para criar um índice cuja definição do dataset é
-    complexa. Isso permite que o índice seja separado de forma lógica do
-    dataset a partir do qual é criado. Isso é útil especificamente quando a
-    definição do dataset é bastante complicada (Mb de origem), já que quando o
-    índice é subsequentemente usado em uma consulta, todos os códigos usados
-    para criá-lo também são interpretados.</para>
+    <para>A forma usual de definir e criar um INDEX é em termos do dataset
+    usado para criá-lo, usando uma declaração INDEX em que o dataset é nomeado
+    como o primeiro parâmetro do INDEX. Isso funciona bem quando o dataset é
+    relativamente simples, mas há desvantagens:</para>
 
-    <para>Exemplo:</para>
+    <itemizedlist>
+      <listitem>
+        <para>O INDEX não pode ser separado logicamente do dataset a partir do
+        qual foi criado.</para>
+      </listitem>
 
-    <programlisting>ds = DATASET(100, TRANSFORM({ unsigned id }, SELF.id := COUNTER));
-i := INDEX({ unsigned id }, 'myIndex');
-BUILD(i, ds);
-</programlisting>
+      <listitem>
+        <para>Se o dataset for muito complicado (Mb de fonte), quando o índice
+        for usado posteriormente em uma query, todo o código para criá-lo
+        também será analisado.</para>
+      </listitem>
+    </itemizedlist>
+
+    <para>Esta forma de BUILD permite separar os dois, para que você possa
+    omitir o parâmetro do dataset base da definição INDEX e especificar apenas
+    o dataset a ser usado na ação BUILD. Os campos são mapeados
+    automaticamente (por nome de campo) do dataset para o índice.</para>
+
+    <para>Exemplos:</para>
+
+    <para><programlisting>//usual way to BUILD an INDEX:
+ds1 = DATASET(100, TRANSFORM({ UNSIGNED id }, SELF.id := COUNTER));
+i1 := INDEX(ds1, { id }, 'myIndex'); //specifies the dataset to always use
+BUILD(i1);
+
+//Separated way to BUILD an INDEX:
+ds2 = DATASET(100, TRANSFORM({ UNSIGNED id }, SELF.id := COUNTER));
+i2 := INDEX({ UNSIGNED id }, 'myIndex');
+BUILD(i2, ds2);       //builds the i2 INDEX from the ds2 dataset
+</programlisting></para>
   </sect2>
 
   <sect2 id="BUILD_a_Query_Library">
-    <title>BUILD uma Biblioteca de Consulta</title>
+    <title>BUILD uma Query Library</title>
 
     <para><emphasis role="bold">BUILD(</emphasis><emphasis> library
     </emphasis><emphasis role="bold">);</emphasis></para>
 
-    <para>A forma 5 cria uma biblioteca de consulta externa <emphasis
-    role="bold">para ser usada apenas no Roxie</emphasis>.</para>
+    <para>A forma 5 cria uma query library externa <emphasis role="bold">para
+    uso apenas em hthor ou Roxie</emphasis>.</para>
 
-    <para>Uma biblioteca de consulta permite que um conjunto de atributos
-    relacionados seja agrupado como uma unidade autocontida, para que o código
-    possa ser compartilhado entre diferentes workunits. Isso reduz o tempo
-    necessário para implementar um conjunto de atributos, podendo reduzir a
-    pegada de memória para o grupo de consultas no Roxie que usam a
-    <emphasis>biblioteca</emphasis>. Além disso, a funcionalidade na
-    <emphasis>biblioteca </emphasis> pode ser atualizada sem a necessidade de
-    reimplementar todas as consultas que utilizam essa funcionalidade.</para>
+    <para>Uma query library permite que um conjunto de atributos relacionados
+    seja empacotado como uma unidade autocontida, para que o código possa ser
+    compartilhado entre diferentes workunits. Isso reduz o tempo necessário
+    para implantar um conjunto de atributos e também reduz a área de memória
+    do conjunto de queries no Roxie que usam a <emphasis>library</emphasis>.
+    Além disso, a funcionalidade na <emphasis>library</emphasis> pode ser
+    atualizada sem precisar reimplantar todas as queries que usam essa
+    funcionalidade.</para>
 
-    <para>As bibliotecas de consulta são adequadas para agrupar conjuntos de
-    funções próximas. Não são adequadas para a inclusão de atributos definidos
-    como MACROs – o significado de uma macro é desconhecido até que os seus
-    parâmetros sejam substituídos.</para>
+    <para>Query libraries são adequadas para empacotar conjuntos de funções
+    estreitamente relacionadas. Elas não são adequadas para incluir atributos
+    definidos como MACROs--o significado de um macro só é conhecido depois que
+    seus parâmetros são substituídos.</para>
 
-    <para>A forma do nome da #WORKUNIT<indexterm>
+    <para>A forma de nome de #WORKUNIT<indexterm>
         <primary>#WORKUNIT</primary>
-      </indexterm> nomeia a workunit que BUILD cria como biblioteca externa.
-    Este nome é o nome da biblioteca externa usada pela função LIBRARY
-    <indexterm>
-        <primary>function LIBRARY</primary>
-      </indexterm> (que fornece acesso à biblioteca a partir da consulta que
-    está usando a <emphasis>biblioteca</emphasis>). <emphasis role="bold">Uma
-    vez que a própria workunit é a biblioteca de consulta externa, BUILD
-    construir(</emphasis><emphasis role="bold">biblioteca)
-    </emphasis><emphasis role="bold">deve ser a única ação na
-    workunit.</emphasis></para>
+      </indexterm> nomeia a workunit que BUILD cria como a biblioteca externa.
+    Esse nome é o nome da biblioteca externa usado pela função LIBRARY<indexterm>
+        <primary>LIBRARY function</primary>
+      </indexterm> (que fornece acesso à biblioteca a partir da query que usa
+    a <emphasis>library</emphasis>). <emphasis role="bold">Como a própria
+    workunit é a query library externa, BUILD(</emphasis><emphasis
+    role="bold">library</emphasis><emphasis role="bold">) deve ser a única
+    ação na workunit.</emphasis></para>
 
     <para>Exemplo:</para>
 
@@ -764,13 +1023,181 @@ END;
 #WORKUNIT('name','Ppass.FilterDsLib')
 BUILD(FilterDsLib1);
 </programlisting>
+  </sect2>
 
-    <para>Ver também: <link linkend="INDEX_record_structure">INDEX</link>,
-    <link linkend="JOIN">JOIN</link>, <link linkend="FETCH">FETCH</link>,
-    <link linkend="MODULE_Structure">MODULE</link>, <link
-    linkend="INTERFACE_Structure">INTERFACE</link>, <link
-    linkend="LIBRARY">LIBRARY</link>, <link
-    linkend="DISTRIBUTE">DISTRIBUTE</link>, <link
-    linkend="_WORKUNIT">#WORKUNIT</link></para>
+  <sect2 id="IDXCOMP2" role="brk">
+    <title>Índices e Compactação</title>
+
+    <para><emphasis role="bold">Opções de compactação:</emphasis></para>
+
+    <informaltable colsep="1" frame="all" rowsep="1">
+      <tgroup cols="2">
+        <colspec align="left" colwidth="188*"/>
+
+        <colspec colwidth="812*"/>
+
+        <tbody>
+          <row>
+            <entry><emphasis role="bold">LZW</emphasis></entry>
+
+            <entry>A compactação padrão. Uma variante do algoritmo
+            Lempel-Ziv-Welch.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold">ROW</emphasis></entry>
+
+            <entry>Compacta entradas de índice com base nas diferenças entre
+            linhas (<emphasis role="bold">somente para uso com registros de
+            comprimento fixo</emphasis>). Normalmente não compacta tão bem
+            quanto LZW, mas ocupa menos espaço na memória porque as linhas são
+            expandidas sob demanda.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold">'inplace'</emphasis></entry>
+
+            <entry>Faz com que o índice seja criado usando o formato de
+            compactação inplace. O payload usa compactação lz4 por
+            padrão.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold"><emphasis
+            role="bold">'inplace:lz4hc'</emphasis> </emphasis></entry>
+
+            <entry>Faz compactação inplace nos campos-chave e compactação
+            lz4hc no payload. O índice resultante pode ser menor do que ao
+            usar lz4.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold"><emphasis
+            role="bold">'inplace:lz4s'</emphasis> </emphasis></entry>
+
+            <entry>Faz compactação inplace nos campos-chave e compactação
+            lz4s no payload. Isso usa a API de stream LZ4 para evitar
+            recomprimir os dados e reduzir os tempos de criação do
+            índice.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold"><emphasis
+            role="bold">'inplace:lz4shc'</emphasis> </emphasis></entry>
+
+            <entry>Faz compactação inplace nos campos-chave e compactação
+            lz4shc no payload. Isso usa a versão de alta compactação (HC) da
+            API de stream LZ4 para evitar recomprimir os dados e reduzir os
+            tempos de criação do índice. A compactação padrão para índices
+            inplace nas versões posteriores a 9.6.90, 9.8.66 e
+            9.10.12.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold">'inplace:zstds'</emphasis></entry>
+
+            <entry>Faz compactação inplace usando o algoritmo Zstandard
+            (zstd), um algoritmo de compactação rápido que fornece altas taxas
+            de compactação.</entry>
+          </row>
+        </tbody>
+      </tgroup>
+    </informaltable>
+
+    <para>O formato de compactação de índice inplace (introduzido na versão
+    9.2.0) melhora a compactação dos campos keyed e permite pesquisá-los sem
+    descompactação. A implementação original de compactação de índice
+    descompacta as linhas quando elas são lidas do disco.</para>
+
+    <para>Os formatos de compactação de índice inplace lz4s e lz4hc
+    (introduzidos nas versões 9.6.90, 9.8.66 e 9.10.12 9.2.0 ou posterior)
+    melhoram a compactação e reduzem o tempo de criação. Esses formatos
+    exigem um engine que os suporte. Em outras palavras, <emphasis
+    role="bold">se você criar um índice usando os formatos lz4s ou lz4shc,
+    deverá usar uma plataforma posterior a 9.6.90, 9.8.66 e 9.10.12 para ler
+    esses índices.</emphasis></para>
+
+    <para>O mesmo vale para índices criados usando o formato zstds. <emphasis
+    role="bold">Se você criar um índice usando o formato zstds, deverá usar
+    uma plataforma posterior a 9.10.40 ou 9.12.14 para ler esses
+    índices.</emphasis></para>
+
+    <para>Se você tentar ler um índice com o formato de compactação inplace em
+    um sistema que não oferece suporte a ele, receberá uma mensagem de
+    erro.</para>
+
+    <para>Como os nós de ramificação podem ser pesquisados sem descompactação,
+    mais nós de ramificação cabem na memória, o que pode melhorar o desempenho
+    da pesquisa. A compactação lz4 usada para o payload é significativamente
+    mais rápida ao descompactar páginas folha do que a compactação LZW
+    anterior. Se o desempenho é melhor com lz4hc (uma variante de alta
+    compactação de lz4) nos campos de payload depende das características de
+    acesso dos dados e de quanto do índice está em cache na memória.</para>
+
+    <para><emphasis role="bold">Níveis de compactação:</emphasis></para>
+
+    <informaltable colsep="1" frame="all" rowsep="1">
+      <tgroup cols="2">
+        <colspec align="left" colwidth="240*"/>
+
+        <colspec colwidth="836*"/>
+
+        <tbody>
+          <row>
+            <entry><emphasis role="bold">hclevel</emphasis></entry>
+
+            <entry>Um inteiro entre 3 e 12 para especificar o nível de
+            compactação. O padrão é 3. Níveis mais altos aumentam a
+            compactação, mas também aumentam os tempos de compactação. Isso
+            pode ser vantajoso dependendo de por quanto tempo os dados são
+            armazenados e dos custos de armazenamento em comparação com os
+            custos de computação para criar o índice.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold">maxcompression</emphasis></entry>
+
+            <entry>A taxa máxima de compactação desejada. Isso evita que os
+            nós folha fiquem grandes demais quando expandidos, mas aumenta o
+            tamanho de alguns índices. O padrão é 20.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold">maxrecompress</emphasis></entry>
+
+            <entry>Especifica o número de vezes que todo o dataset de entrada
+            deve ser recomprimido para liberar espaço. Aumentar o número
+            diminui o tamanho dos índices e provavelmente reduzirá
+            ligeiramente o tempo de descompactação (porque há menos blocos de
+            stream), mas aumentará o tempo de criação. O padrão é 1.</entry>
+          </row>
+        </tbody>
+      </tgroup>
+    </informaltable>
+
+    <para/>
+
+    <para>Exemplo:</para>
+
+    <programlisting>Vehicles := DATASET('vehicles',
+          {STRING2 st,STRING20 city,STRING20 lname},FLAT);
+
+SearchTerms := RECORD
+  Vehicles.st;
+  Vehicles.city;
+END; 
+Payload     := RECORD
+  Vehicles.lname;
+END; 
+VehicleKey := INDEX(Vehicles,SearchTerms,Payload,'vkey::st.city',
+                    COMPRESSED('inplace:lz4shc,compressopt(hclevel=9,
+                                                           maxcompression=25,
+                                                           maxrecompress=4)'));
+BUILD(VehicleKey);</programlisting>
+
+    <para>Ver também: <link linkend="DATASET">DATASET</link>, <link
+    linkend="BUILD">BUILDINDEX</link>, <link linkend="JOIN">JOIN</link>, <link
+    linkend="FETCH">FETCH</link>, <link
+    linkend="KEYED-WILD">KEYED/WILD</link></para>
   </sect2>
 </sect1>

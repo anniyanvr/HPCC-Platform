@@ -20,6 +20,7 @@
 
 #include "ctfile.hpp"
 #include "eclhelper.hpp"
+#include <vector>
 
 class CNodeInfo : implements serializable, public CInterface
 {
@@ -93,16 +94,40 @@ public:
 
 typedef IArrayOf<CNodeInfo> NodeInfoArray;
 
+typedef std::vector<const BloomFilter *> BloomFilterArray;
+
+class jhtree_decl KeyBuilderOptions
+{
+public:
+    KeyBuilderOptions(unsigned _flags, unsigned _rawSize, unsigned _nodeSize, unsigned _keyFieldSize, IHThorIndexWriteArg *_helper);
+
+    void setCompression(const char * value)
+    {
+        compression.set(value);
+    }
+
+public:
+    unsigned flags = 0;
+    unsigned rawSize = 0;
+    unsigned nodeSize = 0;
+    unsigned keyFieldSize = (unsigned) -1;
+    unsigned __int64 startSequence = 0;
+    IHThorIndexWriteArg *helper = nullptr;
+    StringBuffer compression;
+    bool enforceOrder = true;
+    bool isTLK = false;
+};
+
 interface IKeyBuilder : public IInterface
 {
-    virtual void finish(IPropertyTree * metadata, unsigned * crc) = 0;
+    virtual void finish(IPropertyTree * metadata, unsigned * crc, size32_t maxRecordSizeSeen, const BloomFilterArray * optBloomFilters) = 0;
     virtual void processKeyData(const char *keyData, offset_t pos, size32_t recsize) = 0;
     virtual void addLeafInfo(CNodeInfo *info) = 0;
     virtual unsigned __int64 createBlob(size32_t size, const char * _ptr) = 0;
-    virtual unsigned __int64 getDuplicateCount() = 0;
+    virtual unsigned __int64 getStatistic(StatisticKind kind) const = 0;
 };
 
-extern jhtree_decl IKeyBuilder *createKeyBuilder(IFileIOStream *_out, unsigned flags, unsigned rawSize, unsigned nodeSize, unsigned keyFieldSize, unsigned __int64 startSequence, IHThorIndexWriteArg *helper, bool enforceOrder, bool isTLK);
+extern jhtree_decl IKeyBuilder *createKeyBuilder(IFileIOStream *_out, const KeyBuilderOptions &options);
 
 interface IKeyDesprayer : public IInterface
 {
@@ -112,5 +137,22 @@ interface IKeyDesprayer : public IInterface
 
 extern jhtree_decl IKeyDesprayer * createKeyDesprayer(IFile * in, IFileIOStream * out);
 extern jhtree_decl bool checkReservedMetadataName(const char *name);
+
+class jhtree_decl BlobCreatorWrapper : implements IBlobCreator
+{
+    IKeyBuilder *builder;
+    offset_t totalSize = 0;
+public:
+    BlobCreatorWrapper(IKeyBuilder *_builder) : builder(_builder) {}
+
+    void setBuilder(IKeyBuilder *_builder) { builder = _builder; }
+
+    virtual unsigned __int64 createBlob(size32_t size, const void * ptr)
+    {
+        totalSize += size;
+        return builder->createBlob(size, (const char *) ptr);
+    }
+    offset_t queryTotalSize() const { return totalSize; }
+};
 
 #endif

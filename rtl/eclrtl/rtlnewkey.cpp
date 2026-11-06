@@ -196,20 +196,6 @@ void getStretchedValue(MemoryBuffer & target, const RtlTypeInfo & newType, const
 
 //---------------------------------------------------------------------------------------------------------------------
 
-static bool incrementBuffer(byte *buf, size32_t size)
-{
-    int i = size;
-    while (i--)
-    {
-        buf[i]++;
-        if (buf[i]!=0)
-            return true;
-    }
-    return false;
-}
-
-//---------------------------------------------------------------------------------------------------------------------
-
 bool needToApplySubString(const RtlTypeInfo & type, const byte * value, size32_t subLength)
 {
     if (subLength == MatchFullString)
@@ -1439,6 +1425,11 @@ public:
         return false;
     }
 
+    virtual bool isSingleValue() const override
+    {
+        return false;
+    }
+
     virtual unsigned queryScore() const override
     {
         // MORE - the score should probably depend on the number and nature of ranges too.
@@ -1466,6 +1457,7 @@ public:
     virtual bool matches(const RtlRow & row) const override;
     virtual bool isEmpty() const override;
     virtual bool isWild() const override;
+    virtual bool isSingleValue() const override { return values->querySingleValue() != nullptr; }
 
 //More complex index matching
     virtual unsigned numRanges() const override;
@@ -1574,6 +1566,7 @@ public:
     virtual bool matches(const RtlRow & row) const override;
     virtual bool isEmpty() const override { return false; }
     virtual bool isWild() const override { return false; }
+    virtual bool isSingleValue() const override { return true; }
 
 //More complex index matching
     virtual unsigned numRanges() const override { return 1; };
@@ -1764,6 +1757,9 @@ public:
 
     virtual StringBuffer & serialize(StringBuffer & out) const override;
     virtual MemoryBuffer & serialize(MemoryBuffer & out) const override;
+
+    // A substring match never guarantees the full field is a single value
+    virtual bool isSingleValue() const override { return false; }
 
 protected:
     Linked<SharedRtlTypeInfo> subType;
@@ -2173,12 +2169,14 @@ void RowFilter::addFilter(const IFieldFilter & filter)
 
 const IFieldFilter & RowFilter::addFilter(const RtlRecord & record, const char * filterText)
 {
-    IFieldFilter & filter = *deserializeFieldFilter(record, filterText);
-    filters.append(filter);
-    unsigned fieldNum = filter.queryFieldIndex();
+    IFieldFilter * filter = deserializeFieldFilter(record, filterText);
+    if (!filter)
+        throw makeStringExceptionV(0, "Could not process filter %s", filterText);
+    filters.append(*filter);
+    unsigned fieldNum = filter->queryFieldIndex();
     if (fieldNum >= numFieldsRequired)
         numFieldsRequired = fieldNum+1;
-    return filter;
+    return *filter;
 }
 
 bool RowFilter::matches(const RtlRow & row) const
@@ -2257,6 +2255,27 @@ void RowFilter::extractMemKeyFilter(const RtlRecord & record, const UnsignedArra
     }
 }
 
+void RowFilter::splitIntoKeyFilter(const RtlRecord & record, RowFilter &keyFilter)
+{
+    if (0 == filters.ordinality())
+        return;
+
+    unsigned numKeyedFields = record.getNumKeyedFields();
+    ForEachItemInRev(i, filters)
+    {
+        const IFieldFilter & cur = filters.item(i);
+        if (cur.queryFieldIndex() < numKeyedFields)
+        {
+            keyFilter.addFilter(OLINK(cur));
+            filters.remove(i);
+        }
+    }
+    keyFilter.sortByFieldOrder(); // NB: need to be ordered ahead of keyFilter.createSegmentMonitors being used
+    //There is either a payload filter, in which case numFieldsRequired will not change, or now no filter
+    if (filters.ordinality() == 0)
+        numFieldsRequired = 0;
+}
+
 const IFieldFilter *RowFilter::findFilter(unsigned fieldNum) const
 {
     ForEachItemIn(i, filters)
@@ -2308,6 +2327,13 @@ void RowFilter::recalcFieldsRequired()
 void RowFilter::remapField(unsigned filterIdx, unsigned newFieldNum)
 {
     filters.replace(*filters.item(filterIdx).remap(newFieldNum), filterIdx);
+}
+
+void RowFilter::sortByFieldOrder()
+{
+    if (0 == filters.ordinality())
+        return;
+    filters.sort(compareFieldFilters);
 }
 
 //---------------------------------------------------------------------------------------------------------------------

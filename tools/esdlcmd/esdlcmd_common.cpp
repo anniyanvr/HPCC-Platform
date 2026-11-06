@@ -20,7 +20,6 @@
 #include "jfile.hpp"
 #include "jargv.hpp"
 #include "junicode.hpp"
-#include "build-config.h"
 #include "esdlcmdutils.hpp"
 
 #include "esdlcmd_common.hpp"
@@ -58,7 +57,7 @@ void saveAsFile(const char * filepath, const char *filename, const char *text, c
         path.append(ext);
 
     Owned<IFile> file = createIFile(path.str());
-    Owned<IFileIO> io = file->open(IFOcreaterw);
+    Owned<IFileIO> io = file->open(IFOcreate);
 
     DBGLOG("Writing to file %s", file->queryFilename());
 
@@ -82,7 +81,7 @@ esdlCmdOptionMatchIndicator EsdlCmdCommon::matchCommandLineOption(ArgvIterator &
     }
     if (iter.matchFlag(boolValue, ESDLOPT_VERSION))
     {
-        fprintf(stdout, "%s\n", BUILD_TAG);
+        fprintf(stdout, "%s\n", hpccBuildInfo.buildTag);
         return EsdlCmdOptionCompletion;
     }
 

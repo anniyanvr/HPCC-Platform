@@ -32,6 +32,10 @@
 #include "hqlusage.hpp"
 #include "eclrtl.hpp"
 
+#include <algorithm>
+#include <string>
+#include <unordered_map>
+
 #ifdef _DEBUG
 //#define SPOT_POTENTIAL_COMMON_ACTIVITIES
 #endif
@@ -51,6 +55,7 @@ enum {
     EclTextPrio = 1000,         // has no dependencies on anything else
     HashFunctionPrio = 1100,
     TypeInfoPrio = 1200,
+    RegexPatternPrio = 1300,
     RowMetaPrio = 1500,         
     XmlTransformerPrio = 1700,
     SteppedPrio = 1800,
@@ -136,7 +141,7 @@ public:
 class HQLCPP_API HqlCppInstance : public IHqlCppInstance, public CInterface
 {
 public:
-    HqlCppInstance(IWorkUnit * _workunit, const char * _wupathname);
+    HqlCppInstance(IWorkUnit * _workunit, const char * _wupathname, CompilerType _compiler);
     IMPLEMENT_IINTERFACE
 
     virtual HqlStmts * ensureSection(IAtom * section);
@@ -145,6 +150,7 @@ public:
     virtual const char * querySourceFile(unsigned idx);
     virtual const char * querySourceFlags(unsigned idx);
     virtual const char * queryTempDirectory(unsigned idx);
+    virtual const char * queryIncludeDirectory(unsigned idx);
     virtual bool querySourceIsTemp(unsigned idx);
     virtual HqlStmts * querySection(IAtom * section);
     virtual void flushHints();
@@ -157,6 +163,7 @@ public:
     virtual void getActivityRange(unsigned cppIndex, unsigned & minActivityId, unsigned & maxActivityId);
     virtual void useSourceFile(const char * srcname, const char *flags, bool isTemp);
     virtual void addTemporaryDir(const char * path);
+    virtual void addIncludeDirectory(const char * path);
     
     bool useFunction(IHqlExpression * funcdef);
     void useInclude(const char * include);
@@ -180,6 +187,7 @@ public:
     StringAttrArray     sourceFiles;
     StringAttrArray     sourceFlags;
     StringAttrArray     tempDirs;
+    StringAttrArray     includeDirs;
     StringAttrArray     includes;
     BoolArray           sourceIsTemp;
     CIArray             extra;
@@ -189,6 +197,7 @@ public:
     Owned<IPropertyTree> plugins;
     Owned<IFileIOStream> hintFile;
     CIArrayOf<CppFileInfo> cppInfo;
+    CompilerType        compilerType;
 };
 
 //---------------------------------------------------------------------------
@@ -480,11 +489,11 @@ public:
 class GlobalFileTracker : public IHqlDelayedCodeGenerator, public CInterface
 {
 public:
-    GlobalFileTracker(IHqlExpression * _filename, IPropertyTree * _graphNode)
+    GlobalFileTracker(IHqlExpression * _filename, IPropertyTree * _graphNode, unsigned _requiredGraph)
+    : requiredGraph(_requiredGraph)
     {
         filename.set(_filename->queryBody());
         graphNode.set(_graphNode);
-        usageCount = 0;
     }
     IMPLEMENT_IINTERFACE
 
@@ -492,12 +501,14 @@ public:
     virtual void generateCpp(StringBuffer & out) { out.append(usageCount); }
 
     bool checkMatch(IHqlExpression * searchFilename);
+    bool checkRequiredGraph(unsigned graphSeqNumber) const;
     void writeToGraph();
 
 public:
-    unsigned usageCount;
+    unsigned usageCount = 0;
     OwnedHqlExpr filename;
     Owned<IPropertyTree> graphNode;
+    unsigned requiredGraph = 0;
 };
 
 //===========================================================================
@@ -592,248 +603,266 @@ class TransformBuilder;
 
 struct HqlCppOptions
 {
-    unsigned            defaultImplicitKeyedJoinLimit;
-    unsigned            defaultImplicitIndexReadLimit;
-    unsigned            optimizeDiskFlag;
-    unsigned            activitiesPerCpp;
-    unsigned            maxRecordSize;
-    unsigned            inlineStringThreshold;
-    unsigned            maxRootMaybeThorActions;
-    unsigned            maxLocalRowSize;
-    unsigned            insertProjectCostLevel;
-    unsigned            dfaRepeatMax;
-    unsigned            dfaRepeatMaxScore;
-    unsigned            debugNlp;
-    unsigned            regexVersion;
-    unsigned            parseDfaComplexity;
-    unsigned            resourceMaxMemory;
-    unsigned            resourceMaxSockets;
-    unsigned            resourceMaxActivities;
-    unsigned            resourceMaxHeavy;
-    unsigned            resourceMaxDistribute;
-    unsigned            filteredReadSpillThreshold;
-    unsigned            topnLimit;
-    unsigned            specifiedClusterSize;
-    unsigned            globalFoldOptions;
-    unsigned            minimizeSpillSize;
-    unsigned            applyInstantEclTransformationsLimit;
-    unsigned            complexClassesThreshold;
-    unsigned            complexClassesActivityFilter;
-    unsigned            subgraphToRegenerate;
-    unsigned            defaultPersistExpiry;
-    unsigned            defaultExpiry;
-    unsigned            varFieldAccessorThreshold;
-    unsigned            searchDistanceThreshold;
-    unsigned            generateActivityThreshold;    // Record activities which take more than this value (in ms) to generate (0 disables)
-    cycle_t             generateActivityThresholdCycles;
-    int                 defaultNumPersistInstances;
-    unsigned            reportDFSinfo;
-    unsigned            checkDuplicateThreshold;
-    unsigned            checkDuplicateMinActivities;
-    CompilerType        targetCompiler;
-    DBZaction           divideByZeroAction;
-    unsigned            maxOptimizeSize;
-    unsigned            minNoOptimizeSize;
-    bool                peephole;
-    bool                foldConstantCast;
-    bool                optimizeBoolReturn;
-    bool                freezePersists;
-    bool                checkRoxieRestrictions;
-    bool                checkThorRestrictions;
-    bool                allowCsvWorkunitRead;
-    bool                evaluateCoLocalRowInvariantInExtract;
-    bool                allowInlineSpill;
-    bool                spanMultipleCpp;
-    bool                optimizeGlobalProjects;
-    bool                optimizeResourcedProjects;
-    byte                notifyOptimizedProjects;
-    bool                checkAsserts;
-    bool                assertSortedDistributed;
-    bool                optimizeLoopInvariant;
-    bool                warnOnImplicitJoinLimit;
-    bool                warnOnImplicitReadLimit;
-    bool                commonUpChildGraphs;
-    bool                detectAmbiguousSelector;
-    bool                allowAmbiguousSelector;
-    bool                regressionTest;
-    bool                recreateMapFromIf;
-    bool                reduceNetworkTraffic;
-    bool                optimizeProjectsPreservePersists;
-    bool                showMetaText;
-    bool                resourceConditionalActions;
-    bool                resourceSequential;
-    bool                workunitTemporaries;
-    bool                minimizeWorkunitTemporaries;
-    bool                pickBestEngine;
-    bool                groupedChildIterators;
-    bool                convertJoinToLookup;
-    bool                convertJoinToLookupIfSorted;
-    bool                spotCSE;
-    bool                spotCseInIfDatasetConditions;
-    bool                noAllToLookupConversion;
-    bool                optimizeNonEmpty;
-    bool                allowVariableRoxieFilenames;
-    bool                notifyWorkflowCse;
-    bool                performWorkflowCse;
-    bool                foldConstantDatasets;
-    bool                hoistSimpleGlobal;
-    bool                percolateConstants;
-    bool                percolateFilters;
-    bool                usePrefetchForAllProjects;
-    bool                allFilenamesDynamic;
-    bool                optimizeSteppingPostfilter;
-    bool                moveUnconditionalActions;
-    bool                paranoidCheckNormalized;
-    bool                paranoidCheckDependencies;
-    bool                preventKeyedSplit;
-    bool                preventSteppedSplit;
-    bool                canGenerateSimpleAction;
-    bool                minimizeActivityClasses;
-    bool                minimizeSkewBeforeSpill;
-    bool                createSerializeForUnknownSize;
-    bool                implicitLinkedChildRows;
-    bool                mainRowsAreLinkCounted;
-    bool                allowSections;
-    bool                autoPackRecords;
-    bool                commonUniqueNameAttributes;
-    bool                sortIndexPayload;
-    bool                foldFilter;
-    bool                finalizeAllRows;
-    bool                optimizeGraph;
-    bool                orderDiskFunnel;
-    bool                alwaysAllowAllNodes;
-    bool                slidingJoins;
-    bool                foldOptimized;
-    bool                globalOptimize;
-    bool                applyInstantEclTransformations;
-    bool                calculateComplexity;
-    bool                generateLogicalGraph;
-    bool                generateLogicalGraphOnly;
-    bool                globalAutoHoist;
-    bool                expandRepeatAnyAsDfa;
-    bool                unlimitedResources;
-    bool                allowThroughSpill;
-    bool                minimiseSpills;
-    bool                spillMultiCondition;
-    bool                spotThroughAggregate;
-    bool                hoistResourced;
-    bool                maximizeLexer;
-    bool                foldStored;
-    bool                spotTopN;
-    bool                groupAllDistribute;
-    bool                spotLocalMerge;
-    bool                spotPotentialKeyedJoins;
-    bool                combineTrivialStored;
-    bool                combineAllStored;
-    bool                allowStoredDuplicate;
-    bool                allowScopeMigrate;
-    bool                supportFilterProject;
-    bool                normalizeExplicitCasts;
-    bool                optimizeInlineSource;
-    bool                optimizeDiskSource;
-    bool                optimizeIndexSource;
-    bool                optimizeChildSource;
-    bool                reportLocations;
-    bool                debugGeneratedCpp;
-    bool                addFilesnamesToGraph;
-    bool                normalizeLocations;
-    bool                ensureRecordsHaveSymbols;
-    bool                constantFoldNormalize;
-    bool                constantFoldPostNormalize;
-    bool                optimizeGrouping;
-    bool                showMetaInGraph;
-    bool                spotComplexClasses;
-    bool                optimizeString1Compare;
-    bool                optimizeSpillProject;
-    bool                expressionPeephole;
-    bool                optimizeIncrement;
-    bool                supportsMergeDistribute;
-    bool                debugNlpAsHint;
-    bool                forceVariableWuid;
-    bool                okToDeclareAndAssign;       // long time ago gcc had problems doing this for very complex functions
-    bool                noteRecordSizeInGraph;
-    bool                convertRealAssignToMemcpy;
-    bool                allowActivityForKeyedJoin;
-    bool                forceActivityForKeyedJoin;
-    bool                addLibraryInputsToGraph;
-    bool                showRecordCountInGraph;
-    bool                serializeRowsetInExtract;
-    bool                testIgnoreMaxLength;
-    bool                trackDuplicateActivities;               // for diagnosing problems with code becoming duplicated
-    bool                showActivitySizeInGraph;
-    bool                addLocationToCpp;
-    bool                alwaysCreateRowBuilder;                 // allow paranoid check to ensure builders are built everywhere
-    bool                precalculateFieldOffsets;               // useful for some queries, can be expensive
-    bool                generateStaticInlineTables;
-    bool                staticRowsUseStringInitializer;
-    bool                convertWhenExecutedToCompound;
-    bool                standAloneExe;
-    bool                enableCompoundCsvRead;
-    bool                optimizeNestedConditional;
-    bool                createImplicitAliases;
-    bool                combineSiblingGraphs;
-    bool                optimizeSharedGraphInputs;
-    bool                supportsSubSortActivity;  // Does the target engine support SUBSORT?
-    bool                implicitSubSort;  // convert sort when partially sorted to subsort (group,sort,ungroup)
-    bool                implicitBuildIndexSubSort;  // use subsort when building indexes?
-    bool                implicitJoinSubSort;  // use subsort for partially sorted join inputs when possible
-    bool                implicitGroupSubSort;  // use subsort if some sort conditions match when grouping
-    bool                implicitGroupHashAggregate;  // convert aggregate(sort(x,a),{..},a,d) to aggregate(group(sort(x,a),a_,{},d))
-    bool                implicitGroupHashDedup;
-    bool                reportFieldUsage;
-    bool                reportFileUsage;
-    bool                recordFieldUsage;
-    bool                subsortLocalJoinConditions;
-    bool                projectNestedTables;
-    bool                showSeqInGraph;
-    bool                normalizeSelectorSequence;
-    bool                removeXpathFromOutput;
-    bool                canLinkConstantRows;
-    bool                checkAmbiguousRollupCondition;
-    bool                paranoidCheckSelects;
-    bool                matchExistingDistributionForJoin;
-    bool                createImplicitKeyedDistributeForJoin;
-    bool                expandHashJoin;
-    bool                traceIR;
-    bool                preserveCaseExternalParameter;
-    bool                multiplePersistInstances;
-    bool                optimizeParentAccess;
-    bool                expandPersistInputDependencies;
-    bool                expirePersists;
-    bool                actionLinkInNewGraph;
-    bool                optimizeMax;
-    bool                useResultsForChildSpills;
-    bool                alwaysUseGraphResults;
-    bool                noConditionalLinks;
-    bool                reportAssertFilenameTail;
-    bool                newBalancedSpotter;
-    bool                keyedJoinPreservesOrder;
-    bool                expandSelectCreateRow;
-    bool                obfuscateOutput;
-    bool                showEclInGraph;
-    bool                showChildCountInGraph;
-    bool                optimizeSortAllFields;
-    bool                optimizeSortAllFieldsStrict;
-    bool                alwaysReuseGlobalSpills;
-    bool                forceAllDatasetsParallel;
-    bool                embeddedWarningsAsErrors;
-    bool                optimizeCriticalFunctions;
-    bool                addLikelihoodToGraph;
-    bool                translateDFSlayouts;
-    bool                timeTransforms;
-    bool                useGlobalCompareClass;
-    bool                createValueSets;
-    bool                implicitKeyedDiskFilter;
-    bool                addDefaultBloom;
-    bool                newDiskReadMapping;
-    bool                transformNestedSequential;
-    bool                preserveWhenSequential;
-    bool                forceAllProjectedDiskSerialized;
-    bool                newIndexReadMapping;
-    bool                diskReadsAreSimple;
-    bool                genericDiskReads;
-    bool                generateActivityFormats;
-    bool                generateDiskFormats;
+    unsigned            defaultImplicitKeyedJoinLimit = 0;
+    unsigned            defaultImplicitIndexReadLimit = 0;
+    unsigned            optimizeDiskFlag = 0;
+    unsigned            activitiesPerCpp = 0;
+    unsigned            maxRecordSize = 0;
+    unsigned            inlineStringThreshold = 0;
+    unsigned            maxRootMaybeThorActions = 0;
+    unsigned            maxLocalRowSize = 0;
+    unsigned            insertProjectCostLevel = 0;
+    unsigned            dfaRepeatMax = 0;
+    unsigned            dfaRepeatMaxScore = 0;
+    unsigned            debugNlp = 0;
+    unsigned            regexVersion = 0;
+    unsigned            parseDfaComplexity = 0;
+    unsigned            resourceMaxMemory = 0;
+    unsigned            resourceMaxSockets = 0;
+    unsigned            resourceMaxActivities = 0;
+    unsigned            resourceMaxHeavy = 0;
+    unsigned            resourceMaxDistribute = 0;
+    unsigned            filteredReadSpillThreshold = 0;
+    unsigned            topnLimit = 0;
+    unsigned            specifiedClusterSize = 0;
+    unsigned            globalFoldOptions = 0;
+    unsigned            minimizeSpillSize = 0;
+    unsigned            applyInstantEclTransformationsLimit = 0;
+    unsigned            complexClassesThreshold = 0;
+    unsigned            complexClassesActivityFilter = 0;
+    unsigned            subgraphToRegenerate = 0;
+    unsigned            defaultPersistExpiry = 0;
+    unsigned            defaultExpiry = 0;
+    unsigned            varFieldAccessorThreshold = 0;
+    unsigned            searchDistanceThreshold = 0;
+    unsigned            generateActivityThreshold = 0;    // Record activities which take more than this value (in ms) to generate (0 disables)
+    cycle_t             generateActivityThresholdCycles = 0;
+    int                 defaultNumPersistInstances = 0;
+    unsigned            reportDFSinfo = 0;
+    unsigned            checkDuplicateThreshold = 0;
+    unsigned            checkDuplicateMinActivities = 0;
+    CompilerType        targetCompiler = GccCppCompiler;
+    DBZaction           divideByZeroAction = DBZnone;
+    unsigned            maxOptimizeSize = 0;
+    unsigned            minNoOptimizeSize = 0;
+    unsigned            irOptions = 0;
+    UnsignedArray       traceActivityIds;
+    bool                peephole = false;
+    bool                foldConstantCast = false;
+    bool                optimizeBoolReturn = false;
+    bool                freezePersists = false;
+    bool                checkRoxieRestrictions = false;
+    bool                checkThorRestrictions = false;
+    bool                allowCsvWorkunitRead = false;
+    bool                evaluateCoLocalRowInvariantInExtract = false;
+    bool                allowInlineSpill = false;
+    bool                spanMultipleCpp = false;
+    bool                metaMultipleCpp = false;
+    bool                optimizeGlobalProjects = false;
+    bool                optimizeResourcedProjects = false;
+    byte                notifyOptimizedProjects = 0;
+    bool                checkAsserts = false;
+    bool                assertSortedDistributed = false;
+    bool                optimizeLoopInvariant = false;
+    bool                warnOnImplicitJoinLimit = false;
+    bool                warnOnImplicitReadLimit = false;
+    bool                commonUpChildGraphs = false;
+    bool                detectAmbiguousSelector = false;
+    bool                allowAmbiguousSelector = false;
+    bool                regressionTest = false;
+    bool                recreateMapFromIf = false;
+    bool                reduceNetworkTraffic = false;
+    bool                optimizeProjectsPreservePersists = false;
+    bool                showMetaText = false;
+    bool                resourceConditionalActions = false;
+    bool                resourceSequential = false;
+    bool                workunitTemporaries = false;
+    bool                minimizeWorkunitTemporaries = false;
+    bool                pickBestEngine = false;
+    bool                groupedChildIterators = false;
+    bool                convertJoinToLookup = false;
+    bool                convertJoinToLookupIfSorted = false;
+    bool                spotCSE = false;
+    bool                spotCseInIfDatasetConditions = false;
+    bool                noAllToLookupConversion = false;
+    bool                optimizeNonEmpty = false;
+    bool                allowVariableRoxieFilenames = false;
+    bool                notifyWorkflowCse = false;
+    bool                performWorkflowCse = false;
+    bool                foldConstantDatasets = false;
+    bool                hoistSimpleGlobal = false;
+    bool                percolateConstants = false;
+    bool                percolateFilters = false;
+    bool                usePrefetchForAllProjects = false;
+    bool                allFilenamesDynamic = false;
+    bool                optimizeSteppingPostfilter = false;
+    bool                moveUnconditionalActions = false;
+    bool                paranoidCheckNormalized = false;
+    bool                paranoidCheckDependencies = false;
+    bool                preventKeyedSplit = false;
+    bool                preventSteppedSplit = false;
+    bool                canGenerateSimpleAction = false;
+    bool                minimizeActivityClasses = false;
+    bool                minimizeSkewBeforeSpill = false;
+    bool                createSerializeForUnknownSize = false;
+    bool                implicitLinkedChildRows = false;
+    bool                mainRowsAreLinkCounted = false;
+    bool                allowSections = false;
+    bool                autoPackRecords = false;
+    bool                commonUniqueNameAttributes = false;
+    bool                sortIndexPayload = false;
+    bool                foldFilter = false;
+    bool                finalizeAllRows = false;
+    bool                optimizeGraph = false;
+    bool                orderDiskFunnel = false;
+    bool                alwaysAllowAllNodes = false;
+    bool                slidingJoins = false;
+    bool                foldOptimized = false;
+    bool                globalOptimize = false;
+    bool                applyInstantEclTransformations = false;
+    bool                calculateComplexity = false;
+    bool                generateLogicalGraph = false;
+    bool                generateLogicalGraphOnly = false;
+    bool                globalAutoHoist = false;
+    bool                expandRepeatAnyAsDfa = false;
+    bool                unlimitedResources = false;
+    bool                allowThroughSpill = false;
+    bool                minimiseSpills = false;
+    bool                spillMultiCondition = false;
+    bool                spotThroughAggregate = false;
+    bool                hoistResourced = false;
+    bool                maximizeLexer = false;
+    bool                foldStored = false;
+    bool                spotTopN = false;
+    bool                groupAllDistribute = false;
+    bool                spotLocalMerge = false;
+    bool                spotPotentialKeyedJoins = false;
+    bool                allowKeyedJoins = false;
+    bool                combineTrivialStored = false;
+    bool                combineAllStored = false;
+    bool                allowStoredDuplicate = false;
+    bool                allowScopeMigrate = false;
+    bool                supportFilterProject = false;
+    bool                normalizeExplicitCasts = false;
+    bool                optimizeInlineSource = false;
+    bool                optimizeDiskSource = false;
+    bool                optimizeIndexSource = false;
+    bool                optimizeChildSource = false;
+    bool                reportLocations = false;
+    bool                debugGeneratedCpp = false;
+    bool                addFilesnamesToGraph = false;
+    bool                normalizeLocations = false;
+    bool                ensureRecordsHaveSymbols = false;
+    bool                constantFoldNormalize = false;
+    bool                constantFoldPostNormalize = false;
+    bool                optimizeGrouping = false;
+    bool                showMetaInGraph = false;
+    bool                spotComplexClasses = false;
+    bool                optimizeString1Compare = false;
+    bool                optimizeSpillProject = false;
+    bool                expressionPeephole = false;
+    bool                optimizeIncrement = false;
+    bool                supportsMergeDistribute = false;
+    bool                debugNlpAsHint = false;
+    bool                forceVariableWuid = false;
+    bool                okToDeclareAndAssign = false;       // long time ago gcc had problems doing this for very complex functions
+    bool                noteRecordSizeInGraph = false;
+    bool                noteFieldsInGraph = false;
+    bool                convertRealAssignToMemcpy = false;
+    bool                allowActivityForKeyedJoin = false;
+    bool                forceActivityForKeyedJoin = false;
+    bool                addLibraryInputsToGraph = false;
+    bool                showRecordCountInGraph = false;
+    bool                serializeRowsetInExtract = false;
+    bool                testIgnoreMaxLength = false;
+    bool                trackDuplicateActivities = false;               // for diagnosing problems with code becoming duplicated
+    bool                trackRemoveInputs = false;
+    bool                showActivitySizeInGraph = false;
+    bool                addLocationToCpp = false;
+    bool                alwaysCreateRowBuilder = false;                 // allow paranoid check to ensure builders are built everywhere
+    bool                precalculateFieldOffsets = false;               // useful for some queries, can be expensive
+    bool                generateStaticInlineTables = false;
+    bool                staticRowsUseStringInitializer = false;
+    bool                convertWhenExecutedToCompound = false;
+    bool                standAloneExe = false;
+    bool                enableCompoundCsvRead = false;
+    bool                optimizeNestedConditional = false;
+    bool                createImplicitAliases = false;
+    bool                combineSiblingGraphs = false;
+    bool                optimizeSharedGraphInputs = false;
+    bool                supportsSubSortActivity = false;  // Does the target engine support SUBSORT?
+    bool                implicitSubSort = false;  // convert sort when partially sorted to subsort (group,sort,ungroup)
+    bool                implicitBuildIndexSubSort = false;  // use subsort when building indexes?
+    bool                implicitJoinSubSort = false;  // use subsort for partially sorted join inputs when possible
+    bool                implicitGroupSubSort = false;  // use subsort if some sort conditions match when grouping
+    bool                implicitGroupHashAggregate = false;  // convert aggregate(sort(x,a),{..},a,d) to aggregate(group(sort(x,a),a_,{},d))
+    bool                implicitGroupHashDedup = false;
+    bool                reportFieldUsage = false;
+    bool                reportFileUsage = false;
+    bool                recordFieldUsage = false;
+    bool                recordUnusedFields = false;
+    bool                subsortLocalJoinConditions = false;
+    bool                projectNestedTables = false;
+    bool                showSeqInGraph = false;
+    bool                normalizeSelectorSequence = false;
+    bool                removeXpathFromOutput = false;
+    bool                canLinkConstantRows = false;
+    bool                checkAmbiguousRollupCondition = false;
+    bool                paranoidCheckSelects = false;
+    bool                matchExistingDistributionForJoin = false;
+    bool                createImplicitKeyedDistributeForJoin = false;
+    bool                expandHashJoin = false;
+    bool                traceIR = false;
+    bool                preserveCaseExternalParameter = false;
+    bool                multiplePersistInstances = false;
+    bool                optimizeParentAccess = false;
+    bool                expandPersistInputDependencies = false;
+    bool                expirePersists = false;
+    bool                actionLinkInNewGraph = false;
+    bool                optimizeMax = false;
+    bool                useResultsForChildSpills = false;
+    bool                alwaysUseGraphResults = false;
+    bool                noConditionalLinks = false;
+    bool                reportAssertFilenameTail = false;
+    bool                newBalancedSpotter = false;
+    bool                keyedJoinPreservesOrder = false;
+    bool                expandSelectCreateRow = false;
+    bool                obfuscateOutput = false;
+    bool                showEclInGraph = false;
+    bool                showChildCountInGraph = false;
+    bool                optimizeSortAllFields = false;
+    bool                optimizeSortAllFieldsStrict = false;
+    bool                alwaysReuseGlobalSpills = false;
+    bool                forceAllDatasetsParallel = false;
+    bool                embeddedWarningsAsErrors = false;
+    bool                optimizeCriticalFunctions = false;
+    bool                addLikelihoodToGraph = false;
+    bool                translateDFSlayouts = false;
+    bool                timeTransforms = false;
+    bool                useGlobalCompareClass = false;
+    bool                createValueSets = false;
+    bool                implicitKeyedDiskFilter = false;
+    bool                addDefaultBloom = false;
+    bool                newDiskReadMapping = false;
+    bool                transformNestedSequential = false;
+    bool                preserveWhenSequential = false;
+    bool                forceAllProjectedDiskSerialized = false;
+    bool                newIndexReadMapping = false;
+    bool                diskReadsAreSimple = false;
+    bool                allKeyedFiltersOptional = false;
+    bool                genericDiskReadWrites = false;
+    bool                generateActivityFormats = false;
+    bool                generateDiskFormats = false;
+    bool                generateIR = false;
+    bool                generateIRAfterTransform = false;
+    bool                allowStaticRegex = true;
+    bool                defaultStaticRegex = false;
+    bool                traceAll = false;
+    bool                enableClusterHopping = false;
+    std::unordered_map<std::string, bool> traceOptions;
+
+public:
+    bool queryTrace(const char * option) const;
 };
 
 //Any information gathered while processing the query should be moved into here, rather than cluttering up the translator class
@@ -1039,7 +1068,7 @@ public:
     inline bool generateAsserts() const                     { return options.checkAsserts; }
     inline bool getCheckRoxieRestrictions() const           { return options.checkRoxieRestrictions; }
     inline bool queryFreezePersists() const                 { return options.freezePersists; }
-    inline bool checkIndexReadLimit() const                 { return options.warnOnImplicitReadLimit; }
+    inline bool checkIndexReadLimit() const                 { return isOptionOverridden("warnOnImplicitReadLimit") ? options.warnOnImplicitReadLimit : targetRoxie(); }
     inline unsigned getDefaultImplicitIndexReadLimit() const { return options.defaultImplicitIndexReadLimit; }
     inline bool queryCommonUpChildGraphs() const            { return options.commonUpChildGraphs; }
     inline bool insideLibrary() const                       { return outputLibraryId != NULL; }
@@ -1050,10 +1079,10 @@ public:
     unsigned getSourceAggregateOptimizeFlags() const;
     void addGlobalOnWarning(IHqlExpression * setMetaExpr);
 
-    ClusterType getTargetClusterType() const { return targetClusterType; }
-    inline bool targetRoxie() const { return targetClusterType == RoxieCluster; }
-    inline bool targetHThor() const { return targetClusterType == HThorCluster; }
-    inline bool targetThor() const { return isThorCluster(targetClusterType); }
+    ClusterType getTargetClusterType() const { return targetClusterTypes.back(); }
+    inline bool targetRoxie() const { return targetClusterTypes.back() == RoxieCluster; }
+    inline bool targetHThor() const { return targetClusterTypes.back() == HThorCluster; }
+    inline bool targetThor() const { return isThorCluster(targetClusterTypes.back()); }
     inline IErrorReceiver & queryErrorProcessor() { return *errorProcessor; }
     inline ErrorSeverityMapper & queryLocalOnWarningMapper() { return *localOnWarnings; }
 
@@ -1076,8 +1105,8 @@ public:
 public:
     BoundRow * bindSelf(BuildCtx & ctx, IHqlExpression * dataset, const char * builder);
     BoundRow * bindSelf(BuildCtx & ctx, IHqlExpression * dataset, IHqlExpression * expr, IHqlExpression * builder);
-    BoundRow * bindTableCursor(BuildCtx & ctx, IHqlExpression * dataset, const char * bound, bool isLinkCounted, node_operator no_side, IHqlExpression * selSeq);
-    BoundRow * bindTableCursor(BuildCtx & ctx, IHqlExpression * dataset, IHqlExpression * bound, node_operator no_side, IHqlExpression * selSeq);
+    BoundRow * bindTableCursor(BuildCtx & ctx, IHqlExpression * dataset, const char * bound, bool isLinkCounted, node_operator no_side, IHqlExpression * selSeq, bool delayOffsetCalculation = false);
+    BoundRow * bindTableCursor(BuildCtx & ctx, IHqlExpression * dataset, IHqlExpression * bound, node_operator no_side, IHqlExpression * selSeq, bool delayOffsetCalculation = false);
     BoundRow * bindCsvTableCursor(BuildCtx & ctx, IHqlExpression * dataset, const char * name, node_operator side, IHqlExpression * selSeq, bool translateVirtuals, IAtom * encoding);
     BoundRow * bindCsvTableCursor(BuildCtx & ctx, IHqlExpression * dataset, IHqlExpression * bound, node_operator side, IHqlExpression * selSeq, bool translateVirtuals, IAtom * encoding);
     BoundRow * bindXmlTableCursor(BuildCtx & ctx, IHqlExpression * dataset, const char * name, node_operator side, IHqlExpression * selSeq, bool translateVirtuals);
@@ -1097,11 +1126,11 @@ public:
     void ensureRowAllocated(BuildCtx & ctx, BoundRow * row);
 
     inline BoundRow * bindTableCursor(BuildCtx & ctx, IHqlExpression * dataset, const char * bound, node_operator side, IHqlExpression * selSeq)
-           { return bindTableCursor(ctx, dataset, bound, false, side, selSeq); }
+           { return bindTableCursor(ctx, dataset, bound, false, side, selSeq, false); }
     inline BoundRow * bindTableCursor(BuildCtx & ctx, IHqlExpression * dataset, const char * bound)
-           { return bindTableCursor(ctx, dataset, bound, false, no_none, NULL); }
+           { return bindTableCursor(ctx, dataset, bound, false, no_none, NULL, false); }
     inline BoundRow * bindTableCursor(BuildCtx & ctx, IHqlExpression * dataset, IHqlExpression * bound)
-           { return bindTableCursor(ctx, dataset, bound, no_none, NULL); }
+           { return bindTableCursor(ctx, dataset, bound, no_none, NULL, false); }
 
 
     IHqlExpression * getRtlFieldKey(IHqlExpression * expr, IHqlExpression * ownerRecord, bool &isPayload);
@@ -1112,7 +1141,7 @@ public:
     unsigned expandRtlRecordFields(StringBuffer & fieldListText, IHqlExpression * record, IHqlExpression * rowRecord, const char * rowTypeName);
     unsigned buildRtlIfBlockField(StringBuffer & instanceName, IHqlExpression * ifblock, IHqlExpression * rowRecord, const char * rowTypeName, bool isPayload);
 
-    void buildMetaInfo(MetaInstance & instance);
+    IHqlExpression * buildMetaInfo(MetaInstance & instance);
     IHqlExpression * buildMetaParameter(IHqlExpression * arg);
     void buildMetaForRecord(StringBuffer & name, IHqlExpression * record);
     void buildMetaForSerializedRecord(StringBuffer & name, IHqlExpression * record, bool isGrouped);
@@ -1153,6 +1182,8 @@ public:
     void noteXpathUsed(IHqlExpression * expr);
 
     HqlCppOptions const & queryOptions() const { return options; }
+    bool queryTrace(const char * option) const { return options.queryTrace(option); }
+
     bool needToSerializeToSlave(IHqlExpression * expr) const;
     void noteFinishedTiming(const char * name, cycle_t startCycles)
     {
@@ -1173,8 +1204,14 @@ public:
     }
 
     void setTargetClusterType(ClusterType clusterType);
+    ClusterType pushTargetClusterType(ClusterType clusterType);
+    ClusterType popTargetClusterType();
+    void saveTargetClusterTypes();
+    ClusterType restoreTargetClusterTypes();
     void ensureDiskAccessAllowed(IHqlExpression * expr);
     void checkAbort();
+    void saveOverriddenOption(const char * name);
+    bool isOptionOverridden(const char * name) const;
 
 public:
     //various helper functions.
@@ -1319,6 +1356,7 @@ public:
     void buildDatasetAssignAggregate(BuildCtx & ctx, IHqlCppDatasetBuilder * target, IHqlExpression * expr);
     void buildDatasetAssignChoose(BuildCtx & ctx, IHqlCppDatasetBuilder * target, IHqlExpression * expr);
     void buildDatasetAssignCombine(BuildCtx & ctx, IHqlCppDatasetBuilder * target, IHqlExpression * expr);
+    void buildDatasetAssignIf(BuildCtx & ctx, IHqlCppDatasetBuilder * target, IHqlExpression * expr);
     void buildDatasetAssignInlineTable(BuildCtx & ctx, IHqlCppDatasetBuilder * target, IHqlExpression * expr);
     void buildDatasetAssignDatasetFromTransform(BuildCtx & ctx, IHqlCppDatasetBuilder * target, IHqlExpression * expr);
     void buildDatasetAssignJoin(BuildCtx & ctx, IHqlCppDatasetBuilder * target, IHqlExpression * expr);
@@ -1396,6 +1434,11 @@ public:
     void noteResultAccessed(BuildCtx & ctx, IHqlExpression * seq, IHqlExpression * name);
     void noteResultDefined(BuildCtx & ctx, ActivityInstance * activityInstance, IHqlExpression * seq, IHqlExpression * name, bool alwaysExecuted);
 
+// File type formatting option handling
+    void buildFormatOption(BuildCtx & ctx, IHqlExpression * name, IHqlExpression * value);
+    void buildFormatOptions(BuildCtx & ctx, IHqlExpression * expr);
+    void buildFormatOptionsFunction(BuildCtx & ctx, IHqlExpression * expr);
+
 //Expressions:
     void doBuildExprAbs(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void doBuildExprAdd(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
@@ -1412,6 +1455,7 @@ public:
     void doBuildExprCountDict(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void doBuildExprCount(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void doBuildExprCounter(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
+    void doBuildExprPow(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void doBuildExprDivide(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void doBuildExprEmbedBody(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr * tgt);
     void doBuildExprEvaluate(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
@@ -1440,6 +1484,7 @@ public:
     void doBuildExprRank(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void doBuildExprRanked(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void doBuildExprRegexFindReplace(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & bound);
+    void doBuildExprRegexExtract(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & bound);
     void doBuildExprRegexFindSet(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & bound);
     void doBuildExprRound(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void doBuildExprSelect(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
@@ -1470,6 +1515,7 @@ public:
     void buildWorkflowPersistCheck(BuildCtx & ctx, IHqlExpression * expr);
 
     IHqlExpression * cvtGetEnvToCall(IHqlExpression * expr);
+    IHqlExpression * cvtGetSecretToCall(IHqlExpression * expr);
 
 //Statements
     void doBuildStmtApply(BuildCtx & ctx, IHqlExpression * expr);
@@ -1479,6 +1525,7 @@ public:
     void doBuildStmtCall(BuildCtx & ctx, IHqlExpression * expr);
     void doBuildStmtCluster(BuildCtx & ctx, IHqlExpression * expr);
     void doBuildStmtEnsureResult(BuildCtx & ctx, IHqlExpression * expr);
+    void doBuildStmtExecuteWhen(BuildCtx & ctx, IHqlExpression * expr);
     void doBuildStmtFail(BuildCtx & ctx, IHqlExpression * expr);
     void doBuildStmtIf(BuildCtx & ctx, IHqlExpression * expr);
     void doBuildStmtNotify(BuildCtx & ctx, IHqlExpression * expr);
@@ -1629,6 +1676,7 @@ public:
     void gatherActiveCursors(BuildCtx & ctx, HqlExprCopyArray & activeRows);
 
     IHqlStmt * buildFilterViaExpr(BuildCtx & ctx, IHqlExpression * expr);
+    IHqlStmt * buildFilterViaSimpleExpr(BuildCtx & ctx, IHqlExpression * expr);
 
     void doBuildPureSubExpr(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void doBuildTempExprConcat(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
@@ -1650,6 +1698,8 @@ public:
     IHqlExpression * getFirstCharacter(IHqlExpression * source);
     bool hasAddress(BuildCtx & ctx, IHqlExpression * expr);
 
+    void buildTimerBase(BuildCtx & ctx, CHqlBoundExpr & boundTimer, const char * name, int statsOption);
+    void buildHelperTimer(BuildCtx & ctx, CHqlBoundExpr & boundTimer, const char * name, int statsOption);
     void buildStartTimer(BuildCtx & ctx, CHqlBoundExpr & boundTimer, CHqlBoundExpr & boundStart, const char * name);
     void buildStopTimer(BuildCtx & ctx, const CHqlBoundExpr & boundTimer, const CHqlBoundExpr & boundStart);
 
@@ -1714,7 +1764,7 @@ public:
 
     void doBuildNewRegexFindReplace(BuildCtx & ctx, const CHqlBoundTarget * target, IHqlExpression * expr, CHqlBoundExpr * bound);
     
-    IHqlExpression * doBuildRegexCompileInstance(BuildCtx & ctx, IHqlExpression * pattern, bool unicode, bool caseSensitive);
+    IHqlExpression * doBuildRegexCompileInstance(BuildCtx & ctx, IHqlExpression * pattern, ITypeInfo * stringType, bool caseSensitive);
     IHqlExpression * doBuildRegexFindInstance(BuildCtx & ctx, IHqlExpression * compiled, IHqlExpression * search, bool cloneSearch);
     
     IHqlExpression * doCreateGraphLookup(BuildCtx & declarectx, BuildCtx & resolvectx, unique_id_t id, const char * activity, bool isChild);
@@ -1861,8 +1911,8 @@ public:
     void doBuildFunctionReturn(BuildCtx & ctx, ITypeInfo * type, IHqlExpression * value);
     void doBuildUserFunctionReturn(BuildCtx & ctx, ITypeInfo * type, IHqlExpression * value);
 
-    void addFilenameConstructorParameter(ActivityInstance & instance, WuAttr attr, IHqlExpression * expr);
-    void buildFilenameFunction(ActivityInstance & instance, BuildCtx & classctx, WuAttr attr, const char * name, IHqlExpression * expr, bool isDynamic);
+    void addFilenameConstructorParameter(ActivityInstance & instance, WuAttr attr, IHqlExpression * expr, SummaryType summaryType);
+    void buildFilenameFunction(ActivityInstance & instance, BuildCtx & classctx, WuAttr attr, const char * name, IHqlExpression * expr, bool isDynamic, SummaryType summaryType, bool isOpt, bool isSigned);
     void buildRefFilenameFunction(ActivityInstance & instance, BuildCtx & classctx, WuAttr attr, const char * name, IHqlExpression * dataset);
     void createAccessFunctions(StringBuffer & helperFunc, BuildCtx & declarectx, unsigned prio, const char * interfaceName, const char * object);
 
@@ -1886,7 +1936,7 @@ protected:
     void buildIteratorNext(BuildCtx & ctx, IHqlExpression * iter, IHqlExpression * row);
     bool shouldEvaluateSelectAsAlias(BuildCtx & ctx, IHqlExpression * expr);
     IWUResult * createWorkunitResult(int sequence, IHqlExpression * nameExpr);
-    void noteFilename(ActivityInstance & instance, WuAttr attr, IHqlExpression * expr, bool isDynamic);
+    void noteFilename(ActivityInstance & instance, WuAttr attr, IHqlExpression * expr, bool isDynamic, SummaryType summaryType, bool isOpt, bool isSigned);
     bool checkGetResultContext(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr & tgt);
     void buildGetResultInfo(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr * boundTarget, const CHqlBoundTarget * targetAssign);
     void buildGetResultSetInfo(BuildCtx & ctx, IHqlExpression * expr, CHqlBoundExpr * boundTarget, const CHqlBoundTarget * targetAssign);
@@ -1961,6 +2011,7 @@ protected:
     void doReportWarning(WarnErrorCategory category, ErrorSeverity explicitSeverity, IHqlExpression * location, unsigned id, const char * msg);
 
     void optimizePersists(HqlExprArray & exprs);
+    void optimizeSingleGraphGlobals(WorkflowItem & curWorkflow);
     IHqlExpression * convertSetResultToExtract(IHqlExpression * expr);
     void allocateSequenceNumbers(HqlExprArray & exprs);
     void transformNestedSequential(HqlExprArray & exprs);
@@ -1984,6 +2035,7 @@ protected:
     void processEmbeddedLibraries(HqlExprArray & exprs, HqlExprArray & internalLibraries, bool isLibrary);
     void pickBestEngine(WorkflowArray & array);
     void pickBestEngine(HqlExprArray & exprs);
+    void recordPickBestEngineRedirect();
     IHqlExpression * separateLibraries(IHqlExpression * query, HqlExprArray & internalLibraries);
 
     void doBuildSerialize(BuildCtx & ctx, IIdAtom * name, IHqlExpression * length, CHqlBoundExpr & bound, const char * bufferName);
@@ -2013,14 +2065,15 @@ protected:
     bool isNeverDistributed(IHqlExpression * expr);
 
     void ensureWorkUnitUpdated();
+    void addWorkunitSummaries();
     bool getDebugFlag(const char * name, bool defValue);
     void initOptions();
     void postProcessOptions();
-    SourceFieldUsage * querySourceFieldUsage(IHqlExpression * expr);
     void noteAllFieldsUsed(IHqlExpression * expr);
     IHqlExpression * translateGetGraphResult(BuildCtx & ctx, IHqlExpression * expr);
 
 public:
+    SourceFieldUsage * querySourceFieldUsage(IHqlExpression * expr);
     IHqlExpression * convertToPhysicalIndex(IHqlExpression * tableExpr);
     IHqlExpression * buildIndexFromPhysical(IHqlExpression * expr);
     //MORE: At some point the global getUniqueId() should be killed so there are only local references.
@@ -2031,11 +2084,12 @@ public:
     unsigned nextLibrarySequence() { return librarySequence++; }
     unsigned queryMaxWfid() { return maxWfid; }
     void setMaxWfid(unsigned wfid) { maxWfid = wfid; }
+    bool isLightweightQuery(WorkflowArray & workflow);
 
 public:
-    void traceExpression(const char * title, IHqlExpression * expr, unsigned level=500);
-    void traceExpressions(const char * title, HqlExprArray & exprs, unsigned level=500);
-    void traceExpressions(const char * title, WorkflowItem & workflow, unsigned level=500) { traceExpressions(title, workflow.queryExprs(), level); };
+    void traceExpression(const char * title, IHqlExpression * expr);
+    void traceExpressions(const char * title, HqlExprArray & exprs);
+    void traceExpressions(const char * title, WorkflowItem & workflow) { traceExpressions(title, workflow.queryExprs()); };
     void traceExpressions(const char * title, WorkflowArray & exprs);
 
     void checkNormalized(IHqlExpression * expr);
@@ -2063,14 +2117,15 @@ protected:
     unsigned            curCppFile;
     unsigned            maxWfid = 0;
     Linked<ICodegenContextCallback> ctxCallback;
-    ClusterType         targetClusterType;
+    std::vector<ClusterType> targetClusterTypes; // There will always be at least one entry in this list; last entry is the current target
+    std::vector<ClusterType> savedClusterTypes;
+    bool clusterTypesChanged = false;
     bool contextAvailable;
     unsigned maxSequence;
     unsigned librarySequence = LibraryBaseSequence;
     unsigned            startCursorSet;
     bool                requireTable;
     BuildCtx *          activeGraphCtx;
-    HqlExprArray        metas;
     Owned<GeneratedGraphInfo> activeGraph;
     unsigned            graphSeqNumber;
     StringAttr          graphLabel;
@@ -2090,7 +2145,10 @@ protected:
     unsigned            nextGlobalCompareId = 1;
     HqlExprArray        internalFunctions;
     HqlExprArray        internalFunctionExternals;
+    std::unordered_map<std::string, unsigned> projectedEntrypointVariations;
     UniqueSequenceCounter spillSequence;
+    std::vector<IHqlStmt *> metaPassStmts;
+    StringArray         overriddenDebugOptions;
     
 #ifdef SPOT_POTENTIAL_COMMON_ACTIVITIES
     LocationArray       savedActivityLocations;
@@ -2113,6 +2171,30 @@ protected:
     PointerArray recordIndexCache;
     Owned<ITimeReporter> timeReporter;
     CIArrayOf<SourceFieldUsage> trackedSources;
+    HqlExprArray tracedActivities;
+
+    // These are used to generate workunit summary info, to avoid having to walk the xgmml to get it
+    SummaryMap summaries[(int) SummaryType::NumItems];
+    void noteSummaryInfo(const char *name, SummaryType type, bool isOpt, bool isSigned)
+    {
+        if (type == SummaryType::None)
+            return;
+        //Spill files are meaningless in roxie, and no current benefit in recording them for hthor/thor
+        if (type == SummaryType::SpillFile)
+            return;
+
+        SummaryMap &map = summaries[(int) type];
+        SummaryFlags flags = SummaryFlags::None;
+        if (isOpt)
+            flags |= SummaryFlags::IsOpt;
+        if (isSigned)
+            flags |= SummaryFlags::IsSigned;
+        auto match = map.find(name);
+        if (match == map.end())
+            map[name] = flags;
+        else
+            match->second &= flags;
+    }
 };
 
 

@@ -1,0 +1,97 @@
+/*##############################################################################
+
+    Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#pragma once
+
+#include "eventconsumption.h"
+#include "eventvisitor.h"
+
+class CMetaInfoState;
+
+enum class FilterTermComparison : byte
+{
+    Default,
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+    ElementOf,
+    NotElementOf,
+    Wildcard,
+    Except,
+};
+
+// Extension of IEventVisitationLink that supports filtering of visited events. Implementations
+// expect to be linked to another visitor, forwarding all visits not blocked by the specified
+// constraints to the next linked visitor.
+//
+// An event blocked by a type or context constraint must not be forwarded to the next chained visitor.
+//
+// An event blocked by an attribute constraint must not be forwarded to the next chained visitor.
+// Events that do not include a constrained attribute are not blocked.
+interface IEventFilter : extends IEventVisitationLink
+{
+    // Optionally setup a filter using the contents of a property tree.
+    virtual void configure(const IPropertyTree& config) = 0;
+    // Filter on a single event type. All events are accepted by default.
+    virtual bool acceptEvent(EventType type, FilterTermComparison comp) = 0;
+    inline bool acceptEvent(EventType type) { return acceptEvent(type, FilterTermComparison::Default); };
+    // Filter on all events of a given context. All events are accepted by default.
+    virtual bool acceptEvents(EventContext context, FilterTermComparison comp) = 0;
+    inline bool acceptEvents(EventContext context) { return acceptEvents(context, FilterTermComparison::Default); };
+    // Filter on a comma-delimited list of event type names and/or event context names. All events
+    // are accepted by default.
+    virtual bool acceptEvents(const char* types) = 0;
+    // Filter on a comma-delimited list of attribute value tokens. The internal type of the given
+    // attribute is used to determine token processing requirements.
+    // - Integral token options are:
+    //   - #: a single numeric value
+    //   - #-#: a range of numeric values, bounded on both ends
+    //   - #-: a range of numeric values, bounded only on the lower end
+    //   - -#: a range of numeric values, bounded only on the upper end
+    // - String token options include exact matches and regular expressions.
+    // - Boolean token options are text representations of true and false recognized by strToBool.
+    //   Specification of multiple Boolean values is unnecessary - either they will be repetitive
+    //   or will cancel each other out.
+    //
+    // Supported special cases include:
+    // - Timestamps may be given using a standard date/time format, such as "2025-01-01T00:00:00".
+    // - A filter for the integral EvAttrFileId accepts numeric file IDs only. The derived path,
+    //   plane, and logical file name for a file ID may be filtered independently using the
+    //   special attribute names "meta.Path", "meta.Plane", and "meta.LogicalFileName".
+    // - A filter for the string EvAttrEventTraceId accepts trace ID patterns only. The derived
+    //   service name for a trace ID may be filtered independently using the special attribute
+    //   name "meta.ServiceName".
+    virtual bool acceptAttribute(EventAttr attr, const char* values) = 0;
+    // Filter on a synthetic or derived attribute ID that is not represented by EventAttr.
+    // Values use the comparison syntax appropriate to the extended attribute; for example,
+    // SearchFlags bit attributes accept true/false tokens.
+    virtual bool acceptExtendedAttribute(unsigned attr, const char* values) = 0;
+    // Filter on a comma-delimited list of value tokens for a named meta attribute derived from
+    // another event attribute. Recognized names (and the attribute they derive from):
+    //   "meta.Path"            - file path derived from EvAttrFileId
+    //   "meta.Plane"           - storage plane derived from EvAttrFileId
+    //   "meta.LogicalFileName" - logical file name derived from EvAttrFileId
+    //   "meta.ServiceName"     - service name derived from EvAttrEventTraceId
+    virtual bool acceptMetaAttribute(const char* name, const char* values) = 0;
+};
+
+// Obtain a new instance of a standard event filter.
+extern event_decl IEventFilter* createEventFilter(CMetaInfoState& metaState);
+extern event_decl IEventFilter* createEventFilter(const IPropertyTree& config, CMetaInfoState& metaState);

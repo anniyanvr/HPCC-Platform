@@ -41,13 +41,15 @@ static const char* const SESSION_ID_COOKIE = "ESPSessionID";
 static const char* const SESSION_START_URL_COOKIE = "ESPAuthURL";
 static const char* const SESSION_TIMEOUT_COOKIE = "ESPSessionTimeoutSeconds";
 static const char* const SESSION_ID_TEMP_COOKIE = "ESPAuthIDTemp";
+static const char* const SESSION_DOMAIN_AUTH_DATA_TEMP_COOKIE = "ESPDomainAuthDataTemp";
 static const char* const SESSION_AUTH_OK_COOKIE = "ESPAuthenticated";
 static const char* const SESSION_AUTH_MSG_COOKIE = "ESPAuthenticationMSG";
 static const char* const USER_ACCT_ERROR_COOKIE = "ESPUserAcctError";
 static const char* const DEFAULT_LOGIN_URL = "/esp/files/Login.html";
 static const char* const DEFAULT_LOGIN_LOGO_URL = "/esp/files/eclwatch/img/Loginlogo.png";
 static const char* const DEFAULT_GET_USER_NAME_URL = "/esp/files/GetUserName.html";
-static const char* const ECLWATCH_STUB_REQ = "/esp/files/stub.htm";
+static const char* const ECLWATCH_STUB_REQ = "/esp/files/stub.html";
+static const char* const ECLWATCH_INDEX_REQ = "/esp/files/index.html";
 static const char* const DEFAULT_UNRESTRICTED_RESOURCES = "/favicon.ico,/esp/files/*,/esp/xslt/*";
 static const char* const AUTH_STATUS_NA = "NA";
 static const char* const AUTH_STATUS_FAIL = "Fail";
@@ -67,6 +69,7 @@ static const char* const PathSessionSession="Session_";
 static const char* const PropSessionID = "@id";
 static const char* const PropSessionExternalID = "@externalid";
 static const char* const PropSessionUserID = "@userid";
+static const char* const PropSessionDomainAuthData = "@domainauthdata";
 static const char* const PropSessionNetworkAddress = "@netaddr";
 static const char* const PropSessionState = "@state";
 static const char* const PropSessionCreateTime = "@createtime";
@@ -78,15 +81,15 @@ static const char* const PropSessionLoginURL = "@loginurl";
 <Sessions>
  <Process name="myesp">
    <Application port="8010">
-    <Session_3831947145 createtime="1497376914"
-             id="3831947145"
+    <Session_a3f5e7b9c2d4f81e0b2c4d6f8a1c3e5f createtime="1497376914"
+             id="a3f5e7b9c2d4f81e0b2c4d6f8a1c3e5f"
              lastaccessed="1497377015"
              timeoutAt="1497477015"
              loginurl="/"
              netaddr="10.176.152.200"
              userid="user1"/>
-    <Session_4106750941 createtime="1497377427"
-             id="4106750941"
+    <Session_b4c6d8e0a2f4b81c3d5e7f9a1c3e5f7b createtime="1497377427"
+             id="b4c6d8e0a2f4b81c3d5e7f9a1c3e5f7b"
              lastaccessed="1497377427"
              timeoutAt="1497477427"
              loginurl="/"
@@ -94,8 +97,8 @@ static const char* const PropSessionLoginURL = "@loginurl";
              userid="user2"/>
    </Application>
    <Application port="8002">
-    <Session_3680948651 createtime="1497376989"
-             id="3680948651"
+    <Session_c5d7e9f1b3a5c92d4e6f8a0b2c4d6e8f createtime="1497376989"
+             id="c5d7e9f1b3a5c92d4e6f8a0b2c4d6e8f"
              lastaccessed="1497377003"
              timeoutAt="1497477003"
              loginurl="/"
@@ -107,16 +110,17 @@ static const char* const PropSessionLoginURL = "@loginurl";
  */
 
 interface IEspSecureContext;
+interface IDataMaskingProfile;
 
-esp_http_decl IEspContext* createEspContext(IEspSecureContext* secureContext = nullptr);
+esp_http_decl IEspContext* createEspContext(IEspSecureContextEx* secureContext = nullptr);
 
 // Get URL parameters (include these from Content)
-// Return: a=b&c=d format. 
+// Return: a=b&c=d format.
 esp_http_decl bool getUrlParams(IProperties *props, StringBuffer& params);
 
 // Only the original URL (not these from Content: URL form encoded)
 // Also remove these params that start with dot (.).
-// Return: a=b&c=d format. 
+// Return: a=b&c=d format.
 esp_http_decl void getEspUrlParams(IEspContext& ctx, StringBuffer& params, const char* excludeParams[]);
 
 esp_http_decl void addEspNativeArray(StringBuffer& schema, const char* xsdType, const char* arrayType);
@@ -129,6 +133,10 @@ esp_http_decl LogLevel getEspLogLevel();
 esp_http_decl LogRequest getEspLogRequests();
 esp_http_decl bool getEspLogResponses();
 esp_http_decl LogLevel getTxSummaryLevel();
+esp_http_decl unsigned int getTxSummaryStyle();
+esp_http_decl unsigned int readTxSummaryStyle(const char* style);
+esp_http_decl unsigned int getTxSummaryGroup();
+esp_http_decl unsigned int readTxSummaryGroup(const char* group);
 esp_http_decl bool getTxSummaryResourceReq();
 esp_http_decl unsigned getSlowProcessingTime();
 
@@ -144,8 +152,8 @@ esp_http_decl const char* getCFD();
 esp_http_decl void setBuildVersion(const char* buildVersion);
 esp_http_decl const char* getBuildVersion();
 esp_http_decl void setBuildLevel(const char* buildLevel);
-esp_http_decl const char* getBuildLevel();
 esp_http_decl IEspServer* queryEspServer();
+esp_http_decl IDataMaskingProfile* queryDataMaskingProfile(const char* profileName, int version);
 
 #define SDSSESSION_CONNECT_TIMEOUTMS (180*1000)
 interface IRemoteConnection;

@@ -32,6 +32,7 @@
 #include "hqlcpp.ipp"
 #include "hqlwcpp.hpp"
 #include "hqlwcpp.ipp"
+#include "hqlcatom.hpp"
 
 #define INDENT_SOURCE
 #define FILE_CHUNK_SIZE         65000
@@ -50,6 +51,7 @@ inline const char * intTypeName(unsigned len, CompilerType compiler, bool isSign
     switch (compiler)
     {
     case GccCppCompiler:
+    case ClangCppCompiler:
         return isSigned ? gccIntTypes[len] : gccUIntTypes[len];
     case Vs6CppCompiler:
         return isSigned ? vcIntTypes[len] : vcUIntTypes[len];
@@ -101,9 +103,14 @@ CppWriterTemplate::CppWriterTemplate(const char * codeTemplate)
     loadTemplate(codeTemplate);
 }
 
-void CppWriterTemplate::generate(ISectionWriter & writer, unsigned pass, IProperties * properties)
+void CppWriterTemplate::generate(ISectionWriter & writer, IFile * outputFile, unsigned pass, IProperties * properties)
 {
-    writer.setOutput(out, outStream);
+    Owned<IFileIO> io = outputFile->open(IFOcreate);
+    if (!io)
+        throwError1(HQLERR_CouldNotCreateOutputX, outputFile->queryFilename());
+
+    outStream.setown(createIOStream(io));
+    writer.setOutput(outputFile, outStream);
 
     const char * finger = text;
     bool output = true;
@@ -147,6 +154,8 @@ void CppWriterTemplate::generate(ISectionWriter & writer, unsigned pass, IProper
         outputQuoted(writer, end-finger, finger);
 
     writer.setOutput(NULL, NULL);
+    outStream.clear();
+    io->close();
 }
 
 void CppWriterTemplate::loadTemplate(const char * codeTemplate)
@@ -410,7 +419,7 @@ void HqlCppWriter::generateType(ITypeInfo * type, const char * name)
             {
                 unsigned dim = type->getCardinality();
                 result.addSuffix().append("[");
-                if (dim && (dim != UNKNOWN_LENGTH))
+                if (dim && (!isUnknownLength(dim)))
                     result.addSuffix().append(dim);
                 result.addSuffix().append("]");
                 break;
@@ -423,7 +432,7 @@ void HqlCppWriter::generateType(ITypeInfo * type, const char * name)
         case type_data:
         case type_utf8:
             {
-                if ((size != UNKNOWN_LENGTH) && !isPointer)
+                if ((!isUnknownLength(size)) && !isPointer)
                 {
                     result.addArray(size);
                 }
@@ -452,7 +461,7 @@ void HqlCppWriter::generateType(ITypeInfo * type, const char * name)
         case type_varunicode:
         case type_unicode:
             {
-                if ((type->getSize() != UNKNOWN_LENGTH) && !isPointer)
+                if (!isUnknownLength(type->getSize()) && !isPointer)
                     result.addArray(size/2);
                 else
                     isPointer = true;
@@ -497,6 +506,7 @@ void HqlCppWriter::generateType(ITypeInfo * type, const char * name)
         case type_filepos:
         case type_blob:
             prefix = intTypeName(8-1, compiler, false);
+            next = nullptr; // Do not follow the base type of a type_filepos
             break;
         case type_keyedint:
             break;
@@ -850,7 +860,7 @@ void HqlCppWriter::generateParamCpp(IHqlExpression * param, IHqlExpression * att
     case type_dictionary:
     case type_table:
     case type_groupedtable:
-        if ((paramType->getSize() == UNKNOWN_LENGTH) && !hasStreamedModifier(paramType))
+        if (isUnknownLength(paramType->getSize()) && !hasStreamedModifier(paramType))
         {
             out.append("size32_t");
             if (isOut)
@@ -989,7 +999,7 @@ void HqlCppWriter::generateFunctionReturnType(StringBuffer & params, ITypeInfo *
     {
     case type_varstring:
     case type_varunicode:
-        if (retType->getSize() == UNKNOWN_LENGTH)
+        if (isUnknownLength(retType->getSize()))
         {
             generateType(retType, NULL);
             break;
@@ -1003,7 +1013,7 @@ void HqlCppWriter::generateFunctionReturnType(StringBuffer & params, ITypeInfo *
         {
             OwnedITypeInfo ptrType = makeReferenceModifier(LINK(retType));
             out.append("void");
-            if (retType->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(retType->getSize()))
             {
                 if (retType->getTypeCode() != type_varstring)
                     params.append("size32_t & __lenResult,");
@@ -1428,7 +1438,7 @@ StringBuffer & HqlCppWriter::generateExprCpp(IHqlExpression * expr)
             break;
         case no_callback:
             {
-                IHqlDelayedCodeGenerator * generator = (IHqlDelayedCodeGenerator *)expr->queryUnknownExtra();
+                IHqlDelayedCodeGenerator * generator = (IHqlDelayedCodeGenerator *)expr->queryUnknownExtra(0);
                 generator->generateCpp(out);
                 break;
             }
@@ -1471,9 +1481,13 @@ StringBuffer & HqlCppWriter::generateChildExpr(IHqlExpression * expr, unsigned c
             {
             case no_and:
             case no_or:
-            case no_add:
             case no_band:
             case no_bor:
+                //These operators are associative, so no need to add brackets to force and ordering.
+                needBra = false;
+                break;
+            case no_add:
+                //Add is theoretically associative, but the potential for overflow means we should preserve the order
                 needBra = (childIndex != 0); // Operators are left associative, so use () on rhs to preserve order
                 break;
             }
@@ -1841,7 +1855,7 @@ void HqlCppWriter::generateStmtAssign(IHqlStmt * assign, bool link)
         case type_varunicode:
             if (hasModifier(type, typemod_ref))
                generateSimpleAssign(target, source);
-            else if (type->getSize() == UNKNOWN_LENGTH)
+            else if (isUnknownLength(type->getSize()))
             {
                 indent();
                 generateExprCpp(target).append(setFunction);
@@ -1958,22 +1972,29 @@ void HqlCppWriter::generateStmtCase(IHqlStmt * stmt)
         //if case label contains nothing then it is commoned up with the next case
         break;
     case 1:
-        newline();
-        indent(1);
-        generateChildren(stmt, false);
-        if (stmt->queryChild(childCount-1)->getStmt() != return_stmt)
         {
-            indent().append("break;");
             newline();
+            indent(1);
+            generateChildren(stmt, false);
+
+            StmtKind lastStmt = stmt->queryChild(childCount-1)->getStmt();
+            if ((lastStmt != return_stmt) && (lastStmt != break_stmt))
+            {
+                indent().append("break;");
+                newline();
+            }
+            indent(-1);
+            break;
         }
-        indent(-1);
-        break;
     default:
-        generateChildren(stmt, true);
-        if (stmt->queryChild(childCount-1)->getStmt() != return_stmt)
         {
-            indent().append("break;");
-            newline();
+            generateChildren(stmt, true);
+            StmtKind lastStmt = stmt->queryChild(childCount-1)->getStmt();
+            if ((lastStmt != return_stmt) && (lastStmt != break_stmt))
+            {
+                indent().append("break;");
+                newline();
+            }
         }
     }
 }
@@ -1996,7 +2017,6 @@ void HqlCppWriter::generateStmtCatch(IHqlStmt * stmt)
 void HqlCppWriter::generateStmtDeclare(IHqlStmt * declare)
 {
     IHqlExpression * name = declare->queryExpr(0);
-    IHqlExpression * value = declare->queryExpr(1);
     
     ITypeInfo * type = name->queryType();
 
@@ -2016,7 +2036,8 @@ void HqlCppWriter::generateStmtDeclare(IHqlStmt * declare)
     //    out.append("const ");
 
     size32_t typeSize = type->getSize();
-    bool useConstructor = false;
+    bool useCurlies = declare->hasOption(classAtom);
+    bool useConstructor = useCurlies;
     if (hasWrapperModifier(type))
     {
         ITypeInfo * builderModifier = queryModifier(type, typemod_builder);
@@ -2045,7 +2066,7 @@ void HqlCppWriter::generateStmtDeclare(IHqlStmt * declare)
             else
                 out.append("rtlRowsAttr ").append(targetName);
         }
-        else if (typeSize != UNKNOWN_LENGTH)
+        else if (!isUnknownLength(typeSize))
             out.append("rtlFixedSizeDataAttr<").append(typeSize).append("> ").append(targetName);
         else
             out.append("rtlDataAttr ").append(targetName);
@@ -2058,13 +2079,22 @@ void HqlCppWriter::generateStmtDeclare(IHqlStmt * declare)
             useConstructor = true;
     }
 
+    IHqlExpression * value = declare->queryExpr(1);
     if (value)
     {
         if (useConstructor)
         {
-            out.append("(");
-            generateExprCpp(value);
-            out.append(")");
+            out.append(useCurlies ? "{" : "(");
+            for (unsigned i=1; ; i++)
+            {
+                IHqlExpression * cur = declare->queryExpr(i);
+                if (!cur || cur->isAttribute())
+                    break;
+                if (i != 1)
+                    out.append(", ");
+                generateExprCpp(cur);
+            }
+            out.append(useCurlies ? "}" : ")");
         }
         else
         {
@@ -2256,11 +2286,9 @@ void HqlCppSectionWriter::generateSection(unsigned delta, IAtom * section, unsig
 
 //---------------------------------------------------------------------------
 
-ITemplateExpander * createTemplateExpander(IFile * output, const char * codeTemplate)
+ITemplateExpander * createTemplateExpander(const char * codeTemplate)
 {
-    Owned<CppWriterTemplate> expander = new CppWriterTemplate(codeTemplate);
-    expander->setOutput(output);
-    return expander.getClear();
+    return new CppWriterTemplate(codeTemplate);
 }
 
 ISectionWriter * createCppWriter(IHqlCppInstance & _instance, CompilerType compiler)

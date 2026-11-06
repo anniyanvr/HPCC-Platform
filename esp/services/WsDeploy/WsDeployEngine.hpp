@@ -96,10 +96,10 @@ private:
     Owned<IPropertyTree> m_pOptions;
     Owned<IPropertyTree> m_pResponseXml;
     Owned<IEnvDeploymentEngine> m_pEnvDepEngine;
-    mutable CriticalSection      m_critSection;
+    mutable CriticalSection m_critSection{SYNC_LOCATION};
 
-    typedef pair<string, IPropertyTree*> StringIptPair;
-    struct CStringToIptMap : public map<string, IPropertyTree*>
+    typedef std::pair<string, IPropertyTree*> StringIptPair;
+    struct CStringToIptMap : public std::map<std::string, IPropertyTree*>
     {
     };
     CStringToIptMap     m_comp2TasksMap;

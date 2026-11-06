@@ -5,8 +5,8 @@
     "tasks": [
         {
             "type": "npm",
-            "label": "tsc watch",
-            "script": "compile-watch",
+            "label": "tsc watch dojo",
+            "script": "compile-dojo-watch",
             "problemMatcher": [
                 "$tsc-watch"
             ],
@@ -16,16 +16,18 @@
         },
         {
             "type": "npm",
-            "label": "bundle watch",
-            "script": "bundle-watch",
-            "problemMatcher": [],
+            "label": "tsc watch react",
+            "script": "compile-react-watch",
+            "problemMatcher": [
+                "$tsc-watch"
+            ],
             "presentation": {
                 "group": "group-build"
             }
         },
         {
             "type": "npm",
-            "label": "webpack-dev-server",
+            "label": "dev start vite",
             "script": "start",
             "problemMatcher": [],
             "presentation": {
@@ -33,29 +35,11 @@
             }
         },
         {
-            "type": "npm",
-            "label": "dev server",
-            "script": "dev-start-ws",
-            "problemMatcher": [],
-            "presentation": {
-                "group": "group-build"
-            }
-        },
-        {
-            "label": "build-webpack-dev-server",
+            "label": "build-all",
             "dependsOn": [
-                "tsc watch",
-                "webpack-dev-server"
-            ],
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "build-local-dev-server",
-            "dependsOn": [
-                "tsc watch",
-                "bundle watch",
-                "dev server"
+                "tsc watch dojo",
+                "tsc watch react",
+                "dev start vite"
             ],
             "group": {
                 "kind": "build",

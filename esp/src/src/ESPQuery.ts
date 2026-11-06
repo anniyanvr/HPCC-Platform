@@ -1,11 +1,7 @@
-﻿import * as arrayUtil from "dojo/_base/array";
-import * as declare from "dojo/_base/declare";
-import * as Deferred from "dojo/_base/Deferred";
-import * as lang from "dojo/_base/lang";
-import * as Observable from "dojo/store/Observable";
-import * as topic from "dojo/topic";
+﻿import { arrayUtil, declare, Deferred, lang, Observable, topic, dojoxXmlParser as parser } from "src-dojo/index";
 
-import * as parser from "dojox/xml/parser";
+import { WorkunitsService, WsWorkunits as WsWorkunitsNS } from "@hpcc-js/comms";
+import { scopedLogger } from "@hpcc-js/util";
 
 import * as ESPRequest from "./ESPRequest";
 import * as ESPUtil from "./ESPUtil";
@@ -13,18 +9,23 @@ import * as ESPWorkunit from "./ESPWorkunit";
 import nlsHPCC from "./nlsHPCC";
 import * as WsEcl from "./WsEcl";
 import * as WsWorkunits from "./WsWorkunits";
+import { Paged } from "./store/Paged";
+import { BaseStore } from "./store/Store";
 
-const Store = declare([ESPRequest.Store], {
-    i18n: nlsHPCC,
-    service: "WsWorkunits",
-    action: "WUListQueries",
-    responseQualifier: "WUListQueriesResponse.QuerysetQueries.QuerySetQuery",
-    responseTotalQualifier: "WUListQueriesResponse.NumberOfQueries",
-    idProperty: "__hpcc_id",
-    startProperty: "PageStartFrom",
-    countProperty: "PageSize",
+const logger = scopedLogger("src/ESPQuery.ts");
 
-    _watched: [],
+class Store extends ESPRequest.Store {
+
+    service = "WsWorkunits";
+    action = "WUListQueries";
+    responseQualifier = "WUListQueriesResponse.QuerysetQueries.QuerySetQuery";
+    responseTotalQualifier = "WUListQueriesResponse.NumberOfQueries";
+    idProperty = "__hpcc_id";
+
+    startProperty = "PageStartFrom";
+    countProperty = "PageSize";
+
+    _watched = [];
 
     create(__hpcc_id) {
         const tmp = __hpcc_id.split(":");
@@ -33,7 +34,8 @@ const Store = declare([ESPRequest.Store], {
             QuerySetId: tmp[0],
             Id: tmp[1]
         });
-    },
+    }
+
     update(id, item) {
         const storeItem = this.get(id);
         storeItem.updateData(item);
@@ -45,10 +47,9 @@ const Store = declare([ESPRequest.Store], {
                 }
             });
         }
-    },
+    }
 
     preProcessRow(item, request, query, options) {
-        const context = this;
         let ErrorCount = 0;
         let StatusMessage;
         let MixedNodeStates;
@@ -57,17 +58,17 @@ const Store = declare([ESPRequest.Store], {
             arrayUtil.some(item.Clusters.ClusterQueryState, function (cqs, idx) {
                 if (lang.exists("Errors", cqs) && cqs.Errors || cqs.State !== "Available") {
                     ErrorCount++;
-                    StatusMessage = context.i18n.SuspendedByCluster;
+                    StatusMessage = nlsHPCC.SuspendedByCluster;
                     return false;
                 }
                 if (lang.exists("MixedNodeStates", cqs) && cqs.MixedNodeStates === true) {
-                    StatusMessage = context.i18n.MixedNodeStates;
+                    StatusMessage = nlsHPCC.MixedNodeStates;
                     MixedNodeStates = true;
                 }
             });
         }
         if (item.Suspended === true) {
-            StatusMessage = this.i18n.SuspendedByUser;
+            StatusMessage = nlsHPCC.SuspendedByUser;
         }
 
         lang.mixin(item, {
@@ -76,7 +77,7 @@ const Store = declare([ESPRequest.Store], {
             MixedNodeStates
         });
     }
-});
+}
 
 const Query = declare([ESPUtil.Singleton], {  // jshint ignore:line
     i18n: nlsHPCC,
@@ -175,9 +176,37 @@ const Query = declare([ESPUtil.Singleton], {  // jshint ignore:line
     }
 });
 
+function processQueryRow(qry: WsWorkunitsNS.QuerySetQuery) {
+    let errorCount = 0;
+    let statusMessage: string | undefined;
+    let mixedNodeStates: boolean | undefined;
+
+    qry.Clusters?.ClusterQueryState?.forEach(cqs => {
+        if (cqs.Errors || cqs.State !== "Available") {
+            errorCount++;
+            statusMessage = nlsHPCC.SuspendedByCluster;
+        } else if (cqs.MixedNodeStates === true) {
+            statusMessage = nlsHPCC.MixedNodeStates;
+            mixedNodeStates = true;
+        }
+    });
+
+    if (qry.Suspended === true) {
+        statusMessage = nlsHPCC.SuspendedByUser;
+    }
+
+    return {
+        ...qry,
+        __hpcc_id: `${qry.QuerySetId}:${qry.Id}`,
+        ErrorCount: errorCount,
+        Status: statusMessage,
+        MixedNodeStates: mixedNodeStates
+    };
+}
+
 export function Get(QuerySetId, Id, data?) {
     const store = new Store();
-    const retVal = store.get(QuerySetId + ":" + Id);
+    const retVal = store.get(`${QuerySetId}:${Id}`);
     if (data) {
         retVal.updateData(data);
     }
@@ -196,7 +225,34 @@ export function GetFromRequestXML(QuerySetId, requestXml) {
     return null;
 }
 
-export function CreateQueryStore(options) {
-    const store = new Store(options);
+export function CreateQueryStoreLegacy() {
+    const store = new Store();
+    return new Observable(store);
+}
+
+const service = new WorkunitsService({ baseUrl: "" });
+
+export type WUQueryStore = BaseStore<WsWorkunitsNS.WUListQueries, WsWorkunitsNS.QuerySetQuery>;
+
+export function CreateQueryStore(): BaseStore<WsWorkunitsNS.WUListQueries, WsWorkunitsNS.QuerySetQuery> {
+    const store = new Paged<WsWorkunitsNS.WUListQueries, WsWorkunitsNS.QuerySetQuery>({
+        start: "PageStartFrom",
+        count: "PageSize",
+        sortBy: "Sortby",
+        descending: "Descending"
+    }, "__hpcc_id", (request) => {
+        return service.WUListQueries(request).then(response => {
+            return {
+                data: response?.QuerysetQueries?.QuerySetQuery?.map(qry => Get(qry.QuerySetId, qry.Id, processQueryRow(qry))) ?? [],
+                total: response?.NumberOfQueries ?? 0
+            };
+        }).catch(err => {
+            logger.error(err);
+            return {
+                data: [],
+                total: 0
+            };
+        });
+    });
     return new Observable(store);
 }

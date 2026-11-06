@@ -51,7 +51,6 @@ set (    SRCS
          join/thjoinslave.cpp 
          keydiff/thkeydiffslave.cpp 
          keyedjoin/thkeyedjoinslave.cpp 
-         keyedjoin/thkeyedjoinslave-legacy.cpp 
          keypatch/thkeypatchslave.cpp 
          limit/thlimitslave.cpp 
          lookupjoin/thlookupjoinslave.cpp 
@@ -117,8 +116,10 @@ set_target_properties(activityslaves_lcr PROPERTIES
     COMPILE_FLAGS -D_USRDLL
     DEFINE_SYMBOL ACTIVITYSLAVES_EXPORTS )
 install ( TARGETS activityslaves_lcr RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( activityslaves_lcr 
+target_link_libraries ( activityslaves_lcr PRIVATE
          jlib
+         mp
+         dafsclient
          thorsort_lcr 
          nbcd 
          hql
@@ -127,7 +128,6 @@ target_link_libraries ( activityslaves_lcr
          thorhelper 
          remote 
          dalibase 
-         environment 
          dllserver 
          workunit 
          thorcodectx_lcr 
@@ -137,4 +137,6 @@ target_link_libraries ( activityslaves_lcr
          roxiemem
     )
 
-
+if (NOT CONTAINERIZED)
+    target_link_libraries ( activityslaves_lcr PRIVATE environment )
+endif()

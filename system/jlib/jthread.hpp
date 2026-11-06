@@ -25,6 +25,7 @@
 #include "jexcept.hpp"
 #include "jhash.hpp"
 #include <functional>
+#include "jtrace.hpp"
 
 #ifdef _WIN32
 #define DEFAULT_THREAD_PRIORITY THREAD_PRIORITY_NORMAL
@@ -32,9 +33,35 @@
 // no thread priority handling?
 #endif
 
+// Functions used to reset thread-local context variables, when a threadpool starts
+//NOTE: Currently activeSpan is not linked in the SavedThreadContext.
+//That will not cause any problems as long as the lifetime of the thread executing with that saved span value is less than the lifetime of the span.
+//It would be trivial to use a linked pointer inside the savedthread context, at the expense of a little inefficiency.
+//Revisit when this feature starts being used in anger.
+typedef unsigned __int64 LogMsgJobId;
+interface IContextLogger;
+interface ISpan;
+struct jlib_decl SavedThreadContext
+{
+    const IContextLogger * logctx = nullptr;
+    LogMsgJobId jobId = (LogMsgJobId)-1;
+    TraceFlags traceFlags = queryDefaultTraceFlags();
+    ISpan * activeSpan = nullptr;
+};
+
+extern void restoreThreadContext(const SavedThreadContext & saveCtx);
+extern void saveThreadContext(SavedThreadContext & saveCtx);
+
+extern jlib_decl ISpan * queryThreadedActiveSpan();
+extern jlib_decl ISpan * setThreadedActiveSpan(ISpan * span);
+
+//--------------------------------------------------------------
+
+typedef unsigned PooledThreadHandle;
+
 interface jlib_decl IThread : public IInterface
 {
-    virtual void start() = 0;
+    virtual void start(bool inheritThreadContext) = 0;
     virtual int run() = 0;
 };
 
@@ -44,13 +71,13 @@ interface jlib_decl IThreadName
 };
 
 
-
+extern jlib_decl bool isMainThread();
 extern jlib_decl void addThreadExceptionHandler(IExceptionHandler *handler);
 extern jlib_decl void removeThreadExceptionHandler(IExceptionHandler *handler);
 extern jlib_decl void enableThreadSEH();
 extern jlib_decl void disableThreadSEH();
 
-extern jlib_decl unsigned threadLogID();  // for use in logging
+extern jlib_decl unsigned getSystemThreadId();  // for use in logging etc.
 
 // A function registered via addThreadTermFunc will be called when the thread that registered that function
 // terminates. Such a function should call on to the previously registered function (if any) - generally you
@@ -75,6 +102,7 @@ public:
 
 class jlib_decl Thread : public CInterface, public IThread
 {
+friend class CThreadedPersistent;
 private:
     ThreadId threadid;
     unsigned short stacksize; // in 4K blocks
@@ -82,6 +110,7 @@ private:
     int nicelevel;
 
     bool alive;
+    bool suppressRunning = false;
     unsigned tidlog;
 #ifdef _WIN32
     HANDLE hThread;
@@ -95,37 +124,39 @@ private:
     void adjustNiceLevel();
 
 protected:
-    struct cThreadName: implements IThreadName
-    {
-        char *threadname;
-        const char *get() { return threadname; }
-    } cthreadname;
-    IThreadName *ithreadname;
+    StringAttr cthreadname;
+    SavedThreadContext savedCtx;
 public:
 #ifndef _WIN32
-    Semaphore suspend;
-    Semaphore starting;
+    Semaphore suspend{SYNC_LOCATION};
+    Semaphore starting{SYNC_LOCATION};
 #endif
-    Semaphore stopped;
+    Semaphore stopped{SYNC_LOCATION};
 
     IMPLEMENT_IINTERFACE;
 
     Thread(const char *_name) { init(_name); }
-    Thread() { init(NULL); }
+    Thread(const char *_name, bool _suppressRunning)
+    {
+        init(_name);
+        suppressRunning = _suppressRunning;
+    }
+    Thread() = delete;
     ~Thread();
 
     void adjustPriority(int delta);
     bool isCurrentThread() const;
     void setNice(int nicelevel);
     void setStackSize(size32_t size);               // required stack size in bytes - called before start() (obviously)
-    const char *getName() { const char *ret = ithreadname?ithreadname->get():NULL; return ret?ret:"unknown"; }
+    const char *getName() { return cthreadname.isEmpty() ? "unknown" : cthreadname.str(); }
     bool isAlive() { return alive; }
     bool join(unsigned timeout=INFINITE);
+    void captureThreadLoggingInfo();                // Capture current thread logging context to be used by this thread when started
 
-    virtual void start();
+    virtual void start(bool inheritThreadContext);
     virtual void startRelease();        
 
-    StringBuffer &getInfo(StringBuffer &str) { str.appendf("%8" I64F "X %6" I64F "d %u: %s",(__int64)threadid,(__int64)threadid,tidlog,getName()); return str; } 
+    StringBuffer &getInfo(StringBuffer &str);
     const char *getLogInfo(int &thandle,unsigned &tid) { 
 #ifdef _WIN32
         thandle = (int)(memsize_t)hThread;
@@ -140,37 +171,48 @@ public:
 
     // run method not implemented - concrete derived classes must do so
     static  void setDefaultStackSize(size32_t size);    // NB under windows requires linker setting (/stack:)
-
-    IThreadName *queryThreadName() { return ithreadname; }
-    void setThreadName(IThreadName *name) { ithreadname = name; }
-
 };
 
 interface IThreaded
 {
     virtual void threadmain() = 0;
+    virtual bool requestAbort() { return false; }
 protected:
     virtual ~IThreaded() {}
 };
 
 // utility class, useful for containing a thread
-class CThreaded : public Thread
+class jlib_decl CThreaded : public Thread
 {
     IThreaded *owner;
 public:
     inline CThreaded(const char *name, IThreaded *_owner) : Thread(name), owner(_owner) { }
     inline CThreaded(const char *name) : Thread(name) { owner = NULL; }
-    inline void init(IThreaded *_owner) { owner = _owner; start(); }
-    virtual int run() { owner->threadmain(); return 1; }
+    inline void init(IThreaded *_owner, bool inheritThreadContext) { owner = _owner; start(inheritThreadContext); }
+    virtual int run() override;
 };
 
-extern jlib_decl void asyncStart(IThreaded & threaded);
-extern jlib_decl void asyncStart(const char * name, IThreaded & threaded);
-#if defined(__cplusplus) && __cplusplus >= 201100
-extern jlib_decl void asyncStart(std::function<void()> func);
-#endif
+// A pooled worker that borrows a reusable thread for each start/join cycle.
+class jlib_decl CPooledPersistent : implements IThreaded
+{
+    Owned<IException> exception;
+    IThreaded *owner;
+    StringAttr name;
+    PooledThreadHandle handle = 0;
+    bool joined = true;
+    virtual void threadmain() override;
+    virtual bool requestAbort() override;
+public:
+    CPooledPersistent(const char *name, IThreaded *_owner);
+    ~CPooledPersistent();
+    void setName(const char *_name) { name.set(_name); }
+    void start(bool inheritThreadContext);
+    bool stop();
+    bool join(unsigned timeout, bool throwException = true);
+};
 
-// Similar to above, but the underlying thread always remains running. This can make repeated start + join's significantly quicker
+
+// A persistent worker with one dedicated thread that waits for repeated start/join cycles.
 class jlib_decl CThreadedPersistent
 {
     class CAThread : public Thread
@@ -182,35 +224,41 @@ class jlib_decl CThreadedPersistent
     } athread;
     Owned<IException> exception;
     IThreaded *owner;
-    Semaphore sem, joinSem;
+    Semaphore sem{SYNC_LOCATION};
+    Semaphore joinSem{SYNC_LOCATION};
     std::atomic_uint state;
     bool halt;
     enum ThreadStates { s_ready, s_running, s_joining };
-
     void threadmain();
 public:
     CThreadedPersistent(const char *name, IThreaded *_owner);
     ~CThreadedPersistent();
-    void start();
+    void start(bool inheritThreadContext);
     bool join(unsigned timeout, bool throwException = true);
 };
 
 
 // Asynchronous 'for' utility class
 // see HRPCUTIL.CPP for example of usage
-
+interface ITaskScheduler;
 class jlib_decl CAsyncFor
 {
 public:
+    CAsyncFor(const char *_name) : name(_name) {}
     void For(unsigned num,unsigned maxatonce,bool abortFollowingException=false,bool shuffled=false);
+    void TaskFor(unsigned num, ITaskScheduler & scheduler);
     virtual void Do(unsigned idx=0)=0;
+    const char *queryName() const { return !name.isEmpty() ? name.get() : "CAsyncFor"; }
+
+protected:
+    StringAttr name;
 };
 
 template <typename AsyncFunc>
 class CAsyncForFunc final : public CAsyncFor
 {
 public:
-    CAsyncForFunc(AsyncFunc _func) : func(_func) {}
+    CAsyncForFunc(const char *_name, AsyncFunc _func) : CAsyncFor(_name), func(_func) {}
     virtual void Do(unsigned idx=0) { func(idx); }
 private:
     AsyncFunc func;
@@ -219,25 +267,25 @@ private:
 //Utility functions for executing a lambda function in parallel, but allow the number of concurrent iterations
 //action on exception, and shuffling to be controlled.
 template <typename AsyncFunc>
-inline void asyncFor(unsigned num, unsigned maxAtOnce, bool abortFollowingException, bool shuffled, AsyncFunc func)
+inline void asyncFor(const char *asyncName, unsigned num, unsigned maxAtOnce, bool abortFollowingException, bool shuffled, AsyncFunc func)
 {
-    CAsyncForFunc<AsyncFunc> async(func);
+    CAsyncForFunc<AsyncFunc> async(asyncName, func);
     async.For(num, maxAtOnce, abortFollowingException, shuffled);
 }
 template <typename AsyncFunc>
-inline void asyncFor(unsigned num, unsigned maxAtOnce, bool abortFollowingException, AsyncFunc func)
+inline void asyncFor(const char *asyncName, unsigned num, unsigned maxAtOnce, bool abortFollowingException, AsyncFunc func)
 {
-    asyncFor(num, maxAtOnce, abortFollowingException, false, func);
+    asyncFor(asyncName, num, maxAtOnce, abortFollowingException, false, func);
 }
 template <typename AsyncFunc>
-inline void asyncFor(unsigned num, unsigned maxAtOnce, AsyncFunc func)
+inline void asyncFor(const char *asyncName, unsigned num, unsigned maxAtOnce, AsyncFunc func)
 {
-    asyncFor(num, maxAtOnce, false, false, func);
+    asyncFor(asyncName, num, maxAtOnce, false, false, func);
 }
 template <typename AsyncFunc>
-inline void asyncFor(unsigned num, AsyncFunc func)
+inline void asyncFor(const char *asyncName, unsigned num, AsyncFunc func)
 {
-    asyncFor(num, num, false, false, func);
+    asyncFor(asyncName, num, num, false, false, func);
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +297,7 @@ interface IPooledThread: extends IInterface                 // base class for de
 public:
     virtual void init(void *param) = 0;                    // called before threadmain started (from within start)
     virtual void threadmain() = 0;                         // where threads code goes (param is passed from start)
-    virtual bool stop() = 0;                               // called to cause threadmain to return, returns false if request rejected
+    virtual bool stop() = 0;                               // non-blocking request to cause threadmain to return; may be called concurrently with threadmain
     virtual bool canReuse() const = 0;                     // return true if object can be re-used (after stopped), otherwise released
 };
 
@@ -259,13 +307,14 @@ interface IThreadFactory: extends IInterface                // factory for creat
 };
 
 typedef IIteratorOf<IPooledThread> IPooledThreadIterator;
-typedef unsigned PooledThreadHandle;
 
 interface IThreadPool : extends IInterface
 {
         virtual PooledThreadHandle start(void *param)=0;    // starts a new thread reuses stopped pool entries
         virtual PooledThreadHandle start(void *param,const char *name)=0;   // starts a new thread reuses stopped pool entries 
+        virtual PooledThreadHandle startWithContext(void *param,const char *name,bool inheritThreadContext)=0; // starts a thread with per-start context inheritance
         virtual PooledThreadHandle start(void *param,const char *name,unsigned timeout)=0;  // starts a new thread reuses stopped pool entries, throws exception if can't start within timeout 
+        virtual void stopAccepting() = 0;                   // irreversible: waitAvailable() returns false and start*() throws thereafter; running threads, stop/join are unaffected
         virtual bool stop(PooledThreadHandle handle)=0;     // initiates stop on specified thread (may return false)
         virtual bool stopAll(bool tryall=false)=0;          // initiates stop on all threads, if tryall continues even if one or more fails
         virtual bool join(PooledThreadHandle handle,unsigned timeout=INFINITE)=0;
@@ -275,25 +324,25 @@ interface IThreadPool : extends IInterface
         virtual IPooledThreadIterator *running()=0;                 // return an iterator for all currently running threads
         virtual unsigned runningCount()=0;                  // number of currently running threads
         virtual PooledThreadHandle startNoBlock(void *param)=0; // starts a new thread if it can do so without blocking, else throws exception
-        virtual PooledThreadHandle startNoBlock(void *param,const char *name)=0;    // starts a new thread if it can do so without blocking, else throws exception
         virtual void setStartDelayTracing(unsigned secs) = 0;        // set start delay tracing period
-        virtual bool waitAvailable(unsigned timeout) = 0;            // wait until a pool member is available
+        virtual void setNiceValue(int value) = 0;                    // set priority for thread
+        virtual bool waitAvailable(unsigned timeout) = 0;            // wait until a pool member is available (returns false on timeout or if interrupted)
+        virtual void setPoolSize(unsigned newPoolSize, unsigned newTargetPoolSize) = 0;          // redefine the defaultmax size of the pool
 };
 
 extern jlib_decl IThreadPool *createThreadPool(
                                 const char *poolname,       // trace name of pool
                                 IThreadFactory *factory,    // factory for creating new thread instances
-                                IExceptionHandler *exceptionHandler=NULL, // optional exception handler
-                                unsigned defaultmax=50,     // maximum number of threads before starts blocking
-                                unsigned delay=1000,        // maximum delay on each block
+                                bool inheritThreadContext,  // Default context behavior; per-start overrides are available through IThreadPool::startWithContext
+                                IExceptionHandler *exceptionHandler, // optional exception handler
+                                unsigned defaultmax=50,     // maximum number of threads; zero means unbounded
+                                unsigned delay=1000,        // maximum delay on each block when defaultmax is nonzero
                                 unsigned stacksize=0,       // stack size (bytes) 0 is default
                                 unsigned timeoutOnRelease=INFINITE, // maximum time waited for thread to terminate on releasing pool
-                                unsigned targetpoolsize=0           // target maximum size of pool (default same as defaultmax)   
+                                unsigned targetpoolsize=0           // target maximum size of a bounded pool; defaults to defaultmax
                              );
 
-extern jlib_decl StringBuffer &getThreadList(StringBuffer &str);
 extern jlib_decl unsigned getThreadCount();
-extern jlib_decl StringBuffer &getThreadName(int thandle,unsigned logtid,StringBuffer &name); // either thandle or tid should be 0
 
 // Simple pipe process support
 interface ISimpleReadStream;
@@ -331,9 +380,28 @@ interface IPipeProcess: extends IInterface
     virtual void notifyTerminated(HANDLE pid,unsigned retcode) = 0; // internal
     virtual HANDLE getProcessHandle() = 0;                          // used to auto kill
     virtual void setenv(const char *var, const char *value) = 0;  // Set a value to be passed in the called process environment
+    virtual void setAllowTrace() = 0;                               // Allow child process to trace me
 };
 
 extern jlib_decl IPipeProcess *createPipeProcess(const char *allowedprograms=NULL);
+
+//--------------------------------------------------------
+
+class jlib_decl PerfTracer
+{
+    Owned<IPipeProcess> pipe;
+    double interval = 0.2;
+    StringBuffer result;
+public:
+    void start();
+    void stop();
+    void traceFor(unsigned seconds);
+    StringBuffer &queryResult() { return result; }
+    void setInterval(double _interval);  // In seconds
+private:
+    void dostart(unsigned seconds);
+    void dostop();
+};
 
 //--------------------------------------------------------
 
@@ -352,5 +420,25 @@ interface IWorkQueueThread: extends IInterface
 // Simple lightweight async worker queue
 // internally thread persists for specified time waiting before self destroying
 extern jlib_decl IWorkQueueThread *createWorkQueueThread(unsigned persisttime=1000*60);
+
+//--- Functions that manage the current thread state =- for context, tracing, spans etc.
+
+extern jlib_decl LogMsgJobId queryThreadedJobId();
+extern jlib_decl void setDefaultJobId(LogMsgJobId id);
+
+extern const IContextLogger * queryThreadedContextLogger();
+
+// Temporarily modify the trace context and/or flags for the current thread, for the lifetime of the LogContextScope object
+class jlib_decl LogContextScope
+{
+public:
+    LogContextScope(const IContextLogger *ctx);
+    LogContextScope(const IContextLogger *ctx, TraceFlags traceFlags);
+    ~LogContextScope();
+
+    const IContextLogger *prev;
+    TraceFlags prevFlags;
+};
+
 
 #endif

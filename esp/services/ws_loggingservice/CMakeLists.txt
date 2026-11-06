@@ -37,12 +37,13 @@ include_directories (
      ${HPCC_SOURCE_DIR}/esp/esplib
      ${HPCC_SOURCE_DIR}/esp/clients
      ${HPCC_SOURCE_DIR}/esp/clients/LoggingClient
+     ${HPCC_SOURCE_DIR}/esp/espcommon 
      ${HPCC_SOURCE_DIR}/esp/logging/logginglib
      ${HPCC_SOURCE_DIR}/common/thorhelper
      ./..
 )
 
-ADD_DEFINITIONS( -D_USRDLL -DLOGGINGCOMMON_EXPORTS )
+ADD_DEFINITIONS( -D_USRDLL -DLOGGINGCOMMON_EXPORTS -DWSLOGGING_API_LOCAL -DESP_SERVICE_WsLoggingService)
 
 set ( SRCS
     ${ESPSCM_GENERATED_DIR}/ws_loggingservice_esp.cpp
@@ -54,8 +55,13 @@ HPCC_ADD_LIBRARY( ws_loggingservice SHARED ${SRCS} )
 
 install ( TARGETS ws_loggingservice RUNTIME DESTINATION bin LIBRARY DESTINATION lib )
 add_dependencies (ws_loggingservice espscm)
-target_link_libraries ( ws_loggingservice
+target_link_libraries ( ws_loggingservice PRIVATE
     esphttp
     jlib
     logginglib
+    ${COMMON_ESP_SERVICE_LIBS}
 )
+
+if (CMAKE_DL_LIBS)
+    target_link_libraries ( ws_loggingservice PRIVATE ${CMAKE_DL_LIBS} )
+endif()

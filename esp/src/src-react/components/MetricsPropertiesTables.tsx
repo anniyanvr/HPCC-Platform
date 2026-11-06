@@ -1,0 +1,270 @@
+import * as React from "react";
+import { useConst } from "@fluentui/react-hooks";
+import { tokens } from "@fluentui/react-components";
+import { Palette } from "@hpcc-js/common";
+import { ColumnFormat, ColumnSetTable } from "@hpcc-js/dgrid";
+import { encodeHTML, formatDecimal } from "src/Utility";
+import { formatTwoDigits } from "src/Session";
+import nlsHPCC from "src/nlsHPCC";
+import { IScopeEx } from "../hooks/metrics";
+import { useWorkunitArchive } from "../hooks/workunit";
+import { useUserTheme } from "../hooks/theme";
+import { AutosizeHpccJSComponent } from "../layouts/HpccJSAdapter";
+import { Attribute, UNNAMED_QUERY } from "../util/metricArchive";
+import { MetricGraph } from "../util/metricGraph";
+
+Palette.rainbow("StdDevs", ["#ffffff", "#ffffff", "#fff3cd", "#ffeaa7", "#fdcb6e", "#e17055", "#e17055"]);
+Palette.rainbow("StdDevsDark", ["#222222", "#222222", "#3d3520", "#4a3c1a", "#5a4a2e", "#6b2323", "#6b2323"]);
+
+const DFU_WORKUNIT_REGEX = /^D\d{8}-\d{6}(?:-\d+)?$/;
+const ECL_WORKUNIT_REGEX = /^W\d{8}-\d{6}(?:-\d+)?$/;
+
+const isDfuWu = (workunitId: string): boolean => DFU_WORKUNIT_REGEX.test(workunitId);
+const isEclWu = (workunitId: string): boolean => ECL_WORKUNIT_REGEX.test(workunitId);
+
+class TableEx extends ColumnSetTable {
+    constructor() {
+        super();
+        this
+            .columnWidthAutoFontName("monospace")
+            .columnWidthAutoFontSize(13)
+            .columnWidthAutoSampleSize(9999)
+            ;
+    }
+
+    enter(domNode, element) {
+        super.enter(domNode, element);
+        this._dgridDiv.on("dgrid-sort", (evt: any) => {
+            if ((evt?.sort?.length ?? 0) === 0) {
+                const data = this.data();
+                data.sort((l, r) => {
+                    return l[l.length - 1] < r[r.length - 1] ? -1 : 1;
+                });
+                this
+                    .data(data)
+                    .lazyRender()
+                    ;
+            }
+        });
+    }
+
+    update(domNode, element) {
+        super.update(domNode, element);
+        if (!this._dgrid.hasNeutralSort) {
+            this._dgrid.hasNeutralSort = true;
+        }
+    }
+
+    exit(domNode, element) {
+        this._dgridDiv.on("dgrid-sort", null);
+        super.exit(domNode, element);
+    }
+}
+
+export interface MetricsPropertiesTablesProps {
+    wuid?: string;
+    querySet?: string;
+    queryId?: string;
+    scopesTableColumns?: string[];
+    scopes?: IScopeEx[];
+    metricGraph?: MetricGraph;
+}
+
+export const MetricsPropertiesTables: React.FunctionComponent<MetricsPropertiesTablesProps> = ({
+    wuid = "",
+    querySet = "",
+    queryId = "",
+    scopesTableColumns = [],
+    scopes = [],
+    metricGraph
+}) => {
+
+    const [, , , archive,] = useWorkunitArchive(wuid);
+    const { isDark } = useUserTheme();
+
+    const sortByColumns = React.useMemo(() => {
+        return ["id", "source", "target", "type", "name", ...scopesTableColumns];
+    }, [scopesTableColumns]);
+
+    //  Props Table  ---
+    const propsTable = useConst(() => new TableEx()
+        .columns([nlsHPCC.Property, nlsHPCC.Value, "Avg", "Min", "Max", "Delta", "StdDev", "SkewMin", "SkewMax", "NodeMin", "NodeMax", "StdDevs"])
+        .columnSets([
+            [nlsHPCC.Property]
+        ])
+        .columnFormats([
+            new ColumnFormat()
+                .column(nlsHPCC.Property)
+                .paletteID(isDark ? "StdDevsDark" : "StdDevs")
+                .min(0)
+                .max(6)
+                .valueColumn("StdDevs"),
+            new ColumnFormat()
+                .column("StdDevs")
+                .width(0)
+        ])
+        .sortable(true)
+    );
+
+    const findArchiveItemByPath = React.useCallback((attributes: Attribute[] | undefined, filePath: string) => {
+        if (!attributes) return null;
+        return attributes.find(attr => {
+            if (attr.sourcePath) {
+                return filePath.includes(attr.sourcePath);
+            }
+            return attr.name && filePath.includes(attr.name);
+        });
+    }, []);
+
+    React.useEffect(() => {
+        propsTable.columnFormats()[0]?.paletteID(isDark ? "StdDevsDark" : "StdDevs");
+        propsTable.render();
+    }, [propsTable, isDark]);
+
+    const linkStyle = React.useMemo(() => {
+        return `color: ${tokens.colorBrandForeground1}; text-decoration: none;`;
+    }, []);
+
+    React.useEffect(() => {
+        const props = [];
+        scopes.forEach((item, idx) => {
+            const scopeProps = [];
+            for (const exception of item.__exceptions ?? []) {
+                scopeProps.push([exception.Severity, exception.Message, `${formatTwoDigits(+exception.Priority / 1000)}s`, "", "", "", "", "", "", "", "", 6]);
+            }
+            for (const key in item.__groupedProps) {
+                const row = item.__groupedProps[key];
+                let rowValue;
+                switch (row.Key) {
+                    case "Filename":
+                    case "Indexname":
+                        rowValue = `<a href="#/files/${encodeURIComponent(row.Value)}" style="${linkStyle}">${encodeHTML(row.Value)}</a>`;
+                        break;
+                    case "DefinitionList":
+                        const pathMatches = row.Value?.match(/[/\\]([^/\\]+)\((\d+),(\d+)\)/);
+                        const noPathMatches = !pathMatches && row.Value?.match(/\((\d+),(\d+)\)/);
+                        if (pathMatches && archive) {
+                            const fileName = pathMatches[1];
+                            const lineNum = pathMatches[2];
+                            const archiveItem = findArchiveItemByPath(archive.attributes, row.Value);
+                            const selectionId = archiveItem?.id || fileName.replace(/\.[^.]+$/, "");
+                            rowValue = `<a href="#/workunits/${encodeURIComponent(wuid)}/eclsummary/${encodeURIComponent(selectionId)}/${lineNum}" style="${linkStyle}">${encodeHTML(row.Value)}</a>`;
+                        } else if (noPathMatches && archive) {
+                            const lineNum = noPathMatches[1];
+                            const selectionId = archive.queryId() || UNNAMED_QUERY;
+                            rowValue = `<a href="#/workunits/${encodeURIComponent(wuid)}/eclsummary/${encodeURIComponent(selectionId)}/${lineNum}" style="${linkStyle}">${encodeHTML(row.Value)}</a>`;
+                        } else {
+                            rowValue = encodeHTML(row.Value);
+                        } break;
+                    case "id":
+                        if (isDfuWu(row.Value)) {
+                            rowValue = `<a href="#/dfuworkunits/${encodeURIComponent(row.Value)}/summary" style="${linkStyle}">${encodeHTML(row.Value)}</a>`;
+                        } else if (isEclWu(row.Value)) {
+                            rowValue = `<a href="#/workunits/${encodeURIComponent(row.Value)}/summary" style="${linkStyle}">${encodeHTML(row.Value)}</a>`;
+                        } else {
+                            rowValue = encodeHTML(row.Value);
+                        }
+                        break;
+                    case "name":
+                        const splitMetricName = row.Value.split(":");
+                        const lastMetricNode = splitMetricName.pop();
+                        if (wuid) {
+                            rowValue = `<a href="#/workunits/${encodeURIComponent(wuid)}/metrics/${splitMetricName.map(encodeURIComponent).join(":")}/${encodeURIComponent(lastMetricNode)}" style="${linkStyle}">${encodeHTML(row.Value)}</a>`;
+                        } else if (querySet && queryId) {
+                            rowValue = `<a href="#/queries/${encodeURIComponent(querySet)}/${encodeURIComponent(queryId)}/metrics/statistics/${splitMetricName.map(encodeURIComponent).join(":")}/${encodeURIComponent(lastMetricNode)}" style="${linkStyle}">${encodeHTML(row.Value)}</a>`;
+                        } else {
+                            rowValue = encodeHTML(row.Value);
+                        }
+                        break;
+                    default:
+                        rowValue = encodeHTML(row.Value);
+                }
+                if ((rowValue === undefined || rowValue === null || rowValue === "") && (row.Min !== undefined || row.Avg !== undefined || row.Max !== undefined || row.StdDev !== undefined || row.SkewMin !== undefined || row.SkewMax !== undefined)) {
+                    const parts = [];
+                    if (row.Avg !== undefined) parts.push(`${row.Avg}`);
+                    if (row.Min !== undefined || row.Max !== undefined || row.StdDev !== undefined) parts.push("•");
+                    if (row.Min !== undefined) parts.push(`↓${row.Min}`);
+                    if (row.Max !== undefined) parts.push(`↑${row.Max}`);
+                    if (row.StdDev !== undefined) parts.push(`${formatDecimal(row.StdDevs)}σ`);
+                    if (row.SkewMin !== undefined || row.SkewMax !== undefined) parts.push("•");
+                    if (row.SkewMin !== undefined) parts.push(`⤓${row.SkewMin}`);
+                    if (row.SkewMax !== undefined) parts.push(`⤒${row.SkewMax}`);
+                    rowValue = parts.join(" ");
+                }
+                scopeProps.push([row.Key, rowValue, row.Avg, row.Min, row.Max, row.Delta, row.StdDev === undefined ? "" : `${row.StdDev} (${formatDecimal(row.StdDevs)}σ)`, row.SkewMin, row.SkewMax, row.NodeMin, row.NodeMax, row.StdDevs]);
+            }
+            if (metricGraph) {
+                const activityLink = (v) => {
+                    const splitName = v.name.split(":");
+                    const lastNode = splitName.pop();
+                    const label = encodeHTML(v.Label ? `${v.id} (${v.Label})` : v.id);
+                    if (wuid) {
+                        return `<a href="#/workunits/${encodeURIComponent(wuid)}/metrics/${splitName.map(encodeURIComponent).join(":")}/${encodeURIComponent(lastNode)}" style="${linkStyle}">${label}</a>`;
+                    } else if (querySet && queryId) {
+                        return `<a href="#/queries/${encodeURIComponent(querySet)}/${encodeURIComponent(queryId)}/metrics/statistics/${splitName.map(encodeURIComponent).join(":")}/${encodeURIComponent(lastNode)}" style="${linkStyle}">${label}</a>`;
+                    }
+                    return label;
+                };
+                if (item.type === "edge") {
+                    const sourceActivity = metricGraph.activityByID(item.IdSource);
+                    const targetActivity = metricGraph.activityByID(item.IdTarget);
+                    if (sourceActivity) {
+                        scopeProps.push(["source", activityLink(sourceActivity), "", "", "", "", "", "", "", "", "", 0]);
+                    }
+                    if (targetActivity) {
+                        scopeProps.push(["target", activityLink(targetActivity), "", "", "", "", "", "", "", "", "", 0]);
+                    }
+                } else if (metricGraph.subgraphExists(item.name)) {
+                    const inActivities = metricGraph.inSubgraphActivities(item);
+                    const outActivities = metricGraph.outSubgraphActivities(item);
+                    if (inActivities.length > 0) {
+                        scopeProps.push(["source", inActivities.map(activityLink).join(", "), "", "", "", "", "", "", "", "", "", 0]);
+                    }
+                    if (outActivities.length > 0) {
+                        scopeProps.push(["target", outActivities.map(activityLink).join(", "), "", "", "", "", "", "", "", "", "", 0]);
+                    }
+                } else {
+                    const inActivities = metricGraph.inActivities(item);
+                    const outActivities = metricGraph.outActivities(item);
+                    if (inActivities.length > 0) {
+                        scopeProps.push(["source", inActivities.map(activityLink).join(", "), "", "", "", "", "", "", "", "", "", 0]);
+                    }
+                    if (outActivities.length > 0) {
+                        scopeProps.push(["target", outActivities.map(activityLink).join(", "), "", "", "", "", "", "", "", "", "", 0]);
+                    }
+                }
+            }
+            scopeProps.sort((l, r) => {
+                const lIdx = sortByColumns.indexOf(l[0]);
+                const rIdx = sortByColumns.indexOf(r[0]);
+                if (lIdx >= 0 && rIdx >= 0) {
+                    return lIdx <= rIdx ? -1 : 1;
+                } else if (lIdx >= 0) {
+                    return -1;
+                } else if (rIdx >= 0) {
+                    return 1;
+                }
+                return 0;
+            });
+            if (idx < scopes.length - 1) {
+                scopeProps.push(["------------------------------", "------------------------------"]);
+            }
+            for (const prop of scopeProps) {
+                props.push([...prop, props.length]);
+            }
+        });
+
+        if (propsTable.data().length === 0) {
+            propsTable
+                .columns([])
+                .columns([nlsHPCC.Property, nlsHPCC.Value, "Avg", "Min", "Max", "Delta", "StdDev", "SkewMin", "SkewMax", "NodeMin", "NodeMax", "StdDevs"])
+                ;
+        }
+        propsTable
+            .data(props)
+            .lazyRender()
+            ;
+    }, [archive, findArchiveItemByPath, linkStyle, metricGraph, propsTable, queryId, querySet, scopes, sortByColumns, wuid]);
+
+    return <AutosizeHpccJSComponent widget={propsTable}></AutosizeHpccJSComponent>;
+};

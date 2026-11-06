@@ -21,20 +21,58 @@
 #define __JSEM__
 
 #include "jiface.hpp"
+#include "jprotrace.hpp"
+#include "jeventconst.hpp"
+
+typedef unsigned sync_uid_type;
+
+// Introduce a constexpr function for stripping the path from the filename:line text to reduce memory usage.
+constexpr const char * extractTail(const char * text)
+{
+    const char * result = text;
+    for (const char * p = text; *p; p++)
+        if (*p == '/' || *p == '\\')
+            result = p + 1;
+    return result;
+}
+
+#define SYNC_STRINGIZE2(x)   #x
+#define SYNC_STRINGIZE(x)    SYNC_STRINGIZE2(x)
+#define SYNC_LOCATION        (extractTail(__FILE__ ":" SYNC_STRINGIZE(__LINE__)))
+#define SYNC_UNTRACED        nullptr
+
+// Use SYNC_UNTRACED for Semaphores or Mutexes that are uninteresting - e.g. singletons, or other rarely used locks.
+// This will exclude them from protrace.
+// If you temporarily want to track them, then change the SYNC_UNTRACED macro above to something other than nullptr.
 
 #ifdef _WIN32
 
 class jlib_decl Semaphore
 {
 protected:
-    Semaphore(const char *name)
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_SEMAPHORES
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
+    Semaphore([[maybe_unused]] const char *syncName, const char *name)
     {
         hSem = CreateSemaphore(NULL, 0, 0x7fffffff, name);
+#ifdef PROTRACE_SEMAPHORES
+        if (syncName)
+            syncid = protrace::note_semaphore(syncName);
+#endif
     }
 public:
-    Semaphore(unsigned initialCount = 0U)
+    Semaphore([[maybe_unused]] const char *syncName, unsigned initialCount = 0U)
     {
         hSem = CreateSemaphore(NULL, initialCount, 0x7fffffff, NULL);
+#ifdef PROTRACE_SEMAPHORES
+        if (syncName)
+            syncid = protrace::note_semaphore(syncName);
+#endif
     }
 
 
@@ -45,12 +83,20 @@ public:
 
     bool tryWait()
     {
-        return (WaitForSingleObject(hSem, 0) == WAIT_OBJECT_0);
+        noteEvent(EventSemWait);
+        bool acquired = (WaitForSingleObject(hSem, 0) == WAIT_OBJECT_0);
+        if (acquired)
+            noteEvent(EventSemAcquire);
+        else
+            noteEvent(EventSemWaitTimeout);
+        return acquired;
     }
 
     void wait()
     {
+        noteEvent(EventSemWait);
         WaitForSingleObject(hSem, INFINITE);
+        noteEvent(EventSemAcquire);
     }
 
     void reinit(unsigned initialCount=0U)
@@ -61,67 +107,35 @@ public:
 
     bool wait(unsigned timeout)
     {
-        return (WaitForSingleObject(hSem, (timeout==(unsigned)-1)?INFINITE:timeout)==WAIT_OBJECT_0);
+        noteEvent(EventSemWait);
+        bool acquired = (WaitForSingleObject(hSem, (timeout==(unsigned)-1)?INFINITE:timeout)==WAIT_OBJECT_0);
+        if (acquired)
+            noteEvent(EventSemAcquire);
+        else
+            noteEvent(EventSemWaitTimeout);
+        return acquired;
     }
 
     void signal()
     {
         ReleaseSemaphore(hSem,1,NULL);
+        noteEvent(EventSemSignal);
     }
 
     void signal(unsigned count)
     {
         ReleaseSemaphore(hSem,count,NULL);
+        for (unsigned i=0; i<count; i++)
+            noteEvent(EventSemSignal);
     }
 protected:
     HANDLE hSem;
+#ifdef PROTRACE_SEMAPHORES
+    sync_uid_type syncid = 0;
+#endif
 
 };
 
-class jlib_decl Semaphore_Array
-{
-
-public:
-    Semaphore_Array(int num_sem, unsigned initialCount = 0U)
-    { hSem = new HANDLE [num_sem];
-      sem_count=num_sem;
-        for (int i=0; i<num_sem; i++) {
-            hSem[i] = CreateSemaphore(NULL, initialCount, 0x7fffffff, NULL);
-        }
-    }
-
-
-    ~Semaphore_Array()
-    { for (int i =0; i< sem_count; i++) {
-          CloseHandle(hSem[i]);
-        }
-        delete [] hSem;
-    }
-
-    int wait_one_of()
-    {
-        return WaitForMultipleObjects(sem_count,hSem, false, INFINITE);
-    }
-
-    int wait_one_of(unsigned timeout)
-    {
-        return WaitForMultipleObjects(sem_count,hSem, false, (timeout==(unsigned)-1)?INFINITE:timeout);
-    }
-
-    void signal(int i)
-    {
-        ReleaseSemaphore(hSem[i],1,NULL);
-    }
-
-    void signal(int i,unsigned count)
-    {
-        ReleaseSemaphore(hSem[i],count,NULL);
-    }
-protected:
-    HANDLE * hSem;
-    int sem_count;
-
-};
 #else
 
 #include <semaphore.h>
@@ -136,7 +150,14 @@ void jlib_decl getEndTime(timespec & abs, unsigned timeout);
 class jlib_decl Semaphore
 {
 public:
-    Semaphore(unsigned initialCount=0U);
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_SEMAPHORES
+    if (likely(syncid))
+        protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
+    Semaphore([[maybe_unused]] const char *syncName, unsigned initialCount=0U);
     ~Semaphore();
     bool tryWait();
     void wait();
@@ -154,6 +175,9 @@ protected:
     MutexId mx;
     pthread_cond_t cond;
     int count;
+#endif
+#ifdef PROTRACE_SEMAPHORES
+    sync_uid_type syncid = 0;
 #endif
 };
 

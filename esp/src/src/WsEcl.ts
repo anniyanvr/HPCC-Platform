@@ -1,9 +1,4 @@
-import * as arrayUtil from "dojo/_base/array";
-import * as Deferred from "dojo/_base/Deferred";
-import * as lang from "dojo/_base/lang";
-import * as request from "dojo/request";
-import * as script from "dojo/request/script";
-import * as xhr from "dojo/request/xhr";
+import { arrayUtil, Deferred, lang, request, script, xhr } from "src-dojo/index";
 
 import * as WsTopology from "./WsTopology";
 
@@ -28,7 +23,7 @@ export function _flattenResults(results) {
 export function Call(target, method, query) {
     const deferred = new Deferred();
     const context = this;
-    let request = null;
+    let request;
     if (dojoConfig.urlInfo.baseHost) {
         request = script.get(dojoConfig.urlInfo.baseHost + "/WsEcl/submit/query/" + target + "/" + method + "/json", {
             query,

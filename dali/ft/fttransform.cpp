@@ -94,14 +94,14 @@ bool CTransformer::setPartition(RemoteFilename & remoteInputName, offset_t _star
     CTransformerBase::setPartition(remoteInputName, _startOffset, _length);
     // could be cache for local, nocache for mirror
     input.setown(inputFile->open(IFOread,IFEnocache));
-    if (compressedInput) {                          
+    if (compressedInput) {
         Owned<IExpander> expander;
         if (decryptKey&&*decryptKey) {
             StringBuffer key;
             decrypt(key,decryptKey);
             expander.setown(createAESExpander256(key.length(),key.str()));
         }
-        input.setown(createCompressedFileReader(input,expander));   
+        input.setown(createCompressedFileReader(input, expander, useDefaultIoBufferSize));
     }
     cursor = startOffset;
     return (input != NULL);
@@ -123,7 +123,7 @@ size32_t CTransformer::getBlock(IFileIOStream * out)
 
 //----------------------------------------------------------------------------
 
-CNullTransformer::CNullTransformer(size32_t buffersize) : CTransformer(buffersize) 
+CNullTransformer::CNullTransformer(size32_t buffersize) : CTransformer(buffersize)
 {
     doInputCRC = false;
 }
@@ -145,7 +145,7 @@ void CNullTransformer::setInputCRC(crc32_t _inputCRC)
 
 //----------------------------------------------------------------------------
 
-CFixedToVarTransformer::CFixedToVarTransformer(size32_t _recordSize,size32_t buffersize, bool _bigendian) 
+CFixedToVarTransformer::CFixedToVarTransformer(size32_t _recordSize,size32_t buffersize, bool _bigendian)
     : CTransformer(buffersize)
 {
     recordSize = _recordSize;
@@ -154,7 +154,7 @@ CFixedToVarTransformer::CFixedToVarTransformer(size32_t _recordSize,size32_t buf
 }
 
 
-//Coded slightly strangely, so that we avoid an extra memcpy() - except for the bytes 
+//Coded slightly strangely, so that we avoid an extra memcpy() - except for the bytes
 //that don't quite fit in this block.
 size32_t CFixedToVarTransformer::getN(byte * buffer, size32_t maxLength)
 {
@@ -164,7 +164,7 @@ size32_t CFixedToVarTransformer::getN(byte * buffer, size32_t maxLength)
     size32_t sizeToGet = (maxLength / targetRecordSize) * recordSize;
     size32_t sizeGot = read(sizeToGet, buffer);
 
-    //Now add the varLenType 
+    //Now add the varLenType
     unsigned numGot = sizeGot/recordSize;
     assertex(numGot*recordSize==sizeGot);
     for (unsigned cur=numGot;cur--!=0;)
@@ -172,7 +172,7 @@ size32_t CFixedToVarTransformer::getN(byte * buffer, size32_t maxLength)
         byte * curSource = buffer + recordSize * cur;
         byte * curTarget = buffer + targetRecordSize * cur;
         memmove(curTarget + sizeof(varLenType), curSource, recordSize);
-        _WINCPYREV(curTarget, &recordSize, sizeof(varLenType));  
+        _WINCPYREV(curTarget, &recordSize, sizeof(varLenType));
     }
 
     return numGot * targetRecordSize;
@@ -187,7 +187,7 @@ offset_t CFixedToVarTransformer::tell()
 //---------------------------------------------------------------------------
 
 
-CVarToFixedTransformer::CVarToFixedTransformer(unsigned _recordSize,size32_t buffersize, bool _bigendian) 
+CVarToFixedTransformer::CVarToFixedTransformer(unsigned _recordSize,size32_t buffersize, bool _bigendian)
     : CTransformer(buffersize)
 {
     recordSize = _recordSize;
@@ -251,7 +251,7 @@ offset_t CVarToFixedTransformer::tell()
 
 //----------------------------------------------------------------------------
 
-CBlockToVarTransformer::CBlockToVarTransformer(bool _bigendian) 
+CBlockToVarTransformer::CBlockToVarTransformer(bool _bigendian)
     : CTransformer(EFX_BLOCK_SIZE)
 {
     assertex(sizeof(blockLenType) == 4);
@@ -296,7 +296,7 @@ offset_t CBlockToVarTransformer::tell()
 
 //----------------------------------------------------------------------------
 
-CVarToBlockTransformer::CVarToBlockTransformer(bool _bigendian) 
+CVarToBlockTransformer::CVarToBlockTransformer(bool _bigendian)
     : CTransformer(EFX_BLOCK_SIZE)
 {
     savedSize = 0;
@@ -310,7 +310,7 @@ CVarToBlockTransformer::~CVarToBlockTransformer()
     delete [] savedBuffer;
 }
 
-//Coded slightly strangely, so that we avoid an extra memcpy() - except for the bytes 
+//Coded slightly strangely, so that we avoid an extra memcpy() - except for the bytes
 //that don't quite fit in this block.
 size32_t CVarToBlockTransformer::getN(byte * buffer, size32_t maxLength)
 {
@@ -409,8 +409,397 @@ offset_t CGeneralTransformer::tell()
     return cursor.inputOffset;
 }
 
+//----------------------------------------------------------------------------
+
+#include "jhtree.hpp"
+#include "ctfile.hpp"
+#include "keybuild.hpp"
+#include "eclhelper_dyn.hpp"
+#include "eclhelper_base.hpp"
+#include "hqlexpr.hpp"
+#include "hqlutil.hpp"
+#include "rtldynfield.hpp"
+
+class CIndexTransformer : public CTransformerBase
+{
+    // Block size threshold - process approximately this much expanded row data per getBlock() call
+    static constexpr size32_t ExpandedRowBatchSize = 10 * 1024 * 1024; // 10MB
+
+public:
+    CIndexTransformer(const char * _targetCompression) : targetCompression(_targetCompression)
+    {
+    }
+
+    ~CIndexTransformer()
+    {
+        if (outRecType)
+            outRecType->doDelete();
+
+        ForEachItemIn(idx, deleteFields)
+            delete deleteFields.item(idx);
+    }
+
+    virtual bool setPartition(RemoteFilename & remoteInputName, offset_t _startOffset, offset_t _length, bool compressedInput, const char *decryptKey) override
+    {
+        if (!CTransformerBase::setPartition(remoteInputName, _startOffset, _length))
+            return false;
+
+        inputIO.setown(inputFile->open(IFOread));
+        if (!inputIO)
+            throw MakeStringException(999, "Failed to open file %s", inputFile->queryFilename());
+        return true;
+    }
+
+    virtual size32_t getBlock(IFileIOStream * out) override;
+    virtual void beginTransform(IFileIOStream * out) override;
+    virtual void endTransform(IFileIOStream * out) override;
+
+    virtual offset_t tell() override
+    {
+        return sizeRead;
+    }
+
+    virtual stat_type getStatistic(StatisticKind kind) override
+    {
+        if (inputIO)
+            return inputIO->getStatistic(kind);
+        return 0;
+    }
+
+protected:
+    void initializeTransform(IFileIOStream * out);
+    size32_t processRecordBatch();
+
+protected:
+    StringAttr targetCompression;
+    Owned<IFileIO> inputIO;
+    Owned<IKeyIndex> index;
+    Owned<IKeyManager> manager;
+    Owned<IPropertyTree> metadata;
+    Owned<IOutputMetaData> diskmeta;
+    ArrayOf<const RtlFieldInfo *> deleteFields;
+    ArrayOf<const RtlFieldInfo *> fields;  // Note - the lifetime of the array needs to extend beyond the lifetime of outmeta. The fields themselves are shared with diskmeta, and do not need to be released.
+    Owned<IOutputMetaData> outmeta;
+    Owned<const IDynamicTransform> translator;
+    const RtlRecordTypeInfo *outRecType = nullptr;
+    Owned<IKeyBuilder> keyBuilder;
+    Owned<IFileIOStream> outFileStream;
+    BlobCreatorWrapper blobCreator{nullptr};
+    size32_t maxSizeSeen = 0;
+    size32_t fileposSize = 0;
+    offset_t sizeRead = 0;
+    bool isTLK = false;
+    bool initialized = false;
+    bool finished = false;
+};
+
+class TrivialVirtualFieldCallback : public CInterfaceOf<IVirtualFieldCallback>
+{
+public:
+    TrivialVirtualFieldCallback(IKeyManager *_manager) : manager(_manager)
+    {
+    }
+    virtual const char * queryLogicalFilename(const void * row) override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual unsigned __int64 getFilePosition(const void * row) override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual unsigned __int64 getLocalFilePosition(const void * row) override
+    {
+        UNIMPLEMENTED;
+    }
+    virtual const byte * lookupBlob(unsigned __int64 id) override
+    {
+        size32_t blobSize;
+        return manager->loadBlob(id, blobSize, nullptr);
+    }
+private:
+    Linked<IKeyManager> manager;
+};
+
+
+//This code is copied from equivalent code inside dumpkey.cpp, and then simplied/adapted
+//A few bugs in the original implementation have been fixed, both here and in dumpkey.cpp
+void CIndexTransformer::initializeTransform(IFileIOStream * out)
+{
+    if (initialized)
+        return;
+    initialized = true;
+
+    const char * fieldSelection = nullptr; // could allow projection...
+    const char * keyName = inputFile->queryFilename();
+
+    //read with a buffer size of 4MB - for optimal speed, and minimize azure read costs
+    index.setown(createKeyIndex(keyName, 0, *inputIO, -1, false, { 0x400000, 0x400000 }));
+    size32_t key_size = index->keySize();  // NOTE - in variable size case, this may be 32767 + sizeof(offset_t)
+    size32_t keyedSize = index->keyedSize();
+    unsigned nodeSize = index->getNodeSize();
+    isTLK = index->isTopLevelKey();
+
+    metadata.setown(index->getMetadata());
+    if (metadata && metadata->hasProp("_rtlType"))
+    {
+        MemoryBuffer layoutBin;
+        metadata->getPropBin("_rtlType", layoutBin);
+        try
+        {
+            diskmeta.setown(createTypeInfoOutputMetaData(layoutBin, false));
+        }
+        catch (IException *E)
+        {
+            EXCLOG(E);
+            E->Release();
+        }
+    }
+    if (!diskmeta && metadata && metadata->hasProp("_record_ECL"))
+    {
+        MultiErrorReceiver errs;
+        Owned<IHqlExpression> expr = parseQuery(metadata->queryProp("_record_ECL"), &errs);
+        if (errs.errCount() == 0)
+        {
+            MemoryBuffer layoutBin;
+            if (exportBinaryType(layoutBin, expr, true))
+                diskmeta.setown(createTypeInfoOutputMetaData(layoutBin, false));
+        }
+    }
+    if (!diskmeta)
+    {
+        // We don't have record info - fake it? We could pretend it's a single field...
+        // UNIMPLEMENTED;
+        // manager.setown(createLocalKeyManager(fake, index, nullptr));
+        throw MakeStringException(888, "No disk meta information found for '%s'", keyName);
+    }
+
+    const RtlRecord &inrec = diskmeta->queryRecordAccessor(true);
+    manager.setown(createLocalKeyManager(inrec, index, nullptr, true, false));
+    size32_t minRecSize = 0;
+    bool createTranslator = false;
+    if (fieldSelection)
+    {
+        StringArray fieldNames;
+        fieldNames.appendList(fieldSelection, ",");
+        ForEachItemIn(idx, fieldNames)
+        {
+            unsigned fieldNum = inrec.getFieldNum(fieldNames.item(idx));
+            if (fieldNum == (unsigned) -1)
+                throw MakeStringException(0, "Requested output field '%s' not found", fieldNames.item(idx));
+            const RtlFieldInfo *field = inrec.queryOriginalField(fieldNum);
+            if (isTLK && (field->flags & RFTMispayloadfield))
+                continue;  // payload fields not include in the TLK
+
+            if (field->type->getType() == type_blob)
+            {
+                // We can't just use the original source field in this case (as blobs are only supported in the input)
+                // So instead, create a field in the target with the original type.
+                field = new RtlFieldStrInfo(field->name, field->xpath, field->type->queryChildType());
+                deleteFields.append(field);
+            }
+            fields.append(field);
+            minRecSize += field->type->getMinSize();
+        }
+        fields.append(nullptr);
+        outRecType = new RtlRecordTypeInfo(type_record, minRecSize, fields.getArray(0));
+        outmeta.setown(new CDynamicOutputMetaData(*outRecType));
+        createTranslator = true;
+    }
+    else
+    {
+        // Copy all fields from the source record
+        unsigned numFields = inrec.getNumFields();
+        for (unsigned idx = 0; idx < numFields;idx++)
+        {
+            const RtlFieldInfo *field = inrec.queryOriginalField(idx);
+            if (isTLK && (field->flags & RFTMispayloadfield))
+                continue;  // payload fields not include in the TLK
+
+            if (field->type->getType() == type_blob)
+                createTranslator = true;
+
+            fields.append(field);
+            minRecSize += field->type->getMinSize();
+        }
+        fields.append(nullptr);
+        outmeta.set(diskmeta);
+    }
+
+#if 0
+    //Could also filter records
+    RowFilter rowFilter;
+    if (filters.ordinality())
+    {
+        ForEachItemIn(idx, filters)
+        {
+            const IFieldFilter &thisFilter = rowFilter.addFilter(diskmeta->queryRecordAccessor(true), filters.item(idx));
+            unsigned idx = thisFilter.queryFieldIndex();
+            const RtlFieldInfo *field = inrec.queryOriginalField(idx);
+            if (field->flags & RFTMispayloadfield)
+                throw MakeStringException(0, "Cannot filter on payload field '%s'", field->name);
+        }
+    }
+    rowFilter.createSegmentMonitors(manager);
+#endif
+
+    manager->finishSegmentMonitors();
+    manager->reset();
+
+    outFileStream.setown(createNoSeekIOStream(out));
+
+    unsigned flags = COL_PREFIX | HTREE_FULLSORT_KEY | HTREE_COMPRESSED_KEY | USE_TRAILING_HEADER | TRAILING_HEADER_ONLY;
+    if (!outmeta->isFixedSize())
+        flags |= HTREE_VARSIZE;
+    if (isTLK)
+        flags |= HTREE_TOPLEVEL_KEY;
+    //if (quickCompressed)
+    //    flags |= HTREE_QUICK_COMPRESSED_KEY;
+    // MORE - other global options
+    bool isVariable = outmeta->isVariableSize();
+    fileposSize = hasTrailingFileposition(outmeta->queryTypeInfo()) ? sizeof(offset_t) : 0;
+    size32_t maxDiskRecordSize;
+    if (isTLK)
+        maxDiskRecordSize = keyedSize;
+    else if (isVariable)
+        maxDiskRecordSize = KEYBUILD_MAXLENGTH;
+    else
+        maxDiskRecordSize = outmeta->getFixedSize()-fileposSize;
+    const RtlRecord &indexRecord = outmeta->queryRecordAccessor(true);
+//    size32_t keyedSize = indexRecord.getFixedOffset(indexRecord.getNumKeyedFields());
+
+    //MORE: Need to rebuild/copy bloom filters
+    KeyBuilderOptions options(flags, maxDiskRecordSize, nodeSize, keyedSize, nullptr);
+    options.setCompression(targetCompression);
+    options.enforceOrder = false;
+    options.isTLK = isTLK;
+    keyBuilder.setown(createKeyBuilder(outFileStream, options));
+    blobCreator.setBuilder(keyBuilder);
+
+    if (createTranslator)
+        translator.setown(createRecordBlobTranslator(outmeta->queryRecordAccessor(true), inrec, &blobCreator));
+
+}
+
+//Process a batch of records and return the approximate input size processed
+size32_t CIndexTransformer::processRecordBatch()
+{
+    const size32_t keyedSize = index->keyedSize();
+    TrivialVirtualFieldCallback callback(manager);
+
+    size32_t inputSizeProcessed = 0;  // Approximate input size for current block
+    while (inputSizeProcessed < ExpandedRowBatchSize)
+    {
+        if (!manager->lookup(true))
+        {
+            finished = true;
+            break;
+        }
+
+        byte const * buffer = manager->queryKeyBuffer();
+        size32_t size = isTLK ? keyedSize : manager->queryRowSize();
+        unsigned __int64 seq = manager->querySequence();
+        if (translator)
+        {
+            MemoryBuffer buf;
+            MemoryBufferBuilder aBuilder(buf, 0);
+            size = translator->translate(aBuilder, callback, buffer);
+            if (size)
+            {
+                if (fileposSize)
+                {
+                    offset_t fpos = manager->queryFPos();
+                    offset_t recordFilePos = rtlReadSwapInt8(aBuilder.getSelf() + size - fileposSize);
+                    assertex(fpos == recordFilePos);
+                    size -= fileposSize;
+                    keyBuilder->processKeyData((const char *) aBuilder.getSelf(), fpos, size);
+                }
+                else
+                    keyBuilder->processKeyData((const char *) aBuilder.getSelf(), 0, size);
+            }
+        }
+        else
+        {
+            if (!isTLK && hasTrailingFileposition(outmeta->queryTypeInfo()))
+                size -= sizeof(offset_t);
+            keyBuilder->processKeyData((const char *) buffer, manager->queryFPos(), size);
+            if (size > maxSizeSeen)
+                maxSizeSeen = size;
+        }
+
+        inputSizeProcessed += size;
+        manager->releaseBlobs();
+    }
+
+    // This function is expected to return the number of bytes processed from the input dataset.  That isn't readily available for indexes
+    // so look at the number of bytes read from the file - not completely accurate because of the header etc, but a close approximation.
+
+    offset_t finalSizeProcessed = inputIO->getStatistic(StSizeDiskRead);
+    // If it has increased use that, otherwise add 1 (since returning 0 means end of file)
+    if (finalSizeProcessed <= sizeRead)
+        finalSizeProcessed = sizeRead+1;
+    offset_t processed = finalSizeProcessed - sizeRead;
+
+    // This should never happen, but protect against overflow just in case - ok as long as it never returns 0
+    if (processed != (size32_t)processed)
+        processed = (size32_t) -1;
+    sizeRead += processed;
+    return (size32_t)processed;
+}
+
+void CIndexTransformer::beginTransform(IFileIOStream * out)
+{
+    initializeTransform(out);
+}
+
+void CIndexTransformer::endTransform(IFileIOStream * out)
+{
+    if (!initialized || !keyBuilder)
+        return;
+
+    //Clone any bloom filters from the input dataset - they should be rebuilt if the index was ever filtered.
+    BloomFilterArray clonedBlooms;
+    for (unsigned i = 0; ; i++)
+    {
+        const BloomFilter *bloom = index->queryBloom(i);
+        if (!bloom)
+            break;
+        clonedBlooms.push_back(bloom);
+    }
+
+    keyBuilder->finish(metadata, nullptr, maxSizeSeen, &clonedBlooms);
+
+    printf("New key has %" I64F "u leaves, %" I64F "u branches, %" I64F "u duplicates\n", keyBuilder->getStatistic(StNumLeafCacheAdds), keyBuilder->getStatistic(StNumNodeCacheAdds), keyBuilder->getStatistic(StNumDuplicateKeys));
+    printf("Original key size: %" I64F "u bytes\n", const_cast<IFileIO *>(index->queryFileIO())->size());
+    printf("New key size: %" I64F "u bytes (%" I64F "u bytes written in %" I64F "u writes)\n", outFileStream->size(), outFileStream->getStatistic(StSizeDiskWrite), outFileStream->getStatistic(StNumDiskWrites));
+    keyBuilder.clear();
+
+    sizeRead = inputIO->size();
+
+    //Ensure the file is removed from the key store - in case the input is overwritten and the process repeated
+    const char * keyName = inputFile->queryFilename();
+    index.clear();
+    clearKeyStoreCacheEntry(keyName);
+}
+
+//The index transform processes records incrementally, yielding progress after each block
+size32_t CIndexTransformer::getBlock(IFileIOStream * out)
+{
+    if (!initialized)
+        initializeTransform(out);
+
+    if (finished)
+        return 0;
+
+    return processRecordBatch();
+}
+
 
 //----------------------------------------------------------------------------
+
+ITransformer * createIndexTransformer(const FileFormat & srcFormat, const FileFormat & tgtFormat, const char * keyCompression)
+{
+    return new CIndexTransformer(keyCompression);
+}
 
 ITransformer * createTransformer(const FileFormat & srcFormat, const FileFormat & tgtFormat, size32_t buffersize)
 {
@@ -418,7 +807,9 @@ ITransformer * createTransformer(const FileFormat & srcFormat, const FileFormat 
 
 #ifdef OPTIMIZE_COMMON_TRANSFORMS
     if (srcFormat.equals(tgtFormat))
+    {
         transformer = new CNullTransformer(buffersize);
+    }
     else
     {
         switch (srcFormat.type)
@@ -456,7 +847,7 @@ ITransformer * createTransformer(const FileFormat & srcFormat, const FileFormat 
         case FFTutf8: case FFTutf8n:
             switch (tgtFormat.type)
             {
-            case FFTutf8n: 
+            case FFTutf8n:
             case FFTutf8:
                 transformer = new CNullTransformer(buffersize);
                 break;
@@ -475,6 +866,8 @@ ITransformer * createTransformer(const FileFormat & srcFormat, const FileFormat 
                 throwError(DFTERR_BadSrcTgtCombination);
             }
             break;
+        case FFTkey:
+            throwError(DFTERR_BadSrcTgtCombination);
         }
     }
 #endif
@@ -482,7 +875,7 @@ ITransformer * createTransformer(const FileFormat & srcFormat, const FileFormat 
     if (!transformer)
         transformer = new CGeneralTransformer(srcFormat, tgtFormat);
 //      throwError(DFTERR_BadSrcTgtCombination);
-    
+
     return transformer;
 }
 
@@ -496,7 +889,6 @@ TransferServer::TransferServer(ISocket * _masterSocket)
     updateFrequency = (unsigned int) -1;
     throttleNicSpeed = 0;
     compressedInput = false;
-    compressOutput = false;
     transferBufferSize = DEFAULT_STD_BUFFER_SIZE;
     fileUmask = -1;
 }
@@ -507,6 +899,7 @@ void TransferServer::sendProgress(OutputProgress & curProgress)
     msg.setEndian(__BIG_ENDIAN);
     curProgress.serializeCore(msg.clear().append(false));
     curProgress.serializeExtra(msg, 1);
+    curProgress.serializeExtra(msg, 2);
     if (!catchWriteBuffer(masterSocket, msg))
         throwError(RFSERR_TimeoutWaitMaster);
 
@@ -521,26 +914,43 @@ void TransferServer::appendTransformed(unsigned chunkIndex, ITransformer * input
 
     const offset_t startInputOffset = curPartition.inputOffset;
     const offset_t startOutputOffset = curPartition.outputOffset;
+    stat_type prevNumWrites =  out->getStatistic(StNumDiskWrites);
+    stat_type prevNumReads = input->getStatistic(StNumDiskReads);
 
+    // If compressing, only flush when the job is completed - to prevent compressed output creating
+    // extra blocks.  Also disable when containerized, to prevent too many blob parts ...
+    bool flushOutputPeriodically = !compressOutput() && !isContainerized();
     for (;;)
     {
         unsigned gotLength = input->getBlock(out);
+        bool eof = (gotLength == 0);
         totalLengthRead  += gotLength;
 
-        if (gpfFrequency || !gotLength || ((unsigned)(msTick() - lastTick)) > updateFrequency)
+        if (gpfFrequency || eof || ((unsigned)(msTick() - lastTick)) > updateFrequency)
         {
-            out->flush();
+            //Ensure any trailing data is written before flushing and sending the final positions
+            if (eof)
+                input->endTransform(out);
+
+            if (eof || flushOutputPeriodically)
+                out->flush();
 
             lastTick = msTick();
 
             offset_t outputOffset = out->tell();
             offset_t inputOffset = input->tell();
-            if (totalLengthToRead)
-                LOG(MCdebugProgress, unknownJob, "Progress: %d%% done. [%" I64F "u]", (unsigned)(totalLengthRead*100/totalLengthToRead), (unsigned __int64)totalLengthRead);
+            if (totalLengthToRead && doTrace(traceSprayDetails))
+                LOG(MCdebugProgress, "Progress: %d%% done. [%" I64F "u]", (unsigned)(totalLengthRead*100/totalLengthToRead), (unsigned __int64)totalLengthRead);
 
-            curProgress.status = (gotLength == 0) ? OutputProgress::StatusCopied : OutputProgress::StatusActive;
+            curProgress.status = eof ? OutputProgress::StatusCopied : OutputProgress::StatusActive;
             curProgress.inputLength = input->tell()-startInputOffset;
             curProgress.outputLength = out->tell()-startOutputOffset;
+            stat_type curNumWrites = out->getStatistic(StNumDiskWrites);
+            stat_type curNumReads = input->getStatistic(StNumDiskReads);
+            curProgress.numWrites += (curNumWrites - prevNumWrites);
+            curProgress.numReads += (curNumReads - prevNumReads);
+            prevNumWrites = curNumWrites;
+            prevNumReads = curNumReads;
             if (crcOut)
                 curProgress.outputCRC = crcOut->getCRC();
             if (calcInputCRC)
@@ -548,8 +958,8 @@ void TransferServer::appendTransformed(unsigned chunkIndex, ITransformer * input
             sendProgress(curProgress);
         }
 
-        if (!gotLength)
-            break;
+        if (eof)
+            return;
 
         if (blockDelay)
             MilliSleep(blockDelay);
@@ -562,13 +972,11 @@ void TransferServer::appendTransformed(unsigned chunkIndex, ITransformer * input
 #ifdef _WIN32
         if (gpfFrequency && ((fastRand() % gpfFrequency) == 0))
         {
-            LOG(MCdebugInfo, unknownJob, "About to crash....");
+            LOG(MCdebugInfo, "About to crash....");
             *(char *)0 = 0;
         }
 #endif
     }
-
-    input->endTransform(out);
 }
 
 
@@ -577,11 +985,11 @@ void TransferServer::deserializeAction(MemoryBuffer & msg, unsigned action)
 {
     SocketEndpoint ep;
     ep.deserialize(msg);
-    if (!ep.isLocal())
+    if (!isContainerized() && !ep.isLocal())
     {
         StringBuffer host, expected;
-        queryHostIP().getIpText(host);
-        ep.getIpText(expected);
+        queryHostIP().getHostText(host);
+        ep.getHostText(expected);
         throwError2(DFTERR_WrongComputer, expected.str(), host.str());
     }
 
@@ -596,23 +1004,22 @@ void TransferServer::deserializeAction(MemoryBuffer & msg, unsigned action)
     msg.read(mirror);
     msg.read(isSafeMode);
 
-    srand((unsigned)get_cycles_now());
-    int adjust = fastRand() % updateFrequency - (updateFrequency/2);
+    int adjust = get_cycles_now() % updateFrequency - (updateFrequency/2);
     lastTick = msTick() + adjust;
 
     StringBuffer localFilename;
     if (action == FTactionpull)
     {
         partition.item(0).outputName.getPath(localFilename);
-        LOG(MCdebugProgress, unknownJob, "Process Pull Command: %s", localFilename.str());
+        if (doTrace(traceSprayDetails))
+            LOG(MCdebugProgress, "Process Pull Command: %s", localFilename.str());
     }
     else
     {
         partition.item(0).inputName.getPath(localFilename);
-        LOG(MCdebugProgress, unknownJob, "Process Push Command: %s", localFilename.str());
+        if (doTrace(traceSprayDetails))
+            LOG(MCdebugProgress, "Process Push Command: %s", localFilename.str());
     }
-    LOG(MCdebugProgress, unknownJob, "Num Parallel Slaves=%d Adjust=%d/%d", numParallelSlaves, adjust, updateFrequency);
-    LOG(MCdebugProgress, unknownJob, "copySourceTimeStamp(%d) mirror(%d) safe(%d) incrc(%d) outcrc(%d)", copySourceTimeStamp, mirror, isSafeMode, calcInputCRC, calcOutputCRC);
 
     displayPartition(partition);
 
@@ -627,12 +1034,19 @@ void TransferServer::deserializeAction(MemoryBuffer & msg, unsigned action)
     if (msg.remaining())
         msg.read(throttleNicSpeed);
     if (msg.remaining())
-        msg.read(compressedInput).read(compressOutput);
+    {
+        byte outputFormat;
+        msg.read(compressedInput).read(outputFormat);
+        //Older masters sent a boolean - map 'true' to whatever the current default compression is.
+        if (outputFormat == unspecifiedSprayCompression)
+            outputFormat = defaultSprayCompression;
+        compressOutputFormat = (CompressionMethod)outputFormat;
+    }
     if (msg.remaining())
         msg.read(copyCompressed);
     if (msg.remaining())
         msg.read(transferBufferSize);
-    if (msg.remaining()) 
+    if (msg.remaining())
         msg.read(encryptKey).read(decryptKey);
     if (msg.remaining())
     {
@@ -645,14 +1059,13 @@ void TransferServer::deserializeAction(MemoryBuffer & msg, unsigned action)
 
     if (msg.remaining())
         msg.read(fileUmask);
-
-    LOG(MCdebugProgress, unknownJob, "throttle(%d), transferBufferSize(%d)", throttleNicSpeed, transferBufferSize);
-    PROGLOG("compressedInput(%d), compressedOutput(%d), copyCompressed(%d)", compressedInput?1:0, compressOutput?1:0, copyCompressed?1:0);
-    PROGLOG("encrypt(%d), decrypt(%d)", encryptKey.isEmpty()?0:1, decryptKey.isEmpty()?0:1);
-    if (fileUmask != -1)
-        PROGLOG("umask(0%o)", fileUmask);
-    else
-        PROGLOG("umask(default)");
+    if (msg.remaining())
+    {
+        ForEachItemIn(i2, progress)
+            progress.item(i2).deserializeExtra(msg, 2);
+    }
+    if (msg.remaining())
+        msg.readOpt(keyCompression);
 
     //---Finished deserializing ---
     displayProgress(progress);
@@ -679,28 +1092,37 @@ void TransferServer::transferChunk(unsigned chunkIndex)
 
     StringBuffer targetPath;
     curPartition.outputName.getPath(targetPath);
-    LOG(MCdebugProgress, unknownJob, "Begin to transfer chunk %d (offset: %" I64F "d, size: %" I64F "d) to target:'%s' (offset: %" I64F "d, size: %" I64F "d) ",
-                        chunkIndex, curPartition.inputOffset, curPartition.inputLength, targetPath.str(), curPartition.outputOffset, curPartition.outputLength);
+
+    if (doTrace(traceSprayDetails))
+        LOG(MCdebugProgress, "Begin to transfer chunk %d (offset: %" I64F "d, size: %" I64F "d) to target:'%s' (offset: %" I64F "d, size: %" I64F "d) ",
+                            chunkIndex, curPartition.inputOffset, curPartition.inputLength, targetPath.str(), curPartition.outputOffset, curPartition.outputLength);
+
     const unsigned __int64 startOutOffset = out->tell();
     if (startOutOffset != curPartition.outputOffset+curProgress.outputLength)
         throwError4(DFTERR_OutputOffsetMismatch, out->tell(), curPartition.outputOffset+curProgress.outputLength, "start", chunkIndex);
-    
+
     size32_t fixedTextLength = (size32_t)curPartition.fixedText.length();
     if (fixedTextLength || curPartition.inputName.isNull())
     {
+        stat_type prevWrites = out->getStatistic(StNumDiskWrites);
         out->write(fixedTextLength, curPartition.fixedText.get());
         curProgress.status = OutputProgress::StatusCopied;
         curProgress.inputLength = fixedTextLength;
         curProgress.outputLength = fixedTextLength;
+        curProgress.numWrites += (out->getStatistic(StNumDiskWrites)-prevWrites);
         if (crcOut)
             curProgress.outputCRC = crcOut->getCRC();
         sendProgress(curProgress);
     }
     else
     {
-        Owned<ITransformer> transformer = createTransformer(srcFormat, tgtFormat, transferBufferSize);
-        if (!transformer->setPartition(curPartition.inputName, 
-                                       curPartition.inputOffset+curProgress.inputLength, 
+        Owned<ITransformer> transformer;
+        if (keyCompression)
+            transformer.setown(createIndexTransformer(srcFormat, tgtFormat, keyCompression));
+        else
+            transformer.setown(createTransformer(srcFormat, tgtFormat, transferBufferSize));
+        if (!transformer->setPartition(curPartition.inputName,
+                                       curPartition.inputOffset+curProgress.inputLength,
                                        curPartition.inputLength-curProgress.inputLength,
                                        compressedInput,
                                        decryptKey))
@@ -729,6 +1151,12 @@ void TransferServer::transferChunk(unsigned chunkIndex)
     }
 }
 
+void TransferServer::createOutputStream(IFileIO * outio)
+{
+    size32_t bufferSize = getBlockedSequentialIO(outio, (size32_t)-1);
+    out.setown(createBufferedIOStream(outio, bufferSize));
+}
+
 bool TransferServer::pull()
 {
     unsigned curOutput = (unsigned)-1;
@@ -744,7 +1172,7 @@ bool TransferServer::pull()
         if (startProgress.status == OutputProgress::StatusBegin)
             break;
 
-        assertex(!compressOutput);
+        assertex(!compressOutput());
         RemoteFilename localTempFilename;
         getDfuTempName(localTempFilename, startPartition.outputName);
         OwnedIFile outFile = createIFile(localTempFilename);
@@ -765,7 +1193,7 @@ bool TransferServer::pull()
             unsigned __int64 progressOffset = curOutputOffset + curProgress.outputLength;
             if (progressOffset > size)
             {
-                LOG(MCwarning, unknownJob, "Recovery information seems to be invalid (%" I64F "d %" I64F "d) start copying from the beginning",
+                LOG(MCwarning, "Recovery information seems to be invalid (%" I64F "d %" I64F "d) start copying from the beginning",
                          size, progressOffset);
                 //reset any remaining partitions...
                 for (i = start; i < numPartitions; i++)
@@ -776,13 +1204,16 @@ bool TransferServer::pull()
             assertex(curProgress.status != OutputProgress::StatusRenamed);
             if (curProgress.status != OutputProgress::StatusCopied)
             {
-                out.setown(createIOStream(outio));
+                if (out)
+                    out->close();
+                createOutputStream(outio);
                 out->seek(progressOffset, IFSbegin);
                 wrapOutInCRC(curProgress.outputCRC);
 
                 StringBuffer localFilename;
                 localTempFilename.getPath(localFilename);
-                LOG(MCdebugProgress, unknownJob, "Continue pulling to file: %s from recovery position", localFilename.str());
+                if (doTrace(traceSprayDetails))
+                    LOG(MCdebugProgress, "Continue pulling to file: %s from recovery position", localFilename.str());
                 start = i;
                 goto processedProgress; // break out of both loops
             }
@@ -821,13 +1252,20 @@ processedProgress:
             curOutput = curPartition.whichOutput;
             if (curProgress.status == OutputProgress::StatusRenamed)
             {
-                LOG(MCdebugProgress, unknownJob, "Renamed file found - must be CRC recovery");
+                if (doTrace(traceSprayDetails))
+                    LOG(MCdebugProgress, "Renamed file found - must be CRC recovery");
                 idx = queryLastOutput(curOutput);
                 continue;
             }
 
+            const RemoteFilename & outputFilename = curPartition.outputName;
+            StringBuffer filePath;
+            outputFilename.getPath(filePath);
             RemoteFilename localTempFilename;
-            getDfuTempName(localTempFilename, curPartition.outputName);
+            if (!getRenameSupportedFromPath(filePath))
+                localTempFilename.set(outputFilename);
+            else
+                getDfuTempName(localTempFilename, outputFilename);
 
             StringBuffer localFilename;
             localTempFilename.getPath(localFilename);
@@ -839,32 +1277,36 @@ processedProgress:
             OwnedIFileIO outio = outFile->openShared(IFOcreate,IFSHnone,IFEnocache);
             if (!outio)
                 throwError1(DFTERR_CouldNotCreateOutput, localFilename.str());
-            if (compressOutput) {
+            if (compressOutput()) {
                 Owned<ICompressor> compressor;
                 if (!encryptKey.isEmpty()) {
                     StringBuffer key;
                     decrypt(key,encryptKey);
                     compressor.setown(createAESCompressor256(key.length(),key.str()));
                 }
-                outio.setown(createCompressedFileWriter(outio, false, 0, true, compressor, COMPRESS_METHOD_LZW));
+                outio.setown(createCompressedFileWriter(outio, false, true, compressor, compressOutputFormat));
             }
 
-            LOG(MCdebugProgress, unknownJob, "Start pulling to file: %s", localFilename.str());
-
             //Find the last partition entry that refers to the same file.
-            if (!compressOutput)
+            const auto & fsProperties = outputFilename.queryFileSystemProperties();
+            if (!compressOutput() && fsProperties.preExtendOutput)
             {
                 PartitionPoint & lastChunk = partition.item(queryLastOutput(curOutput));
                 if (lastChunk.outputLength)
                 {
                     char null = 0;
                     offset_t lastOffset = lastChunk.outputOffset+lastChunk.outputLength;
+                    stat_type prevWrites = outio->getStatistic(StNumDiskWrites);
                     outio->write(lastOffset-sizeof(null),sizeof(null),&null);
-                    LOG(MCdebugProgress, unknownJob, "Extend length of target file to %" I64F "d", lastOffset);
+                    curProgress.numWrites += (outio->getStatistic(StNumDiskWrites)-prevWrites);
+                    if (doTrace(traceSprayDetails))
+                        LOG(MCdebugProgress, "Extend length of target file to %" I64F "d", lastOffset);
                 }
             }
 
-            out.setown(createIOStream(outio));
+            if (out)
+                out->close();
+            createOutputStream(outio);
             out->seek(0, IFSbegin);
             wrapOutInCRC(0);
 
@@ -882,7 +1324,10 @@ processedProgress:
     }
 
     crcOut.clear();
+    if (out)
+        out->close();
     out.clear();
+
     //Once the transfers have completed, rename the files, and sync file times
     //if replicating...
     if (!isSafeMode)
@@ -893,15 +1338,17 @@ processedProgress:
         {
             PartitionPoint & curPartition = partition.item(i);
             OutputProgress & curProgress = progress.item(i);
+            const RemoteFilename & outputFilename = curPartition.outputName;
             if (curPartition.whichOutput != prevOutput)
             {
                 if (curProgress.status != OutputProgress::StatusRenamed)
                 {
-                    //rename the files..
-                    renameDfuTempToFinal(curPartition.outputName);
+                    StringBuffer filePath;
+                    curPartition.outputName.getPath(filePath);
+                    if (getRenameSupportedFromPath(filePath))
+                        renameDfuTempToFinal(curPartition.outputName);
 
                     OwnedIFile output = createIFile(curPartition.outputName);
-
                     if (fileUmask != -1)
                         output->setFilePermissions(~fileUmask&0666);
 
@@ -915,22 +1362,23 @@ processedProgress:
                     }
                     else if (!curPartition.modifiedTime.isNull())
                     {
-                        OwnedIFile output = createIFile(curPartition.outputName);
                         output->setTime(&curPartition.modifiedTime, &curPartition.modifiedTime, NULL);
                     }
                     else
                         output->getTime(NULL, &curProgress.resultTime, NULL);
 
-                    //Notify the master that the file has been renamed - and send the modified time.
-                    msg.setEndian(__BIG_ENDIAN);
-                    curProgress.status = OutputProgress::StatusRenamed;
-                    if (compressOutput)
+                    if (compressOutput())
                     {
                         curProgress.compressedPartSize = output->size();
                         curProgress.hasCompressed = true;
                     }
+
+                    //Notify the master that the file has been renamed - and send the modified time.
+                    msg.setEndian(__BIG_ENDIAN);
+                    curProgress.status = OutputProgress::StatusRenamed;
                     curProgress.serializeCore(msg.clear().append(false));
                     curProgress.serializeExtra(msg, 1);
+                    curProgress.serializeExtra(msg, 2);
                     if (!catchWriteBuffer(masterSocket, msg))
                         throwError(RFSERR_TimeoutWaitMaster);
                 }
@@ -958,29 +1406,30 @@ bool TransferServer::push()
             getDfuTempName(outFilename, curPartition.outputName);
 
             OwnedIFile output = createIFile(outFilename);
-            OwnedIFileIO outio = output->openShared(compressOutput?IFOreadwrite:IFOwrite,IFSHfull);
+            OwnedIFileIO outio = output->openShared(compressOutput()?IFOreadwrite:IFOwrite,IFSHfull);
             if (!outio)
             {
                 StringBuffer outputPath;
                 outFilename.getRemotePath(outputPath);
                 throwError1(DFTERR_CouldNotCreateOutput, outputPath.str());
             }
-            if (compressOutput) {
+            if (compressOutput()) {
                 Owned<ICompressor> compressor;
                 if (!encryptKey.isEmpty()) {
                     StringBuffer key;
                     decrypt(key,encryptKey);
                     compressor.setown(createAESCompressor256(key.length(),key.str()));
                 }
-                outio.setown(createCompressedFileWriter(outio, false, 0, true, compressor, COMPRESS_METHOD_LZW));
+                outio.setown(createCompressedFileWriter(outio, false, true, compressor, compressOutputFormat));
             }
-            out.setown(createIOStream(outio));
-            if (!compressOutput)
+
+            createOutputStream(outio);
+            if (!compressOutput())
                 out->seek(curPartition.outputOffset + curProgress.outputLength, IFSbegin);
             wrapOutInCRC(curProgress.outputCRC);
 
             transferChunk(idx);
-            if (compressOutput)
+            if (compressOutput())
             {
                 //Notify the master that the file compressed and its new size
                 curProgress.compressedPartSize = output->size();
@@ -988,6 +1437,7 @@ bool TransferServer::push()
                 sendProgress(curProgress);
             }
             crcOut.clear();
+            out->close();
             out.clear();
         }
     }

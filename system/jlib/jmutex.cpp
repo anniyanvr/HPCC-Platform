@@ -20,6 +20,7 @@
 #include "jsuperhash.hpp"
 #include "jmisc.hpp"
 #include "jfile.hpp"
+#include "jerror.hpp"
 
 #include <stdio.h>
 #include <assert.h>
@@ -27,36 +28,43 @@
 //===========================================================================
 #ifndef _WIN32
 
-Mutex::Mutex()
+LegacyMutex::LegacyMutex([[maybe_unused]] const char *syncName)
 {
     pthread_mutex_init(&mutex, NULL);
     pthread_cond_init(&lock_free, NULL);
     owner = 0;
     lockcount = 0;
+#ifdef PROTRACE_LOCKS
+    if (syncName)
+        syncid = protrace::note_lock(syncName);
+#endif
 }
 
-Mutex::~Mutex()
+LegacyMutex::~LegacyMutex()
 {
     pthread_cond_destroy(&lock_free);
     pthread_mutex_destroy(&mutex);
 }
 
-void Mutex::lock()
+void LegacyMutex::lock()
 {
+    noteEvent(EventLockWait);
     pthread_mutex_lock(&mutex);
     while ((owner!=0) && !pthread_equal(owner, pthread_self()))
         pthread_cond_wait(&lock_free, &mutex);
     if (lockcount++==0)
         owner = pthread_self();
     pthread_mutex_unlock(&mutex);
+    noteEvent(EventLockAcquire);
 }
 
-bool Mutex::lockWait(unsigned timeout)
+bool LegacyMutex::lockWait(unsigned timeout)
 {
     if (timeout==(unsigned)-1) {
         lock();
         return true;
     }
+    noteEvent(EventLockWait);
     pthread_mutex_lock(&mutex);
     bool first=true;
     while ((owner!=0) && !pthread_equal(owner, pthread_self())) {
@@ -67,16 +75,18 @@ bool Mutex::lockWait(unsigned timeout)
         }
         if (pthread_cond_timedwait(&lock_free, &mutex, &abs)==ETIMEDOUT) {
             pthread_mutex_unlock(&mutex);
+            noteEvent(EventLockWaitTimeout);
             return false;
         }
     }
     if (lockcount++==0)
         owner = pthread_self();
     pthread_mutex_unlock(&mutex);
+    noteEvent(EventLockAcquire);
     return true;
 }
 
-void Mutex::unlock()
+void LegacyMutex::unlock()
 {
     pthread_mutex_lock(&mutex);
 #ifdef _DEBUG
@@ -88,10 +98,13 @@ void Mutex::unlock()
         pthread_cond_signal(&lock_free);
     }
     pthread_mutex_unlock(&mutex);
+    noteEvent(EventLockRelease);
 }
 
-void Mutex::lockAll(int count)
+void LegacyMutex::lockAll(int count)
 {
+    //MORE: I have no idea what events to record here - only used by Monitor
+    // which is only used by TaskQueue, which is barely used.
     if (count) {
         pthread_mutex_lock(&mutex);
         while ((owner!=0) && !pthread_equal(owner, pthread_self()))
@@ -102,7 +115,7 @@ void Mutex::lockAll(int count)
     }
 }
 
-int Mutex::unlockAll()
+int LegacyMutex::unlockAll()
 {
     pthread_mutex_lock(&mutex);
     int ret = lockcount;
@@ -117,9 +130,6 @@ int Mutex::unlockAll()
     pthread_mutex_unlock(&mutex);
     return ret;
 }
-
-
-
 
 inline bool read_data(int fd, void *buf, size_t nbytes) 
 {
@@ -147,7 +157,7 @@ inline bool write_data(int fd, const void *buf, size_t nbytes)
     return true;
 }
 
-#define POLLTIME (1000*15)
+constexpr unsigned MUTEX_POLLTIME=(1000*15);
 
 static bool lock_file(const char *lfpath) 
 {
@@ -200,22 +210,27 @@ static void unlock_file(const char *lfpath)
     IERRLOG("NamedMutex cannot unlock file (%d)",errno);
 }
 
-static CriticalSection lockPrefixCS;
+static CriticalSection lockPrefixCS(SYNC_LOCATION);
 static StringBuffer lockPrefix;
-NamedMutex::NamedMutex(const char *name)
+NamedMutex::NamedMutex([[maybe_unused]] const char *syncName, const char *name)
 {
+#ifdef PROTRACE_LOCKS
+    if (syncName)
+        syncid = protrace::note_lock(syncName);
+#endif
     {
         CriticalBlock b(lockPrefixCS);
         if (0 == lockPrefix.length())
         {
-            if (!getConfigurationDirectory(NULL, "lock", NULL, NULL, lockPrefix))
+            if (getConfigurationDirectory(NULL, "lock", NULL, NULL, lockPrefix))
+                addPathSepChar(lockPrefix);
+            else
                 WARNLOG("Failed to get lock directory from environment");
+            lockPrefix.append("JLIBMUTEX_");
         }
-        addPathSepChar(lockPrefix);
-        lockPrefix.append("JLIBMUTEX_");
     }
     StringBuffer tmp(lockPrefix);
-    tmp.append("JLIBMUTEX_").append(name);
+    tmp.append(name);
     mutexfname = tmp.detach();
 }
 
@@ -226,35 +241,47 @@ NamedMutex::~NamedMutex()
 
 void NamedMutex::lock()
 {
+    noteEvent(EventLockWait);
     // first lock locally
     threadmutex.lock();
     // then lock globally
     for (;;) {
         if (lock_file(mutexfname))
+        {
+            noteEvent(EventLockAcquire);
             return;
-        Sleep(POLLTIME);
+        }
+        Sleep(MUTEX_POLLTIME);
     }
 }
 
 bool NamedMutex::lockWait(unsigned timeout)
 {
+    noteEvent(EventLockWait);
     unsigned t = msTick();
     // first lock locally
     if (!threadmutex.lockWait(timeout))
+    {
+        noteEvent(EventLockWaitTimeout);
         return false;
+    }
     // then lock globally
     for (;;) {
         if (lock_file(mutexfname))
+        {
+            noteEvent(EventLockAcquire);
             return true;
+        }
         unsigned elapsed = msTick()-t;
         if (elapsed>=timeout) {
             threadmutex.unlock();
             break;
         }
-        Sleep((timeout-elapsed)>POLLTIME?POLLTIME:(timeout-elapsed));
+        Sleep((timeout-elapsed)>MUTEX_POLLTIME ? MUTEX_POLLTIME : (timeout-elapsed));
     }
-    return false;
 
+    noteEvent(EventLockWaitTimeout);
+    return false;
 }
 
 void NamedMutex::unlock()
@@ -262,15 +289,29 @@ void NamedMutex::unlock()
     // assumed held
     unlock_file(mutexfname);
     threadmutex.unlock();
+    noteEvent(EventLockRelease);
 }
-
-
-
 #endif
 
-void synchronized::throwLockException(unsigned timeout)
+bool TimedMutex::lockWait(unsigned timeout)
 {
-    throw MakeStringException(0,"Can not lock - %d",timeout);
+    if (timeout==(unsigned)-1) {
+        lock();
+        return true;
+    }
+    noteEvent(EventLockWait);
+    std::chrono::milliseconds ms(timeout);
+    bool locked = mutex.try_lock_for(ms);
+    if (locked)
+        noteEvent(EventLockAcquire);
+    else
+        noteEvent(EventLockWaitTimeout);
+    return locked;
+}
+
+void TimedMutexBlock::throwLockException(unsigned timeout)
+{
+    throw MakeStringException(JLIBERR_SystemCanNotLockD,"Can not lock - %d",timeout);
 }
 
 
@@ -279,14 +320,14 @@ void synchronized::throwLockException(unsigned timeout)
 
 void Monitor::wait()
 {
-    assertex(owner==GetCurrentThreadId());
+    assertex(mutex.owner==GetCurrentThreadId());
     waiting++;
     void *cur = last;
     last = &cur;
     while (1) {
-        int locked = unlockAll();
+        int locked = mutex.unlockAll();
         sem->wait();
-        lockAll(locked);
+        mutex.lockAll(locked);
         if (cur==NULL) { // i.e. first in
             void **p=(void **)&last;
             while (*p!=&cur)
@@ -300,7 +341,7 @@ void Monitor::wait()
 
 void Monitor::notify()
 {   // should always be locked
-    assertex(owner==GetCurrentThreadId());
+    assertex(mutex.owner==GetCurrentThreadId());
     if (waiting)
     {
         waiting--;
@@ -310,7 +351,7 @@ void Monitor::notify()
 
 void Monitor::notifyAll()
 {   // should always be locked
-    assertex(owner==GetCurrentThreadId());
+    assertex(mutex.owner==GetCurrentThreadId());
     if (waiting)
     {
         sem->signal(waiting);
@@ -320,46 +361,8 @@ void Monitor::notifyAll()
 
 //==================================================================================
 
-#ifdef USE_PTHREAD_RWLOCK
-
-bool ReadWriteLock::lockRead(unsigned timeout)
-{
-    if (timeout == (unsigned)-1)
-    {
-        lockRead();
-        return true;
-    }
-
-    if (pthread_rwlock_tryrdlock(&rwlock) == 0)
-        return true;
-
-    timespec endtime;
-    getEndTime(endtime, timeout);
-    return (pthread_rwlock_timedrdlock(&rwlock, &endtime) == 0);
-}
-
-bool ReadWriteLock::lockWrite(unsigned timeout)
-{
-    if (timeout == (unsigned)-1)
-    {
-        lockWrite();
-        return true;
-    }
-
-    if (pthread_rwlock_trywrlock(&rwlock) == 0)
-        return true;
-
-    timespec endtime;
-    getEndTime(endtime, timeout);
-    return (pthread_rwlock_timedwrlock(&rwlock, &endtime) == 0);
-}
-
-#endif
-
-//==================================================================================
-
 #ifdef USECHECKEDCRITICALSECTIONS
-CheckedReadLockBlock::CheckedReadLockBlock(ReadWriteLock &l, unsigned timeout, const char *fname,unsigned lnum) : lock(l)
+CheckedReadLockBlock::CheckedReadLockBlock(TimedReadWriteLock &l, unsigned timeout, const char *fname,unsigned lnum) : lock(l)
 {
     for (;;)
     {
@@ -370,7 +373,7 @@ CheckedReadLockBlock::CheckedReadLockBlock(ReadWriteLock &l, unsigned timeout, c
     }
 }
 
-CheckedWriteLockBlock::CheckedWriteLockBlock(ReadWriteLock &l, unsigned timeout, const char *fname,unsigned lnum) : lock(l)
+CheckedWriteLockBlock::CheckedWriteLockBlock(TimedReadWriteLock &l, unsigned timeout, const char *fname,unsigned lnum) : lock(l)
 {
     for (;;)
     {
@@ -381,7 +384,7 @@ CheckedWriteLockBlock::CheckedWriteLockBlock(ReadWriteLock &l, unsigned timeout,
     }
 }
 
-void checkedReadLockEnter(ReadWriteLock &lock, unsigned timeout, const char *fname, unsigned lnum)
+void checkedReadLockEnter(TimedReadWriteLock &lock, unsigned timeout, const char *fname, unsigned lnum)
 {
     for (;;)
     {
@@ -392,7 +395,7 @@ void checkedReadLockEnter(ReadWriteLock &lock, unsigned timeout, const char *fna
     }
 }
 
-void checkedWriteLockEnter(ReadWriteLock &lock, unsigned timeout, const char *fname, unsigned lnum)
+void checkedWriteLockEnter(TimedReadWriteLock &lock, unsigned timeout, const char *fname, unsigned lnum)
 {
     for (;;)
     {
@@ -466,18 +469,15 @@ void ThreadYield()
 #endif
 }
 
-void spinUntilReady(atomic_t &value)
+void ThreadYieldNonRR()
 {
-    unsigned i = 0;
-    const unsigned maxSpins = 10;
-    while (atomic_read(&value))
-    {
-        if (i++ == maxSpins)
-        {
-            i = 0;
-            ThreadYield();
-        }
-    }
+    // Does not work for SCHED_RR threads - see ThreadYield() above.
+    // Only call where that is guaranteed (e.g. application code, not within library)
+#ifdef _WIN32
+    Sleep(0);
+#else
+    sched_yield();
+#endif
 }
 
 void spinUntilReady(std::atomic_uint &value)

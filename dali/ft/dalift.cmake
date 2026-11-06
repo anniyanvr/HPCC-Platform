@@ -25,26 +25,33 @@ project( dalift )
 
 set (    SRCS 
          daft.cpp 
-         daftdir.cpp 
          daftformat.cpp 
          daftmc.cpp 
          daftprogress.cpp 
-         daftsize.cpp 
          filecopy.cpp 
          ftbase.cpp 
          fttransform.cpp 
     )
 
 include_directories ( 
-         ./../../common/remote 
-         ./../../fs/dafsclient
-         ./../../system/mp 
-         ./../base 
-         ./../../system/include 
-         ./../../system/jlib 
-         ./../../common/environment
-         ./../../system/security/shared
+         ${HPCC_SOURCE_DIR}/common/remote
+         ${HPCC_SOURCE_DIR}/dali/base
+         ${HPCC_SOURCE_DIR}/common/deftype
+         ${HPCC_SOURCE_DIR}/ecl/hql
+         ${HPCC_SOURCE_DIR}/fs/dafsclient
+         ${HPCC_SOURCE_DIR}/rtl/eclrtl
+         ${HPCC_SOURCE_DIR}/rtl/include
+         ${HPCC_SOURCE_DIR}/system/jhtree
+         ${HPCC_SOURCE_DIR}/system/jlib
+         ${HPCC_SOURCE_DIR}/system/include
+         ${HPCC_SOURCE_DIR}/system/mp
+         ${HPCC_SOURCE_DIR}/system/security/shared
+         ${HPCC_SOURCE_DIR}/testing/unittests
     )
+
+if (NOT CONTAINERIZED)
+    include_directories ( ${HPCC_SOURCE_DIR}/common/environment )
+endif()
 
 HPCC_ADD_LIBRARY( dalift SHARED ${SRCS} )
 set_target_properties (dalift PROPERTIES 
@@ -52,12 +59,20 @@ set_target_properties (dalift PROPERTIES
     DEFINE_SYMBOL DALIFT_EXPORTS
     )
 install ( TARGETS dalift RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( dalift 
+target_link_libraries ( dalift PRIVATE 
          jlib
+         eclrtl
+         jhtree
+         hql
          mp 
          hrpc 
          dafsclient
          dalibase 
-         environment 
+         remote
+         ${CppUnit_LIBRARIES}
     )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( dalift PRIVATE environment )
+endif()
 

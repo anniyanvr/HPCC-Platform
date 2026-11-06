@@ -64,7 +64,12 @@ static IHqlExpression * optimizedReplaceSelector(IHqlExpression * expr, IHqlExpr
                     IHqlExpression * newField = lookupNewSelectedField(newDataset, field);
 
                     if (newDataset->getOperator() == no_newrow)
-                        return createNewSelectExpr(LINK(newDataset->queryChild(0)), newField);
+                    {
+                        IHqlExpression * newRow = newDataset->queryChild(0);
+                        if ((newRow->getOperator() == no_select) && !newRow->isDataset())
+                           return createSelectExpr(LINK(newRow), newField);
+                        return createNewSelectExpr(LINK(newRow), newField);
+                    }
 
                     if (newDataset->getOperator() == no_activerow)
                         newDataset = newDataset->queryChild(0);
@@ -360,6 +365,12 @@ void NewProjectMapper2::initSelf(IHqlExpression * dataset)
 bool NewProjectMapper2::isMappingKnown()
 {
     return ensureMapping();
+}
+
+bool NewProjectMapper2::mappingCanFilter() const
+{
+    assertex(mapping);
+    return transformContainsSkip(mapping);
 }
 
 void NewProjectMapper2::setRecord(IHqlExpression * record, IHqlExpression * selector)
@@ -666,7 +677,7 @@ IHqlExpression * NewProjectMapper2::doExpandFields(IHqlExpression * expr, IHqlEx
             if (numNonHidden == 0)
                 numNonHidden = max;
             HqlExprArray args;
-            args.ensure(max);
+            args.ensureCapacity(max);
             bool same = true;
             for (unsigned idx=0; idx < max; idx++)
             {
@@ -806,7 +817,7 @@ IHqlExpression * NewProjectMapper2::doCollapseFields(IHqlExpression * expr, IHql
     if (numNonHidden == 0)
         numNonHidden = max;
     HqlExprArray args;
-    args.ensure(max);
+    args.ensureCapacity(max);
     bool same = true;
     for (unsigned idx=0; idx < max; idx++)
     {

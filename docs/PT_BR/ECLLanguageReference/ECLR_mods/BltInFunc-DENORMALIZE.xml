@@ -229,7 +229,7 @@
 
     <para>Exemplo da forma 1:</para>
 
-    <programlisting>NormRec := RECORD
+    <programlisting lang="ECL_Runnable">NormRec := RECORD
   STRING20  thename;
   STRING20  addr;
 END;
@@ -266,7 +266,7 @@ OUTPUT(DeNormedRecs);
 
     <para>Exemplo da forma 2:</para>
 
-    <programlisting>NormRec := RECORD
+    <programlisting lang="ECL_Runnable">NormRec := RECORD
   STRING20  thename;
   STRING20  addr;
 END;
@@ -299,7 +299,14 @@ OUTPUT(DeNormedRecs);
 
     <para>Exemplo NOSORT:</para>
 
-    <programlisting>
+    <programlisting lang="ECL_Runnable">MyRec := RECORD
+  STRING1 Value1;
+  STRING1 Value2;
+END;
+ParentFile := DATASET([{'A','C'},{'B','B'},{'C','A'}],MyRec);
+ChildFile  := DATASET([{'A','Z'},{'A','T'},{'B','S'},{'B','Y'},
+                       {'C','X'},{'C','W'}],MyRec);
+MyOutRec := RECORD
   ParentFile.Value1;
   ParentFile.Value2;
   STRING1 CVal2_1 := '';
@@ -324,8 +331,9 @@ OUTPUT(DeNormedRecs);
 </programlisting>
 
     <para>Ver também: <link linkend="JOIN">JOIN</link>, <link
-    linkend="TRANSFORM_Structure">Estrutura TRANSFORM</link>, <link
-    linkend="RECORD_Structure">Estrutura RECORD</link>, <link
+    linkend="TRANSFORM_Structure">TRANSFORM Structure</link>, <link
+    linkend="RECORD_Structure">RECORD Structure</link>, <link
     linkend="NORMALIZE">NORMALIZE</link></para>
+
   </sect2>
 </sect1>

@@ -39,14 +39,17 @@ include_directories (
          ${CMAKE_BINARY_DIR}/oss
     )
 
+SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STRICT_CXX_FLAGS}")
+
 ADD_DEFINITIONS( -DNO_SYBASE -D_CONSOLE )
 
 HPCC_ADD_EXECUTABLE ( hthor ${SRCS} )
 install ( TARGETS hthor RUNTIME DESTINATION ${EXEC_DIR} )
-target_link_libraries ( hthor
+target_link_libraries ( hthor PRIVATE
+      jlib
       hthorlib
       wuanalysis
-      ${CPPUNIT_LIBRARIES}
+      ${CppUnit_LIBRARIES}
     )
 
 Install ( PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/start_eclagent DESTINATION ${EXEC_DIR} COMPONENT Runtime )

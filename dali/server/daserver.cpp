@@ -18,7 +18,6 @@
 #include <unordered_map>
 #include <string>
 
-#include "build-config.h"
 #include "platform.h"
 #include "thirdparty.h"
 #include "jlib.hpp"
@@ -26,6 +25,7 @@
 #include "jptree.hpp"
 #include "jmisc.hpp"
 #include "jutil.hpp"
+#include "jmetrics.hpp"
 
 #include "mpbase.hpp"
 #include "mpcomm.hpp"
@@ -55,14 +55,12 @@
 #include "daldap.hpp"
 #endif
 
-
-
 Owned<IPropertyTree> serverConfig;
 static IArrayOf<IDaliServer> servers;
 static CriticalSection *stopServerCrit;
 MODULE_INIT(INIT_PRIORITY_DALI_DASERVER)
 {
-    stopServerCrit = new CriticalSection;
+    stopServerCrit = new CriticalSection(SYNC_LOCATION);
     return true;
 }
 MODULE_EXIT()
@@ -75,22 +73,16 @@ MODULE_EXIT()
 #define DEFAULT_PERF_REPORT_DELAY 60
 #define DEFAULT_MOUNT_POINT "/mnt/dalimirror/"
 
-void setMsgLevel(ILogMsgHandler * fileMsgHandler, unsigned level)
-{
-    ILogMsgFilter *filter = getSwitchLogMsgFilterOwn(getComponentLogMsgFilter(3), getCategoryLogMsgFilter(MSGAUD_all, MSGCLS_all, level, true), getDefaultLogMsgFilter());
-    queryLogMsgManager()->changeMonitorFilter(queryStderrLogMsgHandler(), filter);
-    queryLogMsgManager()->changeMonitorFilterOwn(fileMsgHandler, filter);
-}
-
 void AddServers(const char *auditdir)
 {
     // order significant
     servers.append(*createDaliSessionServer());
     servers.append(*createDaliPublisherServer());
-    servers.append(*createDaliSDSServer(serverConfig));
+    servers.append(*createDaliSDSServer());
     servers.append(*createDaliNamedQueueServer());
-    servers.append(*createDaliDFSServer(serverConfig));
-    servers.append(*createDaliAuditServer(auditdir));
+    servers.append(*createDaliDFSServer());
+    if (!isContainerized()) // NB: audit logging is output locally by the container in containerized mode (and picked up by a logging backend)
+        servers.append(*createDaliAuditServer(auditdir));
     servers.append(*createDaliDiagnosticsServer());
     // add new coven servers here
 }
@@ -104,22 +96,23 @@ static void stopServer()
     ForEachItemInRev(h,servers)
     {
         IDaliServer &server=servers.item(h);
-        LOG(MCprogress, unknownJob, "Suspending %d",h);
+        LOG(MCprogress, "Suspending %d",h);
         server.suspend();
     }
     ForEachItemInRev(i,servers)
     {
         IDaliServer &server=servers.item(i);
-        LOG(MCprogress, unknownJob, "Stopping %d",i);
+        LOG(MCprogress, "Stopping %d",i);
         server.stop();
     }
     closeCoven();
+    stopLogMsgReceivers(); //MORE: deprecated feature, not used by any new clients, remove once all deployed clients that depend on it are upgraded
+    stopMPServer();
     ForEachItemInRev(j,servers)
     {
         servers.remove(j);      // ensure correct order for destruction
     }
-    stopLogMsgReceivers(); //MORE: deprecated feature, not used by any new clients, remove once all deployed clients that depend on it are upgraded
-    stopMPServer();
+    protraceOnTerminate();
 }
 
 bool actionOnAbort()
@@ -184,8 +177,6 @@ static IPropertyTree *getSecMgrPluginPropTree(const IPropertyTree *configTree)
  */
 static bool populateAllowListFromEnvironment(IAllowListWriter &writer)
 {
-    if (isContainerized())
-        return false;
     Owned<IRemoteConnection> conn = querySDS().connect("/Environment", 0, 0, INFINITE);
     assertex(conn);
     if (!conn->queryRoot()->hasProp("Software/DaliServerProcess"))
@@ -228,7 +219,7 @@ static bool populateAllowListFromEnvironment(IAllowListWriter &writer)
         IpAddress ip(it->second.c_str());
         if (ip.isNull())
             return defaultValue;
-        return ip.getIpText(result);
+        return ip.getHostText(result);
     };
     auto addRoles = [&writer, &resolveComputer](const IPropertyTree &component, const std::initializer_list<unsigned __int64> &roles)
     {
@@ -372,7 +363,7 @@ static bool populateAllowListFromEnvironment(IAllowListWriter &writer)
                 if (!ip.isNull())
                 {
                     StringBuffer ipStr;
-                    ip.getIpText(ipStr);
+                    ip.getHostText(ipStr);
                     ForEachItemIn(r, roles)
                     {
                         const char *roleStr = roles.item(r);
@@ -396,15 +387,62 @@ static StringBuffer &formatDaliRole(StringBuffer &out, unsigned __int64 role)
     return out.append(queryRoleName((DaliClientRole)role));
 }
 
+#ifdef _CONTAINERIZED
+static IPropertyTree * getContainerLDAPConfiguration(const IPropertyTree *appConfig)
+{
+    const char * authMethod = appConfig->queryProp("@auth");
+    if (streq(authMethod, "none"))
+    {
+        WARNLOG("ECLWatch is unsafe, no security manager specified in configuration (auth: none)");
+        return nullptr; //no security manager
+    }
+
+    if (!streq(authMethod, "ldap"))
+    {
+        throw makeStringExceptionV(-1, "Unrecognized auth method specified, (auth: %s)", authMethod);
+    }
+
+    //Get default LDAP attributes from ldap.yaml
+    StringBuffer ldapDefaultsFile(hpccBuildInfo.componentDir);
+    char sepchar = getPathSepChar(ldapDefaultsFile.str());
+    addPathSepChar(ldapDefaultsFile, sepchar).append("applications").append(sepchar).append("common").append(sepchar).append("ldap").append(sepchar).append("ldap.yaml");
+    Owned<IPropertyTree> defaults;
+    if (!checkFileExists(ldapDefaultsFile))
+    {
+        throw makeStringExceptionV(-1, "Unable to locate LDAP defaults file '%s'", ldapDefaultsFile.str());
+    }
+    defaults.setown(createPTreeFromYAMLFile(ldapDefaultsFile.str()));
+
+    //Build merged configuration
+    Owned<IPropertyTree> mergedConfig = defaults->getPropTree("ldap");
+    mergeConfiguration(*mergedConfig, *appConfig->queryPropTree("ldap"));
+
+    return LINK(mergedConfig);
+}
+#endif
+
 static constexpr const char * defaultYaml = R"!!(
 version: 1.0
 dali:
   name: dali
   dataPath: "/var/lib/HPCCSystems/dalistorage"
-  logging:
-    detail: 100
 )!!";
 
+//
+// Initialize metrics
+static void initializeMetrics(IPropertyTree *pConfig)
+{
+    //
+    // Initialize metrics if present
+    Owned<IPropertyTree> pMetricsTree = pConfig->getPropTree("metrics");
+    if (pMetricsTree != nullptr)
+    {
+        PROGLOG("Metrics initializing...");
+        hpccMetrics::MetricsManager &metricsManager = hpccMetrics::queryMetricsManager();
+        metricsManager.init(pMetricsTree);
+        metricsManager.startCollecting();
+    }
+}
 
 int main(int argc, const char* argv[])
 {
@@ -426,73 +464,70 @@ int main(int argc, const char* argv[])
         serverConfig.setown(loadConfiguration(defaultYaml, argv, "dali", "DALI", DALICONF, nullptr));
         Owned<IFile> sentinelFile = createSentinelTarget();
         removeSentinelFile(sentinelFile);
-#ifndef _CONTAINERIZED
+        StringBuffer dataPath;
+        StringBuffer mirrorPath;
+        if (isContainerized())
+        {
+            port = serverConfig->getPropInt("service/@port");
+            setupContainerizedLogMsgHandler();
 
-        for (unsigned i=1;i<(unsigned)argc;i++) {
-            if (streq(argv[i],"--daemon") || streq(argv[i],"-d")) {
-                if (daemon(1,0) || write_pidfile(argv[++i])) {
-                    perror("Failed to daemonize");
+            serverConfig->getProp("@dataPath", dataPath);
+            /* NB: mirror settings are unlikely to be used in a container setup
+            If detected, set in to legacy location under sds/ for backward compatibility */
+            serverConfig->getProp("@remoteBackupLocation", mirrorPath);
+            if (mirrorPath.length())
+                serverConfig->setProp("sds/@remoteBackupLocation", mirrorPath);
+        }
+        else
+        {
+            port = serverConfig->getPropInt("@port");
+            if (!checkCreateDaemon(argc, argv))
+                return EXIT_FAILURE;
+
+            for (unsigned i=1;i<(unsigned)argc;i++) {
+                if (streq(argv[i],"--daemon") || streq(argv[i],"-d")) {
+                    i++; // consumed within checkCreateDaemon(), bump up here
+                }
+                else if (streq(argv[i],"--server") || streq(argv[i],"-s"))
+                    server = argv[++i];
+                else if (streq(argv[i],"--port") || streq(argv[i],"-p"))
+                    port = atoi(argv[++i]);
+                else if (streq(argv[i],"--rank") || streq(argv[i],"-r"))
+                    myrank = atoi(argv[++i]);
+                else if (!startsWith(argv[i],"--config"))
+                {
+                    usage();
                     return EXIT_FAILURE;
                 }
             }
-            else if (streq(argv[i],"--server") || streq(argv[i],"-s"))
-                server = argv[++i];
-            else if (streq(argv[i],"--port") || streq(argv[i],"-p"))
-                port = atoi(argv[++i]);
-            else if (streq(argv[i],"--rank") || streq(argv[i],"-r"))
-                myrank = atoi(argv[++i]);
-            else if (!startsWith(argv[i],"--config"))
-            {
-                usage();
-                return EXIT_FAILURE;
-            }
-        }
-#endif
-
-#ifndef _CONTAINERIZED
-        ILogMsgHandler * fileMsgHandler;
-        {
             Owned<IComponentLogFileCreator> lf = createComponentLogFileCreator(serverConfig, "dali");
             lf->setLogDirSubdir("server");//add to tail of config log dir
             lf->setName("DaServer");//override default filename
-            fileMsgHandler = lf->beginLogging();
-        }
-#else
-        setupContainerizedLogMsgHandler();
-#endif
-        PROGLOG("Build %s", BUILD_TAG);
+            lf->setLocal(true); //only messages from this process should be sent to the server log file
+            lf->beginLogging();
 
-        StringBuffer dataPath;
-        StringBuffer mirrorPath;
-#ifdef _CONTAINERIZED
-        serverConfig->getProp("@dataPath", dataPath);
-        /* NB: mirror settings are unlikely to be used in a container setup
-           If detected, set in to legacy location under SDS/ for backward compatibility */
-        serverConfig->getProp("@remoteBackupLocation", mirrorPath);
-        if (mirrorPath.length())
-            serverConfig->setProp("SDS/@remoteBackupLocation", mirrorPath);
-#else
-        if (getConfigurationDirectory(serverConfig->queryPropTree("Directories"),"dali","dali",serverConfig->queryProp("@name"),dataPath))
-            serverConfig->setProp("@dataPath",dataPath.str());
-        else if (getConfigurationDirectory(serverConfig->queryPropTree("Directories"),"data","dali",serverConfig->queryProp("@name"),dataPath))
-            serverConfig->setProp("@dataPath",dataPath.str());
-        else
-            serverConfig->getProp("@dataPath",dataPath);
-        if (dataPath.length())
-        {
-            RemoteFilename rfn;
-            rfn.setRemotePath(dataPath);
-            if (!rfn.isLocal())
+            if (getConfigurationDirectory(serverConfig->queryPropTree("Directories"),"dali","dali",serverConfig->queryProp("@name"),dataPath))
+                serverConfig->setProp("@dataPath",dataPath.str());
+            else if (getConfigurationDirectory(serverConfig->queryPropTree("Directories"),"data","dali",serverConfig->queryProp("@name"),dataPath))
+                serverConfig->setProp("@dataPath",dataPath.str());
+            else
+                serverConfig->getProp("@dataPath",dataPath);
+            if (dataPath.length())
             {
-                OERRLOG("if a dataPath is specified, it must be on local machine");
-                return 0;
+                RemoteFilename rfn;
+                rfn.setRemotePath(dataPath);
+                if (!rfn.isLocal())
+                {
+                    OERRLOG("if a dataPath is specified, it must be on local machine");
+                    return 0;
+                }
             }
+            // JCSMORE remoteBackupLocation should not be a property of SDS section really.
+            if (!getConfigurationDirectory(serverConfig->queryPropTree("Directories"),"mirror","dali",serverConfig->queryProp("@name"),mirrorPath))
+                serverConfig->getProp("sds/@remoteBackupLocation",mirrorPath);
         }
-        // JCSMORE remoteBackupLocation should not be a property of SDS section really.
-        if (!getConfigurationDirectory(serverConfig->queryPropTree("Directories"),"mirror","dali",serverConfig->queryProp("@name"),mirrorPath))
-            serverConfig->getProp("SDS/@remoteBackupLocation",mirrorPath);
+        PROGLOG("Build %s", hpccBuildInfo.buildTag);
 
-#endif
         if (dataPath.length())
         {
             addPathSepChar(dataPath); // ensures trailing path separator
@@ -510,7 +545,7 @@ int main(int argc, const char* argv[])
                     StringBuffer backupURL;
                     if (mirrorPath.length()<=2 || !isPathSepChar(mirrorPath.charAt(0)) || !isPathSepChar(mirrorPath.charAt(1)))
                     { // local machine path, convert to url
-                        const char *backupnode = serverConfig->queryProp("SDS/@backupComputer");
+                        const char *backupnode = serverConfig->queryProp("sds/@backupComputer");
                         RemoteFilename rfn;
                         if (backupnode&&*backupnode) {
                             SocketEndpoint ep(backupnode);
@@ -527,13 +562,13 @@ int main(int argc, const char* argv[])
                         backupURL.append(mirrorPath);
                     recursiveCreateDirectory(backupURL.str());
                     addPathSepChar(backupURL);
-                    serverConfig->setProp("SDS/@remoteBackupLocation", backupURL.str());
+                    serverConfig->setProp("sds/@remoteBackupLocation", backupURL.str());
                     PROGLOG("Backup URL = %s", backupURL.str());
                 }
                 catch (IException *e)
                 {
                     EXCLOG(e, "Failed to create remote backup directory, disabling backups", MSGCLS_warning);
-                    serverConfig->removeProp("SDS/@remoteBackupLocation");
+                    serverConfig->removeProp("sds/@remoteBackupLocation");
                     mirrorPath.clear();
                     e->Release();
                 }
@@ -569,7 +604,7 @@ int main(int argc, const char* argv[])
                                 return 0;
                             }
                             else
-                                serverConfig->setProp("SDS/@remoteBackupLocation", mountPoint.str());
+                                serverConfig->setProp("sds/@remoteBackupLocation", mountPoint.str());
                             mirrorPath.clear().append(mountPoint);
                         }
                     }
@@ -578,6 +613,7 @@ int main(int argc, const char* argv[])
                     backupCheck.append("bakchk.").append((unsigned)GetCurrentProcessId());
                     OwnedIFile iFileDataDir = createIFile(backupCheck.str());
                     OwnedIFileIO iFileIO = iFileDataDir->open(IFOcreate);
+                    iFileIO->close();
                     iFileIO.clear();
                     try
                     {
@@ -616,15 +652,15 @@ int main(int argc, const char* argv[])
             catch (IException *e)
             {
                 StringBuffer s("Failure whilst preparing dali backup location: ");
-                LOG(MCoperatorError, unknownJob, e, s.append(mirrorPath).append(". Backup disabled").str());
-                serverConfig->removeProp("SDS/@remoteBackupLocation");
+                LOG(MCoperatorError, e, s.append(mirrorPath).append(". Backup disabled").str());
+                serverConfig->removeProp("sds/@remoteBackupLocation");
                 e->Release();
             }
         }
 
 #ifndef _CONTAINERIZED
         write_pidfile(serverConfig->queryProp("@name"));
-        NamedMutex globalNamedMutex("DASERVER");
+        NamedMutex globalNamedMutex(SYNC_LOCATION, "DASERVER");
         if (!serverConfig->getPropBool("allowMultipleDalis"))
         {
             PROGLOG("Checking for existing daserver instances");
@@ -639,7 +675,7 @@ int main(int argc, const char* argv[])
         SocketEndpointArray epa;
         if (!server)
         {
-            ep.setLocalHost(DALI_SERVER_PORT);
+            ep.setLocalHost(port ? port : DALI_SERVER_PORT);
             epa.append(ep);
         }
         else
@@ -653,11 +689,10 @@ int main(int argc, const char* argv[])
 
         unsigned short myport = epa.item(myrank).port;
         startMPServer(DCR_DaliServer, myport, true, true);
+#ifndef _CONTAINERIZED
         Owned<IMPServer> mpServer = getMPServer();
         Owned<IAllowListHandler> allowListHandler = createAllowListHandler(populateAllowListFromEnvironment, formatDaliRole);
         mpServer->installAllowListCallback(allowListHandler);
-#ifndef _CONTAINERIZED
-        setMsgLevel(fileMsgHandler, serverConfig->getPropInt("SDS/@msgLevel", 100));
 #endif
         startLogMsgChildReceiver();
         startLogMsgParentReceiver();
@@ -667,9 +702,10 @@ int main(int argc, const char* argv[])
         group->Release();
         epa.kill();
 
-// Audit logging
         StringBuffer auditDir;
+        if (!isContainerized()) // NB: audit logging is output locally by the container in containerized mode (and picked up by a logging backend)
         {
+            // Audit logging
             Owned<IComponentLogFileCreator> lf = createComponentLogFileCreator(serverConfig, "dali");
             lf->setLogDirSubdir("audit");//add to tail of config log dir
             lf->setName("DaAudit");//override default filename
@@ -677,13 +713,14 @@ int main(int argc, const char* argv[])
             lf->setMsgFields(MSGFIELD_timeDate | MSGFIELD_code | MSGFIELD_job);
             lf->setMsgAudiences(MSGAUD_audit);
             lf->setMaxDetail(TopDetail);
+            lf->setLocal(false); // include messages from all connected components
             lf->beginLogging();
             auditDir.set(lf->queryLogDir());
         }
 
 // SNMP logging
-        bool enableSNMP = serverConfig->getPropBool("SDS/@enableSNMP");
-        if (serverConfig->getPropBool("SDS/@enableSysLog",true))
+        bool enableSNMP = serverConfig->getPropBool("sds/@enableSNMP");
+        if (serverConfig->getPropBool("sds/@enableSysLog",true))
             UseSysLogForOperatorMessages();
         AddServers(auditDir.str());
         addAbortHandler(actionOnAbort);
@@ -728,7 +765,11 @@ int main(int argc, const char* argv[])
             }
             else
             {
-                setLDAPconnection(createDaliLdapConnection(serverConfig->getPropTree("Coven/ldapSecurity")));
+#ifdef _CONTAINERIZED
+                setLDAPconnection(createDaliLdapConnection(getContainerLDAPConfiguration(serverConfig)));//container configuration
+#else
+                setLDAPconnection(createDaliLdapConnection(serverConfig->getPropTree("Coven/ldapSecurity")));//legacy configuration
+#endif
             }
 #endif
         }
@@ -757,6 +798,7 @@ int main(int argc, const char* argv[])
         }
         if (ok) {
             writeSentinelFile(sentinelFile);
+            initializeMetrics(serverConfig);
             covenMain();
             removeAbortHandler(actionOnAbort);
         }

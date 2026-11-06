@@ -18,7 +18,11 @@
 #ifndef _PLATFORM_H_
 #define _PLATFORM_H_
 
-#define _TESTING // this should remain set for the near future
+#ifdef _DEBUG
+ #ifndef _TESTING
+  #define _TESTING
+ #endif
+#endif
 
 // **** Architecture detection ****
 // Ref: http://sourceforge.net/p/predef/wiki/Architectures/
@@ -84,11 +88,13 @@
 #ifndef __BIG_ENDIAN
 #define __BIG_ENDIAN 2
 #endif
+#ifndef __BYTE_ORDER
 #define __BYTE_ORDER __LITTLE_ENDIAN
+#endif
 
 typedef unsigned size32_t;
 
-#if (defined (__linux__) || defined (__FreeBSD__)  || defined (__APPLE__))
+#if (defined (__linux__) || defined (__FreeBSD__)  || defined (__APPLE__) || defined (__EMSCRIPTEN__))
 typedef __SIZE_TYPE__ memsize_t;
 #else
 typedef size_t memsize_t;
@@ -213,44 +219,47 @@ typedef unsigned long MaxCard;
 
 // MSVC 2008 in debug (perhaps other versions too) will throw exception if negative passed (see bug: #32013)
 #if (_MSC_VER>=1400) // >=vs2005
-#define strictmsvc_isalpha(c) isalpha(c)
-#define isalpha(c) isalpha((const unsigned char)(c))
 
-#define strictmsvc_isupper(c) isupper(c)
-#define isupper(c) isupper((const unsigned char)(c))
+//Defining overloaded versions of these functions is almost certainly undefined behaviour in the c++ standard.
+//However it causes fewer problems than the previous fix using macros to redefine the functions.
+#undef isalpha
+inline bool isalpha(char c) { return isalpha((int)(unsigned char)c); }
 
-#define strictmsvc_islower(c) islower(c)
-#define islower(c) islower((const unsigned char)(c))
+#undef isupper
+inline bool isupper(char c) { return isupper((int)(unsigned char)(c)); }
 
-#define strictmsvc_isdigit(c) isdigit(c)
-#define isdigit(c) isdigit((const unsigned char)(c))
+#undef islower
+inline bool islower(char c) { return islower((int)(unsigned char)(c)); }
 
-#define strictmsvc_isxdigit(c) isxdigit(c)
-#define isxdigit(c) isxdigit((const unsigned char)(c))
+#undef isdigit
+inline bool isdigit(char c) { return isdigit((int)(unsigned char)(c)); }
 
-#define strictmsvc_isspace(c) isspace(c)
-#define isspace(c) isspace((const unsigned char)(c))
+#undef isxdigit
+inline bool isxdigit(char c) { return isxdigit((int)(unsigned char)(c)); }
 
-#define strictmsvc_ispunct(c) ispunct(c)
-#define ispunct(c) ispunct((const unsigned char)(c))
+#undef isspace
+inline bool isspace(char c) { return isspace((int)(unsigned char)(c)); }
 
-#define strictmsvc_isalnum(c) isalnum(c)
-#define isalnum(c) isalnum((const unsigned char)(c))
+#undef ispunct
+inline bool ispunct(char c) { return ispunct((int)(unsigned char)(c)); }
 
-#define strictmsvc_isprint(c) isprint(c)
-#define isprint(c) isprint((const unsigned char)(c))
+#undef isalnum
+inline bool isalnum(char c) { return isalnum((int)(unsigned char)(c)); }
 
-#define strictmsvc_isgraph(c) isgraph(c)
-#define isgraph(c) isgraph((const unsigned char)(c))
+#undef isprint
+inline bool isprint(char c) { return isprint((int)(unsigned char)(c)); }
 
-#define strictmsvc_iscntrl(c) iscntrl(c)
-#define iscntrl(c) iscntrl((const unsigned char)(c))
+#undef isgraph
+inline bool isgraph(char c) { return isgraph((int)(unsigned char)(c)); }
 
-#define strictmsvc_tolower(c) tolower(c)
-#define tolower(c) tolower((const unsigned char)(c))
+#undef iscntrl
+inline bool iscntrl(char c) { return iscntrl((int)(unsigned char)(c)); }
 
-#define strictmsvc_toupper(c) toupper(c)
-#define toupper(c) toupper((const unsigned char)(c))
+#undef tolower
+inline int tolower(char c) { return tolower((int)(unsigned char)(c)); }
+
+#undef toupper
+inline int toupper(char c) { return toupper((int)(unsigned char)(c)); }
 
 #endif // (_MSC_VER>=1400)
 
@@ -273,10 +282,42 @@ inline int daemon(int, int) { return -1; }
 #define __cdecl
 
 
-#if defined(__linux__) || defined (__FreeBSD__)  || defined (__APPLE__)
+#if defined(__linux__) || defined (__FreeBSD__)  || defined (__APPLE__) || defined(__EMSCRIPTEN__)
 // **** START OF LINUX SPECIFIC SECTION ****
-#include <aio.h>
+#if not defined(__EMSCRIPTEN__)
+  #include <aio.h>
+#else
+  #include <utime.h>
+  #include <sys/types.h> // Include for off_t
+  #include <signal.h>    // Include for struct sigevent
+  struct aiocb
+  {
+    int aio_fildes;		/* File descriptor.  */
+    int aio_lio_opcode;		/* Operation to be performed.  */
+    int aio_reqprio;		/* Request priority offset.  */
+    volatile void *aio_buf;	/* Location of buffer.  */
+    size_t aio_nbytes;		/* Length of transfer.  */
+    struct sigevent aio_sigevent;	/* Signal number and value.  */
+
+    /* Internal members.  */
+    struct aiocb *__next_prio;
+    int __abs_prio;
+    int __policy;
+    int __error_code;
+    ssize_t __return_value;
+
+  #ifndef __USE_FILE_OFFSET64
+    __off_t aio_offset;		/* File offset.  */
+    char __pad[sizeof (__off64_t) - sizeof (__off_t)];
+  #else
+    off64_t aio_offset;		/* File offset.  */
+  #endif
+    char __glibc_reserved[32];
+  };
+#endif
+#ifndef __BYTE_ORDER
 #define __BYTE_ORDER __LITTLE_ENDIAN
+#endif
 #define _atoi64     atoll
 #define _lseek      lseek
 #define _llseek     ::lseek
@@ -308,6 +349,9 @@ typedef int socklen_t;
 #include <stdlib.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__EMSCRIPTEN__)
+extern "C" inline int daemon(int, int) { return -1; }
+#endif
 #include <fcntl.h>
 #include <string.h>
 #include <ctype.h>
@@ -343,7 +387,7 @@ typedef int socklen_t;
 #define _lclose     _close
 #define _lwrite     _write
 #define _lopen      _open
-#define DeleteFile(name)    (unlink(name)==0)
+inline bool DeleteFile(const char * name) { return unlink(name)==0; }
 #define wvsprintf   vsprintf
 #define _close      ::close
 #define _stat       stat
@@ -354,11 +398,7 @@ typedef int socklen_t;
 
 #define TRUE    1
 #define FALSE   0
-//#define false FALSE
-//#define true  TRUE
 #define HFILE   int
-//#define bool  unsigned char
-#define BOOL    bool
 #define UINT    unsigned int
 #define DWORD   unsigned long
 #define VOID    void
@@ -431,13 +471,17 @@ typedef int socklen_t;
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#if defined(__EMSCRIPTEN__)
+#include <errno.h>
+#else
 #include <sys/errno.h>
+#endif
 #include <sys/utsname.h>
 
 #if defined (__FreeBSD__) || defined (__APPLE__)
 #define MAP_ANONYMOUS MAP_ANON
 #endif
-#if defined(__FreeBSD__) || defined(__linux__) || defined(__CYGWIN__) || defined (__APPLE__)
+#if defined(__FreeBSD__) || defined(__linux__) || defined(__CYGWIN__) || defined (__APPLE__) || defined(__EMSCRIPTEN__)
 #include <sys/ioctl.h>
 #else
 #include <sys/filio.h>
@@ -486,6 +530,7 @@ typedef int socklen_t;
 #define MAX_DECIMAL_LEADING    32          // Maximum number of leading digits in a decimal field
 #define MAX_DECIMAL_PRECISION  32          // Maximum digits in a decimal field
 #define MAX_DECIMAL_DIGITS     (MAX_DECIMAL_LEADING+MAX_DECIMAL_PRECISION)
+#define MAX_DECIMAL_CHARS      (MAX_DECIMAL_DIGITS+3) // Maximum digits with sign, decimal point, and null terminator
 
 #define strtok(a,b)   j_strtok_deprecated(a,b)  // will disappear at some point
 
@@ -493,7 +538,7 @@ typedef unsigned __int64 hash64_t;
 typedef unsigned __int64 __uint64;
 typedef __uint64 offset_t;
 typedef unsigned char byte;
-typedef __int64 cycle_t;
+typedef __uint64 cycle_t;                 // This must be unsigned to avoid integer overflow issues when subtracting
 typedef unsigned __int64 timestamp_type;
 
 // BUILD_TAG not needed here anymore - defined in build_tag.h

@@ -124,6 +124,11 @@ public:
         }
         return NULL;
     }
+    virtual void getMetaInfo(ThorDataLinkMetaInfo &info) const override
+    {
+        PARENT::getMetaInfo(info);
+        info.fastThrough = true;
+    }
 };
 
 class CFirstNSlaveGrouped : public CFirstNSlaveBase
@@ -211,8 +216,8 @@ class CFirstNSlaveGlobal : public CFirstNSlaveBase, implements ILookAheadStopNot
 {
     typedef CFirstNSlaveBase PARENT;
 
-    Semaphore limitgot;
-    CriticalSection crit;
+    Semaphore limitgot{SYNC_LOCATION};
+    CriticalSection crit{SYNC_LOCATION};
     rowcount_t maxres = RCUNBOUND, skipped = 0, totallimit = RCUNBOUND;
     bool firstget = true;
     ThorDataLinkMetaInfo inputMeta;
@@ -270,7 +275,7 @@ public:
             {
                 rowcount_t maxRead = (totallimit>(RCUNBOUND-_skipCount))?RCUNBOUND:totallimit+_skipCount;
                 setLookAhead(0, createRowStreamLookAhead(this, inputStream, queryRowInterfaces(input), FIRSTN_SMART_BUFFER_SIZE, ::canStall(input), false,
-                                                                                  maxRead, this, &container.queryJob().queryIDiskUsage()), false); // if a very large limit don't bother truncating
+                                                                                  maxRead, this), false); // if a very large limit don't bother truncating
                 lastTotalLimitState = totallimit;
                 lastSkipCountState = _skipCount;
             }

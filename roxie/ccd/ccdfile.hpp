@@ -30,7 +30,7 @@ interface IRoxieFileCache;
 
 interface ILazyFileIO : extends IFileIO
 {
-    virtual const char *queryFilename() = 0;
+    virtual const char *queryFilename() const = 0;
     virtual void checkOpen() = 0;
     virtual bool isAliveAndLink() const = 0;
     virtual void addSource(IFile *source) = 0;
@@ -43,7 +43,7 @@ interface ILazyFileIO : extends IFileIO
     virtual void copyComplete() = 0;
     virtual bool createHardFileLink() = 0;
 
-    virtual unsigned getLastAccessed() const = 0;
+    virtual unsigned __int64 getLastAccessed() const = 0;
     virtual bool isOpen() const = 0;
     virtual void close() = 0;
     virtual void setCopying(bool copying) = 0;
@@ -54,15 +54,19 @@ interface ILazyFileIO : extends IFileIO
     virtual void removeCache(const IRoxieFileCache *) = 0;
     virtual unsigned getFileIdx() const = 0;
     virtual unsigned getCrc() const = 0;
+    virtual bool checkCopyComplete() = 0;
+    virtual void dump() const = 0;
 };
 
 interface IRoxieFileCache : extends IInterface
 {
-    virtual ILazyFileIO *lookupFile(const char *lfn, RoxieFileType fileType, IPartDescriptor *pdesc, unsigned numParts,
-                                      unsigned channel, const StringArray &deployedLocationInfo, bool startFileCopy) = 0;
+    virtual ILazyFileIO *lookupFile(const char *lfn, RoxieFileType fileType, IPartDescriptor *pdesc, IPartDescriptor *remotePDesc, unsigned numParts,
+                                      unsigned channel, bool startFileCopy) = 0;
     virtual RoxieFileStatus fileUpToDate(IFile *f, offset_t size, const CDateTime &modified, bool isCompressed, bool autoDisconnect=true) = 0;
     virtual int numFilesToCopy() = 0;
     virtual void closeExpired(bool remote) = 0;
+    virtual void closeOpenFiles() = 0;
+    virtual void stopCopyingAndCloseFiles() = 0;
     virtual StringAttrMapping *queryFileErrorList() = 0;  // returns list of files that could not be open
     virtual void flushUnusedDirectories(const char *origBaseDir, const char *directory, StringBuffer &info) = 0;
     virtual void start() = 0;
@@ -73,6 +77,7 @@ interface IRoxieFileCache : extends IInterface
     virtual void loadSavedOsCacheInfo() = 0;
     virtual void noteRead(unsigned fileIdx, offset_t pos, unsigned len) = 0;
     virtual void startCacheReporter() = 0;
+    virtual ILazyFileIO *lookupLocalFile(const char *filename) = 0;
 };
 
 interface IDiffFileInfoCache : extends IInterface
@@ -114,6 +119,8 @@ interface IResolvedFile : extends ISimpleSuperFileEnquiry
     virtual unsigned getNumParts() const = 0;
     virtual IInMemoryIndexManager *getIndexManager(bool isOpt, unsigned channel, IOutputMetaData *disklayout, bool preload) const = 0;
     virtual offset_t getFileSize() const = 0;
+    virtual unsigned getNumTotalParts() const = 0; // how many parts in total does this file/subfile have
+    virtual unsigned getNumLocalParts(unsigned channel) const = 0; // how many parts will be local for a given channel?
 
     virtual const CDateTime &queryTimeStamp() const = 0;
     virtual unsigned queryCheckSum() const = 0;
@@ -140,7 +147,7 @@ interface IResolvedFileCreator : extends IResolvedFile
 };
 
 extern IResolvedFileCreator *createResolvedFile(const char *lfn, const char *physical, bool isSuperFile);
-extern IResolvedFile *createResolvedFile(const char *lfn, const char *physical, IDistributedFile *dFile, IRoxieDaliHelper *daliHelper, bool isDynamic, bool cacheIt, bool writeAccess);
+extern IResolvedFile *createResolvedFile(const char *lfn, const char *physical, IDistributedFile *dFile, IRoxieDaliHelper *daliHelper, bool isDynamic, bool cacheIt, AccessMode accessMode);
 
 interface IRoxiePublishCallback
 {

@@ -47,6 +47,7 @@ public:
     offset_t *partitionpos;
     size32_t chunkmaxsize;
     unsigned width;
+    unsigned rwFlags = 0x0; // flags for streams (e.g. compression flags)
 
     class cRemoteStream : implements IRowStream, public CSimpleInterface
     {
@@ -132,6 +133,10 @@ public:
         bool stopped = true;
         Linked<IOutputRowSerializer> serializer;
     public:
+        cProvider() : Thread("GlobalMergeSlaveActivity Provider")
+        {
+        }
+
         void init(GlobalMergeSlaveActivity *_parent, IOutputRowSerializer *_serializer,mptag_t _tag)
         {
             serializer.set(_serializer);
@@ -220,7 +225,7 @@ public:
 
         CThorKeyArray partition(*this, queryRowInterfaces(this),helper->querySerialize(),helper->queryCompare(),helper->queryCompareKey(),helper->queryCompareRowKey());
         partition.deserialize(mb,false);
-        partition.calcPositions(tmpfile,sample);
+        partition.calcPositions(tmpfile, sample, rwFlags);
         partitionpos = new offset_t[width];
         unsigned i;
         for (i=0;i<width;i++) {
@@ -236,7 +241,7 @@ public:
         }
         delete [] intertags;
         provider.init(this,queryRowSerializer(),intertag);
-        provider.start();
+        provider.start(true);
         if (!streams.ordinality())
             return NULL;
         if (streams.ordinality()==1)
@@ -270,6 +275,19 @@ public:
     void init(MemoryBuffer &data, MemoryBuffer &slaveData) override
     {
         masterMpTag = container.queryJobChannel().deserializeMPTag(data);
+        rwFlags = DEFAULT_RWFLAGS;
+        if (getOptBool(THOROPT_COMPRESS_SPILLS, true))
+        {
+            StringBuffer compType;
+            getOpt(THOROPT_COMPRESS_SPILL_TYPE, compType);
+            unsigned spillCompInfo = 0x0;
+            setCompFlag(compType, spillCompInfo);
+            if (spillCompInfo)
+            {
+                rwFlags |= rw_compress;
+                rwFlags |= spillCompInfo;
+            }
+        }
     }
 
     void abort()
@@ -320,9 +338,9 @@ public:
         chunkmaxsize = MERGE_TRANSFER_BUFFER_SIZE;
         Owned<IRowStream> merged = createRowStreamMerger(streams.ordinality(), streams.getArray(), helper->queryCompare(),helper->dedup(), linkcounter);
         StringBuffer tmpname;
-        GetTempName(tmpname,"merge",true); // use alt temp dir
+        GetTempFilePath(tmpname,"merge");
         tmpfile.setown(createIFile(tmpname.str()));
-        Owned<IRowWriter> writer =  createRowWriter(tmpfile, this);
+        Owned<IRowWriter> writer =  createRowWriter(tmpfile, this, rwFlags);
         CThorKeyArray sample(*this, this, helper->querySerialize(), helper->queryCompare(), helper->queryCompareKey(), helper->queryCompareRowKey());
         sample.setSampling(MERGE_TRANSFER_BUFFER_SIZE);
         ActPrintLog("MERGE: start gather");
@@ -366,7 +384,12 @@ public:
         offset_t end = partitionpos[idx];
         if (pos>=end)
             return 0;
-        Owned<IExtRowStream> rs = createRowStreamEx(tmpfile, queryRowInterfaces(this), pos, end); // this is not good
+        // Suboptimal: each chunk request recreates the row stream and, for normal file reads, reopens tmpfile.
+        FileRowStreamOptions options;
+        options.offset = pos;
+        options.len = end - pos;
+        options.rwFlags = rwFlags;
+        Owned<IExtRowStream> rs = createRowStream(tmpfile, queryRowInterfaces(this), options);
         offset_t so = rs->getOffset();
         size32_t len = 0;
         size32_t chunksize = chunkmaxsize;

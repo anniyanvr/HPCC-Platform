@@ -32,7 +32,7 @@ ESPStruct ActiveWorkunit
     string Owner;
     string Jobname;
     string Server;
-    strint Instance;
+    string Instance;
     string Priority;
     [min_ver("1.01")] string Extra;
     [min_ver("1.02")] string GraphName;
@@ -46,6 +46,7 @@ ESPStruct ActiveWorkunit
     [min_ver("1.15")] string ClusterType;
     [min_ver("1.15")] string ClusterQueueName;
     [min_ver("1.16")] string TargetClusterName;
+    [min_ver("1.25")] bool NoAccess(false);
 };
 
 ESPStruct TargetCluster
@@ -203,6 +204,7 @@ ESPrequest SMCQueueRequest
     [min_ver("1.19")] string ServerType;
     [min_ver("1.19")] string NetworkAddress;
     [min_ver("1.19")] int Port;
+    [min_ver("1.31")] string AbortReason;
 };
 
 
@@ -217,6 +219,7 @@ ESPrequest SMCJobRequest
     string Cluster;
     string QueueName;
     string Wuid;
+    [min_ver("1.31")] string AbortReason;
 };
 
 
@@ -271,9 +274,24 @@ ESPresponse [exceptions_inline] SetBannerResponse
 {
 };
 
+ESPrequest [nil_remove, min_ver("1.30")] GetBannerRequest
+{
+};
+
+ESPresponse [exceptions_inline, min_ver("1.30")] GetBannerResponse
+{
+    string BannerContent;
+    string BannerColor;
+    string BannerSize;
+    string BannerScroll;
+    string ChatURL;
+    int ShowBanner(0);
+    int ShowChatURL(0);
+};
+
 ESPrequest NotInCommunityEditionRequest
 {
-    string EEPortal; 
+    string EEPortal;
 };
 
 ESPresponse [exceptions_inline] NotInCommunityEditionResponse
@@ -309,7 +327,8 @@ ESPresponse
 BrowseResourcesResponse
 {
     string PortalURL;
-    string NetAddress;
+    [depr_ver("1.27")] string NetAddress;
+    [min_ver("1.27")] string ESPInstance;
     int OS;
     [min_ver("1.13")] bool UseResource;
     ESParray<ESPstruct HPCCResourceRepository> HPCCResourceRepositories;
@@ -321,12 +340,16 @@ ESPenum RoxieControlCmdType : string
     DETACH("Detach"),
     STATE("State"),
     RELOAD("Reload"),
-    RELOAD_RETRY("ReloadRetry")
+    RELOAD_RETRY("ReloadRetry"),
+    MEMLOCK("MemLock"),
+    MEMUNLOCK("MemUnlock"),
+    GETMEMLOCKED("GetMemLocked")
 };
 
 ESPrequest RoxieControlCmdRequest
 {
     string ProcessCluster;
+    [min_ver("1.24")] string TargetCluster;
     ESPenum RoxieControlCmdType Command;
     int Wait;
 };
@@ -337,6 +360,7 @@ ESPStruct [nil_remove] RoxieControlEndpointInfo
     bool Attached;
     string StateHash;
     string Status;
+    [min_ver("1.26")] bool MemLocked;
 };
 
 ESPresponse
@@ -346,6 +370,23 @@ ESPresponse
 RoxieControlCmdResponse
 {
     ESParray<ESPstruct RoxieControlEndpointInfo, Endpoint> Endpoints;
+};
+
+ESPrequest RoxieXrefCmdRequest
+{
+    string RoxieCluster;
+    ESParray<string> QueryIds;
+    bool CheckAllNodes(false);
+    int Wait;
+};
+
+ESPresponse
+[
+    exceptions_inline, nil_remove
+]
+RoxieXrefCmdResponse
+{
+    string Result;
 };
 
 ESPrequest GetStatusServerInfoRequest
@@ -413,7 +454,59 @@ ESPresponse [exceptions_inline] GetBuildInfoResponse
     ESParray<ESPstruct NamedValue> BuildInfo;
 };
 
-ESPservice [auth_feature("DEFERRED"), noforms, version("1.23"), exceptions_inline("./smc_xslt/exceptions.xslt"), use_method_name] WsSMC
+// ----- Global Metrics (migrated from ws_machine) -----
+ESPstruct DateTimeRange
+{
+    // Inclusive range, Format: yyyy-mm-ddThh:mm:ss[.nnnnnnnnn]
+    xsdDateTime Start;
+    xsdDateTime End;
+};
+
+ESPstruct Dimension
+{
+    string Name;
+    string Value;
+};
+
+ESPrequest [nil_remove] GetGlobalMetricsRequest
+{
+    string Category;                            // 'All' or empty/missing for all Categories
+    ESParray<ESPstruct Dimension> Dimensions;   // empty/missing for all Dimensions
+    ESPstruct DateTimeRange DateTimeRange;
+};
+
+ESPstruct Stat
+{
+    string Name;
+    string Value; // Holds unsigned long long (64-bit unsigned int)
+};
+
+ESPstruct GlobalMetric
+{
+    string Category;
+    ESParray<ESPstruct Dimension, Dimension> Dimensions;
+    ESPstruct DateTimeRange DateTimeRange;
+    ESParray<ESPstruct Stat, Stat> Stats;
+};
+
+ESPresponse [exceptions_inline, nil_remove] GetGlobalMetricsResponse
+{
+    ESParray<ESPstruct GlobalMetric, GlobalMetric> GlobalMetrics;
+};
+
+ESPrequest [nil_remove] RecordGlobalMetricsRequest
+{
+    string Category;                            // Category to record metrics for (required)
+    ESParray<ESPstruct Dimension> Dimensions;   // Optional dimensions for the metrics
+    ESParray<ESPstruct Stat, Stat> Stats;       // Statistics to record
+};
+
+ESPresponse [exceptions_inline, nil_remove] RecordGlobalMetricsResponse
+{
+    string Result;                              // Success or partial success message
+};
+
+ESPservice [auth_feature("DEFERRED"), noforms, version("1.31"), default_client_version("1.31"), exceptions_inline("./smc_xslt/exceptions.xslt"), use_method_name] WsSMC
 {
     ESPmethod Index(SMCIndexRequest, SMCIndexResponse);
     ESPmethod [resp_xsl_default("/esp/xslt/index.xslt")] Activity(ActivityRequest, ActivityResponse);
@@ -434,6 +527,7 @@ ESPservice [auth_feature("DEFERRED"), noforms, version("1.23"), exceptions_inlin
     ESPmethod GetThorQueueAvailability(GetThorQueueAvailabilityRequest, GetThorQueueAvailabilityResponse);
 //this one ensures superuser, but no feature check is done, Kevin/Tony?
     ESPmethod [auth_feature("NONE")] SetBanner(SetBannerRequest, SetBannerResponse);
+    ESPmethod [auth_feature("NONE"), min_ver("1.30")] GetBanner(GetBannerRequest, GetBannerResponse);
 //this one ensures superuser, but no feature check is done, Kevin/Tony?
     ESPmethod [auth_feature("NONE")] NotInCommunityEdition(NotInCommunityEditionRequest, NotInCommunityEditionResponse);
 
@@ -441,10 +535,14 @@ ESPservice [auth_feature("DEFERRED"), noforms, version("1.23"), exceptions_inlin
     ESPmethod [resp_xsl_default("/esp/xslt/hpccresourcelist.xslt")] BrowseResources(BrowseResourcesRequest, BrowseResourcesResponse);
 
     ESPmethod RoxieControlCmd(RoxieControlCmdRequest, RoxieControlCmdResponse);
+    ESPmethod RoxieXrefCmd(RoxieXrefCmdRequest, RoxieXrefCmdResponse);
+
 //this one doesn't seem to do any feature level check, Kevin/Tony?
     ESPmethod [auth_feature("NONE")] GetStatusServerInfo(GetStatusServerInfoRequest, GetStatusServerInfoResponse);
 //this one doesn't seem to do any feature level check, Kevin/Tony?
     ESPmethod [auth_feature("NONE")] LockQuery(LockQueryRequest, LockQueryResponse);
+    ESPmethod [min_ver("1.28")] GetGlobalMetrics(GetGlobalMetricsRequest, GetGlobalMetricsResponse);
+    ESPmethod [min_ver("1.29")] RecordGlobalMetrics(RecordGlobalMetricsRequest, RecordGlobalMetricsResponse);
 };
 
 SCMexportdef(WSSMC);

@@ -18,13 +18,12 @@ limitations under the License.
 #ifndef _ESPWIZ_WS_STORE_HPP__
 #define _ESPWIZ_WS_STORE_HPP__
 
-#include <build-config.h>
-
 #include "ws_store.hpp"
 #include "ws_store_esp.ipp"
 
 #include "dautils.hpp"
 #include "espStoreShare.hpp"
+#include "eclwatch_errorlist.hpp"
 
 static StringBuffer g_wsstoreBuildVersion;
 

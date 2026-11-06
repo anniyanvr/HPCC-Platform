@@ -27,12 +27,15 @@ enum CompilerType
 {
     Vs6CppCompiler      = 0,
     GccCppCompiler      = 1,
+    ClangCppCompiler    = 2,
     MaxCompiler
 };
-const char * const compilerTypeText[MaxCompiler] = {"vs6", "gcc" };
+const char * const compilerTypeText[MaxCompiler] = {"vs6", "gcc", "clang" };
 
 #ifdef _WIN32
 #define DEFAULT_COMPILER Vs6CppCompiler
+#elif defined(__APPLE__)
+#define DEFAULT_COMPILER ClangCppCompiler
 #else
 #define DEFAULT_COMPILER GccCppCompiler
 #endif
@@ -40,6 +43,9 @@ const char * const compilerTypeText[MaxCompiler] = {"vs6", "gcc" };
 extern jlib_decl void setCompilerPath(const char * path, const char *ipath, const char *lpath, const char * tmpdir, bool verbose);
 extern jlib_decl void setCompilerPath(const char * path, const char *ipath, const char *lpath, const char * tmpdir, CompilerType compiler, bool verbose);
 extern jlib_decl bool fileIsOlder(const char *dest, const char *src);
+extern jlib_decl void extractErrorsFromCppLog(IArrayOf<IError> & errors, const char * cur, bool linkFailed);
+extern jlib_decl unsigned queryMaxCompileThreads(unsigned configured, unsigned numCppFiles, unsigned numCpus);
+extern jlib_decl unsigned queryMaxCompileThreads(unsigned configured, unsigned numCppFiles);
 
 interface ICppCompiler : public IInterface
 {
@@ -59,15 +65,20 @@ public:
     virtual void setOnlyCompile(bool _onlyCompile) = 0;
     virtual void setCreateExe(bool _createExe) = 0;
     virtual void setOptimizeLevel(unsigned level) = 0;
+    virtual void setStripSymbols(bool stripSymbols) = 0;
     virtual void setTargetBitLength(unsigned bitlength) = 0;
     virtual void setMaxCompileThreads(const unsigned max) = 0;
     virtual void setCCLogPath(const char* path) = 0;
     virtual void setSaveTemps(bool _save) = 0;
     virtual void setPrecompileHeader(bool _pch) = 0;
     virtual void setAbortChecker(IAbortRequestCallback * abortChecker) = 0;
+    virtual void removeTemporary(const char *fname) = 0;
+    virtual void removeTempDir(const char *fname) = 0;
+    virtual bool reportOnly() const = 0;
+    virtual void finish() = 0;
+
 };
 
-extern jlib_decl ICppCompiler * createCompiler(const char * coreName, const char * sourceDir = NULL, const char * targetDir = NULL, bool verbose = true);
-extern jlib_decl ICppCompiler * createCompiler(const char * coreName, const char * sourceDir, const char * targetDir, CompilerType compiler, bool verbose);
+extern jlib_decl ICppCompiler * createCompiler(const char * coreName, const char * sourceDir, const char * targetDir, CompilerType compiler, bool verbose, const char *compileBatchOut);
 
 #endif

@@ -26,6 +26,10 @@
 #include "jregexp.hpp"
 #include "jlog.ipp"
 #include "jisem.hpp"
+#include "jtask.hpp"
+#include "jerror.hpp"
+#include "jevent.hpp"
+
 #include <assert.h>
 #ifdef _WIN32
 #include <process.h>
@@ -36,6 +40,12 @@
 #include <sys/types.h>
 #include <sys/resource.h>
 #endif
+#ifdef __linux__
+#include <sys/prctl.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#endif
+#include <algorithm>
 
 #define LINUX_STACKSIZE_CAP (0x200000)
 
@@ -53,6 +63,11 @@ static struct MainThreadIdHelper
         tid = GetCurrentThreadId();
     }
 } mainThreadIdHelper;
+
+extern bool isMainThread()
+{
+    return GetCurrentThreadId() == mainThreadIdHelper.tid;
+}
 
 /*
  * NB: Thread termination hook functions are tracked using a thread local vector (threadTermHooks).
@@ -112,13 +127,42 @@ void enableThreadSEH() { SEHHandling=true; }
 void disableThreadSEH() { SEHHandling=false; } // only prevents new threads from having SEH handler, no mech. for turning off existing threads SEH handling.
 
 
-static ICopyArrayOf<Thread> ThreadList;
-static CriticalSection ThreadListSem;
+static std::atomic<unsigned> threadCount;
 static size32_t defaultThreadStackSize=0;
-static ICopyArrayOf<Thread> ThreadDestroyList;
-static SpinLock ThreadDestroyListLock;
 
+/*
+The following variables are used to avoid a race condition between thread termination and join().  There are two situations:
+i) thread is free running. join will never be called.
+ii) thread will be joined
 
+The code in the thread termination code signals a semaphore to indicate it is complete, and then releases the thread
+object.  This ensures the semaphore has not been destroyed before it is signalled, and that threads that are mot joined
+are cleaned up correctly.
+
+The code in join waits for the semaphore to be signalled, and then continues.  If the thread object is a contained
+member the thread object may be destroyed before the release call in the thread termination code - which would lead to
+memory corruption.
+
+Options to prevent this:
+
+* Added the thread to a list before the signal(), and removed after the Release().
+  The joining thread can wake up immediately, but then needs to loop until the thread is not on the list.  (This
+  involved getting a critical section).
+  [This is the previous implementation.]
+
+* The termination code holds the critical section for the { signal(), Release() } duration.
+  The joining thread checks it can get that critical section before continuing.  The joining thread may wake up, try
+  and get the critical section, and then block because the other thread hasn't released it yet, but this is better than
+  the previous situation which would spin-loop.  The join will be blocked by all terminating threads - in a signal,
+  rather than purely user code.
+  [This is the new implementation]
+
+* Terminating thread conditionally signals.
+  The terminating thread could call Release(), and only signal() the semaphore if the object was not destroyed.  This would cope
+  with the common joining pattern, but would fail if another object held onto a reference to the thread but didn't call join().
+  Potentially more efficient, but more scope for accidental bugs.
+*/
+static CriticalSection ThreadDestroyLock(SYNC_LOCATION);
 
 
 #ifdef _WIN32
@@ -129,48 +173,25 @@ unsigned WINAPI Thread::_threadmain(LPVOID v)
 void *Thread::_threadmain(void *v)
 #endif
 {
-    resetThreadLogging();   // Not strictly needed if everything handled via thread_local variable's constructors...
     Thread * t = (Thread *)v;
+    restoreThreadContext(t->savedCtx);
 #ifdef _WIN32
     if (SEHHandling) 
         EnableSEHtranslation();
 #else
-    t->tidlog = threadLogID();
+    t->tidlog = getSystemThreadId();
 #endif
     int ret = t->begin();
-    char *&threadname = t->cthreadname.threadname;
-    if (threadname) {
-        memsize_t l=strlen(threadname);
-        char *newname = (char *)malloc(l+8+1);
-        memcpy(newname,"Stopped ",8);
-        memcpy(newname+8,threadname,l+1);
-        char *oldname = threadname;
-        threadname = newname;
-        free(oldname);
-    }
     {
-        // need to ensure joining thread does not race with us to release
-        t->Link();  // extra safety link
+        try
         {
-            SpinBlock block(ThreadDestroyListLock);
-            ThreadDestroyList.append(*t);
-        }
-        try {
-            t->stopped.signal();        
-            if (t->Release()) {
-                PROGLOG("extra unlinked thread");
-                PrintStackReport();
-            }
-            else
-                t->Release(); 
+            CriticalBlock block(ThreadDestroyLock);
+            t->stopped.signal();
+            t->Release();
         }
         catch (...) {
             PROGLOG("thread release exception");
             throw;
-        }
-        {
-            SpinBlock block(ThreadDestroyListLock);
-            ThreadDestroyList.zap(*t);  // hopefully won't get too big (i.e. one entry!)
         }
     }
 #if defined(_WIN32)
@@ -249,6 +270,8 @@ void Thread::adjustNiceLevel()
     SetThreadPriority(hThread, priority);
 #elif defined(__linux__)
     setpriority(PRIO_PROCESS, 0, nicelevel);
+#elif defined(__APPLE__)
+    setpriority(PRIO_DARWIN_THREAD, 0, nicelevel);
 #else
     UNIMPLEMENTED;
 #endif
@@ -263,10 +286,10 @@ bool Thread::isCurrentThread() const
 void Thread::setNice(int _nicelevel)
 {
     if (_nicelevel < -20 || _nicelevel > 19)
-        throw MakeStringException(0, "nice level should be between -20 and 19");
+        throw MakeStringException(JLIBERR_SystemNiceLevelShouldBeBetween20And, "nice level should be between -20 and 19");
 
     if(alive)
-        throw MakeStringException(0, "nice can only be set before the thread is started.");
+        throw MakeStringException(JLIBERR_SystemNiceCanOnlyBeSetBeforeThe, "nice can only be set before the thread is started.");
     
     nicelevel = _nicelevel;
 }
@@ -289,8 +312,15 @@ int Thread::begin()
     starting.signal();
     suspend.wait();
 #endif
+    if (doTrace(traceThreadStartup))
+        DBGLOG("Thread::start(%s) with id %u", getName(), tidlog);
+
+    if (!cthreadname.isEmpty())
+        protraceNoteThreadName(cthreadname.str());
+
     int ret=-1;
     try {
+        TaskScopeTracker scope(EventTask::Running, !suppressRunning);
         ret = run();
     }
     catch (IException *e)
@@ -300,9 +330,12 @@ int Thread::begin()
 #ifndef NO_CATCHALL
     catch (...)
     {
-        handleException(MakeStringException(0, "Unknown exception in Thread %s", getName()));
+        handleException(MakeStringException(JLIBERR_SystemUnknownExceptionInThreadS, "Unknown exception in Thread %s", getName()));
     }
 #endif
+
+    if (doTrace(traceThreadStartup))
+        DBGLOG("Thread::stop(%s) with id %u", getName(), tidlog);
     callThreadTerminationHooks(false);
 #ifdef _WIN32
 #ifndef _DEBUG
@@ -352,25 +385,44 @@ void Thread::init(const char *_name)
     threadid = 0;
     tidlog = 0;
     alive = false;
-    cthreadname.threadname = (NULL == _name) ? NULL : strdup(_name);
-    ithreadname = &cthreadname;
+    cthreadname.set(_name);
     prioritydelta = 0;
     nicelevel = 0;
     stacksize = 0; // default is EXE default stack size  (set by /STACK)
 }
 
-void Thread::start()
+void Thread::captureThreadLoggingInfo()
 {
+    ::saveThreadContext(savedCtx);
+}
+
+int CThreaded::run()
+{
+    owner->threadmain();
+    return 1;
+}
+
+void Thread::start(bool inheritThreadContext)
+{
+    if (inheritThreadContext)
+        captureThreadLoggingInfo();
     if (alive) {
         IWARNLOG("Thread::start(%s) - Thread already started!",getName());
         PrintStackReport();
 #ifdef _DEBUG
-        throw MakeStringException(-1,"Thread::start(%s) - Thread already started!",getName());
+        throw MakeStringException(JLIBERR_SystemThreadStartSThreadAlreadyStarted,"Thread::start(%s) - Thread already started!",getName());
 #endif
         return;
     }
     Link();
     startRelease();
+}
+
+StringBuffer & Thread::getInfo(StringBuffer &str)
+{
+    const char * status = alive ? "" : "Stopped ";
+    str.appendf("%8" I64F "X %6" I64F "d %u: %s%s",(__int64)threadid,(__int64)threadid,tidlog,status,getName());
+    return str;
 }
 
 void Thread::startRelease()
@@ -390,7 +442,12 @@ void Thread::startRelease()
     unsigned delay = 1000;
     for (;;) {
         pthread_attr_t attr;
-        pthread_attr_init(&attr);
+        status = pthread_attr_init(&attr);
+        if (status)
+        {
+            IERRLOG("pthread_attr_init returns %d",status);
+            throw makeOsException(status);
+        }
         pthread_attr_setscope(&attr, PTHREAD_SCOPE_SYSTEM);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         if (stacksize)
@@ -405,7 +462,14 @@ void Thread::startRelease()
                 pthread_attr_setstacksize(&attr, LINUX_STACKSIZE_CAP);
 #endif
         }
+        sched_param param;
+        pthread_attr_getschedparam(&attr, &param);
+        param.sched_priority = 0;
+        pthread_attr_setschedparam(&attr, &param);
+        pthread_attr_setschedpolicy(&attr, SCHED_OTHER);
+        pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
         status = pthread_create(&threadid, &attr, Thread::_threadmain, this);
+        pthread_attr_destroy(&attr);
         if ((status==EAGAIN)||(status==EINTR)) {
             if (numretrys--==0)
                 break;
@@ -422,9 +486,6 @@ void Thread::startRelease()
         IERRLOG("pthread_create returns %d",status);
         PrintStackReport();
         PrintMemoryReport();
-        StringBuffer s;
-        getThreadList(s);
-        IERRLOG("Running threads:\n %s",s.str());
         throw makeOsException(status);
     }
     unsigned retryCount = 10;
@@ -433,19 +494,14 @@ void Thread::startRelease()
         if (starting.wait(1000*10))
             break;
         else if (0 == --retryCount)
-            throw MakeStringException(-1, "Thread::start(%s) failed", getName());
+            throw MakeStringException(JLIBERR_SystemThreadStartSFailed, "Thread::start(%s) failed", getName());
         IWARNLOG("Thread::start(%s) stalled, waiting to start, retrying", getName());
     }
 #endif
     alive = true;
     if (prioritydelta)
         adjustPriority(prioritydelta);
-
-    {
-        CriticalBlock block(ThreadListSem);
-        ThreadList.zap(*this);  // just in case restarting
-        ThreadList.append(*this);
-    }
+    threadCount++;
 #ifdef _WIN32
     DWORD count = ResumeThread(hThread);
     assertex(count == 1);
@@ -471,22 +527,11 @@ bool Thread::join(unsigned timeout)
         stopped.signal();
         return true;
     }
-    unsigned st = 0;
-    for (;;) {                                              // this is to prevent race with destroy
-                                                        // (because Thread objects are not always link counted!)
-        {
-            SpinBlock block(ThreadDestroyListLock);
-            if (ThreadDestroyList.find(*this)==NotFound)
-                break;
-        }
-#ifdef _DEBUG
-        if (st==10)     
-            PROGLOG("Thread::join race");   
-#endif
-        Sleep(st);      // switch back to exiting thread (not very elegant!)
-        st++;
-        if (st>10)
-            st = 10; // note must be non-zero for high priority threads
+
+    {
+        //Enter and leave the critical section to ensure that the terminating thread has called Release() - it has
+        //already signalled the stopped semaphore
+        CriticalBlock block(ThreadDestroyLock);
     }
 
 #ifdef _DEBUG
@@ -506,7 +551,6 @@ bool Thread::join(unsigned timeout)
 
 Thread::~Thread()
 {
-    ithreadname = &cthreadname; // safer (as derived classes destroyed)
 #ifdef _DEBUG
     if (alive) {
         if (!stopped.wait(0)) { // see if fell out of threadmain and signal stopped
@@ -516,61 +560,146 @@ Thread::~Thread()
         // don't need to resignal as we are on way out
     }
 #endif
-    Link();
-    
-//  DBGLOG("Thread %x (%s) destroyed\n", threadid, threadname);
-    {
-        CriticalBlock block(ThreadListSem);
-        ThreadList.zap(*this);
-    }
-    free(cthreadname.threadname);
-    cthreadname.threadname = NULL;
+    threadCount--;
+//  DBGLOG("Thread %x (%s) destroyed\n", threadid, cthreadname.str());
 }
 
 unsigned getThreadCount()
 {
-    CriticalBlock block(ThreadListSem);
-    return ThreadList.ordinality();
+    return threadCount;
 }
 
-StringBuffer & getThreadList(StringBuffer &str)
+//------------------------------------------------------------------------------------------------------
+// CPooledPersistent
+class GlobalThreadPool : public CInterfaceOf<IThreadFactory>
 {
-    CriticalBlock block(ThreadListSem);
-    ForEachItemIn(i,ThreadList) {
-        Thread &item=ThreadList.item(i);
-        item.getInfo(str).append("\n");
-    }
-    return str;
-}
-
-StringBuffer &getThreadName(int thandle,unsigned tid,StringBuffer &name)
-{
-    CriticalBlock block(ThreadListSem);
-    bool found=false;
-    ForEachItemIn(i,ThreadList) {
-        Thread &item=ThreadList.item(i);
-        int h; 
-        unsigned t;
-        const char *s = item.getLogInfo(h,t);
-        if (s&&*s&&((thandle==0)||(h==thandle))&&((tid==0)||(t==tid))) {
-            if (found) {
-                name.clear();
-                break;  // only return if unambiguous
-            }
-            name.append(s);
-            found = true;
+private:
+    class GlobalThread : public CInterfaceOf<IPooledThread>
+    {
+    public:
+        virtual void init(void *param)
+        {
+            callback = (IThreaded *)param;
         }
+        virtual void threadmain()
+        {
+            callback->threadmain();
+        }
+        virtual bool stop()
+        {
+            return callback->requestAbort();
+        }
+        virtual bool canReuse() const
+        {
+            return true;
+        }
+    private:
+        IThreaded * callback;
+    };
+public:
+    GlobalThreadPool()
+    {
+        IExceptionHandler *exceptionHandler = nullptr;
+        unsigned defaultmax = 0;
+        unsigned delay = 0;
+        unsigned stacksize = 0; // i.e. default;
+        unsigned timeoutOnRelease = 0;
+        unsigned targetpoolsize = 200; // Used if the pool is later changed to a bounded size
+        pool.setown(createThreadPool("GlobalThreadPool", this, false, exceptionHandler, defaultmax, delay, stacksize, timeoutOnRelease, targetpoolsize));
     }
-    return name;
+
+//interface IThreadFactory
+    virtual IPooledThread *createNew() { return new GlobalThread; }
+
+    PooledThreadHandle start(IThreaded *callback, const char *name, bool inheritThreadContext)
+    {
+        return pool->startWithContext(callback, name, inheritThreadContext);
+    }
+
+    bool join(PooledThreadHandle handle, unsigned timeout)
+    {
+        return pool->join(handle, timeout);
+    }
+
+    bool stop(PooledThreadHandle handle)
+    {
+        return pool->stop(handle);
+    }
+
+private:
+    Owned<IThreadPool> pool;
+};
+
+
+static GlobalThreadPool globalThreadPool;
+
+CPooledPersistent::CPooledPersistent(const char *_name, IThreaded *_owner) : owner(_owner), name(_name)
+{
 }
 
+CPooledPersistent::~CPooledPersistent()
+{
+    join(INFINITE, false);
+}
 
+void CPooledPersistent::start(bool inheritThreadContext)
+{
+    exception.clear();
+    handle = globalThreadPool.start(this, name, inheritThreadContext);
+    joined = false;
+}
+
+void CPooledPersistent::threadmain()
+{
+    try
+    {
+        owner->threadmain();
+    }
+    catch (IException *e)
+    {
+        exception.setown(e);
+    }
+#ifndef NO_CATCHALL
+    catch (...)
+    {
+        exception.setown(MakeStringException(JLIBERR_SystemUnknownExceptionInThreadFromPoolS, "Unknown exception in pooled persistent thread"));
+    }
+#endif
+}
+
+bool CPooledPersistent::requestAbort()
+{
+    return owner->requestAbort();
+}
+
+bool CPooledPersistent::stop()
+{
+    if (joined)
+        return true;
+    return globalThreadPool.stop(handle);
+}
+
+bool CPooledPersistent::join(unsigned timeout, bool throwException)
+{
+    if (joined)
+        return true;
+
+    bool ok = globalThreadPool.join(handle, timeout);
+    if (ok)
+    {
+        joined = true;
+        if (throwException && exception)
+            throw exception.getClear();
+    }
+    return ok;
+}
+
+//------------------------------------------------------------------------------------------------------
 // CThreadedPersistent
-
 CThreadedPersistent::CThreadedPersistent(const char *name, IThreaded *_owner) : athread(*this, name), owner(_owner), state(s_ready)
 {
     halt = false;
-    athread.start();
+    athread.start(false);
 }
 
 CThreadedPersistent::~CThreadedPersistent()
@@ -590,6 +719,8 @@ void CThreadedPersistent::threadmain()
             break;
         try
         {
+            restoreThreadContext(athread.savedCtx);
+            TaskScopeTracker scope(EventTask::Running);
             owner->threadmain();
             // Note we do NOT call the thread reset hook here - these threads are expected to be able to preserve state, I think
         }
@@ -611,7 +742,7 @@ void CThreadedPersistent::threadmain()
     }
 }
 
-void CThreadedPersistent::start()
+void CThreadedPersistent::start(bool inheritThreadContext)
 {
     unsigned expected = s_ready;
     if (!state.compare_exchange_strong(expected, s_running))
@@ -619,8 +750,10 @@ void CThreadedPersistent::start()
         VStringBuffer msg("CThreadedPersistent::start(%s) - not ready", athread.getName());
         IWARNLOG("%s", msg.str());
         PrintStackReport();
-        throw MakeStringExceptionDirect(-1, msg.str());
+        throw MakeStringExceptionDirect(JLIBERR_SystemThreadPersistentNotReady, msg.str());
     }
+    if (inheritThreadContext)
+        athread.captureThreadLoggingInfo();
     sem.signal();
 }
 
@@ -662,86 +795,109 @@ void CAsyncFor::For(unsigned num,unsigned maxatonce,bool abortFollowingException
             Do(0);
         return;
     }
-    Mutex errmutex;
-    IException *e=NULL;
+
+    if (maxatonce==0 || maxatonce > num)
+        maxatonce = num;
+
+    AtomicShared<IException> e;
     Owned<IShuffledIterator> shuffler;
-    if (shuffled) {
+    //Only worth shuffling if there are not enough threads to do all at once
+    if (shuffled && (maxatonce < num))
         shuffler.setown(createShuffledIterator(num));
-        shuffler->first(); // prime (needed to make thread safe)
-    }
+
     unsigned i;
-    if (maxatonce==1) { // no need for threads
-        for (i=0;i<num;i++) {
+    if (maxatonce==1)
+    { // no need for threads
+        for (i=0;i<num;i++)
+        {
             unsigned idx = shuffled?shuffler->lookup(i):i;
-            try {
+            try
+            {
                 Do(idx);
             }
             catch (IException * _e)
             {
-                if (e)
-                    _e->Release();  // only return first
-                else
-                    e = _e;
+                e.setownIfNull(_e);
                 if (abortFollowingException) 
                     break;
             }
         }
     }
-    else {
-        if (maxatonce==0 || maxatonce > num)
-            maxatonce = num;
+    else
+    {
         if (maxatonce < num)
         {
+            // Internal scheduling granularity for atomic work-claim path.
+            // Kept local (not public API) so it can be tuned later if needed.
+            // If there was lots of very fine-grained work it might be worth increasing the value, or making it a parameter.
+            constexpr unsigned chunkSize = 1;
+
             class cdothread: public Thread
             {
             public:
-                Mutex *errmutex;
-                Semaphore &ready;
-                IException *&erre;
-                unsigned idx;
-                CAsyncFor *self;
-                cdothread(CAsyncFor *_self,unsigned _idx,Semaphore &_ready,Mutex *_errmutex,IException *&_e)
-                    : Thread("CAsyncFor"),ready(_ready),erre(_e)
+                AtomicShared<IException> &erre;
+                std::atomic<unsigned> &next;
+                const unsigned limit;
+                const bool abortFollowingException;
+                const bool shuffled;
+                IShuffledIterator * const shuffler;
+                CAsyncFor * const self;
+                cdothread(CAsyncFor *_self,AtomicShared<IException> &_e, std::atomic<unsigned> &_next, unsigned _limit, bool _abortFollowingException, bool _shuffled, IShuffledIterator *_shuffler)
+                    : Thread(_self->queryName()),erre(_e), next(_next), limit(_limit), abortFollowingException(_abortFollowingException), shuffled(_shuffled), shuffler(_shuffler), self(_self)
                 {
-                    errmutex =_errmutex;
-                    idx = _idx;
-                    self = _self;
                 }
                 int run()
                 {
-                    try {
-                        self->Do(idx);
-                    }
-                    catch (IException * _e)
+                    while (true)
                     {
-                        synchronized block(*errmutex);
-                        if (erre)
-                            _e->Release();  // only return first
-                        else
-                            erre = _e;
-                    }
+                        if (abortFollowingException && erre.isSet())
+                            break;
+
+                        unsigned logical = next.fetch_add(chunkSize, std::memory_order_relaxed);
+                        if (logical >= limit)
+                            break;
+
+                        unsigned end = logical + chunkSize;
+                        // This test supports the general case, but the check for chunkSize==1 should allow the following loop to be optimized away
+                        if ((chunkSize != 1) && (end > limit))
+                            end = limit;
+
+                        for (; logical < end; ++logical)
+                        {
+                            if (abortFollowingException && erre.isSet())
+                                return 0;
+                            try
+                            {
+                                unsigned idx = shuffled ? shuffler->lookup(logical) : logical;
+                                TaskScopeTracker scope(EventTask::Running);
+                                self->Do(idx);
+                            }
+                            catch (IException * _e)
+                            {
+                                erre.setownIfNull(_e);
+                                if (abortFollowingException)
+                                    return 0;
+                            }
     #ifndef NO_CATCHALL
-                    catch (...)
-                    {
-                        synchronized block(*errmutex);
-                        if (!erre)
-                            erre = MakeStringException(0, "Unknown exception in Thread %s", getName());
-                    }
+                            catch (...)
+                            {
+                                erre.setownIfNull(MakeStringException(JLIBERR_SystemUnknownExceptionInThreadS_1, "Unknown exception in Thread %s", getName()));
+                                if (abortFollowingException)
+                                    return 0;
+                            }
     #endif
-                    ready.signal();
+                        }
+                    }
                     return 0;
                 }
             };
-            Semaphore ready;
-            for (i=0;(i<num)&&(i<maxatonce);i++)
-                ready.signal();
+
+            std::atomic<unsigned> next{0};
             IArrayOf<Thread> started;
-            started.ensure(num);
-            for (i=0;i<num;i++) {
-                ready.wait();
-                if (abortFollowingException && e) break;
-                Owned<Thread> thread = new cdothread(this,shuffled?shuffler->lookup(i):i,ready,&errmutex,e);
-                thread->start();
+            started.ensureCapacity(maxatonce);
+            for (i=0;i<maxatonce;i++) {
+                Owned<Thread> thread = new cdothread(this,e,next,num,abortFollowingException,shuffled,shuffler);
+                thread->start(true);
                 started.append(*thread.getClear());
             }
             ForEachItemIn(idx, started)
@@ -756,90 +912,81 @@ void CAsyncFor::For(unsigned num,unsigned maxatonce,bool abortFollowingException
             class cdothread: public Thread
             {
             public:
-                Mutex *errmutex;
-                IException *&erre;
-                unsigned idx;
-                CAsyncFor *self;
-                cdothread(CAsyncFor *_self,unsigned _idx,Mutex *_errmutex,IException *&_e)
-                    : Thread("CAsyncFor"),erre(_e)
+                AtomicShared<IException> &erre;
+                const unsigned idx;
+                CAsyncFor * const self;
+                cdothread(CAsyncFor *_self,unsigned _idx,AtomicShared<IException>&_e)
+                    : Thread(_self->queryName()),erre(_e), idx(_idx), self(_self)
                 {
-                    errmutex =_errmutex;
-                    idx = _idx;
-                    self = _self;
                 }
                 int run()
                 {
-                    try {
+                    try
+                    {
+                        TaskScopeTracker scope(EventTask::Running);
                         self->Do(idx);
                     }
                     catch (IException * _e)
                     {
-                        synchronized block(*errmutex);
-                        if (erre)
-                            _e->Release();  // only return first
-                        else
-                            erre = _e;
+                        erre.setownIfNull(_e);
                     }
     #ifndef NO_CATCHALL
                     catch (...)
                     {
-                        synchronized block(*errmutex);
-                        if (!erre)
-                            erre = MakeStringException(0, "Unknown exception in Thread %s", getName());
+                        erre.setownIfNull(MakeStringException(JLIBERR_SystemUnknownExceptionInThreadS_1, "Unknown exception in Thread %s", getName()));
                     }
     #endif
                     return 0;
                 }
             };
             IArrayOf<Thread> started;
-            started.ensure(num);
+            started.ensureCapacity(num);
             for (i=0;i<num-1;i++)
             {
-                Owned<Thread> thread = new cdothread(this,i,&errmutex,e);
-                thread->start();
+                Owned<Thread> thread = new cdothread(this,i,e);
+                thread->start(true);
                 started.append(*thread.getClear());
             }
-            Do(num-1);
+
+            try
+            {
+                Do(num-1);
+            }
+            catch (IException * _e)
+            {
+                e.setownIfNull(_e);
+            }
+#ifndef NO_CATCHALL
+            catch (...)
+            {
+                e.setownIfNull(MakeStringException(JLIBERR_SystemUnknownExceptionInMainThread, "Unknown exception in main Thread"));
+            }
+#endif
+
             ForEachItemIn(idx, started)
             {
                 started.item(idx).join();
             }
         }
     }
-    if (e)
-        throw e;
+    if (e.isSet())
+        throw e.getClear();
 }
 
-//---------------------------------------------------------------------------------------------------------------------
-
-class CSimpleFunctionThread : public Thread
+void CAsyncFor::TaskFor(unsigned num, ITaskScheduler & scheduler)
 {
-    std::function<void()> func;
-public:
-    inline CSimpleFunctionThread(std::function<void()> _func) : Thread("TaskProcessor"), func(_func) { }
-    virtual int run()
+    if (num <= 1)
     {
-        func();
-        return 1;
+        if (num == 1)
+            Do(0);
+        return;
     }
-};
 
-void asyncStart(IThreaded & threaded)
-{
-    CThreaded * thread = new CThreaded("AsyncStart", &threaded);
-    thread->startRelease();
-}
+    Owned<CCompletionTask> completed = new CCompletionTask(scheduler);
+    for (unsigned i=0; i < num; i++)
+        completed->spawn([i, this]() { Do(i); });
 
-void asyncStart(const char * name, IThreaded & threaded)
-{
-    CThreaded * thread = new CThreaded(name, &threaded);
-    thread->startRelease();
-}
-
-//Experimental - is this a useful function to replace some uses of IThreaded?
-void asyncStart(std::function<void()> func)
-{
-    (new CSimpleFunctionThread(func))->startRelease();
+    completed->decAndWait();
 }
 
 // ---------------------------------------------------------------------------
@@ -853,20 +1000,24 @@ class CPooledThreadWrapper;
 class CThreadPoolBase
 {
 public:
+    CThreadPoolBase(bool _inheritThreadContext)
+    : inheritThreadContext(_inheritThreadContext)
+    {
+    }
     virtual ~CThreadPoolBase() {}
 protected: friend class CPooledThreadWrapper;
-    IExceptionHandler *exceptionHandler;
-    CriticalSection crit;
+    IExceptionHandler *exceptionHandler = nullptr;
+    CriticalSection crit{SYNC_LOCATION};
     StringAttr poolname;
-    int donewaiting;
-    Semaphore donesem;
+    Semaphore donesem{SYNC_LOCATION};
     PointerArray waitingsems;
     UnsignedArray waitingids;
-    bool stopall;
-    unsigned defaultmax;
-    unsigned targetpoolsize;
-    unsigned delay;
-    Semaphore availsem;
+    std::atomic<bool> stopall{false};
+    const bool inheritThreadContext;
+    unsigned defaultmax = 0;
+    unsigned targetpoolsize = 0;
+    unsigned delay = 0;
+    Semaphore availsem{SYNC_LOCATION};
     std::atomic_uint numrunning{0};
     virtual void notifyStarted(CPooledThreadWrapper *item)=0;
     virtual bool notifyStopped(CPooledThreadWrapper *item)=0;
@@ -877,37 +1028,71 @@ class CPooledThreadWrapper: public Thread
 {
     PooledThreadHandle handle;
     IPooledThread *thread;
-    Semaphore sem;
+    Semaphore sem{SYNC_LOCATION};
+    Semaphore stopDoneSem{SYNC_LOCATION};
     CThreadPoolBase &parent;
-    char *runningname;
+    StringAttr runningName;
+    bool inheritThreadContext;
+    bool stopInProgress = false;
+    bool waitingForStop = false;
 public:
     CPooledThreadWrapper(CThreadPoolBase &_parent,
                          PooledThreadHandle _handle,
                          IPooledThread *_thread) // takes ownership of thread
-        : Thread(StringBuffer("Member of thread pool: ").append(_parent.poolname).str()), parent(_parent)
+        : Thread(StringBuffer("Member of thread pool: ").append(_parent.poolname).str(), true), parent(_parent), inheritThreadContext(_parent.inheritThreadContext)
     {
         thread = _thread;
         handle = _handle;
-        runningname = strdup(_parent.poolname); 
+        runningName.set(_parent.poolname); 
     }
 
     ~CPooledThreadWrapper()
     {
         thread->Release();
-        free(runningname);
     }
 
-    void setName(const char *name) { free(runningname); runningname=strdup(name); }
+    void setName(const char *name) { runningName.set(name); }
+    void setInheritThreadContext(bool inherit) { inheritThreadContext = inherit; }
     void setHandle(PooledThreadHandle _handle) { handle = _handle; }
     PooledThreadHandle queryHandle() { return handle; }
     IPooledThread &queryThread() { return *thread; }
     void setThread(IPooledThread *_thread) { thread = _thread; } // takes ownership
     bool isStopped() { return (handle==0); }
+    bool isAvailableForReuse() { return isStopped() && !stopInProgress; }
+    bool beginStop()
+    {
+        if (!handle || stopInProgress)
+            return false;
+        stopInProgress = true;
+        return true;
+    }
+    void finishStop()
+    {   // called in parent.crit
+        stopInProgress = false;
+        if (waitingForStop)
+        {
+            waitingForStop = false;
+            stopDoneSem.signal();
+        }
+    }
+    void waitForPendingStop()
+    {   // called in parent.crit - the stop callback may still reference job-owned state, so don't release joiners yet
+        while (stopInProgress)
+        {
+            waitingForStop = true;
+            CriticalUnblock unblock(parent.crit);
+            stopDoneSem.wait();
+        }
+    }
+    bool invokeStop()
+    {
+        return thread->stop();
+    }
     PooledThreadHandle markStopped()
     {
         PooledThreadHandle ret=handle;
         handle = 0;
-        if (ret) // JCSMORE - I can't see how handle can not be set if here..
+        if (ret) // The handle identifies the job that has just stopped.
             parent.numrunning--;
         return ret;
     }
@@ -920,41 +1105,38 @@ public:
     {
         do
         {
-            resetThreadLogging();
             sem.wait();
             {
                 CriticalBlock block(parent.crit); // to synchronize
                 if (parent.stopall)
                     break;
             }
+
+            if (inheritThreadContext)
+                restoreThreadContext(savedCtx);
+            else
+                restoreThreadContext(SavedThreadContext{}); // Reset in case a previous context was set
+
             parent.notifyStarted(this);
             try
             {
-                char *&threadname = cthreadname.threadname;
-                char *temp = threadname;    // swap running name and threadname
-                threadname = runningname;
-                runningname = temp;
-                thread->threadmain();
-                temp = threadname;  // and back
-                threadname = runningname;
-                runningname = temp;
+                cthreadname.swapWith(runningName); // swap running name and threadname
+                {
+                    TaskScopeTracker scope(EventTask::Running);
+                    thread->threadmain();
+                }
+                cthreadname.swapWith(runningName); // swap back
             }
             catch (IException *e)
             {
-                char *&threadname = cthreadname.threadname;
-                char *temp = threadname;    // swap back
-                threadname = runningname;
-                runningname = temp;
+                cthreadname.swapWith(runningName); // swap back
                 handleException(e);
             }
 #ifndef NO_CATCHALL
             catch (...)
             {
-                char *&threadname = cthreadname.threadname;
-                char *temp = threadname;    // swap back
-                threadname = runningname;
-                runningname = temp;
-                handleException(MakeStringException(0, "Unknown exception in Thread from pool %s", parent.poolname.get()));
+                cthreadname.swapWith(runningName); // swap back
+                handleException(MakeStringException(JLIBERR_SystemUnknownExceptionInThreadFromPoolS, "Unknown exception in Thread from pool %s", parent.poolname.get()));
             }
 #endif
             callThreadTerminationHooks(true);    // Reset any per-thread state.
@@ -971,13 +1153,6 @@ public:
     {
         thread->init(param);
         cycle();
-    }
-
-    bool stop()
-    {
-        if (handle)
-            return thread->stop();
-        return true;
     }
 
     void handleException(IException *e)
@@ -1032,64 +1207,93 @@ public:
 
 class CThreadPool: public CThreadPoolBase, implements IThreadPool, public CInterface
 {
-    CIArrayOf<CPooledThreadWrapper> threadwrappers;
+    IArrayOf<CPooledThreadWrapper> threadwrappers;
     PooledThreadHandle nextid;
     IThreadFactory *factory;
     unsigned stacksize;
     unsigned timeoutOnRelease;
-    unsigned traceStartDelayPeriod;
-    unsigned startsInPeriod;
-    cycle_t startDelayInPeriod;
+    unsigned traceStartDelayPeriod = 0;
+    int niceValue = 0;
+    unsigned startsInPeriod = 0;
+    cycle_t startDelayInPeriod = 0;
     CCycleTimer overAllTimer;
+    std::atomic<bool> waitAvailableInterrupted{false};
 
-    PooledThreadHandle _start(void *param,const char *name, bool noBlock, unsigned timeout=0)
+    bool acquireSlot(unsigned timeout)
     {
-        CCycleTimer startTimer;
-        bool timedout = defaultmax && !availsem.wait(noBlock ? 0 : (timeout>0?timeout:delay));
-        PooledThreadHandle ret;
+        if (!availsem.wait(timeout))
+            return false;
+        if (waitAvailableInterrupted)
+        {
+            availsem.signal(); // never keep a slot once interrupted, so the interrupt wake-up is passed on and the pool limit is preserved
+            throw makeStringExceptionV(JLIBERR_SystemNoThreadsAvailableInPoolS, "Thread pool %s interrupted", poolname.get());
+        }
+        return true;
+    }
+
+    PooledThreadHandle _start(void *param,const char *name, bool noBlock, unsigned timeout=0, bool inheritContextOverride=false, bool hasInheritContextOverride=false)
+    {
+        if (waitAvailableInterrupted)
+            throw makeStringExceptionV(JLIBERR_SystemNoThreadsAvailableInPoolS, "Thread pool %s interrupted", poolname.get());
+        CCycleTimer startTimer(traceStartDelayPeriod);
+        bool waited = false;
+        bool timedout = false;
+        if (defaultmax)
+        {
+            waited = !acquireSlot(0);
+            if (noBlock)
+                timedout = waited;
+            else if (waited)
+                timedout = !acquireSlot(timeout>0?timeout:delay);
+        }
+
+        CPooledThreadWrapper * t = nullptr;
         {
             CriticalBlock block(crit);
             if (timedout)
             {
-                if (!availsem.wait(0)) {  // make sure take allocated sem if has become available
+                if (!acquireSlot(0)) // make sure take allocated sem if has become available
+                {
                     if (noBlock || timeout > 0)
-                        throw MakeStringException(0, "No threads available in pool %s", poolname.get());
+                        throw MakeStringException(JLIBERR_SystemNoThreadsAvailableInPoolS, "No threads available in pool %s", poolname.get());
                     IWARNLOG("Pool limit exceeded for %s", poolname.get());
                 }
-                else
-                    timedout = false;
             }
             if (traceStartDelayPeriod)
             {
                 ++startsInPeriod;
-                if (timedout)
-                {
+                if (waited)
                     startDelayInPeriod += startTimer.elapsedCycles();
-                    if (overAllTimer.elapsedCycles() >= queryOneSecCycles()*traceStartDelayPeriod) // check avg. delay per minute
-                    {
-                        double totalDelayMs = (static_cast<double>(cycle_to_nanosec(startDelayInPeriod)))/1000000;
-                        double avgDelayMs = (static_cast<double>(cycle_to_nanosec(startDelayInPeriod/startsInPeriod)))/1000000;
-                        unsigned totalElapsedSecs = overAllTimer.elapsedMs()/1000;
-                        PROGLOG("%s: %u threads started in last %u seconds, total delay = %0.2f milliseconds, average delay = %0.2f milliseconds, currently running = %u", poolname.get(), startsInPeriod, totalElapsedSecs, totalDelayMs, avgDelayMs, runningCount());
-                        startsInPeriod = 0;
-                        startDelayInPeriod = 0;
-                        overAllTimer.reset();
-                    }
+                if (overAllTimer.elapsedCycles() >= queryOneSecCycles()*traceStartDelayPeriod) // check avg. delay per minute
+                {
+                    double totalDelayMs = (static_cast<double>(cycle_to_nanosec(startDelayInPeriod)))/1000000;
+                    double avgDelayMs = (static_cast<double>(cycle_to_nanosec(startDelayInPeriod/startsInPeriod)))/1000000;
+                    unsigned totalElapsedSecs = overAllTimer.elapsedMs()/1000;
+                    PROGLOG("%s: %u threads started in last %u seconds, total delay = %0.2f milliseconds, average delay = %0.2f milliseconds, currently running = %u", poolname.get(), startsInPeriod, totalElapsedSecs, totalDelayMs, avgDelayMs, runningCount());
+                    startsInPeriod = 0;
+                    startDelayInPeriod = 0;
+                    overAllTimer.reset();
                 }
             }
-            CPooledThreadWrapper &t = allocThread();
-            if (name)
-                t.setName(name);
-            t.go(param);
-            ret = t.queryHandle();
+            t = &allocThread();
         }
-        Sleep(0);
-        return ret;
+        if (name)
+            t->setName(name);
+        if (hasInheritContextOverride)
+            t->setInheritThreadContext(inheritContextOverride);
+        else
+            t->setInheritThreadContext(inheritThreadContext);
+        if (hasInheritContextOverride ? inheritContextOverride : inheritThreadContext)
+            t->captureThreadLoggingInfo();
+        t->go(param);
+        Sleep(0); // Potentially yield so that the new thread has a chance to start processing.
+        return t->queryHandle();
     }
 
 public:
     IMPLEMENT_IINTERFACE;
-    CThreadPool(IThreadFactory *_factory,IExceptionHandler *_exceptionHandler,const char *_poolname,unsigned _defaultmax, unsigned _delay, unsigned _stacksize, unsigned _timeoutOnRelease, unsigned _targetpoolsize)
+    CThreadPool(IThreadFactory *_factory,bool _inheritThreadContext, IExceptionHandler *_exceptionHandler,const char *_poolname,unsigned _defaultmax, unsigned _delay, unsigned _stacksize, unsigned _timeoutOnRelease, unsigned _targetpoolsize)
+    : CThreadPoolBase(_inheritThreadContext)
     {
         poolname.set(_poolname);
         factory = LINK(_factory);
@@ -1103,9 +1307,6 @@ public:
         stacksize = _stacksize;
         timeoutOnRelease = _timeoutOnRelease;
         targetpoolsize = _targetpoolsize?_targetpoolsize:defaultmax;
-        traceStartDelayPeriod = 0;
-        startsInPeriod = 0;
-        startDelayInPeriod = 0;
     }
 
     ~CThreadPool()
@@ -1139,7 +1340,7 @@ public:
             newid=nextid++;
         ForEachItemIn(i,threadwrappers) {
             CPooledThreadWrapper &it = threadwrappers.item(i);
-            if (it.isStopped()) {
+            if (it.isAvailableForReuse()) {
                 it.setHandle(newid);
                 if (!it.queryThread().canReuse()) {
                     it.queryThread().Release();
@@ -1151,7 +1352,9 @@ public:
         CPooledThreadWrapper &ret = *new CPooledThreadWrapper(*this,newid,factory->createNew());
         if (stacksize)
             ret.setStackSize(stacksize);
-        ret.start();
+        if (niceValue)
+            ret.setNice(niceValue);
+        ret.start(false);
         threadwrappers.append(ret);
         return ret;
     }
@@ -1171,11 +1374,6 @@ public:
         return _start(param, NULL, true);
     }
 
-    PooledThreadHandle startNoBlock(void *param,const char *name)
-    {
-        return _start(param, name, true);
-    }
-
     PooledThreadHandle start(void *param)
     {
         return _start(param, NULL, false);
@@ -1186,32 +1384,81 @@ public:
         return _start(param, name, false);
     }
 
+    PooledThreadHandle startWithContext(void *param,const char *name,bool inheritContext)
+    {
+        return _start(param, name, false, 0, inheritContext, true);
+    }
+
     PooledThreadHandle start(void *param,const char *name, unsigned timeout)
     {
         return _start(param, name, false, timeout);
     }
 
+    bool invokeAndFinishStop(CPooledThreadWrapper &t)
+    {   // called outside crit; must always finishStop() to release a worker blocked in notifyStopped()
+        bool ret;
+        try
+        {
+            ret = t.invokeStop();
+        }
+        catch (...)
+        {
+            //This should never occur - it should be a non blocking, non throwing call
+            CriticalBlock block(crit);
+            t.finishStop();
+            throw;
+        }
+        CriticalBlock block(crit);
+        t.finishStop();
+        return ret;
+    }
+
     bool stop(PooledThreadHandle handle)
     {
-        CriticalBlock block(crit);
-        CPooledThreadWrapper *t = findThread(handle);
-        if (t)
-            return t->stop();
-        return true;    // already stopped
+        Owned<CPooledThreadWrapper> t;
+        {
+            CriticalBlock block(crit);
+            CPooledThreadWrapper *found = findThread(handle);
+            if (!found)
+                return true;    // already stopped
+            if (!found->beginStop())
+                return true;    // stop already requested
+            t.set(found);
+        }
+        return invokeAndFinishStop(*t);
     }
 
     bool stopAll(bool tryall=false)
     {
         availsem.signal(1000);
         availsem.wait();
-        CriticalBlock block(crit);
         bool ret=true;
-        ForEachItemIn(i,threadwrappers) {
-            CPooledThreadWrapper &it = threadwrappers.item(i);
-            if (!it.stop()) {
-                ret = false;
-                if (!tryall)
-                    break;
+        IArrayOf<CPooledThreadWrapper> tostop;
+        {
+            CriticalBlock block(crit);
+            ForEachItemIn(i,threadwrappers)
+            {
+                CPooledThreadWrapper &it = threadwrappers.item(i);
+                if (!it.isStopped() && it.beginStop())
+                {
+                    it.Link();
+                    tostop.append(it);
+                }
+            }
+        }
+        ForEachItemIn(i,tostop)
+        {
+            CPooledThreadWrapper &it = tostop.item(i);
+            if (ret || tryall)
+            {
+                // This function is non blocking, and is not allow to throw an exception
+                if (!invokeAndFinishStop(it))
+                    ret = false;
+            }
+            else
+            {
+                CriticalBlock block(crit);
+                it.finishStop();
             }
         }
         return ret;
@@ -1222,7 +1469,7 @@ public:
         // called in critical section
         if (t.isStopped())
             return true;
-        Semaphore sem;
+        Semaphore sem(SYNC_LOCATION);
         waitingsems.append(&sem);
         waitingids.append(t.queryHandle());
         crit.leave();
@@ -1248,7 +1495,7 @@ public:
     virtual bool joinAll(bool del,unsigned timeout=INFINITE)
     { // note timeout is for each join
         CriticalBlock block(crit);
-        CIArrayOf<CPooledThreadWrapper> tojoin;
+        IArrayOf<CPooledThreadWrapper> tojoin;
         ForEachItemIn(i1,threadwrappers) {
             CPooledThreadWrapper &it = threadwrappers.item(i1);
             it.Link();
@@ -1300,6 +1547,7 @@ public:
     bool notifyStopped(CPooledThreadWrapper *item)
     {
         CriticalBlock block(crit);
+        item->waitForPendingStop();
         PooledThreadHandle myid = item->markStopped();
         ForEachItemIn(i1,waitingids) { // tell anyone waiting
             if (waitingids.item(i1)==myid)
@@ -1308,6 +1556,7 @@ public:
         bool ret = true;
         if (defaultmax) {
             unsigned n=threadwrappers.ordinality();
+            // Only wrappers beyond targetpoolsize are candidates for removal.
             for (unsigned i2=targetpoolsize;i2<n;i2++) {        // only check excess for efficiency
                 if (item==&threadwrappers.item(i2)) {
                     threadwrappers.remove(i2);
@@ -1315,7 +1564,10 @@ public:
                     break;
                 }
             }
-            availsem.signal();
+            // NB: a threadpool can have an arbitrary number of threads in running state if started after throttling period
+            // Only release a 'slot' if the number of remaining running threads has fallen under the limit
+            if (numrunning < defaultmax)
+                availsem.signal();
         }
         return ret;
     }
@@ -1323,23 +1575,103 @@ public:
     {
         traceStartDelayPeriod = secs;
     }
+    void setNiceValue(int value)
+    {
+        niceValue = value;
+    }
     bool waitAvailable(unsigned timeout)
     {
+        if (waitAvailableInterrupted)
+            return false;
         if (!defaultmax)
             return true;
         if (availsem.wait(timeout))
         {
-            availsem.signal();
-            return true;
+            availsem.signal(); // NB: also passes an interrupt wake-up on to any other waiters
+            return !waitAvailableInterrupted;
         }
         return false;
     }
+    virtual void stopAccepting() override
+    {
+        // Irreversible: the pool can no longer start threads (start*() throw, waitAvailable() returns false); running threads, stop/join/destruction are unaffected.
+        // The extra slot is never retained: every availsem consumer hands it back once interrupted
+        if (!waitAvailableInterrupted.exchange(true))
+            availsem.signal();
+    }
+    // setPoolSize allocates more 'slots' (availsem), or reduces the number of available slots
+    // Due to the throttling mechanism, the number of running threads may exceed the defaultmax
+    // Reducing the pool size, can in effect increase the number of running threads over the limit
+    // Completing threads will only make a slot available if the number running is less than the limit
+    virtual void setPoolSize(unsigned newPoolSize, unsigned newTargetPoolSize) override
+    {
+        CriticalBlock block(crit);
+        if (newPoolSize > defaultmax)
+        {
+            // NB: calc difference, but consider 'burst' threads, and discount them from the number to add
+            // because the new defaultmax will mean those burst(any thread) threads will add to slot capacity.
+
+            unsigned slotsToAdd = newPoolSize - defaultmax;
+            if (numrunning > defaultmax) // i.e. some 'burst' threads are running
+            {
+                // consider some of the 'burst' threads as part of the new pool size
+                unsigned burstThreads = numrunning - defaultmax;
+                if (burstThreads >= slotsToAdd)
+                    slotsToAdd = 0; // already enough capacity
+                else
+                    slotsToAdd -= burstThreads;
+            }
+            if (slotsToAdd)
+                availsem.signal(slotsToAdd);
+        }
+        else if (newPoolSize < defaultmax)
+        {
+            unsigned slotsToConsume = defaultmax - newPoolSize;
+            // consume what we can from those not yet consumed
+            while (slotsToConsume)
+            {
+                if (!availsem.wait(0))
+                    break; // none available
+                if (waitAvailableInterrupted)
+                {
+                    availsem.signal(); // don't swallow the interrupt wake-up
+                    break;
+                }
+                --slotsToConsume;
+            }
+            // NB: any unconsumed are now in effect 'burst' threads. Their lifetime (as before) is governed by targetpoolsize
+        }
+
+        if (0 == newTargetPoolSize)
+            newTargetPoolSize = newPoolSize;
+
+        unsigned n = threadwrappers.ordinality();
+        unsigned i = n;
+        // walk backwards, removing stopped threads until we reach the new targetpoolsize (or have considered all threadwrappers)
+        while (n>newTargetPoolSize)
+        {
+            --i;
+            CPooledThreadWrapper &t = threadwrappers.item(i);
+            if (t.isStopped())
+            {
+                threadwrappers.remove(i);
+                --n;
+            }
+            if (0 == i)
+            {
+                // NB: if n>0, it implies the # of running threads is greater than newTargetPoolSize.
+                // Excess threadwrappers will continue to be considered for removal when completed by notifyStopped.
+                break;
+            }
+        }
+        targetpoolsize = newTargetPoolSize;
+        defaultmax = newPoolSize;
+    }
 };
 
-
-IThreadPool *createThreadPool(const char *poolname,IThreadFactory *factory,IExceptionHandler *exceptionHandler,unsigned defaultmax, unsigned delay, unsigned stacksize, unsigned timeoutOnRelease, unsigned targetpoolsize)
+IThreadPool *createThreadPool(const char *poolname,IThreadFactory *factory,bool inheritThreadContext, IExceptionHandler *exceptionHandler,unsigned defaultmax, unsigned delay, unsigned stacksize, unsigned timeoutOnRelease, unsigned targetpoolsize)
 {
-    return new CThreadPool(factory,exceptionHandler,poolname,defaultmax,delay,stacksize,timeoutOnRelease,targetpoolsize);
+    return new CThreadPool(factory,inheritThreadContext,exceptionHandler,poolname,defaultmax,delay,stacksize,timeoutOnRelease,targetpoolsize);
 }
 
 //=======================================================================================================
@@ -1363,7 +1695,7 @@ static void CheckAllowedProgram(const char *prog,const char *allowed)
             return;
     }
     AERRLOG("Unauthorized pipe program(%s)",head.str());
-    throw MakeStringException(-1,"Unauthorized pipe program(%s)",head.str());
+    throw MakeStringException(JLIBERR_SystemUnauthorizedPipeProgramS,"Unauthorized pipe program(%s)",head.str());
 }
 
 class CPipeProcessException : public CSimpleInterfaceOf<IPipeProcessException>
@@ -1429,7 +1761,7 @@ class CWindowsPipeProcess: implements IPipeProcess, public CInterface
     HANDLE hError;
     StringAttr title;
     unsigned retcode;
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     bool aborted;
     StringAttr allowedprogs;
     StringArray env;
@@ -1583,7 +1915,7 @@ public:
                 throw e;
             }
         }
-        return aborted?((size32_t)-1):((size32_t)sizeRead);
+        return aborted?0:((size32_t)sizeRead);
     }
     ISimpleReadStream *getOutputStream()
     {
@@ -1610,7 +1942,7 @@ public:
                 throw e;
             }
         }
-        return aborted?((size32_t)-1):((size32_t)sizeRead);
+        return aborted?0:((size32_t)sizeRead);
     }
     ISimpleReadStream *getErrorStream()
     {
@@ -1775,6 +2107,7 @@ public:
     {
         return pipeProcess;
     }
+    void setAllowTrace() override {}
 };
 
 IPipeProcess *createPipeProcess(const char *allowedprogs)
@@ -1847,7 +2180,11 @@ static unsigned dowaitpid(HANDLE pid, int mode)
     return 0;
 }
 
-static CriticalSection runsect; // single thread process start to avoid forked handle open/closes interleaving
+#ifdef __APPLE__
+extern char **environ;
+#endif
+
+static CriticalSection runsect(SYNC_LOCATION); // single thread process start to avoid forked handle open/closes interleaving
 class CLinuxPipeProcess: implements IPipeProcess, public CInterface
 {
 
@@ -1855,7 +2192,7 @@ class CLinuxPipeProcess: implements IPipeProcess, public CInterface
     {
         CLinuxPipeProcess *parent;
     public:
-        cForkThread(CLinuxPipeProcess *_parent)
+        cForkThread(CLinuxPipeProcess *_parent) : Thread("cForkThread")
         {
             parent = _parent;
         }
@@ -1873,12 +2210,12 @@ class CLinuxPipeProcess: implements IPipeProcess, public CInterface
     {
         MemoryAttr buf;
         size32_t bufsize;
-        Semaphore stopsem;
+        Semaphore stopsem{SYNC_LOCATION};
         CriticalSection &sect;
         int &hError;
     public:
         cStdErrorBufferThread(size32_t maxbufsize,int &_hError,CriticalSection &_sect)
-            : sect(_sect), hError(_hError)
+            : Thread("cStdErrorBufferThread"),sect(_sect), hError(_hError)
         {
             buf.allocate(maxbufsize);
             bufsize = 0;
@@ -1961,13 +2298,14 @@ protected: friend class PipeWriterThread;
     StringAttr prog;
     StringAttr dir;
     int retcode;
-    CriticalSection sect;
-    Semaphore started;
+    CriticalSection sect{SYNC_LOCATION};
+    Semaphore started{SYNC_LOCATION};
     bool aborted;
     MemoryBuffer stderrbuf;
     size32_t stderrbufsize;
     StringAttr allowedprogs;
     StringArray env;
+    bool allowTrace = false;
 
     void clearUtilityThreads(bool clearStderr)
     {
@@ -2047,7 +2385,8 @@ public:
         int inpipe[2];
         int outpipe[2];
         int errpipe[2];
-        if ((hasinput && (::pipe(inpipe)==-1)) ||
+        if (aborted ||
+            (hasinput && (::pipe(inpipe)==-1)) ||
             (hasoutput && (::pipe(outpipe)==-1)) ||
             (haserror && (::pipe(errpipe)==-1)))
         {
@@ -2073,6 +2412,21 @@ public:
             }
             envp.append(nullptr);
         }
+#ifdef __linux__
+        sem_t *mutex = nullptr;
+        int shmid=0;
+        if (allowTrace)
+        {
+            shmid = shmget(0, sizeof(sem_t)*2, IPC_CREAT | SHM_R | SHM_W);
+            assertex(shmid>=0);
+            mutex = (sem_t *) shmat(shmid, NULL, 0);
+            assertex(mutex);
+            int r = sem_init(&mutex[0], 1, 0);
+            assertex(r==0);
+            r = sem_init(&mutex[1], 1, 0);
+            assertex(r==0);
+        }
+#endif
 
         /* NB: Important to call splitargs (which calls malloc) before the fork()
          * and not in the child process. Because performing malloc in the child
@@ -2107,7 +2461,31 @@ public:
         // NOTE - from here to the execvp/_exit call, we must only call "signal-safe" functions, that do not do any memory allocation
         // fork() only clones the one thread from parent process, meaning any mutexes/semaphores protecting multi-threaded access
         // to (for example) malloc cannot be relied upon not to be locked, and will never be unlocked if they are.
-        if (pipeProcess==0) { // child
+        if (pipeProcess)
+        {
+#ifdef __linux__
+            if (allowTrace)
+            {
+                prctl(PR_SET_PTRACER, pipeProcess, 0, 0, 0);
+                sem_post(&mutex[0]);
+                sem_wait(&mutex[1]);
+                sem_destroy(&mutex[0]);
+                sem_destroy(&mutex[1]);
+                shmdt(mutex);
+                shmctl(shmid, IPC_RMID, NULL);
+            }
+#endif
+        }
+        else
+        { // child
+#ifdef __linux__
+            if (allowTrace)
+            {
+                sem_wait(&mutex[0]);
+                sem_post(&mutex[1]);
+                shmdt(mutex);
+            }
+#endif
             if (newProcessGroup)//Force the child process into its own process group, so we can terminate it and its children.
                 setpgid(0,0);
             if (hasinput) {
@@ -2126,19 +2504,21 @@ public:
                 close(errpipe[1]);
             }
 
-            if (dir.get()) {
-                if (chdir(dir) == -1)
-                    throw MakeStringException(-1, "CLinuxPipeProcess::run: could not change dir to %s", dir.get());
+            if (dir.get() && chdir(dir) == -1)
+            {
+                if (haserror)
+                {
+                    fprintf(stderr, "ERROR: CLinuxPipeProcess::run: could not change dir to %s", dir.str());
+                    fflush(stderr);
+                }
+                _exit(START_FAILURE);    // must be _exit!!
             }
             if (envp.length())
-                execve(argv[0], argv, (char *const *) envp.detach());
-            else
-                execvp(argv[0], argv);
+                environ = (char **) envp.detach();
+            execvp(argv[0], argv);
             if (haserror)
             {
-                Owned<IException> e = createPipeErrnoExceptionV(errno, "exec failed: %s", prog.get());
-                StringBuffer eStr;
-                fprintf(stderr, "ERROR: %d: %s", e->errorCode(), e->errorMessage(eStr).str());
+                fprintf(stderr, "ERROR: %d: exec failed: %s, %s", errno, prog.str(), strerror(errno));
                 fflush(stderr);
             }
             _exit(START_FAILURE);    // must be _exit!!
@@ -2174,7 +2554,14 @@ public:
         if (_title)
         {
             title.set(_title);
-            PROGLOG("%s: Creating PIPE program process : '%s' - hasinput=%d, hasoutput=%d stderrbufsize=%d", title.get(), prog.get(),(int)hasinput, (int)hasoutput, stderrbufsize);
+            StringBuffer envText;
+            ForEachItemIn(idx, env)
+            {
+                const auto & cur = env.item(idx);
+                envText.append(" ").append(cur);
+            }
+
+            PROGLOG("%s: Creating PIPE program process : '%s' - hasinput=%d, hasoutput=%d stderrbufsize=%d [%s] in (%s)", title.get(), prog.get(),(int)hasinput, (int)hasoutput, stderrbufsize, envText.str(), _dir ? _dir : "<cwd>");
         }
         CheckAllowedProgram(prog,allowedprogs);
         retcode = 0;
@@ -2187,7 +2574,7 @@ public:
             forkthread.clear();
         }
         forkthread.setown(new cForkThread(this));
-        forkthread->start();
+        forkthread->start(true);
         bool joined = false;
         {
             CriticalUnblock unblock(sect); 
@@ -2209,7 +2596,7 @@ public:
                 delete stderrbufferthread;
             }
             stderrbufferthread = new cStdErrorBufferThread(stderrbufsize,hError,sect);
-            stderrbufferthread->start();
+            stderrbufferthread->start(true);
         }
         return true;
     }
@@ -2248,7 +2635,7 @@ public:
     {
         CriticalBlock block(sect); 
         if (aborted)
-            return (size32_t)-1;
+            return 0;
         if (hOutput==(HANDLE)-1)
             return 0;
         size32_t sizeRead;
@@ -2266,7 +2653,7 @@ public:
                 throw createPipeErrnoExceptionV(errno,"Pipe: read failed (size %d)", sz);
             }
         }
-        return aborted?((size32_t)-1):((size32_t)sizeRead);
+        return aborted?0:((size32_t)sizeRead);
     }
 
     ISimpleReadStream *getOutputStream()
@@ -2306,7 +2693,7 @@ public:
         if (stderrbufferthread) 
             return stderrbufferthread->read(sz,buf);
         if (aborted)
-            return (size32_t)-1;
+            return 0;
         if (hError==(HANDLE)-1)
             return 0;
         size32_t sizeRead;
@@ -2324,7 +2711,7 @@ public:
                 throw createPipeErrnoExceptionV(errno, "Pipe: readError failed (size %d)", sz);
             }
         }
-        return aborted?((size32_t)-1):((size32_t)sizeRead);
+        return aborted?0:((size32_t)sizeRead);
     }
 
     ISimpleReadStream *getErrorStream()
@@ -2406,10 +2793,10 @@ public:
     void abort()
     {
         CriticalBlock block(sect);
+        aborted = true;
         if (pipeProcess != (HANDLE)-1) {
             if (title.length())
                 PROGLOG("%s: Pipe Aborting",title.get());
-            aborted = true;
             closeInput();
             if (forkthread)
             {
@@ -2457,6 +2844,11 @@ public:
         CriticalBlock block(sect);
         return pipeProcess;
     }
+    
+    void setAllowTrace() override
+    {
+        allowTrace = true;
+    }
 };
 
 
@@ -2477,7 +2869,7 @@ class CWorkQueueThread: implements IWorkQueueThread, public CInterface
 {
 public:
     IMPLEMENT_IINTERFACE;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     unsigned persisttime;
 
     class cWorkerThread: public Thread
@@ -2487,13 +2879,13 @@ public:
         CriticalSection &crit;
     public:
         cWorkerThread(CWorkQueueThread *_parent,CriticalSection &_crit,unsigned _persisttime)
-            : crit(_crit)
+            : Thread("WorkQueueThread::cWorkerThread", true),crit(_crit)
         {
             parent = _parent;
             persisttime = _persisttime;
         }
         QueueOf<IWorkQueueItem,false> queue;
-        Semaphore sem;  
+        Semaphore sem{SYNC_LOCATION};  
 
         int run()
         {
@@ -2511,7 +2903,10 @@ public:
                 }
                 if (!work)
                     break;
+
                 try {
+                    //If the thread context needs to be preserved - it should be done inside the IWorkQueueItem implementation.
+                    TaskScopeTracker scope(EventTask::Running);
                     work->execute();
                     work->Release();
                 }
@@ -2521,17 +2916,15 @@ public:
                     e->Release();
                 }
             }
-            CriticalBlock block(crit);
-            parent->worker=NULL;    // this should be safe
             return 0;
         }
         
-    } *worker;
+    };
+    Owned<cWorkerThread> worker;
 
     CWorkQueueThread(unsigned _persisttime)
     {
         persisttime = _persisttime;
-        worker = NULL;
     }
 
     ~CWorkQueueThread()
@@ -2543,8 +2936,8 @@ public:
     {
         CriticalBlock block(crit);
         if (!worker) {
-            worker = new cWorkerThread(this,crit,persisttime);
-            worker->startRelease();
+            worker.setown(new cWorkerThread(this,crit,persisttime));
+            worker->start(false);
         }
         worker->queue.enqueue(packet);
         worker->sem.signal();
@@ -2552,16 +2945,20 @@ public:
 
     void wait()
     {
-        CriticalBlock block(crit);
-        if (worker) {
-            worker->queue.enqueue(NULL);
-            worker->sem.signal();
-            Linked<cWorkerThread> wt;
-            wt.set(worker);
-            CriticalUnblock unblock(crit);
-            wt->join();
+        Owned<cWorkerThread> wt;
+        {
+            CriticalBlock block(crit);
+            if (worker) {
+                worker->queue.enqueue(NULL);
+                worker->sem.signal();
+                wt.swap(worker);
+            }
         }
+
+        if (wt)
+            wt->join();
     }
+
     unsigned pending()
     {
         CriticalBlock block(crit);
@@ -2578,7 +2975,7 @@ IWorkQueueThread *createWorkQueueThread(unsigned persisttime)
     return new CWorkQueueThread(persisttime);
 }
 
-unsigned threadLogID()  // for use in logging
+unsigned getSystemThreadId()  // for use in logging etc.
 {
 #if defined(__APPLE__)
      return pthread_mach_thread_np(pthread_self());
@@ -2588,4 +2985,189 @@ unsigned threadLogID()  // for use in logging
 #endif
 #endif
     return (unsigned)(memsize_t) GetCurrentThreadId(); // truncated in 64bit
+}
+
+void PerfTracer::setInterval(double _interval)
+{
+    interval = _interval;
+}
+
+void PerfTracer::start()
+{
+#ifdef __linux__
+    dostart(1000000);
+#else
+    UNIMPLEMENTED;
+#endif
+}
+
+void PerfTracer::dostart(unsigned seconds)
+{
+#ifdef __linux__
+    pipe.setown(createPipeProcess());
+    pipe->setAllowTrace();
+    VStringBuffer cmd("doperf %u %u %f", GetCurrentProcessId(), seconds, interval);
+    if (!pipe->run(nullptr, cmd, ".", false, true, false, 1024*1024))
+    {
+        pipe.clear();
+        throw makeStringException(JLIBERR_SystemFailedToRunDoperf, "Failed to run doperf");
+    }
+#else
+    UNIMPLEMENTED;
+#endif
+}
+
+void PerfTracer::stop()
+{
+#ifdef __linux__
+    assertex(pipe);
+    ::kill(pipe->getProcessHandle(), SIGINT);
+    dostop();
+#else
+    UNIMPLEMENTED;
+#endif
+}
+
+void PerfTracer::traceFor(unsigned seconds)
+{
+#ifdef __linux__
+    dostart(seconds);
+    dostop();
+#else
+    UNIMPLEMENTED;
+#endif
+}
+
+void PerfTracer::dostop()
+{
+#ifdef __linux__
+    char buf[1024];
+    while (true)
+    {
+        size32_t read = pipe->read(sizeof(buf), buf);
+        if (!read)
+            break;
+        result.append(read, buf);
+    }
+    pipe->wait();
+#else
+    UNIMPLEMENTED;
+#endif
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+//Global defaults used to initialize thread local variables
+static TraceFlags defaultTraceFlags = TraceFlags::Standard;
+
+// NOTE - extern thread_local variables are very inefficient - don't be tempted to expose the variables directly
+
+static thread_local LogMsgJobId defaultJobId = UnknownJob;
+static thread_local TraceFlags threadTraceFlags = TraceFlags::Standard;
+static thread_local const IContextLogger *default_thread_logctx = nullptr;
+static thread_local ISpan * threadActiveSpan = nullptr;
+
+void saveThreadContext(SavedThreadContext & saveCtx)
+{
+    saveCtx.jobId = defaultJobId;
+    saveCtx.logctx = default_thread_logctx;
+    saveCtx.traceFlags = threadTraceFlags;
+    saveCtx.activeSpan = threadActiveSpan;
+}
+
+void restoreThreadContext(const SavedThreadContext & saveCtx)
+{
+    // Note - as implemented the thread default job info is determined by what the global one was when the thread was created.
+    // There is an alternative interpretation, that an unset thread-local one should default to whatever the global one is at the time the thread one is used.
+    // In practice I doubt there's a lot of difference as global one is likely to be set once at program startup
+    defaultJobId = saveCtx.jobId;
+    default_thread_logctx = saveCtx.logctx;
+    threadTraceFlags = saveCtx.traceFlags;
+    threadActiveSpan = saveCtx.activeSpan;
+}
+
+LogMsgJobId queryThreadedJobId()
+{
+    return defaultJobId;
+}
+
+void setDefaultJobId(LogMsgJobId id)
+{
+    defaultJobId = id;
+}
+
+const IContextLogger * queryThreadedContextLogger()
+{
+    return default_thread_logctx;
+}
+
+ISpan * queryThreadedActiveSpan()
+{
+    ISpan * result = threadActiveSpan;
+    if (!result)
+        result = queryNullSpan();
+    return result;
+}
+
+ISpan * setThreadedActiveSpan(ISpan * span)
+{
+    ISpan * ret = threadActiveSpan;
+    threadActiveSpan = span;
+    return ret;
+}
+
+//---------------------------
+
+bool doTrace(TraceFlags featureFlag, TraceFlags level)
+{
+    if ((threadTraceFlags & TraceFlags::LevelMask) < level)
+        return false;
+    return (threadTraceFlags & featureFlag) == featureFlag;
+}
+
+void updateTraceFlags(TraceFlags flag, bool global)
+{
+    if (global)
+        defaultTraceFlags = flag;
+    threadTraceFlags = flag;
+}
+
+TraceFlags queryTraceFlags()
+{
+    return threadTraceFlags;
+}
+
+TraceFlags queryDefaultTraceFlags()
+{
+    return defaultTraceFlags;
+}
+
+TraceFlags combineTraceFlags(TraceFlags existing, TraceFlags request)
+{
+    //Choose the highest level of the two
+    TraceFlags newLevel = std::max(existing & TraceFlags::LevelMask, request & TraceFlags::LevelMask);
+    //Use the union of the different flags
+    TraceFlags newFlags = (existing | request) & ~TraceFlags::LevelMask;
+    return newLevel | newFlags;
+}
+
+//---------------------------
+
+LogContextScope::LogContextScope(const IContextLogger *ctx)
+{
+    prevFlags = threadTraceFlags;
+    prev = default_thread_logctx;
+    default_thread_logctx = ctx;
+}
+LogContextScope::LogContextScope(const IContextLogger *ctx, TraceFlags traceFlags)
+{
+    prevFlags = threadTraceFlags;
+    threadTraceFlags = traceFlags;
+    prev = default_thread_logctx;
+    default_thread_logctx = ctx;
+}
+LogContextScope::~LogContextScope()
+{
+    default_thread_logctx = prev;
+    threadTraceFlags = prevFlags;
 }

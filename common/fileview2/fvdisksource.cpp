@@ -153,7 +153,7 @@ bool PhysicalFileInfo::readData(MemoryBuffer & out, __int64 startOffset, size32_
         }
         if (df->isCompressed())
         {
-            cachedIO.setown(createCompressedFileReader(cachedIO));
+            cachedIO.setown(createCompressedFileReader(cachedIO, nullptr, useDefaultIoBufferSize));
             if (!cachedIO)
             {
                 StringBuffer str;
@@ -193,7 +193,7 @@ DiskDataSource::DiskDataSource(const char * _logicalName, IHqlExpression * _disk
         udesc->set(_username, _password);
     }
 
-    df.setown(queryDistributedFileDirectory().lookup(logicalName, udesc.get(),false,false,false,nullptr,defaultPrivilegedUser));
+    df.setown(queryDistributedFileDirectory().lookup(logicalName, udesc.get(),AccessMode::readRandom,false,false,nullptr,defaultPrivilegedUser));
 }
 
 
@@ -678,7 +678,8 @@ bool TranslatedDiskDataSource::init()
 bool TranslatedDiskDataSource::compileHelperWU()
 {
     submitWorkUnit(helperWuid, username, password);
-    return waitForWorkUnitToCompile(helperWuid);
+    WUState state = waitForWorkUnitToCompile(helperWuid);
+    return isCompiled(state);
 }
 
 //---------------------------------------------------------------------------

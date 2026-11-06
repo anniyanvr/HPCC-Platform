@@ -248,6 +248,8 @@ protected:
 
 class DALIFT_API CCsvPartitioner : public CInputBasePartitioner
 {
+    friend class CsvDeduceLineTest;
+    enum TokenKind { NONE=0, SEPARATOR=1, TERMINATOR=2, WHITESPACE=3, QUOTE=4, ESCAPE=5, UNKNOWN=6 };
 public:
     CCsvPartitioner(const FileFormat & _format);
 
@@ -264,11 +266,13 @@ protected:
         return getSplitRecordSize(record,maxToRead,processFullBuffer,true);
     }
 
+    size32_t deduceStartNextLine(const byte * record, unsigned maxToRead, bool ateof);
+
+    static inline TokenKind kind(unsigned match) { return (TokenKind)(match & 255); }
 private:
     void storeFieldName(const char * start, unsigned len);
 
 protected:
-    enum { NONE=0, SEPARATOR=1, TERMINATOR=2, WHITESPACE=3, QUOTE=4, ESCAPE=5 };
     unsigned        maxElementLength;
     FileFormat      format;
     StringMatcher   matcher;
@@ -377,9 +381,10 @@ class DALIFT_API JsonSplitter : implements IPTreeNotifyEvent, public CInterface
 public:
     IMPLEMENT_IINTERFACE;
 
-    JsonSplitter(const FileFormat & format, IFileIOStream &stream) : headerLength(0), pathPos(0), tangent(0), rowDepth(0), rowStart((offset_t)-1), rowEnd(0), footerLength((offset_t)-1), newRowSet(true), hasRootArray(false)
+    JsonSplitter(const FileFormat & format, IFileIOStream &stream) : rowStart((offset_t)-1), rowEnd(0), headerLength(0), footerLength((offset_t)-1), pathPos(0), tangent(0), rowDepth(0), newRowSet(true), hasRootArray(false)
     {
-        LOG(MCdebugProgressDetail, unknownJob, "JsonSplitter::JsonSplitter(format.type :'%s', rowPath:'%s')", format.getFileFormatTypeString(), format.rowTag.get());
+        if (doTrace(tracePartitionDetails, traceDetailed))
+            LOG(MCdebugProgressDetail, "JsonSplitter::JsonSplitter(format.type :'%s', rowPath:'%s')", format.getFileFormatTypeString(), format.rowTag.get());
 
         size = stream.size();
         const char *rowPath = format.rowTag;
@@ -558,11 +563,13 @@ protected:
         JSON_DBGLOG("CJsonInputPartitioner::findSplitPoint: splitOffset %lld", splitOffset);
         JSON_DBGLOG("CJsonInputPartitioner::findSplitPoint: cursor(inputOffset: %lld, nextInputOffset: %lld, outputOffset: %lld, trimLength: %lld",
                         cursor.inputOffset, cursor.nextInputOffset, cursor.outputOffset, cursor.trimLength);
-        cursor.inputOffset = 0;
         if (!splitOffset) //header + 0 is first offset
+        {
+            cursor.inputOffset = 0;
             return;
+        }
 
-        if (eof)
+        if (eof) // leave cursor.inputOffset untouched
             return;
 
         // To prevent the splitOffset points into an already processed file area
@@ -574,15 +581,12 @@ protected:
         bool foundRowEnd = json->findRowEnd(splitOffset-thisOffset + thisHeaderSize, prevRowEnd);
         JSON_DBGLOG("CJsonInputPartitioner::findSplitPoint: thisOffset: %lld, thisHeaderSize: %u, prevRowEnd: %lld, foundRowEnd:%s ", thisOffset, thisHeaderSize, prevRowEnd, (foundRowEnd ? "True" : "False"));
         if (! foundRowEnd) //false return just means we're processing the end
-        {
-            //cursor.inputOffset = prevRowEnd;
-            return;
-        }
+            return; // leave cursor.inputOffset untouched
 
         bool checkFoundRowStartRes = json->checkFoundRowStart();
         JSON_DBGLOG("CJsonInputPartitioner::findSplitPoint: checkFoundRowStartRes:%s)", (checkFoundRowStartRes ? "True" : "False"));
         if (!checkFoundRowStartRes)
-            return;
+            return; // leave cursor.inputOffset untouched
 
         bool isNewRowSet = json->newRowSet;
         JSON_DBGLOG("CJsonInputPartitioner::findSplitPoint: isNewRowSet:%s", (isNewRowSet ? "True" : "False"));
@@ -657,7 +661,7 @@ public:
     unsigned getMaxElementLength() { return maxElementLength; }
 
 protected:
-    enum { NONE, OPENTAG, CLOSETAG, ENDTAG, ENDCLOSETAG, NEWLINE, WHITESPACE };
+    enum { NONE, OPENTAG, CLOSETAG, ENDTAG, ENDCLOSETAG, NEWLINE, WHITESPACE, UNKNOWN };
     unsigned        maxElementLength;
     StringMatcher   matcher;
     unsigned        unitSize;
@@ -700,11 +704,12 @@ protected:
 
 //---------------------------------------------------------------------------
 
+class FileSprayer;
 class DALIFT_API CRemotePartitioner : public Thread, public IFormatPartitioner
 {
 public:
-    CRemotePartitioner(const SocketEndpoint & _ep, const FileFormat & _srcFormat, const FileFormat & _tgtFormat, const char * _slave, const char *_wuid);
-    IMPLEMENT_IINTERFACE
+    CRemotePartitioner(FileSprayer &sprayer, const SocketEndpoint & _ep, const FileFormat & _srcFormat, const FileFormat & _tgtFormat, const char * _slave, const char *_wuid);
+    IMPLEMENT_IINTERFACE_USING(Thread);
 
     virtual int  run();
 
@@ -715,14 +720,16 @@ public:
     virtual void setTarget(IOutputProcessor * _target) { UNIMPLEMENTED; }
     virtual void setRecordStructurePresent(bool _recordStructurePresent);
     virtual void getRecordStructure(StringBuffer & _recordStructure);
-    virtual void setAbort(IAbortRequestCallback * _abort) { UNIMPLEMENTED; }
+    virtual void setAbort(IAbortRequestCallback * _abort) { /*UNIMPLEMENTED;*/ }
 
 protected:
     void callRemote();
+    void prepareCmd(MemoryBuffer &msg);
 
     virtual bool isAborting() { UNIMPLEMENTED; };
 
 protected:
+    FileSprayer                 &sprayer;
     SocketEndpoint              ep;
     FileFormat                  srcFormat;
     FileFormat                  tgtFormat;

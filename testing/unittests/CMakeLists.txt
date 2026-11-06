@@ -30,15 +30,58 @@ endif()
 
 project( unittests )
 
+include(${HPCC_SOURCE_DIR}/esp/scm/espscm.cmake)
+
 set (    SRCS
          unittests.cpp
          remotetests.cpp
          dalitests.cpp
          jlibtests.cpp
+         jlibtests2.cpp
+         jlibtestcompress.cpp
+         jlibtestcurl.cpp
+         jstreamtests.cpp
          cryptotests.cpp
          hqltests.cpp
          esdltests.cpp
+         loggingtests.cpp
+         testauthsecuritytests.cpp
+         txSummarytests.cpp
+         accessmaptests.cpp
+         fxpptests.cpp
+         espapicmdtests.cpp
+         filetests.cpp
+         ptreetests.cpp
+         wuarchivetests.cpp
+         wutests.cpp
+         socketasynctests.cpp
+         multishotaccepttests.cpp
+         infocachereadertests.cpp
+         tlsasynctests.cpp
+         ${HPCC_SOURCE_DIR}/esp/bindings/SOAP/xpp/fxpp/FragmentedXmlPullParser.cpp
+         ${HPCC_SOURCE_DIR}/esp/bindings/SOAP/xpp/fxpp/FragmentedXmlAssistant.cpp
+         ${HPCC_SOURCE_DIR}/system/security/shared/authmap.cpp
+         ${HPCC_SOURCE_DIR}/system/security/plugins/testauthSecurity/testauthSecurity.cpp
+         ${CMAKE_BINARY_DIR}/generated/ws_loggingservice_esp.cpp
+         datamaskingtests.cpp
+         ${HPCC_SOURCE_DIR}/tools/esp-api/espapi.cpp
+         ${HPCC_SOURCE_DIR}/tools/esp-api/espshell.cpp
+         ${HPCC_SOURCE_DIR}/tools/esp-api/espservice.cpp
+         commonJsonWriterTests.cpp
+         rtlxmltests.cpp
+         json2ecltests.cpp
+         xml2ecltests.cpp
+         ${HPCC_SOURCE_DIR}/ecl/schemasniffer/common.cpp
+         ${HPCC_SOURCE_DIR}/ecl/schemasniffer/json2ecl.cpp
+         ${HPCC_SOURCE_DIR}/ecl/schemasniffer/xml2ecl.cpp
     )
+
+    if (NOT TARGET SMCLib)
+        set (SRCS
+            ${SRCS}
+            ${HPCC_SOURCE_DIR}/esp/smc/SMCLib/InfoCacheReader.cpp
+        )
+    endif ()
 
 if (NOT CONTAINERIZED)
 set (    SRCS
@@ -46,6 +89,8 @@ set (    SRCS
          configmgr/ConfigMgrUnitTests.cpp
          configmgr/ConfigMgrTemplateTests.cpp
          configmgr/ConfigMgrHPCCTests.cpp
+         metrics/MetricFrameworkTests.cpp
+         metrics/PeriodicSinkTests.cpp
     )
 endif ()
 
@@ -53,46 +98,88 @@ include_directories (
          .
          ./../../system/include
          ./../../system/jlib
+         ./../../system/security/LdapSecurity
          ./../../system/mp
          ./../../system/libbase58
          ./../../fs/dafsclient
          ./../../common/thorhelper
          ./../../dali/base
          ./../../system/security/shared
+         ./../../system/security/plugins/testauthSecurity
          ./../../common/deftype
+         ./../../common/workunit
          ./../../system/security/cryptohelper
+         ./../../system/security/securesocket
          ./../../configuration/configmgr/configmgrlib
+         ${HPCC_SOURCE_DIR}/system/masking/include
          ${HPCC_SOURCE_DIR}/system/xmllib
+         ${HPCC_SOURCE_DIR}/rtl/eclrtl
+         ${HPCC_SOURCE_DIR}/rtl/include
+         ${HPCC_SOURCE_DIR}/common/dllserver
+         ${HPCC_SOURCE_DIR}/common/environment
+         ${HPCC_SOURCE_DIR}/common/eventconsumption
+         ${HPCC_SOURCE_DIR}/common/workunit
+         ${HPCC_SOURCE_DIR}/dali/sasha
          ${HPCC_SOURCE_DIR}/ecl/hql
-         ${HPCC_SOURCE_DIR}/configuration/configmgr/RapidJSON/include
+         ${HPCC_SOURCE_DIR}/ecl/eclcmd/queries
+         ${HPCC_SOURCE_DIR}/ecl/schemasniffer
          ${HPCC_SOURCE_DIR}/esp/bindings
+         ${HPCC_SOURCE_DIR}/esp/bindings/SOAP/xpp
          ${HPCC_SOURCE_DIR}/esp/esdllib
+         ${HPCC_SOURCE_DIR}/esp/esdlscriptlib
+         ${HPCC_SOURCE_DIR}/esp/logging
+         ${HPCC_SOURCE_DIR}/esp/logging/logginglib
+         ${HPCC_SOURCE_DIR}/esp/logging/loggingmanager
          ${HPCC_SOURCE_DIR}/esp/platform
          ${HPCC_SOURCE_DIR}/esp/services/common
+         ${HPCC_SOURCE_DIR}/esp/smc/SMCLib
+         ${HPCC_SOURCE_DIR}/tools/hidl
+         ${HPCC_SOURCE_DIR}/tools/esp-api
          ${CMAKE_BINARY_DIR}/generated
          ${CMAKE_BINARY_DIR}
          ${CMAKE_BINARY_DIR}/oss
+         ${HPCC_SOURCE_DIR}/esp/bindings/http/client
     )
 
 ADD_DEFINITIONS( -D_CONSOLE )
 
 HPCC_ADD_EXECUTABLE ( unittests ${SRCS} )
 
+if (NOT TARGET SMCLib)
+    target_compile_definitions ( unittests PRIVATE SMCLIB_EXPORTS )
+endif ()
+
 install ( TARGETS unittests RUNTIME DESTINATION ${EXEC_DIR} )
-target_link_libraries ( unittests
+target_link_libraries ( unittests PRIVATE
          jlib
+         mp
+         eclrtl
          dafsclient
          dalibase
          deftype
          libbase58
+         hql
          thorhelper
          esphttp
          esdllib
-         ${CPPUNIT_LIBRARIES}
+         logginglib
+         workunit
+         eventconsumption
+         dmetaphone
+         securesocket
+         ${CppUnit_LIBRARIES}
     )
 
+if (TARGET SMCLib)
+    target_link_libraries ( unittests PRIVATE SMCLib )
+endif ()
+
 if (NOT CONTAINERIZED)
-  target_link_libraries ( unittests configmgr )
+  target_link_libraries ( unittests PRIVATE configmgr )
+endif ()
+
+if (CMAKE_DL_LIBS)
+    target_link_libraries ( unittests PRIVATE ${CMAKE_DL_LIBS} )
 endif ()
 
 endif ()

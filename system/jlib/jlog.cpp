@@ -17,11 +17,10 @@
 
 
 #include "platform.h"
-#include "build-config.h"
 
 #include <algorithm>
 #include "stdio.h"
-#include "jlog.hpp"
+#include "jerror.hpp"
 #include "jlog.ipp"
 #include "jmutex.hpp"
 #include "jarray.hpp"
@@ -29,10 +28,11 @@
 #include "jmisc.hpp"
 #include "jprop.hpp"
 #include "lnuid.h"
+#include <sys/stat.h>
+#include "jtrace.hpp"
 
 using namespace ln_uid;
 
-#define MSGCOMP_NUMBER 1000
 #define FILE_LOG_ENABLES_QUEUEUING
 
 #ifndef _WIN32
@@ -41,6 +41,16 @@ using namespace ln_uid;
 
 // Time, in nanoseconds, after which the clock field loops --- 3600000000000ns = 1hr
 #define CLOCK_LOOP_NANOSECONDS I64C(3600000000000)
+
+// Standard filters, handlers, manager, and audit event logger
+static ILogMsgManager * theManager = nullptr;
+static PassAllLogMsgFilter * thePassAllFilter = nullptr;
+static PassLocalLogMsgFilter * thePassLocalFilter = nullptr;
+static PassNoneLogMsgFilter * thePassNoneFilter = nullptr;
+static HandleLogMsgHandler * theStderrHandler = nullptr;
+static PostMortemLogMsgHandler * thePostMortemHandler = nullptr;
+static CSysLogEventLogger * theSysLogEventLogger = nullptr;
+
 
 // LogMsgSysInfo
 
@@ -51,6 +61,38 @@ static FILE *getNullHandle()
 #else
     return fopen("/dev/null","w");
 #endif
+}
+
+static bool stdErrIsDevNull()
+{
+    bool result = false;
+
+#ifndef _WIN32
+    int fd2 = fileno(stderr);
+    if (fd2 >= 0)
+    {
+        struct stat stdErr;
+        struct stat devNull;
+        int srtn = fstat(fd2, &stdErr);
+        if (srtn == 0)
+        {
+            if (S_ISCHR(stdErr.st_mode))
+            {
+                srtn = stat("/dev/null", &devNull);
+                if (srtn == 0)
+                {
+                    if ( (stdErr.st_ino == devNull.st_ino) &&
+                         (stdErr.st_dev == devNull.st_dev) )
+                    {
+                        result = true;
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    return result;
 }
 
 LogMsgSysInfo::LogMsgSysInfo(LogMsgId _id, unsigned port, LogMsgSessionId session)
@@ -64,7 +106,7 @@ LogMsgSysInfo::LogMsgSysInfo(LogMsgId _id, unsigned port, LogMsgSessionId sessio
     gettimeofday(&timeStarted, NULL);
 #endif
     processID = GetCurrentProcessId();
-    threadID = threadLogID();
+    threadID = getSystemThreadId();
     sessionID = session;
 #ifdef INCLUDE_LOGMSGSYSINFO_NODE
     node.setLocalHost(port);
@@ -90,7 +132,7 @@ void LogMsgSysInfo::deserialize(MemoryBuffer & in)
 
 class LoggingFieldColumns
 {
-    const EnumMapping MsgFieldMap[16] =
+    const EnumMapping MsgFieldMap[18] =
     {
         { MSGFIELD_msgID,     "MsgID    " },
         { MSGFIELD_audience,  "Audience " },
@@ -107,6 +149,8 @@ class LoggingFieldColumns
         { MSGFIELD_job,       "JobID  " },
         { MSGFIELD_user,      "UserID  " },
         { MSGFIELD_component, "Compo " },
+        { MSGFIELD_trace,     "Trace " },
+        { MSGFIELD_span,      "Span " },
         { MSGFIELD_quote,     "Quoted "}
     };
     const unsigned sizeMsgFieldMap = arraysize(MsgFieldMap);
@@ -198,7 +242,7 @@ const char * LogMsgJobInfo::queryJobIDStr() const
     if (isDeserialized)
         return jobIDStr;
     else if (jobID == UnknownJob)
-        return "Unknown";
+        return "UNK";
     else
         return theManager->queryJobId(jobID);
 }
@@ -230,45 +274,41 @@ void LogMsgJobInfo::serialize(MemoryBuffer & out) const
 
 void LogMsgJobInfo::deserialize(MemoryBuffer & in)
 {
-    StringBuffer idStr;
-    in.read(idStr);
-    jobIDStr = idStr.detach();
-    in.read(userID);
-    isDeserialized = true;
-}
-
-static LogMsgJobInfo globalDefaultJobInfo(UnknownJob, UnknownUser);
-static thread_local LogMsgJobInfo defaultJobInfo = globalDefaultJobInfo;
-
-const LogMsgJobInfo unknownJob(UnknownJob, UnknownUser);
-
-void resetThreadLogging()
-{
-    // Note - as implemented the thread default job info is determined by what the global one was when the thread was created.
-    // There is an alternative interpretation, that an unset thread-local one should default to whatever the global one is at the time the thread one is used.
-    // In practice I doubt there's a lot of difference as global one is likely to be set once at program startup
-    defaultJobInfo = globalDefaultJobInfo;
-}
-
-const LogMsgJobInfo & checkDefaultJobInfo(const LogMsgJobInfo & _jobInfo)
-{
-    if (&_jobInfo == &unknownJob)
+// kludge for backward compatibility of pre 8.0 clients that send a LogMsgJobId: (_uint64), not a string
+// NB: jobID pre 8.0 was redundant as always equal to UnknownJob
+    if (isDeserialized)
     {
-        return defaultJobInfo;
+        free((void *) jobIDStr);
+        jobIDStr = nullptr;
     }
-    return _jobInfo;
+    dbgassertex(in.remaining() >= sizeof(LogMsgJobId)); // should always be at least this amount, because userID follows the jobID
+    if (0 == memcmp(in.toByteArray()+in.getPos(), &UnknownJob, sizeof(LogMsgJobId))) // pre 8.0 client
+    {
+        in.skip(sizeof(jobID));
+        jobID = UnknownJob;
+        isDeserialized = false;
+    }
+    else
+    {
+        // >= 8.0 client
+        StringBuffer idStr;
+        in.read(idStr);
+        jobIDStr = idStr.detach();
+        isDeserialized = true;
+    }
+    in.read(userID);
 }
 
-void setDefaultJobId(const char *id, bool threaded)
+//--------------------------------------------------------------------------------------------------------------------
+
+static const LogMsgJobInfo queryDefaultJobInfo()
 {
-    setDefaultJobId(theManager->addJobId(id), threaded);
+    return LogMsgJobInfo(queryThreadedJobId(), UnknownUser);
 }
 
-void setDefaultJobId(LogMsgJobId id, bool threaded)
+static const LogMsgTraceInfo queryActiveTraceInfo()
 {
-    if (!threaded)
-        globalDefaultJobInfo.setJobID(id);
-    defaultJobInfo.setJobID(id);
+    return LogMsgTraceInfo(queryThreadedActiveSpan());
 }
 
 LogMsg::LogMsg(LogMsgJobId id, const char *job) : category(MSGAUD_programmer, job ? MSGCLS_addid : MSGCLS_removeid), sysInfo(), jobInfo(id), remoteFlag(false)
@@ -277,21 +317,21 @@ LogMsg::LogMsg(LogMsgJobId id, const char *job) : category(MSGAUD_programmer, jo
         text.append(job);
 }
 
-LogMsg::LogMsg(const LogMsgCategory & _cat, LogMsgId _id, const LogMsgJobInfo & _jobInfo, LogMsgCode _code, const char * _text, unsigned _compo, unsigned port, LogMsgSessionId session)
-  : category(_cat), sysInfo(_id, port, session), jobInfo(checkDefaultJobInfo(_jobInfo)), msgCode(_code), component(_compo), remoteFlag(false)
+LogMsg::LogMsg(const LogMsgCategory & _cat, LogMsgId _id, LogMsgCode _code, const char * _text, unsigned port, LogMsgSessionId session)
+  : category(_cat), sysInfo(_id, port, session), jobInfo(queryDefaultJobInfo()), traceInfo(queryActiveTraceInfo()),  msgCode(_code), remoteFlag(false)
 {
     text.append(_text);
 }
 
-LogMsg::LogMsg(const LogMsgCategory & _cat, LogMsgId _id, const LogMsgJobInfo & _jobInfo, LogMsgCode _code, size32_t sz, const char * _text, unsigned _compo, unsigned port, LogMsgSessionId session)
-  : category(_cat), sysInfo(_id, port, session), jobInfo(checkDefaultJobInfo(_jobInfo)), msgCode(_code), component(_compo), remoteFlag(false)
+LogMsg::LogMsg(const LogMsgCategory & _cat, LogMsgId _id, LogMsgCode _code, size32_t sz, const char * _text, unsigned port, LogMsgSessionId session)
+  : category(_cat), sysInfo(_id, port, session), jobInfo(queryDefaultJobInfo()), traceInfo(queryActiveTraceInfo()), msgCode(_code), remoteFlag(false)
 {
     text.append(sz, _text);
 }
 
-LogMsg::LogMsg(const LogMsgCategory & _cat, LogMsgId _id, const LogMsgJobInfo & _jobInfo, LogMsgCode _code, const char * format, va_list args,
-       unsigned _compo, unsigned port, LogMsgSessionId session)
-  : category(_cat), sysInfo(_id, port, session), jobInfo(checkDefaultJobInfo(_jobInfo)), msgCode(_code), component(_compo), remoteFlag(false)
+LogMsg::LogMsg(const LogMsgCategory & _cat, LogMsgId _id, LogMsgCode _code, const char * format, va_list args,
+       unsigned port, LogMsgSessionId session)
+  : category(_cat), sysInfo(_id, port, session), jobInfo(queryDefaultJobInfo()), traceInfo(queryActiveTraceInfo()), msgCode(_code), remoteFlag(false)
 {
     text.valist_appendf(format, args);
 }
@@ -333,9 +373,9 @@ StringBuffer & LogMsg::toStringPlain(StringBuffer & out, unsigned fields) const
         }
     }
     if(fields & MSGFIELD_process)
-        out.appendf("pid=%d ",sysInfo.queryProcessID());
+        out.appendf("pid=%u ",sysInfo.queryProcessID());
     if(fields & MSGFIELD_thread)
-        out.appendf("tid=%d ",sysInfo.queryThreadID());
+        out.appendf("tid=%u ",sysInfo.queryThreadID());
     if(fields & MSGFIELD_session)
     {
         if(sysInfo.querySessionID() == UnknownSession)
@@ -345,7 +385,7 @@ StringBuffer & LogMsg::toStringPlain(StringBuffer & out, unsigned fields) const
     }
     if(fields & MSGFIELD_node)
     {
-        sysInfo.queryNode()->getUrlStr(out);
+        sysInfo.queryNode()->getEndpointHostText(out);
         out.append(" ");
     }
     if(fields & MSGFIELD_job)
@@ -359,8 +399,16 @@ StringBuffer & LogMsg::toStringPlain(StringBuffer & out, unsigned fields) const
         else
             out.appendf("usr=%" I64F "u ", jobInfo.queryUserID());
     }
-    if(fields & MSGFIELD_component)
-        out.appendf("cmp=%u ", component);
+    if(fields & MSGFIELD_trace)
+    {
+        //it seems the existing convention is to use 3 char abbreviation
+        out.appendf("trc=%s ", traceInfo.queryTraceID());
+    }
+    if (fields & MSGFIELD_span)
+    {
+        //it seems the existing convention is to use 3 char abbreviation
+        out.appendf("spn=%s ", traceInfo.querySpanID());
+    }
     if (fields & MSGFIELD_quote)
         out.append('"');
     if (fields & MSGFIELD_prefix)
@@ -428,7 +476,7 @@ StringBuffer & LogMsg::toStringXML(StringBuffer & out, unsigned fields) const
     if(fields & MSGFIELD_node)
     {
         out.append("Node=\"");
-        sysInfo.queryNode()->getUrlStr(out);
+        sysInfo.queryNode()->getEndpointHostText(out);
         out.append("\" ");
     }
 #ifdef LOG_MSG_NEWLINE
@@ -445,25 +493,113 @@ StringBuffer & LogMsg::toStringXML(StringBuffer & out, unsigned fields) const
         else
             out.append("UserID=\"").append(jobInfo.queryUserID()).append("\" ");
     }
+    if(fields & MSGFIELD_trace)
+    {
+        out.append("TraceID=\"").append(traceInfo.queryTraceID()).append("\" ");
+    }
+    if (fields & MSGFIELD_span)
+    {
+        out.append("SpanID=\"").append(traceInfo.querySpanID()).append("\" ");
+    }
 #ifdef LOG_MSG_NEWLINE
     if(fields & MSGFIELD_allJobInfo) out.append("\n     ");
 #endif
-    if(fields & MSGFIELD_component) out.append("Component=\"").append(component).append("\" ");
     if((fields & MSGFIELD_code) && (msgCode != NoLogMsgCode))
         out.append("code=\"").append(msgCode).append("\" ");
     out.append("text=\"").append(text.str()).append("\" />\n");
     return out;
 }
 
+StringBuffer & LogMsg::toStringJSON(StringBuffer & out, unsigned fields) const
+{
+    out.ensureCapacity(LOG_MSG_FORMAT_BUFFER_LENGTH);
+    StringBuffer encodedMsg;
+    out.append("{ \"MSG\": \"").append(encodeJSON(encodedMsg, text.str())).append("\"");
+
+    if(fields & MSGFIELD_msgID)
+        out.append(", \"MID\": \"").append(sysInfo.queryMsgID()).append("\"");
+    if(fields & MSGFIELD_audience)
+        out.append(", \"AUD\": \"").append(LogMsgAudienceToFixString(category.queryAudience())).append("\"");
+    if(fields & MSGFIELD_class)
+        out.append(", \"CLS\": \"").append(LogMsgClassToFixString(category.queryClass())).append("\"");
+    if(fields & MSGFIELD_detail)
+        out.append(", \"DET\": \"").append(category.queryDetail()).append("\"");
+    if(fields & MSGFIELD_timeDate)
+    {
+        time_t timeNum = sysInfo.queryTime();
+        char timeString[23];
+        struct tm timeStruct;
+        localtime_r(&timeNum, &timeStruct);
+        if(fields & MSGFIELD_date)
+        {
+            strftime(timeString, 23, ", \"DATE\": \"%Y-%m-%d\"", &timeStruct);
+            out.append(timeString);
+        }
+        if(fields & MSGFIELD_microTime)
+        {
+            out.appendf(", \"TIME\": \"%02d:%02d:%02d.%06d\"", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec, sysInfo.queryUSecs());
+        }
+        else if(fields & MSGFIELD_milliTime)
+        {
+            out.appendf(", \"TIME\": \"%02d:%02d:%02d.%03d\"", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec, sysInfo.queryUSecs()/1000);
+        }
+        else if(fields & MSGFIELD_time)
+        {
+            out.appendf(", \"TIME\": \"%02d:%02d:%02d\"", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec);
+        }
+    }
+    if(fields & MSGFIELD_process)
+        out.append(", \"PID\": \"").append(sysInfo.queryProcessID()).append("\"");
+    if(fields & MSGFIELD_thread)
+        out.append(", \"TID\": \"").append(sysInfo.queryThreadID()).append("\"");
+    if(fields & MSGFIELD_session)
+    {
+        if(sysInfo.querySessionID() == UnknownSession)
+            out.append(", \"SES\": \"UNK\" ");
+        else
+            out.append(", \"SES\": \"").append(sysInfo.querySessionID()).append("\"");
+    }
+    if(fields & MSGFIELD_node)
+    {
+        out.append(", \"NODE\": \"");
+        sysInfo.queryNode()->getEndpointHostText(out);
+        out.append("\"");
+    }
+    if(fields & MSGFIELD_job)
+    {
+        out.appendf(", \"JOBID\": \"%s\"", jobInfo.queryJobIDStr());
+    }
+    if(fields & MSGFIELD_user)
+    {
+        if(jobInfo.queryUserID() == UnknownUser)
+            out.append(", \"USER\": \"UNK\" ");
+        else
+            out.append(", \"USER\": \"").append(jobInfo.queryUserID()).append("\"");
+    }
+    if(fields & MSGFIELD_trace)
+    {
+        out.appendf("\"TRACEID\"=\"%s\"", traceInfo.queryTraceID());
+    }
+    if (fields & MSGFIELD_span)
+    {
+        out.appendf("\"SPANID\"=\"%s\"",traceInfo.querySpanID());
+    }
+    if((fields & MSGFIELD_code) && (msgCode != NoLogMsgCode))
+        out.append(", \"CODE\": \"").append(msgCode).append("\"");
+
+    out.append(" }\n");
+    return out;
+}
+
 StringBuffer & LogMsg::toStringTable(StringBuffer & out, unsigned fields) const
 {
     if(fields & MSGFIELD_msgID)
-        out.appendf("%8X ", sysInfo.queryMsgID());
+        out.appendf("%08X ", sysInfo.queryMsgID());
     out.ensureCapacity(LOG_MSG_FORMAT_BUFFER_LENGTH);
     if(fields & MSGFIELD_audience)
-        out.append(LogMsgAudienceToFixString(category.queryAudience()));
+        out.appendf("%s ", LogMsgAudienceToFixString(category.queryAudience()));
     if(fields & MSGFIELD_class)
-        out.append(LogMsgClassToFixString(category.queryClass()));
+        out.appendf("%s ", LogMsgClassToFixString(category.queryClass()));
     if(fields & MSGFIELD_detail)
         out.appendf("%10d ", category.queryDetail());
     if(fields & MSGFIELD_timeDate)
@@ -492,9 +628,9 @@ StringBuffer & LogMsg::toStringTable(StringBuffer & out, unsigned fields) const
         }
     }
     if(fields & MSGFIELD_process)
-        out.appendf("%5d ",sysInfo.queryProcessID());
+        out.appendf("%5u ",sysInfo.queryProcessID());
     if(fields & MSGFIELD_thread)
-        out.appendf("%5d ",sysInfo.queryThreadID());
+        out.appendf("%5u ",sysInfo.queryThreadID());
     if(fields & MSGFIELD_session)
     {
         if(sysInfo.querySessionID() == UnknownSession)
@@ -505,12 +641,20 @@ StringBuffer & LogMsg::toStringTable(StringBuffer & out, unsigned fields) const
     if(fields & MSGFIELD_node)
     {
         size32_t len = out.length();
-        sysInfo.queryNode()->getUrlStr(out);
+        sysInfo.queryNode()->getEndpointHostText(out);
         out.appendN(20 + len - out.length(), ' ');
     }
     if(fields & MSGFIELD_job)
     {
         out.appendf("%-7s ", jobInfo.queryJobIDStr());
+    }
+    if(fields & MSGFIELD_trace)
+    {
+        out.appendf("%s ", traceInfo.queryTraceID());
+    }
+    if(fields & MSGFIELD_span)
+    {
+        out.appendf("%s ", traceInfo.querySpanID());
     }
     if(fields & MSGFIELD_user)
     {
@@ -519,8 +663,6 @@ StringBuffer & LogMsg::toStringTable(StringBuffer & out, unsigned fields) const
         else
             out.appendf("%7" I64F "u ", jobInfo.queryUserID());
     }
-    if(fields & MSGFIELD_component)
-        out.appendf("%6u ", component);
     if (fields & MSGFIELD_quote)
         out.append('"');
     if (fields & MSGFIELD_prefix)
@@ -539,234 +681,6 @@ StringBuffer & LogMsg::toStringTableHead(StringBuffer & out, unsigned fields)
 {
     loggingFieldColumns.generateHeaderRow(out, fields, false).append("\n\n");
     return out;
-}
-
-void LogMsg::fprintPlain(FILE * handle, unsigned fields) const
-{
-    if(fields & MSGFIELD_msgID)
-        fprintf(handle, "id=%X ", sysInfo.queryMsgID());
-    if(fields & MSGFIELD_audience)
-        fprintf(handle, "aud=%s", LogMsgAudienceToVarString(category.queryAudience()));
-    if(fields & MSGFIELD_class)
-        fprintf(handle, "cls=%s", LogMsgClassToFixString(category.queryClass()));
-    if(fields & MSGFIELD_detail)
-        fprintf(handle, "det=%d ", category.queryDetail());
-    if(fields & MSGFIELD_timeDate)
-    {
-        time_t timeNum = sysInfo.queryTime();
-        char timeString[12];
-        struct tm timeStruct;
-        localtime_r(&timeNum, &timeStruct);
-        if(fields & MSGFIELD_date)
-        {
-            strftime(timeString, 12, "%Y-%m-%d ", &timeStruct);
-            fputs(timeString, handle);
-        }
-        if(fields & MSGFIELD_microTime)
-        {
-            fprintf(handle, "%02d:%02d:%02d.%06d ", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec, sysInfo.queryUSecs());
-        }
-        else if(fields & MSGFIELD_milliTime)
-        {
-            fprintf(handle, "%02d:%02d:%02d.%03d ", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec, sysInfo.queryUSecs()/1000);
-        }
-        else if(fields & MSGFIELD_time)
-        {
-            strftime(timeString, 12, "%H:%M:%S ", &timeStruct);
-            fputs(timeString, handle);
-        }
-    }
-    if(fields & MSGFIELD_process)
-        fprintf(handle, "pid=%d ",sysInfo.queryProcessID());
-    if(fields & MSGFIELD_thread)
-        fprintf(handle, "tid=%d ",sysInfo.queryThreadID());
-    if(fields & MSGFIELD_session)
-    {
-        if(sysInfo.querySessionID() == UnknownSession)
-            fprintf(handle, "sid=unknown ");
-        else
-            fprintf(handle, "sid=%" I64F "u ", sysInfo.querySessionID());
-    }
-    if(fields & MSGFIELD_node)
-    {
-        StringBuffer buff;
-        sysInfo.queryNode()->getUrlStr(buff);
-        fprintf(handle, "%s ", buff.str());
-    }
-    if(fields & MSGFIELD_job)
-    {
-        fprintf(handle, "job=%s ", jobInfo.queryJobIDStr());
-    }
-    if(fields & MSGFIELD_user)
-    {
-        if(jobInfo.queryUserID() == UnknownUser)
-            fprintf(handle, "usr=unknown ");
-        else
-            fprintf(handle, "usr=%" I64F "u ", jobInfo.queryUserID());
-    }
-    if(fields & MSGFIELD_component)
-        fprintf(handle, "cmp=%u ", component);
-    
-    const char * quote = (fields & MSGFIELD_quote) ? "\"" : "";
-    const char * prefix = (fields & MSGFIELD_prefix) ? msgPrefix(category.queryClass()) : "";
-    if((fields & MSGFIELD_code) && (msgCode != NoLogMsgCode))
-        fprintf(handle, "%s%s%d: %s%s", quote, prefix, msgCode, text.str(), quote);
-    else
-        fprintf(handle, "%s%s%s%s", quote, prefix, text.str(), quote);
-}
-
-void LogMsg::fprintXML(FILE * handle, unsigned fields) const
-{
-    fprintf(handle, "<msg ");
-    if(fields & MSGFIELD_msgID)
-        fprintf(handle, "MessageID=\"%d\" ",sysInfo.queryMsgID());
-    if(fields & MSGFIELD_audience)
-        fprintf(handle, "Audience=\"%s\" ", LogMsgAudienceToVarString(category.queryAudience()));
-    if(fields & MSGFIELD_class)
-        fprintf(handle, "Class=\"%s\" ", LogMsgClassToVarString(category.queryClass()));
-    if(fields & MSGFIELD_detail)
-        fprintf(handle, "Detail=\"%d\" ", category.queryDetail());
-#ifdef LOG_MSG_NEWLINE
-    if(fields & MSGFIELD_allCategory) fprintf(handle, "\n     ");
-#endif
-    if(fields & MSGFIELD_timeDate)
-    {
-        time_t timeNum = sysInfo.queryTime();
-        char timeString[20];
-        struct tm timeStruct;
-        localtime_r(&timeNum, &timeStruct);
-        if(fields & MSGFIELD_date)
-        {
-            strftime(timeString, 20, "date=\"%Y-%m-%d\" ", &timeStruct);
-            fputs(timeString, handle);
-        }
-        if(fields & MSGFIELD_microTime)
-        {
-            fprintf(handle, "time=\"%02d:%02d:%02d.%06d\" ", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec, sysInfo.queryUSecs());
-        }
-        else if(fields & MSGFIELD_milliTime)
-        {
-            fprintf(handle, "time=\"%02d:%02d:%02d.%03d\" ", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec, sysInfo.queryUSecs()/1000);
-        }
-        else if(fields & MSGFIELD_time)
-        {
-            strftime(timeString, 20, "time=\"%H:%M:%S\" ", &timeStruct);
-            fputs(timeString, handle);
-        }
-    }
-    if(fields & MSGFIELD_process)
-        fprintf(handle, "PID=\"%d\" ", sysInfo.queryProcessID());
-    if(fields & MSGFIELD_thread)
-        fprintf(handle, "TID=\"%d\" ", sysInfo.queryThreadID());
-    if(fields & MSGFIELD_session)
-    {
-        if(sysInfo.querySessionID() == UnknownSession)
-            fprintf(handle, "SessionID=\"unknown\" ");
-        else
-            fprintf(handle, "SessionID=\"%" I64F "u\" ", sysInfo.querySessionID());
-    }
-    if(fields & MSGFIELD_node)
-    {
-        StringBuffer buff;
-        sysInfo.queryNode()->getUrlStr(buff);
-        fprintf(handle, "Node=\"%s\" ", buff.str());
-    }
-#ifdef LOG_MSG_NEWLINE
-    if(fields & MSGFIELD_allSysInfo) fprintf(handle, "\n     ");
-#endif
-    if(fields & MSGFIELD_job)
-    {
-        fprintf(handle, "JobID=\"%s\" ", jobInfo.queryJobIDStr());
-    }
-    if(fields & MSGFIELD_user)
-    {
-        if(jobInfo.queryUserID() == UnknownUser)
-            fprintf(handle, "UserID=\"unknown\" ");
-        else
-            fprintf(handle, "UserID=\"%" I64F "u\" ", jobInfo.queryUserID());
-    }
-    if(fields & MSGFIELD_component)
-        fprintf(handle, "Component=\"%6u\" ", component);
-#ifdef LOG_MSG_NEWLINE
-    if(fields & MSGFIELD_allJobInfo) fprintf(handle, "\n     ");
-#endif
-    if((fields & MSGFIELD_code) && (msgCode != NoLogMsgCode))
-        fprintf(handle, "code=\"%d\" ", msgCode);
-    fprintf(handle, "text=\"%s\" />\n", text.str());
-}
-
-void LogMsg::fprintTable(FILE * handle, unsigned fields) const
-{
-    if(fields & MSGFIELD_msgID)
-        fprintf(handle, "%08X ", sysInfo.queryMsgID());
-    if(fields & MSGFIELD_audience)
-        fputs(LogMsgAudienceToFixString(category.queryAudience()), handle);
-    if(fields & MSGFIELD_class)
-        fputs(LogMsgClassToFixString(category.queryClass()), handle);
-    if(fields & MSGFIELD_detail)
-        fprintf(handle, "%10d ", category.queryDetail());
-    if(fields & MSGFIELD_timeDate)
-    {
-        time_t timeNum = sysInfo.queryTime();
-        char timeString[12];
-        struct tm timeStruct;
-        localtime_r(&timeNum, &timeStruct);
-        if(fields & MSGFIELD_date)
-        {
-            strftime(timeString, 12, "%Y-%m-%d ", &timeStruct);
-            fputs(timeString, handle);
-        }
-        if(fields & MSGFIELD_microTime)
-        {
-            fprintf(handle, "%02d:%02d:%02d.%06d ", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec, sysInfo.queryUSecs());
-        }
-        else if(fields & MSGFIELD_milliTime)
-        {
-            fprintf(handle, "%02d:%02d:%02d.%03d ", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec, sysInfo.queryUSecs()/1000);
-        }
-        else if(fields & MSGFIELD_time)
-        {
-            strftime(timeString, 12, "%H:%M:%S ", &timeStruct);
-            fputs(timeString, handle);
-        }
-    }
-    if(fields & MSGFIELD_process)
-        fprintf(handle, "%5d ",sysInfo.queryProcessID());
-    if(fields & MSGFIELD_thread)
-        fprintf(handle, "%5d ",sysInfo.queryThreadID());
-    if(fields & MSGFIELD_session)
-    {
-        if(sysInfo.querySessionID() == UnknownSession)
-            fprintf(handle, "       unknown       ");
-        else
-            fprintf(handle, "%20" I64F "u ", sysInfo.querySessionID());
-    }
-    if(fields & MSGFIELD_node)
-    {
-        StringBuffer buff;
-        static const char * twenty_spaces = "                    ";
-        sysInfo.queryNode()->getUrlStr(buff);
-        fprintf(handle, "%s%s", buff.str(), (buff.length()<=20) ? twenty_spaces+buff.length() : "");
-    }
-    if(fields & MSGFIELD_job)
-    {
-        fprintf(handle, "%-7s ", jobInfo.queryJobIDStr());
-    }
-    if(fields & MSGFIELD_user)
-    {
-        if(jobInfo.queryUserID() == UnknownUser)
-            fprintf(handle, "unknown ");
-        else
-            fprintf(handle, "%7" I64F "u ", jobInfo.queryUserID());
-    }
-    if(fields & MSGFIELD_component)
-        fprintf(handle, "%6u ", component);
-    const char * quote = (fields & MSGFIELD_quote) ? "\"" : "";
-    const char * prefix = (fields & MSGFIELD_prefix) ? msgPrefix(category.queryClass()) : "";
-    if((fields & MSGFIELD_code) && (msgCode != NoLogMsgCode))
-        fprintf(handle, "%s%s%d: %s%s\n", quote, prefix, msgCode, text.str(), quote);
-    else
-        fprintf(handle, "%s%s%s%s\n", quote, prefix, text.str(), quote);
 }
 
 void LogMsg::fprintTableHead(FILE * handle, unsigned fields)
@@ -873,7 +787,7 @@ void NodeLogMsgFilter::addToPTree(IPropertyTree * tree) const
     IPropertyTree * filterTree = createPTree(ipt_caseInsensitive);
     filterTree->setProp("@type", "node");
     StringBuffer buff;
-    node.getIpText(buff);
+    node.getHostText(buff);
     filterTree->setProp("@ip", buff.str());
     filterTree->setPropInt("@port", node.port);
     if(localFlag) filterTree->setPropInt("@local", 1);
@@ -885,7 +799,7 @@ void IpLogMsgFilter::addToPTree(IPropertyTree * tree) const
     IPropertyTree * filterTree = createPTree(ipt_caseInsensitive);
     filterTree->setProp("@type", "ip");
     StringBuffer buff;
-    ip.getIpText(buff);
+    ip.getHostText(buff);
     filterTree->setProp("@ip", buff.str());
     if(localFlag) filterTree->setPropInt("@local", 1);
     tree->addPropTree("filter", filterTree);
@@ -900,18 +814,9 @@ void SessionLogMsgFilter::addToPTree(IPropertyTree * tree) const
     tree->addPropTree("filter", filterTree);
 }
 
-void ComponentLogMsgFilter::addToPTree(IPropertyTree * tree) const
+bool RegexLogMsgFilter::includeMessage(const LogMsg & msg) const
 {
-    IPropertyTree * filterTree = createPTree(ipt_caseInsensitive);
-    filterTree->setProp("@type", "component");
-    filterTree->setPropInt("@component", component);
-    if(localFlag) filterTree->setPropInt("@local", 1);
-    tree->addPropTree("filter", filterTree);
-}
-
-bool RegexLogMsgFilter::includeMessage(const LogMsg & msg) const 
-{ 
-    if(localFlag && msg.queryRemoteFlag()) return false; 
+    if(localFlag && msg.queryRemoteFlag()) return false;
     SpinBlock b(lock);
     return const_cast<RegExpr &>(regex).find(msg.queryText()) != NULL;
 }
@@ -977,6 +882,13 @@ void CategoryLogMsgFilter::reset()
 
 // HandleLogMsgHandler
 
+void HandleLogMsgHandlerTable::handleMessage(const LogMsg & msg)
+{
+    CriticalBlock block(crit);
+    msg.toStringTable(curMsgText.clear(), messageFields);
+    fputs(curMsgText.str(), handle);
+}
+
 void HandleLogMsgHandlerTable::addToPTree(IPropertyTree * tree) const
 {
     IPropertyTree * handlerTree = createPTree(ipt_caseInsensitive);
@@ -986,6 +898,32 @@ void HandleLogMsgHandlerTable::addToPTree(IPropertyTree * tree) const
         handlerTree->setProp("@type", "mischandle");
     handlerTree->setPropInt("@fields", messageFields);
     tree->addPropTree("handler", handlerTree);
+}
+
+void HandleLogMsgHandlerJSON::handleMessage(const LogMsg & msg)
+{
+    CriticalBlock block(crit);
+    msg.toStringJSON(curMsgText.clear(), messageFields);
+    fputs(curMsgText.str(), handle);
+}
+
+void HandleLogMsgHandlerJSON::addToPTree(IPropertyTree * tree) const
+{
+    IPropertyTree * handlerTree = createPTree(ipt_caseInsensitive);
+    if(handle==stderr)
+        handlerTree->setProp("@type", "stderr");
+    else
+        handlerTree->setProp("@type", "mischandle");
+    handlerTree->setPropInt("@fields", messageFields);
+    handlerTree->setProp("@writeJSON", "true");
+    tree->addPropTree("handler", handlerTree);
+}
+
+void HandleLogMsgHandlerXML::handleMessage(const LogMsg & msg)
+{
+    CriticalBlock block(crit);
+    msg.toStringXML(curMsgText.clear(), messageFields);
+    fputs(curMsgText.str(), handle);
 }
 
 void HandleLogMsgHandlerXML::addToPTree(IPropertyTree * tree) const
@@ -1015,7 +953,7 @@ FileLogMsgHandler::FileLogMsgHandler(const char * _filename, const char * _heade
         StringBuffer err;
         err.appendf("LOGGING: could not open file '%s' for output",filename.get());
         OERRLOG("%s",err.str()); // make sure doesn't get lost!
-        throw MakeStringException(3000,"%s",err.str()); // 3000: internal error
+        throw MakeStringException(JLIBERR_CannotOpenLogFile,"%s",err.str()); // 3000: internal error
     }
     if(headerText) fprintf(handle, "--- %s ---\n", (const char *)headerText);
 }
@@ -1027,6 +965,8 @@ static void closeAndDeleteEmpty(const char * filename, FILE *handle)
         bool del = (fgetpos(handle, &pos)==0)&&
 #if defined( _WIN32) || defined(__FreeBSD__) || defined(__APPLE__)
             (pos==0);
+#elif defined(__EMSCRIPTEN__)
+            (pos.__lldata==0);
 #else
             (pos.__pos==0);
 #endif
@@ -1041,23 +981,13 @@ FileLogMsgHandler::~FileLogMsgHandler()
     closeAndDeleteEmpty(filename,handle);
 }
 
-char const * FileLogMsgHandler::disable()
+void FileLogMsgHandlerTable::handleMessage(const LogMsg & msg)
 {
-    crit.enter();
-    fclose(handle);
-    handle = NULL;
-    return filename;
-}
-
-void FileLogMsgHandler::enable()
-{
-    recursiveCreateDirectoryForFile(filename);
-    handle = fopen(filename, "a");
-    if(!handle) {
-        handle = getNullHandle();
-        assertex(!"FileLogMsgHandler::enable : could not open file for output");
-    }
-    crit.leave();
+    CriticalBlock block(crit);
+    msg.toStringTable(curMsgText.clear(), messageFields);
+    fputs(curMsgText.str(), handle);
+    if(flushes)
+        fflush(handle);
 }
 
 void FileLogMsgHandlerTable::addToPTree(IPropertyTree * tree) const
@@ -1073,6 +1003,15 @@ void FileLogMsgHandlerTable::addToPTree(IPropertyTree * tree) const
     tree->addPropTree("handler", handlerTree);
 }
 
+void FileLogMsgHandlerXML::handleMessage(const LogMsg & msg)
+{
+    CriticalBlock block(crit);
+    msg.toStringXML(curMsgText.clear(), messageFields);
+    fputs(curMsgText.str(), handle);
+    if(flushes)
+        fflush(handle);
+}
+
 void FileLogMsgHandlerXML::addToPTree(IPropertyTree * tree) const
 {
     IPropertyTree * handlerTree = createPTree(ipt_caseInsensitive);
@@ -1084,6 +1023,244 @@ void FileLogMsgHandlerXML::addToPTree(IPropertyTree * tree) const
     if(flushes) handlerTree->setProp("@flushes", "true");
     tree->addPropTree("handler", handlerTree);
 }
+
+void FileLogMsgHandlerJSON::handleMessage(const LogMsg & msg)
+{
+    CriticalBlock block(crit);
+    msg.toStringJSON(curMsgText.clear(), messageFields);
+    fputs(curMsgText.str(), handle);
+    if(flushes)
+        fflush(handle);
+}
+
+void FileLogMsgHandlerJSON::addToPTree(IPropertyTree * tree) const
+{
+    IPropertyTree * handlerTree = createPTree(ipt_caseInsensitive);
+    handlerTree->setProp("@type", "file");
+    handlerTree->setProp("@filename", filename.get());
+    if(headerText)
+        handlerTree->setProp("@headertext", headerText.get());
+    handlerTree->setPropInt("@fields", messageFields);
+    handlerTree->setProp("@writeJSON", "true");
+    if(append)
+        handlerTree->setProp("@append", "true");
+    if(flushes)
+        handlerTree->setProp("@flushes", "true");
+    tree->addPropTree("handler", handlerTree);
+}
+
+// PostMortemLogMsgHandler
+
+PostMortemLogMsgHandler::PostMortemLogMsgHandler(const char * _filebase, unsigned _maxLinesToKeep, unsigned _messageFields)
+  : filebase(_filebase), maxLinesToKeep(_maxLinesToKeep), messageFields(_messageFields)
+{
+    openFile();
+}
+
+PostMortemLogMsgHandler::~PostMortemLogMsgHandler()
+{
+    closeAndDeleteEmpty(filename.length()?filename.str():nullptr, handle);
+}
+
+void PostMortemLogMsgHandler::handleMessage(const LogMsg & msg)
+{
+    CriticalBlock block(crit);
+    if (handle)
+    {
+        checkRollover();
+        msg.toStringTable(curMsgText.clear(), messageFields);
+        fputs(curMsgText.str(), handle);
+        if (flushes)
+            fflush(handle);
+        if (filename.length()) // don't track if writing to null (and hence no rollover)
+            linesInCurrent++;
+    }
+}
+
+void PostMortemLogMsgHandler::addToPTree(IPropertyTree * tree) const
+{
+}
+
+void PostMortemLogMsgHandler::checkRollover()
+{
+    if (linesInCurrent>=maxLinesToKeep)
+    {
+        doRollover();
+    }
+}
+
+void PostMortemLogMsgHandler::doRollover()
+{
+    dbgassertex(filename.length());
+    closeAndDeleteEmpty(filename, handle);
+    handle = 0;
+    if (sequence > 0)
+    {
+        StringBuffer agedName;
+        agedName.append(filebase).append('.').append(sequence-1);
+        remove(agedName);
+    }
+    sequence++;
+    openFile();
+}
+
+void PostMortemLogMsgHandler::openFile()
+{
+    filename.clear().append(filebase).append('.').append(sequence);
+    recursiveCreateDirectoryForFile(filename.str());
+    handle = fopen(filename.str(), "wt");
+    if (!handle)
+    {
+        filename.clear();
+        handle = getNullHandle();   // If we can't write where we expected, write to /dev/null instead
+    }
+    linesInCurrent = 0;
+}
+
+void PostMortemLogMsgHandler::copyTo(const char *target, bool clear)
+{
+    CriticalBlock block(crit);
+    if (handle)
+    {
+        fflush(handle);
+        if (clear)
+        {
+            fclose(handle);
+            handle = 0;
+        }
+    }
+    try
+    {
+        if (sequence) // meaning there is a prior file
+        {
+            StringBuffer priorName;
+            priorName.append(filebase).append('.').append(sequence-1);
+            recursiveCreateDirectoryForFile(target);
+            copyFile(target, priorName);
+            if (clear)
+                remove(priorName);
+        }
+        if (filename.length() && linesInCurrent)
+        {
+            Owned<IFile> targetIFile = createIFile(target);
+            Owned<IFileIO> targetIO;
+            if (sequence)
+                targetIO.setown(targetIFile->open(IFOreadwrite));
+            else
+            {
+                recursiveCreateDirectoryForFile(target);
+                targetIO.setown(targetIFile->open(IFOcreate));
+            }
+            if (!targetIO)
+                throwStringExceptionV(-1, "postmortem copyTo - Failed to open target file %s", target);
+            Owned<IFile> currentIFile = createIFile(filename);
+            appendFile(targetIO, currentIFile, 0, currentIFile->size());
+            if (clear)
+                remove(filename);
+        }
+        if (clear)
+            sequence = 0;
+    }
+    catch (IException *e)
+    {
+        EXCLOG(e);
+        e->Release();
+    }
+    if (clear)
+        openFile();
+}
+
+bool PostMortemLogMsgHandler::copyPIDFiles(const char *filebase, const char *target, bool clear)
+{
+    try
+    {
+        recursiveCreateDirectoryForFile(target);
+        StringBuffer path, tail;
+        splitFilename(filebase, nullptr, &path, &tail, &tail);
+        tail.append("*");
+        Owned<IDirectoryIterator> dirIter = createDirectoryIterator(path, tail);
+        StringBuffer fileName;
+        Owned<IFile> targetIFile = createIFile(target);
+        Owned<IFileIO> targetIO = targetIFile->open(IFOcreate);
+        // there should be at most two files to copy (postmortem has current and 1 previous max)
+        ForEach(*dirIter)
+        {
+            dirIter->getName(fileName.clear());
+            if (!targetIO)
+                throwStringExceptionV(-1, "postmortem copyPIDFiles - Failed to open target file %s", target);
+            Owned<IFile> currentIFile = createIFile(fileName);
+            appendFile(targetIO, currentIFile, 0, currentIFile->size());
+            if (clear)
+                remove(fileName);
+        }
+    }
+    catch (IException *e)
+    {
+        EXCLOG(e);
+        e->Release();
+        return false;
+    }
+    return true;
+}
+
+bool copyPostMortemLogging(const char *target, bool clear)
+{
+    if (!thePostMortemHandler)
+        return false;
+    thePostMortemHandler->copyTo(target, clear);
+    return true;
+}
+
+StringBuffer &getPostMortemPidFilename(StringBuffer &out, unsigned pid)
+{
+    if (0 == pid)
+        pid = GetCurrentProcessId();
+    out.appendf("/tmp/postmortem.%u.log", pid);
+    return out;
+}
+
+bool getDebugInstanceDir(StringBuffer &dir, const char *componentType, const char *instance)
+{
+    Owned<IPropertyTree> config = getComponentConfig();
+    if (!getConfigurationDirectory(config->queryPropTree("Directories"), "debug", componentType, config->queryProp("@name"), dir))
+    {
+        if (!isContainerized())
+        {
+            appendCurrentDirectory(dir, false);
+            addPathSepChar(dir);
+            dir.append("debuginfo"); // use ./debuginfo in non-containerized mode
+        }
+        else
+        {
+            IWARNLOG("Failed to get debug directory");
+            return false;
+        }
+    }
+    addPathSepChar(dir);
+    if (!isEmptyString(instance))
+    {
+        dir.append(instance);
+        addPathSepChar(dir);
+    }
+    CDateTime now;
+    timestamp_type nowTime = getTimeStampNowValue();
+    now.setTimeStamp(nowTime);
+    unsigned year, month, day, hour, minute, second, nano;
+    now.getDate(year, month, day);
+    now.getTime(hour, minute, second, nano);
+    unsigned hundredths = ((unsigned __int64)nano) * 100 / 1000000000;
+    VStringBuffer dateStr("%04u%02u%02u-%02u%02u%02u.%02u", year, month, day, hour, minute, second, hundredths);
+    dir.append(dateStr);
+    return true;
+}
+
+bool copyPortMortemPIDFiles(HANDLE pid, const char *target, bool clear)
+{
+    StringBuffer pidFilenameBase;
+    getPostMortemPidFilename(pidFilenameBase, (unsigned)pid);
+    return PostMortemLogMsgHandler::copyPIDFiles(pidFilenameBase, target, clear);
+}
+
 
 // RollingFileLogMsgHandler
 #define MIN_LOGFILE_SIZE_LIMIT 10000
@@ -1109,24 +1286,6 @@ RollingFileLogMsgHandler::RollingFileLogMsgHandler(const char * _filebase, const
 RollingFileLogMsgHandler::~RollingFileLogMsgHandler()
 {
     closeAndDeleteEmpty(filename,handle);
-}
-
-char const * RollingFileLogMsgHandler::disable()
-{
-    crit.enter();
-    fclose(handle);
-    return filename;
-}
-
-void RollingFileLogMsgHandler::enable()
-{
-    recursiveCreateDirectoryForFile(filename);
-    handle = fopen(filename, "a");
-    if(!handle) {
-        handle = getNullHandle();
-        assertex(!"RollingFileLogMsgHandler::enable : could not open file for output");
-    }
-    crit.leave();
 }
 
 void RollingFileLogMsgHandler::addToPTree(IPropertyTree * tree) const
@@ -1229,7 +1388,7 @@ void RollingFileLogMsgHandler::doRollover(bool daily, const char *forceName)
             }
         }
     }
-    if(!handle) 
+    if(!handle)
     {
         handle = getNullHandle();
         OWARNLOG("RollingFileLogMsgHandler::doRollover : could not open log file %s for output", filename.str());
@@ -1280,109 +1439,6 @@ void BinLogMsgHandler::addToPTree(IPropertyTree * tree) const
     tree->addPropTree("handler", handlerTree);
 }
 
-char const * BinLogMsgHandler::disable()
-{
-    crit.enter();
-    fstr.clear();
-    fio.clear();
-    return filename.get();
-}
-
-void BinLogMsgHandler::enable()
-{
-    fio.setown(file->open(IFOwrite));
-    if(!fio) assertex(!"BinLogMsgHandler::enable : Could not create IFileIO");
-    fstr.setown(createIOStream(fio));
-    if(!fstr) assertex(!"BinLogMsgHandler::enable : Could not create IFileIOStream");
-    fstr->seek(0, IFSend);
-    crit.leave();
-}
-
-// LogMsgComponentReporter
-
-void LogMsgComponentReporter::report(const LogMsgCategory & cat, const char * format, ...)
-{
-    va_list args;
-    va_start(args, format);
-    queryLogMsgManager()->report_va(component, cat, unknownJob, format, args);
-    va_end(args);
-}
-
-void LogMsgComponentReporter::report_va(const LogMsgCategory & cat, const char * format, va_list args)
-{
-    queryLogMsgManager()->report_va(component, cat, unknownJob, format, args);
-}
-
-void LogMsgComponentReporter::report(const LogMsgCategory & cat, LogMsgCode code, const char * format, ...)
-{
-    va_list args;
-    va_start(args, format);
-    queryLogMsgManager()->report_va(component, cat, unknownJob, code, format, args);
-    va_end(args);
-}
-
-void LogMsgComponentReporter::report_va(const LogMsgCategory & cat, LogMsgCode code, const char * format, va_list args)
-{
-    queryLogMsgManager()->report_va(component, cat, unknownJob, code, format, args);
-}
-
-void LogMsgComponentReporter::report(const LogMsgCategory & cat, const IException * exception, const char * prefix)
-{
-    StringBuffer buff;
-    if(prefix) buff.append(prefix).append(" : ");
-    exception->errorMessage(buff);
-    queryLogMsgManager()->report(component, cat, unknownJob, exception->errorCode(), "%s", buff.str());
-}
-
-void LogMsgComponentReporter::report(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, ...)
-{
-    va_list args;
-    va_start(args, format);
-    queryLogMsgManager()->report_va(component, cat, job, format, args);
-    va_end(args);
-}
-
-void LogMsgComponentReporter::report_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args)
-{
-    queryLogMsgManager()->report_va(component, cat, job, format, args);
-}
-
-void LogMsgComponentReporter::report(const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, ...)
-{
-    va_list args;
-    va_start(args, format);
-    queryLogMsgManager()->report_va(component, cat, job, code, format, args);
-    va_end(args);
-}
-
-void LogMsgComponentReporter::report_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, va_list args)
-{
-    queryLogMsgManager()->report_va(component, cat, job, code, format, args);
-}
-
-void LogMsgComponentReporter::report(const LogMsgCategory & cat, const LogMsgJobInfo & job, const IException * exception, const char * prefix)
-{
-    StringBuffer buff;
-    if(prefix) buff.append(prefix).append(" : ");
-    exception->errorMessage(buff);
-    queryLogMsgManager()->report(component, cat, job, exception->errorCode(), "%s", buff.str());
-}
-
-void LogMsgComponentReporter::report(const LogMsg & msg)
-{
-    queryLogMsgManager()->report(msg);
-}
-
-void LogMsgComponentReporter::mreport_direct(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * msg)
-{
-    queryLogMsgManager()->mreport_direct(component, cat, job, msg);
-}
-
-void LogMsgComponentReporter::mreport_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args)
-{
-    queryLogMsgManager()->mreport_va(component, cat, job, format, args);
-}
-
 // LogMsgPrepender
 
 void LogMsgPrepender::report(const LogMsgCategory & cat, const char * format, ...)
@@ -1391,10 +1447,7 @@ void LogMsgPrepender::report(const LogMsgCategory & cat, const char * format, ..
     buff.append(file).append("(").append(line).append(") : ").append(format);
     va_list args;
     va_start(args, format);
-    if(reporter)
-        reporter->report_va(cat, unknownJob, buff.str(), args);
-    else
-        queryLogMsgManager()->report_va(cat, unknownJob, buff.str(), args);
+    queryLogMsgManager()->report_va(cat, buff.str(), args);
     va_end(args);
 }
 
@@ -1402,10 +1455,7 @@ void LogMsgPrepender::report_va(const LogMsgCategory & cat, const char * format,
 {
     StringBuffer buff;
     buff.append(file).append("(").append(line).append(") : ").append(format);
-    if(reporter)
-        reporter->report_va(cat, unknownJob, buff.str(), args);
-    else
-        queryLogMsgManager()->report_va(cat, unknownJob, buff.str(), args);
+    queryLogMsgManager()->report_va(cat, buff.str(), args);
 }
 
 void LogMsgPrepender::report(const LogMsgCategory & cat, LogMsgCode code, const char * format, ...)
@@ -1414,10 +1464,7 @@ void LogMsgPrepender::report(const LogMsgCategory & cat, LogMsgCode code, const 
     buff.append(file).append("(").append(line).append(") : ").append(format);
     va_list args;
     va_start(args, format);
-    if(reporter)
-        reporter->report_va(cat, unknownJob, buff.str(), args);
-    else
-        queryLogMsgManager()->report_va(cat, unknownJob, buff.str(), args);
+    queryLogMsgManager()->report_va(cat, buff.str(), args);
     va_end(args);
 }
 
@@ -1425,10 +1472,7 @@ void LogMsgPrepender::report_va(const LogMsgCategory & cat, LogMsgCode code, con
 {
     StringBuffer buff;
     buff.append(file).append("(").append(line).append(") : ").append(format);
-    if(reporter)
-        reporter->report_va(cat, unknownJob, buff.str(), args);
-    else
-        queryLogMsgManager()->report_va(cat, unknownJob, buff.str(), args);
+    queryLogMsgManager()->report_va(cat, buff.str(), args);
 }
 
 void LogMsgPrepender::report(const LogMsgCategory & cat, const IException * exception, const char * prefix)
@@ -1437,73 +1481,12 @@ void LogMsgPrepender::report(const LogMsgCategory & cat, const IException * exce
     buff.append(file).append("(").append(line).append(") : ");
     if(prefix) buff.append(prefix).append(" : ");
     exception->errorMessage(buff);
-    if(reporter)
-        reporter->report(cat, unknownJob, exception->errorCode(), "%s",  buff.str());
-    else
-        queryLogMsgManager()->report(cat, unknownJob, exception->errorCode(), "%s", buff.str());
-}
-
-void LogMsgPrepender::report(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, ...)
-{
-    StringBuffer buff;
-    buff.append(file).append("(").append(line).append(") : ").append(format);
-    va_list args;
-    va_start(args, format);
-    if(reporter)
-        reporter->report_va(cat, job, buff.str(), args);
-    else
-        queryLogMsgManager()->report_va(cat, job, buff.str(), args);
-    va_end(args);
-}
-
-void LogMsgPrepender::report_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args)
-{
-    StringBuffer buff;
-    buff.append(file).append("(").append(line).append(") : ").append(format);
-    if(reporter)
-        reporter->report_va(cat, job, buff.str(), args);
-    else
-        queryLogMsgManager()->report_va(cat, job, buff.str(), args);
-}
-
-void LogMsgPrepender::report(const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, ...)
-{
-    StringBuffer buff;
-    buff.append(file).append("(").append(line).append(") : ").append(format);
-    va_list args;
-    va_start(args, format);
-    if(reporter)
-        reporter->report_va(cat, job, buff.str(), args);
-    else
-        queryLogMsgManager()->report_va(cat, job, buff.str(), args);
-    va_end(args);
-}
-
-void LogMsgPrepender::report_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, va_list args)
-{
-    StringBuffer buff;
-    buff.append(file).append("(").append(line).append(") : ").append(format);
-    if(reporter)
-        reporter->report_va(cat, job, buff.str(), args);
-    else
-        queryLogMsgManager()->report_va(cat, job, buff.str(), args);
-}
-
-void LogMsgPrepender::report(const LogMsgCategory & cat, const LogMsgJobInfo & job, const IException * exception, const char * prefix)
-{
-    StringBuffer txt;
-    if (prefix) 
-        txt.append(prefix).append(" : ");
-    exception->errorMessage(txt);
-    if (reporter)
-        reporter->report(cat, job, exception->errorCode(), "%s(%d) : %s", file, line, txt.str());
-    else
-        queryLogMsgManager()->report(cat, job, exception->errorCode(), "%s(%d) : %s", file, line, txt.str());
+    queryLogMsgManager()->report(cat, exception->errorCode(), "%s", buff.str());
 }
 
 IException * LogMsgPrepender::report(IException * e, const char * prefix, LogMsgClass cls)
 {
-    report(MCexception(e, cls), unknownJob, e, prefix);
+    report(MCexception(e, cls), e, prefix);
     return e;
 }
 
@@ -1522,9 +1505,9 @@ void LogMsgMonitor::addToPTree(IPropertyTree * tree) const
 void CLogMsgManager::MsgProcessor::push(LogMsg * msg)
 {
     //assertex(more); an assertex will just recurse here
-    if (!more) // we are effective stopped so don't bother even dropping (and leak parameter) as drop will involve 
-               // interaction with the base class which is stopped and could easily crash (as this condition 
-               // is expected not to occur - typically occurs if the user has incorrectly called exit on one thread 
+    if (!more) // we are effective stopped so don't bother even dropping (and leak parameter) as drop will involve
+               // interaction with the base class which is stopped and could easily crash (as this condition
+               // is expected not to occur - typically occurs if the user has incorrectly called exit on one thread
                // while still in the process of logging on another)
                // cf Bug #53695 for more discussion of the issue
         return;
@@ -1608,11 +1591,11 @@ bool CLogMsgManager::MsgProcessor::flush(unsigned timeout)
     if(!q.waitMaxOrdinality(0, timeout))
         return false;
     unsigned now = msTick();
-    if(now >= (start+timeout))
+    if(now - start >= timeout)
         return false;
     try
     {
-        synchronized block(pullCycleMutex, timeout+start-now);
+        TimedMutexBlock block(pullCycleMutex, timeout+start-now);
     }
     catch(IException * e)
     {
@@ -1675,19 +1658,19 @@ void CLogMsgManager::enterQueueingMode()
     if(processor) return;
     processor.setown(new MsgProcessor(this));
     processor->setBlockingLimit(defaultMsgQueueLimit);
-    processor->start();
+    processor->start(false);
 }
 
 void CLogMsgManager::setQueueBlockingLimit(unsigned lim)
 {
-    CriticalBlock crit(modeLock); 
+    CriticalBlock crit(modeLock);
     if(processor)
         processor->setBlockingLimit(lim);
 }
 
 void CLogMsgManager::setQueueDroppingLimit(unsigned lim, unsigned numToDrop)
 {
-    CriticalBlock crit(modeLock); 
+    CriticalBlock crit(modeLock);
     if(processor)
         processor->setDroppingLimit(lim, numToDrop);
 }
@@ -1704,14 +1687,14 @@ void CLogMsgManager::report(const LogMsgCategory & cat, const char * format, ...
     if(rejectsCategory(cat)) return;
     va_list args;
     va_start(args, format);
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, NoLogMsgCode, format, args, 0, port, session));
+    pushMsg(new LogMsg(cat, getNextID(), NoLogMsgCode, format, args, port, session));
     va_end(args);
 }
 
 void CLogMsgManager::report_va(const LogMsgCategory & cat, const char * format, va_list args)
 {
     if(rejectsCategory(cat)) return;
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, NoLogMsgCode, format, args, 0, port, session));
+    pushMsg(new LogMsg(cat, getNextID(), NoLogMsgCode, format, args, port, session));
 }
 
 void CLogMsgManager::report(const LogMsgCategory & cat, LogMsgCode code, const char * format, ...)
@@ -1719,17 +1702,17 @@ void CLogMsgManager::report(const LogMsgCategory & cat, LogMsgCode code, const c
     if(rejectsCategory(cat)) return;
     va_list args;
     va_start(args, format);
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, code, format, args, 0, port, session));
+    pushMsg(new LogMsg(cat, getNextID(), code, format, args, port, session));
     va_end(args);
 }
 
 void CLogMsgManager::report_va(const LogMsgCategory & cat, LogMsgCode code, const char * format, va_list args)
 {
     if(rejectsCategory(cat)) return;
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, code, format, args, 0, port, session));
+    pushMsg(new LogMsg(cat, getNextID(), code, format, args, port, session));
 }
 
-void CLogMsgManager::mreport_direct(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * msg)
+void CLogMsgManager::mreport_direct(const LogMsgCategory & cat, const char * msg)
 {
     if(rejectsCategory(cat)) return;
     const char *cursor = msg;
@@ -1739,17 +1722,18 @@ void CLogMsgManager::mreport_direct(unsigned compo, const LogMsgCategory & cat, 
         switch (*cursor)
         {
             case '\0':
-                pushMsg(new LogMsg(cat, getNextID(), job, NoLogMsgCode, (int)(cursor-lineStart), lineStart, compo, port, session));
+                if (cursor != lineStart || cursor==msg)
+                    pushMsg(new LogMsg(cat, getNextID(), NoLogMsgCode, (int)(cursor-lineStart), lineStart, port, session));
                 return;
             case '\r':
                 // NB: \r or \r\n translated into newline
-                pushMsg(new LogMsg(cat, getNextID(), job, NoLogMsgCode, (int)(cursor-lineStart), lineStart, compo, port, session));
+                pushMsg(new LogMsg(cat, getNextID(), NoLogMsgCode, (int)(cursor-lineStart), lineStart, port, session));
                 if ('\n' == *(cursor+1))
                     cursor++;
                 lineStart = cursor+1;
                 break;
             case '\n':
-                pushMsg(new LogMsg(cat, getNextID(), job, NoLogMsgCode, (int)(cursor-lineStart), lineStart, compo, port, session));
+                pushMsg(new LogMsg(cat, getNextID(), NoLogMsgCode, (int)(cursor-lineStart), lineStart, port, session));
                 lineStart = cursor+1;
                 break;
         }
@@ -1757,25 +1741,12 @@ void CLogMsgManager::mreport_direct(unsigned compo, const LogMsgCategory & cat, 
     }
 }
 
-void CLogMsgManager::mreport_direct(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * msg)
-{
-    mreport_direct(0, cat, job, msg);
-}
-
-void CLogMsgManager::mreport_va(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args)
+void CLogMsgManager::mreport_va(const LogMsgCategory & cat, const char * format, va_list args)
 {
     if(rejectsCategory(cat)) return;
     StringBuffer log;
     log.limited_valist_appendf(1024*1024, format, args);
-    mreport_direct(compo, cat, job, log);
-}
-
-void CLogMsgManager::mreport_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args)
-{
-    if(rejectsCategory(cat)) return;
-    StringBuffer log;
-    log.limited_valist_appendf(1024*1024, format, args);
-    mreport_direct(cat, job, log);
+    mreport_direct(cat, log);
 }
 
 void CLogMsgManager::report(const LogMsgCategory & cat, const IException * exception, const char * prefix)
@@ -1784,124 +1755,7 @@ void CLogMsgManager::report(const LogMsgCategory & cat, const IException * excep
     StringBuffer buff;
     if(prefix) buff.append(prefix).append(" : ");
     exception->errorMessage(buff);
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, exception->errorCode(), buff.str(), 0, port, session));
-}
-
-void CLogMsgManager::report(unsigned compo, const LogMsgCategory & cat, const char * format, ...)
-{
-    if(rejectsCategory(cat)) return;
-    va_list args;
-    va_start(args, format);
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, NoLogMsgCode, format, args, compo, port, session));
-    va_end(args);
-}
-
-void CLogMsgManager::report_va(unsigned compo, const LogMsgCategory & cat, const char * format, va_list args)
-{
-    if(rejectsCategory(cat)) return;
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, NoLogMsgCode, format, args, compo, port, session));
-}
-
-void CLogMsgManager::report(unsigned compo, const LogMsgCategory & cat, LogMsgCode code, const char * format, ...)
-{
-    if(rejectsCategory(cat)) return;
-    va_list args;
-    va_start(args, format);
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, code, format, args, compo, port, session));
-    va_end(args);
-}
-
-void CLogMsgManager::report_va(unsigned compo, const LogMsgCategory & cat, LogMsgCode code, const char * format, va_list args)
-{
-    if(rejectsCategory(cat)) return;
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, code, format, args, compo, port, session));
-}
-
-void CLogMsgManager::report(unsigned compo, const LogMsgCategory & cat, const IException * exception, const char * prefix)
-{
-    if(rejectsCategory(cat)) return;
-    StringBuffer buff;
-    if(prefix) buff.append(prefix).append(" : ");
-    exception->errorMessage(buff);
-    pushMsg(new LogMsg(cat, getNextID(), unknownJob, exception->errorCode(), buff.str(), compo, port, session));
-}
-
-void CLogMsgManager::report(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, ...)
-{
-    if(rejectsCategory(cat)) return;
-    va_list args;
-    va_start(args, format);
-    pushMsg(new LogMsg(cat, getNextID(), job, NoLogMsgCode, format, args, 0, port, session));
-    va_end(args);
-}
-
-void CLogMsgManager::report_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args)
-{
-    if(rejectsCategory(cat)) return;
-    pushMsg(new LogMsg(cat, getNextID(), job, NoLogMsgCode, format, args, 0, port, session));
-}
-
-void CLogMsgManager::report(const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, ...)
-{
-    if(rejectsCategory(cat)) return;
-    va_list args;
-    va_start(args, format);
-    pushMsg(new LogMsg(cat, getNextID(), job, code, format, args, 0, port, session));
-    va_end(args);
-}
-
-void CLogMsgManager::report_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, va_list args)
-{
-    if(rejectsCategory(cat)) return;
-    pushMsg(new LogMsg(cat, getNextID(), job, code, format, args, 0, port, session));
-}
-
-void CLogMsgManager::report(const LogMsgCategory & cat, const LogMsgJobInfo & job, const IException * exception, const char * prefix)
-{
-    if(rejectsCategory(cat)) return;
-    StringBuffer buff;
-    if(prefix) buff.append(prefix).append(" : ");
-    exception->errorMessage(buff);
-    pushMsg(new LogMsg(cat, getNextID(), job, exception->errorCode(), buff.str(), 0, port, session));
-}
-
-void CLogMsgManager::report(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, ...)
-{
-    if(rejectsCategory(cat)) return;
-    va_list args;
-    va_start(args, format);
-    pushMsg(new LogMsg(cat, getNextID(), job, NoLogMsgCode, format, args, compo, port, session));
-    va_end(args);
-}
-
-void CLogMsgManager::report_va(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args)
-{
-    if(rejectsCategory(cat)) return;
-    pushMsg(new LogMsg(cat, getNextID(), job, NoLogMsgCode, format, args, compo, port, session));
-}
-
-void CLogMsgManager::report(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, ...)
-{
-    if(rejectsCategory(cat)) return;
-    va_list args;
-    va_start(args, format);
-    pushMsg(new LogMsg(cat, getNextID(), job, code, format, args, compo, port, session));
-    va_end(args);
-}
-
-void CLogMsgManager::report_va(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, va_list args)
-{
-    if(rejectsCategory(cat)) return;
-    pushMsg(new LogMsg(cat, getNextID(), job, code, format, args, compo, port, session));
-}
-
-void CLogMsgManager::report(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const IException * exception, const char * prefix)
-{
-    if(rejectsCategory(cat)) return;
-    StringBuffer buff;
-    if(prefix) buff.append(prefix).append(" : ");
-    exception->errorMessage(buff);
-    pushMsg(new LogMsg(cat, getNextID(), job, exception->errorCode(), buff.str(), compo, port, session));
+    pushMsg(new LogMsg(cat, getNextID(), exception->errorCode(), buff.str(), port, session));
 }
 
 void CLogMsgManager::pushMsg(LogMsg * _msg)
@@ -2051,7 +1905,11 @@ void CLogMsgManager::resetMonitors()
     suspendChildren();
     removeAllMonitors();
     Owned<ILogMsgFilter> defaultFilter = getDefaultLogMsgFilter();
-    addMonitor(theStderrHandler, defaultFilter);
+
+    // dont add stderr log handler if it has been redirected to /dev/null ...
+
+    if (!stdErrIsDevNull())
+        addMonitor(theStderrHandler, defaultFilter);
     unsuspendChildren();
 }
 
@@ -2119,7 +1977,7 @@ ILogMsgFilter * CLogMsgManager::getCompoundFilter(bool locked) const
         else
             otherFilters.set(categoryFilter);
     }
-    if(!locked) monitorLock.unlock();
+    if(!locked) monitorLock.unlockRead();
     if(!otherFilters)
         return getPassNoneLogMsgFilter();
     return otherFilters.getLink();
@@ -2152,8 +2010,8 @@ void CLogMsgManager::addAllMonitorsToPTree(IPropertyTree * tree) const
         monitors.item(i).addToPTree(tree);
 }
 
-bool CLogMsgManager::rejectsCategory(const LogMsgCategory & cat) const 
-{ 
+bool CLogMsgManager::rejectsCategory(const LogMsgCategory & cat) const
+{
     if (!prefilter.includeCategory(cat))
         return true;
 
@@ -2183,7 +2041,6 @@ ILogMsgFilter * getDeserializedLogMsgFilter(MemoryBuffer & in)
     case MSGFILTER_node : return new NodeLogMsgFilter(in);
     case MSGFILTER_ip : return new IpLogMsgFilter(in);
     case MSGFILTER_session : return new SessionLogMsgFilter(in);
-    case MSGFILTER_component : return new ComponentLogMsgFilter(in);
     case MSGFILTER_regex : return new RegexLogMsgFilter(in);
     case MSGFILTER_not : return new NotLogMsgFilter(in);
     case MSGFILTER_and : return new AndLogMsgFilter(in);
@@ -2208,7 +2065,6 @@ ILogMsgFilter * getLogMsgFilterFromPTree(IPropertyTree * xml)
     else if(strcmp(type.str(), "node")==0) return new NodeLogMsgFilter(xml);
     else if(strcmp(type.str(), "ip")==0) return new IpLogMsgFilter(xml);
     else if(strcmp(type.str(), "session")==0) return new SessionLogMsgFilter(xml);
-    else if(strcmp(type.str(), "component")==0) return new ComponentLogMsgFilter(xml);
     else if(strcmp(type.str(), "regex")==0) return new RegexLogMsgFilter(xml);
     else if(strcmp(type.str(), "not")==0) return new NotLogMsgFilter(xml);
     else if(strcmp(type.str(), "and")==0) return new AndLogMsgFilter(xml);
@@ -2310,11 +2166,6 @@ ILogMsgFilter * getSessionLogMsgFilter(LogMsgSessionId session, bool local)
     return new SessionLogMsgFilter(session, local);
 }
 
-ILogMsgFilter * getComponentLogMsgFilter(unsigned component, bool local)
-{
-    return new ComponentLogMsgFilter(component, local);
-}
-
 ILogMsgFilter * getRegexLogMsgFilter(const char *regex, bool local)
 {
     return new RegexLogMsgFilter(regex, local);
@@ -2367,18 +2218,32 @@ ILogMsgFilter * getSwitchLogMsgFilterOwn(ILogMsgFilter * switchFilter, ILogMsgFi
     return ret;
 }
 
-ILogMsgHandler * getHandleLogMsgHandler(FILE * handle, unsigned fields, bool writeXML)
+ILogMsgHandler * getHandleLogMsgHandler(FILE * handle, unsigned fields, LogHandlerFormat logFormat)
 {
-    if(writeXML)
+    switch (logFormat)
+    {
+    case LOGFORMAT_xml:
         return new HandleLogMsgHandlerXML(handle, fields);
-    return new HandleLogMsgHandlerTable(handle, fields);
+    case LOGFORMAT_json:
+        return new HandleLogMsgHandlerJSON(handle, fields);
+    case LOGFORMAT_table:
+    default:
+        return new HandleLogMsgHandlerTable(handle, fields);
+    }
 }
 
-ILogMsgHandler * getFileLogMsgHandler(const char * filename, const char * headertext, unsigned fields, bool writeXML, bool append, bool flushes)
+ILogMsgHandler * getFileLogMsgHandler(const char * filename, const char * headertext, unsigned fields, LogHandlerFormat logFormat, bool append, bool flushes)
 {
-    if(writeXML)
+    switch (logFormat)
+    {
+    case LOGFORMAT_xml:
         return new FileLogMsgHandlerXML(filename, headertext, fields, append, flushes);
-    return new FileLogMsgHandlerTable(filename, headertext, fields, append, flushes);
+    case LOGFORMAT_json:
+        return new FileLogMsgHandlerJSON(filename, headertext, fields, append, flushes);
+    case LOGFORMAT_table:
+    default:
+        return new FileLogMsgHandlerTable(filename, headertext, fields, append, flushes);
+    }
 }
 
 ILogMsgHandler * getRollingFileLogMsgHandler(const char * filebase, const char * fileextn, unsigned fields, bool append, bool flushes, const char *initialName, const char *alias, bool daily, long maxLogSize)
@@ -2389,6 +2254,11 @@ ILogMsgHandler * getRollingFileLogMsgHandler(const char * filebase, const char *
 ILogMsgHandler * getBinLogMsgHandler(const char * filename, bool append)
 {
     return new BinLogMsgHandler(filename, append);
+}
+
+ILogMsgHandler * getPostMortemLogMsgHandler(const char * filebase, unsigned maxLinesToKeep, unsigned messageFields)
+{
+    return new PostMortemLogMsgHandler(filebase, maxLinesToKeep, messageFields);
 }
 
 void installLogMsgFilterSwitch(ILogMsgHandler * handler, ILogMsgFilter * switchFilter, ILogMsgFilter * newFilter)
@@ -2410,7 +2280,7 @@ ILogMsgHandler * getLogMsgHandlerFromPTree(IPropertyTree * tree)
             fields = logMsgFieldsFromAbbrevs(fstr);
     }
     if(strcmp(type.str(), "stderr")==0)
-        return getHandleLogMsgHandler(stderr, fields, tree->hasProp("@writeXML"));
+        return getHandleLogMsgHandler(stderr, fields, tree->hasProp("@writeXML") ? LOGFORMAT_xml : LOGFORMAT_table);
     else if(strcmp(type.str(), "file")==0)
     {
         StringBuffer filename;
@@ -2419,10 +2289,14 @@ ILogMsgHandler * getLogMsgHandlerFromPTree(IPropertyTree * tree)
         {
             StringBuffer headertext;
             tree->getProp("@headertext", headertext);
-            return getFileLogMsgHandler(filename.str(), headertext.str(), fields, !(tree->hasProp("@writeTable")), tree->hasProp("@append"), tree->hasProp("@flushes"));
+            //JSON format now available, but currently not an option for file bound logs
+            return getFileLogMsgHandler(filename.str(), headertext.str(), fields, !(tree->hasProp("@writeTable")) ? LOGFORMAT_xml : LOGFORMAT_table, tree->hasProp("@append"), tree->hasProp("@flushes"));
         }
         else
-            return getFileLogMsgHandler(filename.str(), 0, fields, !(tree->hasProp("@writeTable")), tree->hasProp("@append"), tree->hasProp("@flushes"));
+        {
+            //JSON format now available, but currently not an option for file bound logs
+            return getFileLogMsgHandler(filename.str(), 0, fields, !(tree->hasProp("@writeTable")) ? LOGFORMAT_xml : LOGFORMAT_table, tree->hasProp("@append"), tree->hasProp("@flushes"));
+        }
     }
     else if(strcmp(type.str(), "binary")==0)
     {
@@ -2434,13 +2308,13 @@ ILogMsgHandler * getLogMsgHandlerFromPTree(IPropertyTree * tree)
     return LINK(theStderrHandler);
 }
 
-ILogMsgHandler * attachStandardFileLogMsgMonitor(const char * filename, const char * headertext, unsigned fields, unsigned audiences, unsigned classes, LogMsgDetail detail, bool writeXML, bool append, bool flushes, bool local)
+ILogMsgHandler * attachStandardFileLogMsgMonitor(const char * filename, const char * headertext, unsigned fields, unsigned audiences, unsigned classes, LogMsgDetail detail, LogHandlerFormat logFormat, bool append, bool flushes, bool local)
 {
 #ifdef FILE_LOG_ENABLES_QUEUEUING
     queryLogMsgManager()->enterQueueingMode();
 #endif
     ILogMsgFilter * filter = getCategoryLogMsgFilter(audiences, classes, detail, local);
-    ILogMsgHandler * handler = getFileLogMsgHandler(filename, headertext, fields, writeXML, append, flushes);
+    ILogMsgHandler * handler = getFileLogMsgHandler(filename, headertext, fields, logFormat, append, flushes);
     queryLogMsgManager()->addMonitorOwn(handler, filter);
     return handler;
 }
@@ -2456,10 +2330,10 @@ ILogMsgHandler * attachStandardBinLogMsgMonitor(const char * filename, unsigned 
     return handler;
 }
 
-ILogMsgHandler * attachStandardHandleLogMsgMonitor(FILE * handle, unsigned fields, unsigned audiences, unsigned classes, LogMsgDetail detail, bool writeXML, bool local)
+ILogMsgHandler * attachStandardHandleLogMsgMonitor(FILE * handle, unsigned fields, unsigned audiences, unsigned classes, LogMsgDetail detail, LogHandlerFormat logFormat, bool local)
 {
     ILogMsgFilter * filter = getCategoryLogMsgFilter(audiences, classes, detail, local);
-    ILogMsgHandler * handler = getHandleLogMsgHandler(handle, fields, writeXML);
+    ILogMsgHandler * handler = getHandleLogMsgHandler(handle, fields, logFormat);
     queryLogMsgManager()->addMonitorOwn(handler, filter);
     return handler;
 }
@@ -2483,13 +2357,65 @@ void attachManyLogMsgMonitorsFromPTree(IPropertyTree * tree)
 
 // Calls to make, remove, and return the manager, standard handler, pass all/none filters, reporter array
 
-PassAllLogMsgFilter * thePassAllFilter;
-PassLocalLogMsgFilter * thePassLocalFilter;
-PassNoneLogMsgFilter * thePassNoneFilter;
-HandleLogMsgHandlerTable * theStderrHandler;
-CLogMsgManager * theManager;
-CSysLogEventLogger * theSysLogEventLogger;
-LogMsgComponentReporter * theReporters[MSGCOMP_NUMBER];
+class CNullManager : implements ILogMsgManager
+{
+public:
+// IInterface impl.
+    virtual void Link() const override {}
+    virtual bool Release() const override { return false; }
+
+// ILogMsgListener impl.
+    virtual bool              addMonitor(ILogMsgHandler * handler, ILogMsgFilter * filter) override { return true; }
+    virtual bool              addMonitorOwn(ILogMsgHandler * handler, ILogMsgFilter * filter) override { return true; }
+    virtual bool              removeMonitor(ILogMsgHandler * handler)  override { return true; }
+    virtual unsigned          removeMonitorsMatching(HandlerTest & test) override { return 0; }
+    virtual void              removeAllMonitors()  override {}
+    virtual bool              isActiveMonitor(const ILogMsgHandler * handler) const override { return false; }
+    virtual ILogMsgFilter *   queryMonitorFilter(const ILogMsgHandler * handler) const override { return nullptr; }
+    virtual ILogMsgFilter *   getMonitorFilter(const ILogMsgHandler * handler) const override { return nullptr; }
+    virtual bool              changeMonitorFilter(const ILogMsgHandler * handler, ILogMsgFilter * newFilter) override { return true; }
+    virtual bool              changeMonitorFilterOwn(const ILogMsgHandler * handler, ILogMsgFilter * newFilter) override { return true; }
+    virtual void              prepAllHandlers() const override {}
+    virtual void              addChildOwn(ILogMsgLinkToChild * child) override {}
+    virtual void              removeChild(ILogMsgLinkToChild * child) override {}
+    virtual void              removeAllChildren() override {}
+    virtual ILogMsgFilter *   getCompoundFilter(bool locked = false) const override { return nullptr; }
+    virtual void              suspendChildren() override {}
+    virtual void              unsuspendChildren() override {}
+    virtual bool              addMonitorToPTree(const ILogMsgHandler * handler, IPropertyTree * tree) const override { return true; }
+    virtual void              addAllMonitorsToPTree(IPropertyTree * tree) const override {}
+    virtual void              setPort(unsigned _port) override {}
+    virtual unsigned          queryPort() const override { return 0; }
+    virtual void              setSession(LogMsgSessionId _session) override {}
+    virtual LogMsgSessionId   querySession() const override { return 0; }
+
+// ILogMsgManager impl.
+    virtual void              enterQueueingMode() override {}
+    virtual void              setQueueBlockingLimit(unsigned lim) override {}
+    virtual void              setQueueDroppingLimit(unsigned lim, unsigned numToDrop) override {}
+    virtual void              resetQueueLimit() override {}
+    virtual bool              flushQueue(unsigned timeout) override { return true; }
+    virtual void              resetMonitors() override {}
+    virtual void              report(const LogMsgCategory & cat, const char * format, ...) override {}
+    virtual void              report_va(const LogMsgCategory & cat, const char * format, va_list args) override {}
+    virtual void              report(const LogMsgCategory & cat, LogMsgCode code , const char * format, ...) override {}
+    virtual void              report_va(const LogMsgCategory & cat, LogMsgCode code , const char * format, va_list args) override {}
+    virtual void              report(const LogMsgCategory & cat, const IException * e, const char * prefix = NULL) override {}
+    virtual void              mreport_direct(const LogMsgCategory & cat, const char * msg) override {}
+    virtual void              mreport_va(const LogMsgCategory & cat, const char * format, va_list args) override {}
+    virtual void              report(const LogMsg & msg) const override {}
+    virtual LogMsgId          getNextID() override { return 0; }
+    virtual bool              rejectsCategory(const LogMsgCategory & cat) const override { return true; }
+    virtual offset_t          getLogPosition(StringBuffer &logFileName, const ILogMsgHandler * handler) const override { return 0; }
+    virtual LogMsgJobId       addJobId(const char *job) override { return 0; }
+    virtual void              removeJobId(LogMsgJobId) override {}
+    virtual const char *      queryJobId(LogMsgJobId id) const override { return ""; }
+};
+
+static CNullManager nullManager;
+static Singleton<IRemoteLogAccess> logAccessor;
+static Owned<IException> logAccessorError;
+
 
 MODULE_INIT(INIT_PRIORITY_JLOG)
 {
@@ -2497,109 +2423,190 @@ MODULE_INIT(INIT_PRIORITY_JLOG)
     thePassLocalFilter = new PassLocalLogMsgFilter();
     thePassNoneFilter = new PassNoneLogMsgFilter();
     theStderrHandler = new HandleLogMsgHandlerTable(stderr, MSGFIELD_STANDARD);
+
     theSysLogEventLogger = new CSysLogEventLogger;
     theManager = new CLogMsgManager();
     theManager->resetMonitors();
-    for(unsigned compo = 0; compo<MSGCOMP_NUMBER; compo++)
-        theReporters[compo] = new LogMsgComponentReporter(compo);
     return true;
 }
 MODULE_EXIT()
 {
-    for(unsigned compo = 0; compo<MSGCOMP_NUMBER; compo++)
-    {
-        delete theReporters[compo];
-        theReporters[compo] = NULL;
-    }
-    delete theManager;
+    ::Release(theManager);
+    theManager = &nullManager;
     delete theSysLogEventLogger;
     delete theStderrHandler;
+    delete thePostMortemHandler;
     delete thePassNoneFilter;
     delete thePassLocalFilter;
     delete thePassAllFilter;
-    theManager = NULL;
-    theSysLogEventLogger = NULL;
-    theStderrHandler = NULL;
-    thePassNoneFilter = NULL;
-    thePassLocalFilter = NULL;
-    thePassAllFilter = NULL;
+    theSysLogEventLogger = nullptr;
+    theStderrHandler = nullptr;
+    thePostMortemHandler = nullptr;
+    thePassNoneFilter = nullptr;
+    thePassLocalFilter = nullptr;
+    thePassAllFilter = nullptr;
+    logAccessor.destroy([](IRemoteLogAccess * _logAccessor) { ::Release(_logAccessor); });
 }
-
-#ifdef _CONTAINERIZED
 
 static constexpr const char * logFieldsAtt = "@fields";
 static constexpr const char * logMsgDetailAtt = "@detail";
 static constexpr const char * logMsgAudiencesAtt = "@audiences";
 static constexpr const char * logMsgClassesAtt = "@classes";
-static constexpr const char * useLogQueueAtt = "@useLogQueue";
 static constexpr const char * logQueueLenAtt = "@queueLen";
 static constexpr const char * logQueueDropAtt = "@queueDrop";
-static constexpr const char * logQueueDisabledAtt = "@disabled";
+static constexpr const char * logDisabledAtt = "@disabled";
 static constexpr const char * useSysLogpAtt ="@enableSysLog";
-
-#ifdef _DEBUG
-static constexpr bool useQueueDefault = false;
-#else
-static constexpr bool useQueueDefault = true;
-#endif
+static constexpr const char * capturePostMortemAtt ="@postMortem";
+static constexpr const char * logFormatAtt ="@format";
 
 static constexpr unsigned queueLenDefault = 512;
-static constexpr unsigned queueDropDefault = 32;
+static constexpr unsigned queueDropDefault = 0; // disabled by default
 static constexpr bool useSysLogDefault = false;
 
+// returns LOGFORMAT_undefined if format has not changed
+// NB: returns LOGFORMAT_table if no format specified (i.e. this is the default)
+LogHandlerFormat getConfigHandlerFormat(const IPropertyTree *logConfig)
+{
+    LogHandlerFormat currentFormat = theStderrHandler->queryFormatType();
+    LogHandlerFormat newFormat{LOGFORMAT_undefined};
+    const char *newFormatString = logConfig ? logConfig->queryProp(logFormatAtt) : nullptr;
+    if (!newFormatString) // absent, defaults to "table"
+        newFormat = LOGFORMAT_table;
+    else
+    {
+        if (streq(newFormatString, "xml"))
+            newFormat = LOGFORMAT_xml;
+        else if (streq(newFormatString, "json"))
+            newFormat = LOGFORMAT_json;
+        else if (streq(newFormatString, "table"))
+            newFormat = LOGFORMAT_table;
+        else
+            OWARNLOG("JLog: Invalid log format configuration detected '%s'!", newFormatString);
+    }
+    return currentFormat != newFormat ? newFormat : LOGFORMAT_undefined;
+}
+
+void updateStdErrLogHandler(const IPropertyTree *logConfig)
+{
+    if (logConfig->hasProp(logFieldsAtt))
+    {
+        // Supported logging fields: TRC,SPN,AUD,CLS,DET,MID,TIM,DAT,PID,TID,NOD,JOB,USE,SES,COD,MLT,MCT,NNT,COM,QUO,PFX,ALL,STD
+        const char *logFields = logConfig->queryProp(logFieldsAtt);
+        if (!isEmptyString(logFields))
+            theStderrHandler->setMessageFields(logMsgFieldsFromAbbrevs(logFields));
+    }
+
+    // Only recreate filter if at least one filter attribute configured
+    if (logConfig->hasProp(logMsgDetailAtt) || logConfig->hasProp(logMsgAudiencesAtt) || logConfig->hasProp(logMsgClassesAtt))
+    {
+        LogMsgDetail logDetail = logConfig->getPropInt(logMsgDetailAtt, DefaultDetail);
+
+        unsigned msgClasses = MSGCLS_all;
+        const char *logClasses = logConfig->queryProp(logMsgClassesAtt);
+        if (!isEmptyString(logClasses))
+            msgClasses = logMsgClassesFromAbbrevs(logClasses);
+
+        unsigned msgAudiences = MSGAUD_all;
+        const char *logAudiences = logConfig->queryProp(logMsgAudiencesAtt);
+        if (!isEmptyString(logAudiences))
+            msgAudiences = logMsgAudsFromAbbrevs(logAudiences);
+
+        const bool local = true; // Do not include remote messages from other components
+        Owned<ILogMsgFilter> filter = getCategoryLogMsgFilter(msgAudiences, msgClasses, logDetail, local);
+        theManager->changeMonitorFilter(theStderrHandler, filter);
+    }
+}
+
+static void loggingSetupUpdate(const IPropertyTree *oldComponentConfiguration, const IPropertyTree *oldGlobalConfiguration)
+{
+    Owned<IPropertyTree> logConfig = getComponentConfigSP()->getPropTree("logging");
+    if (!logConfig)
+        return;
+    if (logConfig->getPropBool(logDisabledAtt, false))
+    {
+        OWARNLOG("JLog: Ignoring can't be disabled dynamically via an update");
+        return;
+    }
+
+    LogHandlerFormat newFormat = getConfigHandlerFormat(logConfig);
+    if (newFormat != LOGFORMAT_undefined)
+    {
+        OWARNLOG("JLog: Ignoring log format configuration change on the fly, as it is not supported in a containerized environment");
+    }
+
+    updateStdErrLogHandler(logConfig);
+}
+
+static CConfigUpdateHook configUpdateHook;
+
+// NB: it is not thread-safe to change the handler whilst other threads are logging.
+// This should only be called at startup.
 void setupContainerizedLogMsgHandler()
 {
-    IPropertyTree * logConfig = queryComponentConfig().queryPropTree("logging");
+    Owned<IPropertyTree> logConfig = getComponentConfigSP()->getPropTree("logging");
+    if (logConfig && logConfig->getPropBool(logDisabledAtt, false))
+    {
+        removeLog();
+        return; // NB: can't be reenabled dynamically via an update at present
+    }
+    LogHandlerFormat newFormat = getConfigHandlerFormat(logConfig); // NB: theStderrHandler is initially setup in MODULE_INIT
+    if (newFormat != LOGFORMAT_undefined)
+    {
+        // NB: old theStderrHandler leaks, should be fixed by separate PR.
+        switch (newFormat)
+        {
+            case LOGFORMAT_xml:
+                theStderrHandler = new HandleLogMsgHandlerXML(stderr, MSGFIELD_STANDARD);
+                break;
+            case LOGFORMAT_json:
+                theStderrHandler = new HandleLogMsgHandlerJSON(stderr, MSGFIELD_STANDARD);
+                break;
+            case LOGFORMAT_table:
+                theStderrHandler = new HandleLogMsgHandlerTable(stderr, MSGFIELD_STANDARD);
+                break;
+            default:
+                throwUnexpected(); // should never reach here
+        }
+        theManager->resetMonitors();
+    }
     if (logConfig)
     {
-        if (logConfig->getPropBool(logQueueDisabledAtt, false))
+        unsigned queueLen = logConfig->getPropInt(logQueueLenAtt, queueLenDefault);
+        if (queueLen)
         {
-            removeLog();
-            return;
-        }
-        if (logConfig->hasProp(logFieldsAtt))
-        {
-            //Supported logging fields: AUD,CLS,DET,MID,TIM,DAT,PID,TID,NOD,JOB,USE,SES,COD,MLT,MCT,NNT,COM,QUO,PFX,ALL,STD
-            const char *logFields = logConfig->queryProp(logFieldsAtt);
-            if (!isEmptyString(logFields))
-                theStderrHandler->setMessageFields(logMsgFieldsFromAbbrevs(logFields));
-        }
-
-        //Only recreate filter if at least one filter attribute configured
-        if (logConfig->hasProp(logMsgDetailAtt) || logConfig->hasProp(logMsgAudiencesAtt) || logConfig->hasProp(logMsgClassesAtt))
-        {
-            LogMsgDetail logDetail = logConfig->getPropInt(logMsgDetailAtt, DefaultDetail);
-
-            unsigned msgClasses = MSGCLS_all;
-            const char *logClasses = logConfig->queryProp(logMsgClassesAtt);
-            if (!isEmptyString(logClasses))
-                msgClasses = logMsgClassesFromAbbrevs(logClasses);
-
-            unsigned msgAudiences = MSGAUD_all;
-            const char *logAudiences = logConfig->queryProp(logMsgAudiencesAtt);
-            if (!isEmptyString(logAudiences))
-                msgAudiences = logMsgAudsFromAbbrevs(logAudiences);
-
-            const bool local = true; // Do not include remote messages from other components
-            Owned<ILogMsgFilter> filter = getCategoryLogMsgFilter(msgAudiences, msgClasses, logDetail, local);
-            theManager->changeMonitorFilter(theStderrHandler, filter);
-        }
-
-        bool useLogQueue = logConfig->getPropBool(useLogQueueAtt, useQueueDefault);
-        if (useLogQueue)
-        {
-            unsigned queueLen = logConfig->getPropInt(logQueueLenAtt, queueLenDefault);
-            unsigned queueDrop = logConfig->getPropInt(logQueueDropAtt, queueDropDefault);
-
             queryLogMsgManager()->enterQueueingMode();
-            queryLogMsgManager()->setQueueDroppingLimit(queueLen, queueDrop);
+            unsigned queueDrop = logConfig->getPropInt(logQueueDropAtt, queueDropDefault);
+            if (queueDrop)
+            {
+                queryLogMsgManager()->setQueueDroppingLimit(queueLen, queueDrop);
+                PROGLOG("JLog: queuing enabled with dropping: queueLen=%u, queueDrop=%u", queueLen, queueDrop);
+            }
+            else
+            {
+                queryLogMsgManager()->setQueueBlockingLimit(queueLen);
+                PROGLOG("JLog: queuing enabled: queueLen=%u", queueLen);
+            }
         }
 
         if (logConfig->getPropBool(useSysLogpAtt, useSysLogDefault))
             UseSysLogForOperatorMessages();
+
+        unsigned postMortemLines = logConfig->getPropInt(capturePostMortemAtt, 0);
+        if (postMortemLines)
+        {
+            // augment postmortem files with <pid> to avoid clashes where multiple processes are running within
+            // same process space, e.g. hthor processes running in same k8s container
+            StringBuffer portMortemFileBase;
+            getPostMortemPidFilename(portMortemFileBase, 0);
+
+            thePostMortemHandler = new PostMortemLogMsgHandler(portMortemFileBase, postMortemLines, MSGFIELD_STANDARD);
+            queryLogMsgManager()->addMonitor(thePostMortemHandler, getCategoryLogMsgFilter(MSGAUD_all, MSGCLS_all, TopDetail));
+        }
+
+        updateStdErrLogHandler(logConfig);
     }
+    configUpdateHook.installOnce(loggingSetupUpdate, false);
 }
-#endif
 
 ILogMsgManager * queryLogMsgManager()
 {
@@ -2611,9 +2618,9 @@ ILogMsgHandler * queryStderrLogMsgHandler()
     return theStderrHandler;
 }
 
-LogMsgComponentReporter * queryLogMsgComponentReporter(unsigned compo)
+ILogMsgHandler * queryPostMortemLogMsgHandler()
 {
-    return theReporters[compo];
+    return thePostMortemHandler;
 }
 
 ILogMsgManager * createLogMsgManager() // use with care! (needed by mplog listener facility)
@@ -2630,7 +2637,7 @@ ISysLogEventLogger * querySysLogEventLogger()
 
 ILogMsgHandler * getSysLogMsgHandler(unsigned fields)
 {
-    return new SysLogMsgHandler(theSysLogEventLogger, fields); 
+    return new SysLogMsgHandler(theSysLogEventLogger, fields);
 }
 
 #ifdef _WIN32
@@ -2681,7 +2688,7 @@ bool CSysLogEventLogger::win32Report(unsigned eventtype, unsigned category, unsi
                 char src[_MAX_PATH+1];
                 LPTSTR tail;
                 DWORD res = SearchPath(NULL,"JELOG.DLL",NULL,sizeof(src),src,&tail);
-                if (res>0) 
+                if (res>0)
                     copyFile(path,src);
                 else
                     throw makeOsException(GetLastError());
@@ -2696,20 +2703,20 @@ bool CSysLogEventLogger::win32Report(unsigned eventtype, unsigned category, unsi
 
         }
         HKEY hk;
-        if (RegCreateKeyEx(HKEY_LOCAL_MACHINE,"SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\Seisint", 
+        if (RegCreateKeyEx(HKEY_LOCAL_MACHINE,"SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\Seisint",
                            NULL, NULL, 0, KEY_ALL_ACCESS, NULL, &hk, NULL)==0) {
             DWORD sizedata = 0;
             DWORD type = REG_EXPAND_SZ;
             if ((RegQueryValueEx(hk,"EventMessageFile",NULL, &type, NULL, &sizedata)!=0)||!sizedata) {
-                StringAttr str("%SystemRoot%\\System32\\JELOG.dll"); 
+                StringAttr str("%SystemRoot%\\System32\\JELOG.dll");
                 RegSetValueEx(hk,"EventMessageFile", 0, REG_EXPAND_SZ, (LPBYTE) str.get(), (DWORD)str.length() + 1);
                 RegSetValueEx(hk,"CategoryMessageFile", 0, REG_EXPAND_SZ, (LPBYTE) str.get(), (DWORD)str.length() + 1);
-                DWORD dwData = EVENTLOG_ERROR_TYPE | EVENTLOG_WARNING_TYPE | EVENTLOG_INFORMATION_TYPE | EVENTLOG_AUDIT_SUCCESS | EVENTLOG_AUDIT_FAILURE; 
+                DWORD dwData = EVENTLOG_ERROR_TYPE | EVENTLOG_WARNING_TYPE | EVENTLOG_INFORMATION_TYPE | EVENTLOG_AUDIT_SUCCESS | EVENTLOG_AUDIT_FAILURE;
                 RegSetValueEx(hk, "TypesSupported", 0, REG_DWORD,  (LPBYTE) &dwData,  sizeof(DWORD));
                 dwData = 16;
                 RegSetValueEx(hk, "CategoryCount", 0, REG_DWORD,  (LPBYTE) &dwData,  sizeof(DWORD));
             }
-            RegCloseKey(hk); 
+            RegCloseKey(hk);
         }
         hEventLog = RegisterEventSource(NULL,"Seisint");
         if (!hEventLog) {
@@ -2747,8 +2754,8 @@ bool CSysLogEventLogger::win32Report(unsigned eventtype, unsigned category, unsi
 
 CSysLogEventLogger::~CSysLogEventLogger()
 {
-    if (hEventLog!=0) 
-        DeregisterEventSource(hEventLog); 
+    if (hEventLog!=0)
+        DeregisterEventSource(hEventLog);
 }
 
 #else
@@ -2757,7 +2764,7 @@ CSysLogEventLogger::~CSysLogEventLogger()
 
 #define CATEGORY_AUDIT_FUNCTION_REQUIRED
 #define AUDIT_TYPES_BEGIN int auditTypeDataMap[NUM_AUDIT_TYPES+1] = {
-#define MAKE_AUDIT_TYPE(name, type, categoryid, eventid, level) level, 
+#define MAKE_AUDIT_TYPE(name, type, categoryid, eventid, level) level,
 #define AUDIT_TYPES_END 0 };
 #include "jelogtype.hpp"
 #undef CATEGORY_AUDIT_FUNCTION_REQUIRED
@@ -2896,7 +2903,7 @@ void IContextLogger::CTXLOG(const char *format, ...) const
 {
     va_list args;
     va_start(args, format);
-    CTXLOGva(format, args);
+    CTXLOGva(MCdebugInfo, NoLogMsgCode, format, args);
     va_end(args);
 }
 
@@ -2940,26 +2947,26 @@ void IContextLogger::logOperatorException(IException *E, const char *file, unsig
     logOperatorExceptionVA(E, file, line, format, args);
     va_end(args);
 }
+class CRuntimeStatisticCollection;
+
+/*
+  This class is used to implement the default log context - especially used for engines that only support a single query at a time
+  */
 
 class DummyLogCtx : implements IContextLogger
 {
 private:
-    StringAttr globalId;
-    StringAttr callerId;
-    StringBuffer localId;
-    StringAttr globalIdHeader;
-    StringAttr callerIdHeader;
+    Owned<ISpan> activeSpan = getNullSpan();
 
 public:
+    DummyLogCtx() {}
     // It's a static object - we don't want to actually link-count it...
     virtual void Link() const {}
     virtual bool Release() const { return false; }
 
-    virtual void CTXLOGva(const char *format, va_list args) const __attribute__((format(printf,2,0)))
+    virtual void CTXLOGva(const LogMsgCategory & cat, LogMsgCode code, const char *format, va_list args) const override  __attribute__((format(printf,4,0)))
     {
-        StringBuffer ss;
-        ss.valist_appendf(format, args);
-        DBGLOG("%s", ss.str());
+        VALOG(cat, code, format, args);
     }
     virtual void logOperatorExceptionVA(IException *E, const char *file, unsigned line, const char *format, va_list args) const __attribute__((format(printf,5,0)))
     {
@@ -2973,53 +2980,64 @@ public:
             E->errorMessage(ss.append(": "));
         if (format)
             ss.append(": ").valist_appendf(format, args);
-        LOG(MCoperatorProgress, unknownJob, "%s", ss.str());
+        LOG(MCoperatorProgress, "%s", ss.str());
     }
     virtual void noteStatistic(StatisticKind kind, unsigned __int64 value) const
     {
     }
-    virtual void mergeStats(const CRuntimeStatisticCollection &from) const
+    virtual void setStatistic(StatisticKind kind, unsigned __int64 value) const
+    {
+    }
+    virtual void mergeStats(unsigned activityId, const CRuntimeStatisticCollection &from) const
     {
     }
     virtual unsigned queryTraceLevel() const
     {
         return 0;
     }
-    virtual void setGlobalId(const char *id, SocketEndpoint &ep, unsigned pid) override
+    virtual ISpan * queryActiveSpan() const override
     {
-        globalId.set(id);
-        appendGloballyUniqueId(localId.clear());
+        return activeSpan;
     }
-    virtual void setCallerId(const char *id) override
+    virtual void setActiveSpan(ISpan * span) override
     {
-        callerId.set(id);
+        activeSpan.set(span);
     }
-    virtual const char *queryGlobalId() const
+    virtual IProperties * getClientHeaders() const override
     {
-        return globalId.get();
+        return ::getClientHeaders(activeSpan);
+    }
+    virtual IProperties * getSpanContext() const override
+    {
+        return ::getSpanContext(activeSpan);
+    }
+    virtual void setSpanAttribute(const char *name, const char *value) const override
+    {
+        activeSpan->setSpanAttribute(name, value);
+    }
+    virtual void setSpanAttribute(const char *name, __uint64 value) const override
+    {
+        activeSpan->setSpanAttribute(name, value);
+    }
+    virtual const char *queryGlobalId() const override
+    {
+        return activeSpan->queryGlobalId();
     }
     virtual const char *queryCallerId() const override
     {
-        return callerId.str();
+        return activeSpan->queryCallerId();
     }
-    virtual const char *queryLocalId() const
+    virtual const char *queryLocalId() const override
     {
-        return localId.str();
+        return activeSpan->queryLocalId();
     }
-    virtual void setHttpIdHeaders(const char *global, const char *caller)
+    virtual const CRuntimeStatisticCollection &queryStats() const override
     {
-        if (global && *global)
-            globalIdHeader.set(global);
-        if (caller && *caller)
-            callerIdHeader.set(caller);
+        throwUnexpected();
     }
-    virtual const char *queryGlobalIdHttpHeader() const
+    virtual void recordStatistics(IStatisticGatherer &progress) const override
     {
-        return globalIdHeader.str();
-    }
-    virtual const char *queryCallerIdHttpHeader() const
-    {
-        return callerIdHeader.str();
+        throwUnexpected();
     }
 } dummyContextLogger;
 
@@ -3036,7 +3054,7 @@ extern jlib_decl IContextLogger &updateDummyContextLogger()
 
 extern jlib_decl StringBuffer &appendGloballyUniqueId(StringBuffer &s)
 {
-    string uid = createUniqueIdString();
+    std::string uid = createUniqueIdString();
     return s.append(uid.c_str());
 }
 
@@ -3047,7 +3065,7 @@ extern jlib_decl void UseSysLogForOperatorMessages(bool use)
         return;
     if (use) {
         msgHandler = getSysLogMsgHandler();
-        ILogMsgFilter * operatorFilter = getCategoryLogMsgFilter(MSGAUD_operator, MSGCLS_all, DefaultDetail, true);  
+        ILogMsgFilter * operatorFilter = getCategoryLogMsgFilter(MSGAUD_operator, MSGCLS_all, DefaultDetail, true);
         queryLogMsgManager()->addMonitorOwn(msgHandler, operatorFilter);
     }
     else {
@@ -3109,7 +3127,11 @@ private:
         rolling = true;
         append = true;
         flushes = true;
+#ifdef _CONTAINERIZED
+        const char *logFields = nullptr;
+#else
         const char *logFields = queryEnvironmentConf().queryProp("logfields");
+#endif
         if (!isEmptyString(logFields))
             msgFields = logMsgFieldsFromAbbrevs(logFields);
         else
@@ -3119,7 +3141,7 @@ private:
         maxDetail = DefaultDetail;
         name.set(component); //logfile defaults to component name. Change via setName(), setPrefix() and setPostfix()
         extension.set(".log");
-        local = false;
+        local = true;
         createAlias = true;
     }
 
@@ -3223,7 +3245,7 @@ public:
                 lfs.set(fullFileSpec);
             else
                 lfs.set(logFileSpec.append(extension).str());
-            lmh = getFileLogMsgHandler(lfs.str(), NULL, msgFields, false);
+            lmh = getFileLogMsgHandler(lfs.str(), NULL, msgFields);
         }
         lmh->getLogName(expandedLogSpec);
         queryLogMsgManager()->addMonitorOwn( lmh, getCategoryLogMsgFilter(msgAudiences, msgClasses, maxDetail, local));
@@ -3244,4 +3266,545 @@ IComponentLogFileCreator * createComponentLogFileCreator(const char *_logDir, co
 IComponentLogFileCreator * createComponentLogFileCreator(const char *_component)
 {
     return new CComponentLogFileCreator(_component);
+}
+
+ILogAccessFilter * getLogAccessFilterFromPTree(IPropertyTree * xml)
+{
+    if (xml == nullptr)
+        throw makeStringException(JLIBERR_UtilGetlogaccessfilterfromptreeInputTreeCannotBeNull,"getLogAccessFilterFromPTree: input tree cannot be null");
+
+    StringBuffer type;
+    xml->getProp("@type", type);
+    if (streq(type.str(), "jobid"))
+        return new FieldLogAccessFilter(xml, LOGACCESS_FILTER_jobid);
+    else if (streq(type.str(), "audience"))
+        return new FieldLogAccessFilter(xml, LOGACCESS_FILTER_audience);
+    else if (streq(type.str(), "class"))
+        return new FieldLogAccessFilter(xml, LOGACCESS_FILTER_class);
+    else if (streq(type.str(), "component"))
+        return new FieldLogAccessFilter(xml, LOGACCESS_FILTER_component);
+    else if (streq(type.str(), "and"))
+        return new BinaryLogAccessFilter(xml, LOGACCESS_FILTER_and);
+    else if (streq(type.str(), "or"))
+        return new BinaryLogAccessFilter(xml, LOGACCESS_FILTER_or);
+    else
+        throwUnexpectedX("getLogAccessFilterFromPTree : unrecognized LogAccessFilter type");
+}
+
+ILogAccessFilter * getWildCardLogAccessFilter(const char * wildcardfilter)
+{
+    return new FieldLogAccessFilter(wildcardfilter, LOGACCESS_FILTER_wildcard);
+}
+
+ILogAccessFilter * getWildCardLogAccessFilter()
+{
+    return new FieldLogAccessFilter("", LOGACCESS_FILTER_wildcard);
+}
+
+ILogAccessFilter * getHostLogAccessFilter(const char * host)
+{
+    return new FieldLogAccessFilter(host, LOGACCESS_FILTER_host);
+}
+
+ILogAccessFilter * getInstanceLogAccessFilter(const char * instancename)
+{
+    return new FieldLogAccessFilter(instancename, LOGACCESS_FILTER_instance);
+}
+
+ILogAccessFilter * getJobIDLogAccessFilter(const char * jobId)
+{
+    return new FieldLogAccessFilter(jobId, LOGACCESS_FILTER_jobid);
+}
+
+ILogAccessFilter * getTraceIDLogAccessFilter(const char * traceId)
+{
+    return new FieldLogAccessFilter(traceId, LOGACCESS_FILTER_trace);
+}
+
+ILogAccessFilter * getSpanIDLogAccessFilter(const char * spanId)
+{
+    return new FieldLogAccessFilter(spanId, LOGACCESS_FILTER_span);
+}
+
+ILogAccessFilter * getColumnLogAccessFilter(const char * columnName, const char * value)
+{
+    return new ColumnLogAccessFilter(columnName, value, LOGACCESS_FILTER_column);
+}
+
+ILogAccessFilter * getComponentLogAccessFilter(const char * component)
+{
+    return new FieldLogAccessFilter(component, LOGACCESS_FILTER_component);
+}
+
+ILogAccessFilter * getPodLogAccessFilter(const char * podName)
+{
+    return new FieldLogAccessFilter(podName, LOGACCESS_FILTER_pod);
+}
+
+ILogAccessFilter * getAudienceLogAccessFilter(MessageAudience audience)
+{
+    return new FieldLogAccessFilter(LogMsgAudienceToFixString(audience), LOGACCESS_FILTER_audience);
+}
+
+ILogAccessFilter * getClassLogAccessFilter(LogMsgClass logclass)
+{
+    return new FieldLogAccessFilter(LogMsgClassToFixString(logclass), LOGACCESS_FILTER_class);
+}
+
+ILogAccessFilter * getBinaryLogAccessFilter(ILogAccessFilter * arg1, ILogAccessFilter * arg2, LogAccessFilterType type)
+{
+    return new BinaryLogAccessFilter(arg1, arg2, type);
+}
+
+ILogAccessFilter * getBinaryLogAccessFilterOwn(ILogAccessFilter * arg1, ILogAccessFilter * arg2, LogAccessFilterType type)
+{
+    ILogAccessFilter * ret = new BinaryLogAccessFilter(arg1, arg2, type);
+    if (arg1)
+        arg1->Release();
+    if (arg2)
+        arg2->Release();
+    return ret;
+}
+
+ILogAccessFilter* getCompoundLogAccessFilter(ILogAccessFilter* arg1, ILogAccessFilter* arg2, LogAccessFilterType type)
+{
+    if (!arg1)
+        return LINK(arg2);
+    if (!arg2)
+        return LINK(arg1);
+    return getBinaryLogAccessFilter(arg1, arg2, type);
+}
+
+
+// LOG ACCESS HELPER METHODS
+
+// Fetches log entries - based on provided filter, via provided IRemoteLogAccess instance
+bool fetchLog(LogQueryResultDetails & resultDetails, StringBuffer & returnbuf, IRemoteLogAccess & logAccess, ILogAccessFilter * filter, LogAccessTimeRange timeRange, const StringArray & cols, LogAccessLogFormat format)
+{
+    LogAccessConditions logFetchOptions;
+    logFetchOptions.setTimeRange(timeRange);
+    logFetchOptions.setFilter(filter);
+    logFetchOptions.copyLogFieldNames(cols); //ensure these fields are declared in m_logMapping->queryProp("WorkUnits/@contentcolumn")? or in LogMap/Fields?"
+    return logAccess.fetchLog(resultDetails, logFetchOptions, returnbuf, format);
+}
+
+// Fetches log entries based on provided JobID, via provided IRemoteLogAccess instance
+bool fetchJobIDLog(LogQueryResultDetails & resultDetails,StringBuffer & returnbuf, IRemoteLogAccess & logAccess, const char *jobid, LogAccessTimeRange timeRange, StringArray & cols, LogAccessLogFormat format = LOGACCESS_LOGFORMAT_json)
+{
+    return fetchLog(resultDetails, returnbuf, logAccess, getJobIDLogAccessFilter(jobid), timeRange, cols, format);
+}
+
+// Fetches log entries based on provided component name, via provided IRemoteLogAccess instance
+bool fetchComponentLog(LogQueryResultDetails & resultDetails, StringBuffer & returnbuf, IRemoteLogAccess & logAccess, const char * component, LogAccessTimeRange timeRange, StringArray & cols, LogAccessLogFormat format = LOGACCESS_LOGFORMAT_json)
+{
+    return fetchLog(resultDetails, returnbuf, logAccess, getComponentLogAccessFilter(component), timeRange, cols, format);
+}
+
+// Fetches log entries based on provided pod name, via provided IRemoteLogAccess instance
+bool fetchPodLog(LogQueryResultDetails & resultDetails, StringBuffer & returnbuf, IRemoteLogAccess & logAccess, const char * podName, LogAccessTimeRange timeRange, StringArray & cols, LogAccessLogFormat format = LOGACCESS_LOGFORMAT_json)
+{
+    return fetchLog(resultDetails, returnbuf, logAccess, getPodLogAccessFilter(podName), timeRange, cols, format);
+}
+
+// Fetches log entries based on provided audience, via provided IRemoteLogAccess instance
+bool fetchLogByAudience(LogQueryResultDetails & resultDetails, StringBuffer & returnbuf, IRemoteLogAccess & logAccess, MessageAudience audience, LogAccessTimeRange timeRange, StringArray & cols, LogAccessLogFormat format = LOGACCESS_LOGFORMAT_json)
+{
+    return fetchLog(resultDetails, returnbuf, logAccess, getAudienceLogAccessFilter(audience), timeRange, cols, format);
+}
+
+// Fetches log entries based on provided log message class, via provided IRemoteLogAccess instance
+bool fetchLogByClass(LogQueryResultDetails & resultDetails, StringBuffer & returnbuf, IRemoteLogAccess & logAccess, LogMsgClass logclass, LogAccessTimeRange timeRange, StringArray & cols, LogAccessLogFormat format = LOGACCESS_LOGFORMAT_json)
+{
+    return fetchLog(resultDetails, returnbuf, logAccess, getClassLogAccessFilter(logclass), timeRange, cols, format);
+}
+
+//logAccessPluginConfig expected to contain connectivity and log mapping information
+typedef IRemoteLogAccess * (*newLogAccessPluginMethod_t_)(IPropertyTree & logAccessPluginConfig);
+
+// Length of the "YYYY-MM-DD HH:MM:SS" timestamp prefix written by jlog
+// when MSGFIELD_date and MSGFIELD_time are enabled.
+static constexpr size_t logTimestampPrefixLength = 19;
+
+bool isLogTimestampPrefix(const char *p)
+{
+    // Separator positions inside "YYYY-MM-DD HH:MM:SS":
+    //   YYYY-MM-DD HH:MM:SS
+    //   0123456789012345678
+    //       ^  ^  ^  ^  ^
+    //       4  7  10 13 16
+    return p && p[4] == '-' && p[7] == '-' && p[10] == ' ' && p[13] == ':' && p[16] == ':';
+}
+
+// Maximum rows requested from the remote log backend in one batch.
+static constexpr unsigned defaultAuditLogPageSize = 2000;
+
+// Upper bound on rows returned by a single queryAuditLogs() call, to guard
+// against unbounded results exhausting memory on very large time ranges.
+static constexpr unsigned maxAuditLogRows = 100000;
+
+// Split a chunk of log rows into individual lines and append each as a
+// separate entry to `out`, appending at most `maxRows` lines.
+static void appendLogsFromChunk(const char *chunk, StringAttrArray &out, unsigned maxRows)
+{
+    const char *base = chunk;
+    unsigned appended = 0;
+    while (!isEmptyString(base) && appended < maxRows)
+    {
+        const char *rowStart = base;
+        const char *rowEnd = rowStart;
+        while (*rowEnd && *rowEnd != '\n' && *rowEnd != '\r')
+            ++rowEnd;
+
+        // Find the jlog timestamp prefix in this row.
+        const char *tsStart = nullptr;
+        for (const char *p = rowStart; (p + logTimestampPrefixLength) <= rowEnd; ++p)
+        {
+            if (isLogTimestampPrefix(p))
+            {
+                tsStart = p;
+                break;
+            }
+        }
+        if (!tsStart)
+        {
+            base = rowEnd;
+            while (*base == '\n' || *base == '\r')
+                ++base;
+            continue;
+        }
+
+        // Payload starts at the first comma after the timestamp.
+        const char *payloadStart = tsStart + logTimestampPrefixLength;
+        while (payloadStart < rowEnd && *payloadStart != ',')
+            ++payloadStart;
+        if (payloadStart >= rowEnd)
+        {
+            base = rowEnd;
+            while (*base == '\n' || *base == '\r')
+                ++base;
+            continue;
+        }
+
+        // Message ends at the closing quote.
+        const char *msgEnd = payloadStart;
+        while (msgEnd < rowEnd && *msgEnd != '"')
+            ++msgEnd;
+
+        // Rebuild as daaudit-style text.
+        StringBuffer line;
+        line.append(logTimestampPrefixLength, tsStart);
+        line.append(' ');
+        line.append(static_cast<size32_t>(msgEnd - payloadStart), payloadStart);
+        out.append(*new StringAttrItem(line.str(), line.length()));
+        ++appended;
+
+        base = rowEnd;
+        while (*base == '\n' || *base == '\r')
+            ++base;
+    }
+}
+
+static unsigned queryAuditLogsRemote(IRemoteLogAccess &logAccess, const CDateTime &from, const CDateTime &to, const char *match, StringAttrArray &out, unsigned max)
+{
+    LogAccessTimeRange timeRange;
+    timeRange.setStart(from);
+    timeRange.setEnd(to);
+
+    Owned<ILogAccessFilter> audience(getAudienceLogAccessFilter(MSGAUD_audit));
+    Owned<ILogAccessFilter> filter;
+    if (isEmptyString(match) || streq(match, "*"))
+    {
+        // No message-level filter requested; let backend return all audit audience rows.
+        filter.set(audience.getClear());
+    }
+    else
+    {
+        Owned<ILogAccessFilter> messageFilter(getWildCardLogAccessFilter(match));
+        filter.setown(getBinaryLogAccessFilterOwn(audience.getClear(), messageFilter.getClear(), LOGACCESS_FILTER_and));
+    }
+
+    LogAccessConditions options;
+    options.setFilter(filter.getClear());
+    options.setTimeRange(timeRange);
+    options.setReturnColsMode(RETURNCOLS_MODE_min);
+    options.setLimit(defaultAuditLogPageSize);
+
+    Owned<IRemoteLogAccessStream> reader = logAccess.getLogReader(options, LOGACCESS_LOGFORMAT_csv);
+    if (!reader)
+        return 0;
+
+    const unsigned baseOrdinality = out.ordinality();
+    StringBuffer chunk;
+    do
+    {
+        unsigned recsRead = 0;
+        bool more = reader->readLogEntries(chunk.clear(), recsRead);
+        if (recsRead > 0)
+            appendLogsFromChunk(chunk.str(), out, max - (out.ordinality() - baseOrdinality));
+        if (!more || (out.ordinality() - baseOrdinality) >= max)
+            break;
+    }
+    while (true);
+    return out.ordinality() - baseOrdinality;
+}
+
+// Containerized implementation: scans audit-audience rows via IRemoteLogAccess.
+static unsigned containerizedQueryAuditLogs(const CDateTime &from, const CDateTime &to, const char *match, StringAttrArray &out, unsigned max)
+{
+    IRemoteLogAccess *logAccessor = queryRemoteLogAccessor();
+    assertex(logAccessor); // Containerized systems require IRemoteLogAccess to be initialized
+    return queryAuditLogsRemote(*logAccessor, from, to, match, out, max);
+}
+
+// Bare-metal registers its Dali-backed implementation via registerQueryAuditLogs();
+// containerized deployments default to the IRemoteLogAccess scan above.
+static queryAuditLogsFn registeredQueryAuditLogs = isContainerized() ? containerizedQueryAuditLogs : nullptr;
+
+void registerQueryAuditLogs(queryAuditLogsFn fn)
+{
+    registeredQueryAuditLogs = fn;
+}
+
+unsigned queryAuditLogs(const CDateTime &from, const CDateTime &to, const char *match, StringAttrArray &out)
+{
+    if (!registeredQueryAuditLogs)
+        throw makeStringException(JLIBERR_AuditLogQueryNotRegistered, "queryAuditLogs: no queryAuditLogs function registered");
+    return registeredQueryAuditLogs(from, to, match, out, maxAuditLogRows);
+}
+
+IRemoteLogAccess *queryRemoteLogAccessor()
+{
+    return logAccessor.query([]
+        {
+            PROGLOG("Loading remote log access plug-in.");
+            IRemoteLogAccess *remoteLogAccessor = nullptr;
+
+            try
+            {
+                constexpr const char * methodName = "queryRemoteLogAccessor";
+                constexpr const char * instFactoryName = "createInstance";
+
+                Owned<IPropertyTree> logAccessPluginConfig = getGlobalConfigSP()->getPropTree("logAccess");
+#ifdef LOGACCESSDEBUG
+                if (!logAccessPluginConfig)
+                {
+                    const char * simulatedGlobalYaml = R"!!(global:
+  logAccess:
+    name: "Grafana/loki stack log access"
+    type: "GrafanaCurl"
+    connection:
+      #workspaceID: "ef060646-ef24-48a5-b88c-b1f3fbe40271"
+      #workspaceID: "XYZ"      #ID of the Azure LogAnalytics workspace to query logs from
+      #tenantID: "ABC"         #The Tenant ID, required for KQL API access
+      #clientID: "DEF"         #ID of Azure Active Directory registered application with api.loganalytics.io access
+      protocol: "http"
+      host: "localhost"
+      port: "3000"
+    datasource:
+      id: "1"
+      name: "Loki"
+    namespace:
+      name: "hpcc"
+                    )!!";
+                    Owned<IPropertyTree> testTree = createPTreeFromYAMLString(simulatedGlobalYaml, ipt_none, ptr_ignoreWhiteSpace, nullptr);
+                    logAccessPluginConfig.setown(testTree->getPropTree("global/logAccess"));
+                }
+#endif
+
+                if (!logAccessPluginConfig)
+                    throw makeStringException(JLIBERR_FeatureConfigNotFound, "RemoteLogAccessLoader: logaccess configuration not available!");
+
+                StringBuffer type;
+                logAccessPluginConfig->getProp("@type", type);
+                if (type.isEmpty())
+                    throw makeStringExceptionV(JLIBERR_PluginKindNotSpecified, "%s: RemoteLogAccess plugin kind not specified.", methodName);
+
+                // Store the actual platform-specific filename for diagnostics
+                VStringBuffer actualLibName("%s%slogaccess%s", SharedObjectPrefix, type.str(), SharedObjectExtension);
+
+                //Load the DLL/SO
+                HINSTANCE logAccessPluginLib = LoadSharedObject(actualLibName.str(), false, true);
+
+                if (!logAccessPluginLib) //should not happen, defensive check.
+                    throw makeStringExceptionV(JLIBERR_UnableToLoadLibrary, "%s: failed to load library '%s' for RemoteLogAccess plugin", methodName, actualLibName.str());
+
+                newLogAccessPluginMethod_t_ xproc = (newLogAccessPluginMethod_t_)GetSharedProcedure(logAccessPluginLib, instFactoryName);
+
+                if (xproc == nullptr)
+                    throw makeStringExceptionV(JLIBERR_FactoryFunctionNotFound, "%s: cannot locate procedure %s in library '%s'", methodName, instFactoryName, actualLibName.str());
+
+                //Call logaccessplugin instance factory and return the new instance
+                DBGLOG("Calling '%s' in log access plugin '%s'", instFactoryName, actualLibName.str());
+                remoteLogAccessor = xproc(*logAccessPluginConfig);
+
+                // Verify the factory returned a valid instance
+                if (!remoteLogAccessor)
+                    throw makeStringExceptionV(JLIBERR_FactoryReturnedNull, "%s: Plugin factory returned null instance for library '%s'", methodName, actualLibName.str());
+
+                return remoteLogAccessor;
+            }
+            catch (IException *e)
+            {
+                EXCLOG(e, "Could not load remote log access plug-in: ");
+                logAccessorError.setown(e);
+            }
+            return remoteLogAccessor;
+        }
+    );
+}
+
+/** Query error that might have occurred while loading the remote log access plugin.
+ *
+ * This function should be called after queryRemoteLogAccessor() has been
+ * invoked, for example if queryRemoteLogAccessor() returns nullptr and the caller
+ * needs to determine the reason plugin loading failed.
+ *
+ * @return A pointer to the IException describing the plugin load failure, or
+ *         nullptr if the remote log accessor plugin loaded successfully and no
+ *         error was recorded. The returned exception is owned by the logging
+ *         subsystem and must not be released or modified by the caller.
+ *
+ * Thread safety: This function is safe to call from multiple threads. If a load
+ * error was recorded, callers may concurrently read the returned exception; the
+ * underlying object is immutable and shared.
+ */
+IException * queryRemoteLogAccessorLoadError()
+{
+    return logAccessorError;
+}
+
+void setDefaultJobName(const char * name)
+{
+    setDefaultJobId(theManager->addJobId(name));
+}
+
+
+JobNameScope::JobNameScope(const char * name)
+{
+    set(name);
+}
+
+void JobNameScope::clear()
+{
+    if (id != UnknownJob)
+    {
+        theManager->removeJobId(id);
+        id = prevId;
+        setDefaultJobId(prevId);
+    }
+}
+
+void JobNameScope::set(const char * name)
+{
+    clear();
+    id = theManager->addJobId(name);
+    prevId = queryThreadedJobId();
+    setDefaultJobId(id);
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+TraceFlags loadTraceFlags(const IPropertyTree *ptree, const std::initializer_list<TraceOption> &optNames, TraceFlags dft)
+{
+    for (const TraceOption& option: optNames)
+    {
+        VStringBuffer attrName("@%s", option.name);
+        const char* value = ptree->queryProp(attrName);
+        if (!value)
+        {
+            attrName.setCharAt(0, '_');
+            value = ptree->queryProp(attrName);
+            if (!value)
+                continue;
+        }
+        if (strieq(value, "default")) // allow a configuration to explicitly request a default value
+            continue;
+        if (option.value == traceDetail) // non-Boolean traceDetail
+        {
+            dft &= ~TraceFlags::LevelMask;
+            if (strieq(value, "standard"))
+                dft |= traceStandard;
+            else if (strieq(value, "detailed"))
+                dft |= traceDetailed;
+            else if (strieq(value, "max"))
+                dft |= traceMax;
+            else
+            {
+                char* endptr = nullptr;
+                unsigned tmp = strtoul(value, &endptr, 10);
+                if (endptr && !*endptr && TraceFlags(tmp) <= TraceFlags::LevelMask)
+                    dft |= TraceFlags(tmp);
+            }
+        }
+        else if (option.value <= TraceFlags::LevelMask)
+        {
+            if (strToBool(value))
+                dft = (dft & ~TraceFlags::LevelMask) | option.value;
+        }
+        else // Boolean trace options
+        {
+            bool flag = strToBool(value);
+            if (flag)
+                dft |= option.value;
+            else
+                dft &= ~option.value;
+        }
+    }
+    return dft;
+}
+
+void ctxlogReport(const LogMsgCategory & cat, const char * format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    ctxlogReportVA(cat, NoLogMsgCode, format, args);
+    va_end(args);
+}
+
+void ctxlogReportVA(const LogMsgCategory & cat, const char * format, va_list args)
+{
+    ctxlogReportVA(cat, NoLogMsgCode, format, args);
+}
+void ctxlogReport(const LogMsgCategory & cat, LogMsgCode code, const char * format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    ctxlogReportVA(cat, code, format, args);
+    va_end(args);
+}
+void ctxlogReportVA(const LogMsgCategory & cat, LogMsgCode code, const char * format, va_list args)
+{
+    if (queryThreadedContextLogger())
+    {
+        LogContextScope ls(nullptr);
+        ls.prev->CTXLOGva(cat, code, format, args);
+    }
+    else
+        queryLogMsgManager()->report_va(cat, code, format, args);
+}
+void ctxlogReport(const LogMsgCategory & cat, const IException * e, const char * prefix)
+{
+    StringBuffer buff;
+    e->errorMessage(buff);
+    ctxlogReport(cat, e->errorCode(), "%s%s%s", prefix ? prefix : "", prefix ? " : " : "", buff.str());
+}
+IException * ctxlogReport(IException * e, const char * prefix, LogMsgClass cls)
+{
+    ctxlogReport(MCexception(e, cls), e, prefix);
+    return e;
+}
+
+LogAccessLogFormat logAccessFormatFromName(const char * name)
+{
+    if (isEmptyString(name))
+        throw makeStringException(JLIBERR_UtilEncounteredEmptyLogAccessFormatName, "Encountered empty Log Access Format name");
+
+    if(strieq(name, "xml"))
+        return LOGACCESS_LOGFORMAT_xml;
+    else if(strieq(name, "json"))
+        return LOGACCESS_LOGFORMAT_json;
+    else if(strieq(name, "csv"))
+        return LOGACCESS_LOGFORMAT_csv;
+    else
+        throw makeStringExceptionV(JLIBERR_UtilEncounteredUnknownLogAccessFormatNameS, "Encountered unknown Log Access Format name: '%s'", name);
 }

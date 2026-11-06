@@ -25,6 +25,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
+#include <utility>
 
 #ifndef WIN32
 #include <sys/mman.h>
@@ -36,6 +37,7 @@
 #include "jexcept.hpp"
 #include "jmisc.hpp"
 #include "jutil.hpp"
+#include "jerror.hpp"
 
 #ifdef _DEBUG
 #define KILL_CLEARS_MEMORY  
@@ -51,21 +53,19 @@
 
 
 #if 1
-#define ChunkSize         0x10000
-#define DOUBLE_LIMIT      0x7fffffff    // avoid doubling hitting 0 and infinite loop
+constexpr unsigned ChunkSize=0x10000;
+constexpr unsigned BUFF_DOUBLE_LIMIT=0x7fffffff;    // avoid doubling hitting 0 and infinite loop
 #else
-#define ChunkSize         2048
-#define DOUBLE_LIMIT      4096
+// For testing
+constexpr unsigned ChunkSize=2048;
+constexpr unsigned BUFF_DOUBLE_LIMIT=4096;
 #endif
-#define FIRST_CHUNK_SIZE  8
-#define DETACH_GRANULARITY 16
+constexpr unsigned BUFF_FIRST_CHUNK_SIZE=8;
+constexpr unsigned BUFF_DETACH_GRANULARITY=16;
 
-
-#ifdef _DEBUG
+//Always check the length before reading - so ensure that serialization problems are caught
+//The overhead is trivial....
 #define     CHECKREADPOS(len)  assertex(readPos+(len)<=length())
-#else
-#define     CHECKREADPOS(len)  
-#endif
 
 //-----------------------------------------------------------------------
 
@@ -188,6 +188,11 @@ void MemoryAttr::setOwn(size_t _len, void * _ptr)
     ptr = _ptr;
 }
 
+void MemoryAttr::swapWith(MemoryAttr & other)
+{
+    std::swap(len, other.len);
+    std::swap(ptr, other.ptr);
+}
 
 void MemoryAttr::clear()
 {
@@ -255,10 +260,10 @@ void MemoryBuffer::_realloc(size32_t newLen)
         assertex(ownBuffer);
         size32_t newMax = maxLen;
         //double up to a certain size, otherwise go up in chunks.
-        if (newLen < DOUBLE_LIMIT)
+        if (newLen < BUFF_DOUBLE_LIMIT)
         {
             if (newMax == 0)
-                newMax = FIRST_CHUNK_SIZE;
+                newMax = BUFF_FIRST_CHUNK_SIZE;
             while (newLen > newMax)
             {
                 size32_t newMaxTmp = checkMemoryBufferOverflow(newMax, newMax);
@@ -319,6 +324,17 @@ void * MemoryBuffer::ensureCapacity(unsigned max)
     return buffer + curLen;
 }
 
+void * MemoryBuffer::ensureCapacity(size_t max, size_t & got)
+{
+    if (maxLen - curLen < max)
+    {
+        unsigned newLen = checkMemoryBufferOverflow(curLen, max);
+        _realloc(newLen);
+    }
+    got = maxLen - curLen;
+    return buffer + curLen;
+}
+
 void MemoryBuffer::kill()
 {
     if (ownBuffer)
@@ -336,6 +352,15 @@ MemoryBuffer & MemoryBuffer::_remove(unsigned start, unsigned len)
     return *this;
 }
 
+void MemoryBuffer::replace(size_t offset, size_t len, const void * value)
+{
+    if ((offset >= curLen) || (len == 0))
+        return;
+    if (offset + len > curLen)
+        len = curLen - offset;
+    memcpy(buffer + offset, value, len);
+}
+
 void * MemoryBuffer::reserve(unsigned size)
 {
     unsigned newLen = checkMemoryBufferOverflow(curLen, size);
@@ -350,8 +375,11 @@ void * MemoryBuffer::reserveTruncate(unsigned size)
     unsigned newLen = checkMemoryBufferOverflow(curLen, size);
     curLen += size;
     _reallocExact(newLen);
-    truncate();
-    return buffer + curLen - size;
+    truncate(); // can set buffer to null.
+    if (buffer)
+        return buffer + curLen - size;
+    else
+        return nullptr;
 }
 
 void MemoryBuffer::truncate()
@@ -407,7 +435,7 @@ void *MemoryBuffer::detach()
 {
     void *ret;
     if (ownBuffer) { 
-        if (maxLen>curLen+DETACH_GRANULARITY)
+        if (maxLen>curLen+BUFF_DETACH_GRANULARITY)
             buffer = (char *)realloc(buffer,curLen);
         ret = buffer;
     }
@@ -450,16 +478,18 @@ void MemoryBuffer::setWritePos(unsigned len)
     curLen = len;
 }
 
-#define SWAP(x, y, t)  { t t_##x = x; x = y; y = t_##x; }
+#define SWAPMEM(x, y, t)  { t t_##x = x; x = y; y = t_##x; }
 void MemoryBuffer::swapWith(MemoryBuffer & other)
 {
     //swap two string buffers.  Used for efficiently moving a string on in a pipeline etc.
-    SWAP(buffer, other.buffer, char *);
-    SWAP(curLen, other.curLen, size32_t);
-    SWAP(maxLen, other.maxLen, size32_t);
-    SWAP(readPos, other.readPos, size32_t);
-    SWAP(swapEndian, other.swapEndian, bool);
+    SWAPMEM(buffer, other.buffer, char *);
+    SWAPMEM(curLen, other.curLen, size32_t);
+    SWAPMEM(maxLen, other.maxLen, size32_t);
+    SWAPMEM(readPos, other.readPos, size32_t);
+    SWAPMEM(swapEndian, other.swapEndian, bool);
+    SWAPMEM(ownBuffer, other.ownBuffer, bool);
 }
+#undef SWAPMEM
 
 bool MemoryBuffer::matches(const MemoryBuffer & other) const
 {
@@ -474,13 +504,11 @@ bool MemoryBuffer::matches(const MemoryBuffer & other) const
 MemoryBuffer::MemoryBuffer(size_t initial)
 {
     assertex((size32_t)initial == initial);
-    init();
     _realloc((size32_t)initial);
 }
 
 MemoryBuffer::MemoryBuffer(size_t len, const void * newBuffer)
 {
-    init();
     assertex((size32_t)len == len);
     append((size32_t)len, newBuffer);
 }
@@ -519,6 +547,15 @@ MemoryBuffer & MemoryBuffer::append(const char * value)
         return append((size32_t)strlen(value)+1,value);
     else
         return append((char)0);
+}
+
+MemoryBuffer & MemoryBuffer::appendCStr(const char * value)
+{
+    dbgassertex(value);
+    if (value)
+        return append(strlen(value)+1, value);
+    else
+        return append('\0');
 }
 
 MemoryBuffer & MemoryBuffer::append(const unsigned char * value)
@@ -662,7 +699,7 @@ MemoryBuffer &MemoryBuffer::appendFile(const char *fileName)
     int h = _open(fileName, _O_BINARY | _O_RDONLY | _O_SEQUENTIAL);
     
     if (h == HFILE_ERROR)
-        throw MakeStringException(0, "MemoryBuffer: Error reading file : %s", fileName);
+        throw MakeStringException(JLIBERR_BufferErrorReadingFile, "MemoryBuffer: Error reading file : %s", fileName);
     
     append(fileName);
     
@@ -679,6 +716,15 @@ MemoryBuffer &MemoryBuffer::appendFile(const char *fileName)
     _close(h);
     return *this;
 }
+
+#define DO_READ_ENDIAN(len, value)  \
+    CHECKREADPOS(len); \
+    if (swapEndian) \
+        doCopyRev<len>(value, buffer + readPos); \
+    else \
+        memcpy_iflen(value, buffer + readPos, len); \
+    readPos += len; \
+    return *this;
 
 MemoryBuffer & MemoryBuffer::read(char & value)
 {
@@ -702,21 +748,41 @@ MemoryBuffer & MemoryBuffer::read(bool & value)
     return *this;
 }
 
+inline size32_t getStringLength(const char * buffer, size32_t readPos, size32_t length)
+{
+    for (size32_t i = readPos; i < length; i++)
+    {
+        if (buffer[i] == 0)
+            return i - readPos;
+    }
+    throwUnexpectedX("Null terminator not found within buffer");
+}
+
 MemoryBuffer & MemoryBuffer::read(StringAttr & value)
 {
-    char * src = buffer + readPos;
-    size32_t len = (size32_t)strlen(src);
-    CHECKREADPOS(len+1);
+    size32_t len = getStringLength(buffer, readPos, length());
+    const char * src = buffer + readPos;
     value.set(src, len);
+    readPos += (len+1);
+    return *this;
+}
+
+MemoryBuffer & MemoryBuffer::readOpt(StringAttr & value)
+{
+    size32_t len = getStringLength(buffer, readPos, length());
+    const char * src = buffer + readPos;
+    if (len)
+        value.set(src, len);
+    else
+        value.clear();
     readPos += (len+1);
     return *this;
 }
 
 MemoryBuffer & MemoryBuffer::read(StringBuffer & value)
 {
-    char * src = buffer + readPos;
-    size32_t len = (size32_t)strlen(src);
-    CHECKREADPOS(len+1);
+    size32_t len = getStringLength(buffer, readPos, length());
+    const char * src = buffer + readPos;
     value.append(len, src);
     readPos += (len+1);
     return *this;
@@ -724,9 +790,9 @@ MemoryBuffer & MemoryBuffer::read(StringBuffer & value)
 
 MemoryBuffer & MemoryBuffer::read(const char * &value)
 {
-    value = buffer+readPos;
-    size32_t len = (size32_t)strlen(value);
-    CHECKREADPOS(len+1);
+    size32_t len = getStringLength(buffer, readPos, length());
+    const char * src = buffer + readPos;
+    value = src;
     readPos += (len+1);
     return *this;
 }
@@ -754,44 +820,32 @@ MemoryBuffer & MemoryBuffer::read(float & value)
 
 MemoryBuffer & MemoryBuffer::read(short & value)
 {
-    return readEndian(sizeof(value), &value);
+    DO_READ_ENDIAN(sizeof(value), &value);
 }
 
 MemoryBuffer & MemoryBuffer::read(unsigned short & value)
 {
-    return readEndian(sizeof(value), &value);
+    DO_READ_ENDIAN(sizeof(value), &value);
 }
 
 MemoryBuffer & MemoryBuffer::read(int & value)
 {
-    return readEndian(sizeof(value), &value);
+    DO_READ_ENDIAN(sizeof(value), &value);
 }
 
 MemoryBuffer & MemoryBuffer::read(unsigned & value)
 {
-    return readEndian(sizeof(value), &value);
+    DO_READ_ENDIAN(sizeof(value), &value);
 }
-
-#if 0
-MemoryBuffer & MemoryBuffer::read(unsigned long & value)
-{
-    return readEndian(sizeof(value), &value);
-}
-
-MemoryBuffer & MemoryBuffer::read(long & value)
-{
-    return readEndian(sizeof(value), &value);
-}
-#endif
 
 MemoryBuffer & MemoryBuffer::read(unsigned __int64 & value)
 {
-    return readEndian(sizeof(value), &value);
+    DO_READ_ENDIAN(sizeof(value), &value);
 }
 
 MemoryBuffer & MemoryBuffer::read(__int64 & value)
 {
-    return readEndian(sizeof(value), &value);
+    DO_READ_ENDIAN(sizeof(value), &value);
 }
 
 const byte * MemoryBuffer::readDirect(size32_t len)
@@ -854,7 +908,6 @@ void MemoryBuffer::writeEndianDirect(size32_t pos,size32_t len,const void *buf)
         memcpy_iflen(buffer+pos,buf,len);
 }
 
-
 MemoryBuffer & MemoryBuffer::readEndian(size32_t len, void * value)
 {
     CHECKREADPOS(len);
@@ -883,7 +936,7 @@ MemoryBuffer &MemoryBuffer::readFile(StringAttr &fileName)
     
     int h = _open(fileName.get(), _O_WRONLY|_O_CREAT|_O_TRUNC|_O_BINARY|_O_SEQUENTIAL, _S_IREAD | _S_IWRITE);
     if (h == HFILE_ERROR)
-        throw MakeStringException(0, "MemoryBuffer: Unable to create file : %s, error=%d", fileName.get(), GetLastError());
+        throw MakeStringException(JLIBERR_BufferUnableToCreateFile, "MemoryBuffer: Unable to create file : %s, error=%d", fileName.get(), GetLastError());
     
     CHECKREADPOS(fileSize);
     int w;
@@ -891,12 +944,12 @@ MemoryBuffer &MemoryBuffer::readFile(StringAttr &fileName)
         w = _write(h, buffer+readPos, fileSize);
         if (w == 0) {
             _close(h);
-            throw MakeStringException(0, "MemoryBuffer: Disk full writing %d to file : %s", fileSize, fileName.get());
+            throw MakeStringException(JLIBERR_BufferDiskFull, "MemoryBuffer: Disk full writing %d to file : %s", fileSize, fileName.get());
         }
         if (w == -1)
         {
             _close(h);
-            throw MakeStringException(0, "MemoryBuffer: Error writing to file : %s, error=%d", fileName.get(), GetLastError());
+            throw MakeStringException(JLIBERR_BufferErrorWritingFile, "MemoryBuffer: Error writing to file : %s, error=%d", fileName.get(), GetLastError());
         }
         readPos += (size32_t)w;
         fileSize -= (size32_t)w;
@@ -1012,7 +1065,7 @@ const char * MemoryAttr2IStringVal::str() const
 
 static memsize_t LMsemlimit=0;
 static memsize_t LMtotal=0;
-static CriticalSection LMsemsect;
+static CriticalSection LMsemsect(SYNC_LOCATION);
 static Owned<ILargeMemLimitNotify> LMnotify;
 static bool LMlocked = false;
 
@@ -1250,7 +1303,7 @@ MemoryBuffer &CLargeMemoryAllocator::serialize(MemoryBuffer &mb)
     memsize_t al = allocated();
     size32_t sz = (size32_t)al;
     if (sz!=al)
-        throw MakeStringException(-1,"CLargeMemoryAllocator::serialize overflow");
+        throw MakeStringException(JLIBERR_UtilClargememoryallocatorSerializeOverflow,"CLargeMemoryAllocator::serialize overflow");
     byte *d = (byte *)mb.reserveTruncate(sz)+sz;
     Chunk *p = &chunk;
     while (sz&&p) {

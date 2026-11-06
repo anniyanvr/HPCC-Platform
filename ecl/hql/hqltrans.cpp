@@ -166,18 +166,18 @@ void HqlTransformStats::add(const HqlTransformStats & other)
 void HqlTransformStats::gatherTransformStats(IStatisticTarget & target, const char * scope) const
 {
 #ifdef TRANSFORM_STATS_TIME
-    target.addStatistic(SSTcompilestage, scope, StTimeTotalExecute, nullptr, cycle_to_nanosec(totalTime), 1, 0, StatsMergeSum);
-    target.addStatistic(SSTcompilestage, scope, StTimeLocalExecute, nullptr, cycle_to_nanosec(totalTime-(childTime-recursiveTime)), 1, 0, StatsMergeSum);
+    target.addStatistic(SSToperation, scope, StTimeTotalExecute, nullptr, cycle_to_nanosec(totalTime), 1, 0, StatsMergeSum);
+    target.addStatistic(SSToperation, scope, StTimeLocalExecute, nullptr, cycle_to_nanosec(totalTime-(childTime-recursiveTime)), 1, 0, StatsMergeSum);
 #endif
 #ifdef TRANSFORM_STATS_DETAILS
     if (numAnalyseCalls)
-        target.addStatistic(SSTcompilestage, scope, StNumAnalyseExprs, nullptr, numAnalyseCalls, 1, 0, StatsMergeSum);
+        target.addStatistic(SSToperation, scope, StNumAnalyseExprs, nullptr, numAnalyseCalls, 1, 0, StatsMergeSum);
     if (numAnalyse)
-        target.addStatistic(SSTcompilestage, scope, StNumUniqueAnalyseExprs, nullptr, numAnalyse, 1, 0, StatsMergeSum);
+        target.addStatistic(SSToperation, scope, StNumUniqueAnalyseExprs, nullptr, numAnalyse, 1, 0, StatsMergeSum);
     if (numTransformCalls)
-        target.addStatistic(SSTcompilestage, scope, StNumTransformExprs, nullptr, numTransformCalls, 1, 0, StatsMergeSum);
+        target.addStatistic(SSToperation, scope, StNumTransformExprs, nullptr, numTransformCalls, 1, 0, StatsMergeSum);
     if (numTransforms)
-        target.addStatistic(SSTcompilestage, scope, StNumUniqueTransformExprs, nullptr, numTransforms, 1, 0, StatsMergeSum);
+        target.addStatistic(SSToperation, scope, StNumUniqueTransformExprs, nullptr, numTransforms, 1, 0, StatsMergeSum);
 #endif
 }
 
@@ -247,8 +247,8 @@ void HqlTransformerInfo::gatherTransformStats(IStatisticTarget & target) const
     if (numInstances)
     {
         StringBuffer scope;
-        scope.append("compile:transform:").append(name);
-        target.addStatistic(SSTcompilestage, scope, StNumStarts, nullptr, numInstances, 1, 0, StatsMergeSum);
+        scope.append(">compile:>transform:>").append(name);
+        target.addStatistic(SSToperation, scope, StNumStarts, nullptr, numInstances, 1, 0, StatsMergeSum);
         stats.gatherTransformStats(target, scope);
     }
 #endif
@@ -477,7 +477,7 @@ bool HqlTransformerBase::optimizedTransformChildren(IHqlExpression * expr, HqlEx
         if (idx == max)
             return true;
 
-        children.ensure(max);
+        children.ensureCapacity(max);
         for (unsigned i=numDone; i < idx; i++)
             children.append(*LINK(expr->queryChild(i)));
         children.append(*lastTransformedChild.getClear());
@@ -485,7 +485,7 @@ bool HqlTransformerBase::optimizedTransformChildren(IHqlExpression * expr, HqlEx
     }
     else
     {
-        children.ensure(max);
+        children.ensureCapacity(max);
         idx = numDone;
     }
 
@@ -530,7 +530,7 @@ bool HqlTransformerBase::transformChildren(IHqlExpression * expr, HqlExprArray &
         if (&children.item(idx) != expr->queryChild(idx))
             same = false;
 
-    children.ensure(max);
+    children.ensureCapacity(max);
     for (idx=numDone;idx<max;idx++)
     {
         IHqlExpression * child = expr->queryChild(idx);
@@ -578,15 +578,6 @@ bool HqlTransformerBase::transformScope(HqlExprArray & newSymbols, IHqlScope * s
         newSymbols.append(*transformed.getClear());
     }
 
-    return same;
-}
-
-
-bool HqlTransformerBase::transformScope(IHqlScope * newScope, IHqlScope * oldScope)
-{
-    HqlExprArray newSymbols;
-    bool same = transformScope(newSymbols, oldScope);
-    insertScopeSymbols(newScope, newSymbols);
     return same;
 }
 
@@ -934,7 +925,7 @@ IHqlExpression * QuickHqlTransformer::createTransformedBody(IHqlExpression * exp
             if (type != newType)
             {
                 transformChildren(expr, children);
-                return createValue(op, newType.getClear(), children);
+                return createWrapper(op, newType, children);
             }
             break;
         }
@@ -1011,7 +1002,11 @@ IHqlExpression * QuickHqlTransformer::createTransformedBody(IHqlExpression * exp
                 HqlDummyLookupContext dummyctx(errors);
                 IHqlScope * newScope = newModule->queryScope();
                 if (newScope)
-                    return newScope->lookupSymbol(selectedName, makeLookupFlags(true, expr->hasAttribute(ignoreBaseAtom), false), dummyctx);
+                {
+                    OwnedHqlExpr match = newScope->lookupSymbol(selectedName, makeLookupFlags(true, expr->hasAttribute(ignoreBaseAtom), false), dummyctx);
+                    //This will return a named symbol and be wrapped in a named symbol.  Return body to avoid duplication.
+                    return LINK(match->queryBody(true));
+                }
             }
             break;
         }
@@ -1023,6 +1018,7 @@ IHqlExpression * QuickHqlTransformer::createTransformedBody(IHqlExpression * exp
             if (newDs == ds)
                 return LINK(expr);
 
+            children.ensureCapacity(expr->numChildren());
             children.append(*LINK(newDs));
             if (ds->queryRecord() == newDs->queryRecord())
                 children.append(*LINK(field));
@@ -1145,13 +1141,49 @@ void DebugDifferenceAnalyser::doAnalyse(IHqlExpression * expr)
     {
         if (prev && prev->queryBody() != expr->queryBody())
         {
-            debugFindFirstDifference(expr, prev);
+            traceFindFirstDifference(expr, prev);
             return;
         }
         else
             prev = expr;
     }
     QuickHqlTransformer::doAnalyse(expr);
+}
+
+
+//-------------------------------------------------------------------------------------------------
+
+static HqlTransformerInfo matchExprTracerInfo("MatchExprTracer");
+MatchExprTracer::MatchExprTracer(callback _matches) : QuickHqlTransformer(matchExprTracerInfo, NULL), matches(_matches)
+{
+}
+
+void MatchExprTracer::reportMatches(const char * title)
+{
+    if (matchedExprs.ordinality() < 2)
+        return;
+
+    DBGLOG("Matches for %s", title);
+//    EclIR::dbglogIR(matchedExprs);
+
+    for (unsigned i= 1; i < matchedExprs.ordinality(); i++)
+        traceFindFirstDifference(&matchedExprs.item(i-1), &matchedExprs.item(i));
+}
+
+
+void MatchExprTracer::doAnalyse(IHqlExpression * expr)
+{
+    if (matches(expr))
+        matchedExprs.append(*LINK(expr));
+    QuickHqlTransformer::doAnalyse(expr);
+}
+
+
+void traceMatchExpr(const char * title, const HqlExprArray & exprs, std::function<bool(IHqlExpression *)> matches)
+{
+    MatchExprTracer tracer(matches);
+    tracer.analyseArray(exprs);
+    tracer.reportMatches(title);
 }
 
 
@@ -1399,7 +1431,7 @@ IHqlExpression * NewHqlTransformer::quickTransformTransform(IHqlExpression * exp
     bool same = true;
     unsigned max = expr->numChildren();
     HqlExprArray children;
-    children.ensure(max);
+    children.ensureCapacity(max);
     for (unsigned i=0; i < max; i++)
     {
         IHqlExpression * cur = expr->queryChild(i);
@@ -1695,7 +1727,7 @@ IHqlExpression * NewHqlTransformer::getTransformedChildren(IHqlExpression * expr
     unsigned max = expr->numChildren();
     unsigned idx;
     bool same = true;
-    children.ensure(max);
+    children.ensureCapacity(max);
     for (idx=0;idx<max;idx++)
     {
         IHqlExpression * child = expr->queryChild(idx);
@@ -1797,6 +1829,7 @@ void NewHqlTransformer::transformRoot(HqlExprArray & exprs)
 {
     HqlExprArray temp;
     transformRoot(exprs, temp);
+    sanityCheckTransformation(info.name, exprs, temp);
     exprs.swapWith(temp);
 }
 
@@ -2654,6 +2687,7 @@ bool onlyTransformOnce(IHqlExpression * expr)
     case no_csv:
     case no_xml:
     case no_json:
+    case no_filetype:
     case no_list:
         return (expr->numChildren() == 0);
     case no_select:
@@ -3365,7 +3399,7 @@ void NewSelectorReplacingTransformer::setRootMapping(IHqlExpression * oldSel, IH
         setMappingOnly(oldSel, newSel);
 
     IHqlExpression * newRecord = newSel->queryRecord();
-    if (oldRecord != newRecord)
+    if (newRecord && (oldRecord != newRecord))
     {
         if (oldRecord != queryNullRecord() && newRecord != queryNullRecord())
         {
@@ -3449,7 +3483,7 @@ IHqlExpression * updateChildSelectors(IHqlExpression * expr, IHqlExpression * ol
     unsigned max = expr->numChildren();
     unsigned i;
     HqlExprArray args;
-    args.ensure(max);
+    args.ensureCapacity(max);
     for (i = 0; i < firstChild; i++)
         args.append(*LINK(expr->queryChild(i)));
 
@@ -3478,7 +3512,7 @@ IHqlExpression * updateMappedFields(IHqlExpression * expr, IHqlExpression * oldS
     unsigned max = expr->numChildren();
     unsigned i;
     HqlExprArray args;
-    args.ensure(max);
+    args.ensureCapacity(max);
     for (i = 0; i < firstChild; i++)
         args.append(*LINK(expr->queryChild(i)));
 
@@ -3508,7 +3542,7 @@ IHqlExpression * updateActiveSelectorFields(IHqlExpression * expr, IHqlExpressio
     unsigned max = expr->numChildren();
     unsigned i;
     HqlExprArray args;
-    args.ensure(max);
+    args.ensureCapacity(max);
     for (i = 0; i < firstChild; i++)
         args.append(*LINK(expr->queryChild(i)));
 
@@ -3964,7 +3998,7 @@ IHqlExpression * ScopedTransformer::createTransformed(IHqlExpression * expr)
 
     node_operator op = expr->getOperator();
     unsigned numChildren = expr->numChildren();
-    children.ensure(numChildren);
+    children.ensureCapacity(numChildren);
 
     unsigned idx;
     switch (op)
@@ -4577,6 +4611,7 @@ void ScopedTransformer::suspendAllScopes(ScopeSuspendInfo & info)
 
 void ScopedTransformer::suspendScope()
 {
+    assertHasScope();
     assertex(innerScope->isEmpty());
     savedStack.append(*LINK(innerScope));
     popScope();
@@ -5091,6 +5126,75 @@ unsigned getExpressionCount(IHqlExpression * expr, bool onlyActivities, bool pro
     analyser.analyse(expr);
     return analyser.getNumExprs();
 }
+
+//------------------------------------------------------------------------------------------------
+
+class StringPackingTransformer
+{
+public:
+    StringPackingTransformer(unsigned _minFieldLength) : minFieldLength(_minFieldLength)
+    {
+    }
+
+    IHqlExpression * transformField(IHqlExpression * expr)
+    {
+        //Do not pack blob strings inside indexes because there is hook to translate them...
+        if ((expr->getOperator() == no_field) && !expr->hasAttribute(blobAtom))
+        {
+            ITypeInfo * type = expr->queryType();
+            if (canOverrideStringLength(type) && !isUnknownLength(type->getSize()))
+            {
+                unsigned length = type->getSize();
+                //Only convert fields to variable length if they are longer than the minimum length
+                if (length >= minFieldLength)
+                {
+                    __int64 unknownLengthBytes = 0;
+                    if (length <= 0xFF)
+                        unknownLengthBytes = 1;
+                    else if (length <= 0xFFFF)
+                        unknownLengthBytes = 2;
+
+                    HqlExprArray args;
+                    unwindChildren(args, expr);
+                    OwnedITypeInfo newType = getStretchedType(UNKNOWN_LENGTH, type);
+                    if (unknownLengthBytes)
+                        args.append(*createExprAttribute(lengthSizeAtom, createConstant(unknownLengthBytes)));
+                    return createField(expr->queryId(), newType.getClear(), args);
+                }
+            }
+        }
+
+        return LINK(expr);
+    }
+
+protected:
+    unsigned minFieldLength;
+};
+
+IHqlExpression * createPackedStringRecord(IHqlExpression * record, unsigned firstPayloadIndex, unsigned minFieldLength)
+{
+    StringPackingTransformer transformer(minFieldLength);
+    HqlExprArray fields;
+    bool same = true;
+    ForEachChild(idx, record)
+    {
+        IHqlExpression * cur = record->queryChild(idx);
+        OwnedHqlExpr mapped;
+        if (idx >= firstPayloadIndex)
+            mapped.setown(transformer.transformField(cur));
+        else
+            mapped.set(cur);
+
+        if (mapped != cur)
+            same = false;
+        fields.append(*mapped.getClear());
+    }
+
+    if (same)
+        return LINK(record);
+    return record->clone(fields);
+}
+
 
 //------------------------------------------------------------------------------------------------
 

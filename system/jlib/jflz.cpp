@@ -16,6 +16,7 @@
 ############################################################################## */
 
 
+//LNRSPII:LINES_25:NON_IDENTIFYING:EMAIL,PERSON:hallidgx_risk
 /*  
   FastLZ - lightning-fast lossless compression library
 
@@ -50,6 +51,8 @@
 #include "jfcmp.hpp"
 #include "jflz.hpp"
 #include "jcrc.hpp"
+#include "jevent.hpp"
+#include "jerror.hpp"
 
 /*
  * Always check for bound when decompressing.
@@ -598,7 +601,7 @@ static FASTLZ_INLINE size32_t FASTLZ_DECOMPRESSOR(const void* input, size32_t le
     size32_t trailsize; bytes traildata;    // unexpanded
 */
 
-class jlib_decl CFastLZCompressor : public CFcmpCompressor
+class CFastLZCompressor final : public CFcmpCompressor
 {
     HTAB_T ht;
 
@@ -614,14 +617,31 @@ class jlib_decl CFastLZCompressor : public CFcmpCompressor
         }
     }
 
+    virtual bool adjustLimit(size32_t newLimit) override
+    {
+        assertex(!outBufMb);       // Only supported when a fixed size buffer is provided
+        assertex(newLimit <= originalMax);
+
+        //Reject the limit change if it is too small for the data already committed.
+        if (newLimit < inlen + outlen + sizeof(size32_t))
+            return false;
+
+        blksz = newLimit;
+        setinmax();
+        return true;
+    }
+
     virtual void flushcommitted()
     {
         // only does non trailing
         if (trailing)
             return;
-        size32_t toflush = (inlenblk==COMMITTED)?inlen:inlenblk;
+
+        size32_t toflush = inlen;
         if (toflush == 0)
             return;
+
+        ProTraceTaskScopeTracker scope(EventTask::Compressing, toflush);
         size32_t outSzRequired = outlen+sizeof(size32_t)*2+toflush+fastlzSlack(toflush);
         if (!dynamicOutSz)
             assertex(outSzRequired<=blksz);
@@ -641,29 +661,38 @@ class jlib_decl CFastLZCompressor : public CFcmpCompressor
         {
             *(size32_t *)outbuf += toflush;
             outlen += *cmpsize+sizeof(size32_t);
-            if (inlenblk==COMMITTED)
-                inlen = 0;
-            else
-            {
-                inlen -= inlenblk;
-                memmove(inbuf,inbuf+toflush,inlen);
-            }
+            inlen = 0;
             setinmax();
             return;
         }
         trailing = true;
     }
 
+    size32_t buflen() override
+    {
+        if (inbuf)
+        {
+            //calling flushcommitted() would mean everything is serialized as trailing
+            size32_t toflush = inlen;
+            return outlen+sizeof(size32_t)*2+toflush+fastlzSlack(toflush);
+        }
+        return outlen;
+    }
+
+    virtual CompressionMethod getCompressionMethod() const override { return COMPRESS_METHOD_FASTLZ; }
 };
 
 
 class jlib_decl CFastLZExpander : public CFcmpExpander
 {
 public:
-    virtual void expand(void *buf)
+    virtual void expand(void *buf) override
     {
         if (!outlen)
             return;
+
+        //The compressed size is only known once all the chunks have been walked
+        ProTraceTaskScopeDelayedTracker scope(EventTask::Decompressing);
         if (buf) {
             if (bufalloc)
                 free(outbuf);
@@ -679,29 +708,35 @@ public:
                 throw MakeStringException(MSGAUD_operator,0, "Out of memory in FastLZExpander::expand, requesting %d bytes", bufalloc);
         }
         size32_t done = 0;
+        size32_t srcSize = 0;
         for (;;) {
             const size32_t szchunk = *in;
             in++;
+            srcSize += sizeof(size32_t) + szchunk;
             if (szchunk+done<outlen) {
                 size32_t written = fastlz_decompress(in,szchunk,(byte *)buf+done,outlen-done);
                 done += written;
                 if (!written||(done>outlen))
-                    throw MakeStringException(0, "FastLZExpander - corrupt data(1) %d %d",written,szchunk);
+                    throw MakeStringException(JLIBERR_CompressFastlzexpanderCorruptData1DD, "FastLZExpander - corrupt data(1) %d %d",written,szchunk);
             }
             else {
                 if (szchunk+done!=outlen)
-                    throw MakeStringException(0, "FastLZExpander - corrupt data(2) %d %d",szchunk,outlen);
+                    throw MakeStringException(JLIBERR_CompressFastlzexpanderCorruptData2DD, "FastLZExpander - corrupt data(2) %d %d",szchunk,outlen);
                 memcpy((byte *)buf+done,in,szchunk);
                 break;
             }
             in = (const size32_t *)(((const byte *)in)+szchunk);
         }
+
+        scope.noteComplete(((__uint64)srcSize << 32) | outlen);
     }
 
 };
 
 void fastLZCompressToBuffer(MemoryBuffer & out, size32_t len, const void * src)
 {
+    ProTraceTaskScopeTracker scope(EventTask::Compressing, len);
+
     size32_t outbase = out.length();
     out.append(len);
     DelayedMarker<size32_t> cmpSzMarker(out);
@@ -710,7 +745,7 @@ void fastLZCompressToBuffer(MemoryBuffer & out, size32_t len, const void * src)
     if (sz>=len)
     {
         sz = len;
-        memcpy(cmpData, src, len);
+        memcpy_iflen(cmpData, src, len);
     }
     cmpSzMarker.write(sz);
     out.setLength(outbase+sz+sizeof(size32_t)*2);
@@ -725,10 +760,10 @@ void fastLZDecompressToBuffer(MemoryBuffer & out, const void * src)
     if (cmpsz!=expsz) {
         size32_t written = fastlz_decompress(sz,cmpsz,o,expsz);
         if (written!=expsz)
-            throw MakeStringException(0, "fastLZDecompressToBuffer - corrupt data(1) %d %d",written,expsz);
+            throw MakeStringException(JLIBERR_CompressFastlzdecompresstobufferCorruptData1DD_1, "fastLZDecompressToBuffer - corrupt data(1) %d %d",written,expsz);
     }
     else
-        memcpy(o,sz,expsz);
+        memcpy_iflen(o,sz,expsz);
 }
 
 void fastLZDecompressToBuffer(MemoryBuffer & out, MemoryBuffer & in)
@@ -740,7 +775,7 @@ void fastLZDecompressToBuffer(MemoryBuffer & out, MemoryBuffer & in)
     if (cmpsz!=expsz) {
         size32_t written = fastlz_decompress(in.readDirect(cmpsz),cmpsz,o,expsz);
         if (written!=expsz)
-            throw MakeStringException(0, "fastLZDecompressToBuffer - corrupt data(3) %d %d",written,expsz);
+            throw MakeStringException(JLIBERR_CompressFastlzdecompresstobufferCorruptData3DD_1, "fastLZDecompressToBuffer - corrupt data(3) %d %d",written,expsz);
     }
     else
         memcpy(o,in.readDirect(cmpsz),expsz);
@@ -755,7 +790,7 @@ void fastLZDecompressToAttr(MemoryAttr & out, const void * src)
     if (cmpsz!=expsz) {
         size32_t written = fastlz_decompress(sz,cmpsz,o,expsz);
         if (written!=expsz)
-            throw MakeStringException(0, "fastLZDecompressToBuffer - corrupt data(2) %d %d",written,expsz);
+            throw MakeStringException(JLIBERR_CompressFastlzdecompresstobufferCorruptData2DD_1, "fastLZDecompressToBuffer - corrupt data(2) %d %d",written,expsz);
     }
     else
         memcpy(o,sz,expsz);
@@ -770,7 +805,7 @@ void fastLZDecompressToBuffer(MemoryAttr & out, MemoryBuffer & in)
     if (cmpsz!=expsz) {
         size32_t written = fastlz_decompress(in.readDirect(cmpsz),cmpsz,o,expsz);
         if (written!=expsz)
-            throw MakeStringException(0, "fastLZDecompressToBuffer - corrupt data(4) %d %d",written,expsz);
+            throw MakeStringException(JLIBERR_CompressFastlzdecompresstobufferCorruptData4DD_1, "fastLZDecompressToBuffer - corrupt data(4) %d %d",written,expsz);
     }
     else
         memcpy(o,in.readDirect(cmpsz),expsz);
@@ -809,9 +844,9 @@ class CFastLZStream : public CFcmpStream
         MemoryAttr cmpma;
         byte *cmpbuf = (byte *)cmpma.allocate(sz[1]);
         if (baseio->read(cmpOffset,sz[1],cmpbuf)!=sz[1])
-            throw MakeStringException(-1,"CFastLZStream: file corrupt.1");
+            throw MakeStringException(JLIBERR_CompressCfastlzstreamFileCorrupt1,"CFastLZStream: file corrupt.1");
         if (fastlz_decompress(cmpbuf,sz[1],ma.bufferBase(),bufsize)!=bufsize)
-            throw MakeStringException(-1,"CFastLZStream: file corrupt.2");
+            throw MakeStringException(JLIBERR_CompressCfastlzstreamFileCorrupt2,"CFastLZStream: file corrupt.2");
         cmpOffset += sz[1];
         return true;
     }

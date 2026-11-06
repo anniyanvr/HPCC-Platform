@@ -39,7 +39,7 @@ include_directories (
          ${HPCC_SOURCE_DIR}/system/security/securesocket
          ${HPCC_SOURCE_DIR}/system/security/LdapSecurity
          ${HPCC_SOURCE_DIR}/system/security/shared
-         ${HPCC_SOURCE_DIR}/system/mp 
+         ${HPCC_SOURCE_DIR}/system/mp
          ${HPCC_SOURCE_DIR}/common/environment
          ${HPCC_SOURCE_DIR}/dali/base
          ${HPCC_SOURCE_DIR}/esp/platform
@@ -51,21 +51,26 @@ include_directories (
          ${HPCC_SOURCE_DIR}/common/thorhelper
     )
 
-ADD_DEFINITIONS( -D_USRDLL -DLOGGINGCOMMON_EXPORTS)
+ADD_DEFINITIONS( -D_USRDLL -DLOGGINGCOMMON_EXPORTS -DWSDecoupledLog_API_LOCAL -DESP_SERVICE_WSDecoupledLog)
 
 HPCC_ADD_LIBRARY( ws_decoupledlogging SHARED ${SRCS} )
 add_dependencies( ws_decoupledlogging espscm )
 
 install ( TARGETS ws_decoupledlogging RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( ws_decoupledlogging
+target_link_libraries ( ws_decoupledlogging PRIVATE
          jlib
          xmllib
          logginglib
          esphttp
+         ${COMMON_ESP_SERVICE_LIBS}
     )
-    
+
 IF (USE_OPENSSL)
-    target_link_libraries ( ws_decoupledlogging 
+    target_link_libraries ( ws_decoupledlogging PRIVATE
         securesocket
     )
 ENDIF()
+
+if (CMAKE_DL_LIBS)
+    target_link_libraries ( ws_decoupledlogging PRIVATE ${CMAKE_DL_LIBS} )
+endif()

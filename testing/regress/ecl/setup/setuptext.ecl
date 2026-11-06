@@ -444,7 +444,7 @@ doCreateSimpleIndex(boolean useLocal, boolean useTranslation) := FUNCTION
                 BUILD(distributedWords, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameWordIndex(),
                         OVERWRITE, NOROOT, COMPRESSED(row)),
                 BUILD(normalizedInversion, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameWordIndex(),
-                        OVERWRITE, COMPRESSED(row))
+                        OVERWRITE, COMPRESSED(row),BLOOM(kind, word))
             )
         );
         //Add a column mapping, testing done L->R, multiple transforms, and that parameters work
@@ -508,23 +508,63 @@ donQuixoteStream := normalizeWordFormat(convertTextFileToInversion(3, DirectoryP
 shakespeareStream := normalizeWordFormat(convertTextFileToInversion(4, DirectoryPath+'shaks12.txt', splitShakespeare));         // not convinced we can use this
 
 
-//Build on bible and encyclopedia for the moment.
-//have different characteristics.  Bible has ~74 "documents", encyclopedia has
-doCreateSearchIndex() := FUNCTION
     boolean useLocal := false;
     Files := $.Files(createMultiPart, useLocal);
-    RETURN sequential(
-        BUILD(bibleStream+encyclopediaStream, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameSearchIndex, OVERWRITE,
-    #if (useLocal=true)
-            NOROOT,
-    #end
-              COMPRESSED(ROW)),
-        fileServices.setColumnMapping(Files.NameSearchIndex, 'word{set(unicodelib.UnicodeToLowerCase)}')       // unicode just to be perverse
-    );
-END;
+
+//Build on bible and encyclopedia for the moment.
+//have different characteristics.  Bible has ~74 "documents", encyclopedia has
+    inputStream := (bibleStream + encyclopediaStream) : independent;
+
+    boolean generateAllVariants := true; // Enable to test generating indexes with different compression formats
+    doCreateSearchIndex() := FUNCTION
+        hybridVarIndex := INDEX(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, string original, dpos }, Files.NameSearchIndex+'_hybrid_var', compressed('hybrid'), TRIM);
+        RETURN ORDERED(
+            IF (generateAllVariants,
+                //Need to build sequentially, otherwise roxie will run out of memory with the standard row configuration
+                SEQUENTIAL(
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameSearchIndex+'_default', compressed('legacy'), OVERWRITE),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameSearchIndex+'_inplace', compressed('inplace'), OVERWRITE),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameSearchIndex+'_inplace_row', compressed('inplace:randrow'), OVERWRITE),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameSearchIndex+'_inplace_lzw', compressed('inplace:lzw'), OVERWRITE),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameSearchIndex+'_inplace_lz4hc', compressed('inplace:lz4hc'), OVERWRITE),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameSearchIndex+'_inplace_zstd', compressed('inplace:zstds'), OVERWRITE),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, string original := original, dpos }, Files.NameSearchIndex+'_inplace_var', compressed('inplace'), OVERWRITE, TRIM),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameSearchIndex+'_hybrid', compressed('hybrid'), OVERWRITE),
+                    BUILD(hybridVarIndex, inputStream, OVERWRITE),  // Test the syntax that builds an index definition and creates the field mappings automatically, including the trim
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, dpos, original }, Files.NameSearchIndex+'_hybridz', compressed('hybrid'), OVERWRITE),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, dpos, string original := TRIM(original)}, Files.NameSearchIndex+'_hybridz_var', compressed('hybrid'), OVERWRITE),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, dpos, original }, Files.NameSearchIndex+'_hybridpacked', compressed('hybrid'), PACKED, OVERWRITE),
+                    BUILD(inputStream, { kind, word, doc, segment, wpos }, { wip, flags, original, dpos }, Files.NameSearchIndex+'_nowip', OVERWRITE),
+                )
+            ),
+            BUILD(inputStream, { kind, word, doc, segment, wpos, wip }, { flags, original, dpos }, Files.NameSearchIndex, OVERWRITE,
+        #if (useLocal=true)
+                NOROOT,
+        #end
+                COMPRESSED(ROW)),
+            fileServices.setColumnMapping(Files.NameSearchIndex, 'word{set(unicodelib.UnicodeToLowerCase)}')       // unicode just to be perverse
+        );
+    END;
+
+    doCreateSearchDocument() := FUNCTION
+        projected := TABLE(inputStream, { kind, word, doc, segment, wpos });
+        resorted := SORT(projected, kind, word, doc, segment, wpos, LOCAL); // Ensure the ordering is consistent
+        RETURN PARALLEL(
+            OUTPUT(projected,, Files.NameSearchSource, THOR, OVERWRITE, UNCOMPRESSED); // Do not compress the output, otherwise it skews the timings for stresstext.ecl
+            OUTPUT(projected,, Files.NameSearchSource+'_lzw', THOR, OVERWRITE, COMPRESSED, HINT(compression('LZW')));
+            OUTPUT(projected,, Files.NameSearchSource+'_flz', THOR, OVERWRITE, COMPRESSED, HINT(compression('FLZ')));
+            OUTPUT(projected,, Files.NameSearchSource+'_lz4', THOR, OVERWRITE, COMPRESSED, HINT(compression('LZ4')));
+            OUTPUT(projected,, Files.NameSearchSource+'_lz4hc', THOR, OVERWRITE, COMPRESSED, HINT(compression('LZ4HC')));
+            OUTPUT(projected,, Files.NameSearchSource+'_zstd', THOR, OVERWRITE, COMPRESSED, HINT(compression('ZSTD')));
+            OUTPUT(projected,, Files.NameSearchSource+'_zstd3', THOR, OVERWRITE, COMPRESSED, HINT(compression('ZSTD3')));
+            OUTPUT(projected,, Files.NameSearchSource+'_zstd6', THOR, OVERWRITE, COMPRESSED, HINT(compression('ZSTD6')));
+            OUTPUT(projected,, Files.NameSearchSource+'_zstd9', THOR, OVERWRITE, COMPRESSED, HINT(compression('ZSTD9')));
+        );
+    END;
 
     exports := MODULE
         EXPORT createSearchIndex() := doCreateSearchIndex();
+        EXPORT createSearchSource() := doCreateSearchDocument();
     
         EXPORT createSimpleIndex(boolean useLocal, boolean useTranslation = FALSE) :=
                     doCreateSimpleIndex(useLocal, useTranslation);

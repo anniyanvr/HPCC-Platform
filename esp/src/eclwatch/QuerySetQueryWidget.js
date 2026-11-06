@@ -397,6 +397,13 @@ define([
                             return "<a href='#' onClick='return false;' class='dgrid-row-url'>" + Id + "</a>";
                         }
                     },
+                    priority: {
+                        label: this.i18n.Priority,
+                        width: 80,
+                        formatter: function (priority, idx) {
+                            return priority === undefined ? "" : priority;
+                        }
+                    },
                     Name: {
                         label: this.i18n.Name
                     },
@@ -418,8 +425,7 @@ define([
                     },
                     PublishedBy: {
                         width: 100,
-                        label: this.i18n.PublishedBy,
-                        sortable: false
+                        label: this.i18n.PublishedBy
                     },
                     Status: {
                         width: 100,
@@ -428,6 +434,11 @@ define([
                     }
                 }
             }, this.id + "QuerySetGrid");
+
+            ESPUtil.goToPageUserPreference(this.querySetGrid, "QuerySetQueryWidget_GridRowsPerPage").then(function () {
+                context.refreshGrid();
+            });
+
             this.querySetGrid.on(".dgrid-row-url:click", function (evt) {
                 if (context._onRowDblClick) {
                     var item = context.querySetGrid.row(evt).data;
@@ -463,9 +474,6 @@ define([
                 } else {
                     context.downloadToList.set("disabled", true);
                 }
-            });
-            ESPUtil.goToPageUserPreference(this.querySetGrid, "QuerySetQueryWidget_GridRowsPerPage").then(function () {
-                context.querySetGrid.startup();
             });
 
             this.recreateQueriesGrid.createGrid({
@@ -588,28 +596,28 @@ define([
         _onSuspend: function () {
             var context = this;
             WsWorkunits.WUQuerysetQueryAction(this.querySetGrid.getSelected(), "Suspend").then(function (response) {
-                context.refreshGrid();
+                context.refreshGrid(true);
             });
         },
 
         _onUnsuspend: function () {
             var context = this;
             WsWorkunits.WUQuerysetQueryAction(this.querySetGrid.getSelected(), "Unsuspend").then(function (response) {
-                context.refreshGrid();
+                context.refreshGrid(true);
             });
         },
 
         _onActivate: function () {
             var context = this;
             WsWorkunits.WUQuerysetQueryAction(this.querySetGrid.getSelected(), "Activate").then(function (response) {
-                context.refreshGrid();
+                context.refreshGrid(true);
             });
         },
 
         _onDeactivate: function () {
             var context = this;
             WsWorkunits.WUQuerysetQueryAction(this.querySetGrid.getSelected(), "Deactivate").then(function (response) {
-                context.refreshGrid();
+                context.refreshGrid(true);
             });
         },
 
@@ -650,7 +658,9 @@ define([
             }
             var optionsForm = registry.byId(this.id + "OptionsForm");
             var optionsValues = optionsForm.getValues();
-            return lang.mixin(this.filter.toObject(), optionsValues);
+            const retVal = lang.mixin(this.filter.toObject(), optionsValues);
+            retVal.PriorityHigh = retVal.PriorityLow;
+            return retVal;
         },
 
         ensurePane: function (id, params, workunitTab) {

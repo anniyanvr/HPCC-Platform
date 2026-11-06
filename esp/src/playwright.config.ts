@@ -1,0 +1,89 @@
+import { defineConfig, devices } from "@playwright/test";
+import { baseURL, setBaseURL, storageStatePath } from "./tests/global";
+
+const isCIL = !!process.env.CIL;
+const isCI = isCIL || !!process.env.CI;
+const isFull = !!process.env.FULL;
+const useAuth = !!process.env.AUTH;
+if (isCI && !isCIL) {
+    setBaseURL("http://localhost:8010");
+} else {
+    setBaseURL("http://localhost:8080");
+}
+
+console.log("target URL", baseURL);
+
+/**
+ * See https://playwright.dev/docs/test-configuration.
+ */
+
+export default defineConfig({
+    testDir: "./tests",
+    forbidOnly: isCI,
+    retries: isCI ? 1 : 2,
+    workers: isCI ? "80%" : "80%",
+    timeout: isCI ? 30_000 : 20_000,
+    expect: {
+        timeout: isCI ? 10_000 : 10_000
+    },
+    reporter: isCI ? "line" : "html",
+    use: {
+        baseURL: `${baseURL}/esp/files/`,
+        trace: "on-first-retry",
+        screenshot: "only-on-failure",
+        video: "off",
+        ignoreHTTPSErrors: true,
+        launchOptions: isCI ? {
+            args: [
+                "--disable-background-timer-throttling",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-sandbox"
+            ]
+        } : undefined
+    },
+
+    projects: [
+        ...(useAuth ? [{
+            name: "auth",
+            testMatch: /auth\.setup\.ts/,
+        }] : []),
+        {
+            name: "setup",
+            testMatch: /global\.setup\.ts/,
+            dependencies: useAuth ? ["auth"] : [],
+            teardown: "teardown"
+        },
+        {
+            name: "teardown",
+            testMatch: /global\.teardown\.ts/
+        },
+        {
+            name: "chromium",
+            use: {
+                ...devices["Desktop Chrome"],
+                ...(useAuth ? { storageState: storageStatePath } : {})
+            },
+            dependencies: ["setup"]
+        },
+        ...(isFull ? [
+            {
+                name: "firefox",
+                use: {
+                    ...devices["Desktop Firefox"],
+                    ...(useAuth ? { storageState: storageStatePath } : {})
+                },
+                dependencies: ["setup"]
+            },
+            {
+                name: "webkit",
+                use: {
+                    ...devices["Desktop Safari"],
+                    ...(useAuth ? { storageState: storageStatePath } : {})
+                },
+                dependencies: ["setup"],
+            }
+        ] : [])
+    ],
+
+});

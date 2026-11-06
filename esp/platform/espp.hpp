@@ -20,6 +20,8 @@
 
 #include "espthread.hpp"
 #include "espcfg.ipp"
+#include "datamaskingengine.hpp"
+#include "datamaskingplugin.hpp"
 
 typedef ISocket * isockp;
 
@@ -30,7 +32,9 @@ typedef CopyReferenceArrayOf<ISocket> SocketPortArray;
 class CEspTerminator : public Thread
 {
 public:
-    IMPLEMENT_IINTERFACE;
+    CEspTerminator() : Thread("CEspTerminator")
+    {
+    }
 
     virtual int run()
     {
@@ -50,23 +54,26 @@ private:
     Owned<ISocketSelectHandler> m_selectHndlr;
     SocketPortMap m_srvSockets;
     SocketPortArray m_socketCleanup;
-    Semaphore m_waitForExit;
+    Semaphore m_waitForExit{SYNC_LOCATION};
     bool m_exiting;
     bool m_useDali;
     LogLevel m_logLevel;
     LogRequest m_logReq;
     bool m_logResp;
     LogLevel txSummaryLevel;
+    unsigned int txSummaryStyle;
+    unsigned int txSummaryGroup;
     bool txSummaryResourceReq;
     unsigned m_slowProcessingTime;
     StringAttr m_frameTitle;
-    Mutex abortMutex;
+    Mutex abortMutex{SYNC_LOCATION};
     bool m_SEHMappingEnabled;
     CEspConfig* m_config;
-    CriticalSection m_BindingCritSect;
+    CriticalSection m_BindingCritSect{SYNC_LOCATION};
     unsigned countCacheClients = 0;
     MapStringToMyClass<IEspCache> cacheClientMap;
     Owned<IPropertyTree> applicationConfig;
+    Owned<IDataMaskingEngine> dataMaskEngine;
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -83,6 +90,8 @@ public:
         m_logReq = config->m_options.logReq;
         m_logResp = config->m_options.logResp;
         txSummaryLevel = config->m_options.txSummaryLevel;
+        txSummaryStyle = config->m_options.txSummaryStyle;
+        txSummaryGroup = config->m_options.txSummaryGroup;
         txSummaryResourceReq = config->m_options.txSummaryResourceReq;
         m_slowProcessingTime = config->m_options.slowProcessingTime;
         m_frameTitle.set(config->m_options.frameTitle);
@@ -144,7 +153,7 @@ public:
 
         // YMA: there'll be a leak here, but it's ok.
         CEspTerminator* terminator = new CEspTerminator;  
-        terminator->start();
+        terminator->start(false);
 
         m_exiting=true;
         if(!m_useDali)
@@ -155,12 +164,16 @@ public:
     void setLogRequests(LogRequest logReq) { m_logReq = logReq; }
     void setLogResponses(bool logResp) { m_logResp = logResp; }
     void setTxSummaryLevel(LogLevel level) { txSummaryLevel = level; }
+    void setTxSummaryStyle(unsigned int style) { txSummaryStyle = style; }
+    void setTxSummaryGroup(unsigned int group) { txSummaryGroup = group; }
     void setTxSummaryResourceReq(bool logReq) { txSummaryResourceReq = logReq; }
 
     LogLevel getLogLevel() { return m_logLevel; }
     LogRequest getLogRequests() { return m_logReq; }
     bool getLogResponses() { return m_logResp; }
     LogLevel getTxSummaryLevel() { return txSummaryLevel; }
+    unsigned int getTxSummaryStyle() { return txSummaryStyle; }
+    unsigned int getTxSummaryGroup() { return txSummaryGroup; }
     bool getTxSummaryResourceReq() { return txSummaryResourceReq; }
     void setFrameTitle(const char* title)  { m_frameTitle.set(title); }
     const char* getFrameTitle()  { return m_frameTitle.get(); }
@@ -180,9 +193,16 @@ public:
         {
             va_list args;
             va_start(args, fmt);
-            VALOG(MCdebugInfo, unknownJob, fmt, args);
+            VALOG(MCdebugInfo, fmt, args);
             va_end(args);
         }
+    }
+
+    void initializeDataMaskingEngine(const char* dataMaskConfig);
+
+    virtual IDataMaskingEngine *queryDataMaskingEngine() override
+    {
+        return dataMaskEngine.get();
     }
 
 //IEspServer
@@ -197,7 +217,7 @@ public:
         if (host != NULL)
             strIP.append(host);
         else
-            m_address.getIpText(strIP);
+            m_address.getHostText(strIP);
 
         LOG(MCprogress, "binding %s, on %s:%d", name, strIP.str(), port);
 
@@ -230,6 +250,8 @@ public:
             add(socket, SELECTMODE_READ | SELECTMODE_WRITE, dynamic_cast<ISocketSelectNotify*>(&protocol));
             LOG(MCprogress, "  Socket(%d) listening.", socket->OShandle());
         }
+
+        m_config->addBindingForSDSSession(port);
 
         if (socket)
         {

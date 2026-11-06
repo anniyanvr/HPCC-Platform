@@ -20,8 +20,15 @@
 #ifndef JHASH_HPP
 #define JHASH_HPP
 
+#include <functional>
+#include <list>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+
 #include "platform.h"
 #include <stdio.h>
+#include "jdebug.hpp" // for get_cycles_now()
 #include "jiface.hpp"
 #include "jobserve.hpp"
 #include "jiter.hpp"
@@ -194,6 +201,12 @@ template <class C, class BASE> class CopyMapStringToMyClassViaBase : public Copy
   public:
     CopyMapStringToMyClassViaBase() : CopyMapStringToIInterface() {};
     CopyMapStringToMyClassViaBase(bool _ignorecase) : CopyMapStringToIInterface(_ignorecase) {};
+    static inline C * mapToValue(IMapping * _map)
+      {
+      CopyMappingStringToIInterface * map = (CopyMappingStringToIInterface *)_map;
+      IInterface ** x = &map->getValue();
+      return x ? (C *)(BASE *)*x : NULL;
+      }
     C *getValue(const char *k) const
       {
       IInterface **x = CopyMapStringToIInterface::getValue(k);
@@ -420,11 +433,28 @@ extern jlib_decl IIdAtom * createIdAtom(const char *value);
 extern jlib_decl IIdAtom * createIdAtom(const char *value, size32_t len);
 
 extern jlib_decl void releaseAtoms();
-extern jlib_decl unsigned hashc( const unsigned char *k, unsigned length, unsigned initval);
-extern jlib_decl unsigned hashnc( const unsigned char *k, unsigned length, unsigned initval);
-extern jlib_decl unsigned hashvalue( unsigned value, unsigned initval);
-extern jlib_decl unsigned hashvalue( unsigned __int64 value, unsigned initval);
-extern jlib_decl unsigned hashvalue( const void * value, unsigned initval);
+
+extern jlib_decl unsigned deprecatedHashc(const unsigned char *k, unsigned length, unsigned initval);
+extern jlib_decl unsigned deprecatedHashcz(const unsigned char *k, unsigned initval);
+
+extern jlib_decl unsigned hashc(const unsigned char *k, unsigned length, unsigned initval);
+extern jlib_decl unsigned hashnc(const unsigned char *k, unsigned length, unsigned initval);
+extern jlib_decl unsigned hashcz(const unsigned char *k, unsigned initval);
+extern jlib_decl unsigned hashncz(const unsigned char *k, unsigned initval);
+extern jlib_decl unsigned hashvalue(unsigned value, unsigned initval);
+extern jlib_decl unsigned hashvalue(unsigned __int64 value, unsigned initval);
+extern jlib_decl unsigned hashvalue(const void * value, unsigned initval);
+
+extern jlib_decl unsigned hashc_fnv1a(const unsigned char *k, unsigned length, unsigned initval);
+extern jlib_decl unsigned hashnc_fnv1a(const unsigned char *k, unsigned length, unsigned initval);
+extern jlib_decl unsigned hashcz_fnv1a(const unsigned char *k, unsigned initval);
+extern jlib_decl unsigned hashncz_fnv1a(const unsigned char *k, unsigned initval);
+extern jlib_decl unsigned hashvalue_fnv1a(unsigned value, unsigned initval);
+extern jlib_decl unsigned hashvalue_fnv1a(unsigned __int64 value, unsigned initval);
+extern jlib_decl unsigned hashvalue_fnv1a(const void * value, unsigned initval);
+
+extern jlib_decl unsigned hash_fnv1(const unsigned char *k, unsigned length, unsigned initval, bool ignoreCase);
+extern jlib_decl unsigned hash_fnv1a(const unsigned char *k, unsigned length, unsigned initval, bool ignoreCase);
 
 //================================================
 // Minimal Hash table template - slightly less overhead that HashTable/SuperHashTable
@@ -443,7 +473,7 @@ protected:
             htn = htn*2+1;
         else
             htn /= 2;
-        C **newtable = (C **)calloc(sizeof(C *),htn);
+        C **newtable = (C **)calloc(htn, sizeof(C *));
         while (t--!=table) {
             C *c = *t;
             if (c) {
@@ -461,13 +491,13 @@ protected:
     }       
 
 public:
-    CMinHashTable<C>(unsigned _initialSize = 7)
+    CMinHashTable(unsigned _initialSize = 7)
     {
         htn = _initialSize;
         n = 0;
-        table = (C **)calloc(sizeof(C *),htn);
+        table = (C **)calloc(htn, sizeof(C *));
     }
-    ~CMinHashTable<C>()
+    ~CMinHashTable()
     {
         C **t = table+htn; 
         while (t--!=table) 
@@ -538,13 +568,12 @@ public:
         return table[v];
     }
 
-    void remove(C *c)
+    bool detach(C *c)
     {
         unsigned i = c->hash%htn;
-        C::destroy(c);
         while (table[i]!=c) {
             if (table[i]==NULL) {
-                return;
+                return false;
             }
             if (++i==htn)
                 i = 0;
@@ -571,7 +600,20 @@ public:
         }
         table[i] = NULL;
         n--;
-        if ((n>1024)&&(n<htn/4))
+        return true;
+    }
+
+    void remove(C *c)
+    {
+        // detach() returns false if the element is no longer in the table
+        // (e.g. if the caller already unlinked it manually).
+        bool found = detach(c);
+
+        // remove() always finalizes the object's lifecycle, destroying the memory
+        // regardless of whether it was still linked in the table.
+        C::destroy(c);
+
+        if (found && (n>1024)&&(n<htn/4))
             expand(false);
     }
 
@@ -595,6 +637,209 @@ public:
         return n;
     }
 
+};
+
+
+/* 
+ * A HT/Cache implementation whose items are only valid for a defined timeout period (default 30 secs)
+ * Example use:
+ *   CTimeLimitedCache<std::string, Owned<IPropertyTree>> myCache(10);
+ *   Owned<IPropertyTree> match;
+ *   verifyex( !myCache.get("tree1", match) );
+ *   myCache.add("tree1", createPTree("tree1"));
+ *   verifyex( nullptr != myCache.query("tree1") );
+ *   MilliSleep(11000); // sleep until "tree1" has expired
+ *   verifyex( nullptr == myCache.query("tree1") );
+ *
+ *   myCache.ensure("tree2", [](std::string key) { return createPTree(key.c_str()); });
+ *
+ * Keywords: cache,time,limit,hashtable,hash
+ */
+
+template <class KEYTYPE, class VALUETYPE>
+class CTimeLimitedCache
+{
+public:
+    CTimeLimitedCache(unsigned timeoutMs=defaultCacheTimeoutMs)
+    {
+        timeoutPeriodCycles = ((cycle_t)timeoutMs) * queryOneSecCycles() / 1000;
+    }
+    VALUETYPE *query(KEYTYPE key, bool touch=false)
+    {
+        CacheElement *match = getMatch(key, touch);
+        if (!match)
+            return nullptr;
+        return &match->second;
+    }
+    bool get(KEYTYPE key, VALUETYPE &result, bool touch=false)
+    {
+        VALUETYPE *res = query(key, touch);
+        if (!res)
+            return false;
+        result = *res;
+        return true;
+    }
+    VALUETYPE &add(KEYTYPE key, VALUETYPE val)
+    {
+        auto &ref = ht[key];
+        ref = std::make_pair(get_cycles_now(), val);
+        return ref.second;
+    }
+    VALUETYPE &ensure(KEYTYPE key, std::function<VALUETYPE (KEYTYPE k)> func)
+    {
+        VALUETYPE *res = query(key);
+        if (res)
+            return *res;
+        return add(key, func(key));
+    }
+    void kill()
+    {
+        // NB: std::unordered_map clear() does not free the map memory (or call dtors) until it is out of scope
+        std::unordered_map<KEYTYPE, CacheElement> empty;
+        empty.swap(ht);
+    }
+
+private:
+    static constexpr unsigned defaultCacheTimeoutMs = 30000;
+    typedef std::pair<cycle_t, VALUETYPE> CacheElement;
+    cycle_t timeoutPeriodCycles = 0;
+    std::unordered_map<KEYTYPE, CacheElement> ht;
+
+    CacheElement *getMatch(KEYTYPE key, bool touch)
+    {
+        auto it = ht.find(key);
+        if (it == ht.end())
+            return nullptr;
+        cycle_t nowCycles = get_cycles_now();
+        if ((nowCycles - it->second.first) > timeoutPeriodCycles) // NB: rollover is okay
+        {
+            ht.erase(it);
+            return nullptr;
+        }
+        if (touch)
+            it->second.first = nowCycles;
+        return &it->second;
+    }
+};
+
+/**
+ * CLRUCache
+ *
+ * Least-Recently-Used cache class, specialized for key and
+ * value pointer types (the value is a pointer or a data type
+ * where a nullptr could represent a missing value).
+ *
+ * The get() method returns a found object by value.  This
+ * is intentional and very useful for maintaining refcounts.
+ *
+ * There is a minimum size for the cache, defined by
+ * LRU_MIN_CACHE_SIZE.  Attempts to create a smaller cache
+ * will be silently changed to the minimum size.  If no
+ * initial size is provided to the constructor, the cache
+ * size will be set to LRU_MIN_CACHE_SIZE.
+ *
+ * Methods here are not thread-safe.  Callers should block
+ * concurrent access for non-const methods (which are most
+ * of them).
+ */
+
+#define LRU_MIN_CACHE_SIZE 10
+
+template <class KEYTYPE, class PTRTYPE>
+class CLRUCache
+{
+    private:
+        std::list<KEYTYPE> recentList;
+        std::unordered_map<KEYTYPE, std::pair<PTRTYPE, typename std::list<KEYTYPE>::iterator>> lookupMap;
+        size32_t maxCacheSize;
+
+        void _downsize()
+        {
+            while (lookupMap.size() > maxCacheSize)
+            {
+                lookupMap.erase(recentList.back());
+                recentList.pop_back();
+            }
+        }
+    
+    public:
+        CLRUCache() : maxCacheSize(LRU_MIN_CACHE_SIZE) {}
+        CLRUCache(size32_t _maxCacheSize) : maxCacheSize(_maxCacheSize < LRU_MIN_CACHE_SIZE ? LRU_MIN_CACHE_SIZE : _maxCacheSize) {}
+        CLRUCache(const CLRUCache& other) = delete;
+        ~CLRUCache() = default;
+
+        size32_t getCacheSize() const
+        {
+            return lookupMap.size();
+        }
+
+        size32_t setMaxCacheSize(size32_t _maxCacheSize)
+        {
+            maxCacheSize = _maxCacheSize < LRU_MIN_CACHE_SIZE ? LRU_MIN_CACHE_SIZE : _maxCacheSize;
+            _downsize();
+            return maxCacheSize;
+        }
+
+        PTRTYPE get(const KEYTYPE& key)
+        {
+            auto foundIter = lookupMap.find(key);
+            if (foundIter == lookupMap.end())
+                return nullptr;
+            
+            recentList.splice(recentList.begin(), recentList, foundIter->second.second);
+            foundIter->second.second = recentList.begin();
+            return foundIter->second.first;
+        }
+
+        void set(const KEYTYPE& key, const PTRTYPE& value)
+        {
+            auto foundIter = lookupMap.find(key);
+            
+            if (foundIter == lookupMap.end())
+            {
+                recentList.push_front(key);
+                lookupMap[key] = {value, recentList.begin()};
+                _downsize();
+            }
+            else
+            {
+                recentList.splice(recentList.begin(), recentList, foundIter->second.second);
+                foundIter->second.first = value;
+                foundIter->second.second = recentList.begin();
+            }
+        }
+
+        bool remove(const KEYTYPE& key)
+        {
+            auto foundIter = lookupMap.find(key);
+            if (foundIter == lookupMap.end())
+                return false;
+            
+            recentList.erase(foundIter->second.second);
+            lookupMap.erase(foundIter);
+            return true;
+        }
+};
+
+
+// Case-insensitive hash for std::string_view
+struct CaseInsensitiveHash
+{
+    std::size_t operator()(std::string_view key) const
+    {
+        return hashnc_fnv1a((const byte *)key.data(), key.size(), fnvInitialHash32);
+    }
+};
+
+// Case-insensitive equality for std::string_view for use in std maps
+struct CaseInsensitiveEqual
+{
+    bool operator()(std::string_view lhs, std::string_view rhs) const
+    {
+        if (lhs.size() != rhs.size())
+            return false;
+        return 0 == memicmp(lhs.data(), rhs.data(), lhs.size());
+    }
 };
 
 

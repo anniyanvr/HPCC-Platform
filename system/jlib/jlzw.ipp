@@ -34,38 +34,47 @@ public:
     int nextcode;
     int curbits;
     int nextbump;
-    int dictparent[LZW_HASH_TABLE_SIZE];
+    short dictparent[LZW_HASH_TABLE_SIZE];
     unsigned char dictchar[LZW_HASH_TABLE_SIZE];
 };
 
-
-class jlib_decl CLZWCompressor : public ICompressor, public CInterface
+class CLZWCompressor final : public ICompressor, public CInterface
 {
 public:
     IMPLEMENT_IINTERFACE;
 
     CLZWCompressor(bool _supportbigendian);
-    virtual         ~CLZWCompressor();
-    virtual void    open(MemoryBuffer &mb, size32_t initialSize);
-    virtual void    open(void *blk,size32_t blksize);
-    virtual void    close();
-    virtual size32_t    write(const void *buf,size32_t len);
-    virtual void *  bufptr() { return outbuf;}
-    virtual size32_t    buflen() { return outlen;}
-    virtual void    startblock();
-    virtual void    commitblock();
+    virtual ~CLZWCompressor();
+    virtual void open(MemoryBuffer &mb, size32_t initialSize, size32_t fixedRowSize) override;
+    virtual void open(void *blk, size32_t blksize, size32_t fixedRowSize, bool allowPartialWrites) override;
+    virtual void close() override;
+    virtual size32_t write(const void *buf,size32_t len) override;
+    virtual void * bufptr() override { return outbuf;}
+    virtual size32_t buflen() override { return outlen;}
+    virtual bool adjustLimit(size32_t newLimit) override;
+    virtual CompressionMethod getCompressionMethod() const override
+    {
+        if (supportbigendian)
+            return COMPRESS_METHOD_LZW;
+        else
+            return COMPRESS_METHOD_LZW_LITTLE_ENDIAN;
+    }
+    virtual bool supportsBlockCompression() const override { return false; }
+    virtual bool supportsIncrementalCompression() const override { return true; }
+    virtual size32_t compressBlock(size32_t destSize, void * dest, size32_t srcSize, const void * src) override { return 0; }
+    virtual size32_t compressDirect(size32_t destSize, void * dest, size32_t srcSize, const void * src, size32_t * numCompressed) override { throwUnimplemented(); }
 
 protected:
     void flushbuf();
     void initCommon();
     void ensure(size32_t sz);
-    virtual void initdict();
+    void initdict();
     size32_t inlen;
-    size32_t inlenblk;
     size32_t outlen;
     size32_t maxlen;
+    size32_t originalMax = 0;
+    bool allowPartialWrites{true};
     int curcode;
-    size32_t bufalloc;
     void          *outbuf;
     unsigned char *outbytes;  // byte output
     unsigned char *outbits;   // for trailing bits
@@ -80,15 +89,11 @@ protected:
     unsigned char dictinuse[LZW_HASH_TABLE_SIZE];
     int dictcode[LZW_HASH_TABLE_SIZE];
     bool supportbigendian;
-
 };
 
-
-class jlib_decl CLZWExpander : public IExpander, public CInterface
+class  CLZWExpander : public CExpanderBase
 {
 public:
-    IMPLEMENT_IINTERFACE;
-
     CLZWExpander(bool _supportbigendian);
     ~CLZWExpander();
     virtual size32_t  init(const void *blk); // returns size required

@@ -49,7 +49,6 @@ set (    SRCS
          join/thjoin.cpp 
          keydiff/thkeydiff.cpp 
          keyedjoin/thkeyedjoin.cpp 
-         keyedjoin/thkeyedjoin-legacy.cpp 
          keypatch/thkeypatch.cpp 
          limit/thlimit.cpp 
          lookupjoin/thlookupjoin.cpp 
@@ -115,14 +114,15 @@ target_link_libraries ( activitymasters_lcr
          deftype 
          thorhelper 
          dalibase 
-         environment 
          dllserver 
          workunit 
          thorcodectx_lcr 
          graph_lcr 
-         dalift 
          mfilemanager_lcr 
          graphmaster_lcr 
     )
 
+if (NOT CONTAINERIZED)
+    target_link_libraries ( activitymasters_lcr environment )
+endif()
 

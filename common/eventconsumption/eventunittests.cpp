@@ -1,0 +1,321 @@
+/*##############################################################################
+
+    Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#ifdef _USE_CPPUNIT
+
+#include "eventunittests.hpp"
+#include "eventfilter.h"
+#include "eventmodeling.h"
+#include "eventoperation.h"
+
+namespace
+{
+static EventFileProperties makeTestEventFileProperties()
+{
+    EventFileProperties props;
+    props.path.set("test-event.evt");
+    props.version = 1;
+    return props;
+}
+
+static const EventFileProperties testProperties = makeTestEventFileProperties();
+}
+
+const EventFileProperties& queryTestEventFileProperties()
+{
+    return testProperties;
+}
+
+static const char* queryEventAttributeStateName(CEventAttribute::State state)
+{
+    switch (state)
+    {
+    case CEventAttribute::Unused: return "unused";
+    case CEventAttribute::Defined: return "defined";
+    case CEventAttribute::Assigned: return "assigned";
+    default: return "unknown";
+    }
+}
+
+bool CEventVisitationLinkTester::visitFile([[maybe_unused]] const EventFileProperties& properties)
+{
+    fileVisitDepth++;
+    return true;
+}
+
+bool CEventVisitationLinkTester::visitEvent(CEvent& actualEvent, [[maybe_unused]] const EventFileProperties& properties)
+{
+    CEvent expectEvent;
+    CPPUNIT_ASSERT(expect->nextEvent(expectEvent));
+    if (expectEvent.queryType() != actualEvent.queryType())
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("EventType mismatch", queryEventName(expectEvent.queryType()), queryEventName(actualEvent.queryType()));
+    for (CEventAttribute& expectAttr : expectEvent.definedAttributes)
+    {
+        CEventAttribute& actualAttr = actualEvent.queryAttribute(expectAttr.queryId());
+        VStringBuffer msg("%s/%s", queryEventName(expectEvent.queryType()), queryEventAttributeName(expectAttr.queryId()));
+        if (expectAttr.queryState() != actualAttr.queryState())
+            CPPUNIT_ASSERT_EQUAL_MESSAGE(VStringBuffer("%s state mismatch", msg.str()).str(), queryEventAttributeStateName(expectAttr.queryState()), queryEventAttributeStateName(actualAttr.queryState()));
+        if (!expectAttr.isAssigned())
+            continue;
+        switch (expectAttr.queryTypeClass())
+        {
+        case EATCtext:
+            CPPUNIT_ASSERT_EQUAL_MESSAGE(msg.str(), std::string(expectAttr.queryTextValue()), std::string(actualAttr.queryTextValue()));
+            break;
+        case EATCnumeric:
+            CPPUNIT_ASSERT_EQUAL_MESSAGE(msg.str(), expectAttr.queryNumericValue(), actualAttr.queryNumericValue());
+            break;
+        case EATCtimestamp:
+            if (expectAttr.queryNumericValue() != actualAttr.queryNumericValue())
+                CPPUNIT_ASSERT_EQUAL_MESSAGE(msg.str(), std::string(expectAttr.queryTextValue()), std::string(actualAttr.queryTextValue()));
+            break;
+        case EATCboolean:
+            CPPUNIT_ASSERT_EQUAL_MESSAGE(msg.str(), expectAttr.queryBooleanValue(), actualAttr.queryBooleanValue());
+            break;
+        default:
+            CPPUNIT_FAIL("unhandled attribute type class");
+        }
+    }
+    return true;
+}
+
+void CEventVisitationLinkTester::departFile([[maybe_unused]] const EventFileProperties& properties)
+{
+    assertex(fileVisitDepth != 0);
+    if (0 == --fileVisitDepth)
+        CPPUNIT_ASSERT(hasNoRemainingEvents());
+}
+
+bool CEventVisitationLinkTester::hasNoRemainingEvents()
+{
+    CEvent noEvent;
+    if (!expect->nextEvent(noEvent))
+        return true;
+
+    VStringBuffer tmp("unexpected next event %s", queryEventName(noEvent.queryType()));
+    for (CEventAttribute& attr : noEvent.assignedAttributes)
+    {
+        tmp.appendf(" %s:", queryEventAttributeName(attr.queryId()));
+        switch (attr.queryTypeClass())
+        {
+        case EATCtext:
+            tmp.appendf("'%s'", attr.queryTextValue());
+            break;
+        case EATCnumeric:
+            tmp.appendf("%" I64F "d", attr.queryNumericValue());
+            break;
+        case EATCboolean:
+            tmp.appendf("%s", attr.queryBooleanValue() ? "true" : "false");
+            break;
+        case EATCtimestamp:
+            tmp.appendf("'%s'", attr.queryTextValue());
+            break;
+        default:
+            tmp.appendf("<unknown type>");
+            break;
+        }
+    }
+    CPPUNIT_FAIL(tmp.str());
+    return false;
+}
+
+CEventVisitationLinkTester::CEventVisitationLinkTester(IEventIterator& _expect)
+    : expect(&_expect)
+{
+}
+
+IPropertyTree* createTestConfiguration(const char* testData)
+{
+    CPPUNIT_ASSERT_MESSAGE("invalid test data", !isEmptyString(testData));
+    while (isspace(*testData))
+        ++testData;
+    CPPUNIT_ASSERT_MESSAGE("empty test data", *testData);
+    Owned<IPropertyTree> tree;
+    try
+    {
+        if ('<' == *testData) // looks like XML
+            tree.setown(createPTreeFromXMLString(testData));
+        else if ('{' == *testData || '\"' == *testData) // looks like JSON
+            tree.setown(createPTreeFromJSONString(testData));
+        else // assume YAML
+            tree.setown(createPTreeFromYAMLString(testData));
+    }
+    catch (IException* e)
+    {
+        StringBuffer msg;
+        e->errorMessage(msg);
+        e->Release();
+        CPPUNIT_FAIL(msg.str());
+    }
+    CPPUNIT_ASSERT_MESSAGE("invalid configuration", tree != nullptr);
+    return tree.getClear();
+}
+
+void testEventVisitationLinks(const char* testData, unsigned flags)
+{
+    START_TEST
+    Owned<IPropertyTree> testTree = createTestConfiguration(testData);
+    IPropertyTree* inputTree = testTree->queryBranch("input");
+    CPPUNIT_ASSERT_MESSAGE("missing input section", inputTree != nullptr);
+    IPropertyTree* expectTree = testTree->queryBranch("expect");
+    CPPUNIT_ASSERT_MESSAGE("missing expected results section", expectTree != nullptr);
+    Owned<IPropertyTreeIterator> links = testTree->getElements("link");
+    bool disablePreScan = testTree->hasProp("noPreScan");
+    testEventVisitationLinks(*inputTree, *expectTree, *links, flags, disablePreScan);
+    END_TEST
+}
+
+static bool runEventVisitationLinks(const IPropertyTree& inputTree, const IPropertyTree& expectTree, IPropertyTreeIterator& visitationLinks, unsigned flags, bool disablePreScan)
+{
+    class TestOp : public CEventConsumingOp
+    {
+    public:
+        virtual unsigned getNumSources() const override
+        {
+            Owned<IPropertyTreeIterator> sourcesIter = inputTree.getElements("source");
+            unsigned count = 0;
+            ForEach(*sourcesIter) count++;
+            return count <= 1 ? 1 : count;
+        }
+
+        virtual Owned<IEventIterator> createInputIterator() override
+        {
+            Owned<IEventIterator> input;
+            Owned<IPropertyTreeIterator> sourcesIter = inputTree.getElements("source");
+            std::vector<Owned<IEventIterator>> sources;
+            ForEach(*sourcesIter)
+                sources.emplace_back(createPropertyTreeEvents(sourcesIter->query(), flags));
+            switch (sources.size())
+            {
+            case 0: // implied single source using inputTree
+                input.setown(createPropertyTreeEvents(inputTree, flags));
+                break;
+            case 1:
+                input.setown(sources[0].getClear());
+                break;
+            default:
+                {
+                    Owned<IEventMultiplexer> multiplexer = createChronologicalEventMultiplexer(*metaState, preScanCompleted);
+                    for (auto& s : sources)
+                        multiplexer->addSource(*s);
+                    input.setown(multiplexer.getClear());
+                }
+                break;
+            }
+            return input;
+        }
+
+        virtual bool doOp() override
+        {
+            Owned<IEventIterator> expect = createPropertyTreeEvents(expectTree, flags);
+            Owned<CEventVisitationLinkTester> tester = new CEventVisitationLinkTester(*expect);
+            Owned<IEventVisitor> visitor = LINK(tester);
+            Owned<IEventVisitor> currentVisitor = LINK(visitor);
+
+            bool needsPreScan = false;
+
+            // Build the visitation chain from the links
+            ForEach(visitationLinks)
+            {
+                IPropertyTree& linkTree = visitationLinks.query();
+                const char* kind = linkTree.queryProp("@kind");
+                if (isEmptyString(kind))
+                    return false; // missing link kind
+
+                Owned<IEventVisitationLink> link;
+                if (strieq(kind, "event-filter"))
+                    link.setown(createEventFilter(linkTree, *metaState));
+                else
+                    link.setown(createEventModel(linkTree, *metaState));
+
+                if (!link)
+                    return false; // failed to create link
+
+                if (link->preScanRequired())
+                    needsPreScan = true;
+
+                link->setNextLink(*currentVisitor);
+                currentVisitor.setown(link.getClear());
+            }
+
+            if (needsPreScan && !disablePreScan)
+            {
+                preScanEvents();
+                preScanCompleted = true;
+            }
+
+            Owned<IEventIterator> input = createInputIterator();
+            // Always include the meta information parser as the first link in the chain
+            Owned<IEventVisitationLink> metaCollector = metaState->getCollector();
+            metaCollector->setNextLink(*currentVisitor);
+            visitIterableEvents(*input, *metaCollector);
+            return true;
+        }
+
+    public:
+        TestOp(const IPropertyTree& _inputTree, const IPropertyTree& _expectTree, IPropertyTreeIterator& _visitationLinks, unsigned _flags, bool _disablePreScan)
+            : inputTree(_inputTree)
+            , expectTree(_expectTree)
+            , visitationLinks(_visitationLinks)
+            , flags(_flags)
+            , disablePreScan(_disablePreScan)
+        {
+        }
+
+    protected:
+        const IPropertyTree& inputTree;
+        const IPropertyTree& expectTree;
+        IPropertyTreeIterator& visitationLinks;
+        unsigned flags;
+        bool disablePreScan;
+    };
+
+    TestOp op(inputTree, expectTree, visitationLinks, flags, disablePreScan);
+    return op.doOp();
+}
+
+bool testEventVisitationLinksThrowsIException(const char* testData, unsigned flags)
+{
+    try
+    {
+        Owned<IPropertyTree> testTree = createTestConfiguration(testData);
+        IPropertyTree* inputTree = testTree->queryBranch("input");
+        if (!inputTree)
+            return false;
+        IPropertyTree* expectTree = testTree->queryBranch("expect");
+        if (!expectTree)
+            return false;
+        Owned<IPropertyTreeIterator> links = testTree->getElements("link");
+        bool disablePreScan = testTree->hasProp("noPreScan");
+        (void)runEventVisitationLinks(*inputTree, *expectTree, *links, flags, disablePreScan);
+        return false;
+    }
+    catch (IException* e)
+    {
+        e->Release();
+        return true;
+    }
+}
+
+void testEventVisitationLinks(const IPropertyTree& inputTree, const IPropertyTree& expectTree, IPropertyTreeIterator& visitationLinks, unsigned flags, bool disablePreScan)
+{
+    START_TEST
+    CPPUNIT_ASSERT_MESSAGE("failed to process visitation links", runEventVisitationLinks(inputTree, expectTree, visitationLinks, flags, disablePreScan));
+    END_TEST
+}
+
+#endif

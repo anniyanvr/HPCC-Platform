@@ -2,12 +2,13 @@
 <!DOCTYPE book PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
 "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <sect1 id="ldap_config">
-  <title>Configuring HPCC Systems<superscript>®</superscript> for Authentication</title>
+  <title>Configuring HPCC Systems<superscript>®</superscript> for
+  Authentication</title>
 
-  <para>This section details the steps to configure your HPCC Systems platform to use
-  authentication. There are currently a few ways to use authentication with
-  your HPCC Systems platform: simple htpasswd authentication, LDAP, or another plugin
-  security method.</para>
+  <para>This section details the steps to configure your HPCC Systems platform
+  to use authentication. There are currently a few ways to use authentication
+  with your HPCC Systems platform: simple htpasswd authentication, LDAP, or
+  another plugin security method.</para>
 
   <para>The htpasswd authentication method is basic password authentication.
   It only grants or denies access to a user, based upon MD5 encrypted password
@@ -58,8 +59,8 @@
     <sect3 id="htpasswd_ConnectToConfigMgr">
       <title>Connect to Configuration Manager</title>
 
-      <para>In order to change the configuration for HPCC Systems components, connect
-      to the Configuration Manager.</para>
+      <para>In order to change the configuration for HPCC Systems components,
+      connect to the Configuration Manager.</para>
 
       <orderedlist numeration="arabic">
         <listitem>
@@ -68,7 +69,7 @@
 
         <listitem>
           <para>Verify that they are stopped. You can use a single command,
-          such as : <programlisting>sudo /opt/HPCCSystems/sbin/hpcc-run.sh -a hpcc-init status</programlisting></para>
+          such as : <programlisting>sudo /opt/HPCCSystems/sbin/hpcc-run.sh status</programlisting></para>
         </listitem>
 
         <listitem>
@@ -286,6 +287,25 @@
       url="http://httpd.apache.org/docs/2.2/programs/htpasswd.html">http://httpd.apache.org/docs/2.2/programs/htpasswd.html</ulink>.</para>
     </sect3>
   </sect2>
+<sect2 id="SingleUserSecMgr">
+    <title>Single User Security Manager</title>
+
+    <para>The Single User security manager is a specialized security manager
+    that allows a username/password combination to be specified on the ESP
+    startup command line. At runtime, when you attempt to access any
+    authenticating ESP feature, such as ECL Watch, you must specify a
+    username/password combination.</para>
+
+    <para>A single user security manager could be useful for a custom
+    deployment where you do not want to configure an entire LDAP server or
+    create a Linux HTPASSWD file, such as a classroom environment or a custom
+    HPCC Systems Virtual Machine.</para>
+
+    <para>See the <ulink
+    url="https://hpccsystems.com/training/documentation/all/"><emphasis>Security
+    Manager Plugin Framework</emphasis></ulink> document for more information
+    on configuring and deploying Security Manager plugins.</para>
+  </sect2>
 
   <sect2 id="Using_LDAP_Authentication" role="brk">
     <title>Using LDAP Authentication</title>
@@ -309,8 +329,8 @@
     <sect3 id="UsingLDAP_ConnectToConfigMgr">
       <title>Connect to Configuration Manager</title>
 
-      <para>In order to change the configuration for HPCC Systems components, connect
-      to the Configuration Manager.</para>
+      <para>In order to change the configuration for HPCC Systems components,
+      connect to the Configuration Manager.</para>
 
       <orderedlist numeration="arabic">
         <listitem>
@@ -575,11 +595,6 @@
 
         <para><orderedlist numeration="loweralpha">
             <listitem>
-              <para>Change the <emphasis role="bold">ldapAuthMethod</emphasis>
-              to <emphasis role="blue">kerberos.</emphasis></para>
-            </listitem>
-
-            <listitem>
               <para>Change the <emphasis
               role="bold">ldapConnections</emphasis> to the number appropriate
               for your system (10 is for example only, may not be necessary in
@@ -670,17 +685,6 @@
               <emphasis>ldapserver.</emphasis></para>
 
               <para>Confirm the change when prompted.</para>
-
-              <para>The <emphasis role="bold">filesDefaultUser</emphasis> is
-              an LDAP account used to access files when no user credentials
-              are supplied. This is similar to a guest account, so it should
-              be an account with <emphasis role="bold">very</emphasis> limited
-              access, if used at all. To disable access without credentials,
-              leave <emphasis role="bold">filesDefaultUser</emphasis>
-              blank.</para>
-
-              <para>The <emphasis role="bold">filesDefaultPassword</emphasis>
-              is the password for that account.</para>
             </listitem>
 
             <listitem>
@@ -705,11 +709,11 @@
 
             <listitem>
               <para>Locate the <emphasis role="bold">ldapUser</emphasis> field
-              and verify that there is a valid HPCC Systems user who is a member of
-              the Authenticated Users group on your LDAP server. For example,
-              the "<emphasis>roxie</emphasis>" user assumes that the
-              "<emphasis>roxie</emphasis>" user is a valid HPCC Systems authenticated
-              user.</para>
+              and verify that there is a valid HPCC Systems user who is a
+              member of the Authenticated Users group on your LDAP server. For
+              example, the "<emphasis>roxie</emphasis>" user assumes that the
+              "<emphasis>roxie</emphasis>" user is a valid HPCC Systems
+              authenticated user.</para>
             </listitem>
 
             <listitem>
@@ -761,10 +765,10 @@
     <sect3 id="UsingLDAP_theInitldapUtility">
       <title>The initldap Utility</title>
 
-      <para>The initldap utility creates the HPCC Systems Administrator's user account
-      and the HPCC Systems OUs for a newly defined LDAP server. The initldap utility
-      extracts these settings from the LDAPServer component(s) in the
-      environment.xml bound to the configured ESPs.</para>
+      <para>The initldap utility creates the HPCC Systems Administrator's user
+      account and the HPCC Systems OUs for a newly defined LDAP server. The
+      initldap utility extracts these settings from the LDAPServer
+      component(s) in the environment.xml bound to the configured ESPs.</para>
 
       <para>You run the <emphasis role="bold">initldap</emphasis> utility once
       you complete your configuration with LDAP components enabled and have
@@ -788,32 +792,6 @@ Ready to initialize HPCC Systems LDAP Environment, using the following settings
        HPCC Admin User : HPCCAdmin389
 Proceed?  y/n 
 </programlisting></para>
-    </sect3>
-
-    <sect3 id="UsingLDAP_Using_addScopesTool">
-      <title>Using the addScopes tool</title>
-
-      <para>When a new ESP user account is created, a private
-      "hpccinternal::&lt;user&gt;" file scope is also created granting new
-      users full access to that scope and restricting access to other users.
-      This file scope is used to store temporary HPCC Systems files such as spill
-      files and temp files.</para>
-
-      <para>If you are enabling LDAP file scope security and already have user
-      accounts, you should run the addScopes utility program to create the
-      hpccinternal::&lt;user&gt; scope for those existing users.</para>
-
-      <para>Users which already have this scope defined are ignored and so it
-      can be used on both new and legacy ESP user accounts safely.</para>
-
-      <para>The tool is located in the <emphasis
-      role="bold">/opt/HPCCSystems/bin/</emphasis> folder and to run it you
-      must pass the location of <emphasis role="bold">daliconf.xml</emphasis>,
-      for example:</para>
-
-      <para><programlisting>/opt/HPCCSystems/bin/addScopes /var/lib/HPCCSystems/mydali/daliconf.xml</programlisting></para>
-
-      <para>Run addScopes on the Dali node.</para>
     </sect3>
   </sect2>
 </sect1>

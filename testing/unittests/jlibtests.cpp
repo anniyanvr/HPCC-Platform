@@ -21,9 +21,15 @@
  */
 
 #ifdef _USE_CPPUNIT
-#include <memory>
+#include <algorithm>
 #include <chrono>
+#include <memory>
+#include <random>
+#include <vector>
+#include <future>
+
 #include "jsem.hpp"
+#include "jmutex.hpp"
 #include "jfile.hpp"
 #include "jdebug.hpp"
 #include "jset.hpp"
@@ -31,11 +37,1111 @@
 #include "jlzw.hpp"
 #include "jqueue.hpp"
 #include "jregexp.hpp"
+#include "jsecrets.hpp"
 #include "jutil.hpp"
+#include "junicode.hpp"
+#include "jtrace.hpp"
+
+#include "opentelemetry/sdk/common/attribute_utils.h"
+#include "opentelemetry/sdk/resource/resource.h"
 
 #include "unittests.hpp"
 
 static const unsigned oneMinute = 60000; // msec
+
+#ifdef SYNC_LOCATION
+# define JLIBTEST_SYNC_LOCATION nullptr
+#else
+# define JLIBTEST_SYNC_LOCATION 0U
+#endif
+
+class JlibTraceTest : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(JlibTraceTest);
+        //Invalid since tracemanager initialized at component load time
+        //CPPUNIT_TEST(testTraceDisableConfig);
+        CPPUNIT_TEST(testStringArrayPropegatedServerSpan);
+        CPPUNIT_TEST(testDisabledTracePropegatedValues);
+        CPPUNIT_TEST(testIDPropegation);
+        CPPUNIT_TEST(testTraceConfig);
+        CPPUNIT_TEST(testRootServerSpan);
+        CPPUNIT_TEST(testPropegatedServerSpan);
+        CPPUNIT_TEST(testGeneratedGlobalID);
+        CPPUNIT_TEST(testInvalidPropegatedServerSpan);
+        CPPUNIT_TEST(testInternalSpan);
+        CPPUNIT_TEST(testMultiNestedSpanTraceOutput);
+        CPPUNIT_TEST(testNullSpan);
+        CPPUNIT_TEST(testClientSpanGlobalID);
+        CPPUNIT_TEST(testEnsureTraceID);
+        CPPUNIT_TEST(manualTestsEventsOutput);
+        CPPUNIT_TEST(manualTestsDeclaredFailures);
+        CPPUNIT_TEST(manualTestScopeEnd);
+        CPPUNIT_TEST(manualTestBackdatedSpan);
+        CPPUNIT_TEST(testActiveSpans);
+        CPPUNIT_TEST(testSpanFetchMethods);
+        CPPUNIT_TEST(testSpanIsValid);
+        //CPPUNIT_TEST(testJTraceJLOGExporterprintResources);
+        //CPPUNIT_TEST(testJTraceJLOGExporterprintAttributes);
+        CPPUNIT_TEST(manualTestsDeclaredSpanStartTime);
+    CPPUNIT_TEST_SUITE_END();
+
+    const char * simulatedGlobalYaml = R"!!(global:
+    tracing:
+        disable: false
+        exporterx:
+          type: OTLP
+          endpoint: "localhost:4317"
+          useSslCredentials: true
+          sslCredentialsCACcert: "ssl-certificate"
+        processor:
+          type: batch
+          typex: simple
+    )!!";
+
+    const char * disableTracingYaml = R"!!(global:
+    tracing:
+        disable: true
+    )!!";
+
+    //Mock http headers from request
+    void createMockHTTPHeaders(IProperties * mockHTTPHeaders, bool validOtel)
+    {
+        if (validOtel)
+        {
+            //Trace parent declared in http headers
+            mockHTTPHeaders->setProp("traceparent", "00-beca49ca8f3138a2842e5cf21402bfff-4b960b3e4647da3f-01");
+            mockHTTPHeaders->setProp("tracestate", "hpcc=4b960b3e4647da3f");
+        }
+        else
+        {
+            //valid otel traceparent header name, invalid value
+            mockHTTPHeaders->setProp("traceparent", "00-XYZe5cf21402bfff-4b960b-f1");
+            //invalid otel tracestate header name
+            mockHTTPHeaders->setProp("state", "hpcc=4b960b3e4647da3f");
+        }
+
+        //HPCC specific headers to be propagated
+        mockHTTPHeaders->setProp(kGlobalIdHttpHeaderName, "IncomingUGID");
+        mockHTTPHeaders->setProp(kCallerIdHttpHeaderName, "IncomingCID");
+    }
+
+protected:
+
+    /*void testJTraceJLOGExporterprintAttributes()
+    {
+        StringBuffer out;
+        testJLogExporterPrintAttributes(out, {}, "attributes");
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected non-empty printattributes", true, out.length() == 0);
+
+
+        testJLogExporterPrintAttributes(out, {{"url", "https://localhost"}, {"content-length", 562}, {"content-type", "html/text"}}, "attributes");
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty printattributes", false, out.length() == 0);
+
+        Owned<IPropertyTree> jtraceAsTree;
+        try
+        {
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected leading non-comma char in printattributes", true, out.charAt(0) == ',');
+
+            out.setCharAt(0, '{');
+            out.append("}");
+
+            jtraceAsTree.setown(createPTreeFromJSONString(out.str()));
+        }
+        catch (IException *e)
+        {
+            StringBuffer msg;
+            msg.append("Unexpected printAttributes format failure detected: ");
+            e->errorMessage(msg);
+            e->Release();
+            CPPUNIT_ASSERT_MESSAGE(msg.str(), false);
+        }
+
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected printresources format failure detected", true, jtraceAsTree != nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("attributes"));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("attributes/url"));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("attributes/content-length"));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("attributes/content-type"));
+    }*/
+
+    /*void testJTraceJLOGExporterprintResources()
+    {
+        StringBuffer out;
+        auto dummyAttributes = opentelemetry::sdk::resource::ResourceAttributes
+        {
+            {"service.name", "shoppingcart"},
+            {"service.instance.id", "instance-12"}
+        };
+        auto dummyResources = opentelemetry::sdk::resource::Resource::Create(dummyAttributes);
+
+        testJLogExporterPrintResources(out, dummyResources);
+
+        Owned<IPropertyTree> jtraceAsTree;
+        try
+        {
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty printresources return", false, out.length() == 0);
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected leading non-comma char in printresources return", true, out.charAt(0) == ',');
+
+            out.setCharAt(0, '{');
+            out.append("}");
+
+            jtraceAsTree.setown(createPTreeFromJSONString(out.str()));
+        }
+        catch (IException *e)
+        {
+            StringBuffer msg;
+            msg.append("Unexpected printresources format failure detected: ");
+            e->errorMessage(msg);
+            e->Release();
+            CPPUNIT_ASSERT_MESSAGE(msg.str(), false);
+        }
+
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected printresources format failure detected", true, jtraceAsTree != nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("resources"));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("resources/service.name"));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("resources/service.instance.id"));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("resources/telemetry.sdk.language"));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("resources/telemetry.sdk.version"));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Missing resource attribute detected", true, jtraceAsTree->hasProp("resources/telemetry.sdk.name"));
+    }*/
+
+    //not able to programmatically test yet, but can visually inspect trace output
+    void manualTestsEventsOutput()
+    {
+        Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("spanWithEventsNoAtts", emptyMockHTTPHeaders);
+            Owned<IProperties> emptyEventAtts = createProperties();
+            serverSpan->addSpanEvent("event1", emptyEventAtts);
+        }
+
+        Owned<IProperties> twoEventAtt = createProperties();
+        twoEventAtt->setProp("key", "value");
+        twoEventAtt->setProp("key2", "");
+
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("spanWithEvent1Att", emptyMockHTTPHeaders);
+            serverSpan->addSpanEvent("event2", twoEventAtt);
+        }//{ "type": "span", "name": "spanWithEvents1Att", "trace_id": "3b9f55aaf8fab51fb0d73a32db7d704f", "span_id": "2a25a44ae0b3abe0", "start": 1709696036335278770, "duration": 3363911469, "events":[ { "name": "event2", "time_stamp": 1709696038413023245, "attributes": {"key": "value" } } ] }
+
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("spanWith2Events", emptyMockHTTPHeaders);
+            serverSpan->addSpanEvent("event1", twoEventAtt);
+            serverSpan->addSpanEvent("event2", twoEventAtt);
+        }//{ "type": "span", "name": "spanWith2Events", "trace_id": "ff5c5919b9c5f85913652b77f289bf0b", "span_id": "82f91ca1f9d469c1", "start": 1709698012480805016, "duration": 2811601377, "events":[ { "name": "event1", "time_stamp": 1709698013294323139, "attributes": {"key": "value" } },{ "name": "event2", "time_stamp": 1709698014500350802, "attributes": {"key": "value" } } ] }
+    }
+    //not able to programmatically test yet, but can visually inspect trace output
+    void manualTestsDeclaredSpanStartTime()
+    {
+        Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+        SpanTimeStamp declaredSpanStartTime;
+        declaredSpanStartTime.setNow(); // must be initialized via setNow(), or setMSTickTime
+        MilliSleep(125);
+
+        {
+            //duration should be at least 125 milliseconds
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("declaredSpanStartTime", emptyMockHTTPHeaders, &declaredSpanStartTime);
+            //{ "type": "span", "name": "declaredSpanStartTime", "trace_id": "0a2eff24e1996540056745aaeb2f5824", "span_id": "46d0faf8b4da893e",
+            //"start": 1702672311203213259, "duration": 125311051 }
+
+            SpanTimeStamp clientSpanTimeStamp(true);
+            MilliSleep(20);
+            OwnedActiveSpanScope clientSpan = serverSpan->createClientSpan("clientSpanStartTime", &clientSpanTimeStamp);
+            //{ "type": "span", "name": "clientSpanStartTime", "trace_id": "f73b171fdcd120f88ca5b656866befee", "span_id": "7c798125d10ee0ec",
+            //"start": 1727200325699918374, "duration": 20256156, "parent_span_id": "b79fe15b7d727fca" }
+        }
+
+        auto reqStartMSTick = msTick();
+        // a good test would track chrono::system_clock::now() at the point of span creation
+        // ensure a measurable sleep time between reqStartMSTick and msTickOffsetTimeStamp
+        // then compare OTel reported span start timestamp to span creation-time timestamp
+        SpanTimeStamp msTickOffsetTimeStamp;
+        msTickOffsetTimeStamp.setMSTickTime(reqStartMSTick);
+        //sleep for 50 milliseconds after span creation and mstick offset, expect at least 50 milliseconds duration output
+        MilliSleep(50);
+
+        {
+            SpanTimeStamp nowTimeStamp(true); //not used, printed out as "start" time for manual comparison
+            {
+                OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("msTickOffsetStartTime", emptyMockHTTPHeaders, &msTickOffsetTimeStamp);
+
+                unsigned clientStartMS = msTick();
+                MilliSleep(20);
+                SpanTimeStamp clientSpanTimeStamp;
+                clientSpanTimeStamp.setMSTickTime(clientStartMS);
+                OwnedActiveSpanScope clientSpan = serverSpan->createClientSpan("clientSpanOffsetTime", &clientSpanTimeStamp);
+                //{ "type": "span", "name": "clientSpanOffsetTime", "trace_id": "9a41723ddc0048d854ab34b79340e749", "span_id": "11af70aa6a6dbee3",
+                //"start": 1727200325770619773, "duration": 20015542, "parent_span_id": "531ad336071f453b" }
+            }
+
+            DBGLOG("MsTickOffset span actual start-time timestamp: %lld", (long long)(nowTimeStamp.systemClockTime).count());
+            //14:49:13.776139   904 MsTickOffset span actual start-time timestamp: 1702669753775893057
+            //14:49:13.776082   904 { "type": "span", "name": "msTickOffsetStartTime", "trace_id": "6e89dd6082ff647daed523089f032240", "span_id": "fd359b41a0a9626d",
+            //"start": 1702669753725771035, "duration": 50285323 }
+            //Actual start - declared start: 1702669753775893057-1702669753725771035 = 50162022
+        }
+
+        //uninitialized SpanTimeStamp will be ignored, and current time will be used
+        SpanTimeStamp uninitializedTS;
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected initialized spanTimeStamp", false, uninitializedTS.isInitialized());
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected initialized spanTimeStamp", true, uninitializedTS.systemClockTime == std::chrono::nanoseconds::zero());
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected initialized spanTimeStamp", true, uninitializedTS.steadyClockTime == std::chrono::nanoseconds::zero());
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("uninitializeddeclaredSpanStartTime", emptyMockHTTPHeaders, &uninitializedTS);
+            //sleep for 75 milliseconds after span creation, expect at least 75 milliseconds duration output
+            MilliSleep(75);
+
+            //14:22:37.865509 30396 { "type": "span", "name": "uninitializeddeclaredSpanStartTime", "trace_id": "f7844c5c09b413e008f912ded0e12dec", "span_id": "7fcf9042a090c663",
+            //"start": 1702668157790080022,
+            //"duration": 75316248 }
+        }
+    }
+
+    //not able to programmatically test yet, but can visually inspect trace output
+    void manualTestsDeclaredFailures()
+    {
+        Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("defaultErrorSpan", emptyMockHTTPHeaders);
+            serverSpan->recordError();
+        }//{ "type": "span", "name": "defaultErrorSpan", "trace_id": "209b5d8cea0aec9785d2dfa3117e37ad", "span_id": "ab72e76c2f2466c2", "start": 1709675278129335702, "duration": 188292867932, "status": "Error", "kind": "Server", "instrumented_library": "unittests", "events":[ { "name": "Exception", "time_stamp": 1709675465508149013, "attributes": {"escaped": 0 } } ] }
+
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("defaultErrorSpanStruct", emptyMockHTTPHeaders);
+            SpanError error;
+            serverSpan->recordError(error);
+        }//{ "type": "span", "name": "defaultErrorSpanStruct", "trace_id": "19803a446b971f2e0bdddc9c00db50fe", "span_id": "04c93a91ab8785a2", "start": 1709675487767044352, "duration": 2287497219, "status": "Error", "kind": "Server", "instrumented_library": "unittests", "events":[ { "name": "Exception", "time_stamp": 1709675489216412154, "attributes": {"escaped": 0 } } ] }
+
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("failedErrorSpanEscaped", emptyMockHTTPHeaders);
+            serverSpan->recordError(SpanError("hello", -1, true, true)); //error message hello, no error code, error caused failure, and error caused escape
+        }//{ "type": "span", "name": "failedErrorSpanEscaped", "trace_id": "634f386c18a6140544c980e0d5a15905", "span_id": "e2f59c48f63a8f82", "start": 1709675508231168974, "duration": 7731717678, "status": "Error", "kind": "Server", "description": "hello", "instrumented_library": "unittests", "events":[ { "name": "Exception", "time_stamp": 1709675512164430668, "attributes": {"escaped": 1,"message": "hello" } } ] }
+
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("failedErrEscapedMsgErrCode", emptyMockHTTPHeaders);
+            serverSpan->recordError(SpanError("hello", 34, true, true)); //error message hello, error code 34, error caused failure, and error caused escape
+        }//failedErrEscapedMsgErrCode
+
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("containsErrorAndMessageSpan", emptyMockHTTPHeaders);
+            serverSpan->recordError(SpanError("Error Message!!"));
+        }//{ "type": "span", "name": "containsErrorAndMessageSpan", "trace_id": "9a6e00ea309bc0427733f9b2d452f9e2", "span_id": "de63e9c69b64e411", "start": 1709675552302360510, "duration": 5233037523, "status": "Error", "kind": "Server", "description": "Error Message!!", "instrumented_library": "unittests", "events":[ { "name": "Exception", "time_stamp": 1709675555149852711, "attributes": {"escaped": 0,"message": "Error Message!!" } }
+
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("containsErrorAndMessageFailedNotEscapedSpan", emptyMockHTTPHeaders);
+            serverSpan->recordError(SpanError("Error Message!!", 23, true, false));
+        }//{ "type": "span", "name": "containsErrorAndMessageFailedNotEscapedSpan", "trace_id": "02f4b2d215f8230b15063862f8a91e41", "span_id": "c665ec371d6db147", "start": 1709675573581678954, "duration": 3467489486, "status": "Error", "kind": "Server", "description": "Error Message!!", "instrumented_library": "unittests", "events":[ { "name": "Exception", "time_stamp": 1709675576145074240, "attributes": {"code": 23,"escaped": 0,"message": "Error Message!!" } } ] }
+
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("mockExceptionSpanNotFailedNotEscaped", emptyMockHTTPHeaders);
+            serverSpan->recordException( makeStringExceptionV(76,"Mock exception"), false, false);
+        }//{ "type": "span", "name": "mockExceptionSpanNotFailedNotEscaped", "trace_id": "e01766474db05ce9085943fa3955cd73", "span_id": "7da620e96e10e42c", "start": 1709675595987480704, "duration": 2609091267, "status": "Unset", "kind": "Server", "instrumented_library": "unittests", "events":[ { "name": "Exception", "time_stamp": 1709675597728975355, "attributes": {"code": 76,"escaped": 0,"message": "Mock exception" } } ]
+
+        {
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("thrownExceptionSpan", emptyMockHTTPHeaders);
+            try
+            {
+                throw makeStringExceptionV( 356, "Mock thrown exception");
+            }
+            catch (IException *e)
+            {
+                serverSpan->recordException(e, false, true);
+                e->Release();
+            }
+        }//{ "type": "span", "name": "thrownExceptionSpan", "trace_id": "4d6225e1cefdc6823d1134c71c522426", "span_id": "07f7bd070e008f53", "start": 1709675614823881961, "duration": 4665288686, "status": "Unset", "kind": "Server", "instrumented_library": "unittests", "events":[ { "name": "Exception", "time_stamp": 1709675616485586471, "attributes": {"code": 356,"escaped": 1,"message": "Mock thrown exception" } } ] }
+    }
+    //not able to programmatically test yet, but can visually inspect trace output
+    void manualTestScopeEnd()
+    {
+        Owned<ISpan> savedSpan;
+        {
+            SpanFlags flags = SpanFlags::EnsureTraceId;
+            Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+            OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("mySpan", emptyMockHTTPHeaders, flags);
+            DBGLOG("mySpan is alive");
+            savedSpan.set(serverSpan);
+        }//{ "type": "span", "name": "mySpan", "trace_id": "fe266416e7d588113a5131394d913ab4", "span_id": "7ac62328b04442c5", "start": 1709824793826023368, "duration": 16952 }
+        //NB: Duration for the span should be << 100,000,000ns
+        //If logging is asynchronous the log message may appear after the following logging line
+        DBGLOG("mySpan is finished");
+        Sleep(100);
+
+        //Check that the attributes are still accessible even though the span has ended
+        Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+        savedSpan->getSpanContext(retrievedSpanCtxAttributes.get());
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty TraceID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("traceID")));
+        savedSpan.clear();
+    }
+
+    void nullSpanTest()
+    {
+        Owned<ISpan> nullSpan = getNullSpan();
+        CPPUNIT_ASSERT(nullSpan->queryTraceId() != nullptr);
+        CPPUNIT_ASSERT(nullSpan->querySpanId() != nullptr);
+        CPPUNIT_ASSERT(nullSpan->queryGlobalId() != nullptr);
+        CPPUNIT_ASSERT(nullSpan->queryCallerId() != nullptr);
+        CPPUNIT_ASSERT(nullSpan->queryLocalId() != nullptr);
+    }
+
+    void testTraceDisableConfig()
+    {
+        Owned<IPropertyTree> testTree = createPTreeFromYAMLString(disableTracingYaml, ipt_none, ptr_ignoreWhiteSpace, nullptr);
+        Owned<IPropertyTree> traceConfig = testTree->getPropTree("global");
+
+        //Not valid, due to tracemanager initialized at component load time
+        initTraceManager("somecomponent", traceConfig, nullptr);
+    }
+
+    void testEnsureTraceID()
+    {
+        SpanFlags flags = SpanFlags::EnsureTraceId;
+        Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("noRemoteParentEnsureTraceID", emptyMockHTTPHeaders, flags);
+
+        Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+        serverSpan->getSpanContext(retrievedSpanCtxAttributes.get());
+
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty TraceID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("traceID")));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty SpanID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("spanID")));
+    }
+
+    void testSpanIsValid()
+    {
+        OwnedActiveSpanScope nullSpan = getNullSpan();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullptr nullspan detected", true, nullSpan != nullptr);
+
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected valid nullspan detected", false, nullSpan->isValid());
+
+        const char * nullSpanTraceID = nullSpan->queryTraceId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan TraceID==nullptr", false, nullSpanTraceID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan TraceID length", strlen("00000000000000000000000000000000"), strlen(nullSpanTraceID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan TraceID value", 0, strcmp("00000000000000000000000000000000", nullSpanTraceID));
+
+        const char * nullSpanSpanID = nullSpan->querySpanId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan SpanID==nullptr", false, nullSpanSpanID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan SpanID length", strlen("0000000000000000"), strlen(nullSpanSpanID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan SpanID value", 0, strcmp("0000000000000000", nullSpanSpanID));
+
+        const char * nullSpanGlobalID = nullSpan->queryGlobalId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan GlobalID==nullptr", false, nullSpanGlobalID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan GlobalID length", strlen("11111111111111111111111"), strlen(nullSpanGlobalID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan GlobalID value", 0, strcmp("11111111111111111111111", nullSpanGlobalID));
+
+        const char * nullSpanCallerID = nullSpan->queryCallerId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan CallerID==nullptr", false, nullSpanCallerID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan CallerID length", strlen(""), strlen(nullSpanCallerID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan CallerID value", 0, strcmp("", nullSpanCallerID));
+
+        const char * nullSpanLocalID = nullSpan->queryLocalId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan LocalID==nullptr", false, nullSpanLocalID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan LocalID length", strlen("11111111111111111111111"), strlen(nullSpanLocalID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspan LocalID value", 0, strcmp("11111111111111111111111", nullSpanLocalID));
+
+        OwnedActiveSpanScope nullSpanChild = nullSpan->createClientSpan("nullSpanChild");
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullptr nullSpanChild detected", true, nullSpanChild != nullptr);
+
+        const char * nullSpanChildTraceID = nullSpanChild->queryTraceId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild TraceID==nullptr", false, nullSpanChildTraceID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild TraceID length", strlen("00000000000000000000000000000000"), strlen(nullSpanChildTraceID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild TraceID value", 0, strcmp("00000000000000000000000000000000", nullSpanChildTraceID));
+
+        const char * nullSpanChildSpanID = nullSpanChild->querySpanId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild SpanID==nullptr", false, nullSpanChildSpanID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild SpanID length", strlen("0000000000000000"), strlen(nullSpanChildSpanID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild SpanID value", 0, strcmp("0000000000000000", nullSpanChildSpanID));
+
+        const char * nullSpanChildGlobalID = nullSpanChild->queryGlobalId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild GlobalID==nullptr", false, nullSpanGlobalID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild GlobalID length", strlen("11111111111111111111111"), strlen(nullSpanChildGlobalID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild GlobalID value", 0, strcmp("11111111111111111111111", nullSpanChildGlobalID));
+
+        const char * nullSpanChildCallerID = nullSpanChild->queryCallerId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild CallerID==nullptr", false, nullSpanChildCallerID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild CallerID length", strlen(""), strlen(nullSpanChildCallerID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild CallerID value", 0, strcmp("", nullSpanChildCallerID));
+
+        const char * nullSpanChildLocalID = nullSpanChild->queryLocalId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild LocalID==nullptr", false, nullSpanChildLocalID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild LocalID length", strlen("11111111111111111111111"), strlen(nullSpanChildLocalID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullspanChild LocalID value", 0, strcmp("11111111111111111111111", nullSpanChildLocalID));
+
+
+        Owned<IProperties> mockHTTPHeaders = createProperties();
+        createMockHTTPHeaders(mockHTTPHeaders, true);
+
+        OwnedActiveSpanScope validSpan = queryTraceManager().createServerSpan("validSpan", mockHTTPHeaders);
+
+        const char * validSpanTraceID = validSpan->queryTraceId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan TraceID==nullptr", false, validSpanTraceID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan TraceID length", strlen("00000000000000000000000000000000"), strlen(validSpanTraceID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan TraceID value", true, strcmp("00000000000000000000000000000000", validSpanTraceID)!=0);
+
+        const char * validSpanSpanID = validSpan->querySpanId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan SpanID==nullptr", false, validSpanSpanID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan SpanID length", strlen("0000000000000000"), strlen(validSpanSpanID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan SpanID value", true, strcmp("0000000000000000", validSpanSpanID)!=0);
+
+        const char * validSpanGlobalID = validSpan->queryGlobalId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan GlobalID==nullptr", false, validSpanGlobalID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan GlobalID value", true, strcmp("11111111111111111111111", validSpanGlobalID)!=0);
+
+        const char * validSpanCallerID = validSpan->queryCallerId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan SpanID==nullptr", false, validSpanCallerID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan SpanID value", true, strcmp("", validSpanCallerID)!=0);
+
+        const char * validSpanLocalID = validSpan->queryLocalId();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan SpanID==nullptr", false, validSpanLocalID==nullptr);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected validSpan SpanID value", true, strcmp("11111111111111111111111", validSpanLocalID)!=0);
+
+    }
+
+    void testSpanFetchMethods()
+    {
+        SpanFlags flags = SpanFlags::EnsureTraceId;
+        Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("noRemoteParentEnsureTraceID", emptyMockHTTPHeaders, flags);
+
+        Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+        serverSpan->getSpanContext(retrievedSpanCtxAttributes.get());
+
+        const char * traceID = retrievedSpanCtxAttributes->queryProp("traceID");
+        const char * spanID = retrievedSpanCtxAttributes->queryProp("spanID");
+
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty TraceID detected", false, isEmptyString(traceID));
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty SpanID detected", false, isEmptyString(spanID));
+
+        CPPUNIT_ASSERT_MESSAGE("Queried traceID mismatch vs traceID from attributes",  strsame(serverSpan->queryTraceId(), traceID));
+        CPPUNIT_ASSERT_MESSAGE("Queried spanID mismatch vs spanID from attributes",  strsame(serverSpan->querySpanId(), spanID));
+}
+
+    void testIDPropegation()
+    {
+        Owned<IProperties> mockHTTPHeaders = createProperties();
+        createMockHTTPHeaders(mockHTTPHeaders, true);
+
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("propegatedServerSpan", mockHTTPHeaders);
+        //at this point the serverSpan should have the following context attributes
+        //traceID, spanID, remoteParentSpanID, traceFlags, traceState, globalID, callerID
+
+        //retrieve serverSpan context with the intent to interrogate attributes
+        {
+            Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+            serverSpan->getSpanContext(retrievedSpanCtxAttributes.get());
+
+            CPPUNIT_ASSERT_MESSAGE("Unexpected GlobalID detected",
+             strsame("IncomingUGID", retrievedSpanCtxAttributes->queryProp(kGlobalIdHttpHeaderName)));
+            CPPUNIT_ASSERT_MESSAGE("Unexpected CallerID detected",
+             strsame("IncomingCID", retrievedSpanCtxAttributes->queryProp(kCallerIdHttpHeaderName)));
+            CPPUNIT_ASSERT_MESSAGE("Unexpected Declared Parent SpanID detected",
+             strsame("4b960b3e4647da3f", retrievedSpanCtxAttributes->queryProp("remoteParentSpanID")));
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty TraceID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("traceID")));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty SpanID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("spanID")));
+        }
+
+        //retrieve serverSpan context with the intent to propagate it to a remote child span
+        {
+            Owned<IProperties> retrievedClientHeaders = createProperties();
+            serverSpan->getClientHeaders(retrievedClientHeaders.get());
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("getClientHeaders failed to produce traceParent!", true, retrievedClientHeaders->hasProp("traceparent"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected Otel traceparent header len detected", (size_t)55,
+             strlen(retrievedClientHeaders->queryProp("traceparent")));
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("getClientHeaders failed to produce traceState!", true, retrievedClientHeaders->hasProp("tracestate"));
+            const char * tracestate = retrievedClientHeaders->queryProp("tracestate");
+            CPPUNIT_ASSERT_MESSAGE("Unexpected traceState detected",
+             strsame("hpcc=4b960b3e4647da3f", retrievedClientHeaders->queryProp("tracestate")));
+        }
+    }
+
+    void testTraceConfig()
+    {
+        Owned<IPropertyTree> testTree = createPTreeFromYAMLString(simulatedGlobalYaml, ipt_none, ptr_ignoreWhiteSpace, nullptr);
+        Owned<IPropertyTree> traceConfig = testTree->getPropTree("global");
+
+         initTraceManager("somecomponent", traceConfig, nullptr);
+    }
+
+    void testNullSpan()
+    {
+        if (!queryTraceManager().isTracingEnabled())
+        {
+            DBGLOG("Skipping testNullSpan, tracing is not enabled");
+            return;
+        }
+
+        OwnedActiveSpanScope nullSpan = getNullSpan();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullptr nullspan detected", true, nullSpan != nullptr);
+
+        {
+            Owned<IProperties> headers = createProperties(true);
+            nullSpan->getClientHeaders(headers);
+        }
+
+        OwnedActiveSpanScope nullSpanChild = nullSpan->createClientSpan("nullSpanChild");
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected nullptr nullSpanChild detected", true, nullSpanChild != nullptr);
+    }
+
+    void testClientSpan()
+    {
+        Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("propegatedServerSpan", emptyMockHTTPHeaders);
+        Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+        serverSpan->getSpanContext(retrievedSpanCtxAttributes);
+
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty spanID detected", true, retrievedSpanCtxAttributes->hasProp("spanID"));
+        const char * serverSpanID = retrievedSpanCtxAttributes->queryProp("spanID");
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty traceID detected", true, retrievedSpanCtxAttributes->hasProp("traceID"));
+        const char * serverTraceID = retrievedSpanCtxAttributes->queryProp("traceID");
+
+        {
+            OwnedActiveSpanScope internalSpan = serverSpan->createClientSpan("clientSpan");
+            //retrieve clientSpan context with the intent to propogate otel and HPCC context
+            {
+                Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+                internalSpan->getSpanContext(retrievedSpanCtxAttributes);
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing localParentSpanID detected", true,
+                 retrievedSpanCtxAttributes->hasProp("localParentSpanID"));
+
+                CPPUNIT_ASSERT_MESSAGE("Mismatched localParentSpanID detected",
+                 strsame(serverSpanID, retrievedSpanCtxAttributes->queryProp("localParentSpanID")));
+
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing remoteParentID detected", true,
+                 retrievedSpanCtxAttributes->hasProp("remoteParentID"));
+
+                CPPUNIT_ASSERT_MESSAGE("Unexpected CallerID detected",
+                 strsame(serverTraceID, retrievedSpanCtxAttributes->queryProp("remoteParentID")));
+
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected GlobalID detected", false,
+                retrievedSpanCtxAttributes->hasProp(kGlobalIdHttpHeaderName));
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected CallerID detected", false,
+                retrievedSpanCtxAttributes->hasProp(kCallerIdHttpHeaderName));
+
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected Declared Parent SpanID detected", false,
+                retrievedSpanCtxAttributes->hasProp("remoteParentSpanID"));
+
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty TraceID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("traceID")));
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty SpanID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("spanID")));
+            }
+        }
+    }
+
+    void testInternalSpan()
+    {
+        Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("propegatedServerSpan", emptyMockHTTPHeaders);
+
+        Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+        serverSpan->getSpanContext(retrievedSpanCtxAttributes);
+
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty spanID detected", true, retrievedSpanCtxAttributes->hasProp("spanID"));
+        const char * serverSpanID = retrievedSpanCtxAttributes->queryProp("spanID");
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty traceID detected", true, retrievedSpanCtxAttributes->hasProp("traceID"));
+        const char * serverTraceID = retrievedSpanCtxAttributes->queryProp("traceID");
+
+        {
+            OwnedActiveSpanScope internalSpan = serverSpan->createInternalSpan("internalSpan");
+
+            //retrieve internalSpan context with the intent to interrogate attributes
+            {
+                Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+                internalSpan->getSpanContext(retrievedSpanCtxAttributes);
+
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing localParentSpanID detected", true,
+                 retrievedSpanCtxAttributes->hasProp("localParentSpanID"));
+
+                CPPUNIT_ASSERT_MESSAGE("Mismatched localParentSpanID detected",
+                 strsame(serverSpanID, retrievedSpanCtxAttributes->queryProp("localParentSpanID")));
+
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected remoteParentSpanID detected", false,
+                 retrievedSpanCtxAttributes->hasProp("remoteParentSpanID"));
+
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected GlobalID detected", false,
+                 retrievedSpanCtxAttributes->hasProp(kGlobalIdHttpHeaderName));
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected CallerID detected", false,
+                 retrievedSpanCtxAttributes->hasProp(kCallerIdHttpHeaderName));
+
+
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected Declared Parent SpanID detected", false,
+                 retrievedSpanCtxAttributes->hasProp("remoteParentSpanID"));
+
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty TraceID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("traceID")));
+                CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty SpanID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("spanID")));
+            }
+        }
+    }
+
+    //not able to programmatically test yet, but can visually inspect trace output
+    void manualTestBackdatedSpan()
+    {
+        Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("propegatedServerSpan", emptyMockHTTPHeaders);
+
+        Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+        serverSpan->getSpanContext(retrievedSpanCtxAttributes);
+
+        {
+            OwnedActiveSpanScope internalSpan = createBackdatedInternalSpan("internalSpan", 1'000'000'000);
+            DBGLOG("Now = %llu", (__uint64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        }
+        //Now = 1747317725729197367
+        //{ "type": "span", "name": "internalSpan", "trace_id": "c15305e4d2a6c20a87a49bd20449d996", "span_id": "4d2d7e5de8d008f5", "start": 1747317724729151340, "duration": 1000059222, "parent_span_id": "bfb21030afbf51ac" }
+        //NOTE: The start time should be 1,000,000,000ns before now, and the duration should be at least 1,000,000,000
+    }
+
+
+    void testRootServerSpan()
+    {
+        Owned<IProperties> emptyMockHTTPHeaders = createProperties();
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("propegatedServerSpan", emptyMockHTTPHeaders);
+
+        //retrieve serverSpan context with the intent to propagate it to a remote child span
+        {
+            Owned<IProperties> retrievedClientHeaders = createProperties();
+            serverSpan->getClientHeaders(retrievedClientHeaders);
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("getClientHeaders failed to produce traceParent!", true, retrievedClientHeaders->hasProp("traceparent"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected Otel traceparent header len detected", (size_t)55,
+             strlen(retrievedClientHeaders->queryProp("traceparent")));
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("detected unexpected tracestate from getClientHeaders", false, retrievedClientHeaders->hasProp("tracestate"));
+        }
+
+        //retrieve serverSpan context with the intent to interrogate attributes
+        {
+            Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+            serverSpan->getSpanContext(retrievedSpanCtxAttributes);
+            //at this point the serverSpan should have the following context attributes
+            //traceID, spanID //but no remoteParentSpanID, globalID, callerID
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected GlobalID detected", false,
+             retrievedSpanCtxAttributes->hasProp(kGlobalIdHttpHeaderName));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected CallerID detected", false,
+             retrievedSpanCtxAttributes->hasProp(kCallerIdHttpHeaderName));
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected Declared Parent SpanID detected", false,
+             retrievedSpanCtxAttributes->hasProp("remoteParentSpanID"));
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty TraceID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("traceID")));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty SpanID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("spanID")));
+        }
+    }
+
+    void testActiveSpans()
+    {
+        {
+            Owned<IProperties> spanContext = createProperties();
+            ISpan * activeSpan =  queryThreadedActiveSpan();
+
+            CPPUNIT_ASSERT_MESSAGE("Threaded Active Span == nullptr!", activeSpan != nullptr);
+
+            activeSpan->getSpanContext(spanContext);
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected TraceID detected when no active trace/span expected", false, spanContext->hasProp("traceID"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected SpanID detected when no active trace/span expected", false, spanContext->hasProp("spanID"));
+        }
+
+        {
+            Owned<IProperties> mockHTTPHeaders = createProperties();
+            createMockHTTPHeaders(mockHTTPHeaders, false);
+            ISpan * notActiveSpan = queryTraceManager().createServerSpan("notActiveSpan", mockHTTPHeaders);
+
+            CPPUNIT_ASSERT_MESSAGE("Not Active Span == nullptr!", notActiveSpan != nullptr);
+            Owned<IProperties> spanContext = createProperties();
+            notActiveSpan->getSpanContext(spanContext);
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing TraceID detected", true, spanContext->hasProp("traceID"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing SpanID detected", true, spanContext->hasProp("spanID"));
+
+            ISpan * activeSpan2 =  queryThreadedActiveSpan();
+
+            CPPUNIT_ASSERT_MESSAGE("Threaded Active Span == nullptr!", activeSpan2 != nullptr);
+
+            Owned<IProperties> spanContext2 = createProperties();
+            activeSpan2->getSpanContext(spanContext2);
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected TraceID detected when no active trace/span expected", false, spanContext2->hasProp("traceID"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected SpanID detected when no active trace/span expected", false, spanContext2->hasProp("spanID"));
+        }
+
+        {
+            Owned<IProperties> mockHTTPHeaders = createProperties();
+            createMockHTTPHeaders(mockHTTPHeaders, false);
+            OwnedActiveSpanScope currentSpanScope = queryTraceManager().createServerSpan("currentSpanScope", mockHTTPHeaders);
+
+            CPPUNIT_ASSERT_MESSAGE("currentSpanScope Span == nullptr!", currentSpanScope != nullptr);
+
+            Owned<IProperties> currentSpanContext = createProperties();
+            currentSpanScope->getSpanContext(currentSpanContext);
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing TraceID detected when active trace/span expected", true, currentSpanContext->hasProp("traceID"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing SpanID detected when active trace/span expected", true, currentSpanContext->hasProp("spanID"));
+
+            ISpan * activeSpan =  queryThreadedActiveSpan();
+
+            CPPUNIT_ASSERT_MESSAGE("Threaded Active Span == nullptr!", activeSpan != nullptr);
+
+            Owned<IProperties> activeSpanContext = createProperties();
+            activeSpan->getSpanContext(activeSpanContext);
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing TraceID detected when active trace/span expected", true, activeSpanContext->hasProp("traceID"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing SpanID detected when active trace/span expected", true, activeSpanContext->hasProp("spanID"));
+
+            DBGLOG("This log entry should report traceID: '%s' and spanID: '%s'", currentSpanContext->queryProp("traceID"), currentSpanContext->queryProp("spanID"));
+            //15:07:56.490232  3788 720009f32a9db04f68f2b6545717ebe5 a7ef8749b5926acf This log entry should report traceID: '720009f32a9db04f68f2b6545717ebe5' and spanID: 'a7ef8749b5926acf'
+        }
+    }
+
+    void testInvalidPropegatedServerSpan()
+    {
+        Owned<IProperties> mockHTTPHeaders = createProperties();
+        createMockHTTPHeaders(mockHTTPHeaders, false);
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("invalidPropegatedServerSpan", mockHTTPHeaders);
+
+        Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+        serverSpan->getClientHeaders(retrievedSpanCtxAttributes.get());
+
+        const char * traceParent = retrievedSpanCtxAttributes->queryProp("remoteParentSpanID");
+        DBGLOG("testInvalidPropegatedServerSpan: traceparent: %s", traceParent);
+    }
+
+    void testDisabledTracePropegatedValues()
+    {
+        //only interested in propegated values, no local trace/span
+        //usefull if tracemanager.istraceenabled() is false
+        bool isTraceEnabled = queryTraceManager().isTracingEnabled();
+
+        if (isTraceEnabled)
+            return;
+
+        Owned<IProperties> mockHTTPHeaders = createProperties();
+        createMockHTTPHeaders(mockHTTPHeaders, true);
+
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("propegatedServerSpan", mockHTTPHeaders);
+        //at this point the serverSpan should have the following context attributes
+        //remoteParentSpanID, globalID, callerID
+
+        Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+        serverSpan->getSpanContext(retrievedSpanCtxAttributes.get());
+
+        CPPUNIT_ASSERT_MESSAGE("Unexpected GlobalID detected",
+            strsame("IncomingUGID", retrievedSpanCtxAttributes->queryProp(kGlobalIdHttpHeaderName)));
+        CPPUNIT_ASSERT_MESSAGE("Unexpected CallerID detected",
+            strsame("IncomingCID", retrievedSpanCtxAttributes->queryProp(kCallerIdHttpHeaderName)));
+
+        CPPUNIT_ASSERT_MESSAGE("Unexpected Declared Parent SpanID detected",
+            strsame("4b960b3e4647da3f", retrievedSpanCtxAttributes->queryProp("remoteParentSpanID")));
+    }
+
+    void testMultiNestedSpanTraceOutput()
+    {
+        Owned<IProperties> mockHTTPHeaders = createProperties();
+        createMockHTTPHeaders(mockHTTPHeaders, true);
+
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("propegatedServerSpan", mockHTTPHeaders);
+        OwnedActiveSpanScope clientSpan = serverSpan->createClientSpan("clientSpan");
+        OwnedActiveSpanScope internalSpan = clientSpan->createInternalSpan("internalSpan");
+        OwnedActiveSpanScope internalSpan2 = internalSpan->createInternalSpan("internalSpan2");
+
+        StringBuffer out;
+        out.set("{");
+        internalSpan2->toString(out);
+        out.append("}");
+        {
+            Owned<IPropertyTree> jtraceAsTree;
+            try
+            {
+                jtraceAsTree.setown(createPTreeFromJSONString(out.str()));
+            }
+            catch (IException *e)
+            {
+                StringBuffer msg;
+                msg.append("Unexpected toString format failure detected: ");
+                e->errorMessage(msg);
+                e->Release();
+                CPPUNIT_ASSERT_MESSAGE(msg.str(), false);
+            }
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected toString format failure detected", true, jtraceAsTree != nullptr);
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing 'TraceID' entry in toString output", true, jtraceAsTree->hasProp("TraceID"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing 'SpanID' entry in toString output", true, jtraceAsTree->hasProp("SpanID"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing 'Name' entry in toString output", true, jtraceAsTree->hasProp("Name"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing 'Type' entry in toString output", true, jtraceAsTree->hasProp("Type"));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected missing 'ParentSpan/SpanID' entry in toString output", true, jtraceAsTree->hasProp("ParentSpan/SpanID"));
+        }
+    }
+
+    void testClientSpanGlobalID()
+    {
+        Owned<IProperties> mockHTTPHeaders = createProperties();
+        createMockHTTPHeaders(mockHTTPHeaders, true); //includes global ID
+
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("propegatedServerSpan", mockHTTPHeaders);
+        OwnedActiveSpanScope clientSpan = serverSpan->createClientSpan("clientSpanWithGlobalID");
+
+        //retrieve serverSpan context with the intent to interrogate attributes
+        {
+            Owned<IProperties> retrievedClientSpanCtxAttributes = createProperties();
+            clientSpan->getSpanContext(retrievedClientSpanCtxAttributes.get());
+
+            CPPUNIT_ASSERT_MESSAGE("Unexpected GlobalID detected",
+             strsame("IncomingUGID", retrievedClientSpanCtxAttributes->queryProp(kGlobalIdHttpHeaderName)));
+            CPPUNIT_ASSERT_MESSAGE("Unexpected CallerID detected",
+             strsame("IncomingCID", retrievedClientSpanCtxAttributes->queryProp(kCallerIdHttpHeaderName)));
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty TraceID detected", false, isEmptyString(retrievedClientSpanCtxAttributes->queryProp("traceID")));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty SpanID detected", false, isEmptyString(retrievedClientSpanCtxAttributes->queryProp("spanID")));
+        }
+    }
+
+    void testPropegatedServerSpan()
+    {
+        Owned<IProperties> mockHTTPHeaders = createProperties();
+        createMockHTTPHeaders(mockHTTPHeaders, true);
+
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("propegatedServerSpan", mockHTTPHeaders);
+        //at this point the serverSpan should have the following context attributes
+        //traceID, spanID, remoteParentSpanID, traceFlags, traceState, globalID, callerID
+
+        //retrieve serverSpan context with the intent to interrogate attributes
+        {
+            Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+            serverSpan->getSpanContext(retrievedSpanCtxAttributes.get());
+
+            CPPUNIT_ASSERT_MESSAGE("Unexpected GlobalID detected",
+             strsame("IncomingUGID", retrievedSpanCtxAttributes->queryProp(kGlobalIdHttpHeaderName)));
+            CPPUNIT_ASSERT_MESSAGE("Unexpected CallerID detected",
+             strsame("IncomingCID", retrievedSpanCtxAttributes->queryProp(kCallerIdHttpHeaderName)));
+
+            CPPUNIT_ASSERT_MESSAGE("Unexpected Declared Parent SpanID detected",
+             strsame("4b960b3e4647da3f", retrievedSpanCtxAttributes->queryProp("remoteParentSpanID")));
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty TraceID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("traceID")));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty SpanID detected", false, isEmptyString(retrievedSpanCtxAttributes->queryProp("spanID")));
+        }
+
+        //retrieve serverSpan client headers with the intent to propagate them onto the next hop
+        {
+            Owned<IProperties> retrievedClientHeaders = createProperties();
+            serverSpan->getClientHeaders(retrievedClientHeaders.get());
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected Otel traceparent header len detected", (size_t)55,
+             strlen(retrievedClientHeaders->queryProp("traceparent")));
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("getClientHeaders failed to produce traceState!", true, retrievedClientHeaders->hasProp("tracestate"));
+            const char * tracestate = retrievedClientHeaders->queryProp("tracestate");
+            CPPUNIT_ASSERT_MESSAGE("Unexpected traceState detected",
+             strsame("hpcc=4b960b3e4647da3f", retrievedClientHeaders->queryProp("tracestate")));
+        }
+    }
+
+    void testGeneratedGlobalID()
+    {
+        StringArray emptyHeadersContainer;
+
+        OwnedActiveSpanScope serverSpan1 = queryTraceManager().createServerSpan("StringArrayPropegatedServerSpan1", emptyHeadersContainer, SpanFlags::EnsureGlobalId);
+        Owned<IProperties> retrievedSpanCtxAttributes1 = createProperties();
+        serverSpan1->getSpanContext(retrievedSpanCtxAttributes1.get());
+        const char * guid1 = retrievedSpanCtxAttributes1->queryProp(kGlobalIdHttpHeaderName);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty GlobalID detected", false, isEmptyString(guid1));
+
+        OwnedActiveSpanScope serverSpan2 = queryTraceManager().createServerSpan("StringArrayPropegatedServerSpan2", emptyHeadersContainer, SpanFlags::EnsureGlobalId);
+        Owned<IProperties> retrievedSpanCtxAttributes2 = createProperties();
+        serverSpan2->getSpanContext(retrievedSpanCtxAttributes2.get());
+        const char * guid2 = retrievedSpanCtxAttributes2->queryProp(kGlobalIdHttpHeaderName);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected empty GlobalID detected", false, isEmptyString(guid2));
+
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected duplicate GlobalID value detected", false, strsame(guid1, guid2));
+    }
+
+    void testStringArrayPropegatedServerSpan()
+    {
+        StringArray mockHTTPHeadersSA;
+        //mock opentel traceparent context
+        mockHTTPHeadersSA.append("traceparent:00-beca49ca8f3138a2842e5cf21402bfff-4b960b3e4647da3f-01");
+        //mock opentel tracestate https://www.w3.org/TR/trace-context/#trace-context-http-headers-format
+        mockHTTPHeadersSA.append("tracestate:hpcc=4b960b3e4647da3f");
+        mockHTTPHeadersSA.append("HPCC-Global-Id:someGlobalID");
+        mockHTTPHeadersSA.append("HPCC-Caller-Id:IncomingCID");
+
+        OwnedActiveSpanScope serverSpan = queryTraceManager().createServerSpan("StringArrayPropegatedServerSpan", mockHTTPHeadersSA);
+        //at this point the serverSpan should have the following context attributes
+        //traceID, spanID, remoteParentSpanID, traceFlags, traceState, globalID, callerID
+
+        //retrieve serverSpan context with the intent to interrogate attributes
+        {
+            Owned<IProperties> retrievedSpanCtxAttributes = createProperties();
+            serverSpan->getSpanContext(retrievedSpanCtxAttributes.get());
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected GlobalID detected", true,
+             strsame("someGlobalID", retrievedSpanCtxAttributes->queryProp(kGlobalIdHttpHeaderName)));
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected CallerID detected", true,
+             strsame("IncomingCID", retrievedSpanCtxAttributes->queryProp(kCallerIdHttpHeaderName)));
+
+            CPPUNIT_ASSERT_EQUAL_MESSAGE("Unexpected Declared Parent SpanID detected", true,
+             strsame("4b960b3e4647da3f", retrievedSpanCtxAttributes->queryProp("remoteParentSpanID")));
+        }
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( JlibTraceTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibTraceTest, "JlibTraceTest" );
+
+class JlibStringTest : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(JlibStringTest);
+        CPPUNIT_TEST(testEncodeCSVColumn);
+        CPPUNIT_TEST(testReplaceString);
+    CPPUNIT_TEST_SUITE_END();
+
+protected:
+void testEncodeCSVColumn()
+    {
+        const char * csvCol1 = "hello,world";
+        StringBuffer encodedCSV;
+        encodeCSVColumn(encodedCSV, csvCol1);
+        CPPUNIT_ASSERT_EQUAL_STR(encodedCSV.str(), "\"hello,world\"");
+
+        const char * csvCol2 = "hello world, \"how are you?\"";
+        encodedCSV.clear();
+        encodeCSVColumn(encodedCSV, csvCol2);
+        CPPUNIT_ASSERT_EQUAL_STR(encodedCSV.str(), "\"hello world, \"\"how are you?\"\"\"");
+    }
+
+    void testReplaceString()
+    {
+        // Match string at the end of the source
+        StringBuffer source("aaaaaaaaab");
+        source.replaceString("aaab", "x");
+        CPPUNIT_ASSERT_EQUAL_STR("aaaaaax", source.str());
+
+        // Match string at the end of the source and newStr is same length as oldStr
+        source.set("aaaaaaaaab");
+        source.replaceString("aaab", "xxxx");
+        CPPUNIT_ASSERT_EQUAL_STR("aaaaaaxxxx", source.str());
+
+        // Single char match at beginning of source
+        source.set("baaaaaaaaa");
+        source.replaceString("b", "x");
+        CPPUNIT_ASSERT_EQUAL_STR("xaaaaaaaaa", source.str());
+
+        // Single char match at beginning of source and newStr is shorter
+        source.set("baaaaaaaaa");
+        source.replaceString("b", "");
+        CPPUNIT_ASSERT_EQUAL_STR("aaaaaaaaa", source.str());
+
+        // Single char match at end of source
+        source.set("aaaaaaaaab");
+        source.replaceString("b", "x");
+        CPPUNIT_ASSERT_EQUAL_STR("aaaaaaaaax", source.str());
+
+        // Match string at the start of the source
+        source.set("abababab");
+        source.replaceString("aba", "xxx");
+        CPPUNIT_ASSERT_EQUAL_STR("xxxbxxxb", source.str());
+
+        // Match string at the start of the source and new string is shorter
+        source.set("abababab");
+        source.replaceString("aba", "x");
+        CPPUNIT_ASSERT_EQUAL_STR("xbxb", source.str());
+
+        // Match string at the start of the source and new string is longer
+        source.set("abababab");
+        source.replaceString("aba", "xxxx");
+        CPPUNIT_ASSERT_EQUAL_STR("xxxxbxxxxb", source.str());
+
+        // Match not found
+        source.set("aaaaa");
+        source.replaceString("bb", "xxx");
+        CPPUNIT_ASSERT_EQUAL_STR("aaaaa", source.str());
+
+        // Match not found and new string is same length as old string (Different code path)
+        source.set("aaaaa");
+        source.replaceString("bb", "xx");
+        CPPUNIT_ASSERT_EQUAL_STR("aaaaa", source.str());
+
+        // Replace string is empty
+        source.set("aabaa");
+        source.replaceString("aa", "");
+        CPPUNIT_ASSERT_EQUAL_STR("b", source.str());
+
+        // New string is empty and every character is replaced
+        source.set("aaaaa");
+        source.replaceString("a", "");
+        CPPUNIT_ASSERT_EQUAL_STR("", source.str());
+
+        // Search string is empty
+        source.set("aaaaaa");
+        source.replaceString("", "b");
+        CPPUNIT_ASSERT_EQUAL_STR("aaaaaa", source.str());
+
+        // Source string is empty
+        source.set("");
+        source.replaceString("a", "b");
+        CPPUNIT_ASSERT_EQUAL_STR("", source.str());
+
+        // Search string is longer than source string
+        source.set("a");
+        source.replaceString("aa", "b");
+        CPPUNIT_ASSERT_EQUAL_STR("a", source.str());
+
+        // Replace every character
+        source.set("aaaaa");
+        source.replaceString("a", "b");
+        CPPUNIT_ASSERT_EQUAL_STR("bbbbb", source.str());
+
+        // Replace string is longer than search string
+        source.set("abbabab");
+        source.replaceString("ab", "xxx");
+        CPPUNIT_ASSERT_EQUAL_STR("xxxbxxxxxx", source.str());
+
+        // Search string has same length as source string and matches
+        source.set("ababab");
+        source.replaceString("ababab", "xxxxxx");
+        CPPUNIT_ASSERT_EQUAL_STR("xxxxxx", source.str());
+
+        // Search string has same length as source string and replace is smaller than source
+        source.set("ababab");
+        source.replaceString("ababab", "xxx");
+        CPPUNIT_ASSERT_EQUAL_STR("xxx", source.str());
+
+        // Search string has same length as source string and replace is larger than source
+        source.set("ababab");
+        source.replaceString("ababab", "xxxxxxxxx");
+        CPPUNIT_ASSERT_EQUAL_STR("xxxxxxxxx", source.str());
+
+        // Search string has same length as source string and does not match
+        source.set("ababab");
+        source.replaceString("ababac", "xxxxxx");
+        CPPUNIT_ASSERT_EQUAL_STR("ababab", source.str());
+
+        // Search string has many matches where new string is shorter than the old string
+        source.set("abbabaabaaaababaababababaaabababababbabbbbabbabbbbbbaa");
+        source.replaceString("abab", "x");
+        CPPUNIT_ASSERT_EQUAL_STR("abbabaabaaaxaxxaaxxabbabbbbabbabbbbbbaa", source.str());
+
+        // Search string has many matches where new string is the same length as the old string
+        source.set("abbabaabaaaababaababababaaabababababbabbbbabbabbbbbbaa");
+        source.replaceString("abab", "xxxx");
+        CPPUNIT_ASSERT_EQUAL_STR("abbabaabaaaxxxxaxxxxxxxxaaxxxxxxxxabbabbbbabbabbbbbbaa", source.str());
+
+        // Search string has many matches where new string is empty
+        source.set("abbabaabaaaababaababababaaabababababbabbbbabbabbbbbbaa");
+        source.replaceString("abab", "");
+        CPPUNIT_ASSERT_EQUAL_STR("abbabaabaaaaaaabbabbbbabbabbbbbbaa", source.str());
+
+        // HPCC-32795
+        source.set("ou=roxieuser,ou=hpccinternal,ou=files,ou=dataland_ecl");
+        source.replaceString("ou=files,ou=dataland_ecl", nullptr);
+        CPPUNIT_ASSERT_EQUAL_STR("ou=roxieuser,ou=hpccinternal,", source.str());
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( JlibStringTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibStringTest, "JlibStringTest" );
 
 class JlibSemTest : public CppUnit::TestFixture
 {
@@ -66,7 +1172,7 @@ protected:
     void testSimple()
     {
         //Some very basic semaphore tests.
-        Semaphore sem;
+        Semaphore sem{SYNC_LOCATION};
         sem.signal();
         sem.wait();
         testTimedElapsed(sem, 100);
@@ -125,7 +1231,7 @@ protected:
     void testSimple()
     {
         //Very basic semaphore stress tests.
-        Semaphore sem;
+        Semaphore sem{SYNC_LOCATION};
         sem.signal();
         if (!sem.wait(1000))
         {
@@ -295,13 +1401,13 @@ protected:
         CppUnit::Exception *cppunitException;
     public:
         CBitThread(IBitSet &_bitSet, unsigned _startBit, unsigned _numBits, bool _initial)
-            : threaded("CBitThread", this), bitSet(_bitSet), startBit(_startBit), numBits(_numBits), initial(_initial)
+            : bitSet(_bitSet), startBit(_startBit), numBits(_numBits), initial(_initial), threaded("CBitThread", this)
         {
             cppunitException = NULL;
             setValue = !initial;
             clearValue = initial;
         }
-        void start() { threaded.start(); }
+        void start() { threaded.start(false); }
         void join()
         {
             threaded.join();
@@ -470,27 +1576,25 @@ protected:
         unsigned fsize = (unsigned)(((double)nr * (double)rs) / (1024.0 * 1024.0));
 
         fflush(NULL);
-        fprintf(stdout,"\n");
-        fflush(NULL);
 
         for(int j=0; j<2; j++)
         {
             if (j==0)
-                fprintf(stdout, "File size: %d (MB) Cache, ", fsize);
+                DBGLOG("File size: %d (MB) Cache", fsize);
             else
-                fprintf(stdout, "\nFile size: %d (MB) Nocache, ", fsize);
+                DBGLOG("File size: %d (MB) Nocache", fsize);
 
             if (server != NULL)
             {
                 SocketEndpoint ep;
                 ep.set(server, 7100);
                 ifile = createRemoteFile(ep, tmpfile);
-                fprintf(stdout, "Remote: (%s)\n", server);
+                DBGLOG("Remote: (%s)", server);
             }
             else
             {
                 ifile = createIFile(tmpfile);
-                fprintf(stdout, "Local:\n");
+                DBGLOG("Local:");
             }
 
             ifile->remove();
@@ -513,7 +1617,7 @@ protected:
             }
             catch (...)
             {
-                fprintf(stdout, "ifile->setFilePermissions() exception\n");
+                DBGLOG("ifile->setFilePermissions() exception");
             }
 
             unsigned iter = nr / 40;
@@ -537,7 +1641,7 @@ protected:
             double rsec = (double)(msTick() - st)/1000.0;
             unsigned iorate = (unsigned)((double)fsize / rsec);
 
-            fprintf(stdout, "\nwrite - elapsed time = %6.2f (s) iorate = %4d (MB/s)\n", rsec, iorate);
+            DBGLOG("write - elapsed time = %6.2f (s) iorate = %4d (MB/s)", rsec, iorate);
 
             st = msTick();
 
@@ -563,7 +1667,7 @@ protected:
             rsec = (double)(msTick() - st)/1000.0;
             iorate = (unsigned)((double)fsize / rsec);
 
-            fprintf(stdout, "\nread -- elapsed time = %6.2f (s) iorate = %4d (MB/s)\n", rsec, iorate);
+            DBGLOG("read -- elapsed time = %6.2f (s) iorate = %4d (MB/s)", rsec, iorate);
 
             ifileio->Release();
             ifile->remove();
@@ -598,10 +1702,317 @@ protected:
     }
 };
 
+class JlibRemoteFileIOHandleStress : public CppUnit::TestFixture
+{
+protected:
+    CPPUNIT_TEST_SUITE( JlibRemoteFileIOHandleStress );
+        CPPUNIT_TEST(testDisconnectOnExitDoesNotInvalidateSiblingIO);
+        CPPUNIT_TEST(testDisconnectRemoteFileDoesNotInvalidateSiblingIO);
+    CPPUNIT_TEST_SUITE_END();
+
+    enum class DisconnectMode
+    {
+        OnExit,
+        RemoteFile
+    };
+
+    static void checkRead(IFileIO &reader, offset_t offset, const char *expected, size32_t expectedSize)
+    {
+        std::vector<char> buffer(expectedSize);
+        size32_t bytesRead = reader.read(offset, expectedSize, buffer.data());
+        if (bytesRead != expectedSize)
+            throw makeStringExceptionV(-1, "Expected %u bytes from remote file, read %u", expectedSize, bytesRead);
+        if (memcmp(expected, buffer.data(), expectedSize) != 0)
+            throw makeStringException(-1, "Unexpected data read from remote file");
+    }
+
+    static void failIfThreadFailed(const char *name, IException *error)
+    {
+        if (error)
+        {
+            StringBuffer msg;
+            msg.append(name).append(" failed: ");
+            error->errorMessage(msg);
+            CPPUNIT_FAIL(msg.str());
+        }
+    }
+
+    class SurvivingReader : public Thread
+    {
+    public:
+        SurvivingReader(IFile *_file, const char *_payload, size32_t _payloadSize, Semaphore &_startSem, Semaphore &_readerReadySem, Semaphore &_disconnectCompleteSem, std::atomic<bool> &_readerReady)
+            : Thread("SurvivingReader"), file(_file), payload(_payload), payloadSize(_payloadSize), startSem(_startSem), readerReadySem(_readerReadySem), disconnectCompleteSem(_disconnectCompleteSem), readerReady(_readerReady)
+        {
+        }
+
+        virtual int run() override
+        {
+            try
+            {
+                if (!startSem.wait(oneMinute))
+                    throw makeStringException(-1, "Timed out waiting to start surviving reader");
+
+                reader.setown(file->open(IFOread));
+                if (!reader)
+                    throw makeStringException(-1, "Failed to open surviving remote reader");
+
+                checkRead(*reader, 0, payload, payloadSize);
+                readerReady.store(true);
+                readerReadySem.signal();
+
+                if (!disconnectCompleteSem.wait(oneMinute))
+                    throw makeStringException(-1, "Timed out waiting for disconnecting reader to close");
+
+                checkRead(*reader, 0, payload, payloadSize);
+            }
+            catch (IException *e)
+            {
+                error.setown(e);
+                if (!readerReady.load())
+                    readerReadySem.signal();
+            }
+            catch (...)
+            {
+                error.setown(makeStringException(-1, "Unknown exception in surviving reader"));
+                if (!readerReady.load())
+                    readerReadySem.signal();
+            }
+            return 0;
+        }
+
+        Owned<IException> error;
+
+    private:
+        IFile *file;
+        const char *payload;
+        size32_t payloadSize;
+        Semaphore &startSem;
+        Semaphore &readerReadySem;
+        Semaphore &disconnectCompleteSem;
+        std::atomic<bool> &readerReady;
+        Owned<IFileIO> reader;
+    };
+
+    class DisconnectingReader : public Thread
+    {
+    public:
+        DisconnectingReader(IFile *_file, const char *_payload, size32_t _payloadSize, Semaphore &_readerReadySem, Semaphore &_disconnectCompleteSem, std::atomic<bool> &_readerReady, DisconnectMode _mode)
+            : Thread("DisconnectingReader"),
+              file(_file),
+              payload(_payload),
+              payloadSize(_payloadSize),
+              readerReadySem(_readerReadySem),
+              disconnectCompleteSem(_disconnectCompleteSem),
+              readerReady(_readerReady),
+              mode(_mode)
+        {
+        }
+
+        virtual int run() override
+        {
+            try
+            {
+                if (!readerReadySem.wait(oneMinute))
+                    throw makeStringException(-1, "Timed out waiting for surviving reader to open");
+                if (readerReady.load())
+                {
+                    Owned<IFileIO> reader = file->open(IFOread);
+                    if (!reader)
+                        throw makeStringException(-1, "Failed to open disconnecting remote reader");
+                    if (mode == DisconnectMode::OnExit)
+                        disconnectRemoteIoOnExit(reader);
+                    checkRead(*reader, 0, payload, payloadSize);
+                    if (mode == DisconnectMode::RemoteFile)
+                        disconnectRemoteFile(file);
+                    reader.clear();
+                }
+            }
+            catch (IException *e)
+            {
+                error.setown(e);
+            }
+            catch (...)
+            {
+                error.setown(makeStringException(-1, "Unknown exception in disconnecting reader"));
+            }
+            disconnectCompleteSem.signal();
+            return 0;
+        }
+
+        Owned<IException> error;
+
+    private:
+        IFile *file;
+        const char *payload;
+        size32_t payloadSize;
+        Semaphore &readerReadySem;
+        Semaphore &disconnectCompleteSem;
+        std::atomic<bool> &readerReady;
+        DisconnectMode mode;
+    };
+
+    void testDisconnectOnExitDoesNotInvalidateSiblingIO()
+    {
+        testDeferredDisconnectDoesNotInvalidateSiblingIO(DisconnectMode::OnExit);
+    }
+
+    void testDisconnectRemoteFileDoesNotInvalidateSiblingIO()
+    {
+        testDeferredDisconnectDoesNotInvalidateSiblingIO(DisconnectMode::RemoteFile);
+    }
+
+    void testDeferredDisconnectDoesNotInvalidateSiblingIO(DisconnectMode mode)
+    {
+        constexpr const char defaultPayload[] = "remote file handle lifetime regression";
+        constexpr size32_t defaultPayloadSize = sizeof(defaultPayload) - 1;
+        constexpr size32_t existingFileSampleSize = 1024;
+
+        const char *host = getenv("HPCC_UNITTEST_HOST");
+        if (!host || !*host)
+            host = "localhost";
+        const char *remoteFileName = getenv("HPCC_UNITTEST_FILE");
+        bool generatedFile = !remoteFileName || !*remoteFileName;
+
+        SocketEndpoint ep;
+        ep.set(host, 7100);
+        StringBuffer uuid;
+        StringBuffer generatedFileName;
+        if (generatedFile)
+        {
+            generatedFileName.append("/tmp/JlibRemoteFileIOHandleStress_").append(genUUID(uuid, true)).append(".txt");
+            remoteFileName = generatedFileName.str();
+        }
+        Owned<IFile> file = createRemoteFile(ep, remoteFileName);
+        struct RemoteFileCleanup
+        {
+            IFile &file;
+            bool generatedFile;
+            ~RemoteFileCleanup()
+            {
+                if (generatedFile)
+                {
+                    try
+                    {
+                        file.remove();
+                    }
+                    catch (IException *e)
+                    {
+                        e->Release();
+                    }
+                }
+            }
+        } cleanup { *file, generatedFile };
+
+        std::vector<char> payload;
+        size32_t payloadSize = 0;
+        if (generatedFile)
+        {
+            file->remove();
+            Owned<IFileIO> writer = file->open(IFOcreate);
+            CPPUNIT_ASSERT(writer != nullptr);
+            CPPUNIT_ASSERT_EQUAL(defaultPayloadSize, writer->write(0, defaultPayloadSize, defaultPayload));
+            payload.assign(defaultPayload, defaultPayload + defaultPayloadSize);
+            payloadSize = defaultPayloadSize;
+        }
+        else
+        {
+            payload.resize(existingFileSampleSize);
+            Owned<IFileIO> reader = file->open(IFOread);
+            CPPUNIT_ASSERT(reader != nullptr);
+            payloadSize = reader->read(0, existingFileSampleSize, payload.data());
+            if (!payloadSize)
+                CPPUNIT_FAIL("HPCC_UNITTEST_FILE must identify a non-empty remote file");
+            payload.resize(payloadSize);
+        }
+
+        Semaphore startSem{JLIBTEST_SYNC_LOCATION};
+        Semaphore readerReadySem{JLIBTEST_SYNC_LOCATION};
+        Semaphore disconnectCompleteSem{JLIBTEST_SYNC_LOCATION};
+        std::atomic<bool> readerReady{false};
+
+        SurvivingReader survivingReader(file.get(), payload.data(), payloadSize, startSem, readerReadySem, disconnectCompleteSem, readerReady);
+        DisconnectingReader disconnectingReader(file.get(), payload.data(), payloadSize, readerReadySem, disconnectCompleteSem, readerReady, mode);
+        survivingReader.start(false);
+        disconnectingReader.start(false);
+        startSem.signal();
+        survivingReader.join();
+        disconnectingReader.join();
+
+        failIfThreadFailed("Surviving reader", survivingReader.error);
+        failIfThreadFailed("Disconnecting reader", disconnectingReader.error);
+    }
+};
+
 CPPUNIT_TEST_SUITE_REGISTRATION( JlibFileIOTestTiming );
 CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibFileIOTestTiming, "JlibFileIOTestTiming" );
 CPPUNIT_TEST_SUITE_REGISTRATION( JlibFileIOTestStress );
-CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibFileIOTestTiming, "JlibFileIOTestStress" );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibFileIOTestStress, "JlibFileIOTestStress" );
+CPPUNIT_TEST_SUITE_REGISTRATION( JlibRemoteFileIOHandleStress );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibRemoteFileIOHandleStress, "JlibRemoteFileIOHandleStress" );
+
+/* =========================================================== */
+class JlibContainsRelPathsTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(JlibContainsRelPathsTest);
+        CPPUNIT_TEST(testWindowsPaths);
+        CPPUNIT_TEST(testPosixPaths);
+    CPPUNIT_TEST_SUITE_END();
+
+    bool testContainsRelPaths(const char * path)
+    {
+        return containsRelPaths(path);
+    };
+public:
+    void testWindowsPaths()
+    {
+        CPPUNIT_ASSERT(testContainsRelPaths("a\\b\\c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\b\\c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths(".\\a\\b\\c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("..\\a\\b\\c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("...\\a\\b\\c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\.\\a\\b\\c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\..\\a\\b\\c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\...\\a\\b\\c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\b\\c\\.") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\b\\c\\..") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\b\\c\\...") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\.\\b\\c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\..\\b\\c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\...\\b\\c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\b\\c.d\\e") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\b\\c..d\e") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\b\\c...d\\e") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("\\a\\b\\c.d.e\\f") == false);
+    }
+    void testPosixPaths()
+    {
+        CPPUNIT_ASSERT(testContainsRelPaths("a/b/c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("~/a/b/c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a~/b/c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/c~") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("./a/b/c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("../a/b/c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths(".../a/b/c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("/./a/b/c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("/../a/b/c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("/.../a/b/c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/c/.") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/c/..") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/c/...") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/./c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/../c") == true);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/.../c") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/c.d/e") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/c..d/e") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/c...d/e") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("/a/b/c.d.e/f") == false);
+        CPPUNIT_ASSERT(testContainsRelPaths("abc\\def/../g/h") == true); // The PathSepChar should be '/'.
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(JlibContainsRelPathsTest);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(JlibContainsRelPathsTest, "JlibContainsRelPathsTest");
 
 /* =========================================================== */
 
@@ -678,7 +2089,7 @@ public:
             //Check the values from the quantile iterator match those that are expected
             unsigned pos = (unsigned)iter.get();
 #if 0
-            printf("(%d,%d) %d=%d\n", numItems, numDivisions, i, pos);
+            DBGLOG("(%d,%d) %d=%d", numItems, numDivisions, i, pos);
 #endif
             if (expected)
                 CPPUNIT_ASSERT_EQUAL(expected[i], pos);
@@ -734,11 +2145,19 @@ class JlibTimingTest : public CppUnit::TestFixture
 {
     CPPUNIT_TEST_SUITE( JlibTimingTest );
         CPPUNIT_TEST(testMsTick);
+        CPPUNIT_TEST(testNsTick);
         CPPUNIT_TEST(testGetCyclesNow);
         CPPUNIT_TEST(testStdChrono);
+        CPPUNIT_TEST(testGetTimeOfDay);
+        CPPUNIT_TEST(testClockGetTimeReal);
+        CPPUNIT_TEST(testClockGetTimeMono);
+        CPPUNIT_TEST(testTimestampNow);
+        CPPUNIT_TEST(testTime);
     CPPUNIT_TEST_SUITE_END();
 
 public:
+    static constexpr unsigned scale = 10;
+    static constexpr unsigned iters = 1000000 * scale;
     JlibTimingTest()
     {
     }
@@ -747,25 +2166,91 @@ public:
     {
         unsigned startTime = msTick();
         unsigned value = 0;
-        for (unsigned i=0; i < 1000000; i++)
+        for (unsigned i=0; i < iters; i++)
             value += msTick();
-        printf("msTick() %uns = %u\n", msTick()-startTime, value);
+        DBGLOG("msTick() %uns = %u", (msTick()-startTime)/scale, value);
+    }
+    void testNsTick()
+    {
+        unsigned startTime = msTick();
+        unsigned __int64 value = 0;
+        for (unsigned i=0; i < iters; i++)
+            value += nsTick();
+        DBGLOG("nsTick() %uns = %" I64F "u", (msTick()-startTime)/scale, value);
     }
     void testGetCyclesNow()
     {
         unsigned startTime = msTick();
         unsigned value = 0;
-        for (unsigned i=0; i < 1000000; i++)
+        for (unsigned i=0; i < iters; i++)
             value += get_cycles_now();
-        printf("get_cycles_now() %uns = %u\n", msTick()-startTime, value);
+        DBGLOG("get_cycles_now() %uns = %u", (msTick()-startTime)/scale, value);
     }
     void testStdChrono()
     {
         unsigned startTime = msTick();
         unsigned value = 0;
-        for (unsigned i=0; i < 1000000; i++)
+        for (unsigned i=0; i < iters; i++)
             value += std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        printf("std::chrono::high_resolution_clock::now() %uns = %u\n", msTick()-startTime, value);
+        DBGLOG("std::chrono::high_resolution_clock::now() %uns = %u", (msTick()-startTime)/scale, value);
+    }
+    void testGetTimeOfDay()
+    {
+        unsigned startTime = msTick();
+        struct timeval tv;
+        unsigned value = 0;
+        for (unsigned i=0; i < iters; i++)
+        {
+            gettimeofday(&tv, NULL);
+            value += tv.tv_sec;
+        }
+        DBGLOG("gettimeofday() %uns = %u", (msTick()-startTime)/scale, value);
+    }
+    void testClockGetTimeReal()
+    {
+        unsigned startTime = msTick();
+        struct timespec ts;
+        unsigned value = 0;
+        for (unsigned i=0; i < iters; i++)
+        {
+            clock_gettime(CLOCK_REALTIME, &ts);
+            value += ts.tv_sec;
+        }
+        DBGLOG("clock_gettime(REALTIME) %uns = %u", (msTick()-startTime)/scale, value);
+    }
+    void testClockGetTimeMono()
+    {
+        unsigned startTime = msTick();
+        struct timespec ts;
+        unsigned value = 0;
+        for (unsigned i=0; i < iters; i++)
+        {
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            value += ts.tv_sec;
+        }
+        DBGLOG("clock_gettime(MONOTONIC) %uns = %u", (msTick()-startTime)/scale, value);
+    }
+    void testTimestampNow()
+    {
+        unsigned startTime = msTick();
+        struct timespec ts;
+        unsigned value = 0;
+        for (unsigned i=0; i < iters; i++)
+        {
+            value += getTimeStampNowValue();
+        }
+        DBGLOG("getTimeStampNowValue() %uns = %u", (msTick()-startTime)/scale, value);
+    }
+    void testTime()
+    {
+        unsigned startTime = msTick();
+        struct timespec ts;
+        unsigned value = 0;
+        for (unsigned i=0; i < iters; i++)
+        {
+            value += (unsigned)time(nullptr);
+        }
+        DBGLOG("time() %uns = %u", (msTick()-startTime)/scale, value);
     }
 };
 
@@ -795,7 +2280,7 @@ class JlibReaderWriterTestTiming : public CppUnit::TestFixture
     {
     public:
         Reader(IRowQueue & _source, Semaphore & _doneSem, unsigned _workScale)
-            : Thread("Reader"), source(_source), doneSem(_doneSem), workScale(_workScale), work(0)
+            : Thread("Reader"), source(_source), doneSem(_doneSem), work(0), workScale(_workScale)
         {
         }
 
@@ -820,7 +2305,7 @@ class JlibReaderWriterTestTiming : public CppUnit::TestFixture
     private:
         IRowQueue & source;
         Semaphore & doneSem;
-        volatile unsigned work;
+        std::atomic<unsigned> work{0};
         unsigned workScale;
     };
 
@@ -828,7 +2313,7 @@ class JlibReaderWriterTestTiming : public CppUnit::TestFixture
     {
     public:
         WriterBase(IRowQueue & _target, size_t _len, byte * _buffer, Semaphore & _startSem, Semaphore & _doneSem, unsigned _workScale)
-            : Thread("Writer"), target(_target), len(_len), buffer(_buffer), startSem(_startSem), doneSem(_doneSem), workScale(_workScale), work(0)
+            : Thread("Writer"), len(_len), buffer(_buffer), target(_target), startSem(_startSem), doneSem(_doneSem), workScale(_workScale)
         {
         }
 
@@ -838,7 +2323,7 @@ class JlibReaderWriterTestTiming : public CppUnit::TestFixture
         IRowQueue & target;
         Semaphore & startSem;
         Semaphore & doneSem;
-        volatile unsigned work;
+        std::atomic<unsigned> work{0};
         unsigned workScale;
     };
     class Writer : public WriterBase
@@ -871,22 +2356,22 @@ public:
         const size_t testSize = sizePerProducer * numProducers;
 
         OwnedMalloc<byte> buffer(bufferSize, true);
-        Semaphore startSem;
-        Semaphore writerDoneSem;
-        Semaphore stopSem;
+        Semaphore startSem{SYNC_LOCATION};
+        Semaphore writerDoneSem{SYNC_LOCATION};
+        Semaphore stopSem{SYNC_LOCATION};
 
         Reader * * consumers = new Reader *[numConsumers];
         for (unsigned i2 = 0; i2 < numConsumers; i2++)
         {
             consumers[i2] = new Reader(queue, stopSem, readerWork);
-            consumers[i2]->start();
+            consumers[i2]->start(false);
         }
 
         WriterBase * * producers = new WriterBase *[numProducers];
         for (unsigned i1 = 0; i1 < numProducers; i1++)
         {
             producers[i1] = new Writer(queue, sizePerProducer, buffer + i1 * sizePerProducer, startSem, writerDoneSem, writerWork);
-            producers[i1]->start();
+            producers[i1]->start(false);
         }
 
         cycle_t startTime = get_cycles_now();
@@ -931,11 +2416,11 @@ public:
         unsigned expectedWorkTime = std::max(expectedReadWorkTime, expectedWriteWorkTime);
         if (failures)
         {
-            printf("Fail: Test %u producers %u consumers %u queueItems %u(%u) mismatches fail(@%u=%u)\n", numProducers, numConsumers, queueElements, failures, numClear, (unsigned)failPos, failValue);
+            DBGLOG("Fail: Test %u producers %u consumers %u queueItems %u(%u) mismatches fail(@%u=%u)", numProducers, numConsumers, queueElements, failures, numClear, (unsigned)failPos, failValue);
             ASSERT(failures == 0);
         }
         else
-            printf("Pass: Test %u(@%u) producers %u(@%u) consumers %u queueItems in %ums [%dms]\n", numProducers, writerWork, numConsumers, readerWork, queueElements, timeMs, timeMs-expectedWorkTime);
+            DBGLOG("Pass: Test %u(@%u) producers %u(@%u) consumers %u queueItems in %ums [%dms]", numProducers, writerWork, numConsumers, readerWork, queueElements, timeMs, timeMs-expectedWorkTime);
 
         for (unsigned i4 = 0; i4 < numConsumers; i4++)
         {
@@ -989,7 +2474,7 @@ public:
         testQueue(127, 1, 127);
 
         cycle_t startTime = get_cycles_now();
-        volatile unsigned value = 0;
+        std::atomic<unsigned> value{0};
         for (unsigned pass = 0; pass < 10; pass++)
         {
             for (unsigned i2 = 0; i2 < bufferSize; i2++)
@@ -997,7 +2482,7 @@ public:
         }
         cycle_t stopTime = get_cycles_now();
         unitWorkTimeMs = cycle_to_nanosec(stopTime - startTime) / (1000000 * 10);
-        printf("Work(1) takes %ums\n", unitWorkTimeMs);
+        DBGLOG("Work(1) takes %ums", unitWorkTimeMs);
 
         //How does it scale with number of queue elements?
         for (unsigned elem = 16; elem < 256; elem *= 2)
@@ -1075,7 +2560,7 @@ protected:
         CCycleTimer timer;
         testPatterns(search.get(), patterns);
         if (reportTiming)
-            printf("%u: %u ms\n", length, timer.elapsedMs());
+            DBGLOG("%u: %u ms", length, timer.elapsedMs());
     }
 
     char * generateSearchString(size_t len)
@@ -1272,6 +2757,8 @@ class JlibIPTTest : public CppUnit::TestFixture
         CPPUNIT_TEST(testRootArrayMarkup);
         CPPUNIT_TEST(testArrayMarkup);
         CPPUNIT_TEST(testMergeConfig);
+        CPPUNIT_TEST(testRemoveReuse);
+        CPPUNIT_TEST(testSpecialTags);
     CPPUNIT_TEST_SUITE_END();
 
 public:
@@ -1608,19 +3095,71 @@ public:
     z: kept
 )!!";
 
+                        // with mergeListItemContent=false
+                        static constexpr const char * yamlBlockLeftStd = R"!!(a:
+  attr: left_attr
+  list:
+  - name: left_list_name1
+    x: left_x
+  - name: left_list_name2
+    x: left_x2
+  settings:
+    mode: left_mode
+    type: left_type
+  values:
+  - values_1
+  - values_2
+)!!";
+
+                        static constexpr const char * yamlBlockRightStd = R"!!(a:
+  attr: right_attr
+  list:
+  - name: right_list_name1
+    y: right_y
+  - name: right_list_name2
+    y: right_y2
+  settings:
+    mode: right_mode
+    level: right_level
+  values:
+  - values_3
+)!!";
+
+                        static constexpr const char * yamlMergedStd = R"!!(a:
+  attr: right_attr
+  list:
+  - name: right_list_name1
+    y: right_y
+  - name: right_list_name2
+    y: right_y2
+  settings:
+    level: right_level
+    mode: right_mode
+    type: left_type
+  values:
+  - values_3
+)!!";
+
+
         StringBuffer ml;
 
         Owned<IPropertyTree> treeLeft = createPTreeFromYAMLString(yamlLeft, ipt_none, ptr_ignoreWhiteSpace, nullptr);
         Owned<IPropertyTree> treeRight = createPTreeFromYAMLString(yamlRight, ipt_none, ptr_ignoreWhiteSpace, nullptr);
-        mergeConfiguration(*treeLeft, *treeRight, "@altname");
+        mergeConfiguration(*treeLeft, *treeRight, "@altname", true, true);
         toYAML(treeLeft, ml.clear(), 0, YAML_SortTags|YAML_HideRootArrayObject);
         CPPUNIT_ASSERT(streq(ml, yamlMerged));
 
         Owned<IPropertyTree> treeBlockLeft = createPTreeFromYAMLString(yamlBlockLeft, ipt_none, ptr_ignoreWhiteSpace, nullptr);
         Owned<IPropertyTree> treeBlockRight = createPTreeFromYAMLString(yamlBlockRight, ipt_none, ptr_ignoreWhiteSpace, nullptr);
-        mergeConfiguration(*treeBlockLeft, *treeBlockRight, "@altname");
+        mergeConfiguration(*treeBlockLeft, *treeBlockRight, "@altname", true, true);
         toYAML(treeBlockLeft, ml.clear(), 0, YAML_SortTags|YAML_HideRootArrayObject);
         CPPUNIT_ASSERT(streq(ml, yamlMerged));
+
+        Owned<IPropertyTree> treeBlockLeftStd = createPTreeFromYAMLString(yamlBlockLeftStd, ipt_none, ptr_ignoreWhiteSpace, nullptr);
+        Owned<IPropertyTree> treeBlockRightStd = createPTreeFromYAMLString(yamlBlockRightStd, ipt_none, ptr_ignoreWhiteSpace, nullptr);
+        mergeConfiguration(*treeBlockLeftStd, *treeBlockRightStd);
+        toYAML(treeBlockLeftStd, ml.clear(), 0, YAML_SortTags|YAML_HideRootArrayObject);
+        CPPUNIT_ASSERT(streq(ml, yamlMergedStd));
     }
 
     void testRootArrayMarkup()
@@ -1831,7 +3370,9 @@ subX:
                 "cpptestval"
                 "</cpptest>");
         MemoryBuffer mb;
-        mb.reserveTruncate(4*1024+1); // Must be > PTREE_COMPRESS_THRESHOLD (see top of jptree.cpp)
+        byte * data = (byte *)mb.reserveTruncate(4*1024+1); // Must be > PTREE_COMPRESS_THRESHOLD (see top of jptree.cpp)
+        for (unsigned i=0; i < mb.length(); i++)
+            data[i] = (byte)i;
 
         testTree->addProp("binprop/subbinprop", "nonbinval1");
         testTree->addPropBin("binprop/subbinprop", mb.length(), mb.toByteArray());
@@ -1975,20 +3516,1435 @@ subX:
             ++match;
         }
     }
+    void testRemoveReuse()
+    {
+        Owned<IPropertyTree> t = createPTree();
+        t->addPropInt("a", 1);
+        t->addPropInt("a", 2);
+        Owned<IPropertyTree> a1 = t->getPropTree("a[1]");
+        Owned<IPropertyTree> a2 = t->getPropTree("a[2]");
+        CPPUNIT_ASSERT(t->removeProp("a[2]"));
+        CPPUNIT_ASSERT(t->removeProp("a"));
+        CPPUNIT_ASSERT(!a1->isArray(nullptr));
+        CPPUNIT_ASSERT(!a2->isArray(nullptr));
+        IPropertyTree *na2 = t->addPropTree("na", a2.getClear());
+        CPPUNIT_ASSERT(!na2->isArray(nullptr));
+        IPropertyTree *na1 = t->addPropTree("na", a1.getClear());
+        CPPUNIT_ASSERT(na1->isArray(nullptr));
+        CPPUNIT_ASSERT(na2->isArray(nullptr));
+    }
+    void testPtreeEncode(const char *input, const char *expected=nullptr)
+    {
+        static unsigned id = 0;
+        StringBuffer encoded;
+        encodePTreeName(encoded, input);
+        StringBuffer decoded;
+        decodePtreeName(decoded, encoded.str());
+        //DBGLOG("\nptree name[%d]: %s --> %s --> %s", id++, input, encoded.str(), decoded.str());
+        CPPUNIT_ASSERT(streq(input, decoded.str()));
+        if (expected)
+        {
+            CPPUNIT_ASSERT(streq(expected, encoded.str()));
+        }
+    }
+    void testSpecialTags()
+    {
+        try {
+        //Check a null tag is supported and preserved.
+        static constexpr const char * jsonEmptyNameMarkup = R"!!({
+   "": "default",
+   "end": "x"
+  })!!";
+
+            Owned<IPropertyTree> json = createPTreeFromJSONString(jsonEmptyNameMarkup, ipt_none, ptr_ignoreWhiteSpace, nullptr);
+
+            //if we want the final compares to be less fragile (test will have to be updated if formatting changes) we could reparse and compare trees again
+            StringBuffer ml;
+            toJSON(json, ml.clear(), 2, JSON_Format|JSON_SortTags|JSON_HideRootArrayObject);
+            CPPUNIT_ASSERT(streq(ml, jsonEmptyNameMarkup));
+
+            testPtreeEncode("@a/b*c=d\\e.f", "@a_fb_x2A_c_x3D_d_be.f");
+            testPtreeEncode("A/B*C=D\\E.F", "A_fB_x2A_C_x3D_D_bE.F");
+            testPtreeEncode("_x123_blue.berry", "__x123__blue.berry");
+            testPtreeEncode("_>>_here_**", "___x3E3E___here___x2A2A_");
+            testPtreeEncode("出/售\\耐\"'久", "出_f售_b耐_Q_q久");
+            testPtreeEncode("@出售'\"耐久", "@_xE587BAE594AE__q_Q_xE88090E4B985_");
+            testPtreeEncode("出售耐久", "出售耐久");
+            testPtreeEncode("@出/售\\耐'久", "@_xE587BA__f_xE594AE__b_xE88090__q_xE4B985_");
+            testPtreeEncode("出/售\\耐'久", "出_f售_b耐_q久");
+            testPtreeEncode("space space", "space_sspace");
+
+            static constexpr const char * jsonMarkup = R"!!(
+{
+    "Nothing_toEncodeHere": {
+        "@attributes_need_unicode_encoded_出售耐久": "encode",
+        "but_elements_support_it_出售耐久": "no encode",
+        "e出\\n售耐/久@Aa_a": {
+        "@\\naa_bb食品并/林": "atvalue",
+        "abc/d @ \"e'f": ["value"],
+        "": "noname"
+        }
+    }
+}
+)!!";
+
+            static constexpr const char * yamlMarkup = R"!!(
+Nothing_toEncodeHere:
+  attributes_need_unicode_encoded_出售耐久: "encode"
+  but_elements_support_it_出售耐久: ["no encode"]
+  "e出\\n售耐/久@Aa_a":
+    "\\naa_bb食品并/林": "atvalue"
+    "abc/d @ \"e'f": ["value"]
+    "": [noname]
+)!!";
+
+            static constexpr const char * toXMLOutput = R"!!(<Nothing_toEncodeHere attributes__need__unicode__encoded___xE587BAE594AEE88090E4B985_="encode">
+ <but_elements_support_it_出售耐久>no encode</but_elements_support_it_出售耐久>
+ <e出_bn售耐_f久_aAa__a _bnaa__bb_xE9A39FE59381E5B9B6__f_xE69E97_="atvalue">
+  <_0>noname</_0>
+  <abc_fd_s_a_s_Qe_qf>value</abc_fd_s_a_s_Qe_qf>
+ </e出_bn售耐_f久_aAa__a>
+</Nothing_toEncodeHere>
+)!!";
+
+            static constexpr const char * toJSONOutput = R"!!({
+ "Nothing_toEncodeHere": {
+  "@attributes_need_unicode_encoded_出售耐久": "encode",
+  "but_elements_support_it_出售耐久": "no encode",
+  "e出\n售耐/久@Aa_a": {
+   "@\naa_bb食品并/林": "atvalue",
+   "": "noname",
+   "abc/d @ "e'f": "value"
+  }
+ }
+})!!";
+
+            static constexpr const char * toYAMLOutput = R"!!(Nothing_toEncodeHere:
+  attributes_need_unicode_encoded_出售耐久: encode
+  but_elements_support_it_出售耐久:
+  - no encode
+  e出\n售耐/久@Aa_a:
+    \naa_bb食品并/林: atvalue
+    '':
+    - noname
+    abc/d @ "e'f:
+    - value
+)!!";
+
+            Owned<IPropertyTree> jsonTree = createPTreeFromJSONString(jsonMarkup);
+            IPropertyTree *xmlRoot = jsonTree->queryPropTree("*[1]");
+            toXML(xmlRoot, ml.clear(), 0, XML_SortTags|XML_Format);
+            //printf("\nJSONXML:\n%s\n", ml.str());
+            CPPUNIT_ASSERT(streq(toXMLOutput, ml.str()));
+            toJSON(jsonTree, ml.clear(), 0, JSON_SortTags|JSON_HideRootArrayObject|JSON_Format);
+            //printf("\nJSON:\n%s\n", ml.str());
+            CPPUNIT_ASSERT(streq(toJSONOutput, ml.str()));
+
+            Owned<IPropertyTree> yamlTree = createPTreeFromYAMLString(yamlMarkup);
+            xmlRoot = jsonTree->queryPropTree("*[1]");
+            toXML(xmlRoot, ml.clear(), 0, XML_SortTags|XML_Format);
+            //printf("\nYAMLXML:\n%s\n", ml.str());
+            CPPUNIT_ASSERT(streq(toXMLOutput, ml.str()));
+            toYAML(yamlTree, ml.clear(), 0, YAML_SortTags|YAML_HideRootArrayObject);
+            //printf("\nYAML:\n%s\n", ml.str());
+            CPPUNIT_ASSERT(streq(toYAMLOutput, ml.str()));
+
+//build xpath test
+            static constexpr const char * jsonMarkupForXpathTest = R"!!(
+{
+  "A": {
+    "B": {
+      "@a/b.@100": "encoded attribute found",
+      "x\\y~Z@W": "encoded element found",
+      "rst": "element found",
+      "q_n_a": "underscore element found",
+      "element出": "xpath does not support unicode?"
+        }
+    }
+}
+)!!";
+
+            Owned<IPropertyTree> jsonTreeForXpathTest = createPTreeFromJSONString(jsonMarkupForXpathTest);
+
+            StringBuffer xpath;
+            appendPTreeXPathName(xpath.set("A/B/"), "@a/b.@100"); //attribute will be encoded
+            const char *val = jsonTreeForXpathTest->queryProp(xpath);
+            CPPUNIT_ASSERT(val && streq(val, "encoded attribute found")); //xpath works for unicode here because for attributes it gets encoded
+
+            appendPTreeXPathName(xpath.set("A/B/"), "x\\y~Z@W"); //element will be encoded
+            val = jsonTreeForXpathTest->queryProp(xpath);
+            CPPUNIT_ASSERT(val && streq(val, "encoded element found"));
+
+            appendPTreeXPathName(xpath.set("A/B/"), "rst"); //will not be encoded
+            val = jsonTreeForXpathTest->queryProp(xpath);
+            CPPUNIT_ASSERT(val && streq(val, "element found"));
+
+            appendPTreeXPathName(xpath.set("A/B/"), "q_n_a"); //will not be encoded
+            val = jsonTreeForXpathTest->queryProp(xpath);
+            CPPUNIT_ASSERT(val && streq(val, "underscore element found"));
+
+            appendPTreeXPathName(xpath.set("A/B/"), "element出"); //will not be encoded (elements support unicode)
+            val = jsonTreeForXpathTest->queryProp(xpath);
+            CPPUNIT_ASSERT(!val); //PTree can hold unicode in element names but perhaps xpath can not access it?
+        }
+        catch (IException *e)
+        {
+            StringBuffer msg;
+            printf("\nPTREE: Exception %d - %s", e->errorCode(), e->errorMessage(msg).str());
+            EXCLOG(e, nullptr);
+            throw;
+        }
+    }
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION(JlibIPTTest);
 CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(JlibIPTTest, "JlibIPTTest");
 
+/*
+ * PTree serialization / deserialization tests
+ *
+ *   Test PTree serialization / deserialization format matches from MemoryBuffer to IBufferedSerialInputStream
+ *   Generate timings for serialization and deserialization processes
+ *
+ */
 
+#include "platform.h"
+#include "jfile.ipp"
+#include "jptree.hpp"
+#include "jiface.hpp"
+#include "jio.hpp"
+#include "jstring.hpp"
+#include <string>
+#include "jstats.h"
+#include <cstdlib>
+#include <thread>
+#include <atomic>
+#include <bitset>
+#include <functional>
+
+IPropertyTree *createCompatibilityConfigPropertyTree()
+{
+    // Creates a complex nested property tree with multiple compatibility elements for serialization testing
+    Owned<IPropertyTree> root = createPTree("__array__");
+
+    // Helper lambda to add property elements with name/value attributes
+    auto addProperty = [](IPropertyTree *parent, const char *name, const char *value = nullptr)
+    {
+        IPropertyTree *prop = parent->addPropTree("property");
+        prop->setProp("@name", name);
+        if (value)
+            prop->setProp("@value", value);
+    };
+
+    // Helper lambda to add operation/accepts/uses elements
+    auto addNamedElement = [](IPropertyTree *parent, const char *elementName, const char *name, const char *presence)
+    {
+        IPropertyTree *elem = parent->addPropTree(elementName);
+        elem->setProp("@name", name);
+        elem->setProp("@presence", presence);
+    };
+
+    // Helper lambda to add valueType elements with maskStyle children
+    auto addValueType = [](IPropertyTree *parent, const char *name, const char *presence, bool addMaskStyle = false, const char *setName = nullptr)
+    {
+        IPropertyTree *valueType = parent->addPropTree("valueType");
+        valueType->setProp("@name", name);
+        valueType->setProp("@presence", presence);
+
+        if (addMaskStyle)
+        {
+            IPropertyTree *maskStyle1 = valueType->addPropTree("maskStyle");
+            maskStyle1->setProp("@name", "keep-last-4-numbers");
+            maskStyle1->setProp("@presence", "r");
+
+            IPropertyTree *maskStyle2 = valueType->addPropTree("maskStyle");
+            maskStyle2->setProp("@name", "mask-last-4-numbers");
+            maskStyle2->setProp("@presence", "o");
+        }
+
+        if (setName)
+        {
+            IPropertyTree *set = valueType->addPropTree("Set");
+            set->setProp("@name", setName);
+            set->setProp("@presence", "r");
+        }
+    };
+
+    // Helper lambda to add rule elements
+    auto addRule = [](IPropertyTree *parent, const char *contentType, const char *presence)
+    {
+        IPropertyTree *rule = parent->addPropTree("rule");
+        rule->setProp("@contentType", contentType);
+        rule->setProp("@presence", presence);
+    };
+
+    // First compatibility element
+    {
+        IPropertyTree *compatibility = root->addPropTree("__item__");
+        IPropertyTree *compat = compatibility->addPropTree("compatibility");
+
+        // Context
+        IPropertyTree *context = compat->addPropTree("context");
+        context->setProp("@domain", "urn:hpcc:unittest");
+        context->setProp("@version", "0");
+        addProperty(context, "valuetype-set", "*");
+        addProperty(context, "rule-set", "*");
+
+        // Operations
+        addNamedElement(compat, "operation", "maskValue", "r");
+        addNamedElement(compat, "operation", "maskContent", "r");
+        addNamedElement(compat, "operation", "maskMarkupValue", "o");
+
+        // Accepts
+        addNamedElement(compat, "accepts", "valuetype-set", "r");
+        addNamedElement(compat, "accepts", "valuetype-set:value-type-set-a", "r");
+        addNamedElement(compat, "accepts", "valuetype-set:value-type-set-b", "r");
+        addNamedElement(compat, "accepts", "rule-set", "r");
+        addNamedElement(compat, "accepts", "rule-set:rule-set-2", "r");
+        addNamedElement(compat, "accepts", "required-acceptance", "r");
+        addNamedElement(compat, "accepts", "optional-acceptance", "o");
+
+        // Uses
+        addNamedElement(compat, "uses", "valuetype-set", "r");
+        addNamedElement(compat, "uses", "valuetype-set:value-type-set-a", "r");
+        addNamedElement(compat, "uses", "valuetype-set:value-type-set-b", "r");
+        addNamedElement(compat, "uses", "rule-set", "r");
+        addNamedElement(compat, "uses", "rule-set:rule-set-2", "r");
+        addNamedElement(compat, "uses", "required-acceptance", "p");
+        addNamedElement(compat, "uses", "optional-acceptance", "p");
+
+        // ValueTypes
+        addValueType(compat, "secret", "r");
+        addValueType(compat, "secret-if-a", "r", true, "value-type-set-a");
+        addValueType(compat, "secret-if-b", "r", false, "value-type-set-b");
+        addValueType(compat, "*", "r");
+
+        // Rules
+        addRule(compat, "", "r");
+        addRule(compat, "xml", "r");
+    }
+
+    // Second compatibility element
+    {
+        IPropertyTree *compatibility = root->addPropTree("__item__");
+        IPropertyTree *compat = compatibility->addPropTree("compatibility");
+
+        IPropertyTree *context = compat->addPropTree("context");
+        context->setProp("@domain", "urn:hpcc:unittest");
+        context->setProp("@version", "0");
+        addProperty(context, "valuetype-set", "value-type-set-a");
+        addProperty(context, "rule-set", "");
+
+        addValueType(compat, "secret", "r");
+        addValueType(compat, "secret-if-a", "r", true, "value-type-set-a");
+        addValueType(compat, "secret-if-b", "p", false, "value-type-set-b");
+
+        addRule(compat, "", "r");
+        addRule(compat, "xml", "r");
+    }
+
+    // Third compatibility element
+    {
+        IPropertyTree *compatibility = root->addPropTree("__item__");
+        IPropertyTree *compat = compatibility->addPropTree("compatibility");
+
+        IPropertyTree *context = compat->addPropTree("context");
+        context->setProp("@domain", "urn:hpcc:unittest");
+        context->setProp("@version", "0");
+        addProperty(context, "valuetype-set"); // No value attribute
+        addProperty(context, "rule-set", "rule-set-2");
+
+        addValueType(compat, "secret", "r");
+        addValueType(compat, "secret-if-a", "p", true, "value-type-set-a");
+        addValueType(compat, "secret-if-b", "p", false, "value-type-set-b");
+
+        addRule(compat, "", "p");
+        addRule(compat, "xml", "p");
+    }
+
+    // Fourth compatibility element
+    {
+        IPropertyTree *compatibility = root->addPropTree("__item__");
+        IPropertyTree *compat = compatibility->addPropTree("compatibility");
+
+        IPropertyTree *context = compat->addPropTree("context");
+        context->setProp("@domain", "urn:hpcc:unittest");
+        context->setProp("@version", "0");
+        addProperty(context, "valuetype-set", "value-type-set-b");
+        addProperty(context, "rule-set", "rule-set-2");
+
+        addValueType(compat, "secret", "r");
+        addValueType(compat, "secret-if-a", "p", true, "value-type-set-a");
+        addValueType(compat, "secret-if-b", "r", false, "value-type-set-b");
+
+        addRule(compat, "", "r");
+        addRule(compat, "xml", "r");
+    }
+
+    return root.getClear();
+}
+
+IPropertyTree *createBinaryDataCompressionTestPTree(const char *testXml)
+{
+    // Validate the testXml parameter
+    CPPUNIT_ASSERT(testXml && *testXml);
+
+    // Create a tree with various binary data sizes to test compression thresholds
+    Owned<IPropertyTree> tree = createPTree(testXml);
+
+    // Add some regular properties first
+    tree->setProp("normalProp", "normalValue");
+    tree->setPropInt("intProp", 42);
+
+    // Create binary data of different sizes to test compression thresholds
+    MemoryBuffer largeBinary;
+
+    // Small binary data (under compression threshold)
+    const char *smallData = "This is small binary data";
+    tree->setPropBin("smallBinary", strlen(smallData), smallData);
+
+    // Large binary data (over PTREE_COMPRESS_THRESHOLD to trigger compression)
+    // PTREE_COMPRESS_THRESHOLD is typically 4KB based on the comment in the existing test
+    const size_t largeSize = 8 * 1024; // 8KB to ensure compression
+    largeBinary.ensureCapacity(largeSize);
+    for (size_t i = 0; i < largeSize; i++)
+        largeBinary.append((byte)(i % 256));
+    tree->setPropBin("largeBinary", largeBinary.length(), largeBinary.toByteArray());
+
+    // Add nested elements with binary data
+    IPropertyTree *subTree = tree->addPropTree("subElement");
+    subTree->setProp("subProp", "subValue");
+
+    MemoryBuffer nestedBinary;
+    const char *nestedData = "Nested binary content with some repetitive data for compression testing";
+    // Repeat the data to make it larger and more compressible
+    for (int i = 0; i < 100; i++)
+        nestedBinary.append(strlen(nestedData), nestedData);
+    subTree->setPropBin("nestedBinary", nestedBinary.length(), nestedBinary.toByteArray());
+
+    return tree.getClear();
+}
+
+/*
+ * Combined PTree serialization and deserialization tests
+ *
+ * Tests PTree serialization/deserialization format consistency between MemoryBuffer and IBufferedSerialInputStream
+ * and measures performance of both operations
+ *
+ * testRoundTripForRootOnlyPTree                              - Tests round-trip serialization/deserialization for a PTree with only a root node
+ * testRoundTripForCompatibilityConfigPropertyTree            - Tests round-trip serialization/deserialization for a complex compatibility config PTree
+ * testRoundTripForBinaryDataCompressionTestPTree             - Tests round-trip serialization/deserialization for a PTree with various binary data sizes
+ * testRoundTripForUnnamedRootPTree                           - Tests round-trip for an unnamed root node through createPTree(MemoryBuffer&)
+ * testMemoryBufferDeserializeWithSwapEndian                  - Tests createPTree(MemoryBuffer&) honors MemoryBuffer endian mode
+ * testMalformedStreamTruncations                             - Tests deserialization error handling for deterministic truncation offsets
+ */
+
+class PTreeSerializationDeserializationTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(PTreeSerializationDeserializationTest);
+    // Complete round-trip tests - serialization followed by deserialization with validation
+    CPPUNIT_TEST(testRoundTripForRootOnlyPTree);
+    CPPUNIT_TEST(testRoundTripForCompatibilityConfigPropertyTree);
+    CPPUNIT_TEST(testRoundTripForBinaryDataCompressionTestPTree);
+    CPPUNIT_TEST(testRoundTripForUnnamedRootPTree);
+    CPPUNIT_TEST(testMemoryBufferDeserializeWithSwapEndian);
+    CPPUNIT_TEST(testMalformedStreamTruncations);
+    CPPUNIT_TEST_SUITE_END();
+
+protected:
+    static constexpr const char *testXml{
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Configuration version=\"1.0\" environment=\"test\">"
+        "  <Database host=\"localhost\" port=\"3306\" ssl=\"true\">"
+        "    <Connection timeout=\"30\" pool=\"10\" retry=\"3\"/>"
+        "    <Tables>"
+        "      <Table name=\"users\" schema=\"public\" rows=\"1000\"/>"
+        "      <Table name=\"orders\" schema=\"sales\" rows=\"5000\"/>"
+        "    </Tables>"
+        "  </Database>"
+        "  <Cache enabled=\"true\" size=\"1024\" ttl=\"3600\">"
+        "    <Policies>"
+        "      <Policy name=\"default\" expiry=\"300\"/>"
+        "    </Policies>"
+        "  </Cache>"
+        "</Configuration>"};
+
+    // Complete round-trip test method that performs serialization, deserialization, and validation
+    void performRoundTripTest(const char *testName, IPropertyTree *tree)
+    {
+        Owned<IPropertyTree> originalTree;
+        originalTree.setown(tree);
+        CCycleTimer timer;
+
+        MemoryBuffer memoryBuffer;
+
+        // Time serialize() method
+        __uint64 serializeElapsedNs = 0;
+        {
+            timer.reset();
+            originalTree->serialize(memoryBuffer);
+            serializeElapsedNs = timer.elapsedNs();
+        }
+
+        // Time serializeToStream() method
+        __uint64 serializeToStreamElapsedNs = 0;
+        {
+            MemoryBuffer streamBuffer;
+            Owned<IBufferedSerialOutputStream> out = createBufferedSerialOutputStream(streamBuffer);
+            timer.reset();
+            originalTree->serializeToStream(*out);
+            out->flush();
+            serializeToStreamElapsedNs = timer.elapsedNs();
+
+            // Validation - serialized data matches
+            CPPUNIT_ASSERT_EQUAL(memoryBuffer.length(), streamBuffer.length());
+            CPPUNIT_ASSERT(memcmp(memoryBuffer.toByteArray(), streamBuffer.toByteArray(), memoryBuffer.length()) == 0);
+        }
+
+        // Time deserialize() method
+        __uint64 deserializeElapsedNs = 0;
+        {
+            Owned<IPropertyTree> memoryBufferDeserialized = createPTree();
+            timer.reset();
+            memoryBufferDeserialized->deserialize(memoryBuffer);
+            deserializeElapsedNs = timer.elapsedNs();
+            CPPUNIT_ASSERT(areMatchingPTrees(originalTree, memoryBufferDeserialized));
+        }
+
+        // Time deserializeFromStream() method
+        __uint64 deserializeFromStreamElapsedNs = 0;
+        {
+            MemoryBuffer clone(memoryBuffer.length(), memoryBuffer.toByteArray());
+            Owned<IBufferedSerialInputStream> in = createBufferedSerialInputStreamFillMemory(clone);
+            timer.reset();
+            Owned<IPropertyTree> streamDeserialized = createPTreeFromBinary(*in, ipt_none);
+            deserializeFromStreamElapsedNs = timer.elapsedNs();
+            CPPUNIT_ASSERT(areMatchingPTrees(originalTree, streamDeserialized));
+        }
+
+        // Create PTree from Binary tests
+        //
+        // Test 1: Call with null nodeCreator (should fall back to createPTree(src, ipt_none))
+        {
+            MemoryBuffer clone(memoryBuffer.length(), memoryBuffer.toByteArray());
+            Owned<IBufferedSerialInputStream> in2 = createBufferedSerialInputStreamFillMemory(clone);
+            Owned<IPropertyTree> deserializedCreatePTreeFromBinaryWithNull = createPTreeFromBinary(*in2, nullptr);
+            CPPUNIT_ASSERT(areMatchingPTrees(originalTree, deserializedCreatePTreeFromBinaryWithNull));
+        }
+
+        // Test 2: Call with custom nodeCreator
+        {
+            class TestNodeCreator : public CSimpleInterfaceOf<IPTreeNodeCreator>
+            {
+            public:
+                bool wasCalled = false;
+
+                virtual IPropertyTree *create(const char *tag) override
+                {
+                    wasCalled = true;
+                    return createPTree(tag);
+                }
+            };
+
+            MemoryBuffer clone(memoryBuffer.length(), memoryBuffer.toByteArray());
+            Owned<TestNodeCreator> nodeCreator = new TestNodeCreator();
+            Owned<IBufferedSerialInputStream> in3 = createBufferedSerialInputStreamFillMemory(clone);
+            Owned<IPropertyTree> deserializedCreatePTreeFromBinaryWithCreator = createPTreeFromBinary(*in3, nodeCreator);
+            CPPUNIT_ASSERT(nodeCreator->wasCalled); // Verify nodeCreator was called
+            CPPUNIT_ASSERT(areMatchingPTrees(originalTree, deserializedCreatePTreeFromBinaryWithCreator));
+        }
+
+        double serializeTimeMs = serializeElapsedNs / 1e6;
+        double serializeToStreamTimeMs = serializeToStreamElapsedNs / 1e6;
+        DBGLOG("=== ROUND-TRIP TEST STARTED FOR: %s ===", testName);
+        DBGLOG("=== SERIALIZATION TEST RESULTS:");
+        DBGLOG("  serialize() time: %.6f ms", serializeTimeMs);
+        DBGLOG("  serializeToStream() time: %.6f ms", serializeToStreamTimeMs);
+        DBGLOG("  Performance ratio (serializeToStream/serialize): %.6f", serializeToStreamTimeMs / serializeTimeMs);
+        DBGLOG("  serialize()/serializeToStream() data size: %u bytes", memoryBuffer.length());
+
+        double deserializeTimeMs = deserializeElapsedNs / 1e6;
+        double deserializeFromStreamTimeMs = deserializeFromStreamElapsedNs / 1e6;
+        DBGLOG("=== DESERIALIZATION TEST RESULTS:");
+        DBGLOG("  deserialize() time: %.6f ms", deserializeTimeMs);
+        DBGLOG("  deserializeFromStream() time: %.6f ms", deserializeFromStreamTimeMs);
+        DBGLOG("  Performance ratio (deserializeFromStream/deserialize): %.6f", deserializeFromStreamTimeMs / deserializeTimeMs);
+
+        DBGLOG("=== ROUND-TRIP TEST COMPLETED SUCCESSFULLY");
+    }
+
+    void expectTruncatedStreamFailure(const MemoryBuffer &serialized, size32_t truncationOffset)
+    {
+        VStringBuffer contextDescription("truncation test at offset %u of %u", truncationOffset, serialized.length());
+        VStringBuffer assertMsg("Serialized stream shorter than truncation offset for %s", contextDescription.str());
+        CPPUNIT_ASSERT_MESSAGE(assertMsg.str(), truncationOffset < serialized.length());
+
+        MemoryBuffer truncated;
+        truncated.append(truncationOffset, serialized.toByteArray());
+        Owned<IBufferedSerialInputStream> in{createBufferedSerialInputStreamFillMemory(truncated)};
+        try
+        {
+            Owned<IPropertyTree> unexpected{createPTreeFromBinary(*in, ipt_none)};
+            unexpected.clear();
+        }
+        catch (IException *e)
+        {
+            e->Release();
+            return;
+        }
+
+        VStringBuffer failMsg("Expected createPTreeFromBinary to throw IException for %s", contextDescription.str());
+        CPPUNIT_FAIL(failMsg.str());
+    }
+
+public:
+    // Complete round-trip test methods - perform serialization and deserialization in one test
+    void testRoundTripForRootOnlyPTree()
+    {
+        performRoundTripTest(__func__, createPTree("EmptyRoot"));
+    }
+
+    void testRoundTripForCompatibilityConfigPropertyTree()
+    {
+        performRoundTripTest(__func__, createCompatibilityConfigPropertyTree());
+    }
+
+    void testRoundTripForBinaryDataCompressionTestPTree()
+    {
+        performRoundTripTest(__func__, createBinaryDataCompressionTestPTree(testXml));
+    }
+
+    void testRoundTripForUnnamedRootPTree(ipt_flags flags)
+    {
+        START_TEST
+
+        Owned<IPropertyTree> original{createPTree(nullptr, flags)};
+        original->setProp("@kind", "unnamed-root");
+        original->setProp("child", "value");
+
+        MemoryBuffer serialized;
+        original->serialize(serialized);
+
+        Owned<IPropertyTree> deserialized{createPTree(serialized, flags)};
+        CPPUNIT_ASSERT(areMatchingPTrees(original, deserialized));
+
+        END_TEST
+    }
+
+    void testRoundTripForUnnamedRootPTree()
+    {
+        testRoundTripForUnnamedRootPTree(ipt_none);
+        testRoundTripForUnnamedRootPTree(ipt_lowmem);
+        testRoundTripForUnnamedRootPTree(static_cast<ipt_flags>(ipt_lowmem|ipt_caseInsensitive));
+        testRoundTripForUnnamedRootPTree(ipt_ordered);
+    }
+
+    void testMemoryBufferDeserializeWithSwapEndian()
+    {
+        START_TEST
+
+        Owned<IPropertyTree> original{createCompatibilityConfigPropertyTree()};
+
+        MemoryBuffer swappedSerialized;
+        swappedSerialized.setSwapEndian(true);
+        original->serialize(swappedSerialized);
+
+        CPPUNIT_ASSERT_MESSAGE("Expected swapped serialization buffer to preserve swap-endian mode", swappedSerialized.needSwapEndian());
+
+        Owned<IPropertyTree> deserialized{createPTree(swappedSerialized, ipt_none)};
+        CPPUNIT_ASSERT(areMatchingPTrees(original, deserialized));
+
+        END_TEST
+    }
+
+    // Malformed buffered-serial stream truncations test: ensure deserialize errors are reported without relying on specific format offsets
+    void testMalformedStreamTruncations()
+    {
+        START_TEST
+
+        Owned<IPropertyTree> original{createPTree("root")};
+        original->setProp("@scenario", "truncation-test");
+        original->setProp("@variant", "malformed-stream");
+        original->setProp("name", "truncation-probe");
+        original->setProp("description", "verify truncated binary stream throws");
+
+        MemoryBuffer serialized;
+        Owned<IBufferedSerialOutputStream> out{createBufferedSerialOutputStream(serialized)};
+        original->serializeToStream(*out);
+        out->flush();
+        CPPUNIT_ASSERT_MESSAGE("Expected serialized PTree stream to contain at least one byte", serialized.length() > 0);
+
+        const size32_t truncationOffsets[] = {0, serialized.length() / 2, serialized.length() - 1};
+        for (size32_t truncationOffset : truncationOffsets)
+            expectTruncatedStreamFailure(serialized, truncationOffset);
+
+        END_TEST
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(PTreeSerializationDeserializationTest);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(PTreeSerializationDeserializationTest, "PTreeSerializationDeserializationTest");
+
+#include "jbuff.hpp"
+#include "jutil.hpp"
+#include "jzstd.hpp"
+#include <cmath>
+
+/* Test suite for PTree Binary and XML timing tests
+ *
+ * Custom specific unittest parameters:
+ * --PTreeBinaryTimingStressTest.path=/x/y/z/file.bin             Provide the Dali binary test data path. Can be .bin or .bin.zst (Zstd compressed)
+ * --PTreeBinaryTimingStressTest.iterations=8                     Total iterations per selected mode
+ * --PTreeBinaryTimingStressTest.threadCounts=1,2,4               CSV list of thread counts used by timing tests
+ * --PTreeBinaryTimingStressTest.modes=bin-normal,bin-lowmem,xml-normal,xml-lowmem
+ *                                                                CSV list of explicit benchmark modes. Default runs all four.
+ * --PTreeBinaryTimingStressTest.validateContent=0                Validate that ipt_lowmem re-serializes byte-for-byte identically to the ipt_none reference (default: 0=off)
+ * --PTreeBinaryTimingStressTest.synchronizePhases=1             Barrier the create and dtor phases so they never overlap across threads (default: 1=on).
+ *                                                                If 0 the phases run freely and overlap (some threads creating while others destruct),
+ *                                                                so the reported create and dtor timings mix the two workloads and may be misleading.
+ */
+class PTreeBinaryTimingStressTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(PTreeBinaryTimingStressTest);
+    CPPUNIT_TEST(testPTreeTiming);
+    CPPUNIT_TEST(testPTreeCloneTiming);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    enum ModeIndex : unsigned
+    {
+        modeBinNormal = 0,
+        modeBinLowMem,
+        modeXmlNormal,
+        modeXmlLowMem,
+        modeCount
+    };
+
+    bool modeEnabled(ModeIndex mode) const
+    {
+        return enabledModes.test(mode);
+    }
+
+    PTreeBinaryTimingStressTest()
+    {
+        START_TEST
+
+        getComponentConfigSP()->getProp("PTreeBinaryTimingStressTest/@path", binaryPath);
+        if (binaryPath.isEmpty())
+        {
+            binaryPath.set(hpccBuildInfo.installDir);
+            constexpr const char *relativeBinPath = "/testing/data/dalisds100mb.bin.zst";
+            binaryPath.append(relativeBinPath);
+        }
+
+        iterations = (unsigned)getComponentConfigSP()->getPropInt("PTreeBinaryTimingStressTest/@iterations", 8);
+        constexpr unsigned maxIterations = 32 * 50;  // 1600
+        CPPUNIT_ASSERT_MESSAGE(VStringBuffer("PTree timing test iterations must be greater than zero and <= %u", maxIterations).str(), iterations > 0 && iterations <= maxIterations);
+
+        const char *threadCountsCsv = getComponentConfigSP()->queryProp("PTreeBinaryTimingStressTest/@threadCounts", "1,2,4");
+        StringArray tokens;
+        tokens.appendListUniq(threadCountsCsv, ",", true);
+        ForEachItemIn(i, tokens)
+        {
+            unsigned val = (unsigned)atoi(tokens.item(i));
+            CPPUNIT_ASSERT_MESSAGE(VStringBuffer("Invalid thread count: %s", tokens.item(i)).str(), val > 0);
+            CPPUNIT_ASSERT_MESSAGE(VStringBuffer("Thread count %u exceeds maximum allowed (1024) to prevent resource exhaustion", val).str(), val <= 1024);
+            threadCounts.push_back(val);
+        }
+        CPPUNIT_ASSERT_MESSAGE("PTree timing threadCounts must contain at least one positive integer", !threadCounts.empty());
+        for (unsigned threadCount : threadCounts)
+        {
+            CPPUNIT_ASSERT_MESSAGE(VStringBuffer("PTree timing test iterations (%u) must be a multiple of threadCount (%u)", iterations, threadCount).str(),
+                                   (iterations % threadCount) == 0);
+        }
+
+        enabledModes.set();
+        const char *modesCsv = getComponentConfigSP()->queryProp("PTreeBinaryTimingStressTest/@modes");
+        if (!isEmptyString(modesCsv))
+        {
+            enabledModes.reset();
+
+            StringArray modeTokens;
+            modeTokens.appendListUniq(modesCsv, ",", true);
+            ForEachItemIn(modeIdx, modeTokens)
+            {
+                const char *token = modeTokens.item(modeIdx);
+                if (strieq(token, "bin-normal"))
+                    enabledModes.set(modeBinNormal);
+                else if (strieq(token, "bin-lowmem"))
+                    enabledModes.set(modeBinLowMem);
+                else if (strieq(token, "xml-normal"))
+                    enabledModes.set(modeXmlNormal);
+                else if (strieq(token, "xml-lowmem"))
+                    enabledModes.set(modeXmlLowMem);
+                else
+                    CPPUNIT_ASSERT_MESSAGE(VStringBuffer("Unknown mode token in PTreeBinaryTimingStressTest/@modes: %s", token).str(), false);
+            }
+        }
+        CPPUNIT_ASSERT_MESSAGE("PTree timing test requires at least one enabled mode", enabledModes.any());
+
+        validateContent = getComponentConfigSP()->getPropBool("PTreeBinaryTimingStressTest/@validateContent", false);
+        synchronizePhases = getComponentConfigSP()->getPropBool("PTreeBinaryTimingStressTest/@synchronizePhases", true);
+
+        END_TEST
+    }
+
+    void testPTreeTiming()
+    {
+        START_TEST
+
+        MemoryBuffer binaryInput;
+        readBinaryFile(binaryInput);
+
+        StringBuffer xmlInput;
+        bool runAnyXml = modeEnabled(modeXmlNormal) || modeEnabled(modeXmlLowMem);
+        if (runAnyXml)
+        {
+            MemoryBuffer input;
+            input.setBuffer(binaryInput.length(), (void *)binaryInput.bufferBase(), false);
+            Owned<IBufferedSerialInputStream> in = createBufferedSerialInputStream(input.reset());
+            Owned<IPropertyTree> tree = createPTreeFromBinary(*in, ipt_none);
+            toXML(tree, xmlInput);
+            DBGLOG("=== XML INPUT PREPARED (size=%u bytes, iters=%u) ===", xmlInput.length(), iterations);
+        }
+
+        unsigned enabledModeCount = 0;
+        ModeIndex baselineMode = modeCount;
+        for (unsigned mode = 0; mode < modeCount; ++mode)
+        {
+            ModeIndex modeIndex = (ModeIndex)mode;
+            if (modeEnabled(modeIndex))
+            {
+                if (enabledModeCount == 0)
+                    baselineMode = modeIndex;
+                ++enabledModeCount;
+            }
+        }
+        CPPUNIT_ASSERT_MESSAGE("PTree timing test requires at least one enabled mode", enabledModeCount > 0);
+
+        // Build the ipt_none reference binary only when validating an enabled lowmem mode.
+        // Re-serializing an ipt_none tree produces a stable byte sequence after any one-way format
+        // upgrades (e.g. legacy LZW). Comparing ipt_lowmem re-serialization against this reference
+        // catches atomization bugs (wrong atom -> wrong string -> different bytes).
+        validateContent = validateContent && modeEnabled(modeBinLowMem);
+        MemoryBuffer referenceBin;
+        if (validateContent)
+            buildReferenceBinary(binaryInput, referenceBin);
+
+        bool anyComparing = enabledModeCount > 1;
+
+        std::vector<ModeIndex> enabledList;
+        enabledList.reserve(enabledModeCount);
+        for (unsigned mode = 0; mode < modeCount; ++mode)
+        {
+            ModeIndex modeIndex = (ModeIndex)mode;
+            if (modeEnabled(modeIndex))
+                enabledList.push_back(modeIndex);
+        }
+
+        DBGLOG("=== PTree PARALLEL BENCHMARK (size=%u bytes, iters=%u, validate=%s) ===",
+                binaryInput.length(), iterations,
+                validateContent ? "on" : "off");
+        DBGLOG("create/dtor/total avg/sd/min/max = per-iteration ms pooled across all %u iterations (comparable across thread counts).", iterations);
+        DBGLOG("wall = elapsed ms of the slowest thread for that phase (falls as threadCount shares the work).");
+        if (!synchronizePhases)
+            DBGLOG("NOTE: phase synchronization is OFF - create and dtor phases overlap across threads, so their timings may be misleading.");
+
+        StringBuffer groupHeader;
+        StringBuffer colHeader;
+        groupHeader.appendf("%7s %-10s", "", "");
+        colHeader.appendf("%7s %-10s", "Threads", "Mode");
+        for (const char *grp : {"create", "dtor", "total"})
+        {
+            groupHeader.appendf(" |%45s", grp);
+            colHeader.appendf(" |%9s%9s%9s%9s%9s", "avg", "sd", "min", "max", "wall");
+        }
+        if (anyComparing)
+        {
+            groupHeader.appendf(" |%9s", "");
+            colHeader.appendf(" |%9s", "diff%");
+        }
+        DBGLOG("%s", groupHeader.str());
+        DBGLOG("%s", colHeader.str());
+        if (anyComparing)
+            DBGLOG("diff%% = create avg vs baseline mode %s", queryModeToken(baselineMode));
+
+        const MemoryBuffer *binaryValidationReference = validateContent ? &referenceBin : nullptr;
+
+        for (unsigned threadCount : threadCounts)
+        {
+            std::vector<TimingResult> modeTimings;
+            modeTimings.reserve(enabledModeCount);
+
+            for (unsigned mode = 0; mode < modeCount; ++mode)
+            {
+                ModeIndex modeIndex = (ModeIndex)mode;
+                if (!modeEnabled(modeIndex))
+                    continue;
+
+                switch (modeIndex)
+                {
+                    case modeBinNormal:
+                        modeTimings.push_back(runBinaryMode(threadCount, binaryInput, ipt_none, nullptr));
+                        break;
+                    case modeBinLowMem:
+                        modeTimings.push_back(runBinaryMode(threadCount, binaryInput, ipt_lowmem, binaryValidationReference));
+                        break;
+                    case modeXmlNormal:
+                        modeTimings.push_back(runXmlMode(threadCount, xmlInput, ipt_none, nullptr));
+                        break;
+                    case modeXmlLowMem:
+                        modeTimings.push_back(runXmlMode(threadCount, xmlInput, ipt_lowmem, nullptr));
+                        break;
+                    default:
+                        CPPUNIT_FAIL("Unknown benchmark mode");
+                        break;
+                }
+            }
+
+            const double baseline = selectPrimary(modeTimings[0]);
+            for (unsigned i = 0; i < modeTimings.size(); ++i)
+            {
+                const TimingResult &r = modeTimings[i];
+                StringBuffer row;
+                row.appendf("%7u %-10s", threadCount, queryModeToken(enabledList[i]));
+
+                auto appendStats = [&](const TimingResult::Stats &st)
+                {
+                    row.appendf(" |%9.2f%9.2f%9.2f%9.2f%9.2f", st.avgMs, st.stddevMs, st.minMs, st.maxMs, st.wallMs);
+                };
+                appendStats(r.create);
+                appendStats(r.dtor);
+                appendStats(r.total);
+
+                if (anyComparing)
+                {
+                    if (i == 0)
+                        row.appendf(" |%9s", "-");
+                    else
+                    {
+                        double diff = (baseline > 0.0) ? calculatePercentDiff(baseline, selectPrimary(r)) : 0.0;
+                        row.appendf(" |%+9.2f", diff);
+                    }
+                }
+                DBGLOG("%s", row.str());
+            }
+        }
+
+        END_TEST
+    }
+
+    void testPTreeCloneTiming()
+    {
+        START_TEST
+
+        MemoryBuffer binaryInput;
+        readBinaryFile(binaryInput);
+
+        Owned<IPropertyTree> lowMemSource = createTreeFromBinary(binaryInput, ipt_lowmem);
+        Owned<IPropertyTree> fastSource = createTreeFromBinary(binaryInput, ipt_fast);
+        constexpr ipt_flags cloneFlags[] = { ipt_lowmem, ipt_fast };
+
+        DBGLOG("=== PTree CLONE PARALLEL BENCHMARK (size=%u bytes, iters=%u) ===", binaryInput.length(), iterations);
+        DBGLOG("create/dtor/total avg/sd/min/max = per-iteration ms pooled across all %u iterations.", iterations);
+        if (!synchronizePhases)
+            DBGLOG("NOTE: phase synchronization is OFF - create and dtor phases overlap across threads, so their timings may be misleading.");
+
+        StringBuffer groupHeader;
+        StringBuffer colHeader;
+        groupHeader.appendf("%7s %-15s", "", "");
+        colHeader.appendf("%7s %-15s", "Threads", "Mode");
+        for (const char *grp : {"create", "dtor", "total"})
+        {
+            groupHeader.appendf(" |%45s", grp);
+            colHeader.appendf(" |%9s%9s%9s%9s%9s", "avg", "sd", "min", "max", "wall");
+        }
+        DBGLOG("%s", groupHeader.str());
+        DBGLOG("%s", colHeader.str());
+
+        for (ipt_flags sourceFlags : cloneFlags)
+        {
+            for (ipt_flags targetFlags : cloneFlags)
+            {
+                const IPropertyTree *source = queryCloneSource(sourceFlags, lowMemSource, fastSource);
+                CPPUNIT_ASSERT_MESSAGE("Clone mode source selection failed", source != nullptr);
+                validateCloneMode(source, targetFlags);
+            }
+        }
+
+        for (unsigned threadCount : threadCounts)
+        {
+            for (ipt_flags sourceFlags : cloneFlags)
+            {
+                for (ipt_flags targetFlags : cloneFlags)
+                {
+                    const IPropertyTree *source = queryCloneSource(sourceFlags, lowMemSource, fastSource);
+                    CPPUNIT_ASSERT_MESSAGE("Clone mode source selection failed", source != nullptr);
+
+                    auto cloneTreeFunc = [source, targetFlags]()
+                    {
+                        return createPTreeFromIPT(source, targetFlags);
+                    };
+                    TimingResult result = runParallelTimingTest(threadCount, cloneTreeFunc);
+
+                    StringBuffer row;
+                    row.appendf("%7u %-15s", threadCount, queryCloneModeToken(sourceFlags, targetFlags));
+                    auto appendStats = [&](const TimingResult::Stats &st)
+                    {
+                        row.appendf(" |%9.2f%9.2f%9.2f%9.2f%9.2f", st.avgMs, st.stddevMs, st.minMs, st.maxMs, st.wallMs);
+                    };
+                    appendStats(result.create);
+                    appendStats(result.dtor);
+                    appendStats(result.total);
+                    DBGLOG("%s", row.str());
+                }
+            }
+        }
+
+        END_TEST
+    }
+
+protected:
+    // Timing distribution from a single parallel run. Every iteration on every thread
+    // contributes one create sample and one dtor sample (total = the two summed for the
+    // same iteration). avg/sd/min/max are pooled across all iterations, so they describe
+    // the true per-iteration distribution and stay comparable across thread counts. Each
+    // phase also carries a wall time: the elapsed total of the slowest thread for that
+    // phase, which falls as more threads share the fixed work - the throughput speedup.
+    struct TimingResult
+    {
+        struct Stats
+        {
+            double avgMs = 0.0;
+            double stddevMs = 0.0;  // sample standard deviation (0 when <2 samples)
+            double minMs = 0.0;
+            double maxMs = 0.0;
+            double wallMs = 0.0;    // phase wall time: elapsed total of the slowest thread for this phase
+        };
+        Stats create;  // per-iteration creation/deserialization time (+ phase wall)
+        Stats dtor;     // per-iteration destruction (Release) time (+ phase wall)
+        Stats total;    // create + dtor of the same iteration (+ phase wall)
+    };
+
+    // Average per-iteration creation/deserialization time is the headline metric for diffs.
+    double selectPrimary(const TimingResult &r) const
+    {
+        return r.create.avgMs;
+    }
+
+    static TimingResult::Stats computeStats(const std::vector<double> &valuesMs)
+    {
+        TimingResult::Stats s;
+        if (valuesMs.empty())
+            return s;
+        double sum = 0.0;
+        double mn = valuesMs[0];
+        double mx = valuesMs[0];
+        for (double v : valuesMs)
+        {
+            sum += v;
+            mn = std::min(mn, v);
+            mx = std::max(mx, v);
+        }
+        s.avgMs = sum / valuesMs.size();
+        double var = 0.0;
+        for (double v : valuesMs)
+            var += (v - s.avgMs) * (v - s.avgMs);
+        s.stddevMs = (valuesMs.size() > 1) ? std::sqrt(var / (valuesMs.size() - 1)) : 0.0;
+        s.minMs = mn;
+        s.maxMs = mx;
+        return s;
+    }
+
+    const char *queryModeToken(ModeIndex mode) const
+    {
+        switch (mode)
+        {
+        case modeBinNormal:
+            return "bin-normal";
+        case modeBinLowMem:
+            return "bin-lowmem";
+        case modeXmlNormal:
+            return "xml-normal";
+        case modeXmlLowMem:
+            return "xml-lowmem";
+        default:
+            return "unknown";
+        }
+    }
+
+    const char *queryCloneModeToken(ipt_flags sourceFlags, ipt_flags targetFlags) const
+    {
+        if (sourceFlags == ipt_lowmem && targetFlags == ipt_lowmem)
+            return "lowmem->lowmem";
+        if (sourceFlags == ipt_lowmem && targetFlags == ipt_fast)
+            return "lowmem->fast";
+        if (sourceFlags == ipt_fast && targetFlags == ipt_lowmem)
+            return "fast->lowmem";
+        if (sourceFlags == ipt_fast && targetFlags == ipt_fast)
+            return "fast->fast";
+        return "unknown";
+    }
+
+    IPropertyTree * createTreeFromBinary(const MemoryBuffer &binaryInput, unsigned ptreeFlags)
+    {
+        MemoryBuffer workingBuffer;
+        workingBuffer.setBuffer(binaryInput.length(), (void *)binaryInput.bufferBase(), false);
+        Owned<IBufferedSerialInputStream> in = createBufferedSerialInputStream(workingBuffer.reset());
+        return createPTreeFromBinary(*in, ptreeFlags);
+    }
+
+    const IPropertyTree *queryCloneSource(ipt_flags sourceFlags, const IPropertyTree *lowMemSource, const IPropertyTree *fastSource) const
+    {
+        switch (sourceFlags)
+        {
+            case ipt_lowmem:
+                return lowMemSource;
+            case ipt_fast:
+                return fastSource;
+            default:
+                return nullptr;
+        }
+    }
+
+    void validateCloneMode(const IPropertyTree *sourceTree, ipt_flags targetFlags)
+    {
+        Owned<IPropertyTree> cloned = createPTreeFromIPT(sourceTree, targetFlags);
+        CPPUNIT_ASSERT(areMatchingPTrees(sourceTree, cloned));
+    }
+
+    TimingResult runBinaryMode(unsigned threadCount, const MemoryBuffer &binaryInput, unsigned ptreeFlags,
+                         const MemoryBuffer *validationReference)
+    {
+        auto createTreeFunc = [&]()
+        {
+            return createTreeFromBinary(binaryInput, ptreeFlags);
+        };
+
+        validateMode(createTreeFunc, validationReference);
+        return runParallelTimingTest(threadCount, createTreeFunc);
+    }
+
+    TimingResult runXmlMode(unsigned threadCount, const char *xmlInput, unsigned ptreeFlags,
+                       const MemoryBuffer *validationReference)
+    {
+        auto createTreeFunc = [&]()
+        {
+            return createPTreeFromXMLString(xmlInput, ptreeFlags, ptr_ignoreWhiteSpace, nullptr);
+        };
+
+        validateMode(createTreeFunc, validationReference);
+        return runParallelTimingTest(threadCount, createTreeFunc);
+    }
+
+    static double calculatePercentDiff(double baseline, double result)
+    {
+        CPPUNIT_ASSERT_MESSAGE("Baseline timing must be greater than zero", baseline > 0.0);
+
+        return ((result - baseline) / baseline) * 100.0;
+    }
+
+    // Deserialize binaryData with ipt_none and re-serialize into referenceBin.
+    void buildReferenceBinary(const MemoryBuffer &binaryData, MemoryBuffer &referenceBin)
+    {
+        MemoryBuffer buf;
+        buf.setBuffer(binaryData.length(), (void *)binaryData.bufferBase(), false);
+        Owned<IBufferedSerialInputStream> in = createBufferedSerialInputStream(buf.reset());
+        Owned<IPropertyTree> refTree = createPTreeFromBinary(*in, ipt_none);
+        Owned<IBufferedSerialOutputStream> out = createBufferedSerialOutputStream(referenceBin);
+        refTree->serializeToStream(*out);
+        out->flush();
+    }
+
+    // Re-serialize tree and compare against referenceBin; throws on mismatch.
+    void validateTree(const IPropertyTree *tree, const MemoryBuffer &referenceBin)
+    {
+        MemoryBuffer candidateBin;
+        Owned<IBufferedSerialOutputStream> out = createBufferedSerialOutputStream(candidateBin);
+        tree->serializeToStream(*out);
+        out->flush();
+        if (candidateBin.length() != referenceBin.length() ||
+            memcmp(candidateBin.toByteArray(), referenceBin.toByteArray(), referenceBin.length()) != 0)
+        {
+            throw makeStringExceptionV(-1,
+                "Content validation FAILED: re-serialization of "
+                "(%u bytes) does not match ipt_none reference (%u bytes)",
+                candidateBin.length(), referenceBin.length());
+        }
+    }
+
+    void validateMode(const std::function<IPropertyTree *()> &createTreeFunc,
+                      const MemoryBuffer *validationReference)
+    {
+        if (!validationReference)
+            return;
+
+        Owned<IPropertyTree> validationTree = createTreeFunc();
+        validateTree(validationTree, *validationReference);
+    }
+
+    // Run iterations cycles on threadCount threads in parallel using createTreeFunc.
+    //
+    // The threads are optionally phase-synchronised (see synchronizePhases): when enabled, every
+    // thread finishes creating its tree before any thread starts destructing, so the create and
+    // dtor phases never overlap and each measures only its own contention; when disabled the
+    // phases overlap and the create/dtor timings may be misleading. Every iteration records a
+    // create sample and a dtor sample. The samples from all threads are pooled and summarised
+    // (avg/stddev/min/max) per metric, so the distribution is per-iteration and comparable across
+    // thread counts. Each phase also reports a wall time: the slowest thread's elapsed total for
+    // that phase, showing the throughput speedup.
+    TimingResult runParallelTimingTest(unsigned threadCount,
+                                 const std::function<IPropertyTree *()> &createTreeFunc)
+    {
+        const unsigned itersThisThread = iterations / threadCount;
+        // Per-iteration samples. Thread t owns the disjoint slice [t*itersThisThread, ...),
+        // so no locking is needed; the samples are pooled afterwards for the distribution.
+        std::vector<uint64_t> createCycles(iterations, 0);
+        std::vector<uint64_t> dtorCycles(iterations, 0);
+
+        // Optional phase barrier (see synchronizePhases). When enabled, every thread finishes
+        // creating before any thread starts destructing, so the create and dtor phases never
+        // overlap and each measures only its own contention. When disabled the phases run freely
+        // and overlap across threads (some threads creating while others destruct), so the
+        // reported create and dtor timings mix the two workloads and may be misleading. If a
+        // worker fails it sets stop and aborts the barrier, releasing any waiting threads instead
+        // of deadlocking.
+        std::atomic<bool> stop{false};
+        Barrier barrier(threadCount);
+
+        auto workerTask = [&](unsigned threadIdx)
+        {
+            try
+            {
+                const unsigned base = threadIdx * itersThisThread;
+                for (unsigned i = 0; i < itersThisThread; ++i)
+                {
+                    if (synchronizePhases)
+                        barrier.wait();             // start the create phase together
+                    if (stop)
+                        break;
+                    CCycleTimer iterTimer;
+                    Owned<IPropertyTree> tree = createTreeFunc();
+                    createCycles[base + i] = iterTimer.elapsedCycles();
+
+                    if (synchronizePhases)
+                        barrier.wait();             // all created -> start the dtor phase together
+                    if (stop)
+                        break;
+                    CCycleTimer dtorTimer;
+                    tree.clear();
+                    dtorCycles[base + i] = dtorTimer.elapsedCycles();
+                }
+            }
+            catch(IException *)
+            {
+                stop = true;
+                barrier.abort();
+                throw;
+            }
+            catch (const std::exception &e)
+            {
+                stop = true;
+                barrier.abort();
+                throw makeStringExceptionV(-1, "Worker thread exception: %s", e.what());
+            }
+        };
+
+        try
+        {
+            if (threadCount == 1)
+                workerTask(0);
+            else
+            {
+                std::vector<std::future<void>> futures;
+                futures.reserve(threadCount);
+                Owned<IException> firstException;
+
+                try
+                {
+                    for (unsigned i = 0; i < threadCount; ++i)
+                        futures.emplace_back(std::async(std::launch::async, [&, i]() { workerTask(i); }));
+                }
+                catch (const std::exception &e)
+                {
+                    stop = true;
+                    barrier.abort();
+                    if (!firstException)
+                        firstException.setown(makeStringExceptionV(-1, "Failed to launch worker thread: %s", e.what()));
+                }
+
+                for (auto &f : futures)
+                {
+                    try
+                    {
+                        f.get();
+                    }
+                    catch (IException *e)
+                    {
+                        if (!firstException)
+                            firstException.setown(e);
+                        else
+                            e->Release();
+                    }
+                }
+
+                if (firstException)
+                {
+                    StringBuffer errMsg;
+                    firstException->errorMessage(errMsg);
+                    CPPUNIT_FAIL(errMsg.str());
+                }
+            }
+        }
+        catch (IException *e)
+        {
+            StringBuffer errMsg;
+            e->errorMessage(errMsg);
+            e->Release();
+            CPPUNIT_FAIL(errMsg.str());
+        }
+
+        std::vector<double> createMs;
+        std::vector<double> dtorMs;
+        std::vector<double> totalMs;
+        createMs.reserve(iterations);
+        dtorMs.reserve(iterations);
+        totalMs.reserve(iterations);
+        // Pool every iteration's samples so avg/sd/min/max describe the per-iteration
+        // distribution and stay comparable across thread counts (total = create + dtor of
+        // the same iteration).
+        for (unsigned i = 0; i < iterations; ++i)
+        {
+            double cMs = (double)cycle_to_nanosec(createCycles[i]) / 1e6;
+            double dMs = (double)cycle_to_nanosec(dtorCycles[i]) / 1e6;
+            createMs.push_back(cMs);
+            dtorMs.push_back(dMs);
+            totalMs.push_back(cMs + dMs);
+        }
+
+        // Per-phase wall times: the elapsed total of the slowest thread for each phase,
+        // summed over that thread's slice of iterations.
+        uint64_t maxCreateCycles = 0;
+        uint64_t maxDtorCycles = 0;
+        uint64_t maxTotalCycles = 0;
+        for (unsigned t = 0; t < threadCount; ++t)
+        {
+            const unsigned base = t * itersThisThread;
+            uint64_t threadCreate = 0;
+            uint64_t threadDtor = 0;
+            for (unsigned i = 0; i < itersThisThread; ++i)
+            {
+                threadCreate += createCycles[base + i];
+                threadDtor += dtorCycles[base + i];
+            }
+            maxCreateCycles = std::max(maxCreateCycles, threadCreate);
+            maxDtorCycles = std::max(maxDtorCycles, threadDtor);
+            maxTotalCycles = std::max(maxTotalCycles, threadCreate + threadDtor);
+        }
+
+        TimingResult result;
+        result.create = computeStats(createMs);
+        result.dtor = computeStats(dtorMs);
+        result.total = computeStats(totalMs);
+        result.create.wallMs = (double)cycle_to_nanosec(maxCreateCycles) / 1e6;
+        result.dtor.wallMs = (double)cycle_to_nanosec(maxDtorCycles) / 1e6;
+        result.total.wallMs = (double)cycle_to_nanosec(maxTotalCycles) / 1e6;
+        return result;
+    }
+
+    void decompressZstdBuffer(const void *compressedData, size_t compressedSize, const char *actualPath, MemoryBuffer &output)
+    {
+        assertex(compressedData && compressedSize);
+
+        try
+        {
+            Owned<IExpander> expander = createZStdExpander();
+            size32_t targetSize = expander->init(compressedData);
+            if (targetSize == 0 || targetSize > MEMBUFFER_MAXLEN)
+                throw makeStringExceptionV(-1, "Zstd decompressed size %u out of bounds for \"%s\"", targetSize, actualPath);
+
+            output.clear();
+            void *dest = output.reserveTruncate(targetSize);
+            size32_t decompressedSize = expander->expandDirect(targetSize, dest, compressedSize, compressedData);
+            output.setLength(decompressedSize);
+        }
+        catch (IException *e)
+        {
+            StringBuffer err;
+            e->errorMessage(err);
+            int errCode = e->errorCode();
+            e->Release();
+            throw makeStringExceptionV(errCode ? errCode : -1, "Zstd decompression error for \"%s\": %s", actualPath, err.str());
+        }
+    }
+
+    void readBinaryFile(MemoryBuffer &binaryData)
+    {
+        try
+        {
+            Owned<IFile> binaryFile = createIFile(binaryPath.str());
+            if (!binaryFile->exists())
+                throw makeStringExceptionV(-1, "Binary file \"%s\" does not exist", binaryPath.str());
+
+            Owned<IFileIO> fileIO = binaryFile->open(IFOread);
+            binaryData.clear();
+            ::read(fileIO, 0, (size32_t)-1, binaryData);
+
+            const char *ext = pathExtension(binaryPath.str());
+            if (strsame(ext, ".zst"))
+            {
+                MemoryBuffer compressed;
+                binaryData.swapWith(compressed);
+                decompressZstdBuffer(compressed.toByteArray(), compressed.length(), binaryPath.str(), binaryData);
+            }
+        }
+        catch (IException *e)
+        {
+            StringBuffer msg;
+            e->errorMessage(msg);
+            e->Release();
+            CPPUNIT_FAIL(msg.str());
+        }
+        catch (const std::exception &e)
+        {
+            CPPUNIT_FAIL(e.what());
+        }
+        catch (...)
+        {
+            CPPUNIT_FAIL("Unknown exception caught while reading binary file");
+        }
+
+        unsigned binaryDataLen = binaryData.length();
+        CPPUNIT_ASSERT_MESSAGE("Binary timing test data is empty", binaryDataLen > 0);
+    }
+
+    StringBuffer binaryPath;
+    unsigned iterations = 0;
+    std::vector<unsigned> threadCounts;
+    std::bitset<modeCount> enabledModes;
+    bool validateContent{false};
+    bool synchronizePhases{true};
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(PTreeBinaryTimingStressTest);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(PTreeBinaryTimingStressTest, "PTreeBinaryTimingStressTest");
 
 #include "jdebug.hpp"
-#include "jmutex.hpp"
-
-
-class AtomicTimingTest : public CppUnit::TestFixture
+class TestStdReadWriteLock : public StdReadWriteLock
 {
-    CPPUNIT_TEST_SUITE(AtomicTimingTest);
+public:
+    TestStdReadWriteLock() : StdReadWriteLock(nullptr) {}
+};
+
+class TestStdTimedReadWriteLock : public StdTimedReadWriteLock
+{
+public:
+    TestStdTimedReadWriteLock() : StdTimedReadWriteLock(nullptr) {}
+};
+
+class AtomicTimingStressTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(AtomicTimingStressTest);
         CPPUNIT_TEST(runAllTests);
     CPPUNIT_TEST_SUITE_END();
 
@@ -2019,11 +4975,11 @@ public:
         std::atomic<unsigned __int64> value = { 0 };
     };
 
-    template <typename LOCK, typename BLOCK, typename COUNTER, unsigned NUMVALUES, unsigned NUMLOCKS>
+    template <typename LOCK, typename BLOCK, typename COUNTER>
     class LockTester
     {
     public:
-        LockTester()
+        LockTester(unsigned _NUMVALUES, unsigned _NUMLOCKS) : NUMVALUES(_NUMVALUES), NUMLOCKS(_NUMLOCKS)
         {
             value1 = 0;
         }
@@ -2031,29 +4987,28 @@ public:
         class LockTestThread : public Thread
         {
         public:
-            LockTestThread(Semaphore & _startSem, Semaphore & _endSem, LOCK & _lock1, COUNTER & _value1, LOCK & _lock2, COUNTER * _extraValues, unsigned _numIterations)
-                : startSem(_startSem), endSem(_endSem),
-                  lock1(_lock1), value1(_value1),
-                  lock2(_lock2), extraValues(_extraValues),
+            LockTestThread(LockTester & _tester,
+                  Semaphore & _startSem, Semaphore & _endSem, LOCK & _lock1, COUNTER & _value1, LOCK & _lock2, COUNTER * _extraValues, unsigned _numIterations)
+                : Thread("LockTestThread"), tester(_tester), startSem(_startSem), endSem(_endSem),
+                  lock1(_lock1), lock2(_lock2),
+                  value1(_value1), extraValues(_extraValues),
                   numIterations(_numIterations)
             {
             }
 
             virtual void execute()
             {
+                unsigned NUMVALUES = tester.NUMVALUES;
                 {
                     BLOCK block(lock1);
                     value1++;
                     if (NUMVALUES >= 2)
-                        extraValues[1]++;
-                    if (NUMVALUES >= 3)
-                        extraValues[2]++;
-                    if (NUMVALUES >= 4)
-                        extraValues[3]++;
-                    if (NUMVALUES >= 5)
-                        extraValues[4]++;
+                    {
+                        for (unsigned i = 1; i < NUMVALUES; i++)
+                            extraValues[i]++;
+                    }
                 }
-                if (NUMLOCKS == 2)
+                if (tester.NUMLOCKS == 2)
                 {
                     BLOCK block(lock2);
                     extraValues[1]++;
@@ -2070,6 +5025,7 @@ public:
             }
 
         protected:
+            LockTester & tester;
             Semaphore & startSem;
             Semaphore & endSem;
             LOCK & lock1;
@@ -2082,13 +5038,13 @@ public:
         unsigned __int64 run(const char * title, unsigned numThreads, unsigned numIterations)
         {
             value1 = 0;
-            for (unsigned ix = 1; ix < NUMVALUES; ix++)
+            for (unsigned ix = 0; ix < NUMVALUES; ix++)
                 extraValues[ix] = 0;
             for (unsigned i = 0; i < numThreads; i++)
             {
-                LockTestThread * next = new LockTestThread(startSem, endSem, lock, value1, lock, extraValues, numIterations);
+            LockTestThread * next = new LockTestThread(*this, startSem, endSem, lock, value1, lock, extraValues, numIterations);
                 threads.append(*next);
-                next->start();
+                next->start(false);
             }
 
             cycle_t startCycles = get_cycles_now();
@@ -2098,104 +5054,107 @@ public:
             cycle_t endCycles = get_cycles_now();
             unsigned __int64 expected = (unsigned __int64)numIterations * numThreads;
             unsigned __int64 averageTime = cycle_to_nanosec(endCycles - startCycles) / (numIterations * numThreads);
-            printf("%s@%u/%u threads(%u) %" I64F "uns/iteration lost(%" I64F "d)\n", title, NUMVALUES, NUMLOCKS, numThreads, averageTime, expected - value1);
+//            DBGLOG("%s@%u/%u threads(%u) %" I64F "uns/iteration lost(%" I64F "d)", title, NUMVALUES, NUMLOCKS, numThreads, averageTime, expected - value1);
             for (unsigned i3 = 0; i3 < numThreads; i3++)
                 threads.item(i3).join();
             return averageTime;
         }
 
     protected:
-        CIArrayOf<LockTestThread> threads;
-        Semaphore startSem;
-        Semaphore endSem;
+        IArrayOf<LockTestThread> threads;
+        Semaphore startSem{SYNC_LOCATION};
+        Semaphore endSem{SYNC_LOCATION};
         LOCK lock;
         COUNTER value1;
-        COUNTER extraValues[NUMVALUES];
+        COUNTER extraValues[50];
+        unsigned NUMVALUES;
+        unsigned NUMLOCKS;
     };
 
     #define DO_TEST(LOCK, CLOCK, COUNTER, NUMVALUES, NUMLOCKS)   \
     { \
-        const char * title = #LOCK "," #COUNTER;\
-        LockTester<LOCK, CLOCK, COUNTER, NUMVALUES, NUMLOCKS> tester;\
-        uncontendedTimes.append(tester.run(title, 1, numIterations));\
-        minorTimes.append(tester.run(title, 2, numIterations));\
-        typicalTimes.append(tester.run(title, numCores / 2, numIterations));\
-        tester.run(title, numCores, numIterations);\
-        tester.run(title, numCores + 1, numIterations);\
-        contendedTimes.append(tester.run(title, numCores * 2, numIterations));\
+        const char * title = #CLOCK;\
+        LockTester<LOCK, CLOCK, COUNTER> tester(NUMVALUES, NUMLOCKS);\
+        __uint64 t1 = tester.run(title, 1, numIterations);\
+        __uint64 t2 = tester.run(title, 2, numIterations);\
+        __uint64 t3 = tester.run(title, 4, numIterations);\
+        __uint64 t4 = tester.run(title, numCores / 2, numIterations);\
+        __uint64 t5 = tester.run(title, numCores, numIterations);\
+        __uint64 t6 = tester.run(title, numCores + 1, numIterations);\
+        __uint64 t7 = tester.run(title, numCores * 2, numIterations);\
+        DBGLOG("%-40s: %6llu %6llu %6llu %6llu %6llu %6llu %6llu", title, t1, t2, t3, t4, t5, t6, t7);\
     }
 
     //Use to common out a test
-    #define XDO_TEST(LOCK, CLOCK, COUNTER, NUMVALUES, NUMLOCKS)   \
-    { \
-        uncontendedTimes.append(0);\
-        minorTimes.append(0);\
-        typicalTimes.append(0);\
-        contendedTimes.append(0);\
-    }
-
-
+    class TestCriticalSection : public CriticalSection
+    {
+    public:
+        TestCriticalSection() : CriticalSection(SYNC_LOCATION) {}
+    };
+    class TestMutex : public Mutex
+    {
+    public:
+        TestMutex() : Mutex(SYNC_LOCATION) {}
+    };
+    class TestSimpleMutex : public SimpleMutex
+    {
+    public:
+        TestSimpleMutex() : SimpleMutex(SYNC_LOCATION) {}
+    };
+    class TestTimedMutex : public TimedMutex
+    {
+    public:
+        TestTimedMutex() : TimedMutex(SYNC_LOCATION) {}
+    };
+    class TestSpinLock : public SpinLock
+    {
+    public:
+        TestSpinLock() : SpinLock(SYNC_LOCATION) {}
+    };
     class Null
     {};
 
-    const unsigned numIterations = 1000000;
-    const unsigned numCores = getAffinityCpus();
-    void runAllTests()
+    const unsigned numIterations = 10000;
+    const unsigned numCores = std::max(getAffinityCpus(), 16U);
+
+    void runAllTests(unsigned numValues, unsigned numLocks)
     {
-        DO_TEST(CriticalSection, CriticalBlock, unsigned __int64, 1, 1);
-        DO_TEST(CriticalSection, CriticalBlock, unsigned __int64, 2, 1);
-        DO_TEST(CriticalSection, CriticalBlock, unsigned __int64, 5, 1);
-        DO_TEST(CriticalSection, CriticalBlock, unsigned __int64, 1, 2);
-        DO_TEST(SpinLock, SpinBlock, unsigned __int64, 1, 1);
-        DO_TEST(SpinLock, SpinBlock, unsigned __int64, 2, 1);
-        DO_TEST(SpinLock, SpinBlock, unsigned __int64, 5, 1);
-        DO_TEST(SpinLock, SpinBlock, unsigned __int64, 1, 2);
-        DO_TEST(Null, Null, std::atomic<unsigned __int64>, 1, 1);
-        DO_TEST(Null, Null, std::atomic<unsigned __int64>, 2, 1);
-        DO_TEST(Null, Null, std::atomic<unsigned __int64>, 5, 1);
-        DO_TEST(Null, Null, std::atomic<unsigned __int64>, 1, 2);
-        DO_TEST(Null, Null, RelaxedAtomic<unsigned __int64>, 1, 1);
-        DO_TEST(Null, Null, RelaxedAtomic<unsigned __int64>, 5, 1);
-        DO_TEST(Null, Null, CasCounter, 1, 1);
-        DO_TEST(Null, Null, CasCounter, 5, 1);
-        DO_TEST(Null, Null, unsigned __int64, 1, 1);
-        DO_TEST(Null, Null, unsigned __int64, 2, 1);
-        DO_TEST(Null, Null, unsigned __int64, 5, 1);
+        DBGLOG("Test %u values %u locks", numValues, numLocks);
+        DBGLOG("%-40s: %6u %6u %6u %6u %6u %6u %6u", "test", 1, 2, 4, numCores/2, numCores, numCores+1, numCores*2);
+
+        DO_TEST(TestCriticalSection, CriticalBlock, unsigned __int64, numValues, numLocks);
+
+#if 0
+        DO_TEST(TestMutex, synchronized, unsigned __int64, numValues, numLocks);
+        DO_TEST(TestSimpleMutex, MutexBlock<SimpleMutex>, unsigned __int64, numValues, numLocks);
+        DO_TEST(TestTimedMutex, TimedMutexBlock, unsigned __int64, numValues, numLocks);
+        DO_TEST(TestSpinLock, SpinBlock, unsigned __int64, numValues, numLocks);
+        DO_TEST(Null, Null, std::atomic<unsigned __int64>, numValues, numLocks);
+        DO_TEST(Null, Null, RelaxedAtomic<unsigned __int64>, numValues, numLocks);
+        DO_TEST(Null, Null, CasCounter, numValues, numLocks);
+        DO_TEST(Null, Null, unsigned __int64, numValues, numLocks);
+#endif
 
         //Read locks will fail to prevent values being lost, but the timings are useful in comparison with CriticalSection
-        DO_TEST(ReadWriteLock, ReadLockBlock, unsigned __int64, 1, 1);
-        DO_TEST(ReadWriteLock, ReadLockBlock, unsigned __int64, 2, 1);
-        DO_TEST(ReadWriteLock, ReadLockBlock, unsigned __int64, 5, 1);
-        DO_TEST(ReadWriteLock, ReadLockBlock, unsigned __int64, 1, 2);
-        DO_TEST(ReadWriteLock, WriteLockBlock, unsigned __int64, 1, 1);
-        DO_TEST(ReadWriteLock, WriteLockBlock, unsigned __int64, 2, 1);
-        DO_TEST(ReadWriteLock, WriteLockBlock, unsigned __int64, 5, 1);
-        DO_TEST(ReadWriteLock, WriteLockBlock, unsigned __int64, 1, 2);
+        DO_TEST(TestStdReadWriteLock, StdReadLockBlock, unsigned __int64, numValues, numLocks);
+        DO_TEST(TestStdReadWriteLock, StdWriteLockBlock, unsigned __int64, numValues, numLocks);
 
-        printf("Summary\n");
-        summariseTimings("Uncontended", uncontendedTimes);
-        summariseTimings("Minor", minorTimes);
-        summariseTimings("Typical", typicalTimes);
-        summariseTimings("Over", contendedTimes);
+        DO_TEST(TestStdTimedReadWriteLock, StdTimedReadLockBlock, unsigned __int64, numValues, numLocks);
+        DO_TEST(TestStdTimedReadWriteLock, StdTimedWriteLockBlock, unsigned __int64, numValues, numLocks);
     }
 
-    void summariseTimings(const char * option, UInt64Array & times)
+    void runAllTests()
     {
-        printf("%11s 1x: cs(%3" I64F "u) spin(%3" I64F "u) atomic(%3" I64F "u) ratomic(%3" I64F "u) cas(%3" I64F "u) rd(%3" I64F "u) wr(%3" I64F "u)   "
-                    "5x: cs(%3" I64F "u) spin(%3" I64F "u) atomic(%3" I64F "u) ratomic(%3" I64F "u) cas(%3" I64F "u) rd(%3" I64F "u) wr(%3" I64F "u)\n", option,
-                    times.item(0), times.item(4), times.item(8), times.item(12), times.item(14), times.item(19), times.item(23),
-                    times.item(2), times.item(6), times.item(10), times.item(13), times.item(15), times.item(21), times.item(25));
+        runAllTests(1, 1);
+        runAllTests(2, 1);
+        runAllTests(5, 1);
+        runAllTests(50, 1);
+        runAllTests(1, 2);
     }
-
-private:
-    UInt64Array uncontendedTimes;
-    UInt64Array minorTimes;
-    UInt64Array typicalTimes;
-    UInt64Array contendedTimes;
 };
 
-CPPUNIT_TEST_SUITE_REGISTRATION(AtomicTimingTest);
-CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(AtomicTimingTest, "AtomicTimingTest");
+CPPUNIT_TEST_SUITE_REGISTRATION(AtomicTimingStressTest);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(AtomicTimingStressTest, "AtomicTimingStressTest");
 
 
 //=====================================================================================================================
@@ -2211,20 +5170,20 @@ public:
     void getSystemTiming()
     {
         const unsigned num = 10000;
-        CpuInfo temp;
+        SystemInfo temp;
         CCycleTimer timer;
         for (unsigned i=0; i < num; i++)
-            temp.getSystemTimes();
-        printf("Time to get system cpu activity = %" I64F "uns\n", timer.elapsedNs()/num);
+            temp.update(ReadAllInfo);
+        DBGLOG("Time to get system cpu activity = %" I64F "uns", timer.elapsedNs()/num);
     }
     void getProcessTiming()
     {
         const unsigned num = 10000;
-        CpuInfo temp;
+        ProcessInfo temp;
         CCycleTimer timer;
         for (unsigned i=0; i < num; i++)
-            temp.getProcessTimes();
-        printf("Time to get process cpu activity = %" I64F "uns\n", timer.elapsedNs()/num);
+            temp.update(ReadAllInfo);
+        DBGLOG("Time to get process cpu activity = %" I64F "uns", timer.elapsedNs()/num);
     }
     void runAllTests()
     {
@@ -2233,33 +5192,35 @@ public:
         getProcessTiming();
         getProcessTiming(); // Second call seems to be faster - so more representative
 
-        CpuInfo prevSystem;
-        CpuInfo prevProcess;
-        CpuInfo curProcess(true, false);
-        CpuInfo curSystem(false, true);
-        volatile unsigned x = 0;
+        SystemInfo prevSystem;
+        ProcessInfo prevProcess;
+        ProcessInfo curProcess(ReadAllInfo);
+        SystemInfo curSystem(ReadAllInfo);
+        unsigned x = 0;
         for (unsigned i=0; i < 10; i++)
         {
             prevProcess = curProcess;
             prevSystem = curSystem;
-            curProcess.getProcessTimes();
-            curSystem.getSystemTimes();
-            CpuInfo deltaProcess = curProcess - prevProcess;
-            CpuInfo deltaSystem = curSystem - prevSystem;
+            curProcess.update(ReadAllInfo);
+            curSystem.update(ReadAllInfo);
+            SystemProcessInfo deltaProcess = curProcess - prevProcess;
+            SystemProcessInfo deltaSystem = curSystem - prevSystem;
             if (deltaSystem.getTotalNs())
             {
-                printf(" System: User(%u) System(%u) Total(%u) %u%% Ctx(%" I64F "u)  ",
+                DBGLOG(" System: User(%u) System(%u) Total(%u) %u%% Ctx(%" I64F "u)  ",
                         (unsigned)(deltaSystem.getUserNs() / 1000000), (unsigned)(deltaSystem.getSystemNs() / 1000000), (unsigned)(deltaSystem.getTotalNs() / 1000000),
                         (unsigned)((deltaSystem.getUserNs() * 100) / deltaSystem.getTotalNs()), deltaSystem.getNumContextSwitches());
-                printf(" Process: User(%u) System(%u) Total(%u) %u%% Ctx(%" I64F "u)\n",
+                DBGLOG(" Process: User(%u) System(%u) Total(%u) %u%% Ctx(%" I64F "u)",
                         (unsigned)(deltaProcess.getUserNs() / 1000000), (unsigned)(deltaProcess.getSystemNs() / 1000000), (unsigned)(deltaProcess.getTotalNs() / 1000000),
                         (unsigned)((deltaProcess.getUserNs() * 100) / deltaSystem.getTotalNs()), deltaProcess.getNumContextSwitches());
+                DBGLOG(" Throttled: Periods(%llu/%llu) TimeNs(%llu)", deltaSystem.getNumThrottledPeriods(), deltaSystem.getNumPeriods(), deltaSystem.getTimeThrottledNs());
             }
 
             for (unsigned j=0; j < i*100000000; j++)
                 x += j*j;
             Sleep(1000);
         }
+        DBGLOG("Dummy value to prevent optimization: %u", x);
     }
 
 };
@@ -2267,6 +5228,129 @@ public:
 CPPUNIT_TEST_SUITE_REGISTRATION(MachineInfoTimingTest);
 CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(MachineInfoTimingTest, "MachineInfoTimingTest");
 
+class RWLockStressTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(RWLockStressTest);
+        CPPUNIT_TEST(runAllTests);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    class RWLockReadTestThread : public Thread
+    {
+    public:
+        RWLockReadTestThread(Semaphore & _startSem, Semaphore & _endSem, ReadWriteLock & _lock, unsigned __int64 &_value, unsigned _numIterations)
+                : Thread("RWLockReadTestThread"), startSem(_startSem), endSem(_endSem),
+                  lock(_lock),
+                  value(_value),
+                  numIterations(_numIterations)
+        {
+        }
+
+        virtual void execute()
+        {
+            {
+                ReadLockBlock block(lock);
+                value++;
+            }
+        }
+
+        virtual int run()
+        {
+            startSem.wait();
+            for (unsigned i = 0; i < numIterations; i++)
+                execute();
+            endSem.signal();
+            return 0;
+        }
+
+    protected:
+        Semaphore & startSem;
+        Semaphore & endSem;
+        ReadWriteLock &lock;
+        unsigned __int64 & value;
+        const unsigned numIterations;
+    };
+
+    class RWLockWriteTestThread : public Thread
+    {
+    public:
+        RWLockWriteTestThread(bool &_finished, ReadWriteLock & _lock, unsigned __int64 &_value)
+                : Thread("RWLockWriteTestThread"), lock(_lock),
+                  value(_value),
+                  finished (_finished)
+        {
+        }
+
+        virtual void execute()
+        {
+            {
+                WriteLockBlock block(lock);
+                value -= 5;
+
+            }
+        }
+        virtual int run()
+        {
+            while (!finished)
+                execute();
+            return 0;
+        }
+
+    protected:
+        ReadWriteLock &lock;
+        unsigned __int64 & value;
+        bool &finished;
+    };
+
+    unsigned __int64 run(const char * title, unsigned numThreads, unsigned numWriteThreads, unsigned numIterations)
+    {
+        IArrayOf<Thread> threads;
+        Semaphore startSem{SYNC_LOCATION};
+        Semaphore endSem{SYNC_LOCATION};
+        ReadWriteLock lock{SYNC_LOCATION};
+        unsigned __int64 value;
+
+        value = 0;
+        bool finished = false;
+        for (unsigned i = 0; i < numThreads; i++)
+        {
+            RWLockReadTestThread * next = new RWLockReadTestThread(startSem, endSem, lock, value, numIterations);
+            threads.append(*next);
+            next->start(false);
+        }
+        for (unsigned i = 0; i < numWriteThreads; i++)
+        {
+            RWLockWriteTestThread * next = new RWLockWriteTestThread(finished, lock, value);
+            threads.append(*next);
+            next->start(false);
+        }
+        cycle_t startCycles = get_cycles_now();
+        startSem.signal(numThreads);
+        for (unsigned i2 = 0; i2 < numThreads; i2++)
+            endSem.wait();
+        cycle_t endCycles = get_cycles_now();
+        finished = true;
+        unsigned __int64 expected = (unsigned __int64)numIterations * numThreads;
+        unsigned __int64 averageTime = cycle_to_nanosec(endCycles - startCycles) / (numIterations * numThreads);
+        DBGLOG("%s@%u/%u threads(%u) %" I64F "uns/iteration lost(%" I64F "d)", title, 1, 1, numThreads, averageTime, expected - value);
+        for (unsigned i3 = 0; i3 < numThreads+numWriteThreads; i3++)
+            threads.item(i3).join();
+        return averageTime;
+    }
+
+    const unsigned numIterations = 100000;
+    const unsigned numCores = std::max(getAffinityCpus(), 16U);
+    void runAllTests()
+    {
+        run("10:1", 10, 1, numIterations);
+        run("20:1", 20, 1, numIterations);
+        run("10:10", 10, 10, numIterations);
+    }
+
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(RWLockStressTest);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(RWLockStressTest, "RWLockStressTest");
 
 
 
@@ -2327,100 +5411,8 @@ public:
 CPPUNIT_TEST_SUITE_REGISTRATION(JlibIOTest);
 CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(JlibIOTest, "JlibIOTest");
 
+//--------------------------------------------------------------------------------------------------------------------
 
-class JlibCompressionTestsStress : public CppUnit::TestFixture
-{
-    CPPUNIT_TEST_SUITE(JlibCompressionTestsStress);
-        CPPUNIT_TEST(test);
-    CPPUNIT_TEST_SUITE_END();
-
-public:
-    void test()
-    {
-        try
-        {
-            size32_t sz = 100*0x100000; // 100MB
-            MemoryBuffer src;
-            src.ensureCapacity(sz);
-            MemoryBuffer compressed;
-            const char *aesKey = "012345678901234567890123";
-            Owned<ICompressHandlerIterator> iter = getCompressHandlerIterator();
-
-            StringBuffer tmp;
-            unsigned card = 0;
-            size32_t rowSz = 0;
-            while (true)
-            {
-                size32_t cLen = src.length();
-                if (cLen > sz)
-                    break;
-                src.append(cLen);
-                tmp.clear().appendf("%10u", cLen);
-                src.append(tmp.length(), tmp.str());
-                src.append(++card % 52);
-                src.append(crc32((const char *)&cLen, sizeof(cLen), 0));
-                unsigned ccrc = crc32((const char *)&card, sizeof(card), 0);
-                tmp.clear().appendf("%10u", ccrc);
-                src.append(tmp.length(), tmp.str());
-                tmp.clear().appendf("%20u", (++card % 10));
-                src.append(tmp.length(), tmp.str());
-                if (0 == rowSz)
-                    rowSz = src.length();
-                else
-                {
-                    dbgassertex(0 == (src.length() % rowSz));
-                }
-            }
-
-            printf("\nAlgorithm || Compression Time (ms) || Decompression Time (ms) || Compression Ratio\n");
-
-            ForEach(*iter)
-            {
-                compressed.clear();
-                ICompressHandler &handler = iter->query();
-                Owned<ICompressor> compressor = handler.getCompressor(streq("AES", handler.queryType()) ? aesKey: nullptr);
-
-                CCycleTimer timer;
-                compressor->open(compressed, sz);
-                compressor->startblock();
-                const byte *ptr = src.bytes();
-                const byte *ptrEnd = ptr + src.length();
-                while (ptr != ptrEnd)
-                {
-                    compressor->write(ptr, rowSz);
-                    ptr += rowSz;
-                }
-                compressor->commitblock();
-                compressor->close();
-                cycle_t compressCycles = timer.elapsedCycles();
-
-                Owned<IExpander> expander = handler.getExpander(streq("AES", handler.queryType()) ? aesKey: nullptr);
-
-                timer.reset();
-                size32_t required = expander->init(compressed.bytes());
-                MemoryBuffer tgt(required);
-                expander->expand(tgt.bufferBase());
-                tgt.setWritePos(required);
-                cycle_t decompressCycles = timer.elapsedCycles();
-
-                float ratio = (float)(src.length()) / compressed.length();
-
-                printf("%9s || %21u || %23u || %17.2f [ %u, %u ]\n", handler.queryType(), (unsigned)cycle_to_millisec(compressCycles), (unsigned)cycle_to_millisec(decompressCycles), ratio, src.length(), compressed.length());
-
-                CPPUNIT_ASSERT(tgt.length() >= sz);
-                CPPUNIT_ASSERT(0 == memcmp(src.bufferBase(), tgt.bufferBase(), sz));
-           }
-        }
-        catch (IException *e)
-        {
-            EXCLOG(e, nullptr);
-            throw;
-        }
-    }
-};
-
-CPPUNIT_TEST_SUITE_REGISTRATION( JlibCompressionTestsStress );
-CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibCompressionTestsStress, "JlibCompressionTestsStress" );
 
 class JlibFriendlySizeTest : public CppUnit::TestFixture
 {
@@ -2460,5 +5452,1900 @@ public:
 CPPUNIT_TEST_SUITE_REGISTRATION( JlibFriendlySizeTest );
 CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibFriendlySizeTest, "JlibFriendlySizeTest" );
 
+
+static stat_type readCheckStatisticValue(const char * cur, StatisticMeasure measure)
+{
+    const char * end = nullptr;
+    stat_type ret = readStatisticValue(cur, &end, measure);
+    CPPUNIT_ASSERT(end && *end == '!');
+    return ret;
+}
+
+class JlibStatsTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(JlibStatsTest);
+        CPPUNIT_TEST(test);
+        CPPUNIT_TEST(testThresholdStatPointer);
+        CPPUNIT_TEST(testThresholdStat);
+        CPPUNIT_TEST(testThresholdStatClear);
+        CPPUNIT_TEST(testThresholdStatImplicitConversion);
+        CPPUNIT_TEST(testThresholdStatPerformance);
+        CPPUNIT_TEST(testThresholdStatThreadSafety);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void test()
+    {
+        StringBuffer temp;
+        CPPUNIT_ASSERT(readCheckStatisticValue("100s!", SMeasureTimeNs) ==  U64C(100000000000));
+        CPPUNIT_ASSERT(readCheckStatisticValue("100ms!", SMeasureTimeNs) == U64C(100000000));
+        CPPUNIT_ASSERT(readCheckStatisticValue("100us!", SMeasureTimeNs) == U64C(100000));
+        CPPUNIT_ASSERT(readCheckStatisticValue("100ns!", SMeasureTimeNs) == U64C(100));
+
+        CPPUNIT_ASSERT_EQUAL(U64C(1000000000), readCheckStatisticValue("0:0:1!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(60000000000), readCheckStatisticValue("0:1:0!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(3600000000000), readCheckStatisticValue("1:0:0!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(3600123456789), readCheckStatisticValue("1:0:0.123456789!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(1000), readCheckStatisticValue("0:0:0.000001!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(3600000000000), readCheckStatisticValue("1:0:0!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(86412123456789), readCheckStatisticValue("1d 0:0:12.123456789!", SMeasureTimeNs));
+        CPPUNIT_ASSERT_EQUAL(U64C(86460123456789), readCheckStatisticValue("1d 0:1:0.123456789!", SMeasureTimeNs));
+
+        CPPUNIT_ASSERT_EQUAL(U64C(1000), readCheckStatisticValue("1970-01-01T00:00:00.001Z!", SMeasureTimestampUs));
+        CPPUNIT_ASSERT_EQUAL(std::string("1970-01-01T00:00:00.001Z"), std::string(formatStatistic(temp.clear(), 1000, SMeasureTimestampUs)));
+        CPPUNIT_ASSERT_EQUAL(U64C(1608899696789000), readCheckStatisticValue("2020-12-25T12:34:56.789Z!", SMeasureTimestampUs));
+        CPPUNIT_ASSERT_EQUAL(std::string("2020-12-25T12:34:56.789Z"), std::string(formatStatistic(temp.clear(), U64C(1608899696789000), SMeasureTimestampUs)));
+        CPPUNIT_ASSERT_EQUAL(U64C(1608899696789000), readCheckStatisticValue("1608899696789000!", SMeasureTimestampUs));
+    }
+
+    void testThresholdStatPointer()
+    {
+        // Create a shared ThresholdStat instance for this component
+        auto thresholdStat = makeSharedThresholdStat();
+
+        // Record some values
+        thresholdStat->recordValue(100);
+        thresholdStat->recordValue(120);
+        thresholdStat->recordValue(80);
+
+        // Query statistics using the new consolidated method
+        __uint64 count;
+        double avg, stddev;
+        thresholdStat->queryStatistics(count, avg, stddev);
+
+        CPPUNIT_ASSERT_EQUAL((__uint64)3, count);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(100.0, avg, 0.0001); // (100 + 120 + 80) / 3
+
+        // Check if a new value is an outlier (e.g., more than 2 stddev from mean)
+        double newValue = 200.0;
+        double deviations = (stddev == 0.0) ? 0.0 : (newValue - avg) / stddev;
+        CPPUNIT_ASSERT(fabs(deviations) > 2.0); // 200 is more than 2 stddev from mean
+    }
+
+    void testThresholdStat()
+    {
+        // Test ThresholdStat for tracking numeric values with statistical aggregation
+        std::shared_ptr<ThresholdStat> pThreshold = makeSharedThresholdStat();
+
+        // Initially should be empty
+        __uint64 count;
+        double mean, stddev;
+        pThreshold->queryStatistics(count, mean, stddev);
+        CPPUNIT_ASSERT_EQUAL((__uint64)0, count);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(0.0, mean, 0.0001);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(0.0, stddev, 0.0001);
+
+        // Record first value
+        pThreshold->recordValue(100);
+        pThreshold->queryStatistics(count, mean, stddev);
+        CPPUNIT_ASSERT_EQUAL((__uint64)1, count);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(100.0, mean, 0.0001);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(0.0, stddev, 0.0001);
+
+        // Record second value
+        pThreshold->recordValue(200);
+        pThreshold->queryStatistics(count, mean, stddev);
+        CPPUNIT_ASSERT_EQUAL((__uint64)2, count);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(150.0, mean, 0.0001); // (100 + 200) / 2
+
+        // Record third value
+        pThreshold->recordValue(150);
+        pThreshold->queryStatistics(count, mean, stddev);
+        CPPUNIT_ASSERT_EQUAL((__uint64)3, count);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(150.0, mean, 0.0001); // (100 + 200 + 150) / 3
+        double expectedStdDev = sqrt(((100.0-150.0)*(100.0-150.0) + (200.0-150.0)*(200.0-150.0) + (150.0-150.0)*(150.0-150.0)) / 3.0);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(expectedStdDev, stddev, 0.0001);
+
+        // Test deviation calculation manually (replacing getDeviations)
+        double testValue = 200.0;
+        double deviation = (stddev == 0.0) ? 0.0 : (testValue - mean) / stddev;
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(1.224, deviation, 0.05); // Updated for population stddev
+
+        testValue = 100.0;
+        deviation = (stddev == 0.0) ? 0.0 : (testValue - mean) / stddev;
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(-1.224, deviation, 0.05); // Updated for population stddev
+    }
+
+    void testThresholdStatClear()
+    {
+        // Create a ThresholdStat with unit StatisticMeasure::Count
+        std::shared_ptr<ThresholdStat> pThreshold = makeSharedThresholdStat();
+
+        // Record some values
+        pThreshold->recordValue(10);
+        pThreshold->recordValue(20);
+        pThreshold->recordValue(30);
+
+        // Check that statistics are non-zero
+        __uint64 count;
+        double mean, stddev;
+        pThreshold->queryStatistics(count, mean, stddev);
+        CPPUNIT_ASSERT_EQUAL((__uint64)3, count);
+        CPPUNIT_ASSERT(mean > 0.0);
+        CPPUNIT_ASSERT(stddev > 0.0);
+
+        // Clear the metric
+        pThreshold->clear();
+
+        // After clear, statistics should be zero
+        pThreshold->queryStatistics(count, mean, stddev);
+        CPPUNIT_ASSERT_EQUAL((__uint64)0, count);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(0.0, mean, 0.0001);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(0.0, stddev, 0.0001);
+
+        // Record some values again
+        pThreshold->recordValue(10);
+        pThreshold->recordValue(20);
+        pThreshold->recordValue(30);
+
+        // Check that statistics are non-zero again
+        pThreshold->queryStatistics(count, mean, stddev);
+        CPPUNIT_ASSERT_EQUAL((__uint64)3, count);
+        CPPUNIT_ASSERT(mean > 0.0);
+        CPPUNIT_ASSERT(stddev > 0.0);
+    }
+
+    void testThresholdStatImplicitConversion()
+    {
+        // Test ThresholdStat with various numeric types to verify implicit conversion
+        // Performance Note: recordValue(double) eliminates static_cast overhead
+        // compared to recordValue(__uint64) which required internal conversion
+        std::shared_ptr<ThresholdStat> pThreshold = makeSharedThresholdStat();
+
+        // Test integer literals (implicit int -> double conversion)
+        pThreshold->recordValue(100);    // int literal -> double
+        pThreshold->recordValue(200);    // int literal -> double
+
+        // Test explicit integer types (implicit conversion)
+        __uint64 latency = 150;
+        pThreshold->recordValue(latency); // __uint64 -> double
+
+        unsigned int responseTime = 175;
+        pThreshold->recordValue(responseTime); // unsigned int -> double
+
+        // Test floating-point values (no conversion needed)
+        pThreshold->recordValue(125.5);  // Direct double, optimal performance
+        pThreshold->recordValue(135.7);  // Direct double, optimal performance
+
+        // Verify statistics are calculated correctly across all types
+        __uint64 count;
+        double mean, stddev;
+        pThreshold->queryStatistics(count, mean, stddev);
+        CPPUNIT_ASSERT_EQUAL((__uint64)6, count);
+
+        // Expected mean: (100 + 200 + 150 + 175 + 125.5 + 135.7) / 6 = 147.7
+        double expectedMean = (100.0 + 200.0 + 150.0 + 175.0 + 125.5 + 135.7) / 6.0;
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(expectedMean, mean, 0.0001);
+
+        // Test manual deviation calculation with various types
+        double testValue = expectedMean;
+        double deviation = (stddev == 0.0) ? 0.0 : (testValue - mean) / stddev;
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(0.0, deviation, 0.1); // At mean
+
+        // Test with integer parameter (implicit conversion)
+        int outlierValue = 300;
+        deviation = (stddev == 0.0) ? 0.0 : (outlierValue - mean) / stddev;
+        CPPUNIT_ASSERT(fabs(deviation) > 1.0); // Should be an outlier
+
+        // Test with direct double (optimal case)
+        double preciseValue = 147.65;
+        deviation = (stddev == 0.0) ? 0.0 : (preciseValue - mean) / stddev;
+        CPPUNIT_ASSERT(fabs(deviation) < 0.1); // Should be close to mean
+    }
+
+    void testThresholdStatPerformance()
+    {
+        // Test performance optimizations and batch operations
+        std::shared_ptr<ThresholdStat> pThreshold = makeSharedThresholdStat();
+
+        __uint64 count;
+        double mean, stddev;
+        pThreshold->queryStatistics(count, mean, stddev);
+        CPPUNIT_ASSERT_EQUAL((__uint64)0, count);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(0.0, mean, 0.0001);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(0.0, stddev, 0.0001);
+
+        // Add some data
+        pThreshold->recordValue(100.0);
+        pThreshold->recordValue(200.0);
+        pThreshold->recordValue(150.0);
+
+        // Test batch query optimization - single lock for multiple stats
+        pThreshold->queryStatistics(count, mean, stddev);
+
+        CPPUNIT_ASSERT_EQUAL((__uint64)3, count);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(150.0, mean, 0.0001);
+        CPPUNIT_ASSERT(stddev > 0.0); // Should have calculated standard deviation
+
+        // Test that lock-free count is consistently accessible
+        for (int i = 0; i < 100; ++i)
+        {
+            CPPUNIT_ASSERT_EQUAL((__uint64)3, pThreshold->queryCount()); // Should always be lock-free
+        }
+    }
+
+    void testThresholdStatThreadSafety()
+    {
+        // Test thread safety of recordValue() to ensure Welford's algorithm correctness
+        // This test addresses the race condition identified by Copilot AI where concurrent
+        // threads could apply count increments and mean/M2 updates out of order
+        std::shared_ptr<ThresholdStat> pThreshold = makeSharedThresholdStat();
+
+        const int numThreads = 10;
+        const int numValuesPerThread = 1000;
+        const double baseValue = 100.0;
+
+        std::vector<std::thread> threads;
+        std::atomic<int> readyCount{0};
+        std::atomic<bool> startFlag{false};
+
+        // Create threads that will all start simultaneously
+        for (int i = 0; i < numThreads; ++i)
+        {
+            threads.emplace_back([&, i]() {
+                readyCount++;
+                // Wait for all threads to be ready
+                while (!startFlag.load()) {
+                    std::this_thread::yield();
+                }
+
+                // Each thread records values with slight variation
+                for (int j = 0; j < numValuesPerThread; ++j)
+                {
+                    double value = baseValue + (i * 10) + (j * 0.1);
+                    pThreshold->recordValue(value);
+                }
+            });
+        }
+
+        // Wait for all threads to be ready
+        while (readyCount.load() < numThreads) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        // Start all threads simultaneously
+        startFlag.store(true);
+
+        // Wait for all threads to complete
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        // Verify final statistics are consistent
+        __uint64 finalCount;
+        double finalMean, finalStddev;
+        pThreshold->queryStatistics(finalCount, finalMean, finalStddev);
+
+        CPPUNIT_ASSERT_EQUAL((__uint64)(numThreads * numValuesPerThread), finalCount);
+
+        // Mean should be in expected range (around baseValue + some variation)
+        CPPUNIT_ASSERT(finalMean > baseValue);
+        CPPUNIT_ASSERT(finalMean < baseValue + (numThreads * 10) + (numValuesPerThread * 0.1));
+
+        // Standard deviation should be positive for varied input
+        CPPUNIT_ASSERT(finalStddev > 0.0);
+
+        // Test batch query consistency under concurrent access
+        __uint64 batchCount;
+        double batchMean, batchStddev;
+        pThreshold->queryStatistics(batchCount, batchMean, batchStddev);
+
+        CPPUNIT_ASSERT_EQUAL(finalCount, batchCount);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(finalMean, batchMean, 0.0001);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(finalStddev, batchStddev, 0.0001);
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( JlibStatsTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JlibStatsTest, "JlibStatsTest" );
+
+class HashTableTests : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE( HashTableTests );
+        CPPUNIT_TEST(testTimedCache);
+    CPPUNIT_TEST_SUITE_END();
+
+    void testTimedCache()
+    {
+        unsigned hv = 0;
+        unsigned __int64 inputHvSum = 0;
+        unsigned __int64 lookupHvSum = 0;
+        CTimeLimitedCache<unsigned, unsigned> cache(100); // 100ms timeout
+        for (unsigned i=0; i<10; i++)
+        {
+            hv = hashc((const byte *)&i,sizeof(i), hv);
+            inputHvSum += hv;
+            cache.add(i, hv);
+            unsigned lookupHv = 0;
+            CPPUNIT_ASSERT(cache.get(i, lookupHv));
+            lookupHvSum += lookupHv;
+        }
+        CPPUNIT_ASSERT(inputHvSum == lookupHvSum);
+        MilliSleep(50);
+        CPPUNIT_ASSERT(nullptr != cache.query(0, true)); // touch
+        MilliSleep(60);
+        // all except 0 that was touched should have expired
+        CPPUNIT_ASSERT(nullptr != cache.query(0));
+        for (unsigned i=1; i<10; i++)
+            CPPUNIT_ASSERT(nullptr == cache.query(i));
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( HashTableTests );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( HashTableTests, "HashTableTests" );
+
+class BlockedTimingTests : public CppUnit::TestFixture
+{
+    static constexpr bool trace = false;
+
+    CPPUNIT_TEST_SUITE( BlockedTimingTests );
+        CPPUNIT_TEST(testStandard);
+        CPPUNIT_TEST(testStandard2);
+        CPPUNIT_TEST(testStandard3);
+        CPPUNIT_TEST(testLightweight);
+        CPPUNIT_TEST(testLightweight2);
+        CPPUNIT_TEST(testConcurrent);
+    CPPUNIT_TEST_SUITE_END();
+
+    void testStandard()
+    {
+        BlockedTimeTracker tracker;
+
+        __uint64 blockTime;
+        {
+            BlockedSection block(tracker);
+            MilliSleep(15);
+            blockTime = tracker.getWaitingNs();
+        }
+        __uint64 postBlockTime = tracker.getWaitingNs();
+        __uint64 expected = 15000000;
+        CPPUNIT_ASSERT(blockTime >= expected);
+        CPPUNIT_ASSERT(blockTime <= expected + 2000000);
+        CPPUNIT_ASSERT(postBlockTime - blockTime <= 1000000);
+        if (trace)
+            DBGLOG("%" I64F "u %" I64F "u", blockTime-50000000, postBlockTime-blockTime);
+    }
+
+    void testStandard2()
+    {
+        BlockedTimeTracker tracker;
+
+        __uint64 blockTime;
+        {
+            BlockedSection block3(tracker);
+            MilliSleep(10);
+            {
+                BlockedSection block2(tracker);
+                MilliSleep(20);
+                {
+                    BlockedSection block2(tracker);
+                    MilliSleep(3);
+                    blockTime = tracker.getWaitingNs();
+                }
+            }
+        }
+        __uint64 postBlockTime = tracker.getWaitingNs();
+        __uint64 expected = 10000000 + 2 * 20000000 + 3 * 3000000;
+        CPPUNIT_ASSERT(blockTime >= expected);
+        CPPUNIT_ASSERT(blockTime <= expected + 2000000);
+        CPPUNIT_ASSERT(postBlockTime - blockTime <= 1000000);
+        if (trace)
+            DBGLOG("%" I64F "u %" I64F "u", blockTime-expected, postBlockTime-blockTime);
+    }
+
+    void testStandard3()
+    {
+        BlockedTimeTracker tracker;
+
+        __uint64 blockTime;
+        {
+            auto action = COnScopeExit([&](){ tracker.noteComplete(); });
+            auto action2(COnScopeExit([&](){ tracker.noteComplete(); }));
+            tracker.noteWaiting();
+            tracker.noteWaiting();
+
+            MilliSleep(15);
+            blockTime = tracker.getWaitingNs();
+        }
+        __uint64 postBlockTime = tracker.getWaitingNs();
+        __uint64 expected = 15000000 * 2;
+        CPPUNIT_ASSERT(blockTime >= expected);
+        CPPUNIT_ASSERT(blockTime <= expected + 2000000);
+        CPPUNIT_ASSERT(postBlockTime - blockTime <= 1000000);
+        if (trace)
+            DBGLOG("%" I64F "u %" I64F "u", blockTime-50000000, postBlockTime-blockTime);
+    }
+
+    void testLightweight()
+    {
+        LightweightBlockedTimeTracker tracker;
+
+        __uint64 blockTime;
+        {
+            LightweightBlockedSection block(tracker);
+            MilliSleep(50);
+            blockTime = tracker.getWaitingNs();
+        }
+        __uint64 postBlockTime = tracker.getWaitingNs();
+        __uint64 expected = 50000000;
+        CPPUNIT_ASSERT(blockTime >= expected);
+        CPPUNIT_ASSERT(blockTime <= expected + 2000000);
+        CPPUNIT_ASSERT(postBlockTime - blockTime <= 1000000);
+        if (trace)
+            DBGLOG("%" I64F "u %" I64F "u\n", blockTime-50000000, postBlockTime-blockTime);
+    }
+
+    void testLightweight2()
+    {
+        LightweightBlockedTimeTracker tracker;
+
+        __uint64 blockTime;
+        {
+            LightweightBlockedSection block3(tracker);
+            MilliSleep(10);
+            {
+                LightweightBlockedSection block2(tracker);
+                MilliSleep(20);
+                {
+                    LightweightBlockedSection block2(tracker);
+                    MilliSleep(3);
+                    blockTime = tracker.getWaitingNs();
+                }
+            }
+        }
+        __uint64 postBlockTime = tracker.getWaitingNs();
+        __uint64 expected = 10000000 + 2 * 20000000 + 3 * 3000000;
+        CPPUNIT_ASSERT(blockTime >= expected);
+        CPPUNIT_ASSERT(blockTime <= expected + 2000000);
+        CPPUNIT_ASSERT(postBlockTime - blockTime <= 1000000);
+        if (trace)
+            DBGLOG("%" I64F "u %" I64F "u", blockTime-expected, postBlockTime-blockTime);
+    }
+
+    inline bool within10Percent(__uint64 expected, __uint64 actual)
+    {
+        __uint64 threshold = expected / 10;
+        return (actual >= expected - threshold) && (actual <= expected + threshold);
+    }
+
+    void testConcurrent()
+    {
+        BlockedTimeTracker serverLoadTracker;
+        BlockedTimeTracker workerLoadTracker;
+        OverlapTimeInfo serverStartInfo;
+        OverlapTimeInfo workerStartInfo;
+        OverlapTimeInfo serverFinishInfo;
+        OverlapTimeInfo workerFinishInfo;
+        OverlapTimeInfo dummyInfo;
+
+        serverLoadTracker.extractOverlapInfo(serverStartInfo, true);
+        workerLoadTracker.extractOverlapInfo(workerStartInfo, true);
+        cycle_t startCycles = serverLoadTracker.noteWaiting();
+
+        MilliSleep(100);
+        serverLoadTracker.noteWaiting();  // 2nd query starts          Q1 Q2
+        workerLoadTracker.noteWaiting();  // worker thread starts      Q1 Q2 W1
+        MilliSleep(100);
+        workerLoadTracker.noteComplete(); // worker thread finishes    Q1 Q2
+        serverLoadTracker.noteWaiting();  // 3rd query starts          Q1 Q2 Q3
+        MilliSleep(100);
+        serverLoadTracker.noteComplete(); // 2nd query finishes        Q1 Q3
+        workerLoadTracker.noteWaiting();  // worker thread starts      Q1 Q3 W2
+        MilliSleep(100);
+        workerLoadTracker.noteComplete(); // worker thread finishes    Q1 Q3
+        MilliSleep(100);
+
+        cycle_t endCycles = serverLoadTracker.noteComplete(); //       Q3
+        workerLoadTracker.extractOverlapInfo(workerFinishInfo, false);
+        serverLoadTracker.extractOverlapInfo(serverFinishInfo, false);
+
+        CPPUNIT_ASSERT_EQUAL(2U, workerFinishInfo.count - workerStartInfo.count);
+        CPPUNIT_ASSERT_EQUAL(true, within10Percent(200'000'000, workerFinishInfo.elapsedNs - workerStartInfo.elapsedNs));
+
+        CPPUNIT_ASSERT_EQUAL(3U, serverFinishInfo.count - serverStartInfo.count);
+
+        // This query for 500, second query for 200, 3rd query for 300
+        CPPUNIT_ASSERT_EQUAL(true, within10Percent(1000'000'000, serverFinishInfo.elapsedNs - serverStartInfo.elapsedNs));
+        CPPUNIT_ASSERT_EQUAL(true, within10Percent(500'000'000, cycle_to_nanosec(endCycles - startCycles)));
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( BlockedTimingTests );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( BlockedTimingTests, "BlockedTimingTests" );
+
+
+
+
+class JLibUnicodeTest : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(JLibUnicodeTest);
+        CPPUNIT_TEST(testConversions);
+    CPPUNIT_TEST_SUITE_END();
+
+protected:
+
+    void testConvert(UTF32 codepoint, UtfReader::UtfFormat readFormat, unsigned (*writeFunc)(void * vtarget, unsigned maxLength, UTF32 ch))
+    {
+        constexpr unsigned maxlen = 8;
+        byte temp[maxlen];
+        unsigned len;
+        len = writeFunc(temp, maxlen, codepoint);
+
+        UtfReader reader(readFormat, false);
+        reader.set(len, temp);
+        UTF32 value = reader.next();
+        ASSERT_EQUAL(codepoint, value);
+    }
+
+    void testConvertUtf8(UTF32 codepoint)
+    {
+        constexpr unsigned maxlen = 8;
+        byte temp[maxlen];
+        unsigned len;
+        len = writeUtf8(temp, maxlen, codepoint);
+        const byte * data = temp;
+        UTF32 value = readUtf8Character(len, data);
+        ASSERT_EQUAL(codepoint, value);
+        ASSERT_EQUAL(len, (unsigned)(data - temp));
+    }
+
+    void testConvert(UTF32 codepoint)
+    {
+        testConvertUtf8(codepoint);
+        testConvert(codepoint, UtfReader::Utf8, writeUtf8);
+        testConvert(codepoint, UtfReader::Utf16le, writeUtf16le);
+        testConvert(codepoint, UtfReader::Utf16be, writeUtf16be);
+        testConvert(codepoint, UtfReader::Utf32le, writeUtf32le);
+        testConvert(codepoint, UtfReader::Utf32be, writeUtf32be);
+    }
+
+    void testConversions()
+    {
+        unsigned range = 10;
+        for (unsigned low : { 0U, 0x80U, 100U, 0x7fU, 0x7ffU, 0xffffU, 0x0010FFFFU-(range-1U) })
+        {
+            for (unsigned delta = 0; delta < 10; delta++)
+                testConvert(low + delta);
+        }
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( JLibUnicodeTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JLibUnicodeTest, "JLibUnicodeTest" );
+
+#ifdef _USE_OPENSSL
+#include <jencrypt.hpp>
+
+class JLibOpensslAESTest : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(JLibOpensslAESTest);
+        CPPUNIT_TEST(test);
+    CPPUNIT_TEST_SUITE_END();
+
+protected:
+
+    void testOne(unsigned len, const char *intext)
+    {
+        /* A 256 bit key */
+        unsigned char key[] = { 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+                                0x38, 0x39, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+                                0x36, 0x37, 0x38, 0x39, 0x30, 0x31, 0x32, 0x33,
+                                0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30, 0x31
+                              };
+        constexpr const char * prefix = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        unsigned lenPrefix = strlen(prefix);
+
+        MemoryBuffer ciphertext1, ciphertext2, decrypted1, decrypted2;
+
+        ciphertext1.append(lenPrefix, prefix);
+        ciphertext2.append(lenPrefix, prefix);
+        openssl::aesEncrypt(key, 32, intext, len, ciphertext1);
+        jlib::aesEncrypt(key, 32, intext, len, ciphertext2);
+
+        CPPUNIT_ASSERT(memcmp(ciphertext1.bytes(), prefix, lenPrefix) == 0);
+        CPPUNIT_ASSERT(memcmp(ciphertext2.bytes(), prefix, lenPrefix) == 0);
+        if (len)
+            CPPUNIT_ASSERT(ciphertext1.length() > len + lenPrefix);
+        else
+            CPPUNIT_ASSERT(ciphertext1.length() == len + lenPrefix);
+        CPPUNIT_ASSERT(ciphertext1.length() <= len + lenPrefix + 16);
+        CPPUNIT_ASSERT(ciphertext1.length()==ciphertext2.length());
+        CPPUNIT_ASSERT(memcmp(ciphertext1.bytes(), ciphertext2.bytes(), ciphertext1.length()) == 0);
+
+        unsigned cipherlen = ciphertext1.length() - lenPrefix;
+
+        /* Decrypt the ciphertext */
+        decrypted1.append(lenPrefix, prefix);
+        openssl::aesDecrypt(key, 32, ciphertext1.bytes()+lenPrefix, cipherlen, decrypted1);
+        CPPUNIT_ASSERT(decrypted1.length() == len+lenPrefix);
+        CPPUNIT_ASSERT(memcmp(decrypted1.bytes(), prefix, lenPrefix) == 0);
+        CPPUNIT_ASSERT(memcmp(decrypted1.bytes()+lenPrefix, intext, len) == 0);
+        CPPUNIT_ASSERT(memcmp(ciphertext1.bytes(), ciphertext2.bytes(), ciphertext1.length()) == 0); // check input unchanged
+
+        decrypted2.append(lenPrefix, prefix);
+        jlib::aesDecrypt(key, 32, ciphertext2.bytes()+lenPrefix, cipherlen, decrypted2);
+        CPPUNIT_ASSERT(memcmp(decrypted2.bytes(), prefix, lenPrefix) == 0);
+        CPPUNIT_ASSERT(decrypted2.length() == len + lenPrefix);
+        CPPUNIT_ASSERT(memcmp(decrypted2.bytes() + lenPrefix, intext, len) == 0);
+        CPPUNIT_ASSERT(memcmp(ciphertext1.bytes(), ciphertext2.bytes(), ciphertext1.length()) == 0); // check input unchanged
+
+        // Now test in-place decrypt
+        ciphertext1.append(4, "XXXX");   // Marker
+        unsigned decryptedlen = openssl::aesDecryptInPlace(key, 32, (void *)(ciphertext1.bytes() + lenPrefix), cipherlen);
+        CPPUNIT_ASSERT(decryptedlen == len);
+        CPPUNIT_ASSERT(memcmp(ciphertext1.bytes()+lenPrefix, intext, len) == 0);
+        CPPUNIT_ASSERT(memcmp(ciphertext1.bytes()+lenPrefix+cipherlen, "XXXX", 4) == 0);
+
+        ciphertext2.append(4, "XXXX");   // Marker
+        decryptedlen = jlib::aesDecryptInPlace(key, 32, (void *)(ciphertext2.bytes() + lenPrefix), cipherlen);
+        CPPUNIT_ASSERT(decryptedlen == len);
+        CPPUNIT_ASSERT(memcmp(ciphertext2.bytes()+lenPrefix, intext, len) == 0);
+        CPPUNIT_ASSERT(memcmp(ciphertext2.bytes()+lenPrefix+cipherlen, "XXXX", 4) == 0);
+
+        // Now in-place encrypt
+        ciphertext1.clear().append(lenPrefix, prefix).append(len, intext);
+        ciphertext1.append(16, "1234123412341234"); // Filler to be used by AES padding
+        ciphertext1.append(4, "WXYZ");   // Marker - check this is untouched
+        unsigned encryptedlen = openssl::aesEncryptInPlace(key, 32, (void *)(ciphertext1.bytes() + lenPrefix), len, len+16);
+        CPPUNIT_ASSERT(encryptedlen >= len);
+        CPPUNIT_ASSERT(encryptedlen <= len+16);
+        CPPUNIT_ASSERT(memcmp(ciphertext1.bytes()+lenPrefix+len+16, "WXYZ", 4) == 0);
+        CPPUNIT_ASSERT(len == 0 || memcmp(ciphertext1.bytes()+lenPrefix, intext, len) != 0);  // Check it actually did encrypt!
+        decryptedlen = openssl::aesDecryptInPlace(key, 32, (void *)(ciphertext1.bytes() + lenPrefix), encryptedlen);
+        CPPUNIT_ASSERT(decryptedlen == len);
+        CPPUNIT_ASSERT(memcmp(ciphertext1.bytes()+lenPrefix, intext, len) == 0);
+        CPPUNIT_ASSERT(memcmp(ciphertext1.bytes()+lenPrefix+len+16, "WXYZ", 4) == 0);
+
+        ciphertext2.clear().append(lenPrefix, prefix).append(len, intext);
+        ciphertext2.append(16, "1234123412341234"); // Filler to be used by AES padding
+        ciphertext2.append(4, "ABCD");   // Marker - check this is untouched
+        encryptedlen = jlib::aesEncryptInPlace(key, 32, (void *)(ciphertext2.bytes() + lenPrefix), len, len+16);
+        CPPUNIT_ASSERT(encryptedlen >= len);
+        CPPUNIT_ASSERT(encryptedlen <= len+16);
+        CPPUNIT_ASSERT(memcmp(ciphertext2.bytes()+lenPrefix+len+16, "ABCD", 4) == 0);
+        CPPUNIT_ASSERT(len == 0 || memcmp(ciphertext2.bytes()+lenPrefix, intext, len) != 0);  // Check it actually did encrypt!
+        decryptedlen = jlib::aesDecryptInPlace(key, 32, (void *)(ciphertext2.bytes() + lenPrefix), encryptedlen);
+        CPPUNIT_ASSERT(decryptedlen == len);
+        CPPUNIT_ASSERT(memcmp(ciphertext2.bytes()+lenPrefix, intext, len) == 0);
+        CPPUNIT_ASSERT(memcmp(ciphertext2.bytes()+lenPrefix+len+16, "ABCD", 4) == 0);
+
+        // Test some error cases
+        if (len)
+        {
+            ciphertext1.clear().append(lenPrefix, prefix).append(len, intext);
+            ciphertext1.append(4, "WXYZ");   // Marker - check this is untouched
+            try
+            {
+                encryptedlen = openssl::aesEncryptInPlace(key, 32, (void *)(ciphertext1.bytes() + lenPrefix), len, len);
+                CPPUNIT_ASSERT(!"Should have reported insufficient length");
+            }
+            catch (IException *E)
+            {
+                CPPUNIT_ASSERT(memcmp(ciphertext1.bytes()+lenPrefix+len, "WXYZ", 4) == 0);
+                E->Release();
+            }
+            ciphertext2.clear().append(lenPrefix, prefix).append(len, intext);
+            ciphertext2.append(4, "ABCD");   // Marker - check this is untouched
+            try
+            {
+                encryptedlen = jlib::aesEncryptInPlace(key, 32, (void *)(ciphertext2.bytes() + lenPrefix), len, len);
+                CPPUNIT_ASSERT(!"Should have reported insufficient length");
+            }
+            catch (IException *E)
+            {
+                CPPUNIT_ASSERT(memcmp(ciphertext2.bytes()+lenPrefix+len, "ABCD", 4) == 0);
+                E->Release();
+            }
+        }
+    // Note: Using OpenTelemetry null span
+    }
+
+    void test()
+    {
+        try
+        {
+            /* Message to be encrypted */
+            const char *plaintext = "The quick brown fox jumps over the lazy dog";
+            for (unsigned l = 0; l < strlen(plaintext); l++)
+                testOne(l, plaintext);
+        }
+        catch (IException * e)
+        {
+            EXCLOG(e, "Exception in AES unit test");
+            throw;
+        }
+    }
+
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( JLibOpensslAESTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JLibOpensslAESTest, "JLibOpensslAESTest" );
+#endif
+
+class TopNStressTest : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(TopNStressTest);
+        CPPUNIT_TEST(testTop5a);
+        CPPUNIT_TEST(testTop5b);
+    CPPUNIT_TEST_SUITE_END();
+
+    struct x
+    {
+    static constexpr const unsigned MaxSlowActivities = 5;
+    mutable unsigned slowActivityIds[MaxSlowActivities] = {};
+    mutable stat_type slowActivityTimes[MaxSlowActivities] = {};
+    unsigned cnt = 0;
+
+        __attribute__((noinline))
+        void noteTime(unsigned activityId, stat_type localTime)
+        {
+            if (localTime > slowActivityTimes[MaxSlowActivities-1])
+            {
+                unsigned pos = MaxSlowActivities-1;
+                while (pos > 0)
+                {
+                    if (localTime <= slowActivityTimes[pos-1])
+                        break;
+                    slowActivityIds[pos] = slowActivityIds[pos-1];
+                    slowActivityTimes[pos] = slowActivityTimes[pos-1];
+                    pos--;
+                }
+                slowActivityIds[pos] = activityId;
+                slowActivityTimes[pos] = localTime;
+                cnt++;
+            }
+        }
+        __attribute__((noinline))
+        void noteTime2(unsigned activityId, stat_type localTime)
+        {
+            if (localTime > slowActivityTimes[0])
+            {
+                unsigned pos = 1;
+                while (pos < MaxSlowActivities)
+                {
+                    if (localTime <= slowActivityTimes[pos])
+                        break;
+                    slowActivityIds[pos-1] = slowActivityIds[pos];
+                    slowActivityTimes[pos-1] = slowActivityTimes[pos];
+                    pos++;
+                }
+                slowActivityIds[pos-1] = activityId;
+                slowActivityTimes[pos-1] = localTime;
+                cnt++;
+            }
+        }
+        void report(__uint64 elapsedNs)
+        {
+            StringBuffer ids, times;
+            for (unsigned i=0; i < MaxSlowActivities; i++)
+            {
+                if (!slowActivityIds[i])
+                    break;
+
+                if (i)
+                {
+                    ids.append(",");
+                    times.append(",");
+                }
+                ids.append(slowActivityIds[i]);
+                formatStatistic(times, cycle_to_nanosec(slowActivityTimes[i]), SMeasureTimeNs);
+            }
+            DBGLOG("SlowActivities={ ids=[%s] times=[%s] } in %llu (x%u)", ids.str(), times.str(), elapsedNs, cnt);
+
+        }
+    };
+
+    static constexpr const unsigned NumIters = 5000;
+
+    void testTop5a()
+    {
+        CCycleTimer timer;
+        stat_type value = 0;
+        x tally;
+        for (unsigned activityId = 1; activityId <= NumIters; activityId++)
+        {
+            //coverity[overflow_const : SUPPRESS] - deliberate overflow use case
+            value = value * 0x100000001b3ULL + 99;
+            tally.noteTime(activityId, value);
+        }
+
+        __uint64 elapsedNs = timer.elapsedNs();
+        tally.report(elapsedNs);
+    }
+    void testTop5b()
+    {
+        CCycleTimer timer;
+        stat_type value = 0;
+        x tally;
+        for (unsigned activityId = 1; activityId <= NumIters; activityId++)
+        {
+            //coverity[overflow_const : SUPPRESS] - deliberate overflow use case
+            value = value * 0x100000001b3ULL + 99;
+            tally.noteTime2(activityId, value);
+        }
+
+        __uint64 elapsedNs = timer.elapsedNs();
+        tally.report(elapsedNs);
+    }
+
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( TopNStressTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( TopNStressTest, "TopNStressTest" );
+
+class JLibSecretsTest : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(JLibSecretsTest);
+        CPPUNIT_TEST(setup);
+        CPPUNIT_TEST(testConcurrentRead);
+        CPPUNIT_TEST(testUpdate1);
+        CPPUNIT_TEST(testUpdate2);
+        CPPUNIT_TEST(testBackgroundUpdate);
+        CPPUNIT_TEST(testKeyEncoding);
+
+        CPPUNIT_TEST(testDefaultMasking);
+        CPPUNIT_TEST(testLeftMasking);
+        CPPUNIT_TEST(testCustomMaskChar);
+        CPPUNIT_TEST(testShortSecret);
+        CPPUNIT_TEST(testZeroPercent);
+        CPPUNIT_TEST(testHundredPercent);
+        CPPUNIT_TEST(testNullSecret);
+    CPPUNIT_TEST_SUITE_END();
+
+    //Each test creates a different instance of the class(!) so member values cannot be used to pass items
+    //from one test to another
+    StringBuffer secretRoot;
+
+protected:
+void testDefaultMasking()
+    {
+        StringBuffer masked;
+        maskSecret(masked, "SuperSecret123");
+        // By default, mask right side, 90% (defaultMaskingPercentage), '*' (defaultMaskChar)
+        // For "SuperSecret123" (14 chars), 90% = 1.26 -> 1 chars unmasked on right
+        CPPUNIT_ASSERT_EQUAL_STR("S*************", masked.str());
+    }
+
+    void testLeftMasking()
+    {
+        StringBuffer masked;
+        maskSecret(masked, "SuperSecret123567890", 50, false); // mask left side, 50%
+        // 20 chars, provided % is below minimum. Default min is 70% = 6 chars unmasked on left
+        CPPUNIT_ASSERT_EQUAL_STR("**************567890", masked.str());
+    }
+
+    void testCustomMaskChar()
+    {
+        StringBuffer masked;
+        maskSecret(masked, "Secret", 75, true, '#');
+        // 6 chars, 75% = 1.5 -> 1 unmasked on right
+        CPPUNIT_ASSERT_EQUAL_STR("S#####", masked.str());
+    }
+
+    void testShortSecret()
+    {
+        StringBuffer masked;
+        maskSecret(masked, "12", 70);
+        CPPUNIT_ASSERT_EQUAL_STR("**", masked.str());
+    }
+
+    void testZeroPercent()
+    {
+        StringBuffer masked;
+        maskSecret(masked, "NoMask7890", 0); //min percentage is 70
+        CPPUNIT_ASSERT_EQUAL_STR("NoM*******", masked.str());
+    }
+
+    void testHundredPercent()
+    {
+        StringBuffer masked;
+        maskSecret(masked, "AllMask", 100);
+        CPPUNIT_ASSERT_EQUAL_STR("*******", masked.str());
+    }
+
+    void testNullSecret()
+    {
+        StringBuffer masked;
+        maskSecret(masked, nullptr);
+        CPPUNIT_ASSERT_EQUAL_STR("", masked.str());
+    }
+
+    void checkSecret(const IPropertyTree * match, const char * key, const char * expectedValue)
+    {
+        if (match)
+        {
+            const char * secretValue = match->queryProp(key);
+            if (secretValue)
+            {
+                CPPUNIT_ASSERT_EQUAL_STR(secretValue, expectedValue);
+            }
+            else
+            {
+                //IPropertyTree doesn't allow blank values, so a missing value is the same as a blank value
+                //We should probably revisit some day, but it is likely to break existing code if we do.
+                CPPUNIT_ASSERT_EQUAL_STR("", expectedValue);
+            }
+        }
+        else
+            CPPUNIT_ASSERT_EQUAL_STR("", expectedValue);
+    }
+    void checkSecret(const char * secret, const char * key, const char * expectedValue)
+    {
+        Owned<const IPropertyTree> match = getSecret("testing", secret);
+        checkSecret(match, key, expectedValue);
+    }
+
+    void checkSecret(ISyncedPropertyTree * secret, const char * key, const char * expectedValue)
+    {
+        Owned<const IPropertyTree> match = secret->getTree();
+        checkSecret(match, key, expectedValue);
+    }
+
+    bool hasSecret(const char * name)
+    {
+        Owned<const IPropertyTree> match = getSecret("testing", name);
+        return match != nullptr;
+    }
+
+    void initPath()
+    {
+        char cwd[1024];
+        CPPUNIT_ASSERT(GetCurrentDirectory(1024, cwd));
+        secretRoot.set(cwd).append(PATHSEPCHAR).append("unittest-secrets");
+        secretRoot.append(PATHSEPCHAR).append("testing"); // catgegory
+    }
+
+    void setup()
+    {
+        char cwd[1024];
+        CPPUNIT_ASSERT(GetCurrentDirectory(1024, cwd));
+        secretRoot.append(cwd).append(PATHSEPCHAR).append("unittest-secrets");
+
+        recursiveRemoveDirectory(secretRoot);
+        CPPUNIT_ASSERT(recursiveCreateDirectory(secretRoot.str()));
+        setSecretMount(secretRoot);
+        setSecretTimeout(100); // Set the timeout so we can check it is working.
+
+        secretRoot.append(PATHSEPCHAR).append("testing"); // catgegory
+        CPPUNIT_ASSERT(recursiveCreateDirectory(secretRoot.str()));
+    }
+
+    void testUpdate1()
+    {
+        initPath(); // secretRoot needs to be called for each test
+
+        CPPUNIT_ASSERT(!hasSecret("secret1"));
+        writeTestingSecret("secret1", "value", "secret1Value");
+        //Secret should not appear yet - null should be cached.
+        CPPUNIT_ASSERT(!hasSecret("secret1"));
+
+        Owned<ISyncedPropertyTree> secret2 = getSyncedSecret("testing", "secret2", nullptr, nullptr);
+        CPPUNIT_ASSERT(!secret2->isValid());
+        CPPUNIT_ASSERT(!secret2->isStale());
+
+        MilliSleep(50);
+        //Secret should not appear yet - null should be cached.
+        CPPUNIT_ASSERT(!hasSecret("secret1"));
+        CPPUNIT_ASSERT(!secret2->isValid());
+        CPPUNIT_ASSERT(!secret2->isStale());
+
+        MilliSleep(100);
+        //Secret1 should now be updated - enough time has passed
+        checkSecret("secret1", "value", "secret1Value");
+        CPPUNIT_ASSERT(!secret2->isValid());
+        CPPUNIT_ASSERT(secret2->isStale());
+
+        //Cleanup
+        writeTestingSecret("secret1", "value", nullptr);
+    }
+
+    void testUpdate2()
+    {
+        initPath(); // secretRoot needs to be called for each test
+
+        Owned<ISyncedPropertyTree> secret3 = getSyncedSecret("testing", "secret3", nullptr, nullptr);
+        unsigned version = secret3->getVersion();
+        CPPUNIT_ASSERT(!secret3->isValid());
+        CPPUNIT_ASSERT(!secret3->isStale());
+        writeTestingSecret("secret3", "value", "secret3Value");
+        CPPUNIT_ASSERT(!secret3->isValid());
+        CPPUNIT_ASSERT_EQUAL(version, secret3->getVersion());
+
+        //After sleep new value should not have been picked up
+        MilliSleep(50);
+        CPPUNIT_ASSERT(!secret3->isValid());
+        CPPUNIT_ASSERT_EQUAL(version, secret3->getVersion());
+
+        //After sleep new value should now have been picked up
+        MilliSleep(100);
+        checkSecret("secret3", "value", "secret3Value");
+        unsigned version2 = secret3->getVersion();
+        CPPUNIT_ASSERT(!secret3->isStale());
+        CPPUNIT_ASSERT(secret3->isValid());
+        CPPUNIT_ASSERT(version != version2);
+
+        //Sleep and check that the hash value has not changed
+        MilliSleep(200);
+        checkSecret("secret3", "value", "secret3Value");
+        CPPUNIT_ASSERT(!secret3->isStale());
+        CPPUNIT_ASSERT(secret3->isValid());
+        CPPUNIT_ASSERT_EQUAL(version2, secret3->getVersion());
+
+        //Remove the secret - should have no immediate effect
+        writeTestingSecret("secret3", "value", nullptr);
+        CPPUNIT_ASSERT(!secret3->isStale());
+        CPPUNIT_ASSERT(secret3->isValid());
+        CPPUNIT_ASSERT_EQUAL(version2, secret3->getVersion());
+
+        MilliSleep(50);
+        CPPUNIT_ASSERT(!secret3->isStale());
+        CPPUNIT_ASSERT(secret3->isValid());
+        CPPUNIT_ASSERT_EQUAL(version2, secret3->getVersion());
+        checkSecret("secret3", "value", "secret3Value");
+
+        MilliSleep(100);
+        CPPUNIT_ASSERT(secret3->isStale()); // Value has gone, but the old value is still returned
+        CPPUNIT_ASSERT(secret3->isValid());
+        CPPUNIT_ASSERT_EQUAL(version2, secret3->getVersion());
+        checkSecret("secret3", "value", "secret3Value");
+
+        //Update the value = the change should not be seen until the cache entry expires
+        writeTestingSecret("secret3", "value", "secret3NewValue");
+        CPPUNIT_ASSERT(secret3->isStale());
+        CPPUNIT_ASSERT(secret3->isValid());
+        CPPUNIT_ASSERT_EQUAL(version2, secret3->getVersion());
+        checkSecret("secret3", "value", "secret3Value");
+
+        MilliSleep(50);
+        CPPUNIT_ASSERT(secret3->isStale());
+        CPPUNIT_ASSERT(secret3->isValid());
+        CPPUNIT_ASSERT_EQUAL(version2, secret3->getVersion());
+        checkSecret("secret3", "value", "secret3Value");
+
+        MilliSleep(100);
+        //These functions do not check for up to date values, so they return the same as before
+        CPPUNIT_ASSERT(secret3->isStale()); // Value still appears to be out of date
+        CPPUNIT_ASSERT(secret3->isValid());
+
+        //The getVersion() should force the value to be updated
+        unsigned version3 = secret3->getVersion();
+        CPPUNIT_ASSERT(version2 != version3);
+        CPPUNIT_ASSERT(!secret3->isStale()); // New value has now been picked up
+        CPPUNIT_ASSERT(secret3->isValid());
+        checkSecret("secret3", "value", "secret3NewValue");
+
+        //Finally check that writing a blank value is spotted as a change.
+        writeTestingSecret("secret3", "value", "");
+        MilliSleep(150);
+        //Check the version to ensure that the value has been updated
+        CPPUNIT_ASSERT(version3 != secret3->getVersion());
+        CPPUNIT_ASSERT(secret3->isValid());
+        checkSecret("secret3", "value", "");
+
+        //Cleanup
+        writeTestingSecret("secret3", "value", nullptr);
+    }
+
+    void testBackgroundUpdate()
+    {
+        initPath(); // secretRoot needs to be called for each test
+        startSecretUpdateThread(20);    // 100ms expiry, check every 5ms for items expiring in 20ms time.
+
+        //--------- First check that a missed secret is checked in the background ---------
+        Owned<ISyncedPropertyTree> secret4 = getSyncedSecret("testing", "secret4", nullptr, nullptr);
+        CPPUNIT_ASSERT(!secret4->isValid());
+        CPPUNIT_ASSERT(!secret4->isStale());
+
+        //Sleep for less than the update interval
+        MilliSleep(50);
+        CPPUNIT_ASSERT(!secret4->isValid());
+        CPPUNIT_ASSERT(!secret4->isStale());
+
+        //Sleep so the cache entry should have expired, and no data around to make it not stale.
+        MilliSleep(60);
+        CPPUNIT_ASSERT(!secret4->isValid());
+        CPPUNIT_ASSERT(secret4->isStale());
+
+        //--------- Now update the value in the background ---------
+        //First check that a missed secret is checked in the background
+        Owned<ISyncedPropertyTree> secret5 = getSyncedSecret("testing", "secret5", nullptr, nullptr);
+        CPPUNIT_ASSERT(!secret5->isValid());
+        CPPUNIT_ASSERT(!secret5->isStale());
+        //And write a value so it is picked up on the next refresh
+        writeTestingSecret("secret5", "value", "secret5Value");
+
+        //Sleep for less than the update interval
+        MilliSleep(50); // elapsed=50
+        CPPUNIT_ASSERT(!secret5->isValid());
+        CPPUNIT_ASSERT(!secret5->isStale());
+
+        //Sleep so the cache entry should have expired and the value reread since reading ahead
+        MilliSleep(60); // elapsed=110 = 80 + 30
+        CPPUNIT_ASSERT(secret5->isValid());
+        CPPUNIT_ASSERT(!secret5->isStale());
+
+        //Sleep again so it is not accessed within the timeout period - it should now be marked as stale but valid
+        MilliSleep(100); // elapsed=210 = 80 + 80 + 50
+        CPPUNIT_ASSERT(secret5->isValid());
+        CPPUNIT_ASSERT(secret5->isStale());
+
+        //--------- Check that accessing the function marks the value so it is refreshed ---------
+        Owned<ISyncedPropertyTree> secret6 = getSyncedSecret("testing", "secret6", nullptr, nullptr);
+        CPPUNIT_ASSERT(!secret6->isValid());
+        CPPUNIT_ASSERT(!secret6->isStale());
+        //And write a value so it is picked up on the next refresh
+        writeTestingSecret("secret6", "value", "secret6Value");
+
+        //Sleep for less than the update interval
+        MilliSleep(50); // elapsed=50
+        CPPUNIT_ASSERT(!secret6->isValid());
+        CPPUNIT_ASSERT(!secret6->isStale());
+
+        //Sleep so the cache entry should have expired (between 80 and 85ms) and the value reread since reading ahead
+        MilliSleep(60); // elapsed=110 = 50 + 60
+        CPPUNIT_ASSERT(secret6->isValid());
+        CPPUNIT_ASSERT(!secret6->isStale());
+        unsigned version1 = secret6->getVersion(); // Mark the value as accessed, but too early to be refreshed
+        writeTestingSecret("secret6", "value", "secret6Value2");
+
+        MilliSleep(40); // elapsed=150 = 80 + 70
+        CPPUNIT_ASSERT(secret6->isValid());
+        CPPUNIT_ASSERT(!secret6->isStale());
+        unsigned version2 = secret6->getVersion(); // Mark the value as accessed, but too early to be refreshed
+        CPPUNIT_ASSERT(version2 == version1);
+
+        MilliSleep(30); // elapsed=180 = 80 + 80 + 20
+        CPPUNIT_ASSERT(secret6->isValid());
+        CPPUNIT_ASSERT(!secret6->isStale());
+        unsigned version3 = secret6->getVersion(); // Mark the value as accessed, but will now have been refreshed
+        CPPUNIT_ASSERT(version3 != version1);
+        checkSecret(secret4, "value", "");
+        checkSecret(secret5, "value", "secret5Value");
+        checkSecret(secret6, "value", "secret6Value2");
+
+        //Cleanup
+        writeTestingSecret("secret5", "value", nullptr);
+        writeTestingSecret("secret6", "value", nullptr);
+        stopSecretUpdateThread();
+    }
+
+    class SecretReader : public Thread
+    {
+    public:
+        SecretReader(Semaphore & _startSem) : Thread("SecretReader"), startSem(_startSem) {}
+
+        virtual int run()
+        {
+            startSem.wait();
+            try
+            {
+                getSecretValue(secret, "testing", "concurrent", "value", true);
+            }
+            catch (IException * e)
+            {
+                DBGLOG("Failed to read secret");
+                error.setown(e);
+            }
+            return 0;
+        }
+
+    public:
+        Semaphore & startSem;
+        StringBuffer secret;
+        Owned<IException> error;
+    };
+
+    void testConcurrentRead()
+    {
+        initPath(); // secretRoot needs to be called for each test
+
+        writeTestingSecret("concurrent", "value", "hello");
+
+        unsigned numReaders = 5;
+        Semaphore startSem{SYNC_LOCATION};
+        CIArrayOf<SecretReader> readers;
+
+        for (unsigned i = 0; i < numReaders; i++)
+        {
+            SecretReader * reader = new SecretReader(startSem);
+            readers.append(*reader);
+            reader->start(true);
+        }
+
+        startSem.signal(numReaders);
+
+        for (unsigned i = 0; i < numReaders; i++)
+            readers.item(i).join();
+
+        for (unsigned i = 0; i < numReaders; i++)
+        {
+            IException * e = readers.item(i).error;
+            if (e)
+            {
+                StringBuffer msg;
+                e->errorMessage(msg);
+                CPPUNIT_FAIL(msg.str());
+            }
+        }
+    }
+
+    void testKeyEncoding()
+    {
+        for (auto category : { "abc", "def" })
+        {
+            for (auto name : { "x", "y" })
+            {
+                for (auto vault : { "vaultx", "" })
+                {
+                    for (auto version : { "", "v1" })
+                    {
+                        std::string encoded = testBuildSecretKey(category, name, vault, version);
+
+                        std::string readCategory;
+                        std::string readName;
+                        std::string readVaultId;
+                        std::string readVersion;
+                        testExpandSecretKey(readCategory, readName, readVaultId, readVersion, encoded.c_str());
+
+                        CPPUNIT_ASSERT_EQUAL_STR(category, readCategory.c_str());
+                        CPPUNIT_ASSERT_EQUAL_STR(name, readName.c_str());
+                        CPPUNIT_ASSERT_EQUAL_STR(vault, readVaultId.c_str());
+                        CPPUNIT_ASSERT_EQUAL_STR(version, readVersion.c_str());
+                    }
+                }
+            }
+        }
+    }
+
+    void writeTestingSecret(const char * secret, const char * key, const char * value)
+    {
+        StringBuffer filename;
+        filename.append(secretRoot).append(PATHSEPCHAR).append(secret);
+        CPPUNIT_ASSERT(recursiveCreateDirectory(filename.str()));
+
+        filename.append(PATHSEPCHAR).append(key);
+
+        Owned<IFile> file = createIFile(filename.str());
+        if (value)
+        {
+            Owned<IFileIO> io = file->open(IFOcreate);
+            io->write(0, strlen(value), value);
+        }
+        else
+            file->remove();
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( JLibSecretsTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JLibSecretsTest, "JLibSecretsTest" );
+
+class JLibStringTest : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(JLibStringTest);
+        CPPUNIT_TEST(testStristr);
+        CPPUNIT_TEST(testMemMem);
+        CPPUNIT_TEST(testProcessOptions);
+    CPPUNIT_TEST_SUITE_END();
+
+    void testStristr()
+    {
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("abc", "abc"), "abc");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("abc", "ABC"), "abc");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("x", "ABC"), "");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("abcdefgh", "A"), "abcdefgh");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("ABCDEFGH", "a"), "ABCDEFGH");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("abcdefgh", "E"), "efgh");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("ABCDEFGH", "e"), "EFGH");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("abcdefgh", "FGH"), "fgh");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("aabcdefgh", "ABC"), "abcdefgh");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("ababacz", "ABAC"), "abacz");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("", "ABC"), "");
+        CPPUNIT_ASSERT_EQUAL_STR(stristr("ABC", ""), "");
+    }
+
+    void testMemMem()
+    {
+        constexpr const char * haystack = "abcdefghijklmnopqrstuvwxyz";
+        CPPUNIT_ASSERT_EQUAL((const void*)(haystack), jmemmem(10, haystack, 0, nullptr));
+        CPPUNIT_ASSERT_EQUAL((const void*)(haystack), jmemmem(10, haystack, 3, "abc"));
+        CPPUNIT_ASSERT_EQUAL((const void*)(haystack), jmemmem(3, haystack, 3, "abc"));
+        CPPUNIT_ASSERT_EQUAL((const void*)nullptr, jmemmem(2, haystack, 3, "abc"));
+        CPPUNIT_ASSERT_EQUAL((const void*)(haystack+7), jmemmem(10, haystack, 3, "hij"));
+        CPPUNIT_ASSERT_EQUAL((const void*)nullptr, jmemmem(10, haystack, 3, "ijk"));
+        CPPUNIT_ASSERT_EQUAL((const void*)(haystack+8), jmemmem(10, haystack, 1, "i"));
+        CPPUNIT_ASSERT_EQUAL((const void*)(nullptr), jmemmem(8, haystack, 1, "i"));
+        CPPUNIT_ASSERT_EQUAL((const void*)(nullptr), jmemmem(9, haystack, 2, "ij"));
+        CPPUNIT_ASSERT_EQUAL((const void*)(haystack+8), jmemmem(10, haystack, 2, "ij"));
+    }
+
+    void testOption(const char * text, const std::initializer_list<std::pair<const char *, const char *>> & expected)
+    {
+        StringArray options;
+        StringArray values;
+
+        auto processOption = [this,&options,&values](const char * option, const char * value)
+        {
+            options.append(option);
+            values.append(value);
+        };
+
+        processOptionString(text, processOption);
+
+        CPPUNIT_ASSERT_EQUAL(options.ordinality(), (unsigned)expected.size());
+        ForEachItemIn(i, options)
+        {
+            CPPUNIT_ASSERT_EQUAL(std::string(expected.begin()[i].first), std::string(options.item(i)));
+            CPPUNIT_ASSERT_EQUAL(std::string(expected.begin()[i].second), std::string(values.item(i)));
+        }
+    }
+
+    void testProcessOptions()
+    {
+        testOption("name=boris", {{"name", "boris"}});
+        testOption("name(boris)", {{"name", "boris"}});
+        testOption("name=boris,age(99)", {{"name", "boris"}, {"age", "99"}});
+        testOption("name=boris", {{"name", "boris"}});
+        testOption("option1=value1,option2(value2),option3,option4(nested=value,nested(value))",
+                    {{"option1", "value1"}, {"option2", "value2"}, {"option3", "1"}, {"option4", "nested=value,nested(value)"}});
+        testOption("one,two,three", {{"one", "1"}, {"two", "1"}, {"three", "1"}});
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( JLibStringTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JLibStringTest, "JLibStringTest" );
+
+// ========================================
+
+class CAddrThreadArgs : public CInterface, implements IInterface
+{
+public:
+    IMPLEMENT_IINTERFACE;
+    StringAttr name;
+    unsigned timeoutms;
+    bool logIt = true;
+
+    CAddrThreadArgs(const char *_name, unsigned _timeoutms) : name(_name), timeoutms(_timeoutms)
+    {
+    }
+
+    CAddrThreadArgs(const char *_name, unsigned _timeoutms, bool _logIt) : name(_name), timeoutms(_timeoutms), logIt(_logIt)
+    {
+    }
+};
+
+class CAddrPoolFactory : public CInterface, public IThreadFactory
+{
+    class CAddrPoolHandler : public CInterface, implements IPooledThread
+    {
+    public:
+        IMPLEMENT_IINTERFACE;
+
+        CAddrThreadArgs *args;
+
+        virtual void init(void *param) override
+        {
+            args = (CAddrThreadArgs *)param;
+        }
+
+        virtual void threadmain() override
+        {
+            StringBuffer name(args->name);
+            unsigned timeoutms = args->timeoutms;
+
+            SocketEndpoint ep;
+            CCycleTimer timer;
+            int srtn = ep.ipset(name.str(), timeoutms);
+            unsigned lookupTimeMS = timer.elapsedMs();
+
+            StringBuffer ipstr;
+            if (args->logIt && srtn)
+                ep.getIpText(ipstr);
+            else if (!srtn)
+                ipstr.append("failed");
+            if ((args->logIt && srtn) || (!srtn))
+            {
+                DBGLOG("%s (%d) -> %s (%u ms)", name.str(), (int)timeoutms, ipstr.str(), lookupTimeMS);
+                fflush(NULL);
+            }
+        }
+
+        virtual bool stop() override
+        {
+            return true;
+        }
+
+        virtual bool canReuse() const override
+        {
+            return true;
+        }
+    };
+
+public:
+    IMPLEMENT_IINTERFACE;
+
+    IPooledThread *createNew()
+    {
+        return new CAddrPoolHandler();
+    }
+};
+
+class getaddrinfotest : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(getaddrinfotest);
+        CPPUNIT_TEST(testaddr);
+    CPPUNIT_TEST_SUITE_END();
+
+/*
+ *  can change settings with:
+ *
+ *  <Software>
+ *    <Globals disableDNSTimeout="true" maxDNSThreads="100">
+ *
+ *  global:
+ *    expert:
+ *      disableDNSTimeout: true
+ *      maxDNSThreads: 100
+ */
+
+    void testaddr1(const char *_name, unsigned timeoutms, bool logIt=true)
+    {
+        StringBuffer name(_name);
+
+        SocketEndpoint ep;
+        CCycleTimer timer;
+        int srtn = ep.ipset(name.str(), timeoutms);
+        unsigned lookupTimeMS = timer.elapsedMs();
+
+        StringBuffer ipstr;
+        if (logIt && srtn)
+            ep.getIpText(ipstr);
+        else if (!srtn)
+            ipstr.append("failed");
+        if ((logIt && srtn) || (!srtn))
+        {
+            DBGLOG("%s (%d) -> %s (%u ms)", name.str(), (int)timeoutms, ipstr.str(), lookupTimeMS);
+            fflush(NULL);
+        }
+    }
+
+    void testaddr()
+    {
+        fflush(NULL);
+        DBGLOG(" "); // to get past the "." ...
+        fflush(NULL);
+
+        testaddr1("google.com", 3);
+        testaddr1("google.com", 500);
+
+        Owned<CAddrPoolFactory> threadFactory = new CAddrPoolFactory();
+        Owned<IThreadPool> threadPool = createThreadPool("GetAddrThreadPool", threadFactory, true, nullptr, 60);
+
+        // -----------------
+
+        Owned<CAddrThreadArgs> t1a = new CAddrThreadArgs("mck1.com", 5);
+        Owned<CAddrThreadArgs> t2a = new CAddrThreadArgs("mck1.com", 5000);
+        Owned<CAddrThreadArgs> t3a = new CAddrThreadArgs("mck1.com", INFINITE);
+
+        Owned<CAddrThreadArgs> t1b = new CAddrThreadArgs("mck101.com", 5);
+        Owned<CAddrThreadArgs> t2b = new CAddrThreadArgs("mck101.com", 5000);
+        Owned<CAddrThreadArgs> t3b = new CAddrThreadArgs("mck101.com", INFINITE);
+
+        Owned<CAddrThreadArgs> t1c = new CAddrThreadArgs("google.com", 3);
+        Owned<CAddrThreadArgs> t2c = new CAddrThreadArgs("google.com", 500);
+        Owned<CAddrThreadArgs> t3c = new CAddrThreadArgs("google.com", 10000);
+
+        Owned<CAddrThreadArgs> t1d = new CAddrThreadArgs("localhost", 3);
+        Owned<CAddrThreadArgs> t2d = new CAddrThreadArgs("localhost", 500);
+        Owned<CAddrThreadArgs> t3d = new CAddrThreadArgs("localhost", 1000);
+
+        Owned<CAddrThreadArgs> t1e = new CAddrThreadArgs("127.0.0.1", 2000);
+        Owned<CAddrThreadArgs> t2e = new CAddrThreadArgs("1.2.3.4", 2000);
+
+        Owned<CAddrThreadArgs> t1f = new CAddrThreadArgs("mck2.com", INFINITE);
+
+        Owned<CAddrThreadArgs> t1g = new CAddrThreadArgs("mck103.com", INFINITE);
+
+        Owned<CAddrThreadArgs> t1h = new CAddrThreadArgs("*bogus+", INFINITE);
+
+        // -----------------
+
+        threadPool->startNoBlock(t1a);
+        threadPool->startNoBlock(t2a);
+        threadPool->startNoBlock(t3a);
+
+        threadPool->startNoBlock(t1b);
+        threadPool->startNoBlock(t2b);
+        threadPool->startNoBlock(t3b);
+
+        threadPool->startNoBlock(t1c);
+        threadPool->startNoBlock(t2c);
+        threadPool->startNoBlock(t3c);
+
+        threadPool->startNoBlock(t1d);
+        threadPool->startNoBlock(t2d);
+        threadPool->startNoBlock(t3d);
+
+        threadPool->startNoBlock(t1e);
+        threadPool->startNoBlock(t2e);
+
+        threadPool->startNoBlock(t1f);
+
+        threadPool->startNoBlock(t1g);
+
+        threadPool->startNoBlock(t1h);
+
+        threadPool->joinAll();
+
+        fflush(NULL);
+
+        threadPool->startNoBlock(t1c);
+        threadPool->startNoBlock(t2c);
+        threadPool->startNoBlock(t3c);
+
+        threadPool->joinAll(true);
+
+        fflush(NULL);
+
+        // ---------------
+
+        CCycleTimer timer;
+        for (int i=0; i<10000; i++)
+        {
+            testaddr1("google.com", 500, false);
+        }
+        unsigned lookupTimeMS = timer.elapsedMs();
+        DBGLOG("10k lookups (same thread) time = %u ms", lookupTimeMS);
+        fflush(NULL);
+
+        Owned<IThreadPool> threadPool1 = createThreadPool("GetAddrThreadPool1", threadFactory, true, nullptr, 1);
+
+        timer.reset();
+        Owned<CAddrThreadArgs> t10a = new CAddrThreadArgs("google.com", 500, false);
+        for (int i=0; i<10000; i++)
+        {
+            threadPool1->start(t10a, "threadpool-test", 99999999);
+        }
+
+        threadPool1->joinAll(true);
+
+        lookupTimeMS = timer.elapsedMs();
+        fflush(NULL);
+        DBGLOG("10k lookups (threadpool of 1) time = %u ms", lookupTimeMS);
+
+        fflush(NULL);
+        DBGLOG("testaddr complete");
+        fflush(NULL);
+        Sleep(7000);
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( getaddrinfotest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( getaddrinfotest, "getaddrinfotest" );
+
+class HashFuncTests : public CppUnit::TestFixture
+{
+public:
+    virtual void setUp() override
+    {
+        generateFixedRandomNullTermiantedStrings();
+    }
+
+    CPPUNIT_TEST_SUITE(HashFuncTests);
+        CPPUNIT_TEST(fnvTests);
+    CPPUNIT_TEST_SUITE_END();
+
+protected:
+    static constexpr unsigned maxCalls = 10'000'000;
+    static constexpr unsigned minLen = 5, maxLen = 100;
+    static constexpr unsigned lenRange = maxLen - minLen + 1;
+    static constexpr unsigned randomSeed = 42;
+    static constexpr size_t testBufferSize = 1'000'000;
+    CCycleTimer timer;
+    std::vector<unsigned char> buffer;
+
+    unsigned getOffsetLenHash(unsigned offset, unsigned hash)
+    {
+        hash ^= (offset * 0x27D4EB2D); // use MurMurHash3 multiplier to introduce more randomness
+        hash *= fnvPrime32;
+        return hash;
+    }
+    void generateFixedRandomNullTermiantedStrings()
+    {
+        buffer.resize(testBufferSize);
+        std::mt19937 rng(randomSeed);
+        std::uniform_int_distribution<unsigned char> dist(1, 255);
+
+        unsigned offset = 0;
+        unsigned lenHash = fnvInitialHash32;
+        while (offset < testBufferSize)
+        {
+            // create str lengths between min and max based on offset,
+            // so that we can predictably read them back
+            lenHash = getOffsetLenHash(offset, lenHash);
+            unsigned len = (lenHash % lenRange) + minLen;
+
+            if (offset + len + 1 >= testBufferSize)
+                break;
+
+            for (unsigned i=0; i<len; i++)
+                buffer[offset + i] = dist(rng);
+            buffer[offset + len] = '\0';
+
+            offset += len + 1;
+        }
+    }
+    template <unsigned (*HASHCFUNC)(const unsigned char *, unsigned, unsigned)>
+    void testHashc()
+    {
+        unsigned hashResult = fnvInitialHash32;
+
+        unsigned offset = 0;
+        for (unsigned i=0; i<maxCalls; i++)
+        {
+            unsigned len = (i % 100) + 5;
+            if (offset + len > buffer.size())
+                offset = 0;
+
+            hashResult ^= HASHCFUNC(&buffer[offset], len, hashResult);
+            offset += len;
+        }
+        CPPUNIT_ASSERT(hashResult != 0);
+    }
+    template <unsigned (*HASHCZFUNC)(const unsigned char *, unsigned)>
+    void testHashcz()
+    {
+        unsigned hashResult = fnvInitialHash32;
+
+        unsigned lenHash = fnvInitialHash32;
+        unsigned offset = 0;
+        for (unsigned i=0; i<maxCalls; i++)
+        {
+            // get next length, as populated by generate function
+            lenHash = getOffsetLenHash(offset, lenHash);
+            unsigned len = (lenHash % lenRange) + minLen;
+
+            if (offset + (len + 1) > buffer.size())
+            {
+                offset = 0;
+                lenHash = getOffsetLenHash(offset, fnvInitialHash32);
+                len = (lenHash % lenRange) + minLen;
+            }
+            dbgassertex(len == strlen((const char *)&buffer[offset]));
+            hashResult ^= HASHCZFUNC(&buffer[offset], hashResult);
+            offset += len + 1;
+        }
+        CPPUNIT_ASSERT(hashResult != 0);
+    }
+    template <typename T, unsigned (*HASHCFUNC)(const unsigned char *, unsigned, unsigned)>
+    void testHashcN()
+    {
+        unsigned hashResult = fnvInitialHash32;
+
+        unsigned offset = 0;
+        unsigned len = sizeof(T);
+        for (unsigned i=0; i<maxCalls; i++)
+        {
+            if (offset + len > buffer.size())
+                offset = 0;
+
+            hashResult = HASHCFUNC(&buffer[offset], len, hashResult);
+            offset += len;
+        }
+        CPPUNIT_ASSERT(hashResult != 0);
+    }
+    template <typename T, unsigned (*HASHCFUNC)(T, unsigned)>
+    void testHashValueN()
+    {
+        unsigned hashResult = fnvInitialHash32;
+
+        unsigned offset = 0;
+        unsigned len = sizeof(T);
+        for (unsigned i=0; i<maxCalls; i++)
+        {
+            if (offset + len > buffer.size())
+                offset = 0;
+
+            hashResult = HASHCFUNC(*(const T *)(&buffer[offset]), hashResult);
+            offset += len;
+        }
+        CPPUNIT_ASSERT(hashResult != 0);
+    }
+    void measure(const char *funcName, const std::function<void(void)> &func)
+    {
+        timer.reset();
+        func();
+        unsigned elapsed = timer.elapsedMs();
+        double throughput = static_cast<double>(maxCalls) / elapsed * 1000;
+        PROGLOG("%s: %u calls took %u ms (%.2f hashes/sec)", funcName, maxCalls, elapsed, throughput);
+    }
+    void fnvTests()
+    {
+        measure("deprecatedHashc (fnv1)", [this]() { testHashc<deprecatedHashc>(); });
+        measure("deprecatedHashcz (fnv1)", [this]() { testHashcz<deprecatedHashcz>(); });
+        measure("hashc (fnv1)", [this]() { testHashc<hashc>(); });
+        measure("hashcz (fnv1)", [this]() { testHashcz<hashcz>(); });
+        measure("hashc_fnv1a", [this]() { testHashc<hashc_fnv1a>(); });
+        measure("hashcz_fnv1a", [this]() { testHashcz<hashcz_fnv1a>(); });
+        measure("hashc fnv1a 4", [this]() { testHashcN<unsigned, hashc_fnv1a>(); });
+        measure("hashc fnv1a 8", [this]() { testHashcN<unsigned __int64, hashc_fnv1a>(); });
+        measure("hashc fnv1a 4V", [this]() { testHashValueN<unsigned, hashvalue_fnv1a>(); });
+        measure("hashc fnv1a 8V", [this]() { testHashValueN<unsigned __int64, hashvalue_fnv1a>(); });
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( HashFuncTests );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( HashFuncTests, "HashFuncTests" );
+
+//---------------------------------------------------------------------------------------------------------------------
+
+class SleepTests : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(SleepTests);
+        CPPUNIT_TEST(testSleep);
+    CPPUNIT_TEST_SUITE_END();
+
+protected:
+    void testSleep()
+    {
+        //Sanity check that the sleep functions do not sleep too long or too short
+        {
+            __uint64 start = nsTick();
+            MilliSleep(10);
+            __uint64 elapsed = nsTick() - start;
+            CPPUNIT_ASSERT(elapsed > 10 * 1000 * 1000);
+            CPPUNIT_ASSERT(elapsed < 12 * 1000 * 1000);
+        }
+
+        {
+            __uint64 start = nsTick();
+            NanoSleep(10'000'000);
+            __uint64 elapsed = nsTick() - start;
+            CPPUNIT_ASSERT(elapsed > 10 * 1000 * 1000);
+            CPPUNIT_ASSERT(elapsed < 12 * 1000 * 1000);
+        }
+
+        {
+            __uint64 start = nsTick();
+            NanoSleep(10'000);
+            __uint64 elapsed = nsTick() - start;
+            CPPUNIT_ASSERT(elapsed > 10 * 1000);
+            CPPUNIT_ASSERT(elapsed < 1000 * 1000);
+        }
+
+        //Check case > 1 second
+        {
+            __uint64 start = nsTick();
+            NanoSleep(3'000'000'000);
+            __uint64 elapsed = nsTick() - start;
+            CPPUNIT_ASSERT(elapsed > 3'000'000'000);
+            CPPUNIT_ASSERT(elapsed < 3'100'000'000);
+        }
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( SleepTests );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( SleepTests, "SleepTests" );
+
+//---------------------------------------------------------------------------------------------------------------------
+
+class JLibTraceLevelTests : public CppUnit::TestFixture
+{
+public:
+    CPPUNIT_TEST_SUITE(JLibTraceLevelTests);
+        CPPUNIT_TEST(testDefault);
+        CPPUNIT_TEST(testSetFalse);
+        CPPUNIT_TEST(testSetMultiple);
+        CPPUNIT_TEST(testSetDetailOverride);
+    CPPUNIT_TEST_SUITE_END();
+
+protected:
+    void testDefault()
+    {
+        // Test that the default trace level is traceNone
+        Owned<IPropertyTree> tree = createPTree();
+
+        TraceFlags result = loadTraceFlags(tree, thorTraceOptions, traceNone);
+        TraceFlags level = result & TraceFlags::LevelMask;
+
+        CPPUNIT_ASSERT_EQUAL((unsigned)traceNone, (unsigned)level);
+
+        // Test that the default trace level is traceStandard
+        result = loadTraceFlags(tree, thorTraceOptions, traceStandard);
+        level = result & TraceFlags::LevelMask;
+
+        CPPUNIT_ASSERT_EQUAL((unsigned)traceStandard, (unsigned)level);
+    }
+
+    void testSetFalse()
+    {
+        // Test that setting traceDetailed to false does not change the default behavior
+        Owned<IPropertyTree> tree = createPTree();
+        tree->setProp("@traceDetailed", "false");
+
+        TraceFlags result = loadTraceFlags(tree, thorTraceOptions, traceStandard);
+        TraceFlags level = result & TraceFlags::LevelMask;
+
+        CPPUNIT_ASSERT_EQUAL((unsigned)traceStandard, (unsigned)level);
+    }
+
+    void testSetMultiple()
+    {
+        // Test that setting both traceMax and traceDetailed (in that order) to true sets the trace level to traceMax
+        Owned<IPropertyTree> tree = createPTree();
+        tree->setProp("@traceMax", "true");
+        tree->setProp("@traceDetailed", "true");
+
+        TraceFlags result = loadTraceFlags(tree, thorTraceOptions, traceNone);
+        TraceFlags level = result & TraceFlags::LevelMask;
+
+        CPPUNIT_ASSERT_EQUAL((unsigned)traceMax, (unsigned)level);
+
+        // Test the other way around - traceDetailed first, then traceMax
+        tree.setown(createPTree());
+        tree->setProp("@traceDetailed", "true");
+        tree->setProp("@traceMax", "true");
+
+        result = loadTraceFlags(tree, thorTraceOptions, traceNone);
+        level = result & TraceFlags::LevelMask;
+
+        CPPUNIT_ASSERT_EQUAL((unsigned)traceMax, (unsigned)level);
+    }
+
+    void testSetDetailOverride()
+    {
+        // Test that setting traceMax to true and traceDetail to "detailed" sets the traceLevel to traceDetailed
+        Owned<IPropertyTree> tree = createPTree();
+        tree->setProp("@traceMax", "true");
+        tree->setProp("@traceDetail", "detailed");
+
+        TraceFlags result = loadTraceFlags(tree, thorTraceOptions, traceNone);
+        TraceFlags level = result & TraceFlags::LevelMask;
+
+        // traceDetail should override the boolean traceMax setting
+        CPPUNIT_ASSERT_EQUAL((unsigned)traceDetailed, (unsigned)level);
+
+        // Test with "standard" value
+        tree->setProp("@traceDetail", "standard");
+        result = loadTraceFlags(tree, thorTraceOptions, traceNone);
+        level = result & TraceFlags::LevelMask;
+        CPPUNIT_ASSERT_EQUAL((unsigned)traceStandard, (unsigned)level);
+
+        // Test with "max" value
+        tree->setProp("@traceDetail", "max");
+        result = loadTraceFlags(tree, thorTraceOptions, traceNone);
+        level = result & TraceFlags::LevelMask;
+        CPPUNIT_ASSERT_EQUAL((unsigned)traceMax, (unsigned)level);
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( JLibTraceLevelTests );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( JLibTraceLevelTests, "JLibTraceLevelTests" );
 
 #endif // _USE_CPPUNIT

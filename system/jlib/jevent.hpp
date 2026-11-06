@@ -1,0 +1,950 @@
+/*##############################################################################
+
+    HPCC SYSTEMS software Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#ifndef JEVENT_HPP
+#define JEVENT_HPP
+
+#include "jeventconst.hpp"
+#include "jscm.hpp"
+#include "jatomic.hpp"
+#include "jbuff.hpp"
+#include "jptree.hpp"
+#include "jstream.hpp"
+#include "jstring.hpp"
+#include "jstats.h"
+#include "jprotrace.hpp"
+
+#include <condition_variable>
+#include <initializer_list>
+#include <type_traits>
+
+//--------------------------------------------------------------------------------------------------
+// Event metadata definition tables (maintained values)
+
+// Reusable EventContext values for collection construction.
+// EventCtxNone and reserved/sentinel values are intentionally excluded.
+#define FOR_EACH_EVENT_CONTEXT_VALUE(DEFINE) \
+    DEFINE(Dali,     0x0001) \
+    DEFINE(Index,    0x0002) \
+    DEFINE(Other,    0x0004) \
+    DEFINE(Meta,     0x0008) \
+    DEFINE(Remote,   0x0010) \
+    DEFINE(Query,    0x0020) \
+    DEFINE(Mutex,    0x0040) \
+    DEFINE(Function, 0x0080)
+
+// Reusable EventAttr values for collection construction.
+// EvAttrNone is intentionally excluded and remains explicitly defined in enum EventAttr.
+#define FOR_EACH_EVENT_ATTR_VALUE(DEFINE) \
+    DEFINE(FileId,            u4,        none) \
+    DEFINE(FileOffset,        u8,        size) \
+    DEFINE(NodeKind,          u1,        none) \
+    DEFINE(ReadTime,          u8,        duration) \
+    DEFINE(ElapsedTime,       u8,        duration) \
+    DEFINE(InMemorySize,      u4,        size) \
+    DEFINE(Path,              string,    none) \
+    DEFINE(ConnectId,         u8,        none) \
+    DEFINE(Enabled,           bool,      none) \
+    DEFINE(FileSize,          u8,        size) \
+    DEFINE(EventTimestamp,    timestamp, timestamp) \
+    DEFINE(EventTraceId,      string,    none) \
+    DEFINE(EventThreadId,     u4,        none) \
+    DEFINE(EventStackTrace,   string,    none) \
+    DEFINE(DataSize,          u4,        size) \
+    DEFINE(ExpandTime,        u8,        duration) \
+    DEFINE(FirstUse,          bool,      none) \
+    DEFINE(ServiceName,       string,    none) \
+    DEFINE(ChannelId,         u1,        none) \
+    DEFINE(ReplicaId,         u1,        none) \
+    DEFINE(InstanceId,        u8,        none) \
+    DEFINE(ProcessDescriptor, string,    none) \
+    DEFINE(OpenTime,          u8,        duration) \
+    DEFINE(Plane,             string,    none) \
+    DEFINE(IsStriped,         bool,      none) \
+    DEFINE(RequestId,         u4,        none) \
+    DEFINE(RequestSeq,        u4,        none) \
+    DEFINE(ResponseId,        u4,        none) \
+    DEFINE(ResponseSeq,       u4,        none) \
+    DEFINE(Task,              u1,        none) \
+    DEFINE(LockId,            u4,        none) \
+    DEFINE(ElementId,         u8,        none) \
+    DEFINE(FunctionId,        u4,        none) \
+    DEFINE(SearchFlags,       u1,        none) \
+    DEFINE(ActivityId,        u4,        none)
+
+// Tasks represent a logical step in processing.  They will always start and stop on the same thread.
+enum class EventTask : byte
+{
+    Sink,          // A sink for processing a set of activities in a graph/subgraph
+    Readahead,     // A lookahead thread within a processing graph - e.g. within a keyed join
+    Graph,         // Scope of executing a graph
+    SubGraph,      // Scope of executing a subgraph
+    Running,       // A running thread not otherwise associated with a more specific task scope
+    Reading,       // Reading data
+    Processing,    // Processing data
+    Compressing,   // Compressing data
+    Decompressing, // Decompressing data
+    Writing,       // Writing data
+    CacheReading,  // Reading from cache
+    CacheWriting,  // Writing to cache
+    DllLoading,    // Loading a dynamic link library
+    Max
+};
+
+// The underlying data type was one byte when values were sequentially increasing.
+// The type is now two bytes because the values are now forming a bitmask.
+enum EventContext : uint16_t
+{
+    EventCtxNone    = 0x0000,
+#define DEFINE_EVENTCONTEXT_ENUM(name, bits) EventCtx##name = bits,
+    FOR_EACH_EVENT_CONTEXT_VALUE(DEFINE_EVENTCONTEXT_ENUM)
+#undef DEFINE_EVENTCONTEXT_ENUM
+    // Add all new contexts above this line.
+    // Dedicated sentinel for parse/validation failures. Not a context bit.
+    EventCtxInvalid = 0x8000,
+};
+BITMASK_ENUM(EventContext);
+
+// Reserved context bits include all bits that are not valid for use in event definitions.
+static constexpr EventContext EventCtxReserved = EventCtxInvalid;
+// All non-reserved context bits are valid for use in event definitions.
+static constexpr EventContext EventCtxValid = static_cast<EventContext>(~static_cast<std::underlying_type_t<EventContext>>(EventCtxReserved));
+// All valid context bits are accepted, including bits not explicitly defined in the enumeration.
+static constexpr EventContext EventCtxAll = EventCtxValid;
+
+extern jlib_decl EventContext queryEventContext(EventType event);
+extern jlib_decl EventContext queryEventContext(const char* name);
+
+// Returns true if the event type belongs to any of the contexts specified in the context bitmap,
+// false otherwise.
+inline bool eventInAnyContext(EventType event, EventContext context)
+{
+    EventContext eventContext = queryEventContext(event);
+    // It is a programming error to define any event with any EventCtxReserved context. Assert that it is not set.
+    assertex((eventContext & EventCtxReserved) == EventCtxNone);
+    return (eventContext & (context & EventCtxAll)) != EventCtxNone;
+}
+
+// The attributes that can be associated with each event.
+// The order should not be changed, or items removed. New values should always be appended before EvAttrMax.
+enum EventAttr : byte
+{
+    EvAttrNone,
+#define DEFINE_EVENTATTR_ENUM(name, type, unit) EvAttr##name,
+    FOR_EACH_EVENT_ATTR_VALUE(DEFINE_EVENTATTR_ENUM)
+#undef DEFINE_EVENTATTR_ENUM
+    EvAttrMax
+};
+
+// The different data types of attributes that can be associated with an event.
+enum EventAttrType
+{
+    EATnone,
+    EATbool,
+    EATu1,
+    EATu2,
+    EATu4,
+    EATu8,
+    EATtimestamp,
+    EATstring,
+    EATtraceid,     // should probably delete...
+    EATmax
+};
+
+enum EventAttrTypeClass : byte
+{
+    EATCnone,
+    EATCtext,
+    EATCnumeric,
+    EATCboolean,
+    EATCtimestamp,
+    EATCmax
+};
+
+enum EventAttrUnit : byte
+{
+    EAUnone,
+    EAUscalar,
+    EAUsize,
+    EAUduration,
+    EAUtimestamp,
+    EAUmax
+};
+
+extern jlib_decl EventType queryEventType(const char* name);
+extern jlib_decl const char * queryEventName(EventType event);
+extern jlib_decl std::initializer_list<EventAttr> queryEventAttributeIds(EventType event);
+extern jlib_decl EventAttr queryEventAttribute(const char* name);
+extern jlib_decl const char * queryEventAttributeName(EventAttr attr);
+extern jlib_decl EventAttrType queryEventAttributeType(EventAttr attr);
+extern jlib_decl EventAttrUnit queryEventAttributeUnit(EventAttr attr);
+
+struct jlib_decl EventRecordingSummary
+{
+    unsigned numEvents{0};
+    offset_t totalSize{0};
+    offset_t rawSize{0};
+    bool valid{true};
+    StringBuffer filename;
+    StringBuffer message;
+};
+
+// Encapsulation of a single attribute value for an event. Values may be stored as either text,
+// unsigned integral numbers, or Booleans. Assuming that an event will have an instance of this
+// for every attribute sescribed in EventAttr, the state of any instance of this is either:
+// - Unused: The attribute is not part of the event, and values cannot be set.
+// - Defined: The attribute is part of the event, but no value has been set.
+// - Assigned: The attribute is part of the event, and a value has been set.
+class jlib_decl CEventAttribute
+{
+public:
+    enum State : byte { Unused, Defined, Assigned };
+
+public:
+    EventAttr queryId() const;
+    EventAttrTypeClass queryTypeClass() const;
+    inline bool isTimestamp() const { return EATCtimestamp == queryTypeClass(); }
+    inline bool isText() const { return EATCtext == queryTypeClass() || isTimestamp(); }
+    inline bool isNumeric() const { return EATCnumeric == queryTypeClass() || isTimestamp(); }
+    inline bool isBoolean() const { return EATCboolean == queryTypeClass(); }
+    inline State queryState() const { return state; }
+    inline bool isUnused() const { return Unused == queryState(); }
+    inline bool isDefined() const { return Defined == queryState(); }
+    inline bool isAssigned() const { return Assigned == queryState(); }
+    void setValue(const char* value);
+    void setValue(__uint64 value);
+    void setValue(bool value);
+    const char* queryTextValue() const;
+    __uint64 queryNumericValue() const;
+    virtual bool queryBooleanValue() const;
+    bool queryHashData(const void*& ptr, size_t& length) const;
+    // Called once to identify the intended meaning of this instance
+    void setup(EventAttr attr);
+    // Called once per logical event to restore the original state of this instance
+    void reset(State _state);
+
+protected:
+    mutable StringBuffer text; // mutable allows `queryTextValue() const` to generate timestamp strings on demand
+    __uint64 number{0};
+    bool boolean{false};
+    EventAttr id{EvAttrNone};
+    State state{Unused};
+};
+
+// Encapsulation of a single event. An event is a type and an array of attributes. Each event may
+// have at most one instance of each attribute declared in EventAttr. Range-based iteraration of
+// CEventAttribute instances associated with an event is supported in three ways:
+// - for (auto& attr : event.allAttributes) { ... }
+//   Iteration of all attributes known to the event system, attribute states will include all states
+//   and are presented in numerical order of attribute IDs.
+// - for (auto& attr : event.defineAttributes) { ... }
+//   Iteration of all attributes defined for the event; Unused attributes are excluded. Attributes
+//   are presented in the order in which the event system records them.
+// - for (auto& attr : event.assignedAttributes) { ... }
+//   Iteration of all attributes for which values are set and the state is Assigned. Attributes are
+//   presented in the order in which the event system records them.
+class jlib_decl CEvent
+{
+public:
+    class jlib_decl AssignedAttributes
+    {
+    public:
+        class jlib_decl iterator
+        {
+        public:
+            iterator(CEvent& _owner, std::initializer_list<EventAttr>::const_iterator _cur)
+                : owner(_owner), cur(_cur) { nextAssigned();}
+            CEventAttribute& operator*() { return resolve(); }
+            CEventAttribute* operator->() { return &resolve(); }
+            iterator& operator++() { ++cur; nextAssigned(); return *this; }
+            bool operator != (const iterator& other) const { return cur != other.cur; }
+        protected:
+            CEventAttribute& resolve() const { return owner.attributes[*cur]; }
+            void nextAssigned();
+        protected:
+            CEvent& owner;
+            std::initializer_list<EventAttr>::const_iterator cur;
+        };
+
+        class jlib_decl const_iterator
+        {
+        public:
+            const_iterator(const CEvent& _owner, std::initializer_list<EventAttr>::const_iterator _cur)
+                : owner(_owner), cur(_cur) { nextAssigned();}
+            const CEventAttribute& operator*() { return resolve(); }
+            const CEventAttribute* operator->() { return &resolve(); }
+            const_iterator& operator++() { ++cur; nextAssigned(); return *this; }
+            bool operator != (const const_iterator& other) const { return cur != other.cur; }
+        protected:
+            const CEventAttribute& resolve() const { return owner.attributes[*cur]; }
+            void nextAssigned();
+        protected:
+            const CEvent& owner;
+            std::initializer_list<EventAttr>::const_iterator cur;
+        };
+
+        iterator begin() { return iterator(owner, owner.queryOrderedAttributeIds().begin()); }
+        const_iterator begin() const { return const_iterator(owner, owner.queryOrderedAttributeIds().begin()); }
+        iterator end() { return iterator(owner, owner.queryOrderedAttributeIds().end()); }
+        const_iterator end() const { return const_iterator(owner, owner.queryOrderedAttributeIds().end()); }
+
+        AssignedAttributes(CEvent& _owner) : owner(_owner) {}
+
+    protected:
+        CEvent& owner;
+    };
+
+    class DefinedAttributes
+    {
+    public:
+        class iterator
+        {
+        public:
+            iterator(CEvent& _owner, std::initializer_list<EventAttr>::const_iterator _cur)
+                : owner(_owner), cur(_cur) {}
+            CEventAttribute& operator*() { return resolve(); }
+            CEventAttribute* operator->() { return &resolve(); }
+            iterator& operator++() { ++cur; return *this; }
+            bool operator != (const iterator& other) const { return cur != other.cur; }
+        protected:
+            CEventAttribute& resolve() const { return owner.attributes[*cur]; }
+        protected:
+            CEvent& owner;
+            std::initializer_list<EventAttr>::const_iterator cur;
+        };
+
+        class const_iterator
+        {
+        public:
+            const_iterator(const CEvent& _owner, std::initializer_list<EventAttr>::const_iterator _cur)
+                : owner(_owner), cur(_cur) {}
+            const CEventAttribute& operator*() { return resolve(); }
+            const CEventAttribute* operator->() { return &resolve(); }
+            const_iterator& operator++() { ++cur; return *this; }
+            bool operator != (const const_iterator& other) const { return cur != other.cur; }
+        protected:
+            const CEventAttribute& resolve() const { return owner.attributes[*cur]; }
+        protected:
+            const CEvent& owner;
+            std::initializer_list<EventAttr>::const_iterator cur;
+        };
+
+        iterator begin() { return iterator(owner, owner.queryOrderedAttributeIds().begin()); }
+        const_iterator begin() const { return const_iterator(owner, owner.queryOrderedAttributeIds().begin()); }
+        iterator end() { return iterator(owner, owner.queryOrderedAttributeIds().end()); }
+        const_iterator end() const { return const_iterator(owner, owner.queryOrderedAttributeIds().end()); }
+
+        DefinedAttributes(CEvent& _owner) : owner(_owner) {}
+
+    protected:
+        CEvent& owner;
+    };
+
+    class AllAttributes
+    {
+    public:
+        class iterator
+        {
+        public:
+            iterator(CEvent& _owner, EventAttr _attr)
+                : owner(_owner)
+                , attr(_attr)
+            {
+                assertex(attr <= EvAttrMax);
+                if (EvAttrNone == attr)
+                    attr = EventAttr(1);
+            }
+            CEventAttribute& operator*() { return resolve(); }
+            CEventAttribute* operator->() { return &resolve(); }
+            iterator& operator++() { if (attr < EvAttrMax) ++attr; return *this; }
+            bool operator != (const iterator& other) const { return attr != other.attr; }
+        protected:
+            CEventAttribute& resolve() const { return owner.attributes[attr]; }
+        protected:
+            CEvent& owner;
+            unsigned attr;
+        };
+
+        class const_iterator
+        {
+        public:
+            const_iterator(const CEvent& _owner, EventAttr _attr)
+                : owner(_owner)
+                , attr(_attr)
+            {
+                assertex(attr <= EvAttrMax);
+                if (EvAttrNone == attr)
+                    attr = EventAttr(1);
+            }
+            const CEventAttribute& operator*() { return resolve(); }
+            const CEventAttribute* operator->() { return &resolve(); }
+            const_iterator& operator++() { if (attr < EvAttrMax) ++attr; return *this; }
+            bool operator != (const const_iterator& other) const { return attr != other.attr; }
+        protected:
+            const CEventAttribute& resolve() const { return owner.attributes[attr]; }
+        protected:
+            const CEvent& owner;
+            unsigned attr;
+        };
+
+        iterator begin() { return iterator(owner, EvAttrNone); }
+        const_iterator begin() const { return const_iterator(owner, EvAttrNone); }
+        iterator end() { return iterator(owner, EvAttrMax); }
+        const_iterator end() const { return const_iterator(owner, EvAttrMax); }
+
+        AllAttributes(CEvent& _owner) : owner(_owner) {}
+
+    protected:
+        CEvent& owner;
+    };
+
+public:
+    EventType queryType() const;
+    bool isAttribute(EventAttr attr) const;
+    bool hasAttribute(EventAttr attr) const;
+    bool isComplete() const;
+    CEventAttribute& queryAttribute(EventAttr attr);
+    const CEventAttribute& queryAttribute(EventAttr attr) const;
+    bool isTextAttribute(EventAttr attr) const;
+    bool isNumericAttribute(EventAttr attr) const;
+    bool isBooleanAttribute(EventAttr attr) const;
+    const char* queryTextValue(EventAttr attr) const;
+    __uint64 queryNumericValue(EventAttr attr) const;
+    bool queryBooleanValue(EventAttr attr) const;
+    bool queryHashData(EventAttr attr, const void*& ptr, size_t& length) const;
+    bool setValue(EventAttr attr, const char* value);
+    bool setValue(EventAttr attr, __uint64 value);
+    bool setValue(EventAttr attr, bool value);
+    // Ambiguity resolution: ensures unsigned values are correctly cast to __uint64 and routed to the intended overload.
+    inline bool setValue(EventAttr attr, unsigned value)
+    {
+        return setValue(attr, __uint64(value));
+    }
+    void fixup(const struct EventFileProperties& fileProps);
+
+public:
+    CEvent();
+    CEvent(const CEvent& other);
+    CEvent& operator = (const CEvent& other);
+    void reset(EventType _type);
+    // Reset the event type while retaining attribute values common to both the
+    // original and new event types.
+    void changeEventType(EventType newType);
+
+private:
+    const std::initializer_list<EventAttr>& queryOrderedAttributeIds() const;
+
+protected:
+    EventType type{EventNone};
+    CEventAttribute attributes[EvAttrMax];
+public:
+    AssignedAttributes assignedAttributes;
+    DefinedAttributes definedAttributes;
+    AllAttributes allAttributes;
+};
+
+//---------------------------------------------------------------------------------------------------------------------
+
+enum EventAttr : byte;
+interface IFileIO;
+
+// Pairing of an attribute id with its value, used by EventRecorder::writeEventAttrs.
+template <typename T>
+struct EventAttrPair { EventAttr attr; T value; };
+
+template <typename T>
+constexpr EventAttrPair<T> attrPair(EventAttr attr, T value) { return { attr, value }; }
+
+// The following class is used to record events that occur during execution.
+// More details are in the cpp file before the constructor.
+//
+// Design goals:
+// - To have least possible impact if the recording is not enabled
+// - To have a minimal impact when recording is enabled
+//
+// There is a single public function for each event that needs to be recorded.  The overhead of
+// the functional call can be avoided by checking recordingEvents() first, but calls will be
+// ignored if recording is not enabled.
+class jlib_decl EventRecorder
+{
+    typedef unsigned __int64 offset_type; // sufficient for an offset into the buffer, with little chance of it wrapping
+public:
+    EventRecorder();
+
+    bool isRecording() const { return recordingEvents.load(std::memory_order_acquire); }    // Are events being recorded? false if recording is paused
+
+    bool startRecording(const char * optionsText, const char * filename, const char * processName, unsigned channelId, unsigned replicaId, __uint64 instanceId, bool pause);
+    bool stopRecording(EventRecordingSummary * optSummary, bool throwOnFailure);
+    bool pauseRecording(bool pause, bool recordChange);
+
+//Functions for each of the events that can be recorded..
+    void recordIndexOpen(unsigned fileid, __uint64 loadTime);
+    void recordIndexCacheHit(unsigned fileid, offset_t offset, byte nodeKind, byte searchFlags, size32_t size, __uint64 expandTime);
+    void recordIndexCacheMiss(unsigned fileid, offset_t offset, byte nodeKind, byte searchFlags);
+    void recordIndexLoad(unsigned fileid, offset_t offset, byte nodeKind, byte searchFlags, size32_t size, __uint64 expandTime, __uint64 readTime);
+    void recordIndexEviction(unsigned fileid, offset_t offset, byte nodeKind, byte searchFlags, size32_t size);
+    void recordIndexPayload(unsigned fileid, offset_t offset, bool firstUse, __uint64 expandTime);
+
+    void recordDaliChangeMode(__int64 id, stat_type elapsedNs, size32_t dataSize);
+    void recordDaliCommit(__int64 id, stat_type elapsedNs, size32_t dataSize);
+    void recordDaliConnect(const char * xpath, __int64 id, stat_type elapsedNs, size32_t dataSize);
+    void recordDaliEnsureLocal(__int64 id, stat_type elapsedNs, size32_t dataSize);
+    void recordDaliGet(__int64 id, stat_type elapsedNs, size32_t dataSize);
+    void recordDaliGetChildren(const char * path, __int64 id, stat_type elapsedNs, size32_t dataSize);
+    void recordDaliGetChildrenFor(__int64 id, stat_type elapsedNs, size32_t dataSize);
+    void recordDaliGetElements(const char * path, __int64 id, stat_type elapsedNs, size32_t dataSize);
+    void recordDaliSubscribe(const char * xpath, __int64 id, stat_type elapsedNs);
+
+    void recordFileInformation(unsigned fileid, const char * filename);
+    void recordPlaneInformation(const char * plane, const char * path, bool isStriped);
+
+    void recordQueryStart(const char * queryName);
+    void recordQueryStop();
+
+    void recordRequestSend(unsigned requestId, unsigned requestSeq);
+    void recordRequestReceive(unsigned requestId, unsigned requestSeq);
+    void recordWorkerStart(unsigned requestId, unsigned requestSeq);
+    void recordWorkerStop(unsigned requestId, unsigned requestSeq);
+    void recordResponseSend(unsigned requestId, unsigned requestSeq, unsigned responseId, unsigned responseSeq);
+    void recordResponseReceive(unsigned requestId, unsigned requestSeq, unsigned responseId, unsigned responseSeq);
+    void recordMpRequestSend(unsigned requestId, size32_t dataSize);
+    void recordMpRequestReceive(unsigned requestId);
+    void recordMpResponseSend(unsigned responseId, size32_t dataSize);
+    void recordMpResponseReceive(unsigned responseId);
+    void recordEnqueue(__uint64 elementId);
+    void recordDequeue(__uint64 elementId);
+
+    void recordTaskStart(EventTask task);
+    void recordTaskStart(EventTask task, __uint64 payload);
+    void recordTaskStop(EventTask task);
+
+    void recordLockWait(unsigned lockId);
+    void recordLockAcquire(unsigned lockId);
+    void recordLockRelease(unsigned lockId);
+    void recordSemWait(unsigned lockId);
+    void recordSemAcquire(unsigned lockId);
+    void recordSemSignal(unsigned lockId);
+    void recordLockTryWaitAcquire(unsigned lockId);
+    void recordLockTryWaitFail(unsigned lockId);
+    void recordLockWaitTimeout(unsigned lockId);
+    void recordSemWaitTimeout(unsigned lockId);
+
+    void recordRecordingSource(const char* processDescriptor, byte channelId, byte replicaId, __uint64 instanceId);
+
+    void recordEvent(CEvent& event);
+
+    //-------------------------- End of the public interface --------------------------
+
+private:
+    template <typename... T>
+    void recordTaskEvent(EventType event, EventTask task, EventAttrPair<T>... attrs);
+protected:
+    void recordRecordingActive(bool paused);
+    void recordLockEvent(EventType event, unsigned lockId);
+    void recordRequestIdEvent(EventType event, unsigned requestId, unsigned requestSeq);
+    void recordResponseEvent(EventType event, unsigned requestId, unsigned requestSeq, unsigned responseId, unsigned responseSeq);
+    void recordMpDataEvent(EventType event, EventAttr attr, unsigned id, size32_t dataSize);
+    void recordMpIdEvent(EventType event, EventAttr attr, unsigned id);
+    void recordElementEvent(EventType event, __uint64 elementId);
+    void recordDaliEvent(EventType event, const char * xpath, __int64 id, stat_type elapsedNs, size32_t dataSize);
+    void recordDaliEvent(EventType event, __int64 id, stat_type elapsedNs, size32_t dataSize);
+
+    void checkAttrValue(EventAttr attr, size_t size);
+    void checkDataWrite(offset_type offset, size_t size);
+
+    void writeEventHeader(EventType type, offset_type & offset);
+    void writeEventHeader(EventType type, offset_type & offset, __uint64 timestamp, const char* traceId, unsigned threadId);
+    void writeEventFooter(offset_type & offset, size32_t requiredSize, offset_t writeOffset);
+
+    template <class T>
+    void write(offset_type & offset, T value)
+    {
+        writeData(offset, sizeof(value), &value);
+    }
+
+    void write(offset_type & offset, const char * value)
+    {
+        writeData(offset, strlen(value)+1, value);
+    }
+
+    template <class T>
+    void write(EventRecorder::offset_type & offset, EventAttr attr, T value)
+    {
+        checkAttrValue(attr, sizeof(value));        // MORE: make this debug only....
+        writeData(offset, sizeof(attr), &attr);
+        writeData(offset, sizeof(value), &value);
+    }
+
+    void write(EventRecorder::offset_type & offset, EventAttr attr, const char * value)
+    {
+        writeData(offset, sizeof(attr), &attr);
+        writeData(offset, strlen(value)+1, value);
+    }
+
+    // Writes a complete event (header, attributes, footer). Callers are responsible for
+    // deciding whether the event should be recorded, and for any TRACEEVENT logging.
+    template <typename... T>
+    void writeEventAttrs(EventType type, EventAttrPair<T>... attrs);
+
+    void writeByte(offset_type & offset, byte value);
+    void writeData(offset_type & offset, size_t size, const void * data);
+
+    offset_type reserveEvent(size32_t size);
+    void commitEvent(offset_type startOffset, size32_t size);
+
+    void writeBlock(offset_type startOffset, size32_t size);
+
+    unsigned getBlockFromOffset(offset_type offset) { return (unsigned)((offset & bufferMask) / OutputBlockSize); }
+
+    inline bool isEventEnabled(EventContext contextMask) const
+    {
+        return (contextFlags & (contextMask & EventCtxValid)) != EventCtxNone;
+    }
+
+    inline bool isEventEnabled(EventType event) const
+    {
+        return isEventEnabled(queryEventContext(event));
+    }
+
+    inline void writeTraceId(offset_type & offset, const char* traceid)
+    {
+        assertex(strlen(traceid) == 32);
+        for (unsigned i=0; i < 32; i += 2)
+        {
+            byte next = getHexPair(traceid + i);
+            writeByte(offset, next);
+        }
+    }
+
+protected:
+    static constexpr size32_t numBlocks = 2;
+    static constexpr size32_t OutputBlockSize = 0x100000;
+    static constexpr size32_t OutputBufferSize = numBlocks * OutputBlockSize;
+    static constexpr offset_t bufferMask = OutputBufferSize-1;
+    static constexpr offset_t blockMask = OutputBlockSize-1;
+
+    std::atomic<bool> recordingEvents{false};       // Are events being recorded? false if recording is paused.
+    std::atomic<bool> isStarted{false};             // Use 2 flags for whether started and stopped to ensure clean
+    std::atomic<bool> isStopped{true};              // termination in stopRecording()
+    offset_type nextOffset{0};
+    std::atomic<offset_type> nextWriteOffset{0};
+    std::mutex writeMutex;
+    std::condition_variable writeCv;
+    offset_type numEvents{0};
+    unsigned pendingEventCounts[numBlocks] = {0};
+    std::atomic<cycle_t> startCycles{0};
+    std::atomic<__uint64> startTimestamp{0};
+    MemoryAttr buffer;
+    CriticalSection cs{SYNC_LOCATION};
+    Semaphore okToWriteSem{SYNC_LOCATION};
+    unsigned sizeMessageHeaderFooter{0};
+    unsigned options{0};
+    EventContext contextFlags{EventCtxAll};
+    unsigned writersWaiting{0};
+    byte compressionType;
+    bool outputToLog{false};
+    std::atomic<bool> corruptOutput{false};
+    bool createSpans{false};
+    bool suppressPayloadHits{false};
+    StringBuffer outputFilename;
+    Owned<IFile> outputFile;
+    Owned<IFileIO> output;
+    Owned<ISerialOutputStream> outputStream;
+    AtomicShared<IException> writeException;
+};
+
+// The implementation exposes a global object so that the test for whether events are being recorded
+// is as lightweight as possible.
+// All access should be via the non-internal helper accessor functions
+
+namespace EventRecorderInternal
+{
+extern jlib_decl EventRecorder eventRecorder;
+}
+
+inline EventRecorder & queryRecorder() { return EventRecorderInternal::eventRecorder; }
+inline bool recordingEvents() { return EventRecorderInternal::eventRecorder.isRecording(); }
+
+// Tri-state values for EventFileProperties::options fields
+// File properties for a single file could use a Boolean flag. Potential iteration of events from
+// multiple files introduces a third possibility when not all files are configured identically.
+enum class EventFileOption : byte
+{
+    Disabled,              // No files have this option enabled
+    Enabled,               // All files have this option enabled
+    Ambiguous = UINT8_MAX  // Some but not all files have this option enabled
+};
+
+// Values indicating ambiguous/conflicting properties when multiplexing multiple sources
+constexpr uint32_t AmbiguousVersion = UINT32_MAX;
+constexpr byte AmbiguousChannelId = UINT8_MAX;
+constexpr byte AmbiguousReplicaId = UINT8_MAX;
+constexpr __uint64 AmbiguousInstanceId = UINT64_MAX;
+
+struct EventFileProperties;
+
+// Abstract interface for visiting the events in a previously recorded event data file.
+// An implementation will receive a sequence of calls:
+// - visitFile: signals the start of a file
+// - visitEvent: signals the arrival of an event, including all attribute data
+// - departFile: signals the end of the file
+//
+// Both visitFile and visitEvent return a Boolean value. True continues file parsing.
+// while false stops processing.
+//
+// EventFileProperties references identify the input file associated with each callback.
+// Properties are owned by the event consumer distributing events, and may be discarded after
+// the callback. Do not retain references to the properties or member variables within them.
+interface IEventVisitor : extends IInterface
+{
+    virtual bool visitFile(const EventFileProperties& properties) = 0;
+    virtual bool visitEvent(CEvent& event, const EventFileProperties& properties) = 0;
+    virtual void departFile(const EventFileProperties& properties) = 0;
+};
+
+// Properties related to an event data file being read. It is a combination of static and
+// runtime properties.
+//
+// Static properties are set as the file is read:
+// - path is set when the file is successfully opened
+// - version and options are set when the file header is parsed
+// - startTimestamp is set from the file header; endTimestamp starts at the same value
+// - processDescriptor, channelId, replicaId, instanceId are set when the first RecordingSource
+//   event is encountered; values remain unchanged if no such event is present; a second such
+//   event is an error yielding an exception
+//
+// Runtime properties, including endTimestamp, are updated as events are read.
+struct jlib_decl EventFileProperties
+{
+    StringAttr path;              // location of the event data file
+    uint32_t version{0};          // event file version number (AmbiguousVersion if sources conflict)
+    __uint64 startTimestamp{0};   // recording start time from the file header
+    __uint64 endTimestamp{0};     // timestamp of the last observed event, or startTimestamp if none
+    struct {
+        EventFileOption includeTraceIds{EventFileOption::Disabled};
+        EventFileOption includeThreadIds{EventFileOption::Disabled};
+        EventFileOption includeStackTraces{EventFileOption::Disabled};
+    } options;
+    StringAttr processDescriptor;
+    byte channelId{0};            // AmbiguousChannelId if sources conflict
+    byte replicaId{0};            // AmbiguousReplicaId if sources conflict
+    __uint64 instanceId{0};       // AmbiguousInstanceId if sources conflict
+    uint32_t eventsRead{0};
+    uint32_t bytesRead{0};
+};
+
+// Pull-based interface for reading events from a binary event data file.
+//
+// An IEventIterator provides an iterator-like API over the events contained in a single file.
+// It is the counterpart to the push-based readEvents() helper:
+//   - Use IEventIterator when the caller wants explicit control over when the next event is read,
+//     for example to integrate with existing loops, apply back-pressure, or stop after a
+//     partial read.
+//   - Use readEvents() when all events should be processed in one pass via an IEventVisitor
+//     implementation.
+//
+// Implementations are expected to:
+//   - Open the underlying file and parse its header before any events are returned.
+//   - Populate queryFileProperties() as information becomes available (see EventFileProperties
+//     for details of which fields are set when).
+//   - Throw an IException-derived exception on I/O or format errors.
+interface IEventIterator : extends IInterface
+{
+    // Reads the next event from the file.
+    //
+    // On success, returns true and populates 'event' with the next parsed event.
+    // Returns false when the end of the file is reached and no more events are available.
+    // Throws an IException-derived exception if an error occurs while reading or parsing.
+    virtual bool nextEvent(CEvent& event) = 0;
+
+    // Returns the current properties of the underlying event file.
+    //
+    // The returned reference remains valid for the lifetime of the iterator. Fields are populated
+    // as they become known:
+    //   - path and version are set once the file is opened and its header parsed;
+    //   - options are derived from the header;
+    //   - processDescriptor, channelId, replicaId and instanceId are set when a RecordingSource
+    //     event is first encountered;
+    //   - eventsRead and bytesRead are updated as events are consumed via nextEvent().
+    virtual const EventFileProperties& queryFileProperties() const = 0;
+};
+
+// Creates an IEventIterator for the specified event data file.
+//
+// The path identifies a single binary event file previously produced by the event recording
+// infrastructure. The returned iterator exposes a pull-based API via nextEvent(), allowing
+// callers to iterate over events at their own pace. This is functionally equivalent to
+// readEvents(), but gives the caller more control over iteration and lifetime.
+//
+// On success, returns a new IEventIterator instance. The caller is responsible for releasing
+// the interface when it is no longer needed, using the standard IInterface reference-counting
+// conventions.
+//
+// Throws an IException-derived exception if the file cannot be opened, the header cannot be
+// parsed, or the contents are not a supported event file format.
+extern jlib_decl IEventIterator* createEventFileIterator(const char* path);
+
+// Opens and parses a single binary event data file. Parsed data is passed to the given visitor
+// until parsing completes or the visitor requests it to stop.
+//
+// Exceptions are thrown on error. False is returned if parsing was stopped prematurely. True is
+// returned if all data was parsed successfully.
+extern jlib_decl bool readEvents(const char* filename, IEventVisitor & visitor);
+
+extern jlib_decl bool startComponentRecording(const char * component, const char * optionsText, const char * filename, unsigned channelId, unsigned replicaId, bool pause);
+
+// A RAII wrapper for recording the start and stop of a task scope.  Only goes to protrace.
+class ProTraceTaskScopeTracker
+{
+public:
+#ifdef _USE_PROTRACE
+    ProTraceTaskScopeTracker(EventTask _task, bool _enabled = true)
+        : task(_task), enabled(_enabled)
+    {
+        if (enabled)
+            protraceRecordTaskStart(task);
+    }
+
+    // Constructor that allows an optional payload to be provided
+    ProTraceTaskScopeTracker(EventTask _task, [[maybe_unused]] __uint64 extra, bool _enabled = true)
+        : task(_task), enabled(_enabled)
+    {
+        if (enabled)
+#ifdef PROTRACE_TASK_SIZES
+            protraceRecordTaskStart(task, extra);
+#else
+            protraceRecordTaskStart(task);
+#endif
+    }
+
+    ProTraceTaskScopeTracker(EventTask _task, [[maybe_unused]] size32_t extra, bool _enabled = true)
+    : ProTraceTaskScopeTracker(_task, static_cast<__uint64>(extra), _enabled)
+    {
+    }
+
+
+    ~ProTraceTaskScopeTracker()
+    {
+        if (enabled)
+            protraceRecordTaskStop(task);
+    }
+private:
+    const EventTask task;
+    const bool enabled;
+#else
+    constexpr ProTraceTaskScopeTracker(EventTask, bool = true) {}
+    constexpr ProTraceTaskScopeTracker(EventTask, __uint64, bool = true) {}
+    constexpr ProTraceTaskScopeTracker(EventTask, size32_t, bool = true) {}
+#endif
+};
+
+// A variation of ProTraceTaskScopeTracker where the start event is not emitted until the payload for
+// it is known - allowing a value that is only calculated by the task to be associated with its start.
+class ProTraceTaskScopeDelayedTracker
+{
+public:
+#ifdef _USE_PROTRACE
+    ProTraceTaskScopeDelayedTracker(EventTask _task, bool _enabled = true)
+        : task(_task), enabled(_enabled)
+    {
+        if (enabled)
+            startCycles = get_cycles_now();
+    }
+
+    // Emit the pending start event, back-dated to when this object was created, with extra as its payload.
+    void noteComplete([[maybe_unused]] __uint64 extra)
+    {
+        if (startCycles)
+        {
+#ifdef PROTRACE_TASK_SIZES
+            protraceRecordAt(getTaskStartOp(task), startCycles, extra);
+#else
+            protraceRecordAt(getTaskStartOp(task), startCycles);
+#endif
+            startCycles = 0;
+        }
+    }
+
+    ~ProTraceTaskScopeDelayedTracker()
+    {
+        if (startCycles)
+            protraceRecordAt(getTaskStartOp(task), startCycles);
+        if (enabled)
+            protraceRecordTaskStop(task);
+    }
+private:
+    const EventTask task;
+    const bool enabled;
+    cycle_t startCycles = 0;
+#else
+    constexpr ProTraceTaskScopeDelayedTracker(EventTask, bool = true) {}
+    constexpr void noteComplete(__uint64) {}
+#endif
+};
+
+// Similar to ProTraceTaskScopeTracker, but also records events if recording is enabled.
+class TaskScopeTracker
+{
+public:
+    TaskScopeTracker(EventTask _task, bool _enabled = true)
+        : task(_task), enabled(_enabled), recording(enabled && recordingEvents())
+    {
+        if (enabled)
+        {
+            protraceRecordTaskStart(task);
+            if (recording)
+                queryRecorder().recordTaskStart(task);
+        }
+    }
+
+    // Constructor that allows an optional payload to be provided
+    TaskScopeTracker(EventTask _task, __uint64 extra, bool _enabled = true)
+        : task(_task), enabled(_enabled), recording(enabled && recordingEvents())
+    {
+        if (enabled)
+        {
+#ifdef PROTRACE_TASK_SIZES
+            protraceRecordTaskStart(task, extra);
+#else
+            protraceRecordTaskStart(task);
+#endif
+            if (recording)
+                queryRecorder().recordTaskStart(task, extra);
+        }
+    }
+
+    TaskScopeTracker(EventTask _task, [[maybe_unused]] size32_t extra, bool _enabled = true)
+    : TaskScopeTracker(_task, static_cast<__uint64>(extra), _enabled)
+    {
+    }
+
+    ~TaskScopeTracker()
+    {
+        if (enabled)
+        {
+            protraceRecordTaskStop(task);
+            if (recording)
+                queryRecorder().recordTaskStop(task);
+        }
+    }
+private:
+    const EventTask task;
+    const bool enabled;
+    const bool recording;
+};
+
+#endif

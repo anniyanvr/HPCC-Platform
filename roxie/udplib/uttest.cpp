@@ -18,6 +18,7 @@
 ///* simple test
 #include "udplib.hpp"
 #include "roxiemem.hpp"
+#include "ccd.hpp"
 //#include "udptrr.hpp"
 //#include "udptrs.hpp"
 
@@ -42,7 +43,6 @@ void usage()
     printf("Options are:\n");
     printf(
         "--jumboFrames\n"
-        "--useAeron\n"
         "--udpLocalWriteSocketSize nn\n"
         "--udpRetryBusySenders nn\n"
         "--maxPacketsPerSender nn\n"
@@ -77,7 +77,6 @@ bool doSortSimulator = false;
 bool simpleSequential = true;
 float slowNodeSkew = 1.0;
 unsigned numSortSlaves = 50;
-bool useAeron = false;
 bool doRawTest = false;
 unsigned rawBufferSize = 1024;
 
@@ -91,7 +90,7 @@ bool readRows = true;
 
 IpAddressArray allNodes;
 
-struct TestHeader
+struct TestHeader : public RoxiePacketHeader
 {
     unsigned sequence;
     unsigned nodeIndex;
@@ -106,7 +105,7 @@ class SendAsFastAsPossible : public Thread
     static unsigned totalSent;
 
 public:
-    SendAsFastAsPossible(unsigned port, unsigned sendSize)
+    SendAsFastAsPossible(unsigned port, unsigned sendSize) : Thread("SendAsFastAsPossible")
     {
         SocketEndpoint ep(port, allNodes.item(0));
         flowSocket = ISocket::udp_connect(ep);
@@ -140,16 +139,16 @@ public:
     }
 };
 
-SpinLock SendAsFastAsPossible::ratelock;
+SpinLock SendAsFastAsPossible::ratelock{SYNC_LOCATION};
 unsigned SendAsFastAsPossible::lastReport = 0;
 unsigned SendAsFastAsPossible::totalSent = 0;
 
 class Receiver : public Thread
 {
-    bool running;
-    Semaphore started;
+    std::atomic<bool> running;
+    Semaphore started{SYNC_LOCATION};
     offset_t allReceived;
-    CriticalSection arsect;
+    CriticalSection arsect{SYNC_LOCATION};
 public:
     Receiver() : Thread("Receiver")
     {
@@ -157,9 +156,9 @@ public:
         allReceived = 0;
     }
 
-    virtual void start()
+    void startReceiver()
     {
-        Thread::start();
+        Thread::start(false);
         started.wait();
     }
 
@@ -177,13 +176,7 @@ public:
     virtual int run()
     {
         Owned<IReceiveManager> rcvMgr;
-        if (useAeron)
-        {
-            SocketEndpoint myEP(7000, myNode.getIpAddress());
-            rcvMgr.setown(createAeronReceiveManager(myEP));
-        }
-        else
-            rcvMgr.setown(createReceiveManager(7000, 7001, 7002, 7003, multicastIP, udpQueueSize, maxPacketsPerSender));
+        rcvMgr.setown(createReceiveManager(7000, 7001, 7002, udpQueueSize, false));
         Owned<roxiemem::IRowManager> rowMgr = roxiemem::createRowManager(0, NULL, queryDummyContextLogger(), NULL, false);
         Owned<IMessageCollator> collator = rcvMgr->createMessageCollator(rowMgr, 1);
         unsigned lastReport = 0;
@@ -254,7 +247,7 @@ public:
                                 break;
                         }
                         else
-                            UNIMPLEMENTED;
+                            throwUnexpected();
                     }
                 }
             }   
@@ -290,10 +283,7 @@ void testNxN()
     if (maxPacketsPerSender > udpQueueSize)
         maxPacketsPerSender = udpQueueSize;
     Owned <ISendManager> sendMgr;
-    if (useAeron)
-        sendMgr.setown(createAeronSendManager(7000, udpNumQs, myNode.getIpAddress()));
-    else
-        sendMgr.setown(createSendManager(7000, 7001, 7002, 7003, multicastIP, 100, udpNumQs, NULL));
+    sendMgr.setown(createSendManager(7000, 7001, 7002, 100, udpNumQs, myNode.getIpAddress(), nullptr, false, false));
     Receiver receiver;
 
     IMessagePacker **packers = new IMessagePacker *[numNodes];
@@ -307,7 +297,7 @@ void testNxN()
     DBGLOG("Ready to start");
     if (receiving)
     {
-        receiver.start();
+        receiver.startReceiver();
         if (numNodes > 1)
             Sleep(5000);
     }
@@ -335,7 +325,9 @@ void testNxN()
             while (dontSendToSelf&&(dest==myIndex));
             if (!packers[dest])
             {
-                TestHeader t = {sequences[dest], myIndex};
+                TestHeader t;
+                t.sequence = sequences[dest];
+                t.nodeIndex = myIndex;
                 ServerIdentifier destServer;
                 destServer.setIp(allNodes.item(dest));
                 packers[dest] = sendMgr->createMessagePacker(1, sequences[dest], &t, sizeof(t), destServer, 0);
@@ -403,10 +395,17 @@ void rawSendTest()
     {
         DBGLOG("Starting sender %d on port %d", senders+1, startPort);
         SendAsFastAsPossible *newSender = new SendAsFastAsPossible(startPort++, rawBufferSize);
-        newSender->start();
+        newSender->start(false);
         Sleep(10000);
     }
 }
+
+class SortSemaphore : public Semaphore
+{
+public:
+    SortSemaphore(unsigned initialCount=0) : Semaphore(SYNC_LOCATION, initialCount) {}
+};
+
 
 class SortMaster 
 {
@@ -414,7 +413,7 @@ class SortMaster
     unsigned __int64 sendingMask;
     unsigned __int64 *nodeData;
     int numSlaves;
-    CriticalSection masterCrit;
+    CriticalSection masterCrit{SYNC_LOCATION};
 
     int *nextNode;
     Semaphore *receiveSem;
@@ -436,7 +435,7 @@ public:
         if (simpleSequential)
         {
             nextNode = new int[numSlaves];
-            receiveSem = new Semaphore[numSlaves];
+            receiveSem = new SortSemaphore[numSlaves];
             for (int i = 0; i < numSlaves; i++)
             {
                 nextNode[i] = i+1;
@@ -557,7 +556,7 @@ class SortSlave : public Thread
     }
 
 public:
-    SortSlave()
+    SortSlave() : Thread("SortSlave")
     {
         master = NULL;
         myIdx = -1;
@@ -571,7 +570,7 @@ public:
     }
     void sendTo(unsigned datasize, unsigned slaveIdx)
     {
-        assert(slaveIdx != myIdx);
+        assert(slaveIdx != (unsigned) myIdx);
         DBGLOG("Node %d sending %d bytes to node %d", myIdx, datasize, slaveIdx);
         master->noteTransferStart(myIdx, slaveIdx);
         Sleep(datasize);
@@ -600,7 +599,7 @@ void sortSimulator()
     for (unsigned i = 0; i < numSortSlaves; i++)
     {
         slaves[i].init(&master, i);
-        slaves[i].start();
+        slaves[i].start(false);
     }
     for (unsigned j = 0; j < numSortSlaves; j++)
     {
@@ -612,13 +611,15 @@ void sortSimulator()
     delete[] slaves;
 }
 
+void *leakChecker = nullptr;
+
 int main(int argc, char * argv[] ) 
 {
     InitModuleObjects();
     if (argc < 2)
         usage();
 
-    strdup("Make sure leak checking is working");
+    leakChecker = strdup("Make sure leak checking is working");
     queryStderrLogMsgHandler()->setMessageFields(MSGFIELD_time | MSGFIELD_thread | MSGFIELD_prefix);
 
     {
@@ -641,7 +642,6 @@ int main(int argc, char * argv[] )
     DBGLOG("%s",cmdline.str());
 //  queryLogMsgManager()->enterQueueingMode();
 //  queryLogMsgManager()->setQueueDroppingLimit(512, 32);
-    udpRequestToSendTimeout = 5000;
     for (c = 1; c < argc; c++)
     {
         const char *ip = argv[c];
@@ -660,15 +660,11 @@ int main(int argc, char * argv[] )
                 c++;
                 if (c==argc || !isdigit(*argv[c]))
                     usage();
-                udpRequestToSendTimeout = atoi(argv[c]);
+                udpRequestTimeout = atoi(argv[c]);
             }
             else if (strcmp(ip, "--jumboFrames")==0)
             {
                 roxiemem::setDataAlignmentSize(0x2000);
-            }
-            else if (strcmp(ip, "--useAeron")==0)
-            {
-                useAeron = true;
             }
             else if (strcmp(ip, "--rawSpeedTest")==0)
             {
@@ -681,13 +677,6 @@ int main(int argc, char * argv[] )
                     usage();
                 udpLocalWriteSocketSize = atoi(argv[c]);
             }
-            else if (strcmp(ip, "--udpRetryBusySenders")==0)
-            {
-                c++;
-                if (c==argc)
-                    usage();
-                udpRetryBusySenders = atoi(argv[c]);
-            }
             else if (strcmp(ip, "--maxPacketsPerSender")==0)
             {
                 c++;
@@ -695,26 +684,12 @@ int main(int argc, char * argv[] )
                     usage();
                 maxPacketsPerSender = atoi(argv[c]);
             }
-            else if (strcmp(ip, "--udpSnifferEnabled")==0)
-            {
-                c++;
-                if (c==argc)
-                    usage();
-                udpSnifferEnabled = atoi(argv[c]) != 0;
-            }
             else if (strcmp(ip, "--udpTraceLevel")==0)
             {
                 c++;
                 if (c==argc)
                     usage();
                 udpTraceLevel = atoi(argv[c]);
-            }
-            else if (strcmp(ip, "--udpTraceCategories")==0)
-            {
-                c++;
-                if (c==argc)
-                    usage();
-                udpTraceCategories = atoi(argv[c]);
             }
             else if (strcmp(ip, "--dontSendToSelf")==0)
             {
@@ -755,7 +730,7 @@ int main(int argc, char * argv[] )
                 ipstr.append(startrange - ip, ip).append(firstnum).append(endptr);
                 const IpAddress nodeIP(ipstr);
                 allNodes.append(nodeIP);
-                nodeIP.getIpText(ipstr.clear());
+                nodeIP.getHostText(ipstr.clear());
                 printf("Added node %s\n", ipstr.str());
                 firstnum++;
             }
@@ -789,12 +764,13 @@ int main(int argc, char * argv[] )
             printf("ERROR: my ip does not appear to be in range\n");
             usage();
         }
-        roxiemem::setTotalMemoryLimit(false, true, false, 1048576000, 0, NULL, NULL);
+        roxiemem::setTotalMemoryLimit(false, true, false, false, 1048576000, 0, NULL, NULL);
         testNxN();
         roxiemem::releaseRoxieHeap();
     }
     ExitModuleObjects();
     releaseAtoms();
+    leakChecker = nullptr;
     return 0;
 }
 
@@ -846,7 +822,6 @@ void usage(char *err = NULL)
     fprintf(stderr, " [-destB IP]          : Sets the sender second destination ip address to IP <default no sec dest>\n");
     fprintf(stderr, " [-multiCast IP]      : Sets the sniffer multicast ip address to IP <default %s>\n", multiCast);
     fprintf(stderr, " [-udpTimeout msec]   : Sets the sender udpRequestToSendTimeout value  <default %i>\n", udpRequestToSendTimeout);
-    fprintf(stderr, " [-udpMaxTimeouts val]: Sets the sender udpMaxRetryTimedoutReqs value <default %i>\n", udpMaxRetryTimedoutReqs);
     fprintf(stderr, " [-udpNumQs val]      : Sets the sender's number of output queues <default %i>\n", udpNumQs);
     fprintf(stderr, " [-udpQsPriority val] : Sets the sender's output queues priority udpQsPriority <default %i>\n", udpOutQsPriority);
     fprintf(stderr, " [-packerHdrSize val] : Sets the packers header size (like RoxieHeader) <default %i>\n", packerHdrSize);
@@ -878,8 +853,6 @@ int main(int argc, char * argv[] )
     progName = argv[0];
     destA = myIndex = addRoxieNode(GetCachedHostName());
 
-    udpRequestToSendTimeout = 5000;
-    udpMaxRetryTimedoutReqs = 3;
     udpOutQsPriority = 5;
     udpTraceLevel = 1;
 
@@ -937,19 +910,7 @@ int main(int argc, char * argv[] )
             {
                 if (++i < argc) 
                 {
-                    udpRequestToSendTimeout = atoi(argv[i]);
-                }
-                else 
-                {
-                    sprintf(errBuff,"Missing value after \"%s\"", argv[i-1]);
-                    usage(errBuff);
-                }
-            }
-            else if(stricmp(argv[i]+1,"udpMaxTimeouts")==0)
-            {
-                if (++i < argc) 
-                {
-                    udpMaxRetryTimedoutReqs = atoi(argv[i]);
+                    udpRequestTimeout = atoi(argv[i]);
                 }
                 else 
                 {
@@ -1156,7 +1117,7 @@ int main(int argc, char * argv[] )
 
     if (modeType & RCV_MODE_BIT) 
     {
-        rcvMgr = createReceiveManager(7000, 7001, 7002, 7003, multiCast, 100, 0x7fffffff);
+        rcvMgr = createReceiveManager(7000, 7001, 7002, 100, false);
         rowMgr = createRowManager(0, NULL, queryDummyContextLogger(), NULL, false);
         msgCollA = rcvMgr->createMessageCollator(rowMgr, 100);
         if (destB)
@@ -1168,7 +1129,7 @@ int main(int argc, char * argv[] )
 
     if (modeType & SND_MODE_BIT)
     {
-        sendMgr = createSendManager(7000, 7001, 7002, 7003, multiCast, 100, udpNumQs, 100, NULL, myIndex);
+        sendMgr = createSendManager(7000, 7001, 7002, 7003, multiCast, 100, udpNumQs, 100, NULL, myIndex, false);
         Sleep(5000);
 
         char locBuff[100000];

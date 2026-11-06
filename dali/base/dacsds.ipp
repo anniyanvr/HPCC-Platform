@@ -27,7 +27,7 @@
 #include "jptree.ipp"
 
 #include "dasds.ipp"
-  
+
 class CClientSDSManager;
 class CClientRemoteTree;
 class CRemoteConnection : public CConnectionBase, public CTrackChanges, implements IRemoteConnection
@@ -70,7 +70,6 @@ public:
     inline bool queryUseAppendOpt() const { return useAppendOpt; }
 
     void getDetails(MemoryBuffer &mb);
-    void clearCommitChanges();
     IPropertyTreeIterator *doGetElements(CClientRemoteTree *tree, const char *xpath, IPTIteratorCodes flags);
     void _rollbackChildren(IPropertyTree *parent, bool force);
 
@@ -91,7 +90,7 @@ public:
     virtual IPropertyTreeIterator *getElements(const char *xpath, IPTIteratorCodes flags = iptiter_null);
 
 private:
-    CriticalSection lockCrit;
+    CriticalSection lockCrit{SYNC_LOCATION};
     unsigned lockCount;
     bool lazyFetch;
     bool stateChanges;      // =false when client applying server received changes
@@ -144,12 +143,12 @@ public:
     }
 
     virtual void abort() // called when server closes
-    { 
+    {
         // JCS TBD?
     }
 
     virtual bool aborted() // called when server closes
-    { 
+    {
         return false;
     }
 
@@ -209,11 +208,11 @@ public:
         return data;
     }
     virtual void abort() // called when server closes
-    { 
+    {
         // JCS TBD?
     }
     virtual bool aborted() // called when server closes
-    { 
+    {
         return false;
     }
 };
@@ -311,13 +310,17 @@ public:
     virtual void deserializeSelfRT(MemoryBuffer &mb) override;
     virtual void deserializeChildrenRT(MemoryBuffer &src) override;
 
-    inline void addServerTreeInfo(byte STIInfo) { serverTreeInfo += STIInfo; }
+    virtual void deserializeSelfRT(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx) override;
+    virtual void deserializeChildrenRT(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx) override;
+
+    inline void addServerTreeInfo(byte STIInfo) { serverTreeInfo.store(serverTreeInfo.load() | STIInfo); }
     inline bool queryLazyFetch() const { return connection.queryLazyFetch(); }
     inline CRemoteConnection &queryConnection() { return connection; }
     inline ISDSConnectionManager &queryManager() const { return connection.queryManager(); }
     inline SessionId querySessionId() { return connection.querySessionId(); }
     inline unsigned queryMode() { return connection.queryMode(); }
     inline unsigned queryTimeout() { return connection.queryTimeout(); }
+    inline bool checkChildrenInMemory() const { return children != nullptr; }
     void checkExt() const;
 
     virtual bool setLazyFetch(bool fetch) { return connection.setLazyFetch(fetch); }
@@ -327,14 +330,17 @@ public:
     virtual ChildMap *checkChildren() const override;
     virtual IPropertyTree *create(const char *name, IPTArrayValue *value=NULL, ChildMap *children=NULL, bool existing=false) override;
     virtual IPropertyTree *create(MemoryBuffer &mb) override;
+    virtual IPropertyTree *create(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx) override;
     virtual void createChildMap() override;
     virtual IPropertyTree *ownPTree(IPropertyTree *tree) override;
-    virtual void setLocal(size32_t size, const void *data, bool _binary) override;
+    virtual void setLocal(size32_t size, const void *data, bool _binary, CompressionMethod compressType) override;
     virtual void appendLocal(size32_t size, const void *data, bool binary) override;
     virtual void addingNewElement(IPropertyTree &child, int pos) override;
     virtual void removingElement(IPropertyTree *tree, unsigned pos) override;
-    virtual void setAttribute(const char *attr, const char *val) override;
+    virtual void setAttribute(const char *attr, const char *val, bool encoded) override;
     virtual bool removeAttribute(const char *attr) override;
+    virtual void serializeSelf(MemoryBuffer &tgt) override;
+    virtual IPTArrayValue * cloneValue() const override;
 
 // IPropertyTree
     virtual bool renameTree(IPropertyTree *tree, const char *newName) override;
@@ -342,21 +348,24 @@ public:
     virtual void setProp(const char *xpath, const char *val) override;
     virtual void addPropInt64(const char *xpath, __int64 val) override;
     virtual void setPropInt64(const char *xpath, __int64 val) override;
-    virtual void setPropBin(const char *xpath, size32_t size, const void *data) override;
+    virtual void addPropReal(const char *xpath, double val) override;
+    virtual void setPropReal(const char *xpath, double val) override;
+    virtual void setPropBin(const char *xpath, size32_t size, const void *data, CompressionMethod preferredCompression) override;
     virtual IPropertyTree *setPropTree(const char *xpath, IPropertyTree *val) override;
     virtual IPropertyTree *addPropTree(const char *xpath, IPropertyTree *val) override;
     virtual bool removeProp(const char *xpath) override;
     virtual bool removeTree(IPropertyTree *child) override;
     virtual IPropertyTreeIterator *getElements(const char *xpath, IPTIteratorCodes flags = iptiter_null) const override;
     virtual bool isCompressed(const char *xpath=NULL) const override;
+    virtual CompressionMethod getCompressionType() const override;
     virtual bool getProp(const char *xpath, StringBuffer &ret) const override;
-    virtual const char *queryProp(const char * xpath) const override;
+    virtual const char *queryProp(const char * xpath, const char * dft = nullptr) const override;
     virtual bool getPropBool(const char *xpath, bool dft=false) const override;
     virtual __int64 getPropInt64(const char *xpath, __int64 dft=0) const override;
     virtual bool getPropBin(const char *xpath, MemoryBuffer &ret) const override;
     virtual void localizeElements(const char *xpath, bool allTail=false) override;
     virtual IPropertyTree *queryBranch(const char *xpath) const override;
-    virtual bool hasChildren() const override { return (children && children->count()) || (!children && 0 != (serverTreeInfo & STI_HaveChildren)); }
+    virtual bool hasChildren() const override { return (children && children->count()) || (!children && 0 != (serverTreeInfo.load() & STI_HaveChildren)); }
 
 // ITrackChanges
     virtual ChangeInfo *queryChanges() override;
@@ -369,7 +378,8 @@ public:
 
 private: // data
     unsigned state;
-    mutable byte serverTreeInfo;
+    // Atomic so the value can be read outside a critical section, always modifed inside one.
+    mutable std::atomic<byte> serverTreeInfo;
     CRemoteConnection &connection;
 };
 
@@ -415,13 +425,14 @@ public:
     virtual void setConfigOpt(const char *opt, const char *value);
     virtual unsigned queryCount(const char *xpath);
     virtual bool updateEnvironment(IPropertyTree *newEnv, bool forceGroupUpdate, StringBuffer &response);
+    virtual void closedown() override;
 
 private:
     void noteDisconnected(CRemoteConnection &connection);
 
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     CCopyConnectionHashTable connections;
-    Semaphore concurrentRequests;
+    Semaphore concurrentRequests{SYNC_LOCATION};
     mutable IPropertyTree *properties;
     bool childrenCanBeMissing; // for backward compat servers <= 2.0
     unsigned lazyExtFlag; // for backward compat servers <= 3.3

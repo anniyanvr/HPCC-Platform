@@ -28,12 +28,18 @@
 #include "jthread.hpp"
 #include "jlog.hpp"
 #include "jisem.hpp"
+#include "jencrypt.hpp"
+#include "jsecrets.hpp"
+#include "jevent.hpp"
+#include "jprotrace.hpp"
+
 #include "udplib.hpp"
 #include "udptrr.hpp"
 #include "udptrs.hpp"
 #include "udpmsgpk.hpp"
 #include "roxiemem.hpp"
 #include "roxie.hpp"
+#include "ccd.hpp"
 
 using roxiemem::DataBuffer;
 using roxiemem::IRowManager;
@@ -55,25 +61,35 @@ int g_sequence_compare(const void *arg1, const void *arg2 )
     return 0;
 }
 
-
 class PackageSequencer : public CInterface, implements IInterface
 {
     DataBuffer *firstPacket;
     DataBuffer *lastContiguousPacket;
+    DataBuffer *tail = nullptr;
     unsigned metaSize;
     unsigned headerSize;
-    const void *header;
+    const RoxiePacketHeader *header;
+    unsigned maxSeqSeen = 0;
+#ifdef _DEBUG
+    unsigned numPackets = 0;
+#endif
+    bool outOfBand = false;
 
     MemoryBuffer metadata;
-    InterruptableSemaphore dataAvailable; // MORE - need to work out when to interrupt it!
+    InterruptableSemaphore dataAvailable{SYNC_LOCATION}; // MORE - need to work out when to interrupt it!
+    bool encrypted = false;
+
+    // Currently next() is not called until all the packets have been received because CMessageCollator::collate
+    // only pushes it onto the queue once it is complete.  I am not sure that this was the original intention,
+    // but there is no need to use a semaphore if that is the case.
+    // Set this flag to true to allow processing streaming output.
+    static constexpr bool supportStreamedOutput = false;
 
 public:
     IMPLEMENT_IINTERFACE;
 
-    PackageSequencer() 
+    PackageSequencer(bool _encrypted) : encrypted(_encrypted)
     {
-        if (checkTraceLevel(TRACE_MSGPACK, 3))
-            DBGLOG("UdpCollator: PackageSequencer::PackageSequencer this=%p", this);
         metaSize = 0;
         headerSize = 0;
         header = NULL;
@@ -83,8 +99,6 @@ public:
 
     ~PackageSequencer() 
     {
-        if (checkTraceLevel(TRACE_MSGPACK, 3))
-            DBGLOG("UdpCollator: PackageSequencer::~PackageSequencer this=%p", this);
         DataBuffer *finger = firstPacket;
         while (finger)
         {
@@ -96,80 +110,88 @@ public:
     
     DataBuffer *next(DataBuffer *after)
     {
-        dataAvailable.wait(); // MORE - when do I interrupt? Should I time out? Will potentially block indefinitely if sender restarts (leading to an abandoned packet) or stalls.
+        if (after)
+        {
+            UdpPacketHeader * hdr = (UdpPacketHeader*) after->data;
+            if (hdr->pktSeq & UDP_PACKET_COMPLETE)
+                return nullptr;
+        }
+
+        if (supportStreamedOutput)
+            dataAvailable.wait(); // MORE - when do I interrupt? Should I time out? Will potentially block indefinitely if sender restarts (leading to an abandoned packet) or stalls.
+
         DataBuffer *ret;
         if (after)
             ret = after->msgNext;
         else
             ret = firstPacket;
-        if (checkTraceLevel(TRACE_MSGPACK, 5))
-        {
-            if (ret)
-            {
-                StringBuffer s;
-                UdpPacketHeader *pktHdr = (UdpPacketHeader*) ret->data;
-                DBGLOG("UdpCollator: PackageSequencer::next returns ruid=" RUIDF " id=0x%.8X mseq=%u pkseq=0x%.8X node=%s dataBuffer=%p this=%p",
-                        pktHdr->ruid, pktHdr->msgId, pktHdr->msgSeq, pktHdr->pktSeq, pktHdr->node.getTraceText(s).str(), ret, this);
-            }
-            else
-                DBGLOG("UdpCollator: PackageSequencer::next returns NULL this=%p", this);
-        }
         return ret;
     }
 
-    bool insert(DataBuffer *dataBuff)  // returns true if message is complete.
+    bool insert(DataBuffer *dataBuff, std::atomic<unsigned> &duplicates, std::atomic<unsigned> &resends)  // returns true if message is complete.
     {
         bool res = false;
         assert(dataBuff->msgNext == NULL);
         UdpPacketHeader *pktHdr = (UdpPacketHeader*) dataBuff->data;
-
-        if (checkTraceLevel(TRACE_MSGPACK, 5))
+        unsigned pktseq = pktHdr->pktSeq;
+        if ((pktseq & UDP_PACKET_SEQUENCE_MASK) > maxSeqSeen)
+            maxSeqSeen = pktseq & UDP_PACKET_SEQUENCE_MASK;
+        if (pktseq & UDP_PACKET_RESENT)
         {
-            StringBuffer s;
-            DBGLOG("UdpCollator: PackageSequencer::insert ruid=" RUIDF " id=0x%.8X mseq=%u pkseq=0x%.8X node=%s dataBuffer=%p this=%p",
-                    pktHdr->ruid, pktHdr->msgId, pktHdr->msgSeq, pktHdr->pktSeq, pktHdr->node.getTraceText(s).str(), dataBuff, this);
+            pktseq &= ~UDP_PACKET_RESENT;
+            pktHdr->pktSeq = pktseq;
+            resends++;
         }
 
+        // Optimize the (very) common case where I need to add to the end
         DataBuffer *finger;
         DataBuffer *prev;
-        if (lastContiguousPacket)
+        if (tail && (pktseq > ((UdpPacketHeader*) tail->data)->pktSeq))
         {
-            UdpPacketHeader *oldHdr = (UdpPacketHeader*) lastContiguousPacket->data;
-            if (pktHdr->pktSeq <= oldHdr->pktSeq)
-            {
-                // discard duplicated incoming packet - should be uncommon unless we requested a resend for a packet already in flight
-                if (checkTraceLevel(TRACE_MSGPACK, 5))
-                    DBGLOG("UdpCollator: Discarding duplicate incoming packet");
-                dataBuff->Release();
-                return false;
-            }
-            finger = lastContiguousPacket->msgNext;
-            prev = lastContiguousPacket;
+            assert(tail->msgNext==nullptr);
+            finger = nullptr;
+            prev = tail;
+            tail = dataBuff;
         }
         else
         {
-            finger = firstPacket; 
-            prev = NULL;
-        }
-        while (finger)
-        {
-            UdpPacketHeader *oldHdr = (UdpPacketHeader*) finger->data;
-            if (pktHdr->pktSeq == oldHdr->pktSeq)
+            // This is an insertion sort - YUK!
+            if (lastContiguousPacket)
             {
-                // discard duplicated incoming packet - should be uncommon unless we requested a resend for a packet already in flight
-                if (checkTraceLevel(TRACE_MSGPACK, 5))
-                    DBGLOG("UdpCollator: Discarding duplicate incoming packet");
-                dataBuff->Release();
-                return false;
-            }
-            else if (pktHdr->pktSeq < oldHdr->pktSeq)
-            {
-                break;
+                UdpPacketHeader *oldHdr = (UdpPacketHeader*) lastContiguousPacket->data;
+                if (pktHdr->pktSeq <= oldHdr->pktSeq)
+                {
+                    // discard duplicated incoming packet - should be uncommon unless we requested a resend for a packet already in flight
+                    dataBuff->Release();
+                    duplicates++;
+                    return false;
+                }
+                finger = lastContiguousPacket->msgNext;
+                prev = lastContiguousPacket;
             }
             else
             {
-                prev = finger;
-                finger = finger->msgNext;
+                finger = firstPacket;
+                prev = NULL;
+            }
+            while (finger)
+            {
+                UdpPacketHeader *oldHdr = (UdpPacketHeader*) finger->data;
+                if (pktHdr->pktSeq == oldHdr->pktSeq)
+                {
+                    // discard duplicated incoming packet - should be uncommon unless we requested a resend for a packet already in flight
+                    dataBuff->Release();
+                    return false;
+                }
+                else if (pktHdr->pktSeq < oldHdr->pktSeq)
+                {
+                    break;
+                }
+                else
+                {
+                    prev = finger;
+                    finger = finger->msgNext;
+                }
             }
         }
         if (prev)
@@ -178,8 +200,33 @@ public:
             prev->msgNext = dataBuff;
         }
         else
+        {
             firstPacket = dataBuff;
+            if (!tail)
+                tail = dataBuff;
+        }
         dataBuff->msgNext = finger;
+
+        //NOTE: Record the first unique packet that is received - even if it is resent
+        if (pktHdr->ruid >= RUID_FIRST)
+        {
+            protraceRecord(EventResponseReceive, pktHdr->getRequestId(), pktHdr->getResponseId());
+            if (recordingEvents())
+                queryRecorder().recordResponseReceive(pktHdr->ruid, pktHdr->msgId, pktHdr->msgSeq, pktHdr->pktSeq);
+        }
+
+#ifdef _DEBUG
+        numPackets++;
+#endif
+        // Now that we know we are keeping it, decrypt it
+        // MORE - could argue that we would prefer to wait even longer - until we know consumer wants it - but that might be complex
+        if (encrypted)
+        {
+            const MemoryAttr &udpkey = getSecretUdpKey(true);
+            size_t decryptedSize = aesDecryptInPlace(udpkey.get(), udpkey.length(), pktHdr+1, pktHdr->length-sizeof(UdpPacketHeader));
+            pktHdr->length = decryptedSize + sizeof(UdpPacketHeader);
+        }
+
         if (prev == lastContiguousPacket)
         {
             unsigned prevseq;
@@ -200,14 +247,15 @@ public:
                 unsigned pktseq = fingerHdr->pktSeq & UDP_PACKET_SEQUENCE_MASK;
                 if (pktseq == prevseq+1)
                 {
-                    unsigned packetDataSize = fingerHdr->length - fingerHdr->metalength - sizeof(UdpPacketHeader);
+                    [[maybe_unused]] unsigned packetDataSize = fingerHdr->length - fingerHdr->metalength - sizeof(UdpPacketHeader);
                     assert(packetDataSize < roxiemem::DATA_ALIGNMENT_SIZE);
                     if (pktseq == 0)
                     {
                         // MORE - Is this safe - header lifetime is somewhat unpredictable without a copy of it...
                         // Client header is at the start of packet 0
                         headerSize = *(unsigned short *)(finger->data + sizeof(UdpPacketHeader));
-                        header = finger->data + sizeof(UdpPacketHeader) + sizeof(unsigned short);
+                        header = (const RoxiePacketHeader *) (finger->data + sizeof(UdpPacketHeader) + sizeof(unsigned short));
+                        outOfBand = (header->overflowSequence & OUTOFBAND_SEQUENCE) != 0;
                         packetDataSize -= headerSize + sizeof(unsigned short);
                     }
                     if (fingerHdr->metalength)
@@ -218,12 +266,10 @@ public:
                     }
 
                     lastContiguousPacket = finger;
-                    dataAvailable.signal();
+                    if (supportStreamedOutput)
+                        dataAvailable.signal();
                     if (fingerHdr->pktSeq & UDP_PACKET_COMPLETE)
-                    {
                         res = true;
-                        dataAvailable.signal(); // allowing us to read the NULL that signifies end of message. May prefer to use the flag to stop?
-                    }
                 }
                 else
                     break;
@@ -240,14 +286,17 @@ public:
         return metadata.toByteArray();
     }
 
-    inline const void *getMessageHeader()
+    inline const RoxiePacketHeader *getMessageHeader()
     {
         return header;
     }
-
     inline unsigned getHeaderSize()
     {
         return headerSize;
+    }
+    inline bool isOutOfBand()
+    {
+        return outOfBand;
     }
 
 };
@@ -266,8 +315,6 @@ public:
 
     CMessageUnpackCursor(PackageSequencer *_pkSqncr, IRowManager *_rowMgr) : rowMgr(_rowMgr)
     {
-        if (checkTraceLevel(TRACE_MSGPACK, 3))
-            DBGLOG("UdpCollator: CMessageUnpackCursor::CMessageUnpackCursor this=%p", this);
         pkSequencer = _pkSqncr; 
         dataBuff = pkSequencer->next(NULL);
         UdpPacketHeader *pktHdr = (UdpPacketHeader*) dataBuff->data;
@@ -289,8 +336,6 @@ public:
     
     ~CMessageUnpackCursor() 
     {
-        if (checkTraceLevel(TRACE_MSGPACK, 3))
-            DBGLOG("UdpCollator: CMessageUnpackCursor::~CMessageUnpackCursor this=%p", this);
         pkSequencer->Release();
     }
 
@@ -304,21 +349,13 @@ public:
         return true;
     }
 
-    virtual const void *getNext(int length) 
+    const void *getNext(int length) 
     {
         // YUK horrid code! Though packer is even more horrid
         void        *res = 0;
         if (dataBuff) 
         {   
             UdpPacketHeader *pktHdr = (UdpPacketHeader*) dataBuff->data;
-            if (checkTraceLevel(TRACE_MSGPACK, 4))
-            {
-                StringBuffer s;
-                DBGLOG("UdpCollator: CMessageUnpackCursor::getNext(%u) pos=%u pktLength=%u metaLen=%u ruid=" RUIDF " id=0x%.8X mseq=%u pkseq=0x%.8X node=%s dataBuff=%p this=%p",
-                    length, current_pos, pktHdr->length, pktHdr->metalength,
-                    pktHdr->ruid, pktHdr->msgId, pktHdr->msgSeq, pktHdr->pktSeq, 
-                    pktHdr->node.getTraceText(s).str(), dataBuff, this);
-            }
             unsigned packetDataLimit = pktHdr->length - pktHdr->metalength;
             if ((packetDataLimit  - current_pos) >= (unsigned) length)
             {
@@ -376,28 +413,50 @@ public:
         return res;
     }
 
+    virtual RecordLengthType *getNextLength() override
+    {
+        if (!dataBuff) 
+            return nullptr;
+        UdpPacketHeader *pktHdr = (UdpPacketHeader*) dataBuff->data;
+        unsigned packetDataLimit = pktHdr->length - pktHdr->metalength;
+        assertex ((packetDataLimit  - current_pos) >= sizeof(RecordLengthType));
+        RecordLengthType *res = (RecordLengthType *) &dataBuff->data[current_pos];
+        current_pos += sizeof(RecordLengthType);
+        // Note that length is never separated from data... but length can be zero so still need to do this...
+        // MORE - could common up this code with getNext above
+        while (current_pos >= packetDataLimit)
+        {
+            dataBuff = pkSequencer->next(dataBuff);
+            current_pos = sizeof(UdpPacketHeader);
+            if (dataBuff)
+            {
+                pktHdr = (UdpPacketHeader*) dataBuff->data;
+                packetDataLimit = pktHdr->length - pktHdr->metalength;
+            }
+            else
+                break;
+        }
+        return res;
+    }
+
 };
 
  
 class CMessageResult : public IMessageResult, CInterface {
     PackageSequencer    *pkSequencer;
     mutable MemoryBuffer metaInfo;
-    mutable CriticalSection metaCrit;
+    mutable CriticalSection metaCrit{SYNC_LOCATION};
     
 public:
     IMPLEMENT_IINTERFACE;
 
     CMessageResult(PackageSequencer *_pkSqncr) 
     {
-        if (checkTraceLevel(TRACE_MSGPACK, 3))
-            DBGLOG("UdpCollator: CMessageResult::CMessageResult pkSqncr=%p, this=%p", _pkSqncr, this);
         pkSequencer = _pkSqncr; 
     }
     
     ~CMessageResult() 
     {
-        if (checkTraceLevel(TRACE_MSGPACK, 3))
-            DBGLOG("UdpCollator: CMessageResult::~CMessageResult this=%p", this);
         pkSequencer->Release();
     }
 
@@ -406,7 +465,7 @@ public:
         return new CMessageUnpackCursor(LINK(pkSequencer), rowMgr);
     }
 
-    virtual const void *getMessageHeader(unsigned &length) const 
+    virtual const RoxiePacketHeader *getMessageHeader(unsigned &length) const override
     {
         length = pkSequencer->getHeaderSize();
         return pkSequencer->getMessageHeader();
@@ -419,8 +478,6 @@ public:
 
     virtual void discard() const 
     {
-        if (checkTraceLevel(TRACE_MSGPACK, 2))
-            DBGLOG("UdpCollator: CMessageResult - Roxie server discarded a packet");
         unwantedDiscarded++;
     }
 
@@ -439,10 +496,8 @@ PUID GETPUID(DataBuffer *dataBuff)
     return (((PUID) ip4) << 32) | (PUID) pktHdr->msgSeq;
 }
 
-CMessageCollator::CMessageCollator(IRowManager *_rowMgr, unsigned _ruid) : rowMgr(_rowMgr), ruid(_ruid)
+CMessageCollator::CMessageCollator(IRowManager *_rowMgr, unsigned _ruid, bool _encrypted) : rowMgr(_rowMgr), encrypted(_encrypted), ruid(_ruid)
 {
-    if (checkTraceLevel(TRACE_MSGPACK, 3))
-        DBGLOG("UdpCollator: CMessageCollator::CMessageCollator rowMgr=%p this=%p ruid=" RUIDF "", _rowMgr, this, ruid);
     memLimitExceeded = false;
     activity = false;
     totalBytesReceived = 0;
@@ -450,23 +505,48 @@ CMessageCollator::CMessageCollator(IRowManager *_rowMgr, unsigned _ruid) : rowMg
 
 CMessageCollator::~CMessageCollator()
 {
-    if (checkTraceLevel(TRACE_MSGPACK, 3))
-        DBGLOG("UdpCollator: CMessageCollator::~CMessageCollator ruid=" RUIDF ", this=%p", ruid, this);
     while (!queue.empty())
     {
         PackageSequencer *pkSqncr = queue.front();
-        queue.pop();
+        queue.pop_front();
         pkSqncr->Release();
     }
 }
 
+void CMessageCollator::noteDuplicate(bool isResend)
+{
+    totalDuplicates++;
+    if (isResend)
+        totalResends++;
+}
+
+
 unsigned CMessageCollator::queryBytesReceived() const
 {
-    return totalBytesReceived; // Arguably should lock, but can't be bothered. Never going to cause an issue in practice.
+    return totalBytesReceived;
+}
+
+unsigned CMessageCollator::queryDuplicates() const
+{
+    return totalDuplicates;
+}
+
+unsigned CMessageCollator::queryResends() const
+{
+    return totalResends;
 }
 
 bool CMessageCollator::attach_databuffer(DataBuffer *dataBuff)
 {
+    UdpPacketHeader *pktHdr = (UdpPacketHeader*) dataBuff->data;
+    //This is always called from a single thread - so avoid an atomic increment
+    totalBytesReceived.fastAdd(pktHdr->length);
+    if (pktHdr->node.isNull())   // Indicates a packet that has been identified as a duplicate to be logged and discarded
+    {
+        noteDuplicate((pktHdr->pktSeq & UDP_PACKET_RESENT) != 0);
+        dataBuff->Release();
+        return true;
+    }
     activity = true;
     if (memLimitExceeded || roxiemem::memPoolExhausted())
     {
@@ -488,6 +568,8 @@ bool CMessageCollator::attach_data(const void *data, unsigned len)
     // Simple code can allocate databuffer, copy data in, then call attach_databuffer
     // MORE - we can attach as we create may be more sensible (and simplify roxiemem rather if it was the ONLY way)
     activity = true;
+    //This is always called from a single thread - so avoid an atomic increment
+    totalBytesReceived.fastAdd(len);
     if (memLimitExceeded || roxiemem::memPoolExhausted())
     {
         DBGLOG("UdpCollator: mem limit exceeded");
@@ -510,34 +592,58 @@ bool CMessageCollator::attach_data(const void *data, unsigned len)
 void CMessageCollator::collate(DataBuffer *dataBuff)
 {
     UdpPacketHeader *pktHdr = (UdpPacketHeader*) dataBuff->data;
-    totalBytesReceived += pktHdr->length;
+    // Special case for single packet messages - if the sequence number is 0 and the complete flag is set
+    // No need to check in the hash table - even if a retry.
+    // In the future this could also use a simpler package sequencer
+    PackageSequencer *pkSqncr;
+    if ((pktHdr->pktSeq & (UDP_PACKET_SEQUENCE_MASK|UDP_PACKET_COMPLETE)) == UDP_PACKET_COMPLETE)
+    {
+        pkSqncr = new PackageSequencer(encrypted);
+        bool isComplete = pkSqncr->insert(dataBuff, totalDuplicates, totalResends);
+        assertex(isComplete);
+    }
+    else
+    {
+        PUID puid = GETPUID(dataBuff);
+        // MORE - we leak (at least until query terminates) a PackageSequencer for messages that we only receive parts of - maybe only an issue for "catchall" case
+        pkSqncr = mapping.getValue(puid);
+        bool isNew = false;
+        if (!pkSqncr)
+        {
+            pkSqncr = new PackageSequencer(encrypted);
+            isNew = true;
+        }
+        bool isComplete = pkSqncr->insert(dataBuff, totalDuplicates, totalResends);
+        if (!isComplete)
+        {
+            if (isNew)
+            {
+                mapping.setValue(puid, pkSqncr);
+                pkSqncr->Release();
+            }
+            return;
+        }
 
-    PUID puid = GETPUID(dataBuff);
-    // MORE - I think we leak a PackageSequencer for messages that we only receive parts of - maybe only an issue for "catchall" case
-    PackageSequencer *pkSqncr = mapping.getValue(puid);
-    if (!pkSqncr)
-    {
-        pkSqncr = new PackageSequencer;
-        mapping.setValue(puid, pkSqncr);
-        pkSqncr->Release();
+        if (!isNew)
+        {
+            pkSqncr->Link();
+            mapping.remove(puid);
+        }
     }
-    bool isComplete = pkSqncr->insert(dataBuff);
-    if (isComplete)
-    {
-        pkSqncr->Link();
-        mapping.remove(puid);
-        queueCrit.enter();
-        queue.push(pkSqncr);
-        sem.signal();
-        queueCrit.leave();
-    }
+
+    //At this point the packet sequence is complete - push it ready for processing
+    queueCrit.enter();
+    if (pkSqncr->isOutOfBand())
+        queue.push_front(pkSqncr);
+    else
+        queue.push_back(pkSqncr);
+    protraceRecordEnqueueItem(pkSqncr);
+    queueCrit.leave();
+    sem.signal();
 }
 
 IMessageResult *CMessageCollator::getNextResult(unsigned time_out, bool &anyActivity)
 {
-    if (checkTraceLevel(TRACE_MSGPACK, 3))
-        DBGLOG("UdpCollator: CMessageCollator::getNextResult() timeout=%.8X ruid=%u rowMgr=%p this=%p", time_out, ruid, (void*) rowMgr, this);
-
     if (memLimitExceeded)
     {
         DBGLOG("UdpCollator: CMessageCollator::getNextResult() throwing memory limit exceeded exception - rowMgr=%p this=%p", (void*) rowMgr, this);
@@ -552,7 +658,8 @@ IMessageResult *CMessageCollator::getNextResult(unsigned time_out, bool &anyActi
     {
         queueCrit.enter();
         PackageSequencer *pkSqncr = queue.front();
-        queue.pop();
+        queue.pop_front();
+        protraceRecordDequeueItem(pkSqncr);
         queueCrit.leave();
         anyActivity = true;
         activity = false;
@@ -560,10 +667,6 @@ IMessageResult *CMessageCollator::getNextResult(unsigned time_out, bool &anyActi
     }
     anyActivity = activity;
     activity = false;
-    if (!anyActivity && ruid>=RUID_FIRST && checkTraceLevel(TRACE_MSGPACK, 1)) // suppress the tracing for pings where we expect the timeout...
-    {
-        DBGLOG("UdpCollator: CMessageCollator::GetNextResult timeout");
-    }
     return 0;
 }
 
@@ -575,7 +678,3 @@ void CMessageCollator::interrupt(IException *E)
 // ====================================================================================
 //
 
-extern CMessageCollator *createCMessageCollator(IRowManager *rowManager, ruid_t ruid)
-{
-    return new CMessageCollator(rowManager, ruid);
-}

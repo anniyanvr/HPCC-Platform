@@ -58,7 +58,7 @@ killed()
         cd $1
     fi
     log "Attempting to kill $component"
-    kill_process ${PID_NAME} roxie 3 ${SENTINEL}
+    kill_process ${PID_NAME} roxie 75 ${SENTINEL}
     if [[ $? -eq 1 ]]; then
         log "could not kill $component"
     else
@@ -67,6 +67,9 @@ killed()
     fi
     exit 255
 }
+
+# Delete older *.stdout and *.stderr log files
+find . -name "[0-9]*_[0-9]*.std*" -mtime +3 -delete
 
 trap "killed" SIGINT SIGTERM SIGKILL
 log "Calling nohup roxie --topology=RoxieTopology.xml --logfile --restarts=$restarts --stdlog=0 2>>$logfilename.stderr 1>>$logfilename.stdout &"

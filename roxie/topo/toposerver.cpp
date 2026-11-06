@@ -62,20 +62,29 @@ static void topo_server_usage()
     printf("\n");
 }
 
+struct TopologyEntry
+{
+    unsigned lastSeen = 0;
+    time_t instance = 0;
+};
+
 unsigned traceLevel = 0;
 unsigned topoPort = TOPO_SERVER_PORT;
-std::map<std::string, unsigned> topology;
+std::map<std::string, TopologyEntry> topology;
 StringBuffer cachedResponse;
 StringBuffer cachedDigest;
 bool responseDirty = true;
 unsigned lastTimeoutCheck = 0;
 unsigned lastTopologyReport = 0;
-const unsigned timeoutCheckInterval = 1000;
-const unsigned heartbeatInterval = 5000;
-const unsigned timeoutHeartbeatInterval = 10000;
-const unsigned topologyReportInterval = 60000;
+
+unsigned timeoutCheckInterval = 1000;       // How often we check to see what has expired
+unsigned heartbeatInterval = 10000;          // How often nodes send heartbeats
+unsigned timeoutHeartbeatServer = 60000;    // How long before a server is marked as down
+unsigned timeoutHeartbeatAgent = 20000;     // How long before an agent is marked as down
+unsigned removeHeartbeatInterval = 120000;  // How long before a node is removed from list
+unsigned topologyReportInterval = 60000;    // How often topology is reported to logging (if traceLevel >= 2)
 bool aborted = false;
-Semaphore stopping;
+Semaphore stopping{SYNC_LOCATION};
 StringBuffer topologyFile;
 
 extern "C" void caughtSIGPIPE(int sig)
@@ -121,20 +130,13 @@ void init_signals()
 #endif
 }
 
-void updateTopology(const std::string &newInfo)
+void updateTopology(const std::string &newInfo, time_t instance)
 {
-    if (newInfo[0]=='-')
-    {
-        if (topology.erase(newInfo.substr(1)))
-            responseDirty = true;
-    }
-    else
-    {
-        unsigned &found = topology[newInfo];
-        if (found==0)
-            responseDirty = true;
-        found = msTick();
-    }
+    TopologyEntry &found = topology[newInfo];
+    if (found.lastSeen==0 || found.instance != instance)
+        responseDirty = true;
+    found.lastSeen = msTick();
+    found.instance = instance;
 }
 
 void timeoutTopology()
@@ -142,22 +144,32 @@ void timeoutTopology()
     unsigned now = msTick();
     if (now - lastTimeoutCheck < timeoutCheckInterval)
         return;
-    for (auto it = topology.cbegin(); it != topology.cend(); /* no increment */)
+    for (auto it = topology.begin(); it != topology.end(); /* no increment */)
     {
-        unsigned lastSeen = it->second;
-        if (now-lastSeen > timeoutHeartbeatInterval)
+        bool isServer = it->first.rfind("server", 0)==0;
+        unsigned lastSeen = it->second.lastSeen;
+        unsigned timeout = isServer ? timeoutHeartbeatServer : timeoutHeartbeatAgent;
+        // If a server is missing a heartbeat for a while, we mark it as down. Queued packets for that server will get discarded, and
+        // it will be sorted to the end of the priority list for agent requests
+        // The timeout is different for server vs agent - for servers, we want to be sure it really is down, and there's no huge cost for waiting,
+        // while for agents we want to divert traffic away from it ASAP (so long as there are other destinations available)
+        // Note that there's a difference between 'sick' and 'shut down'
+        if (now-lastSeen > timeout)
         {
             if (traceLevel)
             {
                 DBGLOG("No heartbeat for %u ms for %s", now-lastSeen, it->first.c_str());
             }
-            it = topology.erase(it);
             responseDirty = true;
+            if (now-lastSeen > removeHeartbeatInterval)
+            {
+                it = topology.erase(it);
+                continue;
+            }
+            if (it->second.instance != (time_t) -1)
+                it->second.instance = 0;  // By leaving the entry present but with instance=0, we will ensure that all clients get to see that the machine is degraded
         }
-        else
-        {
-            ++it;
-        }
+        ++it;
     }
     lastTimeoutCheck = now;
 }
@@ -170,7 +182,7 @@ void reportTopology()
     DBGLOG("Current state:");
     for (const auto& it : topology)
     {
-        DBGLOG(" %s - %ums", it.first.c_str(), now-it.second);
+        DBGLOG(" %s - %ums", it.first.c_str(), now-it.second.lastSeen);
     }
     lastTopologyReport = now;
 }
@@ -183,7 +195,7 @@ void regenerateResponse()
         cachedDigest.set("=");
         for (const auto& it : topology)
         {
-           cachedResponse.append(it.first.c_str()).append('\n');
+           cachedResponse.append(it.first.c_str()).append('\t').append((__uint64) it.second.instance).append('\n');
         }
         md5_string(cachedResponse, cachedDigest);
         cachedDigest.append('\n');
@@ -206,6 +218,7 @@ void doServer(ISocket *socket)
             try
             {
                 Owned<ISocket> p = ISocket::connect(me);
+                // TLS TODO: secure_connect() here if globally configured for mtls ...
                 p->write("\0\0\0\0", 4);
                 p->close();
             }
@@ -220,6 +233,7 @@ void doServer(ISocket *socket)
         try
         {
             Owned<ISocket> client = socket->accept();
+            // TLS TODO: secure_accept() here if globally configured for mtls ...
             timeoutTopology();
             unsigned packetLen;
             client->read(&packetLen, 4);
@@ -239,7 +253,27 @@ void doServer(ISocket *socket)
                     if (line[0]=='=')
                         suppliedDigest.swap(line);
                     else
-                        updateTopology(line);
+                    {
+                        time_t instance = 0;
+                        auto end = line.find('\t', 0);
+                        if (end != line.npos)
+                        {
+                            char *tail = nullptr;
+                            std::string instanceStr = line.substr(end+1);
+                            instance = strtoul(instanceStr.c_str(), &tail, 10);
+                            if (*tail)
+                                DBGLOG("Unexpected characters parsing instance value in topology entry %s", line.c_str());
+                            line = line.substr(0, end);
+                        }
+                        if (line[0]=='-')
+                        {
+                            line = line.substr(1);
+                            instance = (time_t) -1;
+                        }
+                        if (traceLevel >= 6)
+                            DBGLOG("Adding entry %s instance %" I64F "u", line.c_str(), (__uint64) instance);
+                        updateTopology(line, instance);
+                    }
                 }
                 regenerateResponse();
                 bool match = suppliedDigest.append("\n").compare(cachedDigest) == 0;
@@ -269,7 +303,7 @@ void doServer(ISocket *socket)
                 // Completely ignore an exception here - someone that did not want a reply may have already closed the socket
                 e->Release();
             }
-            if (traceLevel)
+            if (traceLevel>1)
                 reportTopology();
         }
         catch(IException * e)
@@ -283,11 +317,13 @@ void doServer(ISocket *socket)
 
 static constexpr const char * defaultYaml = R"!!(
   version: "1.0"
-  roxie:
+  toposerver:
     logdir: ""
-    topoport: 9004
+    port: 9004
     stdlog: true
     traceLevel: 1
+    logging:
+      queueDrop: 32
 )!!";
 
 int main(int argc, const char *argv[])
@@ -295,6 +331,10 @@ int main(int argc, const char *argv[])
     EnableSEHtoExceptionMapping();
     setTerminateOnSEH();
     init_signals();
+
+    if (!checkCreateDaemon(argc, argv))
+        return EXIT_FAILURE;
+
     // We need to do the above BEFORE we call InitModuleObjects
     try
     {
@@ -306,10 +346,11 @@ int main(int argc, const char *argv[])
         E->Release();
         return EXIT_FAILURE;
     }
-    Owned<IFile> sentinelFile = createSentinelTarget();
-    removeSentinelFile(sentinelFile);
     try
     {
+        Owned<IFile> sentinelFile = createSentinelTarget();
+        removeSentinelFile(sentinelFile);
+
         for (unsigned i=0; i<(unsigned)argc; i++)
         {
             if (stricmp(argv[i], "--help")==0 ||
@@ -318,20 +359,20 @@ int main(int argc, const char *argv[])
                 topo_server_usage();
                 return EXIT_SUCCESS;
             }
-#ifndef _CONTAINERIZED
-            else if (streq(argv[i],"--daemon") || streq(argv[i],"-d")) {
-                if (daemon(1,0) || write_pidfile(argv[++i])) {
-                    perror("Failed to daemonize");
-                    return EXIT_FAILURE;
-                }
-            }
-#endif
         }
 
         // locate settings xml file in runtime dir
-        Owned<IPropertyTree> topology = loadConfiguration(defaultYaml, argv, "roxie", "ROXIE", nullptr, nullptr);
+        Owned<IPropertyTree> topology = loadConfiguration(defaultYaml, argv, "toposerver", "TOPOSERVER", nullptr, nullptr);
         traceLevel = topology->getPropInt("@traceLevel", 1);
-        topoPort = topology->getPropInt("@topoport", TOPO_SERVER_PORT);
+        topoPort = topology->getPropInt("@port", TOPO_SERVER_PORT);
+
+        timeoutCheckInterval = topology->getPropInt("@timeoutCheckInterval", timeoutCheckInterval);
+        heartbeatInterval = topology->getPropInt("@heartbeatInterval", heartbeatInterval);
+        timeoutHeartbeatAgent = topology->getPropInt("@timeoutHeartbeatAgent", heartbeatInterval*2);
+        timeoutHeartbeatServer = topology->getPropInt("@timeoutHeartbeatServer", heartbeatInterval*6);
+        removeHeartbeatInterval = topology->getPropInt("@removeHeartbeatInterval", heartbeatInterval*10);
+        topologyReportInterval = topology->getPropInt("@topologyReportInterval", topologyReportInterval);
+
 #ifndef _CONTAINERIZED
         if (topology->getPropBool("@stdlog", traceLevel != 0))
             queryStderrLogMsgHandler()->setMessageFields(MSGFIELD_time | MSGFIELD_milliTime | MSGFIELD_thread | MSGFIELD_prefix);
@@ -349,9 +390,24 @@ int main(int argc, const char *argv[])
 #else
         setupContainerizedLogMsgHandler();
 #endif
+        if (timeoutHeartbeatAgent < (heartbeatInterval*4)/3)
+        {
+            timeoutHeartbeatAgent = heartbeatInterval*2;
+            DBGLOG("timeoutHeartbeatAgent value too small - setting to %u", timeoutHeartbeatAgent);
+        }
+        if (timeoutHeartbeatServer < (heartbeatInterval*2))
+        {
+            timeoutHeartbeatServer = heartbeatInterval*6;
+            DBGLOG("timeoutHeartbeatServer value too small - setting to %u", timeoutHeartbeatServer);
+        }
+        if (removeHeartbeatInterval < timeoutHeartbeatServer)
+        {
+            removeHeartbeatInterval = timeoutHeartbeatServer*2;
+            DBGLOG("removeHeartbeatInterval value too small - setting to %u", removeHeartbeatInterval);
+        }
         Owned<ISocket> socket = ISocket::create(topoPort);
         if (traceLevel)
-            DBGLOG("Topology server starting");
+            DBGLOG("Topology server starting on port %u", topoPort);
 
         writeSentinelFile(sentinelFile);
         doServer(socket);

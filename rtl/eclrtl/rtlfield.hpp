@@ -69,10 +69,17 @@ struct ECLRTL_API RtlTypeInfoBase : public RtlTypeInfo
     virtual int compareRange(size32_t lenLeft, const byte * left, size32_t lenRight, const byte * right) const override;
     virtual void setLowBound(void * buffer, const byte * value, size32_t subLength, bool inclusive) const override;
     virtual void setHighBound(void * buffer, const byte * value, size32_t subLength, bool inclusive) const override;
+
 protected:
     virtual void setBound(void * buffer, const byte * value, size32_t subLength, byte fill, bool inclusive) const;
     size32_t buildUtf8ViaString(ARowBuilder &builder, size32_t offset, const RtlFieldInfo *field, size32_t len, const char *value) const;
     void getUtf8ViaString(size32_t & resultLen, char * & result, const void * ptr) const;
+
+    unsigned getLengthSizeBytes() const;
+    size32_t getUnknownLengthMax() const;
+    size32_t readAheadSize(IRowPrefetcherSource & in) const;
+    size32_t readSize(const void * src) const;
+    void writeSize(void * dest, size32_t size) const;
 };
 
 //-------------------------------------------------------------------------------------------------------------------
@@ -279,6 +286,8 @@ struct ECLRTL_API RtlStringTypeInfo final : public RtlTypeInfoBase
     virtual bool canMemCmp() const override;
     virtual unsigned hash(const byte * self, unsigned inhash) const override;
     virtual int compareRange(size32_t lenLeft, const byte * left, size32_t lenRight, const byte * right) const override;
+
+    bool queryDirectAccess(size32_t & resultLen, const char * & result, const void * ptr) const;
 };
 
 struct ECLRTL_API RtlDataTypeInfo final : public RtlTypeInfoBase
@@ -304,6 +313,8 @@ struct ECLRTL_API RtlDataTypeInfo final : public RtlTypeInfoBase
     virtual bool canMemCmp() const override;
     virtual unsigned hash(const byte *self, unsigned inhash) const override;
     virtual int compareRange(size32_t lenLeft, const byte * left, size32_t lenRight, const byte * right) const override;
+
+    bool queryDirectAccess(size32_t & resultLen, const char * & result, const void * ptr) const;
 };
 
 struct ECLRTL_API RtlVarStringTypeInfo final : public RtlTypeInfoBase
@@ -756,4 +767,5 @@ extern bool ECLRTL_API containsKeyedSignedInt(const RtlTypeInfo * type);
 
 extern size32_t translateScalar(ARowBuilder &builder, size32_t offset, const RtlFieldInfo *field, const RtlTypeInfo &destType, const RtlTypeInfo &sourceType, const byte *source);
 
+extern bool incrementBuffer(byte *buff, size32_t size);
 #endif

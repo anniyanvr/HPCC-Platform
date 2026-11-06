@@ -2,6 +2,7 @@ define([
     "dojo/_base/declare",
     "src/nlsHPCC",
     "dojo/topic",
+    "dojo/dom-construct",
 
     "dijit/registry",
 
@@ -17,8 +18,10 @@ define([
     "hpcc/DelayLoadWidget",
     "src/ESPUtil",
     "hpcc/MachineInformationWidget",
-    "hpcc/IFrameWidget"
-], function (declare, nlsHPCCMod, topic,
+    "hpcc/IFrameWidget",
+
+    "dijit/Dialog",
+], function (declare, nlsHPCCMod, topic, domConstruct,
     registry,
     tree, selector,
     GridDetailsWidget, PreflightDetailsWidget, ESPPreflight, ESPRequest, WsTopology, Utility, DelayLoadWidget, ESPUtil, MachineInformationWidget, IFrameWidget) {
@@ -50,7 +53,6 @@ define([
             });
 
             dojo.destroy(this.id + "Open");
-            this.refreshGrid();
             this.refreshActionState();
         },
 
@@ -60,9 +62,15 @@ define([
                 if (currSel.id === this.id + "_Grid") {
                     this.refreshGrid();
                 } else if (currSel.id === this.legacyTargetClustersIframeWidget.id && !this.legacyTargetClustersIframeWidget.initalized) {
-                    this.legacyTargetClustersIframeWidget.init({
-                        src: ESPRequest.getBaseURL("WsTopology") + "/TpTargetClusterQuery?Type=ROOT"
-                    });
+                    if (!dojoConfig.isContainer) {
+                        this.legacyTargetClustersIframeWidget.init({
+                            src: ESPRequest.getBaseURL("WsTopology") + "/TpTargetClusterQuery?Type=ROOT"
+                        });
+                    } else {
+                        const unavailMsg = domConstruct.create("div", { style: { margin: "5px" } });
+                        unavailMsg.innerText = this.i18n.UnavailableInContainerized;
+                        this.legacyTargetClustersIframeWidget.contentPane.set("content", unavailMsg);
+                    }
                 } else if (currSel.params.newPreflight || currSel.params.Usergenerated) { //prevents loop of pfTab.init above
                     currSel.init(currSel.params);
                 }
@@ -87,12 +95,16 @@ define([
                 style: "border: 0; width: 100%; height: 100%"
             });
             this.legacyTargetClustersIframeWidget.placeAt(this._tabContainer, "last");
+            if (dojoConfig.isContainer) {
+                const legacyTab = registry.byId(this.id + "_LegacyTargetClustersIframeWidget");
+                legacyTab.set("disabled", true);
+            }
             this.machineFilter.disable();
         },
 
         createGrid: function (domID) {
             var context = this;
-            var retVal = new declare([ESPUtil.Grid(true, true, false, true)])({
+            var retVal = new declare([ESPUtil.Grid(true, true, undefined, true)])({
                 store: ESPPreflight.CreateTargetClusterStore(),
                 columns: {
                     col1: selector({
@@ -107,7 +119,7 @@ define([
                         renderHeaderCell: function (node) {
                             node.innerHTML = Utility.getImageHTML("configuration.png", context.i18n.Configuration);
                         },
-                        width: 8,
+                        width: 12,
                         sortable: false,
                         formatter: function (configuration) {
                             if (configuration === true) {
@@ -121,7 +133,7 @@ define([
                         renderHeaderCell: function (node) {
                             node.innerHTML = Utility.getImageHTML("server.png", context.i18n.Dali);
                         },
-                        width: 8,
+                        width: 12,
                         sortable: false,
                         formatter: function (dali) {
                             if (dali === true) {
@@ -133,11 +145,11 @@ define([
                     Name: tree({
                         formatter: function (_name, row) {
                             var img = "";
-                            var name = _name;
+                            var name = Utility.encodeHTML(_name);
                             if (row.type === "targetClusterComponent") {
-                                name = "<a href='#' onClick='return false;' class='dgrid-row-url'>" + row.Netaddress + " - " + _name + "</a>";
+                                name = `<a href="#" onClick="return false;" class="dgrid-row-url">${Utility.encodeHTML(row.Netaddress + "-" + _name)}</a>`;
                             }
-                            return img + "&nbsp;" + name;
+                            return `${img}&nbsp;${name}`;
                         },
                         expand: true,
                         label: this.i18n.Name,

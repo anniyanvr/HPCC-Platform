@@ -2,21 +2,20 @@
 <html>
 
 <head>
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta charset="UTF-8">
     <title class="loginStr"></title>
     <style type="text/css">
         body {
             font-family: Lucida Sans, Lucida Grande, Arial !important;
             font-size: 15px !important;
-            background-color: #1A9BD7;
+            background-color: #155d8a;
         }
 
         .container {
-            width: 99%;
             position: absolute;
             top: 50%;
-            transform: translateY(-50%);
+            left: 50%;
+            transform: translate(-50%, -50%);
         }
 
         .formContainer {
@@ -62,7 +61,7 @@
         }
 
         #button {
-            background-color: #1A9BD7;
+            background-color: #155d8a;
             border: none;
             color: white;
             padding: 15px 32px;
@@ -88,71 +87,106 @@
             display: none;
         }
     </style>
-    <script src="/esp/files/dist/dojoLib.eclwatch.js"></script>
 </head>
 
 <body>
     <div id="container" class="container visible">
         <div class="formContainer">
-            <img id="logo" src="eclwatch/img/Loginlogo.png" />
+            <img id="logo" src="eclwatch/img/hpccsystems.svg" alt="HPCC Systems" style="width: 206px" />
             <p id="loginStr" class="loginStr"></p>
             <div class="login">
                 <form method="POST" action="/esp/login">
-                    <input id="username" type="text" name="username" placeholder="username" class="loginStr"
-                        autofocus></input>
-                    <input id="password" type="password" name="password" placeholder="password"
-                        class="loginStr"></input>
+                    <input id="username" type="text" name="username" placeholder="username" class="loginStr" autofocus></input>
+                    <input id="password" type="password" name="password" placeholder="password" class="loginStr"></input>
                     <p id="hidden_msg" class="loginStr"></p>
                     <button class="loginStr" id="button" type="submit"></button>
                 </form>
             </div>
         </div>
     </div>
-    <script type="text/javascript">
-        require(["dojo/ready", "src/nlsHPCC"],
-            function (ready, nlsHPCCMod) {
-                var nlsHPCC = nlsHPCCMod.default;
-                ready(function () {
-                    var loginStr = document.getElementById("loginStr");
-                    var error = document.getElementById("hidden_msg");
-                    var username = document.getElementById("username");
-                    var password = document.getElementById("password");
-                    var button = document.getElementById("button");
-                    var enableCookies = "";
-                    var HPCCSystems = document.getElementById("logo");
+    <script type="module">
+        import nlsHPCC from "src-dojo/index";
 
-                    loginStr.innerHTML = nlsHPCC.PleaseLogIntoECLWatch;
-                    error.innerHTML = nlsHPCC.InvalidUsernamePassword;
-                    username.innerHTML = nlsHPCC.Username;
-                    password.innerHTML = nlsHPCC.Password;
-                    button.innerHTML = nlsHPCC.Login;
-                    enableCookies = nlsHPCC.PleaseEnableCookies;
-                    HPCCSystems.setAttribute("alt", nlsHPCC.HPCCSystems);
+        // localStorage is shared across tabs (used by Dojo UI); sessionStorage keeps each tab's return route its own.
+        window.localStorage.setItem("redirectAfterLogin", window.location.hash);
+        window.sessionStorage.setItem("redirectAfterLogin", window.location.hash);
 
-                    var element = document.getElementById('container');
+        var loginStr = document.getElementById("loginStr");
+        var error = document.getElementById("hidden_msg");
+        var username = document.getElementById("username");
+        var password = document.getElementById("password");
+        var button = document.getElementById("button");
+        var enableCookies = "";
+        var HPCCSystems = document.getElementById("logo");
 
-                    if (navigator.cookieEnabled) {
-                        var element = document.getElementById("container");
-                        element.classList.remove("visible");
-                    } else {
-                        alert(enableCookies);
+        loginStr.innerHTML = nlsHPCC.PleaseLogIntoECLWatch;
+        error.innerHTML = nlsHPCC.InvalidUsernamePassword;
+        username.innerHTML = nlsHPCC.Username;
+        password.innerHTML = nlsHPCC.Password;
+        button.innerHTML = nlsHPCC.Login;
+        enableCookies = nlsHPCC.PleaseEnableCookies;
+        HPCCSystems.setAttribute("alt", nlsHPCC.HPCCSystems);
+
+        if (navigator.cookieEnabled) {
+            document.getElementById("container").classList.remove("visible");
+        } else {
+            alert(enableCookies);
+        }
+
+        function deleteCookie(cname) {
+            // Clear cookie using the same root path and explicit expiration.
+            document.cookie = cname + "=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; Path=/;";
+        }
+
+        function getCookie(name) {
+            var key = name + "=";
+            var cookieParts = document.cookie.split(";");
+            for (var i = 0; i < cookieParts.length; i++) {
+                var c = cookieParts[i].trim();
+                if (c.indexOf(key) === 0) {
+                    var rawValue = c.substring(key.length, c.length);
+                    try {
+                        return decodeURIComponent(rawValue);
+                    } catch (e) {
+                        return rawValue;
                     }
-
-                    function deleteCookie(cname, cvalue, exMins) {
-                        var d = new Date();
-                        d.setTime(d.getTime() + (exMins * 60 * 1000));
-                        var expires = "expires=" + d.toUTCString();
-                        document.cookie = cname + "=" + cvalue + ";" + expires + ";path=/";
-                    }
-
-                    if (document.cookie.indexOf("ESPAuthenticationMSG") > -1) {
-                        var element = document.getElementById('hidden_msg');
-                        element.style.display = "inline-block";
-                        deleteCookie('ESPAuthenticationMSG', '', 0);
-                    }
-                });
+                }
             }
-        );
+            return "";
+        }
+
+        function consumeLoginMessage() {
+            var loginMessage = getCookie("ESPAuthenticationMSG") || getCookie("ESPUserAcctError");
+            deleteCookie('ESPAuthenticationMSG');
+            deleteCookie('ESPUserAcctError');
+            return loginMessage;
+        }
+
+        var loginMessage = consumeLoginMessage();
+        if (loginMessage) {
+            var element = document.getElementById('hidden_msg');
+            element.textContent = loginMessage;
+            element.style.display = "inline-block";
+        }
+
+        // If the session is revived in another tab, leave this stale login page for the saved route.
+        function checkSessionRevived() {
+            if (getCookie("ESPAuthenticated") === "true") {
+                window.clearInterval(sessionMonitor);
+                window.location.href = "/" + window.location.hash;
+            }
+        }
+        var sessionMonitor = window.setInterval(checkSessionRevived, 2000);
+
+        // Fast-path: another tab broadcasts when it re-authenticates; the poll is the fallback.
+        if (typeof BroadcastChannel !== "undefined") {
+            var sessionChannel = new BroadcastChannel("eclwatch_session");
+            sessionChannel.onmessage = function (ev) {
+                if (ev.data && ev.data.type === "authenticated") {
+                    checkSessionRevived();
+                }
+            };
+        }
     </script>
 </body>
 

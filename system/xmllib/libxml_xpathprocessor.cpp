@@ -20,6 +20,8 @@
 #include "jptree.hpp"
 #include "jexcept.hpp"
 #include "jlog.hpp"
+#include "eclhelper.hpp" //IXmlWriter
+#include "eclrtl.hpp" //IXmlWriter
 
 #include <libxml/xmlmemory.h>
 #include <libxml/parserInternals.h>
@@ -41,6 +43,9 @@
 #include <stack>
 #include <string>
 #include <memory>
+
+// Ensures no XXE (external entity/DTD resolution) to prevent that attack surface.
+constexpr int hpccXpathParseOptions = XML_PARSE_NO_XXE;
 
 static inline char *skipWS(char *s)
 {
@@ -82,7 +87,7 @@ class CLibCompiledXpath : public CInterfaceOf<ICompiledXpath>
 private:
     xmlXPathCompExprPtr m_compiledXpathExpression = nullptr;
     StringBuffer m_xpath;
-    ReadWriteLock m_rwlock;
+    ReadWriteLock m_rwlock{SYNC_LOCATION};
 
 public:
     CLibCompiledXpath(const char * xpath)
@@ -130,14 +135,17 @@ static xmlXPathObjectPtr variableLookupFunc(void *data, const xmlChar *name, con
 
 typedef std::map<std::string, xmlXPathObjectPtr> XPathObjectMap;
 
+
+
 class CLibXpathScope
 {
 public:
     StringAttr name; //in future allow named parent access?
     XPathObjectMap variables;
+    XpathVariableScopeType variableScopeType = XpathVariableScopeType::simple;
 
 public:
-    CLibXpathScope(const char *_name) : name(_name){}
+    CLibXpathScope(const char *_name, XpathVariableScopeType _variableScopeType) : name(_name), variableScopeType(_variableScopeType) {}
     ~CLibXpathScope()
     {
         for (XPathObjectMap::iterator it=variables.begin(); it!=variables.end(); ++it)
@@ -156,12 +164,15 @@ public:
         ret.first->second = obj;
         return true;
     }
-    xmlXPathObjectPtr getObject(const char *key)
+    xmlXPathObjectPtr getObject(const char *key, bool remove=false)
     {
         XPathObjectMap::iterator it = variables.find(key);
         if (it == variables.end())
             return nullptr;
-        return it->second;
+        xmlXPathObjectPtr obj = it->second;
+        if (remove)
+            variables.erase(it);
+        return obj;
     }
 };
 
@@ -193,16 +204,148 @@ public:
     }
 };
 
+class XpathContextXmlWriter : public CInterfaceOf<IXmlWriter>
+{
+public:
+    XpathContextXmlWriter(xmlNodePtr _location) : location(_location)
+    {
+    }
+    void addNameValue(const char *name, const char *value)
+    {
+        if (isEmptyString(name))
+            return;
+        if (*name=='@')
+            xmlSetProp(location, (const xmlChar *)name+1, (const xmlChar *)value);
+        else
+            xmlNewTextChild(location, nullptr, (const xmlChar *) name, (const xmlChar *) value);
+    }
+    virtual void outputQuoted(const char *text) override
+    {
+
+    }
+    virtual void outputString(unsigned len, const char *field, const char *fieldname) override
+    {
+        StringAttr out(field, len);
+        addNameValue(fieldname, out.str());
+    }
+    virtual void outputBool(bool field, const char *fieldname) override
+    {
+        addNameValue(fieldname, field ? "true" : "false");
+    }
+
+    virtual void outputData(unsigned len, const void *field, const char *fieldname) override
+    {
+        StringBuffer out;
+        outputXmlData(len, field, nullptr, out);
+        addNameValue(fieldname, out.str());
+    }
+    virtual void outputInt(__int64 field, unsigned size, const char *fieldname) override
+    {
+        StringBuffer out;
+        outputXmlInt(field, nullptr, out);
+        addNameValue(fieldname, out.str());
+    }
+    virtual void outputUInt(unsigned __int64 field, unsigned size, const char *fieldname) override
+    {
+        StringBuffer out;
+        outputXmlUInt(field, nullptr, out);
+        addNameValue(fieldname, out.str());
+    }
+    virtual void outputReal(double field, const char *fieldname) override
+    {
+        StringBuffer out;
+        outputXmlReal(field, nullptr, out);
+        addNameValue(fieldname, out.str());
+    }
+    virtual void outputDecimal(const void *field, unsigned size, unsigned precision, const char *fieldname) override
+    {
+        StringBuffer out;
+        outputXmlDecimal(field, size, precision, fieldname, out);
+        addNameValue(fieldname, out.str());
+    }
+    virtual void outputUDecimal(const void *field, unsigned size, unsigned precision, const char *fieldname) override
+    {
+        StringBuffer out;
+        outputXmlUDecimal(field, size, precision, fieldname, out);
+        addNameValue(fieldname, out.str());
+    }
+    virtual void outputUnicode(unsigned len, const UChar *field, const char *fieldname) override
+    {
+        char * buff = 0;
+        unsigned bufflen = 0;
+        rtlUnicodeToCodepageX(bufflen, buff, len, field, "utf-8");
+        StringBuffer out(bufflen, buff);
+        rtlFree(buff);
+        addNameValue(fieldname, out.str());
+    }
+    virtual void outputQString(unsigned len, const char *field, const char *fieldname) override
+    {
+        MemoryAttr tempBuffer;
+        char * temp;
+        if (len <= 100)
+            temp = (char *)alloca(len);
+        else
+            temp = (char *)tempBuffer.allocate(len);
+        rtlQStrToStr(len, temp, len, field);
+        outputString(len, temp, fieldname);
+    }
+    virtual void outputBeginDataset(const char *dsname, bool nestChildren) override
+    {
+        outputBeginNested("Dataset", nestChildren); //indent row, not dataset for backward compatibility
+        if (!isEmptyString(dsname))
+            outputUtf8(rtlUtf8Length(strlen(dsname), dsname), dsname, "@name");
+    }
+    virtual void outputEndDataset(const char *dsname) override
+    {
+        outputEndNested("Dataset");
+    }
+    virtual void outputBeginNested(const char *fieldname, bool nestChildren) override
+    {
+        location = xmlNewChild(location, nullptr, (const xmlChar *)fieldname, nullptr);
+    }
+    virtual void outputEndNested(const char *fieldname) override
+    {
+        if (location->parent)
+            location = location->parent;
+    }
+    virtual void outputSetAll() override
+    {
+        StringBuffer out;
+        outputXmlSetAll(out);
+        xmlNodeAddContent(location, (const xmlChar *)out.str());
+    }
+    virtual void outputUtf8(unsigned len, const char *field, const char *fieldname) override
+    {
+        unsigned bytes = rtlUtf8Size(len, field);
+        StringBuffer out(bytes, field);
+        addNameValue(fieldname, out.str());
+    }
+    virtual void outputBeginArray(const char *fieldname){} //no op for libxml structure
+    virtual void outputEndArray(const char *fieldname){}
+
+    virtual void outputInlineXml(const char *text){} //um no
+    virtual void outputXmlns(const char *name, const char *uri)
+    {
+        xmlNewNs(location, (const xmlChar *) uri, (const xmlChar *) name);
+    }
+    virtual void flushContent(bool close){}
+private:
+    xmlNodePtr location;
+};
+
+
 typedef std::vector<XpathContextState> XPathContextStateVector;
 
-class CLibXpathContext : public CInterfaceOf<IXpathContext>
+class CLibXpathContext : public CInterfaceOf<IXpathContext>, implements IVariableSubstitutionHelper
 {
 public:
     XPathInputMap provided;
     xmlDocPtr m_xmlDoc = nullptr;
     xmlXPathContextPtr m_xpathContext = nullptr;
-    ReadWriteLock m_rwlock;
+    ReadWriteLock m_rwlock{SYNC_LOCATION};
     XPathScopeVector scopes;
+    Owned<CLibXpathContext> primaryContext; //if set will lookup variables from primaryContext (secondary context is generally target not source)
+
     bool strictParameterDeclaration = true;
     bool removeDocNamespaces = false;
     bool ownedDoc = false;
@@ -211,16 +354,21 @@ public:
     XPathContextStateVector saved;
 
 public:
+    IMPLEMENT_IINTERFACE_USING(CInterfaceOf<IXpathContext>)
+
     CLibXpathContext(const char * xmldoc, bool _strictParameterDeclaration, bool removeDocNs) : strictParameterDeclaration(_strictParameterDeclaration), removeDocNamespaces(removeDocNs)
     {
-        beginScope("/");
+        xmlKeepBlanksDefault(0);
+        beginScope("/", XpathVariableScopeType::simple);
         setXmlDoc(xmldoc);
         registerExslt();
     }
 
-    CLibXpathContext(xmlDocPtr doc, xmlNodePtr node, bool _strictParameterDeclaration) : strictParameterDeclaration(_strictParameterDeclaration)
+    CLibXpathContext(CLibXpathContext *_primary, xmlDocPtr doc, xmlNodePtr node, bool _strictParameterDeclaration) : strictParameterDeclaration(_strictParameterDeclaration)
     {
-        beginScope("/");
+        xmlKeepBlanksDefault(0);
+        primaryContext.set(_primary);
+        beginScope("/", XpathVariableScopeType::simple);
         setContextDocument(doc, node);
         registerExslt();
     }
@@ -241,7 +389,7 @@ public:
         exsltSetsXpathCtxtRegister(m_xpathContext, (xmlChar*)"set");
         exsltStrXpathCtxtRegister(m_xpathContext, (xmlChar*)"str");
     }
-    void pushLocation()
+    void pushLocation() override
     {
         WriteLockBlock wblock(m_rwlock);
         saved.emplace_back(XpathContextState(m_xpathContext));
@@ -265,17 +413,17 @@ public:
         m_xpathContext->proximityPosition = ctx->proximityPosition;
     }
 
-    void popLocation()
+    void popLocation() override
     {
         WriteLockBlock wblock(m_rwlock);
         saved.back().restore(m_xpathContext);
         saved.pop_back();
     }
 
-    void beginScope(const char *name) override
+    void beginScope(const char *name, XpathVariableScopeType variableScopeType) override
     {
         WriteLockBlock wblock(m_rwlock);
-        scopes.emplace_back(new CLibXpathScope(name));
+        scopes.emplace_back(new CLibXpathScope(name, variableScopeType));
     }
 
     void endScope() override
@@ -341,25 +489,65 @@ public:
         assertex(scopes.size());
         return scopes.back().get();
     }
+
+    bool findVariable(const char *name, StringBuffer &s) override
+    {
+        xmlXPathObjectPtr obj = findVariable(name, nullptr, nullptr);
+        return append(s, obj);
+    }
+
     xmlXPathObjectPtr findVariable(const char *name, const char *ns_uri, CLibXpathScope *scope)
     {
+        xmlXPathObjectPtr obj = nullptr;
+        if (primaryContext)
+        {
+            //could always return from here, but may find a use for secondary variables, they currently can't be defined from esdl script, so can't hurt there
+            obj = primaryContext->findVariable(name, ns_uri, scope);
+            if (obj)
+                return obj;
+        }
         const char *fullname = name;
         StringBuffer s;
         if (!isEmptyString(ns_uri))
             fullname = s.append(ns_uri).append(':').append(name).str();
 
         ReadLockBlock wblock(m_rwlock);
-        xmlXPathObjectPtr obj = nullptr;
         if (scope)
             return scope->getObject(fullname);
 
         for (XPathScopeVector::const_reverse_iterator it=scopes.crbegin(); !obj && it!=scopes.crend(); ++it)
+        {
             obj = it->get()->getObject(fullname);
+            if (it->get()->variableScopeType==XpathVariableScopeType::isolated)  //An isolated scope can't use variables from higher level scopes
+                break;
+        }
 
         //check libxml2 level variables, shouldn't happen currently but we may want to wrap existing xpathcontexts in the future
         if (!obj)
             obj = (xmlXPathObjectPtr)xmlHashLookup2(m_xpathContext->varHash, (const xmlChar *)name, (const xmlChar *)ns_uri);
         return obj;
+    }
+
+    CLibXpathScope *queryParameterScope()
+    {
+        if (scopes.size()<2)
+            return nullptr;
+
+        CLibXpathScope *parameterScope = scopes[scopes.size() - 2].get();
+        if (!parameterScope || parameterScope->variableScopeType!=XpathVariableScopeType::parameter)
+            return nullptr;
+        return parameterScope;
+    }
+
+    bool processPassedParameter(CLibXpathScope *parameterScope, const char *name)
+    {
+        if (!parameterScope)
+            return false;
+        xmlXPathObjectPtr paramValueObj = parameterScope->getObject(name, true);
+        if (!paramValueObj)
+            return false;
+        addObjectVariable(name, paramValueObj, nullptr);
+        return true;
     }
 
     xmlXPathObjectPtr getVariableObject(const char *name, const char *ns_uri, CLibXpathScope *scope)
@@ -370,6 +558,492 @@ public:
     bool hasVariable(const char *name, const char *ns_uri, CLibXpathScope *scope)
     {
         return (findVariable(name, ns_uri, scope)!=nullptr);
+    }
+
+    void setLocation(xmlNodePtr node)
+    {
+        WriteLockBlock wblock(m_rwlock);
+        m_xpathContext->doc = node->doc;
+        m_xpathContext->node = node;
+        m_xpathContext->contextSize = 0;
+        m_xpathContext->proximityPosition = 0;
+    }
+
+    bool setLocation(xmlXPathObjectPtr obj, bool required, const char *xpath)
+    {
+        if (!obj)
+        {
+            if (required)
+                throw MakeStringException(XPATHERR_InvalidInput,"XpathContext:setLocation: Error: Syntax error XPATH '%s'", xpath);
+            return false;
+        }
+        if (obj->type!=XPATH_NODESET || !obj->nodesetval || obj->nodesetval->nodeNr==0)
+        {
+            xmlXPathFreeObject(obj);
+            if (required)
+                throw MakeStringException(XPATHERR_EvaluationFailed,"XpathContext:setLocation: Error: Could not evaluate XPATH '%s'", xpath);
+            return false;
+        }
+        if (obj->nodesetval->nodeNr>1)
+        {
+            xmlXPathFreeObject(obj);
+            if (required)
+                throw MakeStringException(XPATHERR_EvaluationFailed,"XpathContext:setLocation: Error: ambiguous XPATH '%s'", xpath);
+            return false;
+        }
+        xmlNodePtr location = obj->nodesetval->nodeTab[0];
+        xmlXPathFreeObject(obj);
+        setLocation(location);
+        return true;
+    }
+
+    virtual bool setLocation(ICompiledXpath * compiledXpath, bool required) override
+    {
+        if (!compiledXpath)
+            return false;
+
+        CLibCompiledXpath * ccXpath = static_cast<CLibCompiledXpath *>(compiledXpath);
+        if (!ccXpath)
+            throw MakeStringException(XPATHERR_InvalidState,"XpathProcessor:setLocation: Error: BAD compiled XPATH");
+
+        xmlXPathObjectPtr obj = evaluate(ccXpath->getCompiledXPathExpression(), compiledXpath->getXpath());
+        return setLocation(obj, required, compiledXpath->getXpath());
+    }
+
+    virtual bool setLocation(const char *s, bool required) override
+    {
+        StringBuffer xpath;
+        replaceVariables(xpath, s, false, this, "{$", "}");
+
+        xmlXPathObjectPtr obj = evaluate(xpath);
+        return setLocation(obj, required, xpath.str());
+    }
+
+    virtual void addElementToLocation(const char *name) override
+    {
+        if (!validateXMLTag(name))
+            throw MakeStringException(XPATHERR_InvalidState,"XpathContext:addElementToLocation: invalid name '%s'", name);
+        xmlNodePtr location = m_xpathContext->node;
+        if (!location)
+            return;
+        location = xmlNewChild(location, nullptr, (const xmlChar *) name, nullptr);
+        if (!location)
+            throw MakeStringException(XPATHERR_InvalidState,"XpathContext:addElementToLocation: failed to add element '%s'", name);
+        setLocation(location);
+    }
+
+    virtual void addXmlContent(const char *xml) override
+    {
+        xmlNodePtr location = m_xpathContext->node;
+        if (!location)
+            return;
+
+        xmlDocPtr contentDoc = xmlReadMemory(xml, strlen(xml), "addXmlContent", nullptr, hpccXpathParseOptions);
+        if (!contentDoc)
+            throw makeStringExceptionV(-1, "XpathContext:addXmlContent: Unable to parse %s XML content", xml);
+
+        xmlNodePtr contentRoot = xmlDocGetRootElement(contentDoc);
+        if (!contentRoot)
+        {
+            xmlFreeDoc(contentDoc);
+            throw makeStringExceptionV(-1, "XpathContext:addXmlContent: Missing root node for %s XML content", xml);
+        }
+
+        xmlNodePtr contentCopy = xmlDocCopyNode(contentRoot, location->doc, 1);
+        xmlFreeDoc(contentDoc);
+        if (!contentCopy)
+            throw makeStringExceptionV(-1, "XpathContext:addXmlContent: Unable to copy %s XML content", xml);
+
+        xmlAddChild(location, contentCopy);
+    }
+    virtual IXmlWriter *createXmlWriter() override
+    {
+        return new XpathContextXmlWriter(m_xpathContext->node);
+    }
+
+    virtual bool ensureLocation(const char *xpath, bool required) override
+    {
+        if (isEmptyString(xpath))
+            return true;
+        if (strstr(xpath, "//")) //maybe in the future, scripting error rather than not found, required==false has no effect
+            throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureLocation: '//' not currently allowed '%s'", xpath);
+
+        xmlNodePtr current = m_xpathContext->node;
+        xmlNodePtr node = current;
+        if (*xpath=='/')
+        {
+            xpath++;
+            if (strncmp(xpath, "esdl_script_context/", 20)!=0)
+                throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureLocation: incorect first absolute path node '%s'", xpath);
+            xpath+=20;
+            node = xmlDocGetRootElement(m_xmlDoc);
+        }
+
+        StringArray xpathnodes;
+        xpathnodes.appendList(xpath, "/");
+        ForEachItemIn(i, xpathnodes)
+        {
+            const char *finger = xpathnodes.item(i);
+            if (isEmptyString(finger)) //shouldn't happen, scripting error rather than not found, required==false has no effect
+                throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureLocation: '//' not allowed '%s'", xpath);
+            if (*finger=='@')
+                throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureLocation: attribute cannot be selected '%s'", xpath);
+
+            xmlXPathObjectPtr obj = xmlXPathNodeEval(node, (const xmlChar*) finger, m_xpathContext);
+            xmlXPathSetContextNode(current, m_xpathContext); //restore
+
+            if (!obj)
+                throw MakeStringException(XPATHERR_InvalidInput,"XpathContext:ensureLocation: invalid xpath '%s' at node '%s'", xpath, finger);
+
+            if (obj->type!=xmlXPathObjectType::XPATH_NODESET || !obj->nodesetval || obj->nodesetval->nodeNr==0)
+            {
+                if (*finger=='.' || strpbrk(finger, "[()]*") || strstr(finger, "::")) //complex nodes must already exist
+                {
+                    if (required)
+                        throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureLocation: xpath node not found '%s' in xpath '%s'", finger, xpath);
+                    return false;
+                }
+                node = xmlNewChild(node, nullptr, (const xmlChar *) finger, nullptr);
+                if (!node)
+                {
+                    if (required)
+                        throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureLocation: error creating node '%s' in xpath '%s'", finger, xpath);
+                    return false;
+                }
+            }
+            else
+            {
+                xmlNodePtr *nodes = obj->nodesetval->nodeTab;
+                if (obj->nodesetval->nodeNr>1)
+                {
+                    if (required)
+                        throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureLocation: ambiguous xpath '%s' at node '%s'", xpath, finger);
+                    return false;
+                }
+                node = *nodes;
+            }
+            xmlXPathFreeObject(obj);
+        }
+        setLocation(node);
+        return true;
+    }
+
+    virtual void setLocationNamespace(const char *prefix, const char * uri, bool current) override
+    {
+        xmlNodePtr node = m_xpathContext->node;
+        if (!node)
+            return;
+        xmlNsPtr ns = nullptr;
+        if (isEmptyString(uri))
+            ns = xmlSearchNs(node->doc, node, (const xmlChar *) prefix);
+        else
+            ns = xmlNewNs(node, (const xmlChar *) uri, (const xmlChar *) prefix);
+        if (current && ns)
+            xmlSetNs(node, ns);
+    }
+
+    enum class ensureValueMode { set, add, appendto };
+    virtual void ensureValue(const char *xpath, const char *value, ensureValueMode action, bool required)
+    {
+        if (isEmptyString(xpath))
+            return;
+        if (strstr(xpath, "//")) //maybe in the future, scripting error rather than not found, required==false has no effect
+            throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureValue: '//' not currently allowed for set operations '%s'", xpath);
+
+        xmlNodePtr current = m_xpathContext->node;
+        if (!current || *xpath=='/')
+        {
+            current = xmlDocGetRootElement(m_xmlDoc); //valuable, but very dangerous
+            if (*xpath=='/')
+                xpath++;
+        }
+        xmlNodePtr node = current;
+
+        StringArray xpathnodes;
+        xpathnodes.appendList(xpath, "/");
+        ForEachItemIn(i, xpathnodes)
+        {
+            const char *finger = xpathnodes.item(i);
+            if (isEmptyString(finger)) //shouldn't happen, scripting error rather than not found, required==false has no effect
+                throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureValue: empty xpath node unexpected '%s'", xpath);
+            bool last = (i == (xpathnodes.ordinality()-1));
+            if (*finger=='@')
+            {
+                if (!last) //scripting error
+                    throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureValue: invalid xpath attribute node '%s' in xpath '%s'", finger, xpath);
+                if (action == ensureValueMode::appendto)
+                {
+                    const char *existing = (const char *) xmlGetProp(node, (const xmlChar *) finger+1);
+                    if (!isEmptyString(existing))
+                    {
+                        StringBuffer appendValue(existing);
+                        appendValue.append(value);
+                        xmlSetProp(node, (const xmlChar *) finger+1, (const xmlChar *) appendValue.str());
+                        return;
+                    }
+                }
+                xmlSetProp(node, (const xmlChar *) finger+1, (const xmlChar *) value);
+                return;
+            }
+            xmlXPathObjectPtr obj = xmlXPathNodeEval(node, (const xmlChar*) finger, m_xpathContext);
+            xmlXPathSetContextNode(current, m_xpathContext);
+
+            if (!obj)
+                throw MakeStringException(XPATHERR_InvalidInput,"XpathContext:ensureValue: invalid xpath '%s' at node '%s'", xpath, finger);
+
+            if (obj->type!=xmlXPathObjectType::XPATH_NODESET || !obj->nodesetval || obj->nodesetval->nodeNr==0)
+            {
+                if (*finger=='.' || strpbrk(finger, "[()]*") || strstr(finger, "::")) //complex nodes must already exist
+                {
+                    if (required)
+                        throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureValue: xpath node not found '%s' in xpath '%s'", finger, xpath);
+                    return;
+                }
+                const char *nsx = strchr(finger, ':');
+                if (nsx)
+                {
+                    StringAttr prefix(finger, nsx-finger);
+                    finger = nsx+1;
+                    //translate the xpath xmlns prefix into the one defined in the content xml (exception if not found)
+                    const char *uri = queryNamespace(prefix.str());
+                    if (isEmptyString(uri))
+                        throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureValue: xmlns prefix '%s' not defined in script used in xpath '%s'", prefix.str(), xpath);
+                    xmlNsPtr ns = xmlSearchNsByHref(m_xmlDoc, node, (const xmlChar *) uri);
+                    if (!ns)
+                        throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureValue: namespace uri '%s' (referenced as xmlns prefix '%s') not declared in xml ", uri, prefix.str());
+                    node = xmlNewChild(node, ns, (const xmlChar *) finger, last ? (const xmlChar *) value : nullptr);
+                }
+                else
+                {
+                    node = xmlNewChild(node, nullptr, (const xmlChar *) finger, last ? (const xmlChar *) value : nullptr);
+                    //default libxml2 behavior here would be very confusing for scripts.  After adding a tag with no prefix you would need a tag on the xpath to read it.
+                    //Instead when there is no prefix, create a node with no namespace. To match the parent default namespace, define an xpath prefix for it.
+                    //You can always add the namespace you want by declaring it both in the xml (<es:namespace>) and the script (xmlns:prefix on the root node of the script) and then using it on the xpath.
+                    xmlSetNs(node, nullptr);
+                }
+
+                if (!node)
+                {
+                    if (required)
+                        throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureValue: error creating node '%s' in xpath '%s'", finger, xpath);
+                    return;
+                }
+            }
+            else
+            {
+                xmlNodePtr *nodes = obj->nodesetval->nodeTab;
+                if (!last)
+                {
+                    if (obj->nodesetval->nodeNr>1)
+                    {
+                        if (required)
+                            throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureValue: ambiguous xpath '%s' at node '%s'", xpath, finger);
+                        return;
+                    }
+                    node = *nodes;
+                }
+                else
+                {
+                    if (obj->nodesetval->nodeNr>1 && action != ensureValueMode::add)
+                    {
+                        if (required)
+                            throw MakeStringException(XPATHERR_InvalidState,"XpathContext:ensureValue: ambiguous xpath '%s'", xpath);
+                        return;
+                    }
+
+                    xmlNodePtr parent = node;
+                    node = *nodes;
+                    switch (action)
+                    {
+                        case ensureValueMode::add:
+                        {
+                            StringBuffer name((const char *)node->name);
+                            xmlNewChild(parent, node->ns, (const xmlChar *) name.str(), (const xmlChar *) value);
+                            break;
+                        }
+                        case ensureValueMode::appendto:
+                        {
+                            xmlChar *existing = xmlNodeGetContent(node);
+                            StringBuffer appendValue((const char *)existing);
+                            xmlNodeSetContent(node, (const xmlChar *) appendValue.append(value).str());
+                            xmlFree(existing);
+                            break;
+                        }
+                        case ensureValueMode::set:
+                        {
+                            xmlNodeSetContent(node, (const xmlChar *) value);
+                            break;
+                        }
+                    }
+                }
+            }
+            xmlXPathFreeObject(obj);
+        }
+    }
+
+    virtual void ensureSetValue(const char *xpath, const char *value, bool required) override
+    {
+        ensureValue(xpath, value, ensureValueMode::set, required);
+    }
+    virtual void ensureAddValue(const char *xpath, const char *value, bool reqired) override
+    {
+        ensureValue(xpath, value, ensureValueMode::add, reqired);
+    }
+    virtual void ensureAppendToValue(const char *xpath, const char *value, bool required) override
+    {
+        ensureValue(xpath, value, ensureValueMode::appendto, required);
+    }
+
+    virtual void rename(const char *xpath, const char *name, bool all) override
+    {
+        if (isEmptyString(xpath) || isEmptyString(name))
+            return;
+        xmlXPathObjectPtr obj = xmlXPathEval((const xmlChar*) xpath, m_xpathContext);
+        if (!obj)
+            return;
+        if (obj->type!=xmlXPathObjectType::XPATH_NODESET || obj->nodesetval->nodeNr==0)
+        {
+            xmlXPathFreeObject(obj);
+            return;
+        }
+        if (obj->nodesetval->nodeNr>1 && !all)
+        {
+            xmlXPathFreeObject(obj);
+            throw MakeStringException(XPATHERR_InvalidState,"XpathContext:rename: ambiguous xpath '%s' to rename all set 'all'", xpath);
+        }
+        xmlNodePtr *nodes = obj->nodesetval->nodeTab;
+        for (int i = 0; i < obj->nodesetval->nodeNr; i++)
+            xmlNodeSetName(nodes[i], (const xmlChar *)name);
+        xmlXPathFreeObject(obj);
+    }
+
+    virtual void remove(const char *xpath, bool all) override
+    {
+        if (isEmptyString(xpath))
+            return;
+        xmlXPathObjectPtr obj = xmlXPathEval((const xmlChar*) xpath, m_xpathContext);
+        if (!obj)
+            return;
+        if (obj->type!=xmlXPathObjectType::XPATH_NODESET || !obj->nodesetval || obj->nodesetval->nodeNr==0)
+        {
+            xmlXPathFreeObject(obj);
+            return;
+        }
+        if (obj->nodesetval->nodeNr>1 && !all)
+        {
+            xmlXPathFreeObject(obj);
+            throw MakeStringException(XPATHERR_InvalidState,"XpathContext:remove: ambiguous xpath '%s' to remove all set 'all'", xpath);
+        }
+        xmlNodePtr *nodes = obj->nodesetval->nodeTab;
+        for (int i = obj->nodesetval->nodeNr - 1; i >= 0; i--)
+        {
+            xmlUnlinkNode(nodes[i]);
+            xmlFreeNode(nodes[i]);
+            nodes[i]=nullptr;
+        }
+        xmlXPathFreeObject(obj);
+    }
+
+    virtual void copyFromPrimaryContext(ICompiledXpath *select, const char *newname) override
+    {
+        if (!primaryContext)
+            return;
+        xmlNodePtr current = m_xpathContext->node;
+        if (!current || !select)
+            return;
+        CLibCompiledXpath * ccXpath = static_cast<CLibCompiledXpath *>(select);
+        xmlXPathObjectPtr obj = primaryContext->evaluate(ccXpath->getCompiledXPathExpression(), ccXpath->getXpath());
+        if (!obj)
+            throw MakeStringException(XPATHERR_InvalidState, "XpathContext:copyof xpath syntax error '%s'", ccXpath->getXpath());
+        if (obj->type!=xmlXPathObjectType::XPATH_NODESET || !obj->nodesetval || obj->nodesetval->nodeNr==0)
+        {
+            xmlXPathFreeObject(obj);
+            return;
+        }
+        xmlNodePtr *nodes = obj->nodesetval->nodeTab;
+        for (int i = 0; i < obj->nodesetval->nodeNr; i++)
+        {
+            xmlNodePtr copy = xmlCopyNode(nodes[i], 1);
+            if (!copy)
+                continue;
+            if (!isEmptyString(newname))
+                xmlNodeSetName(copy, (const xmlChar *)newname);
+            xmlAddChild(current, copy);
+        }
+        xmlXPathFreeObject(obj);
+    }
+
+    StringBuffer &toXML(xmlNodePtr node, StringBuffer &xml)
+    {
+        if (!node)
+            return xml;
+
+        xmlOutputBufferPtr xmlOut = xmlAllocOutputBuffer(nullptr);
+        xmlNodeDumpOutput(xmlOut, node->doc, node, 0, 1, nullptr);
+        if (xmlOutputBufferFlush(xmlOut) >= 0)
+        {
+            xmlBufPtr buf = (xmlOut->conv != nullptr) ? xmlOut->conv : xmlOut->buffer;
+            if (xmlBufUse(buf))
+                xml.append(xmlBufUse(buf), (const char *)xmlBufContent(buf));
+        }
+        xmlOutputBufferClose(xmlOut);
+        return xml;
+    }
+
+    StringBuffer &toXMLNodeSet(xmlXPathObjectPtr obj, StringBuffer &xml)
+    {
+        if (!obj || obj->type!=XPATH_NODESET || !obj->nodesetval || !obj->nodesetval->nodeTab || obj->nodesetval->nodeNr<1)
+            return xml;
+        xmlNodePtr *nodes = obj->nodesetval->nodeTab;
+        for (int i = 0; i < obj->nodesetval->nodeNr; i++)
+        {
+            xmlNodePtr node = obj->nodesetval->nodeTab[i];
+            toXML(node, xml);
+        }
+        return xml;
+    }
+
+    virtual bool selectText(ICompiledXpath* select, StringBuffer& content, bool& isValue)
+    {
+        xmlNodePtr current = m_xpathContext->node;
+        if (!current || !select)
+            return false;
+        CLibCompiledXpath * ccXpath = static_cast<CLibCompiledXpath *>(select);
+        xmlXPathObjectPtr obj = primaryContext->evaluate(ccXpath->getCompiledXPathExpression(), ccXpath->getXpath());
+        if (!obj)
+            throw makeStringExceptionV(XPATHERR_InvalidState, "XpathContext:selectText xpath syntax error '%s'", ccXpath->getXpath());
+        bool result = true;
+        switch (obj->type)
+        {
+            case XPATH_NODESET:
+                if (isValue)
+                {
+                    if (obj->nodesetval->nodeNr > 1)
+                    {
+                        isValue = false;
+                        result = false;
+                    }
+                    else
+                    {
+                        evaluateAsString(obj, content, ccXpath->getXpath());
+                        obj = nullptr; // freed above
+                    }
+                }
+                else
+                    toXMLNodeSet(obj, content);
+                break;
+            case XPATH_BOOLEAN:
+            case XPATH_NUMBER:
+            case XPATH_STRING:
+                append(content, obj);
+                isValue = true;
+                break;
+            default:
+                result = false;
+                break;
+        }
+        xmlXPathFreeObject(obj);
+        return result;
     }
 
     virtual bool addObjectVariable(const char * name, xmlXPathObjectPtr obj, CLibXpathScope *scope)
@@ -414,13 +1088,13 @@ public:
     bool addCompiledVariable(const char * name, ICompiledXpath * compiled, CLibXpathScope *scope)
     {
         if (!compiled)
-            addVariable(name, "");
+            return addVariable(name, "");
         if (m_xpathContext)
         {
-            CLibCompiledXpath * clibCompiledXpath = static_cast<CLibCompiledXpath *>(compiled);
-            xmlXPathObjectPtr obj = evaluate(clibCompiledXpath->getCompiledXPathExpression(), clibCompiledXpath->getXpath());
+            CLibCompiledXpath * ccXpath = static_cast<CLibCompiledXpath *>(compiled);
+            xmlXPathObjectPtr obj = evaluate(ccXpath->getCompiledXPathExpression(), ccXpath->getXpath());
             if (!obj)
-                throw MakeStringException(-1, "addEvaluateVariable xpath error %s", clibCompiledXpath->getXpath());
+                throw MakeStringException(-1, "addEvaluateVariable xpath error %s", ccXpath->getXpath());
             return addObjectVariable(name, obj, scope);
         }
 
@@ -459,13 +1133,20 @@ public:
 
     virtual bool declareCompiledParameter(const char * name, ICompiledXpath * compiled) override
     {
-        if (hasVariable(name, nullptr, getCurrentScope()))
+        CLibXpathScope *cur = getCurrentScope();
+        if (hasVariable(name, nullptr, cur))
             return false;
 
-        //use input value
-        ICompiledXpath *inputxp = findInput(name);
-        if (inputxp)
-            return addCompiledVariable(name, inputxp, getCurrentScope());
+        CLibXpathScope *parameterScope = queryParameterScope();
+        if (!parameterScope)
+        {
+            //use input value
+            ICompiledXpath *inputxp = findInput(name);
+            if (inputxp)
+                return addCompiledVariable(name, inputxp, getCurrentScope());
+        }
+        else if (processPassedParameter(parameterScope, name))
+            return true;
 
         //use default provided
         return addCompiledVariable(name, compiled, getCurrentScope());
@@ -489,6 +1170,15 @@ public:
 
         //use default provided
         return addStringVariable(name, value, getCurrentScope());
+    }
+
+    virtual bool checkParameterName(const char * name) override
+    {
+        if (hasVariable(name, nullptr, getCurrentScope()))
+            return true;
+        if (findInput(name))
+            return true;
+        return false;
     }
 
     virtual bool addXpathVariable(const char * name, const char * xpath) override
@@ -538,6 +1228,28 @@ public:
         return evaluateAsBoolean(evaluate(xpath), xpath);
     }
 
+    virtual StringBuffer &toXml(const char *xpath, StringBuffer & xml) override
+    {
+        xmlXPathObjectPtr obj = evaluate(xpath);
+        if (!obj || obj->type!=XPATH_NODESET || !obj->nodesetval || !obj->nodesetval->nodeTab || obj->nodesetval->nodeNr!=1)
+            return xml;
+        xmlNodePtr node = obj->nodesetval->nodeTab[0];
+        if (!node)
+            return xml;
+
+        xmlOutputBufferPtr xmlOut = xmlAllocOutputBuffer(nullptr);
+        xmlNodeDumpOutput(xmlOut, node->doc, node, 0, 1, nullptr);
+        if (xmlOutputBufferFlush(xmlOut) >= 0)
+        {
+            xmlBufPtr buf = (xmlOut->conv != nullptr) ? xmlOut->conv : xmlOut->buffer;
+            if (xmlBufUse(buf))
+                xml.append(xmlBufUse(buf), (const char *)xmlBufContent(buf));
+        }
+        xmlOutputBufferClose(xmlOut);
+        xmlXPathFreeObject(obj);
+        return xml;
+    }
+
     virtual bool evaluateAsString(const char * xpath, StringBuffer & evaluated) override
     {
         if (!xpath || !*xpath)
@@ -547,26 +1259,26 @@ public:
 
     virtual bool evaluateAsBoolean(ICompiledXpath * compiledXpath) override
     {
-        CLibCompiledXpath * clibCompiledXpath = static_cast<CLibCompiledXpath *>(compiledXpath);
-        if (!clibCompiledXpath)
+        CLibCompiledXpath * ccXpath = static_cast<CLibCompiledXpath *>(compiledXpath);
+        if (!ccXpath)
             throw MakeStringException(XPATHERR_MissingInput,"XpathProcessor:evaluateAsBoolean: Error: Missing compiled XPATH");
-        return evaluateAsBoolean(evaluate(clibCompiledXpath->getCompiledXPathExpression(), compiledXpath->getXpath()), compiledXpath->getXpath());
+        return evaluateAsBoolean(evaluate(ccXpath->getCompiledXPathExpression(), compiledXpath->getXpath()), compiledXpath->getXpath());
     }
 
     virtual const char * evaluateAsString(ICompiledXpath * compiledXpath, StringBuffer & evaluated) override
     {
-        CLibCompiledXpath * clibCompiledXpath = static_cast<CLibCompiledXpath *>(compiledXpath);
-        if (!clibCompiledXpath)
+        CLibCompiledXpath * ccXpath = static_cast<CLibCompiledXpath *>(compiledXpath);
+        if (!ccXpath)
             throw MakeStringException(XPATHERR_MissingInput,"XpathProcessor:evaluateAsString: Error: Missing compiled XPATH");
-        return evaluateAsString(evaluate(clibCompiledXpath->getCompiledXPathExpression(), compiledXpath->getXpath()), evaluated, compiledXpath->getXpath());
+        return evaluateAsString(evaluate(ccXpath->getCompiledXPathExpression(), compiledXpath->getXpath()), evaluated, compiledXpath->getXpath());
     }
 
     virtual double evaluateAsNumber(ICompiledXpath * compiledXpath) override
     {
-        CLibCompiledXpath * clibCompiledXpath = static_cast<CLibCompiledXpath *>(compiledXpath);
-        if (!clibCompiledXpath)
+        CLibCompiledXpath * ccXpath = static_cast<CLibCompiledXpath *>(compiledXpath);
+        if (!ccXpath)
             throw MakeStringException(XPATHERR_MissingInput,"XpathProcessor:evaluateAsNumber: Error: Missing compiled XPATH");
-        return evaluateAsNumber(evaluate(clibCompiledXpath->getCompiledXPathExpression(), compiledXpath->getXpath()), compiledXpath->getXpath());
+        return evaluateAsNumber(evaluate(ccXpath->getCompiledXPathExpression(), compiledXpath->getXpath()), compiledXpath->getXpath());
     }
 
     virtual bool setXmlDoc(const char * xmldoc) override
@@ -716,6 +1428,18 @@ private:
         return evaluated.str();
     }
 
+    bool append(StringBuffer &s, xmlXPathObjectPtr obj)
+    {
+        if (!obj)
+            return false;
+        xmlChar *value = xmlXPathCastToString(obj);
+        if (!value || !*value)
+            return false;
+        s.append((const char *) value);
+        xmlFree(value);
+        return true;
+    }
+
     double evaluateAsNumber(xmlXPathObjectPtr evaluatedXpathObj, const char* xpath)
     {
         if (!evaluatedXpathObj)
@@ -746,21 +1470,12 @@ private:
 
     virtual xmlXPathObjectPtr evaluate(const char * xpath)
     {
-        xmlXPathObjectPtr evaluatedXpathObj = nullptr;
-        if (xpath && *xpath)
-        {
-            ReadLockBlock rlock(m_rwlock);
-            if ( m_xpathContext)
-            {
-                evaluatedXpathObj = xmlXPathEval((const xmlChar *)xpath, m_xpathContext);
-            }
-            else
-            {
-                throw MakeStringException(XPATHERR_InvalidState,"XpathProcessor:evaluate: Error: Could not evaluate XPATH '%s'; ensure xmldoc has been set", xpath);
-            }
-        }
-
-        return evaluatedXpathObj;
+        if (isEmptyString(xpath))
+            return nullptr;
+        if (!m_xpathContext)
+            throw MakeStringException(XPATHERR_InvalidState,"XpathProcessor:evaluate: Error: Could not evaluate XPATH '%s'; ensure xmldoc has been set", xpath);
+        ReadLockBlock rlock(m_rwlock);
+        return xmlXPathEval((const xmlChar *)xpath, m_xpathContext);
     }
 };
 
@@ -852,6 +1567,13 @@ extern ICompiledXpath* compileXpath(const char * xpath)
     return new CLibCompiledXpath(xpath);
 }
 
+extern ICompiledXpath* compileOptionalXpath(const char * xpath)
+{
+    if (isEmptyString(xpath))
+        return nullptr;
+    return compileXpath(xpath);
+}
+
 void addChildFromPtree(xmlNodePtr parent, IPropertyTree &tree, const char *name)
 {
     if (isEmptyString(name))
@@ -939,41 +1661,37 @@ static const char *queryAttrValue(xmlNodePtr node, const char *name)
     return (const char *) att->children->content;
 }
 
-class CEsdlScriptContext : public CInterfaceOf<IEsdlScriptContext>
+class CSectionalXmlDocModel : public CInterfaceOf<ISectionalXmlDocModel>
 {
 private:
-    void *espCtx = nullptr;
+    void *userData = nullptr;
     xmlDocPtr doc = nullptr;
     xmlNodePtr root = nullptr;
     xmlXPathContextPtr xpathCtx = nullptr;
 
 public:
-    CEsdlScriptContext(void *ctx) : espCtx(ctx)
+    CSectionalXmlDocModel(void *_userData) : userData(_userData)
     {
         doc =   xmlParseDoc((const xmlChar *) "<esdl_script_context/>");
         xpathCtx = xmlXPathNewContext(doc);
         if(xpathCtx == nullptr)
-            throw MakeStringException(-1, "CEsdlScriptContext: Unable to create new xPath context");
+            throw MakeStringException(-1, "CSectionalXmlDocModel: Unable to create new xPath context");
 
         root = xmlDocGetRootElement(doc);
         xpathCtx->node = root;
     }
 
 private:
-    ~CEsdlScriptContext()
+    ~CSectionalXmlDocModel()
     {
         xmlXPathFreeContext(xpathCtx);
         xmlFreeDoc(doc);
     }
-    virtual void *queryEspContext() override
-    {
-        return espCtx;
-    }
     inline void sanityCheckSectionName(const char *name)
     {
         //sanity check the name, not a full validation
-        if (strpbrk(name, "/[]()*?"))
-            throw MakeStringException(-1, "CEsdlScriptContext:removeSection invalid section name %s", name);
+        if (isEmptyString(name) || strpbrk(name, "/[]()*?"))
+            throw MakeStringException(-1, "CSectionalXmlDocModel:removeSection invalid section name %s", name);
     }
     xmlNodePtr getSectionNode(const char *name, const char *xpath="*[1]")
     {
@@ -988,6 +1706,7 @@ private:
         xmlXPathFreeObject(eval);
         return sect;
     }
+
     void addXpathCtxConfigInputs(IXpathContext *tgtXpathCtx)
     {
         xmlXPathObjectPtr eval = xmlXPathEval((const xmlChar *) "config/*/Transform/Param", xpathCtx);
@@ -1064,6 +1783,36 @@ private:
     {
         return getSectionNode(name, nullptr);
     }
+
+    xmlNodePtr ensureCopiedSection(const char *target, const char *source, bool replace)
+    {
+        if (isEmptyString(source)||isEmptyString(target))
+            return nullptr;
+        sanityCheckSectionName(target);
+        sanityCheckSectionName(source);
+
+        xmlNodePtr targetNode = getSectionNode(target, nullptr);
+        if (targetNode && !replace)
+            return targetNode;
+
+        xmlNodePtr sourceNode = getSectionNode(source, nullptr);
+        if (!sourceNode)
+            return nullptr;
+
+        xmlNodePtr copyNode = xmlCopyNode(sourceNode, 1);
+        xmlNodeSetName(copyNode, (const xmlChar *) target);
+
+        if (targetNode)
+        {
+            xmlNodePtr oldNode = xmlReplaceNode(targetNode, copyNode);
+            xmlFreeNode(oldNode);
+            return copyNode;
+        }
+
+        xmlAddChild(root, copyNode);
+        return copyNode;
+    }
+
     xmlNodePtr ensureSection(const char *name)
     {
         sanityCheckSectionName(name);
@@ -1106,16 +1855,64 @@ private:
         if (xml==nullptr) //means delete content
             return;
 
-        xmlParserCtxtPtr parserCtx = xmlCreateDocParserCtxt((const unsigned char *)xml);
-        if (!parserCtx)
-            throw MakeStringException(-1, "CEsdlScriptContext:setContent: Unable to init parse of %s XML content", section);
-        parserCtx->node = sect;
-        xmlParseDocument(parserCtx);
-        int wellFormed = parserCtx->wellFormed;
-        xmlFreeDoc(parserCtx->myDoc); //dummy document
-        xmlFreeParserCtxt(parserCtx);
-        if (!wellFormed)
-           throw MakeStringException(-1, "CEsdlScriptContext:setContent xml string: Unable to parse %s XML content", section);
+        xmlDocPtr contentDoc = xmlReadMemory(xml, strlen(xml), section, nullptr, hpccXpathParseOptions);
+        if (!contentDoc)
+            throw MakeStringException(-1, "CSectionalXmlDocModel:setContent xml string: Unable to parse %s XML content", section);
+
+        xmlNodePtr contentRoot = xmlDocGetRootElement(contentDoc);
+        if (!contentRoot)
+        {
+            xmlFreeDoc(contentDoc);
+            throw MakeStringException(-1, "CSectionalXmlDocModel:setContent xml string: Missing root node for %s XML content", section);
+        }
+
+        xmlNodePtr contentCopy = xmlDocCopyNode(contentRoot, doc, 1);
+        xmlFreeDoc(contentDoc);
+        if (!contentCopy)
+            throw MakeStringException(-1, "CSectionalXmlDocModel:setContent xml string: Unable to copy %s XML content", section);
+
+        xmlAddChild(sect, contentCopy);
+    }
+    virtual void appendContent(const char *section, const char *name, const char *xml) override
+    {
+        xmlNodePtr sect = ensureSection(section);
+
+        if (xml==nullptr)
+            return;
+        xmlNodePtr sectNode = getSectionNode(section, name);
+
+        xmlDocPtr doc = xmlParseDoc((const xmlChar *)xml);
+        if (!doc)
+            return;
+        xmlNodePtr content = xmlDocGetRootElement(doc);
+        if (!content)
+        {
+            xmlFreeDoc(doc);
+            return;
+        }
+        if (!sectNode)
+        {
+            xmlUnlinkNode(content);
+            if (!isEmptyString(name))
+                xmlNodeSetName(content, (const xmlChar *) name);
+            xmlAddChild(sect, content);
+            xmlFreeDoc(doc);
+            return;
+        }
+        xmlAttrPtr prop = content->properties;
+        while (prop != nullptr)
+        {
+            xmlChar *value = xmlGetProp(content, prop->name);
+            xmlSetProp(sectNode, prop->name, value);
+            xmlFree(value);
+            prop = prop->next;
+        }
+        for (xmlNodePtr node = xmlFirstElementChild(content); node != nullptr; node = xmlFirstElementChild(content))
+        {
+            xmlUnlinkNode(node);
+            xmlAddChild(sectNode, node);
+        }
+        xmlFreeDoc(doc);
     }
     virtual void setContent(const char *section, IPropertyTree *tree) override
     {
@@ -1152,6 +1949,30 @@ private:
         xmlFree(val);
         return s;
     }
+    virtual bool tokenize(const char *str, const char *delimeters, StringBuffer &resultPath)
+    {
+        xmlNodePtr sect = ensureSection("temporaries");
+        if (!sect)
+            return false;
+
+        StringBuffer unique("T");
+        appendGloballyUniqueId(unique);
+        xmlNodePtr container = xmlNewChild(sect, nullptr, (const xmlChar *) unique.str(), nullptr);
+        if (!container)
+            return false;
+
+        resultPath.set("/esdl_script_context/temporaries/").append(unique.str()).append("/token");
+
+        StringArray tkns;
+        tkns.appendList(str, delimeters);
+        ForEachItemIn(i, tkns)
+        {
+            const char *tkn = tkns.item(i);
+            xmlNewChild(container, nullptr, (const xmlChar *) "token", (const xmlChar *) tkn);
+        }
+        return true;
+    }
+
 
     virtual void toXML(StringBuffer &xml, const char *section, bool includeParentNode=false) override
     {
@@ -1165,12 +1986,13 @@ private:
 
         xmlOutputBufferPtr xmlOut = xmlAllocOutputBuffer(nullptr);
         xmlNodeDumpOutput(xmlOut, sect->doc, sect, 0, 1, nullptr);
-        xmlOutputBufferFlush(xmlOut);
-        xmlBufPtr buf = (xmlOut->conv != nullptr) ? xmlOut->conv : xmlOut->buffer;
-        if (xmlBufUse(buf))
-            xml.append(xmlBufUse(buf), (const char *)xmlBufContent(buf));
+        if (xmlOutputBufferFlush(xmlOut) >= 0)
+        {
+            xmlBufPtr buf = (xmlOut->conv != nullptr) ? xmlOut->conv : xmlOut->buffer;
+            if (xmlBufUse(buf))
+                xml.append(xmlBufUse(buf), (const char *)xmlBufContent(buf));
+        }
         xmlOutputBufferClose(xmlOut);
-
     }
     virtual IPropertyTree *createPTreeFromSection(const char *section) override
     {
@@ -1186,12 +2008,16 @@ private:
     {
         toXML(xml, nullptr, true);
     }
-    IXpathContext* createXpathContext(const char *section, bool strictParameterDeclaration) override
+    IXpathContext* createXpathContext(IXpathContext *primaryContext, const char *section, bool strictParameterDeclaration) override
     {
-        xmlNodePtr sect = getSectionNode(section);
-        if (!sect)
-            throw MakeStringException(-1, "CEsdlScriptContext:createXpathContext: section not found %s", section);
-        CLibXpathContext *xpathContext = new CLibXpathContext(doc, sect, strictParameterDeclaration);
+        xmlNodePtr sect = nullptr;
+        if (!isEmptyString(section))
+        {
+            sect = getSectionNode(section);
+            if (!sect)
+                throw MakeStringException(-1, "CSectionalXmlDocModel:createXpathContext: section not found %s", section);
+        }
+        CLibXpathContext *xpathContext = new CLibXpathContext(static_cast<CLibXpathContext *>(primaryContext), doc, sect, strictParameterDeclaration);
         StringBuffer val;
         xpathContext->addVariable("method", getAttribute("esdl", "method", val));
         xpathContext->addVariable("service", getAttribute("esdl", "service", val.clear()));
@@ -1204,14 +2030,207 @@ private:
 
         return xpathContext;
     }
+    IXpathContext *getCopiedSectionXpathContext(IXpathContext *primaryContext, const char *tgtSection, const char *srcSection, bool strictParameterDeclaration) override
+    {
+        ensureCopiedSection(tgtSection, srcSection, false);
+        return createXpathContext(primaryContext, tgtSection, strictParameterDeclaration);
+    }
+    virtual void cleanupTemporaries() override
+    {
+        removeSection("temporaries");
+    }
 };
 
-IEsdlScriptContext *createEsdlScriptContext(void * espCtx)
+ISectionalXmlDocModel *createSectionalXmlDocModel(void * userData)
 {
-    return new CEsdlScriptContext(espCtx);
+    return new CSectionalXmlDocModel(userData);
 }
 
 extern IXpathContext* getXpathContext(const char * xmldoc, bool strictParameterDeclaration, bool removeDocNamespaces)
 {
     return new CLibXpathContext(xmldoc, strictParameterDeclaration, removeDocNamespaces);
 }
+
+#ifdef _USE_CPPUNIT
+#include "unittests.hpp"
+
+class LibXml2XPathProcessorTests : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE( LibXml2XPathProcessorTests );
+        CPPUNIT_TEST(testWriteUTF8);
+        CPPUNIT_TEST(testAddXmlContentWellFormed);
+        CPPUNIT_TEST(testAddXmlContentMalformed);
+        CPPUNIT_TEST(testAddXmlContentBlocksExternalEntity);
+        CPPUNIT_TEST(testSetContentBlocksExternalEntity);
+    CPPUNIT_TEST_SUITE_END();
+
+    static constexpr const char * xxeCanaryFilename = "xmllib_xpath_xxe_canary.txt";
+    static constexpr const char * xxeCanaryContent  = "XPATH_XXE_CANARY";
+
+    static void removeIfExists(const char * filename)
+    {
+        Owned<IFile> f = createIFile(filename);
+        if (f->exists())
+            f->remove();
+    }
+
+    static void writeFile(const char * filename, const char * content)
+    {
+        Owned<IFile> f = createIFile(filename);
+        Owned<IFileIO> io = f->open(IFOcreate);
+        CPPUNIT_ASSERT_MESSAGE("Failed to create file for XXE tests", io != nullptr);
+        io->write(0, strlen(content), content);
+    }
+
+public:
+    void setUp() override
+    {
+        writeFile(xxeCanaryFilename, xxeCanaryContent);
+    }
+
+    void tearDown() override
+    {
+        removeIfExists(xxeCanaryFilename);
+    }
+
+    void testWriteUTF8()
+    {
+        bool failed = false;
+        if (!checkXmlWriterUtf8("testWriteUTF8", "an_element", R"!!!(contains "quoted" text)!!!"))
+            failed = true;
+        if (!checkXmlWriterUtf8("testWriteUTF8", "@an_attribute", R"!!!(contains "quoted" text)!!!"))
+            failed = true;
+        CPPUNIT_ASSERT(!failed);
+    }
+
+    // Regression tests for HPCC-35881: upgrading to libxml2 2.15.2.
+    // libxml2 2.15+ marks internal xmlParserCtxt struct members (node, wellFormed, myDoc) as
+    // deprecated. The old addXmlContent and setContent implementations accessed these
+    // directly, which violates the encapsulation of the library.
+    //
+    // These tests will verify that addXmlContent uses only public libxml2 APIs as the
+    // API is updated. The setContent function is already excercised in other unittests.
+
+    void testAddXmlContentWellFormed()
+    {
+        // Verify that a well-formed XML fragment is correctly parsed and added as a child
+        // of the current context node.
+        static constexpr const char* section = "content";
+        Owned<ISectionalXmlDocModel> scriptCtx(createScriptContext(section, "<root/>"));
+        Owned<IXpathContext> xpathCtx(createXPathContext(scriptCtx, section));
+
+        xpathCtx->addXmlContent("<child>text</child>");
+
+        StringBuffer result;
+        bool found = xpathCtx->evaluateAsString("child", result);
+        CPPUNIT_ASSERT_MESSAGE("addXmlContent: child node not found after insert", found);
+        CPPUNIT_ASSERT_EQUAL_MESSAGE("addXmlContent: child node content mismatch", std::string("text"), std::string(result.str()));
+    }
+
+    void testAddXmlContentMalformed()
+    {
+        // Verify that a malformed XML fragment causes an exception to be thrown
+        // with an appropriate error message, rather than silently corrupting the tree.
+        static constexpr const char* section = "content";
+        Owned<ISectionalXmlDocModel> scriptCtx(createScriptContext(section, "<root/>"));
+        Owned<IXpathContext> xpathCtx(createXPathContext(scriptCtx, section));
+
+        // Note: libxml2 reports an error for this test directly to stderr, but it is not a failure
+        CPPUNIT_ASSERT_THROWS_IEXCEPTION(xpathCtx->addXmlContent("<child>unclosed"), "addXmlContent: expected exception for malformed XML was not thrown");
+    }
+
+    // Regression tests: addXmlContent and setContent previously parsed with
+    // options=0, which happened to be safe only because entity substitution was never
+    // requested. They now explicitly pass XML_PARSE_NO_XXE. These tests confirm external
+    // SYSTEM entities are never resolved (no canary file content leaks into the tree),
+    // protecting this security invariant against future regression.
+    //
+    // Both tests share this helper, differing only in how the entity-bearing XML reaches
+    // the context (addXmlContent() vs. createScriptContext()'s initial content).
+    void assertExternalEntityBlocked(const char * elementName, const char * xpath, bool viaAddXmlContent)
+    {
+        StringBuffer canaryPath;
+        makeAbsolutePath(xxeCanaryFilename, canaryPath);
+
+        VStringBuffer xml(
+            "<?xml version=\"1.0\"?>"
+            "<!DOCTYPE %s ["
+            "  <!ENTITY xxe SYSTEM \"file://%s\">"
+            "]>"
+            "<%s>&xxe;</%s>",
+            elementName, canaryPath.str(), elementName, elementName);
+
+        static constexpr const char* section = "content";
+        Owned<ISectionalXmlDocModel> scriptCtx(createScriptContext(section, viaAddXmlContent ? "<root/>" : xml.str()));
+        Owned<IXpathContext> xpathCtx(createXPathContext(scriptCtx, section));
+
+        if (viaAddXmlContent)
+            xpathCtx->addXmlContent(xml.str());
+
+        StringBuffer result;
+        xpathCtx->evaluateAsString(xpath, result);
+        CPPUNIT_ASSERT_MESSAGE(
+            "external SYSTEM entity must not be resolved: canary content must be absent",
+            strstr(result.str(), xxeCanaryContent) == nullptr);
+    }
+
+    void testAddXmlContentBlocksExternalEntity()
+    {
+        assertExternalEntityBlocked("child", "child", true);
+    }
+
+    void testSetContentBlocksExternalEntity()
+    {
+        assertExternalEntityBlocked("root", ".", false);
+    }
+
+private:
+    ISectionalXmlDocModel* createScriptContext(const char* section, const char* content)
+    {
+        Owned<ISectionalXmlDocModel> ctx(createSectionalXmlDocModel(nullptr)); // context holds but does not use the usage parameter
+        ctx->setContent(section, content);
+        return ctx.getClear();
+    }
+    IXpathContext* createXPathContext(ISectionalXmlDocModel* scriptCtx, const char* section)
+    {
+        Owned<IXpathContext> xpathCtx;
+        try
+        {
+            xpathCtx.setown(scriptCtx->createXpathContext(nullptr, section, true));
+        }
+        catch (IException* e)
+        {
+            StringBuffer msg;
+            fprintf(stdout, "\nexception creating XPath context for section '%s' [%s]\n", section, e->errorMessage(msg).str());
+            throw;
+        }
+        catch (...)
+        {
+            fprintf(stdout, "\nunknown exception creating XPath context for section '%s'\n", section);
+            throw;
+        }
+        return xpathCtx.getClear();
+    }
+    bool checkXmlWriterUtf8(const char* test, const char* name, const char* value)
+    {
+        static constexpr const char* section = "writer";
+        Owned<ISectionalXmlDocModel>    scriptCtx(createScriptContext(section, "<this_node_is_required_to_satisfy_createXPathContext/>"));
+        Owned<IXpathContext>         xpathCtx(createXPathContext(scriptCtx, section));
+        Owned<IXmlWriter>            writer(xpathCtx->createXmlWriter());
+        StringBuffer                 stored;
+
+        writer->outputUtf8(rtlUtf8Length(unsigned(strlen(value)), value), value, name);
+        if (!xpathCtx->evaluateAsString(name, stored))
+            fprintf(stdout, "\n%s: evaluation of '%s' failed\n", test, name);
+        else if (!streq(stored, value))
+            fprintf(stdout, "\n%s: expected '%s' but got '%s'\n", test, value, stored.str());
+        else
+            return true;
+        return false;
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( LibXml2XPathProcessorTests );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( LibXml2XPathProcessorTests, "libxml2xpath" );
+
+#endif // _USE_CPPUNIT

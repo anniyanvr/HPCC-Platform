@@ -29,6 +29,7 @@
 
 #include "daaudit.hpp"
 #include "dadfs.hpp"
+#include "dafsaudit.hpp"
 #include "dalienv.hpp"
 #include "dasess.hpp"
 #include "dasds.hpp"
@@ -37,6 +38,8 @@
 #include "thexception.hpp"
 
 #include "workunit.hpp"
+
+#include "ws_dfsclient.hpp"
 
 #define CHECKPOINTSCOPE "checkpoints"
 #define TMPSCOPE "temporary"
@@ -61,7 +64,7 @@ class CFileManager : public CSimpleInterface, implements IThorFileManager
         // ii) It publishes immediately not when done!
         // iii) it is not removing existing physicals first
         // If we really want this, it should replicate when done somehow, and only publish at end.
-        Owned<IDistributedFile> file = lookup(job, logicalName, false, true, false, defaultPrivilegedUser);
+        Owned<IDistributedFile> file = lookup(job, logicalName, AccessMode::writeSequential, false, true, false, defaultPrivilegedUser);
         StringBuffer scopedName;
         addScope(job, logicalName, scopedName);
         if (group) // publishing
@@ -117,6 +120,9 @@ class CFileManager : public CSimpleInterface, implements IThorFileManager
             }
             else
             {
+                // NB: it is very unlikely this code has ever been used.
+                // The whole of fixTotal should be deleted at some point (see HPCC-33150)
+
                 // Check options to shrink 'large' tgtfile to this cluster size
                 const char *wideDestOptStr = globals->queryProp("@wideDestOpt");
                 if (wideDestOptStr)
@@ -196,7 +202,7 @@ class CFileManager : public CSimpleInterface, implements IThorFileManager
         }
     }
 
-    void remove(CJobBase &job, IDistributedFile &file, unsigned timeout=INFINITE)
+    void remove(CJobBase &job, IDistributedFile &file, unsigned timeout=INFINITE, const DFSAuditContext &auditCtx = DFSAuditContext{})
     {
         StringBuffer lfn;
         file.getLogicalName(lfn);
@@ -215,7 +221,7 @@ class CFileManager : public CSimpleInterface, implements IThorFileManager
         else
         {
             VStringBuffer blockedMsg("delete file '%s'", file.queryLogicalName());
-            auto func = [&file](unsigned timeout){ file.detach(timeout); return true; };
+            auto func = [&file, &auditCtx](unsigned timeout) { file.detach(timeout, nullptr, auditCtx); return true; };
             blockReportFunc<bool>(job, func, timeout, blockedMsg);
         }
     }
@@ -226,13 +232,6 @@ public:
     CFileManager()
     {
         replicateOutputs = globals->getPropBool("@replicateOutputs");
-
-        /* In nas/non-local storage mode, create a published named group for files to use
-         * that matches the width of the cluster.
-         * Also create a 1-way named group, that is used in special cases, e.g. BUILDINDEX,FEW
-         */
-        if (isContainerized())
-            queryNamedGroupStore().ensureNasGroup(queryClusterWidth());
     }
     StringBuffer &mangleLFN(CJobBase &job, const char *lfn, StringBuffer &out)
     {
@@ -252,24 +251,8 @@ public:
         }
         if (temporary)
         {
-            StringBuffer tail;
-            tmp.append(queryDfsXmlBranchName(DXB_Internal)).append("::");
-            const char *user = job.queryUser();
-            if (user && *user)
-                tmp.append(user).append("::");
-            if (paused)
-            {
-                tmp.append(PAUSETMPSCOPE);
-                CDfsLogicalFileName dfslfn;
-                dfslfn.set(logicalname);
-                dfslfn.getTail(tail);
-                logicalname = tail.str();
-            }
-            else
-                tmp.append(job.queryUseCheckpoints() ? CHECKPOINTSCOPE : TMPSCOPE);
-            tmp.append("::");
-
-            mangleLFN(job, logicalname, tmp);
+            // Mangling function shared with hthor
+            mangleTemporaryFileName(tmp, logicalname, job.queryWuid(), job.queryUser(), paused, job.queryUseCheckpoints());
         }
         else
         {
@@ -298,37 +281,26 @@ public:
     {
         Owned<IWorkUnit> wu = &job.queryWorkUnit().lock();
         wu->noteFileRead(file);
-
-        StringArray clusters;
-        file->getClusterNames(clusters);
-        StringBuffer outs;
-        outs.appendf(",FileAccess,Thor,%s,%s,%s,%s,%s,%s,%" I64F "d,%d",
-                        extended?"EXTEND":"READ",
-                        globals->queryProp("@nodeGroup"),
-                        job.queryUser(),
-                        file->queryLogicalName(),
-                        job.queryWuid(),
-                        job.queryGraphName(),
-                        file->getFileSize(false, false),clusters.ordinality());
-        ForEachItemIn(i,clusters) {
-            outs.append(',').append(clusters.item(i));
-        }
-        LOG(MCauditInfo,"%s",outs.str());
     }
 
-    IDistributedFile *timedLookup(CJobBase &job, CDfsLogicalFileName &lfn, bool write, bool privilegedUser=false, unsigned timeout=INFINITE)
+    IDistributedFile *timedLookup(CJobBase &job, CDfsLogicalFileName &lfn, AccessMode accessMode, bool privilegedUser=false, unsigned timeout=INFINITE, const DFSAuditContext &auditCtx = DFSAuditContext{}, IDistributedFileTransaction *transaction=nullptr)
     {
-        VStringBuffer blockedMsg("lock file '%s' for %s access", lfn.get(), write ? "WRITE" : "READ");
-        auto func = [&job, &lfn, write, privilegedUser](unsigned timeout) { return queryDistributedFileDirectory().lookup(lfn, job.queryUserDescriptor(), write, false, false, nullptr, privilegedUser, timeout); };
+        auto func = [&job, &lfn, accessMode, privilegedUser, &auditCtx, transaction](unsigned timeout)
+        {
+            return wsdfs::lookup(lfn, job.queryUserDescriptor(), accessMode, false, false, transaction, privilegedUser, timeout, auditCtx);
+        };
+
+        VStringBuffer blockedMsg("lock file '%s' for %s access", lfn.get(), isWrite(accessMode) ? "WRITE" : "READ");
         return blockReportFunc<IDistributedFile *>(job, func, timeout, blockedMsg);
     }
-    IDistributedFile *timedLookup(CJobBase &job, const char *logicalName, bool write, bool privilegedUser=false, unsigned timeout=INFINITE)
+    
+    IDistributedFile *timedLookup(CJobBase &job, const char *logicalName, AccessMode accessMode, bool privilegedUser=false, unsigned timeout=INFINITE, const DFSAuditContext &auditCtx = DFSAuditContext{}, IDistributedFileTransaction *transaction=nullptr)
     {
         CDfsLogicalFileName lfn;
         lfn.set(logicalName);
-        return timedLookup(job, lfn, write, privilegedUser, timeout);
+        return timedLookup(job, lfn, accessMode, privilegedUser, timeout, auditCtx, transaction);
     }
-    IDistributedFile *lookup(CJobBase &job, const char *logicalName, bool temporary, bool optional, bool reportOptional, bool privilegedUser, bool updateAccessed=true)
+    IDistributedFile *lookup(CJobBase &job, const char *logicalName, AccessMode mode, bool temporary, bool optional, bool reportOptional, bool privilegedUser, IDistributedFileTransaction *transaction=nullptr, bool updateAccessed=true)
     {
         StringBuffer scopedName;
         bool paused = false;
@@ -348,7 +320,7 @@ public:
         if (fileMapping)
             return &fileMapping->get();
 
-        Owned<IDistributedFile> file = timedLookup(job, scopedName.str(), false, privilegedUser, job.queryMaxLfnBlockTimeMins() * 60000);
+        Owned<IDistributedFile> file = timedLookup(job, scopedName.str(), mode, privilegedUser, job.queryMaxLfnBlockTimeMins() * 60000, job.queryBaseAuditContext(), transaction);
         if (file && 0 == file->numParts())
         {
             if (file->querySuperFile())
@@ -367,7 +339,7 @@ public:
                 throw MakeStringException(TE_MachineOrderNotFound, "Missing logical file %s\n", scopedName.str());
             if (reportOptional)
             {
-                Owned<IThorException> e = MakeThorException(TE_MissingOptionalFile, "Input file '%s' was missing but declared optional", scopedName.str());
+                Owned<IThorException> e = MakeThorException(ENGINEERR_MISSING_OPTIONAL_FILE, "Input file '%s' was missing but declared optional", scopedName.str());
                 e->setAction(tea_warning);
                 e->setSeverity(SeverityWarning);
                 reportExceptionToWorkunitCheckIgnore(job.queryWorkUnit(), e);
@@ -388,7 +360,7 @@ public:
         bool extend = 0 != (helperFlags&TDWextend);
         bool jobTemp = 0 != (helperFlags&TDXjobtemp);
 
-        LOG(MCdebugInfo, thorJob, "createLogicalFile ( %s )", logicalName);
+        LOG(MCdebugInfo, "createLogicalFile ( %s )", logicalName);
 
         Owned<IDistributedFile> efile;
         CDfsLogicalFileName dlfn;
@@ -398,7 +370,7 @@ public:
                 throw MakeStringException(99, "Cannot publish %s, invalid logical name", logicalName);
             if (dlfn.isForeign())
                 throw MakeStringException(99, "Cannot publish to a foreign Dali: %s", logicalName);
-            efile.setown(timedLookup(job, dlfn, true, true, job.queryMaxLfnBlockTimeMins() * 60000));
+            efile.setown(timedLookup(job, dlfn, AccessMode::erase, true, job.queryMaxLfnBlockTimeMins() * 60000));
             if (efile)
             {
                 if (!extend && !overwriteok)
@@ -426,48 +398,13 @@ public:
                     }
                 }
                 if (found)
-                {
                     workunit->releaseFile(logicalName);
-                    Owned<IDistributedFile> f = timedLookup(job, dlfn, false, true, job.queryMaxLfnBlockTimeMins() * 60000);
-                    if (f)
-                    {
-                        unsigned p, parts = f->numParts();
-                        for (p=0; p<parts; p++)
-                        {
-                            Owned<IDistributedFilePart> part = f->getPart(p);
-                            offset_t sz = part->getFileSize(false, false);
-                            if ((offset_t)-1 != sz)
-                                job.addNodeDiskUsage(p, -(__int64)sz);
-                        }
-                    }
-                }
             }
             if (efile.get())
             {
-                __int64 fs = efile->getFileSize(false,false);
-                StringArray clusters;
-                unsigned c=0;
-                for (; c<efile->numClusters(); c++)
-                {
-                    StringBuffer clusterName;
-                    efile->getClusterName(c, clusterName);
-                    clusters.append(clusterName);
-                }
-                remove(job, *efile, job.queryMaxLfnBlockTimeMins() * 60000);
+                remove(job, *efile, job.queryMaxLfnBlockTimeMins() * 60000, job.queryBaseAuditContext());
                 efile.clear();
-                efile.setown(timedLookup(job, dlfn, true, true, job.queryMaxLfnBlockTimeMins() * 60000));
-                if (!efile.get())
-                {
-                    ForEachItemIn(c, clusters)
-                    {
-                        LOG(MCauditInfo,",FileAccess,Thor,DELETED,%s,%s,%s,%s,%s,%" I64F "d,%s",
-                                        globals->queryProp("@name"),
-                                        userStr.str(),
-                                        logicalName,
-                                        wuidStr.str(),
-                                        job.queryGraphName(),fs,clusters.item(c));
-                    }
-                }
+                efile.setown(timedLookup(job, dlfn, AccessMode::erase, true, job.queryMaxLfnBlockTimeMins() * 60000));
             }
         }
         Owned<IFileDescriptor> desc;
@@ -478,69 +415,60 @@ public:
             desc.setown(createFileDescriptor());
             if (temporary)
                 desc->queryProperties().setPropBool("@temporary", temporary);
+            else
+                desc->setTraceName(logicalName);
             if (persistent)
                 desc->queryProperties().setPropBool("@persistent", persistent);
             desc->queryProperties().setProp("@workunit", wuidStr.str());
             desc->queryProperties().setProp("@job", jobStr.str());
             desc->queryProperties().setProp("@owner", userStr.str());
 
-            // if supporting different OS's in CLUSTER this should be checked where addCluster called
-            DFD_OS os = DFD_OSdefault;
-            EnvMachineOS thisOs = queryOS(groups.item(0).queryNode(0).endpoint());
-            switch (thisOs)
-            {
-                case MachineOsW2K:
-                    os = DFD_OSwindows;
-                    break;
-                case MachineOsLinux:
-                case MachineOsSolaris:
-                    os = DFD_OSunix;
-                    break;
-                default:
-                    break;
-            };
-
-            unsigned offset = 0;
             unsigned total;
             if (restrictedWidth)
                 total = restrictedWidth;
-            else
+            else if (job.getOptBool("legacyLFNTargetWidth"))
+            {
+                unsigned offset; // set by fixTotal (always 0), but never used.
                 total = fixTotal(job, groups, offset);
+            }
+            else
+                total = job.querySlaves();
             if (nonLocalIndex)
                 ++total;
             StringBuffer dir;
+            bool dirPerPart = false;
             if (temporary && !job.queryUseCheckpoints()) 
-                dir.append(queryTempDir(false));
+                dir.append(queryTempDir());
             else
             {
+                StringBuffer planeDir;
                 // NB: always >= 1 groupNames
-                StringBuffer curDir;
                 ForEachItemIn(gn, groupNames)
                 {
-#ifdef _CONTAINERIZED
-                    if (!globals->getPropBool("@_dafsStorage"))
+                    Owned<const IStoragePlane> plane = getDataStoragePlane(groupNames.item(gn), true);
+                    StringBuffer thisPlaneDir(plane->queryPrefix());
+                    bool thisDirPerPart = plane->queryDirPerPart();
+                    if (!planeDir.length()) // 1st output plane
                     {
-                        Owned<IStoragePlane> plane = getStoragePlane(groupNames.item(gn), true);
-                        curDir.append(plane->queryPrefix());
+                        planeDir.swapWith(thisPlaneDir);
+                        dirPerPart = thisDirPerPart;
                     }
-#else
-                    if (!getConfigurationDirectory(globals->queryPropTree("Directories"), "data", "thor", groupNames.item(gn), curDir))
-                        makePhysicalPartName(logicalName, 0, 0, curDir, 0, os); // legacy
-#endif
-                    if (!dir.length())
-                        dir.swapWith(curDir);
                     else
                     {
-                        if (!streq(curDir, dir))
-                            throw MakeStringException(0, "When targeting multiple clusters on a write, the clusters must have the same target directory");
-                        curDir.clear();
+                        // 2nd+ output plane
+                        if (!streq(thisPlaneDir, planeDir))
+                            throw makeStringException(0, "When targeting multiple clusters on a write, the clusters must have the same target directory");
+                        if (thisDirPerPart != dirPerPart)
+                            throw makeStringException(0, "When targeting multiple clusters on a write, all clusters must have the same subDirPerFilePart value");
                     }
                 }
-                curDir.swapWith(dir);
                 // places logical filename directory in 'dir'
-                makePhysicalPartName(logicalName, 0, 0, dir, false, os, curDir.str());
+                getLFNDirectoryUsingBaseDir(dir, logicalName, planeDir.str());
             }
             desc->setDefaultDir(dir.str());
+
+            if (job.getOptBool("subDirPerFilePart", dirPerPart) && total>1)
+                desc->setFlags(FileDescriptorFlags::dirperpart);
 
             StringBuffer partmask;
             getPartMask(partmask,logicalName,total);
@@ -566,10 +494,12 @@ public:
 
     void publish(CJobBase &job, const char *logicalName, IFileDescriptor &fileDesc, Owned<IDistributedFile> *publishedFile=NULL)
     {
+        DFSAuditContext baseAuditContext = job.queryBaseAuditContext();
+
         IPropertyTree &props = fileDesc.queryProperties();
         bool temporary = props.getPropBool("@temporary");
         if (!temporary || job.queryUseCheckpoints())
-            queryDistributedFileDirectory().removeEntry(logicalName, job.queryUserDescriptor());
+            queryDistributedFileDirectory().removeEntry(logicalName, job.queryUserDescriptor(), nullptr, INFINITE, false, baseAuditContext);
         // thor clusters are backed up so if replicateOutputs set *always* assume a replicate
         if (replicateOutputs && (!temporary || job.queryUseCheckpoints()))
         {
@@ -582,32 +512,9 @@ public:
             fileMap.replace(*new CIDistributeFileMapping(logicalName, *LINK(file))); // cache takes ownership
             return;
         }
-        file->setAccessed();
         if (publishedFile)
             publishedFile->set(file);
-        __int64 fs = file->getFileSize(false,false);
-        if (fs!=-1)
-            file->queryAttributes().setPropInt64("@size",fs);
-        if (file->isCompressed())
-        {
-            fs = file->getDiskSize(false,false);
-            if (fs!=-1)
-                file->queryAttributes().setPropInt64("@compressedSize",fs);
-        }
-        file->attach(logicalName, job.queryUserDescriptor());
-        unsigned c=0;
-        for (; c<fileDesc.numClusters(); c++)
-        {
-            StringBuffer clusterName;
-            fileDesc.getClusterGroupName(c, clusterName, &queryNamedGroupStore());
-            LOG(MCauditInfo,",FileAccess,Thor,CREATED,%s,%s,%s,%s,%s,%" I64F "d,%s",
-                            globals->queryProp("@nodeGroup"),
-                            job.queryUser(),
-                            file->queryLogicalName(),
-                            job.queryWuid(),
-                            job.queryGraphName(),
-                            fs,clusterName.str());
-        }
+        file->attach(logicalName, job.queryUserDescriptor(), baseAuditContext);
     }
 
     StringBuffer &getPublishPhysicalName(CJobBase &job, const char *logicalName, unsigned partno, StringBuffer &res)
@@ -622,7 +529,7 @@ public:
 
     unsigned __int64 getFileOffset(CJobBase &job, const char *logicalName, unsigned partno)
     {
-        Owned<IDistributedFile> file = lookup(job, logicalName, false, false, false, defaultPrivilegedUser);
+        Owned<IDistributedFile> file = lookup(job, logicalName, AccessMode::readLogicalMeta, false, false, false, defaultPrivilegedUser, nullptr);
         StringBuffer scopedName;
         addScope(job, logicalName, scopedName);
         if (!file)

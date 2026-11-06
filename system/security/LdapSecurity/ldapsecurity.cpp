@@ -17,11 +17,14 @@
 
 #define AXA_API DECL_EXPORT
 
+#include <memory>
+
 #include "ldapsecurity.ipp"
 #include "ldapsecurity.hpp"
 #include "authmap.ipp"
 #include "digisign.hpp"
 #include "caching.hpp"
+#include "dautils.hpp"
 
 using namespace cryptohelper;
 
@@ -41,8 +44,6 @@ CLdapSecUser::CLdapSecUser(const char *name, const char *pw) :
     setName(name);
     setUserID(0);
     setPosixenabled(false);
-    setSudoersEnabled(false);
-    setInSudoers(false);
     setSessionToken(0);
     setSignature(nullptr);
 }
@@ -474,10 +475,7 @@ bool CLdapSecResourceList::copyTo(ISecResourceList& destination)
 ISecResource* CLdapSecResourceList::addResource(const char * name)
 {
     if(!name || !*name)
-    {
-        DBGLOG("CLdapSecResourceList::addResource resource name must be provided");
         return NULL;
-    }
 
     ISecResource* resource = m_rmap[name];
     if(resource == NULL)
@@ -493,16 +491,11 @@ ISecResource* CLdapSecResourceList::addResource(const char * name)
 void CLdapSecResourceList::addResource(ISecResource * resource)
 {
     if(resource == NULL)
-    {
-        DBGLOG("CLdapSecResourceList::addResource2 ISecResource cannot be NULL");
         return;
-    }
+
     const char* name = resource->getName();
     if(!name || !*name)
-    {
-        DBGLOG("CLdapSecResourceList::addResource2 resource name must be provided");
         return;
-    }
 
     ISecResource* r = m_rmap[name];
     if(r == NULL)
@@ -520,10 +513,7 @@ bool CLdapSecResourceList::addCustomResource(const char * name, const char * con
 ISecResource * CLdapSecResourceList::getResource(const char * Resource)
 {
     if(!Resource || !*Resource)
-    {
-        DBGLOG("CLdapSecResourceList::getResource resource name must be provided");
         return NULL;
-    }
 
     ISecResource* r = m_rmap[Resource];
     if(r)
@@ -537,7 +527,7 @@ void CLdapSecResourceList::clear()
     m_rlist.kill();
 }
 
-int CLdapSecResourceList::count()
+unsigned CLdapSecResourceList::count()
 {
     return m_rlist.length();
 }
@@ -563,11 +553,9 @@ ISecPropertyIterator * CLdapSecResourceList::getPropertyItr()
 ISecProperty* CLdapSecResourceList::findProperty(const char* name)
 {
     if(!name || !*name)
-    {
-        DBGLOG("CLdapSecResourceList::findProperty property name must be provided");
         return NULL;
-    }
-    return m_rmap[name];
+
+        return m_rmap[name];
 }
 
 
@@ -604,15 +592,10 @@ void CLdapSecManager::init(const char *serviceName, IPropertyTree* cfg)
     IPermissionProcessor* pp;
     if(ldap_client->getServerType() == ACTIVE_DIRECTORY)
         pp = new PermissionProcessor(cfg);
-    else if(ldap_client->getServerType() == IPLANET)
+    else if(ldap_client->getServerType() == IPLANET || ldap_client->getServerType() == LDAP_389DS)
         pp = new CIPlanetAciProcessor(cfg);
     else if(ldap_client->getServerType() == OPEN_LDAP)
-    {
-        if (0 == stricmp(ldap_client->getLdapConfig()->getCfgServerType(), "389DirectoryServer"))//uses iPlanet style ACI
-            pp = new CIPlanetAciProcessor(cfg);
-        else
-            pp = new COpenLdapAciProcessor(cfg);
-    }
+        pp = new COpenLdapAciProcessor(cfg);
     else
         throwUnexpected();
 
@@ -621,18 +604,16 @@ void CLdapSecManager::init(const char *serviceName, IPropertyTree* cfg)
 
     m_ldap_client.setown(ldap_client);
     m_pp.setown(pp);
-    int cacheTimeoutMinutes = cfg->getPropInt("@cacheTimeout", DEFAULT_RESOURCE_CACHE_TIMEOUT_MINUTES);//config value is in minutes
+    unsigned cacheTimeoutMinutes = cfg->getPropInt("@cacheTimeout", DEFAULT_RESOURCE_CACHE_TIMEOUT_MINUTES);//config value is in minutes
 
     if (cfg->getPropBool("@sharedCache", true))
-        m_permissionsCache.setown(CPermissionsCache::getInstance(cfg->queryProp("@name")));
+        m_permissionsCache.setown(CPermissionsCache::getInstance(cfg->queryProp("@name"), this, cacheTimeoutMinutes));
     else
-        m_permissionsCache.setown(new CPermissionsCache());
+        m_permissionsCache.setown(new CPermissionsCache(this, cacheTimeoutMinutes));
 
-    m_permissionsCache->setCacheTimeout( 60 * cacheTimeoutMinutes);
-    m_permissionsCache->setTransactionalEnabled(true);
-    m_permissionsCache->setSecManager(this);
     m_passwordExpirationWarningDays = cfg->getPropInt(".//@passwordExpirationWarningDays", 10); //Default to 10 days
     m_checkViewPermissions = cfg->getPropBool(".//@checkViewPermissions", false);
+    m_hpccInternalScope.set(queryDfsXmlBranchName(DXB_Internal)).append("::");//HpccInternal::
 };
 
 
@@ -689,10 +670,7 @@ bool CLdapSecManager::unsubscribe(ISecAuthenticEvents & events, IEspSecureContex
 bool CLdapSecManager::authenticate(ISecUser* user)
 {
     if(!user)
-    {
-        DBGLOG("CLdapSecManager::authenticate user cannot be NULL");
         return false;
-    }
 
     bool isCaching = m_permissionsCache->isCacheEnabled() && !m_usercache_off;//caching enabled?
     bool isUserCached = false;
@@ -789,6 +767,53 @@ bool CLdapSecManager::authenticate(ISecUser* user)
     return AS_AUTHENTICATED == user->getAuthenticateStatus();
 }
 
+bool CLdapSecManager::authorizeResourceList(SecResourceType rtype, ISecUser& sec_user, IArrayOf<ISecResource>& rlist)
+{
+    return authorizeResourceList(rtype, sec_user, rlist, nullptr);
+}
+
+bool CLdapSecManager::authorizeResourceList(SecResourceType rtype, ISecUser& sec_user, IArrayOf<ISecResource>& rlist, const char* resName)
+{
+    int nResources = rlist.length();
+    for (int ri = 0; ri < nResources; ri++)
+    {
+        ISecResource* res = &rlist.item(ri);
+        if (res != NULL)
+            res->setResourceType(rtype);
+    }
+
+    if (nResources <= 0)
+        return true;
+
+    if (!m_permissionsCache->isCacheEnabled() || m_cache_off[rtype])
+        return m_ldap_client->authorize(rtype, sec_user, rlist, resName);
+
+    // Heap-allocate the "found in cache" flags instead of using alloca(), which sized the
+    // buffer directly from caller-supplied input and could exhaust the stack for very large
+    // resource lists.
+    auto cachedFound = std::make_unique<bool[]>(nResources);
+    int nFound = m_permissionsCache->lookup(sec_user, rlist, cachedFound.get());
+    if (nFound >= nResources)
+        return true;
+
+    IArrayOf<ISecResource> uncached;
+    for (int i = 0; i < nResources; i++)
+    {
+        if (!cachedFound[i])
+        {
+            ISecResource& secRes = rlist.item(i);
+            secRes.Link();
+            uncached.append(secRes);
+            //DBGLOG("CACHE: Fetching permissions for %s:%s", sec_user.getName(), secRes.getName());
+        }
+    }
+
+    bool rc = m_ldap_client->authorize(rtype, sec_user, uncached);
+    if (rc)
+        m_permissionsCache->add(sec_user, uncached);
+    return rc;
+}
+
 bool CLdapSecManager::authorizeEx(SecResourceType rtype, ISecUser& sec_user, ISecResourceList * Resources, IEspSecureContext* secureContext)
 {
     if(!authenticate(&sec_user))
@@ -799,53 +824,8 @@ bool CLdapSecManager::authorizeEx(SecResourceType rtype, ISecUser& sec_user, ISe
     CLdapSecResourceList * reslist = (CLdapSecResourceList*)Resources;
     if(!reslist)
         return true;
-    IArrayOf<ISecResource>& rlist = reslist->getResourceList();
-    int nResources = rlist.length();
-    int ri;
-    for(ri = 0; ri < nResources; ri++)
-    {
-        ISecResource* res = &rlist.item(ri);
-        if(res != NULL)
-            res->setResourceType(rtype);
-    }
 
-    if (nResources <= 0)
-        return true;
-
-    bool rc;
-
-    time_t tctime = getThreadCreateTime();
-    if ((m_permissionsCache->isCacheEnabled() || (m_permissionsCache->isTransactionalEnabled() && tctime > 0)) && (!m_cache_off[rtype]))
-    {
-        bool* cached_found = (bool*)alloca(nResources*sizeof(bool));
-        int nFound = m_permissionsCache->lookup(sec_user, rlist, cached_found);
-        if (nFound < nResources)
-        {
-            IArrayOf<ISecResource> rlist2;
-            int i;
-            for (i=0; i < nResources; i++)
-            {
-                if (*(cached_found+i) == false)
-                {
-                    ISecResource& secRes = rlist.item(i);
-                    secRes.Link();
-                    rlist2.append(secRes);
-                    //DBGLOG("CACHE: Fetching permissions for %s:%s", sec_user.getName(), secRes.getName());
-                }
-            }
-
-            rc = m_ldap_client->authorize(rtype, sec_user, rlist2);
-            if (rc)
-                m_permissionsCache->add(sec_user, rlist2);
-        }
-        else
-            rc = true;  
-    }
-    else
-    {
-        rc = m_ldap_client->authorize(rtype, sec_user, rlist, reslist->getName());
-    }
-    return rc;
+    return authorizeResourceList(rtype, sec_user, reslist->getResourceList(), reslist->getName());
 }
 
 SecAccessFlags CLdapSecManager::authorizeEx(SecResourceType rtype, ISecUser & user, const char * resourcename, IEspSecureContext* secureContext)
@@ -874,53 +854,8 @@ bool CLdapSecManager::authorizeEx(SecResourceType rtype, ISecUser& sec_user, ISe
     CLdapSecResourceList * reslist = (CLdapSecResourceList*)Resources;
     if(!reslist)
         return true;
-    IArrayOf<ISecResource>& rlist = reslist->getResourceList();
-    int nResources = rlist.length();
-    int ri;
-    for(ri = 0; ri < nResources; ri++)
-    {
-        ISecResource* res = &rlist.item(ri);
-        if(res != NULL)
-            res->setResourceType(rtype);
-    }
 
-    if (nResources <= 0)
-        return true;
-
-    bool rc;
-
-    time_t tctime = getThreadCreateTime();
-    if ((m_permissionsCache->isCacheEnabled() || (m_permissionsCache->isTransactionalEnabled() && tctime > 0)) && (!m_cache_off[rtype]))
-    {
-        bool* cached_found = (bool*)alloca(nResources*sizeof(bool));
-        int nFound = m_permissionsCache->lookup(sec_user, rlist, cached_found);
-        if (nFound < nResources)
-        {
-            IArrayOf<ISecResource> rlist2;
-            int i;
-            for (i=0; i < nResources; i++)
-            {
-                if (*(cached_found+i) == false)
-                {
-                    ISecResource& secRes = rlist.item(i);
-                    secRes.Link();
-                    rlist2.append(secRes);
-                    //DBGLOG("CACHE: Fetching permissions for %s:%s", sec_user.getName(), secRes.getName());
-                }
-            }
-
-            rc = m_ldap_client->authorize(rtype, sec_user, rlist2);
-            if (rc)
-                m_permissionsCache->add(sec_user, rlist2);
-        }
-        else
-            rc = true;  
-    }
-    else
-    {
-        rc = m_ldap_client->authorize(rtype, sec_user, rlist);
-    }
-    return rc;
+    return authorizeResourceList(rtype, sec_user, reslist->getResourceList());
 }
 
 SecAccessFlags CLdapSecManager::authorizeEx(SecResourceType rtype, ISecUser & user, const char * resourcename, bool doAuthentication)
@@ -951,54 +886,8 @@ SecAccessFlags CLdapSecManager::getAccessFlagsEx(SecResourceType rtype, ISecUser
     CLdapSecResourceList * reslist = (CLdapSecResourceList*)rlist0.get();
     if(!reslist)
         return SecAccess_Unavailable;
-    IArrayOf<ISecResource>& rlist = reslist->getResourceList();
-    int nResources = rlist.length();
-    int ri;
-    for(ri = 0; ri < nResources; ri++)
-    {
-        ISecResource* res = &rlist.item(ri);
-        if(res != NULL)
-            res->setResourceType(rtype);
-    }
 
-    if (nResources <= 0)
-        return SecAccess_Unavailable;
-
-    bool ok = false;
-
-    time_t tctime = getThreadCreateTime();
-    if ((m_permissionsCache->isCacheEnabled() || (m_permissionsCache->isTransactionalEnabled() && tctime > 0)) && (!m_cache_off[rtype]))
-    {
-        bool* cached_found = (bool*)alloca(nResources*sizeof(bool));
-        int nFound = m_permissionsCache->lookup(user, rlist, cached_found);
-        if (nFound < nResources)
-        {
-            IArrayOf<ISecResource> rlist2;
-            int i;
-            for (i=0; i < nResources; i++)
-            {
-                if (*(cached_found+i) == false)
-                {
-                    ISecResource& secRes = rlist.item(i);
-                    secRes.Link();
-                    rlist2.append(secRes);
-                    //DBGLOG("CACHE: Fetching permissions for %s:%s", sec_user.getName(), secRes.getName());
-                }
-            }
-
-            ok = m_ldap_client->authorize(rtype, user, rlist2);
-            if (ok)
-                m_permissionsCache->add(user, rlist2);
-        }
-        else
-            ok = true;  
-    }
-    else
-    {
-        ok = m_ldap_client->authorize(rtype, user, rlist);
-    }
-
-    //bool ok = authorizeEx(rtype, user, rlist.get());
+    bool ok = authorizeResourceList(rtype, user, reslist->getResourceList());
     if(ok)
         return rlist0->queryResource(0)->getAccessFlags();
     else
@@ -1015,6 +904,19 @@ SecAccessFlags CLdapSecManager::authorizeFileScope(ISecUser & user, const char *
 {
     if(filescope == 0 || filescope[0] == '\0')
         return SecAccess_Full;
+
+    //Preprocess "HpccInternal::" scopes, since they are not managed by LDAP
+    //Grant user access to their own hpccinternal::<user> scope, deny if anything else
+    if(startsWithIgnoreCase(filescope, m_hpccInternalScope.str()))
+    {
+        StringBuffer userName;
+        for (const char * p = &filescope[m_hpccInternalScope.length()]; *p && *p != ':'; p++)//extract scope username
+            userName.append(*p);
+        if(strieq(userName.str(), user.getName()) || isSuperUser(&user))
+            return SecAccess_Full;
+        PROGLOG("Access denied to scope %s for user %s", filescope, user.getName());
+        return SecAccess_None;
+    }
 
     StringBuffer managedFilescope;
     if(m_permissionsCache->isCacheEnabled() && !m_usercache_off)
@@ -1157,10 +1059,7 @@ ISecUser * CLdapSecManager::lookupUser(unsigned uid, IEspSecureContext* secureCo
 ISecUser * CLdapSecManager::findUser(const char * username, IEspSecureContext* secureContext)
 {
     if(username == NULL || strlen(username) == 0)
-    {
-        DBGLOG("findUser - username is empty");
         return NULL;
-    }
 
     Owned<ISecUser> user;
     user.setown(createUser(username, secureContext));
@@ -1189,7 +1088,7 @@ ISecUser * CLdapSecManager::findUser(const char * username, IEspSecureContext* s
 
 ISecUserIterator * CLdapSecManager::getAllUsers(IEspSecureContext* secureContext)
 {
-    synchronized block(m_monitor);
+    MonitorBlock block(m_monitor);
     m_user_array.popAll(true);
     m_ldap_client->retrieveUsers(m_user_array);
     return new ArrayIIteratorOf<IUserArray, ISecUser, ISecUserIterator>(m_user_array);
@@ -1236,10 +1135,7 @@ ISecItemIterator* CLdapSecManager::getResourcePermissionsSorted(const char* name
 void CLdapSecManager::setExtraParam(const char * name, const char * value, IEspSecureContext* secureContext)
 {
     if(name == NULL || name[0] == '\0')
-    {
-        DBGLOG("CLdapSecManager::setExtraParam name must be provided");
         return;
-    }
 
     if (!m_extraparams)
         m_extraparams.setown(createProperties(false));
@@ -1259,8 +1155,7 @@ IAuthMap * CLdapSecManager::createAuthMap(IPropertyTree * authconfig, IEspSecure
 {
     CAuthMap* authmap = new CAuthMap();
 
-    IPropertyTreeIterator *loc_iter = NULL;
-    loc_iter = authconfig->getElements(".//Location");
+    Owned<IPropertyTreeIterator> loc_iter(authconfig->getElements(".//Location"));
     if (loc_iter != NULL)
     {
         IPropertyTree *location = NULL;
@@ -1295,8 +1190,6 @@ IAuthMap * CLdapSecManager::createAuthMap(IPropertyTree * authconfig, IEspSecure
             }
             loc_iter->next();
         }
-        loc_iter->Release();
-        loc_iter = NULL;
     }
 
     authmap->shareWithManager(*this, secureContext);
@@ -1309,8 +1202,7 @@ IAuthMap * CLdapSecManager::createFeatureMap(IPropertyTree * authconfig, IEspSec
 {
     CAuthMap* feature_authmap = new CAuthMap();
 
-    IPropertyTreeIterator *feature_iter = NULL;
-    feature_iter = authconfig->getElements(".//Feature");
+    Owned<IPropertyTreeIterator> feature_iter(authconfig->getElements(".//Feature"));
     if (feature_iter != NULL)
     {
         IPropertyTree *feature = NULL;
@@ -1342,8 +1234,6 @@ IAuthMap * CLdapSecManager::createFeatureMap(IPropertyTree * authconfig, IEspSec
             }
             feature_iter->next();
         }
-        feature_iter->Release();
-        feature_iter = NULL;
     }
 
     feature_authmap->shareWithManager(*this, secureContext);
@@ -1404,6 +1294,11 @@ void CLdapSecManager::addGroup(const char* groupname, const char * groupOwner, c
     m_ldap_client->addGroup(groupname, groupOwner, groupDesc);
 }
 
+void CLdapSecManager::addGroup(const char* groupname, const char * groupOwner, const char * groupDesc, const char* basedn)
+{
+    m_ldap_client->addGroup(groupname, groupOwner, groupDesc, basedn);
+}
+
 void CLdapSecManager::deleteGroup(const char* groupname)
 {
     m_ldap_client->deleteGroup(groupname);
@@ -1411,7 +1306,13 @@ void CLdapSecManager::deleteGroup(const char* groupname)
 
 bool CLdapSecManager::changePermission(CPermissionAction& action)
 {
-    return m_ldap_client->changePermission(action);
+    bool ret = m_ldap_client->changePermission(action);
+    if (ret)
+    {
+        if (m_permissionsCache->isCacheEnabled())
+            m_permissionsCache->remove(action.m_rtype, action.m_rname.str());
+    }
+    return ret;
 }
 
 void CLdapSecManager::getGroups(const char* username, StringArray & groups)
@@ -1422,6 +1323,12 @@ void CLdapSecManager::getGroups(const char* username, StringArray & groups)
 void CLdapSecManager::changeUserGroup(const char* action, const char* username, const char* groupname)
 {
     m_ldap_client->changeUserGroup(action, username, groupname);
+    m_permissionsCache->removePermissions(username);
+}
+
+void CLdapSecManager::changeGroupMember(const char* action, const char* groupdn, const char* userdn)
+{
+    m_ldap_client->changeGroupMember(action, groupdn, userdn);
 }
 
 bool CLdapSecManager::deleteUser(ISecUser* user)
@@ -1438,8 +1345,7 @@ void CLdapSecManager::deleteResource(SecResourceType rtype, const char * name, c
 {
     m_ldap_client->deleteResource(rtype, name, basedn);
 
-    time_t tctime = getThreadCreateTime();
-    if ((m_permissionsCache->isCacheEnabled() || (m_permissionsCache->isTransactionalEnabled() && tctime > 0)) && (!m_cache_off[rtype]))
+    if (m_permissionsCache->isCacheEnabled() && !m_cache_off[rtype])
         m_permissionsCache->remove(rtype, name);
 }
 
@@ -1447,8 +1353,7 @@ void CLdapSecManager::renameResource(SecResourceType rtype, const char * oldname
 {
     m_ldap_client->renameResource(rtype, oldname, newname, basedn);
 
-    time_t tctime = getThreadCreateTime();
-    if ((m_permissionsCache->isCacheEnabled() || (m_permissionsCache->isTransactionalEnabled() && tctime > 0)) && (!m_cache_off[rtype]))
+    if (m_permissionsCache->isCacheEnabled() && !m_cache_off[rtype])
         m_permissionsCache->remove(rtype, oldname);
 }
 
@@ -1496,25 +1401,6 @@ bool CLdapSecManager::getUserInfo(ISecUser& user, const char* infotype)
     return m_ldap_client->getUserInfo(user, infotype);
 }
 
-bool CLdapSecManager::createUserScopes(IEspSecureContext* secureContext)
-{
-    Owned<ISecUserIterator> it = getAllUsers(secureContext);
-    it->first();
-    bool rc = true;
-    while(it->isValid())
-    {
-        ISecUser &user = it->get();
-        if (!m_ldap_client->createUserScope(user))
-        {
-            PROGLOG("CLdapSecManager::createUserScopes Error creating user scope for user '%s'", user.getName());
-            rc = false;
-        }
-        it->next();
-    }
-    return rc;
-}
-
-
 aindex_t CLdapSecManager::getManagedScopeTree(SecResourceType rtype, const char * basedn, IArrayOf<ISecResource>& scopes, IEspSecureContext* secureContext)
 {
     return m_ldap_client->getManagedScopeTree(nullptr, rtype, basedn, scopes);
@@ -1540,6 +1426,7 @@ bool CLdapSecManager::clearPermissionsCache(ISecUser& user, IEspSecureContext* s
             return false;
         }
         m_permissionsCache->flush();
+        PROGLOG("Permissions cache cleared by admin user %s", user.getName());
     }
     return true;
 }
@@ -1615,6 +1502,21 @@ bool CLdapSecManager::userInView(const char * user, const char* viewName)
     return m_ldap_client->userInView(user, viewName);
 }
 
+void CLdapSecManager::createLdapBasedn(ISecUser* user, const char* basedn, SecPermissionType ptype, const char* description)
+{
+    m_ldap_client->createLdapBasedn(user, basedn, ptype, description);
+}
+
+bool CLdapSecManager::organizationalUnitExists(const char * ou) const
+{
+    return m_ldap_client->organizationalUnitExists(ou);
+}
+
+bool CLdapSecManager::addUser(ISecUser & user, const char* basedn)
+{
+    return m_ldap_client->addUser(user, basedn);
+}
+
 extern "C"
 {
 LDAPSECURITY_API ISecManager * newLdapSecManager(const char *serviceName, IPropertyTree &config)
@@ -1626,9 +1528,7 @@ LDAPSECURITY_API IAuthMap *newDefaultAuthMap(IPropertyTree* config)
 {
     CAuthMap* authmap = new CAuthMap();
 
-    IPropertyTreeIterator *loc_iter = NULL;
-    loc_iter = config->getElements(".//Location");
-
+    Owned<IPropertyTreeIterator> loc_iter(config->getElements(".//Location"));
     if (loc_iter != NULL)
     {
         IPropertyTree *location = NULL;
@@ -1650,8 +1550,6 @@ LDAPSECURITY_API IAuthMap *newDefaultAuthMap(IPropertyTree* config)
             }
             loc_iter->next();
         }
-        loc_iter->Release();
-        loc_iter = NULL;
     }
 
     return authmap;

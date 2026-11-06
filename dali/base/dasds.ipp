@@ -30,6 +30,7 @@
 
 #define EXTERNAL_NAME_PREFIX "dalisds_"
 #define EXT_ATTR "@sds:ext"
+#define COMPRESS_ATTR "@sds:compress"
 #define EF_LegacyBinaryValue "bin"
 #define EF_BinaryValue       "bv2"
 #define EF_XML         "xml"
@@ -166,7 +167,7 @@ public:
         bool res = true;
         if (op.applyTop(node))
         {
-            IPropertyTreeIterator *iter = node.getElements("*");
+            Owned<IPropertyTreeIterator> iter = node.getElements("*");
             if (iter->first())
             {
                 bool levelBreak = false;
@@ -180,7 +181,6 @@ public:
                     iter->next();
                 }
             }
-            iter->Release();
         }
         return res;
     }
@@ -231,10 +231,16 @@ class CRemoteTreeBase : public SDS_PTREE
 public:
     CRemoteTreeBase(MemoryBuffer &mb);
     CRemoteTreeBase(const char *name=NULL, IPTArrayValue *value=NULL, ChildMap *children=NULL);
+    CRemoteTreeBase(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx);
 
     void deserializeRT(MemoryBuffer &src);
     virtual void deserializeSelfRT(MemoryBuffer &src);
     virtual void deserializeChildrenRT(MemoryBuffer &src);
+
+    void deserializeRT(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx);
+    virtual void deserializeSelfRT(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx);
+    virtual void deserializeChildrenRT(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx);
+
     virtual bool isOrphaned() const { return false; }
 
     void clearChildren();
@@ -248,9 +254,10 @@ public:
     virtual bool isEquivalent(IPropertyTree *tree) const override { return (NULL != QUERYINTERFACE(tree, CRemoteTreeBase)); }
     virtual IPropertyTree *create(const char *name=NULL, IPTArrayValue *value=NULL, ChildMap *children=NULL, bool existing=false) override = 0;
     virtual IPropertyTree *create(MemoryBuffer &mb) override = 0;
+    virtual IPropertyTree *create(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx) override = 0;
 
 protected: // data
-    __int64 serverId;
+    __int64 serverId = 0;
 };
 
 class CTrackChanges
@@ -327,11 +334,6 @@ public:
         t->setPropInt(NULL, l);
     }
 
-    void clearChanges()
-    {
-        changeMap.kill();
-    }
-
     void clearChanges(IPropertyTree &owner)
     {
         IPropertyTree *_owner = &owner;
@@ -393,7 +395,7 @@ public:
             case SDSExcpt_AmbiguousXpath:
                 return out.append("Invalid ambiguous xpath detected ");
             case SDSExcpt_OpenStoreFailed:
-                return out.append("Failed to open sds xml store file ");
+                return out.append("Failed to open sds store ");
             case SDSExcpt_OrphanedNode:
                 return out.append("Transaction to orphaned server node ");
             case SDSExcpt_ServerStoppedLockAborted:
@@ -431,7 +433,10 @@ public:
     int errorCode() const { return errCode; }
     StringBuffer &errorMessage(StringBuffer &out) const
     {
-        return translateCode(out).append("\n").append(errMsg.str());
+        translateCode(out);
+        if (errMsg.length())
+            out.append(" - ").append(errMsg.str());
+        return out;
     }
     MessageAudience errorAudience() const { return MSGAUD_user; }
 
@@ -587,7 +592,7 @@ public:
         root->Release();
         matchTree->Release();
     }
-    
+
     StringBuffer &getCurrentPath(StringBuffer &out)
     {
         if (!currentChild) return out;

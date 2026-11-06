@@ -20,6 +20,7 @@
 <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xml:space="default"
  xmlns:seisint="http://seisint.com" exclude-result-prefixes="seisint">
     <xsl:output method="xml" indent="yes" omit-xml-declaration="no" encoding="UTF-8"/>
+    <xsl:include href="vaults-common.xsl"/>
     <xsl:template match="text()"/>
     <xsl:param name="process" select="'unknown'"/>
     <xsl:param name="isLinuxInstance" select="1"/>
@@ -121,7 +122,35 @@
                 </xsl:variable>
                 <xsl:value-of select="translate($path3, $oldPathSeparator, $newPathSeparator)"/>
             </xsl:attribute>
+            <xsl:copy-of select="./expert"/>
+            <xsl:copy-of select="./pageCache"/>
+            <xsl:call-template name="copyVaultsConfig"/>
+            <xsl:copy-of select="./directAccessPlanes"/>
+            <xsl:copy-of select="./preferredPlanes"/>
             <xsl:copy-of select="/Environment/Software/Directories"/>
+            <xsl:copy-of select="./protrace"/>
+            <xsl:choose>
+                <xsl:when test="tracing">
+                    <xsl:copy-of select="./tracing"/>
+                </xsl:when>
+                <xsl:otherwise>
+                    <xsl:copy-of select="/Environment/Software/tracing"/>
+                </xsl:otherwise>
+            </xsl:choose>
+            <!--
+            # Generated for configuration info. accessed by getGlobalConfig()
+            -->
+            <global>
+                <storage>
+                    <xsl:copy-of select="/Environment/Software/RemoteStorage/*"/>
+                    <xsl:copy-of select="/Environment/Software/Globals/storage/*"/>
+                    <xsl:copy-of select="/Environment/Software/Storage/*"/>
+                </storage>
+                <expert>
+                    <xsl:copy-of select="/Environment/Software/Globals/@* | /Environment/Software/Globals/*"/>
+                </expert>
+                <xsl:copy-of select="/Environment/Hardware/cost"/>
+            </global>
             <xsl:copy-of select="/Environment/Hardware/NAS"/>
             <xsl:for-each select="ACL">
                 <xsl:copy>

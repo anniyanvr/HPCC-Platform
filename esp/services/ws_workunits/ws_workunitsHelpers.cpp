@@ -22,6 +22,7 @@
 #include "daclient.hpp"
 #include "dalienv.hpp"
 #include "daaudit.hpp"
+#include "dautils.hpp"
 #include "portlist.h"
 #include "dadfs.hpp"
 #include "fileview.hpp"
@@ -31,6 +32,8 @@
 #include "hqlexpr.hpp"
 #include "rmtsmtp.hpp"
 #include "LogicFileWrapper.hpp"
+#include "TpWrapper.hpp"
+#include "WUXMLInfo.hpp"
 
 #ifndef _NO_LDAP
 #include "ldapsecurity.ipp"
@@ -41,6 +44,12 @@
 #endif
 
 namespace ws_workunits {
+
+#ifdef _CONTAINERIZED
+static const char* LOG_ACCESS_FEATURE = "WsLogAccess";
+#else
+static const char* LOG_ACCESS_FEATURE = "ClusterTopologyAccess";
+#endif
 
 const char * const timerFilterText = "measure[time],source[global],depth[1,]"; // Does not include hthor subgraph timings
 const char* zipFolder = "tempzipfiles" PATHSEPSTR;
@@ -89,30 +98,46 @@ SecAccessFlags getWsWorkunitAccess(IEspContext& ctx, IConstWorkUnit& cw)
     return accessFlag;
 }
 
-bool validateWsWorkunitAccess(IEspContext& ctx, const char* wuid, SecAccessFlags minAccess)
+bool validateWsWorkunitAccess(IEspContext& ctx, IConstWorkUnit& cw, SecAccessFlags minAccess, StringBuffer& secAccessFeature)
+{
+    secAccessFeature.set(getWuAccessType(cw, ctx.queryUserId()));
+    return ctx.validateFeatureAccess(secAccessFeature, minAccess, false);
+}
+
+bool validateWsWorkunitAccess(IEspContext& ctx, const char* wuid, SecAccessFlags minAccess, StringBuffer& secAccessFeature)
 {
     Owned<IWorkUnitFactory> wf = getWorkUnitFactory(ctx.querySecManager(), ctx.queryUser());
     Owned<IConstWorkUnit> cw = wf->openWorkUnit(wuid);
     if (!cw)
         throw MakeStringException(ECLWATCH_CANNOT_OPEN_WORKUNIT, "Failed to open workunit %s when validating workunit access", wuid);
-    return ctx.validateFeatureAccess(getWuAccessType(*cw, ctx.queryUserId()), minAccess, false);
+    return validateWsWorkunitAccess(ctx, *cw, minAccess, secAccessFeature);
+}
+
+bool validateWsWorkunitAccessByOwnerId(IEspContext& ctx, const char* owner, SecAccessFlags minAccess, StringBuffer& secAccessFeature)
+{
+    secAccessFeature.set(getWuAccessType(owner, ctx.queryUserId()));
+    return ctx.validateFeatureAccess(secAccessFeature, minAccess, false);
 }
 
 void ensureWsWorkunitAccessByOwnerId(IEspContext& ctx, const char* owner, SecAccessFlags minAccess)
 {
-    if (!ctx.validateFeatureAccess(getWuAccessType(owner, ctx.queryUserId()), minAccess, false))
+    const char * secAccessFeature = getWuAccessType(owner, ctx.queryUserId());
+    if (!ctx.validateFeatureAccess(secAccessFeature, minAccess, false))
     {
         ctx.setAuthStatus(AUTH_STATUS_NOACCESS);
-        throw MakeStringException(ECLWATCH_ECL_WU_ACCESS_DENIED, "Failed to access workunit. Permission denied.");
+        throw makeStringExceptionV(ECLWATCH_ECL_WU_ACCESS_DENIED, "Failed to access workunit. Resource %s : Permission denied. %s Access Required.",
+            secAccessFeature, getSecAccessFlagName(minAccess));
     }
 }
 
 void ensureWsWorkunitAccess(IEspContext& ctx, IConstWorkUnit& cw, SecAccessFlags minAccess)
 {
-    if (!ctx.validateFeatureAccess(getWuAccessType(cw, ctx.queryUserId()), minAccess, false))
+    const char * secAccessFeature = getWuAccessType(cw, ctx.queryUserId());
+    if (!ctx.validateFeatureAccess(secAccessFeature, minAccess, false))
     {
         ctx.setAuthStatus(AUTH_STATUS_NOACCESS);
-        throw MakeStringException(ECLWATCH_ECL_WU_ACCESS_DENIED, "Failed to access workunit. Permission denied.");
+        throw makeStringExceptionV(ECLWATCH_ECL_WU_ACCESS_DENIED, "Failed to access workunit %s. Resource %s : Permission denied. %s Access Required.",
+            cw.queryWuid(), secAccessFeature, getSecAccessFlagName(minAccess));
     }
 }
 
@@ -130,13 +155,13 @@ void ensureWsCreateWorkunitAccess(IEspContext& ctx)
     if (!ctx.validateFeatureAccess(OWN_WU_ACCESS, SecAccess_Write, false))
     {
         ctx.setAuthStatus(AUTH_STATUS_NOACCESS);
-        throw MakeStringException(ECLWATCH_ECL_WU_ACCESS_DENIED, "Failed to create workunit. Permission denied.");
+        throw makeStringExceptionV(ECLWATCH_ECL_WU_ACCESS_DENIED, "Failed to create workunit. Resource %s : Permission denied. Write Access Required.", OWN_WU_ACCESS);
     }
 }
 
 StringBuffer &getWuidFromLogicalFileName(IEspContext &context, const char *logicalName, StringBuffer &wuid)
 {
-    Owned<IDistributedFile> df = lookupLogicalName(context, logicalName, false, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = lookupLogicalName(context, logicalName, AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
     if (!df)
         throw makeStringExceptionV(ECLWATCH_FILE_NOT_EXIST, "Cannot find file %s.", logicalName);
     return wuid.append(df->queryAttributes().queryProp("@workunit"));
@@ -179,10 +204,14 @@ WsWUExceptions::WsWUExceptions(IConstWorkUnit& wu): numerr(0), numwrn(0), numinf
         e->setFileName(cur.getExceptionFileName(file).str());
         e->setLineNo(cur.getExceptionLineNo());
         e->setColumn(cur.getExceptionColumn());
+        SCMStringBuffer timeStamp;
+        e->setTimeStamp(cur.getTimeStamp(timeStamp).str());
         if (cur.getActivityId())
             e->setActivity(cur.getActivityId());
         if (cur.getPriority())
             e->setPriority(cur.getPriority());
+        if (cur.getCost())
+            e->setCost(cur.getCost());
         e->setScope(cur.queryScope());
 
         const char * label = "";
@@ -200,19 +229,262 @@ WsWUExceptions::WsWUExceptions(IConstWorkUnit& wu): numerr(0), numwrn(0), numinf
     }
 }
 
-#define SDS_LOCK_TIMEOUT 30000
-
-void getSashaNode(SocketEndpoint &ep)
+void streamFilteredLogsToFile(const char* outFile, LogAccessConditions & logFetchOptions, const LogAccessLogFormat logFormat)
 {
-    Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
-    Owned<IConstEnvironment> env = factory->openEnvironment();
-    Owned<IPropertyTree> root = &env->getPTree();
-    IPropertyTree *pt = root->queryPropTree("Software/SashaServerProcess[1]/Instance[1]");
-    if (!pt)
-        throw MakeStringException(ECLWATCH_ARCHIVE_SERVER_NOT_FOUND, "Archive Server not found.");
-    ep.set(pt->queryProp("@netAddress"), pt->getPropInt("@port",DEFAULT_SASHA_PORT));
+    unsigned maxLogRecords = logFetchOptions.getLimit();
+
+    Owned<IFileIOStream> outIOS;
+    outIOS.setown(createBufferedIOStreamFromFile(outFile, IFOcreate));
+
+    if (!outIOS)
+        throw makeStringException(ECLWATCH_CANNOT_OPEN_FILE, "WsWuInfo: Could not create target log file!");
+
+    Owned<IRemoteLogAccessStream> logReader = queryRemoteLogAccessor()->getLogReader(logFetchOptions, logFormat);
+
+    StringBuffer logcontent;
+    unsigned totalRecsRead = 0;
+    unsigned recsRead = 0;
+
+    if (logFormat == LOGACCESS_LOGFORMAT_json)
+        writeStringToStream(*outIOS, "{\"lines\": [");
+    else if (logFormat == LOGACCESS_LOGFORMAT_xml)
+        writeStringToStream(*outIOS, "<lines>");
+
+    bool moreToRead = false;
+    do
+    {
+        moreToRead = logReader->readLogEntries(logcontent.clear(), recsRead);
+
+        if (recsRead > 0)
+        {
+            if (logFormat == LOGACCESS_LOGFORMAT_json && totalRecsRead > 0)
+            {
+                writeCharToStream(*outIOS, ',');
+            }
+            totalRecsRead += recsRead;
+            writeStringToStream(*outIOS, logcontent.str());
+        }
+    }
+    while (moreToRead == true);
+
+    if (totalRecsRead == maxLogRecords) //Warn of possible truncation
+    {
+        VStringBuffer truncationWarnmessage("Log query reached record limit (%u). Log report could be incomplete.", maxLogRecords);
+        LOG(MCuserInfo, "WsWuInfo: %s", truncationWarnmessage.str());
+
+        if (logFormat == LOGACCESS_LOGFORMAT_json)
+        {
+            VStringBuffer jsonMessage("], \"Message\": \"%s\"}", truncationWarnmessage.str()); //close lines array, append Message object
+            writeStringToStream(*outIOS, jsonMessage.str());
+        }
+        else if (logFormat == LOGACCESS_LOGFORMAT_xml)
+        {
+            VStringBuffer xmlMessage("</lines>\n<!-- %s -->", truncationWarnmessage.str()); //close lines element, append comment message
+            writeStringToStream(*outIOS, xmlMessage.str());
+        }
+        else if (logFormat == LOGACCESS_LOGFORMAT_csv)
+        {
+            writeStringToStream(*outIOS, truncationWarnmessage);
+        }
+    }
+    else //close the lines container
+    {
+        if (logFormat == LOGACCESS_LOGFORMAT_json)
+            writeStringToStream(*outIOS, "]}");
+        else if (logFormat == LOGACCESS_LOGFORMAT_xml)
+            writeStringToStream(*outIOS, "</lines>");
+    }
 }
 
+void WsWuInfo::readWorkunitComponentLogs(const char* outFile, CWsWuZAPInfoReq& zapLogFilterOptions)
+{
+    if (isEmptyString(outFile))
+        throw makeStringException(ECLWATCH_INVALID_FILE_NAME, "WsWuInfo: Target filename not provided!");
+
+    const LogAccessTimeRange& trange = zapLogFilterOptions.logFilter.logFetchOptions.getTimeRange();
+
+    if (trange.getStartt().isNull())
+        setLogTimeRange(zapLogFilterOptions.logFilter.logFetchOptions, zapLogFilterOptions.logFilter.wuLogSearchTimeBuffSecs);
+
+    streamFilteredLogsToFile(outFile, zapLogFilterOptions.logFilter.logFetchOptions, zapLogFilterOptions.logFilter.logDataFormat);
+}
+
+void WsWuInfo::readWorkunitComponentLogs(const char* outFile, unsigned maxLogRecords, const LogAccessReturnColsMode retColsMode,
+                                         const LogAccessLogFormat logFormat, unsigned wuLogSearchTimeBuffSecs)
+{
+    if (!queryRemoteLogAccessor())
+        throw makeStringException(ECLWATCH_LOGACCESS_UNAVAILABLE, "WsWuInfo: Remote Log Access plug-in not available!");
+
+    if (isEmptyString(outFile))
+        throw makeStringException(ECLWATCH_INVALID_FILE_NAME, "WsWuInfo: Target filename not provided!");
+
+    LogAccessConditions logFetchOptions;
+
+    logFetchOptions.setFilter(getJobIDLogAccessFilter(wuid));
+    setLogTimeRange(logFetchOptions, wuLogSearchTimeBuffSecs);
+
+    logFetchOptions.setReturnColsMode(retColsMode);
+    logFetchOptions.setLimit(maxLogRecords);
+
+    streamFilteredLogsToFile(outFile, logFetchOptions, logFormat);
+}
+
+void WsWuInfo::setLogTimeRange(LogAccessConditions& logFetchOptions, unsigned wuLogSearchTimeBuffSecs)
+{
+    struct LogAccessTimeRange range;
+    stat_type timeStamp;
+    if (cw->getStatistic(timeStamp, "", StWhenCreated))
+    {
+        CDateTime startt;
+        startt.set(timeStamp / microSecsToSecDivisor);
+
+        startt.adjustTimeSecs(-wuLogSearchTimeBuffSecs);
+        range.setStart(startt);
+
+        StringBuffer newstart;
+        startt.getString(newstart);
+        DBGLOG("Searching for WUID '%s' log entries starting time: '%s'", wuid.get(), newstart.str());
+    }
+    else
+        throw makeStringExceptionV(ECLWATCH_WU_START_NOT_AVAILABLE, "WsWuInfo: Cound not determine WUID '%s' start time", wuid.get());
+
+    if (cw->getStatistic(timeStamp, "", StWhenFinished))
+    {
+        CDateTime endt;
+        endt.set(timeStamp / microSecsToSecDivisor);
+        endt.adjustTimeSecs(wuLogSearchTimeBuffSecs);
+
+        range.setEnd(endt);
+        StringBuffer newend;
+        endt.getString(newend);
+        DBGLOG("Searching for WUID '%s' log entries ending time: '%s'", wuid.get(), newend.str()); //end + time buffer
+    }
+    else
+        WARNLOG("WsWuInfo: Fetching log entries for '%s' without a 'finished' statistics entry", wuid.get());
+
+    logFetchOptions.setTimeRange(range);
+}
+
+void WsWuInfo::sendImportedWorkunitComponentLog(const char* logFile, CHttpResponse* response)
+{
+    IFileIOStream* stream = createIOStreamFromFile(logFile, IFOread);
+    if (stream == nullptr)
+        throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Cannot open stream for file %s", logFile);
+    response->setContent(stream);
+    response->send();
+}
+
+void WsWuInfo::sendWorkunitComponentLogs(IEspContext* context, CHttpResponse* response, WUComponentLogOptions& options)
+{
+    if (!queryRemoteLogAccessor())
+    {
+        //Called from CWsWorkunitsSoapBindingEx::onGetInstantQuery() where an exception has to be added to
+        //the response directly ('throw makeStringException()' not work).
+        response->setLogAccessErrorMessageContent("WsWuInfo: Remote Log Access plug-in not available!", options.logFormat);
+        response->setStatus(HTTP_STATUS_OK);
+        response->send();
+        return;
+    }
+
+    setLogTimeRange(options.logFetchOptions, options.wuLogSearchTimeBuffSecs);
+    options.logFetchOptions.setFilter(getJobIDLogAccessFilter(wuid));
+
+    response->setStatus(HTTP_STATUS_OK);
+    response->startSend();
+
+    Owned<CFlushingHttpResponseBuffer> flusher = new CFlushingHttpResponseBuffer(response, defaultResponseFlushThresholdBytes); //No need to use a different ResponseFlushThreshold.
+    Owned<IRemoteLogAccessStream> logReader = queryRemoteLogAccessor()->getLogReader(options.logFetchOptions, options.logFormat);
+    if (options.logFormat == LOGACCESS_LOGFORMAT_csv)
+        sendComponentLogCSV(context, logReader, flusher, options);
+    else if (options.logFormat == LOGACCESS_LOGFORMAT_json)
+        sendComponentLogJSON(context, logReader, flusher, options);
+    else
+        sendComponentLogXML(context, logReader, flusher, options);
+}
+
+void WsWuInfo::sendComponentLogCSV(IEspContext* context, IRemoteLogAccessStream* logReader, IXmlStreamFlusher* flusher, const WUComponentLogOptions& options)
+{
+    unsigned totalRecsRead = sendComponentLogContent(context, logReader, flusher, options);
+    if (totalRecsRead == options.logFetchOptions.getLimit()) //Warn of possible truncation
+    {
+        VStringBuffer truncationWarnmessage("Log query reached record limit (%u). Log report could be incomplete.", options.logFetchOptions.getLimit());
+        LOG(MCuserInfo, "WsWuInfo: %s", truncationWarnmessage.str());
+        flusher->flushXML(truncationWarnmessage, false);
+    }
+}
+
+void WsWuInfo::sendComponentLogJSON(IEspContext* context, IRemoteLogAccessStream* logReader, IXmlStreamFlusher* flusher, const WUComponentLogOptions& options)
+{
+    StringBuffer s("{\"lines\": [");
+    flusher->flushXML(s, false);
+    unsigned totalRecsRead = sendComponentLogContent(context, logReader, flusher, options);
+    if (totalRecsRead == options.logFetchOptions.getLimit()) //Warn of possible truncation
+    {
+        VStringBuffer truncationWarnmessage("Log query reached record limit (%u). Log report could be incomplete.", options.logFetchOptions.getLimit());
+        LOG(MCuserInfo, "WsWuInfo: %s", truncationWarnmessage.str());
+        VStringBuffer jsonMessage("], \"Message\": \"%s\"}", truncationWarnmessage.str()); //close lines array, append Message object
+        flusher->flushXML(jsonMessage, true);
+    }
+    else
+    {
+        s.set("]}");
+        flusher->flushXML(s, true);
+    }
+}
+
+void WsWuInfo::sendComponentLogXML(IEspContext* context, IRemoteLogAccessStream* logReader, IXmlStreamFlusher* flusher, const WUComponentLogOptions& options)
+{
+    StringBuffer s("<lines>");
+    flusher->flushXML(s, false);
+    unsigned totalRecsRead = sendComponentLogContent(context, logReader, flusher, options);
+    if (totalRecsRead == options.logFetchOptions.getLimit()) //Warn of possible truncation
+    {
+        VStringBuffer truncationWarnmessage("Log query reached record limit (%u). Log report could be incomplete.", options.logFetchOptions.getLimit());
+        LOG(MCuserInfo, "WsWuInfo: %s", truncationWarnmessage.str());
+        VStringBuffer xmlMessage("</lines>\n<!-- %s -->", truncationWarnmessage.str()); //close lines element, append comment message
+        flusher->flushXML(xmlMessage, true);
+    }
+    else
+    {
+        s.set("</lines>");
+        flusher->flushXML(s, true);
+    }
+}
+
+unsigned WsWuInfo::sendComponentLogContent(IEspContext* context, IRemoteLogAccessStream* logReader, IXmlStreamFlusher* flusher, const WUComponentLogOptions& options)
+{
+    CESPAbortRequestCallback abortCallback(context);
+
+    StringBuffer logContent;
+    unsigned totalRecsRead = 0;
+    unsigned recsRead = 0;
+    bool moreToRead = false;
+    do
+    {
+        moreToRead = logReader->readLogEntries(logContent.clear(), recsRead);
+
+        if (recsRead > 0)
+        {
+            if (options.logFormat == LOGACCESS_LOGFORMAT_json && totalRecsRead > 0)
+            {
+                StringBuffer s(',');
+                flusher->flushXML(s, false);
+            }
+
+            totalRecsRead += recsRead;
+            flusher->flushXML(logContent, false);
+        }
+
+        if (abortCallback.abortRequested())
+        {
+            LOG(MCdebugInfo, "WsWuInfo::sendComponentLogContent(): abort requested via callback");
+            break;
+        }
+    }
+    while (moreToRead == true);
+
+    return totalRecsRead;
+}
 
 void WsWuInfo::getSourceFiles(IEspECLWorkunit &info, unsigned long flags)
 {
@@ -512,16 +784,6 @@ unsigned WsWuInfo::getTimerCount()
     return visitor.getNumTimers();
 }
 
-EnumMapping queryFileTypes[] = {
-   { FileTypeCpp, "cpp" },
-   { FileTypeDll, "dll" },
-   { FileTypeResText, "res" },
-   { FileTypeHintXml, "hint" },
-   { FileTypeXml, "xml" },
-   { FileTypeLog, "log" },
-   { FileTypeSize,  NULL },
-};
-
 void WsWuInfo::getHelpers(IEspECLWorkunit &info, unsigned long flags)
 {
     try
@@ -569,7 +831,33 @@ void WsWuInfo::getHelpers(IEspECLWorkunit &info, unsigned long flags)
             for (unsigned i = 0; i < FileTypeSize; i++)
                 getHelpFiles(query, (WUFileType) i, helpers, flags, helpersCount);
         }
-
+#ifdef _CONTAINERIZED
+        helpersCount++;
+        if ((flags & WUINFO_IncludeHelpers))
+        {
+            Owned<IEspECLHelpFile> h = createECLHelpFile();
+            StringBuffer componentLog;
+            getImportedComponentLog(componentLog);
+            if (componentLog.length() > 0) //from imported WU
+            {
+                h->setName(componentLog.str());
+                offset_t fileSize;
+                if (getFileSize(componentLog.str(), nullptr, fileSize))
+                    h->setFileSize(fileSize);
+            }
+            else
+            {
+                h->setName(File_ComponentLog);
+                if (!queryRemoteLogAccessor())
+                {
+                    h->setIsAvailable(false);
+                    h->setDescription("No logging stack available");
+                }
+            }
+            h->setType(File_ComponentLog);
+            helpers.append(*h.getLink());
+        }
+#else
         getWorkunitThorLogInfo(helpers, info, flags, helpersCount);
 
         if (cw->getWuidVersion() > 0)
@@ -633,6 +921,7 @@ void WsWuInfo::getHelpers(IEspECLWorkunit &info, unsigned long flags)
                 break;
             }
         }
+#endif
 
         info.setHelpers(helpers);
         info.setHelpersCount(helpersCount);
@@ -644,6 +933,27 @@ void WsWuInfo::getHelpers(IEspECLWorkunit &info, unsigned long flags)
         info.setHelpersDesc(eMsg.str());
         e->Release();
     }
+}
+
+const char *WsWuInfo::getImportedComponentLog(StringBuffer &log)
+{
+    SCMStringBuffer s;
+    cw->getDebugValue("imported", s);
+    if (s.length() == 0)
+        return log.str();
+
+    StringArray list;
+    list.appendList(s.str(), ",");
+    ForEachItemIn(i, list)
+    {
+        const char *item = list.item(i);
+        if (hasPrefix(item, "ComponentLog=", false))
+        {
+            log.append(item + strlen("ComponentLog="));
+            break;
+        }
+    }
+    return log.str();
 }
 
 void WsWuInfo::getApplicationValues(IEspECLWorkunit &info, unsigned long flags)
@@ -901,22 +1211,135 @@ void WsWuInfo::getServiceNames(IEspECLWorkunit &info, unsigned long flags)
 {
     if (!(flags & WUINFO_IncludeServiceNames))
         return;
-
     StringArray serviceNames;
-    WuScopeFilter filter;
-    filter.addScopeType("activity");
-    filter.addOutputAttribute(WaServiceName);
-    filter.addRequiredAttr(WaServiceName);
-    filter.finishedFilter();
-    Owned<IConstWUScopeIterator> it = &cw->getScopeIterator(filter);
-    ForEach(*it)
+    SummaryMap services;
+    if (cw->getSummary(SummaryType::Service, services))
     {
-        StringBuffer serviceName;
-        const char *value = it->queryAttribute(WaServiceName, serviceName);
-        if (!isEmptyString(value))
-            serviceNames.append(value);
+        for (const auto& [serviceName, flags] : services)
+            if (!serviceName.empty())
+                serviceNames.append(serviceName.c_str());
+    }
+    else
+    {
+        // Old method used if new information not present
+        WuScopeFilter filter;
+        filter.addScopeType("activity");
+        filter.addOutputAttribute(WaServiceName);
+        filter.addRequiredAttr(WaServiceName);
+        filter.finishedFilter();
+        Owned<IConstWUScopeIterator> it = &cw->getScopeIterator(filter);
+        ForEach(*it)
+        {
+            StringBuffer serviceName;
+            const char *value = it->queryAttribute(WaServiceName, serviceName);
+            if (!isEmptyString(value))
+                serviceNames.append(value);
+        }
     }
     info.setServiceNames(serviceNames);
+}
+
+void WsWuInfo::getECLWUProcesses(IEspECLWorkunit &info, unsigned long flags)
+{
+    if (!(flags & WUINFO_IncludeProcesses))
+        return;
+
+    IArrayOf<IEspECLWUProcess> processList;
+    Owned<IPropertyTreeIterator> processGroupItr = cw->getProcessTypes();
+    ForEach(*processGroupItr)
+    {
+        IPropertyTree &processGroup = processGroupItr->query();
+        const char *type = processGroup.queryName();
+
+        Owned<IPropertyTreeIterator> processItr = processGroup.getElements("*");
+        ForEach(*processItr)
+        {
+            IPropertyTree &process = processItr->query();
+            Owned<IEspECLWUProcess> p = createECLWUProcess();
+            p->setName(process.queryName());
+            p->setType(type);
+            const char *podName = process.queryProp("@podName");
+            if (!isEmptyString(podName))
+                p->setPodName(podName);
+            if (version >= 2.04)
+            {
+                const char *containerName = process.queryProp("@containerName");
+                if (!isEmptyString(containerName))
+                    p->setContainerName(containerName);
+                const char *sequence = process.queryProp("@sequence");
+                if (!isEmptyString(sequence))
+                    p->setSequence(sequence);
+                IPropertyTree *graphsTree = process.queryPropTree("graphs");
+                if (graphsTree)
+                {
+                    StringArray graphNames;
+                    Owned<IPropertyTreeIterator> graphItr = graphsTree->getElements("*");
+                    ForEach(*graphItr)
+                    {
+                        const char *graphName = graphItr->query().queryName();
+                        if (!isEmptyString(graphName))
+                            graphNames.append(graphName);
+                    }
+                    if (graphNames.length())
+                        p->setGraphs(graphNames);
+                }
+            }
+            unsigned instanceNum = process.getPropInt("@instanceNum", NotFound);
+            if (NotFound != instanceNum)
+                p->setInstanceNumber(instanceNum);
+            const char *pid = process.queryProp("@pid");
+            if (!isEmptyString(pid))
+                p->setPID(pid);
+            const char *log = process.queryProp("@log");
+            if (!isEmptyString(log))
+                p->setLog(log);
+            unsigned max = process.getPropInt("@max", NotFound);
+            if (NotFound != max)
+                p->setMax(max);
+            const char *pattern = process.queryProp("@pattern");
+            if (!isEmptyString(pattern))
+                p->setPattern(pattern);
+
+            processList.append(*p.getClear());
+        }
+    }
+    info.setECLWUProcessList(processList);
+}
+
+void WsWuInfo::getFileSummaries(IEspECLWorkunit &info, unsigned long flags)
+{
+    if (!(flags & WUINFO_IncludeFileSummaries))
+        return;
+
+    static const struct { SummaryType type; const char *name; } summaryTypeInfo[] = {
+        { SummaryType::ReadFile,    "ReadFile"    },
+        { SummaryType::ReadIndex,   "ReadIndex"   },
+        { SummaryType::WriteFile,   "WriteFile"   },
+        { SummaryType::WriteIndex,  "WriteIndex"  },
+        { SummaryType::PersistFile, "PersistFile" },
+        { SummaryType::SpillFile,   "SpillFile"   },
+        { SummaryType::JobTemp,     "JobTemp"     },
+        { SummaryType::Service,     "Service"     },
+    };
+
+    IArrayOf<IEspECLWUFileSummary> summaryList;
+    for (const auto &typeEntry : summaryTypeInfo)
+    {
+        SummaryMap entries;
+        if (cw->getSummary(typeEntry.type, entries))
+        {
+            for (const auto &[name, entryFlags] : entries)
+            {
+                Owned<IEspECLWUFileSummary> item = createECLWUFileSummary();
+                item->setName(name.c_str());
+                item->setType(typeEntry.name);
+                item->setIsOpt((entryFlags & SummaryFlags::IsOpt) != 0);
+                item->setIsSigned((entryFlags & SummaryFlags::IsSigned) != 0);
+                summaryList.append(*item.getClear());
+            }
+        }
+    }
+    info.setFileSummaries(summaryList);
 }
 
 void WsWuInfo::getEventScheduleFlag(IEspECLWorkunit &info)
@@ -1001,6 +1424,20 @@ void WsWuInfo::getCommon(IEspECLWorkunit &info, unsigned long flags)
     cw->getTimeScheduled(dt);
     if(dt.isValid())
         info.setDateTimeScheduled(dt.getString(s).str());
+    if (version>=1.84)
+        info.setExecuteCost(cost_type2money(cw->getExecuteCost()));
+    if (version>=1.85)
+        info.setFileAccessCost(cost_type2money(cw->getFileAccessCost()));
+    if (version>=1.87)
+        info.setCompileCost(cost_type2money(cw->getCompileCost()));
+    if (version>=2.03)
+        info.setCostSavingPotential(cost_type2money(cw->getCostSavingPotential()));
+    if (version >= 2.08)
+    {
+        const char *failMsg = cw->queryFailMessage();
+        if (!isEmptyString(failMsg))
+            info.setFailureDesc(failMsg);
+    }
 }
 
 void WsWuInfo::setWUAbortTime(IEspECLWorkunit &info, unsigned __int64 abortTS)
@@ -1036,6 +1473,12 @@ void WsWuInfo::getInfo(IEspECLWorkunit &info, unsigned long flags)
                 info.setAbortBy(s.str());
         }
     }
+    if (version >= 2.10)
+    {
+        cw->getAbortReason(s);
+        if (s.length())
+            info.setAbortReason(s.str());
+    }
     info.setPriorityClass(cw->getPriority());
     info.setPriorityLevel(cw->getPriorityLevel());
     if (context.querySecManager())
@@ -1056,6 +1499,14 @@ void WsWuInfo::getInfo(IEspECLWorkunit &info, unsigned long flags)
     info.setSourceFileCount(cw->getSourceFileCount());
     info.setApplicationValueCount(cw->getApplicationValueCount());
     info.setHasDebugValue(cw->hasDebugValue("__calculated__complexity__"));
+    if(version>=1.84)
+        info.setExecuteCost(cost_type2money(cw->getExecuteCost()));
+    if(version>=1.85)
+        info.setFileAccessCost(cost_type2money(cw->getFileAccessCost()));
+    if (version>=1.87)
+        info.setCompileCost(cost_type2money(cw->getCompileCost()));
+    if (version>=2.03)
+        info.setCostSavingPotential(cost_type2money(cw->getCostSavingPotential()));
 
     getClusterInfo(info, flags);
     getExceptions(info, flags);
@@ -1069,8 +1520,13 @@ void WsWuInfo::getInfo(IEspECLWorkunit &info, unsigned long flags)
     getApplicationValues(info, flags);
     getWorkflow(info, flags);
     getServiceNames(info, flags);
+    if (version>=1.98)
+        getECLWUProcesses(info, flags);
+    if (version >= 2.09)
+        getFileSummaries(info, flags);
 }
 
+#ifndef _CONTAINERIZED
 unsigned WsWuInfo::getWorkunitThorLogInfo(IArrayOf<IEspECLHelpFile>& helpers, IEspECLWorkunit &info, unsigned long flags, unsigned& helpersCount)
 {
     unsigned countThorLog = 0;
@@ -1257,6 +1713,7 @@ unsigned WsWuInfo::getWorkunitThorLogInfo(IArrayOf<IEspECLHelpFile>& helpers, IE
 
     return countThorLog;
 }
+#endif
 
 bool WsWuInfo::getClusterInfo(IEspECLWorkunit &info, unsigned long flags)
 {
@@ -1290,11 +1747,7 @@ bool WsWuInfo::getClusterInfo(IEspECLWorkunit &info, unsigned long flags)
     {
         int clusterTypeFlag = 0;
 
-        Owned<IEnvironmentFactory> envFactory = getEnvironmentFactory(true);
-        Owned<IConstEnvironment> constEnv = envFactory->openEnvironment();
-        Owned<IPropertyTree> root = &constEnv->getPTree();
-
-        Owned<IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(clusterName.str());
+        Owned<IConstWUClusterInfo> clusterInfo = getWUClusterInfoByName(clusterName.str());
         if (clusterInfo.get())
         {//Set thor flag or roxie flag in order to display some options for thor or roxie
             ClusterType platform = clusterInfo->getPlatform();
@@ -1359,7 +1812,7 @@ void WsWuInfo::getWorkflow(IEspECLWorkunit &info, unsigned long flags)
 
 IDistributedFile* WsWuInfo::getLogicalFileData(IEspContext& context, const char* logicalName, bool& showFileContent)
 {
-    Owned<IDistributedFile> df = lookupLogicalName(context, logicalName, false, false, false, nullptr, defaultPrivilegedUser);
+    Owned<IDistributedFile> df = lookupLogicalName(context, logicalName, AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
     if (!df)
         return nullptr;
 
@@ -1540,7 +1993,7 @@ void WsWuInfo::getResult(IConstWUResult &r, IArrayOf<IEspECLResult>& results, un
     }
     else
     {
-        value.append('[').append(r.getResultTotalRowCount()).append(" rows]");
+        getResultTotalRowCountString(r, value);
         if((r.getResultSequence()>=0) && (!filename.length() || (df && df->queryAttributes().hasProp("ECL"))))
             link.append(r.getResultSequence());
     }
@@ -1611,7 +2064,7 @@ class FilteredStatisticsVisitor : public WuScopeVisitorBase
 {
 public:
     FilteredStatisticsVisitor(WsWuInfo & _wuInfo, bool _createDescriptions, IArrayOf<IEspWUStatisticItem>& _statistics, const StatisticsFilter& _statsFilter)
-        : wuInfo(_wuInfo), statistics(_statistics), statsFilter(_statsFilter), createDescriptions(_createDescriptions) {}
+        : wuInfo(_wuInfo), statsFilter(_statsFilter), statistics(_statistics), createDescriptions(_createDescriptions) {}
 
     virtual void noteStatistic(StatisticKind curKind, unsigned __int64 value, IConstWUStatistic & cur) override
     {
@@ -1720,9 +2173,24 @@ void WsWuInfo::getHelpFiles(IConstWUQuery* query, WUFileType type, IArrayOf<IEsp
         if (cur.getType() != type)
             continue;
 
-        helpersCount++;
+        StringArray postMortemFiles;
+        if (cur.getType() != FileTypePostMortem)
+            helpersCount++;
+        else
+        {
+            cur.getName(name);
+            Owned<IFile> f = createIFile(name.str());
+            getPostMortemFiles(f, helpersCount, postMortemFiles);
+        }
+
         if (!(flags & WUINFO_IncludeHelpers))
             continue;
+
+        if (cur.getType() == FileTypePostMortem)
+        {
+            addPostMortemFiles(postMortemFiles, helpers);
+            continue;
+        }
 
         cur.getName(name);
         Owned<IEspECLHelpFile> h= createECLHelpFile("","");
@@ -1759,6 +2227,43 @@ void WsWuInfo::getHelpFiles(IConstWUQuery* query, WUFileType type, IArrayOf<IEsp
             }
         }
         helpers.append(*h.getLink());
+    }
+}
+
+//Called by WsWuInfo::getHelpFiles().
+//Read file names with path into the postMortemFiles array and count the files.
+//Skip folder name. It is not not needed for WUInfo.
+void WsWuInfo::getPostMortemFiles(IFile* file, unsigned& helpersCount, StringArray& postMortemFiles)
+{
+    if (file->isFile() == fileBool::foundYes)
+    {
+        postMortemFiles.append(file->queryFilename());
+        helpersCount++;
+        return;
+    }
+
+    Owned<IDirectoryIterator> files = file->directoryFiles(nullptr, false, true);
+    ForEach(*files)
+        getPostMortemFiles(&files->query(), helpersCount, postMortemFiles);
+}
+
+void WsWuInfo::addPostMortemFiles(StringArray& postMortemFiles, IArrayOf<IEspECLHelpFile>& helpers)
+{
+    const char* typeStr = getEnumText(FileTypePostMortem, queryFileTypes);
+    ForEachItemIn(i, postMortemFiles)
+    {
+        const char* postMortemFile = postMortemFiles.item(i);
+        Owned<IEspECLHelpFile> helpFile = createECLHelpFile();
+        helpFile->setName(postMortemFile);
+        helpFile->setType(typeStr);
+
+        if (version >= 1.43)
+        {
+            offset_t fileSize;
+            if (getFileSize(postMortemFile, nullptr, fileSize))//postMortemFiles are local files.
+                helpFile->setFileSize(fileSize);
+        }
+        helpers.append(*helpFile.getLink());
     }
 }
 
@@ -1907,6 +2412,7 @@ void WsWuInfo::readFileContent(const char* sourceFileName, const char* sourceIPA
         throw MakeStringException(ECLWATCH_CANNOT_READ_FILE, "Cannot read %s.", sourceAlias);
 }
 
+#ifndef _CONTAINERIZED
 void WsWuInfo::getWorkunitEclAgentLog(const char* processName, const char* fileName, const char* agentPid, MemoryBuffer& buf, const char* outFile)
 {
     if (isEmptyString(processName) && isEmptyString(fileName))
@@ -1915,8 +2421,9 @@ void WsWuInfo::getWorkunitEclAgentLog(const char* processName, const char* fileN
     Owned<IFileIOStream> outIOS;
     if (!isEmptyString(outFile))
     {
-        CWsWuFileHelper helper(nullptr);
-        outIOS.setown(helper.createIOStreamWithFileName(outFile, IFOcreate));
+        outIOS.setown(createBufferedIOStreamFromFile(outFile, IFOcreate));
+        if (!outIOS)
+            throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Cannot open stream for file %s", outFile);
     }
 
     StringBuffer line;
@@ -1948,7 +2455,7 @@ void WsWuInfo::getWorkunitEclAgentLog(const char* processName, const char* fileN
         OwnedIFileIO rIO = rFile->openShared(IFOread,IFSHfull);
         if (!rIO)
             throw makeStringExceptionV(ECLWATCH_CANNOT_READ_FILE, "Cannot read file %s.", logSpecs.item(i));
-        OwnedIFileIOStream ios = createIOStream(rIO);
+        OwnedIFileIOStream ios = createBufferedIOStream(rIO);
         Owned<IStreamLineReader> lineReader = createLineReader(ios, true);
 
 /*
@@ -2016,7 +2523,7 @@ void WsWuInfo::getWorkunitThorSlaveLog(IGroup *nodeGroup, const char *ipAddress,
     StringBuffer slaveIPAddress;
     if (slaveNum > 0)
     {
-        nodeGroup->queryNode(slaveNum-1).endpoint().getIpText(slaveIPAddress);
+        nodeGroup->queryNode(slaveNum-1).endpoint().getHostText(slaveIPAddress);
         if (slaveIPAddress.length() < 1)
             throw makeStringException(ECLWATCH_INVALID_INPUT, "ThorSlave log network address not found.");
 
@@ -2070,8 +2577,9 @@ void WsWuInfo::readWorkunitThorLog(const char* processName, const char* log, con
     Owned<IFileIOStream> outIOS;
     if (!isEmptyString(outFile))
     {
-        CWsWuFileHelper helper(nullptr);
-        outIOS.setown(helper.createIOStreamWithFileName(outFile, IFOcreate));
+        outIOS.setown(createBufferedIOStreamFromFile(outFile, IFOcreate));
+        if (!outIOS)
+            throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Cannot open stream for file %s", outFile);
     }
 
     StringArray logSpecs;
@@ -2090,7 +2598,7 @@ void WsWuInfo::readWorkunitThorLog(const char* processName, const char* log, con
         {
             StringBuffer thorMasterLog, ext;
             splitFilename(logSpec, nullptr, nullptr, &thorMasterLog, &ext);
-    
+
             StringBuffer logSpecStr(log);
             addPathSepChar(logSpecStr);
             //Append the file name of the slave log to logSpecStr.
@@ -2113,7 +2621,7 @@ void WsWuInfo::readWorkunitThorLog(const char* processName, const char* log, con
             if (!rFile)
                 throw MakeStringException(ECLWATCH_CANNOT_OPEN_FILE, "Cannot open file %s.", logSpec);
         }
-    
+
         readWorkunitThorLogOneDay(rFile, processID, buf, outIOS);
     }
 }
@@ -2124,7 +2632,7 @@ void WsWuInfo::readWorkunitThorLogOneDay(IFile* sourceFile, unsigned& processID,
     if (!sourceIO)
         throw MakeStringException(ECLWATCH_CANNOT_READ_FILE,"Cannot read file %s.", sourceFile->queryFilename());
 
-    Owned<IFileIOStream> ios = createIOStream(sourceIO);
+    Owned<IFileIOStream> ios = createBufferedIOStream(sourceIO);
 
     VStringBuffer startwuid("Started wuid=%s", wuid.str());
     VStringBuffer endwuid("Finished wuid=%s", wuid.str());
@@ -2147,7 +2655,7 @@ void WsWuInfo::readWorkunitThorLogOneDay(IFile* sourceFile, unsigned& processID,
     bool outputThisLine = false;
     if (processID > 0) //after the 1st page of the log
         outputThisLine = true;
-    bool foundEndWUID = false; 
+    bool foundEndWUID = false;
     while (!eof)
     {
         if (outputThisLine)
@@ -2210,7 +2718,7 @@ void WsWuInfo::getWUProcessLogSpecs(const char* processName, const char* logSpec
             //Parse the process name from the logSpec or logDir.
             if (isEmptyString(logSpec) && isEmptyString(logDir))
                 throw makeStringException(ECLWATCH_ECLAGENT_LOG_NOT_FOUND, "Process name and log file not specified");
-    
+
             StringBuffer path, process;
             if (!isEmptyString(logDir))
                 path.set(logDir);
@@ -2239,6 +2747,78 @@ void WsWuInfo::getWUProcessLogSpecs(const char* processName, const char* logSpec
     if (logSpecs.length() > 1)
         logSpecs.sortAscii(false); //Sort the logSpecs from old to new
 }
+#endif
+
+bool WsWuInfo::validateWUProcessLog(const char* file, bool eclAgent)
+{
+    Owned<IStringIterator> logs = cw->getLogs(eclAgent ? "EclAgent" : "Thor");
+    ForEach (*logs)
+    {
+        SCMStringBuffer logName;
+        logs->str(logName);
+        if (logName.length() < 1)
+            continue;
+
+        if (strieq(file, logName.str()))
+            return true;
+    }
+    return false;
+}
+
+bool WsWuInfo::validateWUAssociatedFile(const char* file, WUFileType type)
+{
+    Owned<IConstWUQuery> query = cw->getQuery();
+    if (!query)
+        return false;
+
+    Owned<IConstWUAssociatedFileIterator> iter = &query->getAssociatedFiles();
+    ForEach(*iter)
+    {
+        IConstWUAssociatedFile & cur = iter->query();
+        if (cur.getType() != type)
+            continue;
+
+        SCMStringBuffer name;
+        cur.getName(name);
+        if (name.length() < 1)
+            continue;
+
+        if (type == FileTypePostMortem)
+        {
+            bool validated = false;
+            //Workunit Associated Files only stores the name of the folder
+            //which contains Post Mortem files.
+            Owned<IFile> postMortemFile = createIFile(name.str());
+            validatePostMortemFile(postMortemFile, file, validated);
+            if (validated)
+                return true;
+        }
+
+        if (strieq(file, name.str()))
+            return true;
+    }
+    return false;
+}
+
+void WsWuInfo::validatePostMortemFile(IFile* postMortemFile, const char* fileToBeValidated, bool& validated)
+{
+    if (postMortemFile->isFile() == fileBool::foundYes)
+    {
+        if (strieq(fileToBeValidated, postMortemFile->queryFilename()))
+        {
+            validated = true;
+            return;
+        }
+    }
+
+    Owned<IDirectoryIterator> files = postMortemFile->directoryFiles(nullptr, false, true);
+    ForEach(*files)
+    {
+        validatePostMortemFile(&files->query(), fileToBeValidated, validated);
+        if (validated)
+            break;
+    }
+}
 
 void WsWuInfo::getWorkunitResTxt(MemoryBuffer& buf)
 {
@@ -2259,16 +2839,41 @@ void WsWuInfo::getWorkunitArchiveQuery(StringBuffer& str)
 
     StringBufferAdaptor istr(str);
     query->getQueryText(istr);
+    Owned<IWuWebView> wv;
     if ((str.length() < 1) || !isArchiveQuery(str.str()))
     {
         if (!query->hasArchive())
             throw MakeStringException(ECLWATCH_CANNOT_GET_WORKUNIT, "Archive query not found for workunit %s.", wuid.str());
 
-        Owned<IWuWebView> wv = createWuWebView(*cw, NULL, NULL, NULL, false, nullptr);
+        wv.setown(createWuWebView(*cw, NULL, NULL, NULL, false, nullptr));
         if (!wv)
             throw MakeStringException(ECLWATCH_CANNOT_GET_WORKUNIT, "Cannot create webview for workunit %s.", wuid.str());
         if (!wv->getEmbeddedArchive(str) || (str.length() < 1) || !isArchiveQuery(str.str()))
             throw MakeStringException(ECLWATCH_CANNOT_GET_WORKUNIT, "Archive query not found for workunit %s.", wuid.str());
+    }
+
+    if (!wv)
+        wv.setown(createWuWebView(*cw, NULL, NULL, NULL, false, nullptr));
+    if (wv)
+    {
+        try
+        {
+            Owned<IPropertyTree> archive = createPTreeFromXMLString(str.str(), ipt_caseInsensitive|ipt_lowmem);
+            addManifestResourcesToArchive(*wv, *archive);
+            StringBuffer restoredArchive;
+            toXML(archive, restoredArchive);
+            str.set(restoredArchive);
+        }
+        catch (IException *e)
+        {
+            StringBuffer msg;
+            WARNLOG("Failed to restore archive resources for workunit %s: %s", wuid.str(), e->errorMessage(msg).str());
+            e->Release();
+        }
+        catch (...)
+        {
+            WARNLOG("Unexpected failure restoring archive resources for workunit %s", wuid.str());
+        }
     }
 }
 
@@ -2293,9 +2898,11 @@ void WsWuInfo::getWorkunitQueryShortText(MemoryBuffer& buf, const char* outFile)
         buf.append(queryText.length(), queryText.str());
     else
     {
-        CWsWuFileHelper helper(nullptr);
-        Owned<IFileIOStream> outIOS = helper.createIOStreamWithFileName(outFile, IFOcreate);
-        outIOS->write(queryText.length(), queryText.str());
+        Owned<IFileIOStream> outIOS = createIOStreamFromFile(outFile, IFOcreate);
+        if (outIOS)
+            outIOS->write(queryText.length(), queryText.str());
+        else
+            throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Failed to open FileIOStream for %s.", outFile);
     }
 }
 
@@ -3071,6 +3678,16 @@ bool addToQueryString(StringBuffer &queryString, const char *name, const char *v
     return true;
 }
 
+bool addDoubleToQueryString(StringBuffer &queryString, const char *name, double value)
+{
+    if (value > 0)
+    {
+        VStringBuffer valueStr("%g", value);
+        return addToQueryString(queryString, name, valueStr.str());
+    }
+    return false;
+}
+
 int WUSchedule::run()
 {
     PROGLOG("ECLWorkunit WUSchedule Thread started.");
@@ -3214,7 +3831,7 @@ void WsWuHelpers::submitWsWorkunit(IEspContext& context, IConstWorkUnit* cw, con
     ensureWsWorkunitAccess(context, *cw, SecAccess_Write);
 
 #ifndef _NO_LDAP
-    CLdapSecManager* secmgr = dynamic_cast<CLdapSecManager*>(context.querySecManager());
+    ILdapSecManager* secmgr = dynamic_cast<ILdapSecManager*>(context.querySecManager());
 
     // View Scope is checked only when LDAP secmgr is available AND checkViewPermissions config is also enabled.
     // Otherwise, the view permission check is skipped, and WU is submitted as normal.
@@ -3246,76 +3863,101 @@ void WsWuHelpers::submitWsWorkunit(IEspContext& context, IConstWorkUnit* cw, con
     if(!wu.get())
         throw MakeStringException(ECLWATCH_CANNOT_UPDATE_WORKUNIT, "Cannot update workunit %s.", wuid.str());
 
-    wu->clearExceptions();
-    if(notEmpty(cluster))
-        wu->setClusterName(cluster);
-    if(notEmpty(snapshot))
-        wu->setSnapshot(snapshot);
-    wu->setState(WUStateSubmitted);
-    if (maxruntime)
-        wu->setDebugValueInt("maxRunTime",maxruntime,true);
-    if (maxcost)
-        wu->setDebugValueInt("maxCost", maxcost, true);
-    if (debugs && debugs->length())
+    try
     {
-        ForEachItemIn(i, *debugs)
+        wu->clearExceptions();
+        if(notEmpty(cluster))
         {
-            IConstNamedValue &item = debugs->item(i);
-            const char *name = item.getName();
-            const char *value = item.getValue();
-            if (!name || !*name)
-                continue;
-            StringBuffer expanded;
-            if (*name=='-')
-                name=expanded.append("eclcc").append(name).str();
-            if (!value)
+            wu->setClusterName(cluster);
+            if (compile)
             {
-                size_t len = strlen(name);
-                char last = name[len-1];
-                if (last == '-' || last == '+')
-                {
-                    StringAttr s(name, len-1);
-                    wu->setDebugValueInt(s.get(), last == '+' ? 1 : 0, true);
-                }
-                else
-                    wu->setDebugValueInt(name, 1, true);
-                continue;
+                StringBuffer targetArchitecture;
+                getTargetClusterTargetArchitecture(targetArchitecture, cluster);
+                setWorkUnitTargetArchitecture(wu, targetArchitecture.str());
             }
-            wu->setDebugValue(name, value, true);
         }
-    }
-
-    if (applications)
-    {
-        ForEachItemIn(ii, *applications)
+        if(notEmpty(snapshot))
+            wu->setSnapshot(snapshot);
+        wu->setState(WUStateSubmitted);
+        if (maxruntime)
+            wu->setDebugValueInt("maxRunTime",maxruntime,true);
+        if (maxcost)
+            wu->setDebugValueInt("maxCost", maxcost, true);
+        if (debugs && debugs->length())
         {
-            IConstApplicationValue& item = applications->item(ii);
-            if(notEmpty(item.getApplication()) && notEmpty(item.getName()))
-                wu->setApplicationValue(item.getApplication(), item.getName(), item.getValue(), true);
+            ForEachItemIn(i, *debugs)
+            {
+                IConstNamedValue &item = debugs->item(i);
+                const char *name = item.getName();
+                const char *value = item.getValue();
+                if (!name || !*name)
+                    continue;
+                StringBuffer expanded;
+                if (*name=='-')
+                    name=expanded.append("eclcc").append(name).str();
+                if (!value)
+                {
+                    size_t len = strlen(name);
+                    char last = name[len-1];
+                    if (last == '-' || last == '+')
+                    {
+                        StringAttr s(name, len-1);
+                        wu->setDebugValueInt(s.get(), last == '+' ? 1 : 0, true);
+                    }
+                    else
+                        wu->setDebugValueInt(name, 1, true);
+                    continue;
+                }
+                wu->setDebugValue(name, value, true);
+            }
         }
-    }
 
-    if (resetWorkflow)
-        wu->resetWorkflow();
-    if (!compile)
-        wu->schedule();
-
-    if (resetVariables)
-    {
-        SCMStringBuffer varname;
-        Owned<IConstWUResultIterator> vars = &wu->getVariables();
-        ForEach (*vars)
+        if (applications)
         {
-            vars->query().getResultName(varname);
-            Owned<IWUResult> v = wu->updateVariableByName(varname.str());
-            if (v)
-                v->setResultStatus(ResultStatusUndefined);
+            ForEachItemIn(ii, *applications)
+            {
+                IConstApplicationValue& item = applications->item(ii);
+                if(notEmpty(item.getApplication()) && notEmpty(item.getName()))
+                    wu->setApplicationValue(item.getApplication(), item.getName(), item.getValue(), true);
+            }
         }
+
+        ISpan * activeSpan = queryThreadedActiveSpan();
+        OwnedActiveSpanScope clientSpan(activeSpan->createClientSpan("run_workunit"));
+        Owned<IProperties> httpHeaders = ::getClientHeaders(clientSpan);
+        recordTraceDebugOptions(wu, httpHeaders);
+
+        if (resetWorkflow)
+            wu->resetWorkflow();
+        if (!compile)
+            wu->schedule();
+
+        if (resetVariables)
+        {
+            SCMStringBuffer varname;
+            Owned<IConstWUResultIterator> vars = &wu->getVariables();
+            ForEach (*vars)
+            {
+                vars->query().getResultName(varname);
+                Owned<IWUResult> v = wu->updateVariableByName(varname.str());
+                if (v)
+                    v->setResultStatus(ResultStatusUndefined);
+            }
+        }
+
+        setXmlParameters(wu, paramXml, variables, (wu->getAction()==WUActionExecuteExisting));
+        wu->commit();
+    }
+    catch (IException * e)
+    {
+        //An exception occurred when setting up the workunit e.g. an invalid debug value name.
+        wu->setState(WUStateFailed);
+        StringBuffer msg;
+        addExceptionToWorkunit(wu, SeverityError, "esp", e->errorCode(), e->errorMessage(msg).str(), nullptr, 0, 0, 0);
+        wu->commit();
+        throw;
     }
 
-    setXmlParameters(wu, paramXml, variables, (wu->getAction()==WUActionExecuteExisting));
-
-    wu->commit();
     wu.clear();
 
     if (!compile)
@@ -3399,7 +4041,7 @@ StringBuffer & WsWuHelpers::resolveQueryWuid(StringBuffer &wuid, const char *que
 }
 
 void WsWuHelpers::runWsWuQuery(IEspContext &context, IConstWorkUnit *cw, const char *queryset, const char *query,
-    const char *cluster, const char *paramXml, IArrayOf<IConstApplicationValue> *applications)
+    const char *cluster, const char *paramXml, IArrayOf<IConstNamedValue> *variables, IArrayOf<IConstApplicationValue> *applications)
 {
     StringBuffer srcWuid;
 
@@ -3408,11 +4050,11 @@ void WsWuHelpers::runWsWuQuery(IEspContext &context, IConstWorkUnit *cw, const c
     copyWsWorkunit(context, *wu, srcWuid);
     wu.clear();
 
-    submitWsWorkunit(context, cw, cluster, NULL, 0,  0, false, true, true, paramXml, NULL, NULL, applications);
+    submitWsWorkunit(context, cw, cluster, NULL, 0,  0, false, true, true, paramXml, variables, NULL, applications);
 }
 
 void WsWuHelpers::runWsWuQuery(IEspContext &context, StringBuffer &wuid, const char *queryset, const char *query,
-    const char *cluster, const char *paramXml, IArrayOf<IConstApplicationValue> *applications)
+    const char *cluster, const char *paramXml, IArrayOf<IConstNamedValue> *variables, IArrayOf<IConstApplicationValue> *applications)
 {
     StringBuffer srcWuid;
 
@@ -3422,7 +4064,7 @@ void WsWuHelpers::runWsWuQuery(IEspContext &context, StringBuffer &wuid, const c
     copyWsWorkunit(context, *wu, srcWuid);
     wu.clear();
 
-    submitWsWorkunit(context, wuid.str(), cluster, NULL, 0,  0, false, true, true, paramXml, NULL, NULL, applications);
+    submitWsWorkunit(context, wuid.str(), cluster, NULL, 0,  0, false, true, true, paramXml, variables, NULL, applications);
 }
 
 void WsWuHelpers::checkAndTrimWorkunit(const char* methodName, StringBuffer& input)
@@ -3431,22 +4073,12 @@ void WsWuHelpers::checkAndTrimWorkunit(const char* methodName, StringBuffer& inp
     if (isEmpty(trimmedInput))
         throw MakeStringException(ECLWATCH_INVALID_INPUT, "%s: Workunit ID not set", methodName);
 
-    if (!looksLikeAWuid(trimmedInput, 'W'))
+    if (!looksLikeAWuid(trimmedInput, "WP"))
         throw MakeStringException(ECLWATCH_INVALID_INPUT, "%s: Invalid Workunit ID: %s", methodName, trimmedInput);
 
     return;
 }
 
-IFileIOStream* CWsWuFileHelper::createIOStreamWithFileName(const char* fileNameWithPath, IFOmode mode)
-{
-    if (isEmptyString(fileNameWithPath))
-        throw MakeStringException(ECLWATCH_CANNOT_COMPRESS_DATA, "File name not specified.");
-    Owned<IFile> wuInfoIFile = createIFile(fileNameWithPath);
-    Owned<IFileIO> wuInfoIO = wuInfoIFile->open(mode);
-    if (!wuInfoIO)
-        throw MakeStringException(ECLWATCH_CANNOT_OPEN_FILE, "Failed to open %s.", fileNameWithPath);
-    return createIOStream(wuInfoIO);
-}
 
 void CWsWuFileHelper::writeToFile(const char* fileName, size32_t contentLength, const void* content)
 {
@@ -3467,8 +4099,7 @@ void CWsWuFileHelper::writeToFileIOStream(const char* folder, const char* file, 
     if (isEmptyString(file))
         throw MakeStringException(ECLWATCH_INVALID_INPUT, "Empty file name is not allowed to create FileIOStream.");
     VStringBuffer fileNameWithPath("%s%c%s", folder, PATHSEPCHAR, file);
-    CWsWuFileHelper helper(nullptr);
-    Owned<IFileIOStream> outIOS = helper.createIOStreamWithFileName(fileNameWithPath.str(), IFOcreate);
+    Owned<IFileIOStream> outIOS = createIOStreamFromFile(fileNameWithPath.str(), IFOcreate);
     if (outIOS)
         outIOS->write(mb.length(), mb.toByteArray());
     else
@@ -3483,20 +4114,19 @@ void CWsWuFileHelper::cleanFolder(IFile* folder, bool removeFolder)
     ForEach(*iter)
     {
         OwnedIFile thisFile = createIFile(iter->query().queryFilename());
-        if (thisFile->isFile() == fileBool::foundYes)
-            thisFile->remove();
+        thisFile->remove();
     }
     if (removeFolder)
         folder->remove();
 }
 
-void CWsWuFileHelper::createProcessLogfile(IConstWorkUnit* cwu, WsWuInfo& winfo, const char* process, const char* path)
+#ifndef _CONTAINERIZED
+void CWsWuFileHelper::createProcessLogfile(IConstWorkUnit* cwu, WsWuInfo& winfo, const char* process, const char* path, bool hasLogsAccess)
 {
     BoolHash uniqueProcesses;
     Owned<IPropertyTreeIterator> procs = cwu->getProcesses(process, NULL);
     ForEach (*procs)
     {
-        StringBuffer logSpec;
         IPropertyTree& proc = procs->query();
         const char* processName = proc.queryName();
         if (isEmpty(processName))
@@ -3520,11 +4150,17 @@ void CWsWuFileHelper::createProcessLogfile(IConstWorkUnit* cwu, WsWuInfo& winfo,
                 pid.appendf("%d", proc.getPropInt("@pid"));
 
                 fileName.append("_eclagent.log");
+                if (!hasLogsAccess)
+                    throw makeStringExceptionV(ECLWATCH_ACCESS_TO_FILE_DENIED, "Access to log files is denied. You are missing permission %s:READ - check with your system admin.", LOG_ACCESS_FEATURE);
+
                 winfo.getWorkunitEclAgentLog(processName, nullptr, pid.str(), mb, fileName.str());
             }
             else if (strieq(process, "Thor"))
             {
                 fileName.append("_thormaster.log");
+                if (!hasLogsAccess)
+                    throw makeStringExceptionV(ECLWATCH_ACCESS_TO_FILE_DENIED, "Access to log files is denied. You are missing permission %s:READ - check with your system admin.", LOG_ACCESS_FEATURE);
+
                 winfo.getWorkunitThorMasterLog(processName, nullptr, mb, fileName.str());
             }
         }
@@ -3532,20 +4168,21 @@ void CWsWuFileHelper::createProcessLogfile(IConstWorkUnit* cwu, WsWuInfo& winfo,
         {
             StringBuffer s;
             e->errorMessage(s);
-            IERRLOG("Error accessing Process Log file %s: %s", logSpec.str(), s.str());
+            IERRLOG("Error accessing Process Log file %s: %s", processName, s.str());
             writeToFile(fileName.str(), s.length(), s.str());
             e->Release();
         }
     }
 }
 
-void CWsWuFileHelper::createThorSlaveLogfile(IConstWorkUnit* cwu, WsWuInfo& winfo, const char* path)
+void CWsWuFileHelper::createThorSlaveLogfile(IConstWorkUnit* cwu, WsWuInfo& winfo, const char* path, bool hasLogsAccess)
 {
     if (cwu->getWuidVersion() == 0)
         return;
     const char* clusterName = cwu->queryClusterName();
     if (isEmptyString(clusterName)) //Cluster name may not be set yet
         return;
+
     Owned<IConstWUClusterInfo> clusterInfo = getTargetClusterInfo(clusterName);
     if (!clusterInfo)
     {
@@ -3553,9 +4190,21 @@ void CWsWuFileHelper::createThorSlaveLogfile(IConstWorkUnit* cwu, WsWuInfo& winf
         return;
     }
 
+    // Since there is not already a handler inserting exceptions into the thor slave log,
+    // make a simple case here to insert a message about permission failure and write it to
+    // a file that could be recognized as a thor slave log.
+    if (!hasLogsAccess)
+    {
+        StringBuffer msg;
+        msg.appendf("Access to log files is denied. You are missing permission %s:READ - check with your system admin.", LOG_ACCESS_FEATURE);
+        VStringBuffer fileName("%s%cthorslave.log", path, PATHSEPCHAR);
+        writeToFile(fileName.str(), msg.length(), msg.str());
+        return;
+    }
+
     Owned<IThreadFactory> threadFactory = new CGetThorSlaveLogToFileThreadFactory();
     Owned<IThreadPool> threadPool = createThreadPool("WsWuFileHelper GetThorSlaveLogToFile Thread Pool",
-        threadFactory, NULL, thorSlaveLogThreadPoolSize, INFINITE);
+        threadFactory, false, nullptr, thorSlaveLogThreadPoolSize, INFINITE);
 
     unsigned numberOfSlaveLogs = clusterInfo->getNumberOfSlaveLogs();
     BoolHash uniqueProcesses;
@@ -3592,31 +4241,25 @@ void CWsWuFileHelper::createThorSlaveLogfile(IConstWorkUnit* cwu, WsWuInfo& winf
     }
     threadPool->joinAll();
 }
+#endif
 
-void CWsWuFileHelper::createZAPInfoFile(const char* url, const char* espIP, const char* thorIP, const char* problemDesc,
-    const char* whatChanged, const char* timing, IConstWorkUnit* cwu, const char* pathNameStr)
+void CWsWuFileHelper::createZAPInfoFile(CWsWuZAPInfoReq &request, IConstWorkUnit* cwu, const char* tempDirName)
 {
-    VStringBuffer fileName("%s.txt", pathNameStr);
-    Owned<IFileIOStream> outFile = createIOStreamWithFileName(fileName.str(), IFOcreate);
+    VStringBuffer fileName("%s%c%s.txt", tempDirName, PATHSEPCHAR, cwu->queryWuid());
+    Owned<IFileIOStream> outFile = createBufferedIOStreamFromFile(fileName.str(), IFOcreate);
+    if(outFile == nullptr)
+        throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Cannot open stream for ZAP Info file %s", fileName.str());
 
     StringBuffer sb;
     sb.set("Workunit:     ").append(cwu->queryWuid()).append("\r\n");
     sb.append("User:         ").append(cwu->queryUser()).append("\r\n");
     sb.append("Build Version:").append(getBuildVersion()).append("\r\n");
     sb.append("Cluster:      ").append(cwu->queryClusterName()).append("\r\n");
-    if (!isEmptyString(espIP))
-        sb.append("ESP:          ").append(espIP).append("\r\n");
-    else
-    {
-        StringBuffer espIPAddr;
-        IpAddress ipaddr = queryHostIP();
-        ipaddr.getIpText(espIPAddr);
-        sb.append("ESP:          ").append(espIPAddr.str()).append("\r\n");
-    }
-    if (!isEmptyString(url))
-        sb.append("URL:          ").append(url).append("\r\n");
-    if (!isEmptyString(thorIP))
-        sb.append("Thor:         ").append(thorIP).append("\r\n");
+    sb.append("ESP:          ").append(request.esp).append("\r\n");
+    if (!isEmptyString(request.url))
+        sb.append("URL:          ").append(request.url).append("\r\n");
+    if (!isEmptyString(request.thor))
+        sb.append("Thor:         ").append(request.thor).append("\r\n");
     outFile->write(sb.length(), sb.str());
 
     //Exceptions/Warnings/Info
@@ -3650,9 +4293,9 @@ void CWsWuFileHelper::createZAPInfoFile(const char* url, const char* espIP, cons
     }
 
     //User provided Information
-    writeZAPWUInfoToIOStream(outFile, "Problem:      ", problemDesc);
-    writeZAPWUInfoToIOStream(outFile, "What Changed: ", whatChanged);
-    writeZAPWUInfoToIOStream(outFile, "Timing:       ", timing);
+    writeZAPWUInfoToIOStream(outFile, "Problem:      ", request.problemDesc);
+    writeZAPWUInfoToIOStream(outFile, "What Changed: ", request.whatChanged);
+    writeZAPWUInfoToIOStream(outFile, "Timing:       ", request.whereSlow);
 }
 
 void CWsWuFileHelper::writeZAPWUInfoToIOStream(IFileIOStream* outFile, const char* name, SCMStringBuffer& value)
@@ -3670,15 +4313,15 @@ void CWsWuFileHelper::writeZAPWUInfoToIOStream(IFileIOStream* outFile, const cha
     outFile->write(4, "\r\n\r\n");
 }
 
-void CWsWuFileHelper::createZAPWUXMLFile(WsWuInfo& winfo, const char* pathNameStr)
+void CWsWuFileHelper::createZAPWUXMLFile(WsWuInfo& winfo, const char* tempDirName)
 {
     MemoryBuffer mb;
     winfo.getWorkunitXml(NULL, mb);
-    VStringBuffer fileName("%s.xml", pathNameStr);
+    VStringBuffer fileName("%s%cZAPReport_%s.xml", tempDirName, PATHSEPCHAR, winfo.wuid.get());
     writeToFile(fileName.str(), mb.length(), mb.bufferBase());
 }
 
-void CWsWuFileHelper::createZAPECLQueryArchiveFiles(IConstWorkUnit* cwu, const char* pathNameStr)
+void CWsWuFileHelper::createZAPECLQueryArchiveFiles(IConstWorkUnit* cwu, const char* tempDirName)
 {
     Owned<IConstWUQuery> query = cwu->getQuery();
     if(!query)
@@ -3722,7 +4365,7 @@ void CWsWuFileHelper::createZAPECLQueryArchiveFiles(IConstWorkUnit* cwu, const c
             archiveContents.insert(0, "Error accessing archive file ").appendf("%s: %s\r\n\r\n", ssb.str(), s.str());
             e->Release();
         }
-        fileName.setf("%s.archive", pathNameStr);
+        fileName.setf("%s%c%s.archive", tempDirName, PATHSEPCHAR, ssb.str());
         writeToFile(fileName.str(), archiveContents.length(), archiveContents.str());
         break;
     }
@@ -3732,12 +4375,227 @@ void CWsWuFileHelper::createZAPECLQueryArchiveFiles(IConstWorkUnit* cwu, const c
     query->getQueryText(temp);
     if (temp.length())
     {
-        VStringBuffer fileName("%s.ecl", pathNameStr);
+        VStringBuffer fileName("%s%cZAPReport_%s.ecl", tempDirName, PATHSEPCHAR, cwu->queryWuid());
         writeToFile(fileName.str(), temp.length(), temp.str());
     }
 }
 
-void CWsWuFileHelper::createZAPWUGraphProgressFile(const char* wuid, const char* pathNameStr)
+void CWsWuFileHelper::readWULogToFiles(IConstWorkUnit *cwu, WsWuInfo &winfo, const char *path, CWsWuZAPInfoReq &zapLogFilterOptions)
+{
+    if (cwu->getWuidVersion() == 0)
+        return;
+
+    if (!queryRemoteLogAccessor())
+        throw makeStringException(ECLWATCH_LOGACCESS_UNAVAILABLE, "CWsWuFileHelper: Remote Log Access plug-in not available!");
+
+    LogAccessLogFormat logFormat = zapLogFilterOptions.logFilter.logDataFormat;
+    StringBuffer logfileextension;
+    if (logFormat == LOGACCESS_LOGFORMAT_csv)
+        logfileextension.set("csv");
+    else if (logFormat == LOGACCESS_LOGFORMAT_xml)
+        logfileextension.set("xml");
+    else if (logFormat == LOGACCESS_LOGFORMAT_json)
+        logfileextension.set("json");
+    else
+        logfileextension.set("log");
+
+    const char *wuid = cwu->queryWuid();
+    Owned<ILogAccessFilter> logFetchFilter = getJobIDLogAccessFilter(wuid);
+    zapLogFilterOptions.logFilter.logFetchOptions.setFilter(logFetchFilter.getLink());
+
+    if (zapLogFilterOptions.includeRelatedLogs)
+    {
+        VStringBuffer componentLog("%s%c%s-log.%s", path, PATHSEPCHAR, wuid, logfileextension.str());
+        readWULogToFile(componentLog, winfo, zapLogFilterOptions);
+    }
+    if (!zapLogFilterOptions.includePerComponentLogs)
+        return;
+
+    Owned<IPropertyTreeIterator> iter = cwu->getProcesses("*", nullptr);
+    ForEach(*iter)
+    {
+        const char *processName = iter->query().queryProp("@podName");
+        Owned<ILogAccessFilter> podFilter = getPodLogAccessFilter(processName);
+        Owned<ILogAccessFilter> compoundFilter = getCompoundLogAccessFilter(logFetchFilter, podFilter, LOGACCESS_FILTER_and);
+        zapLogFilterOptions.logFilter.logFetchOptions.setFilter(compoundFilter.getClear());
+
+        VStringBuffer processLog("%s%c%s-%s-log.%s", path, PATHSEPCHAR, wuid, processName, logfileextension.str());
+        readWULogToFile(processLog, winfo, zapLogFilterOptions);
+    }
+}
+
+void CWsWuFileHelper::readWULogToFile(const char *logFileName, WsWuInfo &winfo, CWsWuZAPInfoReq &zapLogFilterOptions)
+{
+    try
+    {
+        if (!zapLogFilterOptions.hasLogsAccess)
+            throw makeStringExceptionV(ECLWATCH_ACCESS_TO_FILE_DENIED, "Access to log files is denied. You are missing permission %s:READ - check with your system admin.", LOG_ACCESS_FEATURE);
+        winfo.readWorkunitComponentLogs(logFileName, zapLogFilterOptions);
+    }
+    catch(IException* e)
+    {
+        StringBuffer s;
+        e->errorMessage(s);
+        IERRLOG(e, "Error accessing WU logs");
+        writeToFile(logFileName, s.length(), s.str());
+        e->Release();
+    }
+}
+
+template <class T>
+void readWUComponentLogOptionsReq(T* logReq, WUComponentLogOptions& options)
+{
+    //If MaxLogRecords is in logReq, use it; otherwise, default to 100 in LogAccessConditions.
+    if (!logReq->getMaxLogRecords_isNull())
+        options.logFetchOptions.setLimit(logReq->getMaxLogRecords());
+    //If LogSearchTimeBuffSecs is in logReq, use it; otherwise, default to defaultWULogSearchTimeBufferSecs.
+    if (!logReq->getLogSearchTimeBuffSecs_isNull())
+        options.wuLogSearchTimeBuffSecs = logReq->getLogSearchTimeBuffSecs();
+    CLogAccessLogFormat logFormatSetting = logReq->getLogFormat();
+    if (logFormatSetting != LogAccessLogFormat_Undefined)
+        options.logFormat = (LogAccessLogFormat) logFormatSetting;
+    else
+        options.logFormat = LOGACCESS_LOGFORMAT_csv;
+
+    switch (logReq->getLogSelectColumnMode())
+    {
+    case CLogSelectColumnMode_MIN:
+        options.logFetchOptions.setReturnColsMode(RETURNCOLS_MODE_min);
+        break;
+    case CLogSelectColumnMode_ALL:
+        options.logFetchOptions.setReturnColsMode(RETURNCOLS_MODE_all);
+        break;
+    case CLogSelectColumnMode_CUSTOM:
+        options.logFetchOptions.setReturnColsMode(RETURNCOLS_MODE_custom);
+        options.logFetchOptions.copyLogFieldNames(logReq->getLogColumns());
+        break;
+    default:
+        options.logFetchOptions.setReturnColsMode(RETURNCOLS_MODE_default);
+        break;
+    }
+}
+
+void CWsWuFileHelper::sendWUComponentLogStreaming(CHttpRequest* request, CHttpResponse* response)
+{
+    StringBuffer wuid, fileName;
+    request->getParameter("Wuid", wuid);
+    if (wuid.isEmpty())
+        throw makeStringException(ECLWATCH_INVALID_INPUT, "Empty Wuid detected");
+    request->getParameter("Name", fileName);
+    if (fileName.isEmpty())
+        throw makeStringException(ECLWATCH_INVALID_INPUT, "Empty Name detected");
+
+    IEspContext* ctx = request->queryContext();
+    double version = ctx->getClientVersion();
+    Owned<CWULogFileRequest> espRequest = new CWULogFileRequest(ctx, "WsWorkunits", request->queryParameters(), request->queryAttachments());
+
+    WUComponentLogOptions options;
+    if (version < 1.92)
+        readWUComponentLogOptionsReq(&espRequest->getFileOptions(), options);
+    else
+        readWUComponentLogOptionsReq(espRequest.get(), options);
+
+    WsWuInfo winfo(*ctx, wuid.str());
+    int option = request->getParameterInt("Option", CWUFileDownloadOption_OriginalText); //0: original content; 1: content as attachment; 2: zip; 3: gzip.
+    if ((option < CWUFileDownloadOption_OriginalText) || (option > CWUFileDownloadOption_GZIP))
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid WU File Download option detected: '%d'", option);
+
+    StringBuffer importedComponentLog;
+    winfo.getImportedComponentLog(importedComponentLog);
+
+    CWUFileDownloadOption opt = (CWUFileDownloadOption) option;
+    if ((opt == CWUFileDownloadOption_OriginalText) || (opt == CWUFileDownloadOption_Attachment))
+    {
+        if (importedComponentLog.length() > 0)
+            options.logFormat = getComponentLogFormatFromLogName(importedComponentLog);
+        if (opt == CWUFileDownloadOption_OriginalText)
+        {
+            if (options.logFormat == LOGACCESS_LOGFORMAT_csv)
+                ctx->setResponseFormat(ESPSerializationCSV);
+            else if (options.logFormat == LOGACCESS_LOGFORMAT_json)
+                ctx->setResponseFormat(ESPSerializationJSON);
+            else
+                ctx->setResponseFormat(ESPSerializationXML);
+        }
+        else
+        {
+            VStringBuffer headerStr("attachment;filename=%s", fileName.str());
+            if (options.logFormat == LOGACCESS_LOGFORMAT_csv)
+                headerStr.append(".csv");
+            else if (options.logFormat == LOGACCESS_LOGFORMAT_json)
+                headerStr.append(".json");
+            else
+                headerStr.append(".xml");
+            ctx->addCustomerHeader("Content-disposition", headerStr.str());
+        }
+
+        if (importedComponentLog.length() > 0)
+            winfo.sendImportedWorkunitComponentLog(importedComponentLog, response);
+        else
+            winfo.sendWorkunitComponentLogs(ctx, response, options);
+    }
+    else
+    {   //zip or gzip the WUComponentLog
+        StringBuffer resultFileNameWithPath;
+        Owned<IFile> tempDir;
+
+        if (importedComponentLog.length())
+            resultFileNameWithPath.set(importedComponentLog.str());
+        else
+        {
+            tempDir.setown(createUniqueTempDirectory());
+            resultFileNameWithPath.setf("%s%s%s", tempDir->queryFilename(), PATHSEPSTR, fileName.str());
+
+            //Read the WUComponentLog into a file
+            winfo.readWorkunitComponentLogs(resultFileNameWithPath, options.logFetchOptions.getLimit(), options.logFetchOptions.getReturnColsMode(), options.logFormat, options.wuLogSearchTimeBuffSecs);
+        }
+
+        VStringBuffer headerStr("attachment;filename=%s", fileName.str());
+        if (opt == CWUFileDownloadOption_GZIP)
+            headerStr.append(".gz");
+        else
+            headerStr.append(".zip");
+        ctx->addCustomerHeader("Content-disposition", headerStr.str());
+
+        //zip or gzip
+        StringBuffer zipFileNameWithPath(resultFileNameWithPath);
+        zipFileNameWithPath.append((opt == CWUFileDownloadOption_GZIP) ? ".gz" : ".zip");
+        StringBuffer zipCommand;
+        if (opt == CWUFileDownloadOption_GZIP)
+            zipCommand.setf("tar -czf %s %s", zipFileNameWithPath.str(), resultFileNameWithPath.str());
+        else
+            zipCommand.setf("zip -j %s %s", zipFileNameWithPath.str(), resultFileNameWithPath.str());
+        if (system(zipCommand) != 0)
+            throw makeStringExceptionV(ECLWATCH_CANNOT_COMPRESS_DATA, "Failed to execute system command '%s'. Please make sure that zip utility is installed.",
+                (opt == CWUFileDownloadOption_GZIP) ? "tar" : "zip");
+
+        //Send the zipped file and clean the workingFolder.
+        IFileIOStream* stream = createIOStreamFromFile(zipFileNameWithPath, IFOread);
+        if (stream == nullptr)
+            throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Cannot open stream for zip file %s", zipFileNameWithPath.str());
+        response->setContent(stream);
+        if (opt == CWUFileDownloadOption_GZIP)
+            response->setContentType("application/x-gzip");
+        else
+            response->setContentType("application/zip");
+        response->send();
+        if (tempDir)
+            recursiveRemoveDirectory(tempDir->queryFilename());
+    }
+}
+
+LogAccessLogFormat CWsWuFileHelper::getComponentLogFormatFromLogName(const char* log)
+{
+    StringBuffer ext;
+    splitFilename(log, nullptr, nullptr, nullptr, &ext);
+    if (strieq(".xml", ext.str()))
+        return LOGACCESS_LOGFORMAT_xml;
+    if (strieq(".json", ext.str()))
+        return LOGACCESS_LOGFORMAT_json;
+    return LOGACCESS_LOGFORMAT_csv;
+}
+
+void CWsWuFileHelper::createZAPWUGraphProgressFile(const char* wuid, const char* tempDirName)
 {
     Owned<IPropertyTree> graphProgress = getWUGraphProgress(wuid, true);
     if (!graphProgress)
@@ -3746,19 +4604,56 @@ void CWsWuFileHelper::createZAPWUGraphProgressFile(const char* wuid, const char*
     StringBuffer graphProgressXML;
     toXML(graphProgress, graphProgressXML, 1, XML_Format);
 
-    VStringBuffer fileName("%s.graphprogress", pathNameStr);
+    VStringBuffer fileName("%s%cZAPReport_%s.graphprogress", tempDirName, PATHSEPCHAR, wuid);
     writeToFile(fileName.str(), graphProgressXML.length(), graphProgressXML.str());
 }
 
-int CWsWuFileHelper::zipAFolder(const char* folder, const char* passwordReq, const char* zipFileNameWithPath)
+void CWsWuFileHelper::zipAllZAPFiles(const char* zapWorkingFolder, StringArray& localFiles, const char* passwordReq, const char* zipFileNameWithFullPath)
 {
-    VStringBuffer archiveInPath("%s%c*", folder, PATHSEPCHAR);
+    VStringBuffer files("%s%c*", zapWorkingFolder, PATHSEPCHAR);
+    ForEachItemIn(i, localFiles)
+    {
+        const char* localFile = localFiles.item(i);
+        if (!isDirectory(localFile))
+            files.append(' ').append(localFile);
+        else
+        {
+            StringBuffer dirPath, dirTail;
+            Owned<IPropertyTree> plane = findPlane(nullptr, localFile, nullptr, false, false);
+            if (plane)
+            {
+                const char *planePrefix = plane->queryProp("@prefix");
+                dirPath.set(planePrefix);
+                const char *tail = localFile + strlen(planePrefix);
+                if (PATHSEPCHAR == *tail)
+                    tail++;
+                dirTail.set(tail);
+            }
+            else // not sure if ever will be true..
+                splitFilename(localFile, &dirPath, &dirPath, &dirTail, nullptr);
+            zipZAPFiles(dirPath, dirTail, passwordReq, zipFileNameWithFullPath);
+        }
+    }
+    zipZAPFiles(nullptr, files, passwordReq, zipFileNameWithFullPath);
+}
+
+void CWsWuFileHelper::zipZAPFiles(const char* parentFolder, const char* zapFiles, const char* passwordReq, const char* zipFileNameWithFullPath)
+{
     StringBuffer zipCommand;
-    if (!isEmptyString(passwordReq))
-        zipCommand.setf("zip -j --password %s %s %s", passwordReq, zipFileNameWithPath, archiveInPath.str());
+    if (isEmptyString(parentFolder))
+        zipCommand.set("zip -j");
     else
-        zipCommand.setf("zip -j %s %s", zipFileNameWithPath, archiveInPath.str());
-    return (system(zipCommand.str()));
+        zipCommand.setf("cd %s\nzip -r", parentFolder);
+    if (!isEmptyString(passwordReq))
+    {
+        StringBuffer sanitizedPassword;
+        sanitizeCommandArg(passwordReq, sanitizedPassword);
+        zipCommand.append(" --password ").append(sanitizedPassword);
+    }
+    zipCommand.append(" ").append(zipFileNameWithFullPath).append(" ").append(zapFiles);
+    int zipRet = system(zipCommand);
+    if (zipRet != 0)
+        throw makeStringExceptionV(ECLWATCH_CANNOT_COMPRESS_DATA, "Failed to execute system command '%s'. Please make sure that zip utility is installed.", zipCommand.str());
 }
 
 int CWsWuFileHelper::zipAFolder(const char* folder, bool gzip, const char* zipFileNameWithPath)
@@ -3773,37 +4668,39 @@ int CWsWuFileHelper::zipAFolder(const char* folder, bool gzip, const char* zipFi
 }
 
 void CWsWuFileHelper::createWUZAPFile(IEspContext& context, IConstWorkUnit* cwu, CWsWuZAPInfoReq& request,
-    StringBuffer& zipFileName, StringBuffer& zipFileNameWithPath, unsigned _thorSlaveLogThreadPoolSize)
+    const char* tempDirName, StringBuffer& zapFileName, StringBuffer& zipFileNameWithFullPath, unsigned _thorSlaveLogThreadPoolSize)
 {
-    StringBuffer zapReportNameStr, folderToZIP, inFileNamePrefixWithPath;
-    Owned<IFile> zipDir = createWorkingFolder(context, request.wuid.str(), "ZAPReport_", zapReportNameStr, folderToZIP);
-    setZAPFile(request.zapFileName.str(), zapReportNameStr.str(), zipFileName, zipFileNameWithPath);
+    request.hasLogsAccess = context.validateFeatureAccess(LOG_ACCESS_FEATURE, SecAccess_Read, false);
+    setZAPReportName(request.zapFileName, cwu->queryWuid(), zapFileName);
+
+    zipFileNameWithFullPath.set(tempDirName).append(PATHSEPCHAR).append("zapreport.zip");
     thorSlaveLogThreadPoolSize = _thorSlaveLogThreadPoolSize;
 
-    //create WU ZAP files
-    inFileNamePrefixWithPath.set(folderToZIP.str()).append(PATHSEPCHAR).append(zapReportNameStr.str());
-    createZAPInfoFile(request.url.str(), request.espIP.str(), request.thorIP.str(), request.problemDesc.str(), request.whatChanged.str(),
-        request.whereSlow.str(), cwu, inFileNamePrefixWithPath.str());
-    createZAPECLQueryArchiveFiles(cwu, inFileNamePrefixWithPath.str());
+//create WU ZAP files
+    createZAPInfoFile(request, cwu, tempDirName);
+    createZAPECLQueryArchiveFiles(cwu, tempDirName);
 
     WsWuInfo winfo(context, cwu);
-    createZAPWUXMLFile(winfo, inFileNamePrefixWithPath.str());
-    createZAPWUGraphProgressFile(request.wuid.str(), inFileNamePrefixWithPath.str());
-    createZAPWUQueryAssociatedFiles(cwu, folderToZIP);
-    createProcessLogfile(cwu, winfo, "EclAgent", folderToZIP.str());
-    createProcessLogfile(cwu, winfo, "Thor", folderToZIP.str());
-    if (request.includeThorSlaveLog.isEmpty() || strieq(request.includeThorSlaveLog.str(), "on"))
-        createThorSlaveLogfile(cwu, winfo, folderToZIP.str());
+    createZAPWUXMLFile(winfo, tempDirName);
+    createZAPWUGraphProgressFile(request.wuid.str(), tempDirName);
+
+    StringArray localFiles;
+    createZAPWUQueryAssociatedFiles(cwu, tempDirName, localFiles, request.hasLogsAccess);
+#ifndef _CONTAINERIZED
+        createProcessLogfile(cwu, winfo, "EclAgent", tempDirName, request.hasLogsAccess);
+        createProcessLogfile(cwu, winfo, "Thor", tempDirName, request.hasLogsAccess);
+        if (request.includeThorSlaveLog.isEmpty() || strieq(request.includeThorSlaveLog.str(), "on"))
+            createThorSlaveLogfile(cwu, winfo, tempDirName, request.hasLogsAccess);
+#else
+    if (request.includeRelatedLogs || request.includePerComponentLogs)
+        readWULogToFiles(cwu, winfo, tempDirName, request);
+#endif
 
     //Write out to ZIP file
-    int zipRet = zipAFolder(folderToZIP.str(), request.password.str(), zipFileNameWithPath);
-    //Remove the temporary files and the folder
-    cleanFolder(zipDir, true);
-    if (zipRet != 0)
-        throw MakeStringException(ECLWATCH_CANNOT_COMPRESS_DATA,"Failed to execute system command 'zip'. Please make sure that zip utility is installed.");
+    zipAllZAPFiles(tempDirName, localFiles, request.password, zipFileNameWithFullPath);
 }
 
-void CWsWuFileHelper::createZAPWUQueryAssociatedFiles(IConstWorkUnit* cwu, const char* pathToCreate)
+void CWsWuFileHelper::createZAPWUQueryAssociatedFiles(IConstWorkUnit* cwu, const char* tempDirName, StringArray& localFiles, bool hasLogsAccess)
 {
     Owned<IConstWUQuery> query = cwu->getQuery();
     if (!query)
@@ -3823,6 +4720,26 @@ void CWsWuFileHelper::createZAPWUQueryAssociatedFiles(IConstWorkUnit* cwu, const
         RemoteFilename rfn;
         SocketEndpoint ep(ip.str());
         rfn.setPath(ep, name.str());
+        StringBuffer fileName(name.str());
+        getFileNameOnly(fileName, false);
+
+        VStringBuffer outFileName("%s%c%s", tempDirName, PATHSEPCHAR, fileName.str());
+
+        // Since users are only accustomed to seeing error messages replacing log file contents,
+        // special case an access denied error message for the one log file processed here.
+        if (!hasLogsAccess && endsWith(name.str(), ".eclcc.log"))
+        {
+            StringBuffer msg;
+            msg.appendf("Access to log files is denied. You are missing permission %s:READ - check with your system admin.", LOG_ACCESS_FEATURE);
+            writeToFile(outFileName.str(), msg.length(), msg.str());
+            continue;
+        }
+
+        if (rfn.isLocal())
+        {
+            localFiles.append(name.str());
+            continue;
+        }
 
         OwnedIFile sourceFile = createIFile(rfn);
         if (!sourceFile)
@@ -3830,12 +4747,6 @@ void CWsWuFileHelper::createZAPWUQueryAssociatedFiles(IConstWorkUnit* cwu, const
             IERRLOG("Cannot open %s on %s.", name.str(), ip.str());
             continue;
         }
-
-        StringBuffer fileName(name.str());
-        getFileNameOnly(fileName, false);
-
-        StringBuffer outFileName(pathToCreate);
-        outFileName.append(PATHSEPCHAR).append(fileName);
 
         OwnedIFile outFile = createIFile(outFileName);
         if (!outFile)
@@ -3848,33 +4759,20 @@ void CWsWuFileHelper::createZAPWUQueryAssociatedFiles(IConstWorkUnit* cwu, const
     }
 }
 
-void CWsWuFileHelper::setZAPFile(const char* zipFileNameReq, const char* zipFileNamePrefix,
-    StringBuffer& zipFileName, StringBuffer& zipFileNameWithPath)
+const char* CWsWuFileHelper::setZAPReportName(const char* zapFileNameReq, const char* wuid, StringBuffer& zapReportName)
 {
-    StringBuffer outFileNameReq(zipFileNameReq);
-    //Clean zipFileNameReq. The zipFileNameReq should not end with PATHSEPCHAR.
-    while (!outFileNameReq.isEmpty() && (outFileNameReq.charAt(outFileNameReq.length() - 1) == PATHSEPCHAR))
-        outFileNameReq.setLength(outFileNameReq.length() - 1);
-
-    if (outFileNameReq.isEmpty())
-        zipFileName.set(zipFileNamePrefix).append(".zip");
+    zapReportName.set(zapFileNameReq);
+    removeTrailingPathSepChar(zapReportName);
+    if (zapReportName.isEmpty())
+        zapReportName.set(wuid).append(".zip");
     else
     {
-        zipFileName.set(outFileNameReq.str());
-        const char* ext = pathExtension(zipFileName.str());
+        //ZAP report should be a zip file.
+        const char* ext = pathExtension(zapReportName);
         if (!ext || !strieq(ext, ".zip"))
-            zipFileName.append(".zip");
+            zapReportName.append(".zip");
     }
-
-    zipFileNameWithPath.set(zipFolder);
-    Owned<IFile> workingDir = createIFile(zipFileNameWithPath.str());
-    if (!workingDir->exists())
-        workingDir->createDirectory();
-
-    zipFileNameWithPath.append(PATHSEPCHAR).append(zipFileName);
-    OwnedIFile thisFile = createIFile(zipFileNameWithPath.str());
-    if (thisFile->isFile() == fileBool::foundYes)
-        thisFile->remove();
+    return zapReportName;
 }
 
 IFile* CWsWuFileHelper::createWorkingFolder(IEspContext& context, const char* wuid, const char* namePrefix,
@@ -3894,14 +4792,14 @@ IFile* CWsWuFileHelper::createWorkingFolder(IEspContext& context, const char* wu
 }
 
 IFileIOStream* CWsWuFileHelper::createWUZAPFileIOStream(IEspContext& context, IConstWorkUnit* cwu,
-    CWsWuZAPInfoReq& request, unsigned thorSlaveLogThreadPoolSize)
+    CWsWuZAPInfoReq& request, const char* tempDirName, unsigned thorSlaveLogThreadPoolSize)
 {
-    StringBuffer zapFileName, zapFileNameWithPath;
-    createWUZAPFile(context, cwu, request, zapFileName, zapFileNameWithPath, thorSlaveLogThreadPoolSize);
+    StringBuffer zapFileName, zipFileNameWithFullPath;
+    createWUZAPFile(context, cwu, request, tempDirName, zapFileName, zipFileNameWithFullPath, thorSlaveLogThreadPoolSize);
 
     if (request.sendEmail)
     {
-        CWsWuEmailHelper emailHelper(request.emailFrom.str(), request.emailTo.str(), request.emailServer.str(), request.port);
+        CWsWuEmailHelper emailHelper(request.emailFrom.str(), request.emailTo.str(), request.emailServer.str(), request.port, true);
 
         StringBuffer subject(request.emailSubject.str());
         if (subject.isEmpty())
@@ -3915,7 +4813,7 @@ IFileIOStream* CWsWuFileHelper::createWUZAPFileIOStream(IEspContext& context, IC
             emailHelper.send(request.emailBody.str(), "", 0, warnings);
         else
         {
-            Owned<IFile> f = createIFile(zapFileNameWithPath.str());
+            Owned<IFile> f = createIFile(zipFileNameWithFullPath);
             Owned<IFileIO> io = f->open(IFOread);
             unsigned zapFileSize = (unsigned) io->size();
             if (zapFileSize > request.maxAttachmentSize)
@@ -3939,7 +4837,10 @@ IFileIOStream* CWsWuFileHelper::createWUZAPFileIOStream(IEspContext& context, IC
 
     VStringBuffer headerStr("attachment;filename=%s", zapFileName.str());
     context.addCustomerHeader("Content-disposition", headerStr.str());
-    return createIOStreamWithFileName(zapFileNameWithPath.str(), IFOread);
+    auto stream = createIOStreamFromFile(zipFileNameWithFullPath.str(), IFOread);
+    if (stream == nullptr)
+        throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Unable to create output stream for ZAP file %s", zipFileNameWithFullPath.str());
+    return stream;
 }
 
 IFileIOStream* CWsWuFileHelper::createWUFileIOStream(IEspContext& context, const char* wuid, IArrayOf<IConstWUFileOption>& wuFileOptions,
@@ -3981,7 +4882,10 @@ IFileIOStream* CWsWuFileHelper::createWUFileIOStream(IEspContext& context, const
         }
 
         zipFileNameWithPath.set(zipFolder).append(fileName.str());
-        return createIOStreamWithFileName(zipFileNameWithPath.str(), IFOread);
+        auto stream = createIOStreamFromFile(zipFileNameWithPath.str(), IFOread);
+        if (stream == nullptr)
+            throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Unable to create output stream for zip file %s", zipFileNameWithPath.str());
+        return stream;
     }
 
     if (downloadOptions == CWUFileDownloadOption_ZIP)
@@ -4003,7 +4907,67 @@ IFileIOStream* CWsWuFileHelper::createWUFileIOStream(IEspContext& context, const
     contentType.set(HTTP_TYPE_OCTET_STREAM);
     VStringBuffer headerStr("attachment;filename=%s", fileName.str());
     context.addCustomerHeader("Content-disposition", headerStr.str());
-    return createIOStreamWithFileName(zipFileNameWithPath.str(), IFOread);
+    auto stream = createIOStreamFromFile(zipFileNameWithPath.str(), IFOread);
+    if (stream == nullptr)
+        throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Cannot open stream for zip file %s", zipFileNameWithPath.str());
+    return stream;
+}
+
+void CWsWuFileHelper::validateFilePath(const char* file, WsWuInfo& winfo, CWUFileType wuFileType, bool UNCFileName, const char* fileType, const char* compType, const char* compName)
+{
+    if (validateWUFile(file, winfo, wuFileType))
+        return;
+
+    StringBuffer actualPath;
+    if (UNCFileName)
+        splitUNCFilename(file, nullptr, &actualPath, nullptr, nullptr);
+    else
+        splitFilename(file, nullptr, &actualPath, nullptr, nullptr);
+    if (containsRelPaths(actualPath)) //Detect a path like: /home/lexis/runtime/var/log/HPCCSystems/myesp/../../../
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid file path %s", actualPath.str());
+    if (!validateConfigurationDirectory(nullptr, fileType, compType, compName, actualPath))
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid file path %s", actualPath.str());
+}
+
+bool CWsWuFileHelper::validateWUFile(const char* file, WsWuInfo& winfo, CWUFileType wuFileType)
+{
+    bool valid = false;
+    switch (wuFileType)
+    {
+    case CWUFileType_ThorLog:
+    {
+        valid = winfo.validateWUProcessLog(file, false);
+        break;
+    }
+    case CWUFileType_EclAgentLog:
+    {
+        valid = winfo.validateWUProcessLog(file, true);
+        break;
+    }
+    case CWUFileType_CPP:
+    {
+        valid = winfo.validateWUAssociatedFile(file, FileTypeCpp);
+        break;
+    }
+    case CWUFileType_LOG:
+    {
+        valid = winfo.validateWUAssociatedFile(file, FileTypeLog);
+        break;
+    }
+    case CWUFileType_XML:
+    {
+        valid = winfo.validateWUAssociatedFile(file, FileTypeXml);
+        break;
+    }
+    case CWUFileType_PostMortem:
+    {
+        valid = winfo.validateWUAssociatedFile(file, FileTypePostMortem);
+        break;
+    }
+    default:
+        throw MakeStringException(ECLWATCH_INVALID_INPUT, "Unsupported file type %d.", wuFileType);
+    }
+    return valid;
 }
 
 void CWsWuFileHelper::readWUFile(const char* wuid, const char* workingFolder, WsWuInfo& winfo, IConstWUFileOption& item,
@@ -4023,11 +4987,18 @@ void CWsWuFileHelper::readWUFile(const char* wuid, const char* workingFolder, Ws
     case CWUFileType_CPP:
     case CWUFileType_LOG:
     {
-        const char *tail=pathTail(item.getName());
-        fileName.set(tail ? tail : item.getName());
+        const char *file=item.getName();
+#ifndef _CONTAINERIZED
+        validateFilePath(file, winfo, fileType, false, "run", nullptr, nullptr);
+#else
+        validateFilePath(file, winfo, fileType, false, "query", nullptr, nullptr);
+#endif
+
+        const char *tail=pathTail(file);
+        fileName.set(tail ? tail : file);
         fileMimeType.set(HTTP_TYPE_TEXT_PLAIN);
         fileNameWithPath.set(workingFolder).append(PATHSEPCHAR).append(fileName.str());
-        winfo.getWorkunitCpp(item.getName(), item.getDescription(), item.getIPAddress(), mb, true, fileNameWithPath.str());
+        winfo.getWorkunitCpp(file, item.getDescription(), item.getIPAddress(), mb, true, fileNameWithPath.str());
         break;
     }
     case CWUFileType_DLL:
@@ -4046,12 +5017,18 @@ void CWsWuFileHelper::readWUFile(const char* wuid, const char* workingFolder, Ws
         winfo.getWorkunitResTxt(mb);
         writeToFileIOStream(workingFolder, fileName.str(), mb);
         break;
+#ifndef _CONTAINERIZED
     case CWUFileType_ThorLog:
+    {
+        const char *file=item.getName();
+        validateFilePath(file, winfo, fileType, true, "log", nullptr, nullptr);
+
         fileName.set("thormaster.log");
         fileMimeType.set(HTTP_TYPE_TEXT_PLAIN);
         fileNameWithPath.set(workingFolder).append(PATHSEPCHAR).append(fileName.str());
-        winfo.getWorkunitThorMasterLog(nullptr, item.getName(), mb, fileNameWithPath.str());
+        winfo.getWorkunitThorMasterLog(nullptr, file, mb, fileNameWithPath.str());
         break;
+    }
     case CWUFileType_ThorSlaveLog:
     {
         fileName.set("ThorSlave.log");
@@ -4063,11 +5040,44 @@ void CWsWuFileHelper::readWUFile(const char* wuid, const char* workingFolder, Ws
         break;
     }
     case CWUFileType_EclAgentLog:
+    {
+        const char *file=item.getName();
+        validateFilePath(file, winfo, fileType, true, "log", nullptr, nullptr);
+
         fileName.set("eclagent.log");
         fileMimeType.set(HTTP_TYPE_TEXT_PLAIN);
         fileNameWithPath.set(workingFolder).append(PATHSEPCHAR).append(fileName.str());
-        winfo.getWorkunitEclAgentLog(nullptr, item.getName(), item.getProcess(), mb, fileNameWithPath.str());
+        winfo.getWorkunitEclAgentLog(nullptr, file, item.getProcess(), mb, fileNameWithPath.str());
         break;
+    }
+#endif
+    case CWUFileType_ComponentLog:
+    {
+        WUComponentLogOptions options;
+        readWUComponentLogOptionsReq(&item, options); //The item comes from ESPrequest WUDownloadFilesRequest.
+
+        fileName.set(File_ComponentLog);
+        if (options.logFormat == LOGACCESS_LOGFORMAT_csv)
+        {
+            fileMimeType.set(HTTP_TYPE_TEXT_PLAIN);
+            fileName.append(".csv");
+        }
+        else if (options.logFormat == LOGACCESS_LOGFORMAT_json)
+        {
+            fileMimeType.set(HTTP_TYPE_JSON);
+            fileName.append(".json");
+        }
+        else
+        {
+            fileMimeType.set(HTTP_TYPE_APPLICATION_XML);
+            fileName.append(".xml");
+        }
+        fileNameWithPath.set(workingFolder).append(PATHSEPCHAR).append(fileName.str());
+
+        winfo.readWorkunitComponentLogs(fileNameWithPath, options.logFetchOptions.getLimit(), options.logFetchOptions.getReturnColsMode(),
+            options.logFormat, options.wuLogSearchTimeBuffSecs);
+        break;
+    }
     case CWUFileType_XML:
     {
         StringBuffer name(item.getName());
@@ -4102,13 +5112,189 @@ void CWsWuFileHelper::readWUFile(const char* wuid, const char* workingFolder, Ws
     }
 }
 
+void CWsWuFileHelper::sendLocalFileStreaming(CHttpRequest* request, CHttpResponse* response)
+{
+    StringBuffer wuid;
+    readWUIDRequest(request, wuid);
+
+    IEspContext* ctx = request->queryContext();
+    ensureWsWorkunitAccess(*ctx, wuid, SecAccess_Read);
+
+    StringBuffer localFileName, localFileNameWithPath, zipFileNameWithPath, headerStr;
+    request->getParameter("Name", localFileNameWithPath);
+    if (localFileNameWithPath.isEmpty())
+        throw makeStringException(ECLWATCH_INVALID_INPUT, "Empty File Name detected");
+
+    WsWuInfo winfo(*ctx, wuid);
+    if (!validateWUFile(localFileNameWithPath, winfo, CWUFileType_PostMortem))
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid file %s", localFileNameWithPath.str());
+
+    //Find localFileName which will be used in HTTP attachment header.
+    splitFilename(localFileNameWithPath, nullptr, nullptr, &localFileName, &localFileName);
+
+    int option = request->getParameterInt("Option", CWUFileDownloadOption_OriginalText); //0: original content; 1: content as attachment; 2: zip; 3: gzip.
+    if ((option < CWUFileDownloadOption_OriginalText) || (option > CWUFileDownloadOption_GZIP))
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid WU File Download option detected: '%d'", option);
+
+    Owned<IFile> tempDir;
+    bool noZIP = (option == CWUFileDownloadOption_OriginalText) || (option == CWUFileDownloadOption_Attachment);
+    if (noZIP)
+    {
+        if (option == CWUFileDownloadOption_OriginalText)
+            response->setContentType(HTTP_TYPE_TEXT_PLAIN);
+        else
+        {
+            headerStr.setf("attachment;filename=%s", localFileName.str());
+            ctx->addCustomerHeader("Content-disposition", headerStr);
+        }
+    }
+    else
+    {
+        //ZIP the local file inside a tempDir.
+        tempDir.setown(createUniqueTempDirectory());
+        zipFileNameWithPath.setf("%s%c%s", tempDir->queryFilename(), PATHSEPCHAR, localFileName.str());
+        zipFileNameWithPath.append(option == CWUFileDownloadOption_GZIP ? ".gz" : ".zip");
+
+        VStringBuffer zipCommand("%s %s %s", option == CWUFileDownloadOption_GZIP ? "tar -czf" : "zip -j",
+            zipFileNameWithPath.str(), localFileNameWithPath.str());
+        if (system(zipCommand) != 0)
+            throw makeStringExceptionV(ECLWATCH_CANNOT_COMPRESS_DATA, "Failed to execute system command '%s'. Please make sure that zip utility is installed.",
+                (option == CWUFileDownloadOption_GZIP) ? "tar" : "zip");
+
+        //Set HTTP headers.
+        headerStr.setf("attachment;filename=%s", localFileName.str());
+        if (option == CWUFileDownloadOption_GZIP)
+        {
+            headerStr.append(".gz");
+            response->setContentType("application/x-gzip");
+        }
+        else
+        {
+            headerStr.append(".zip");
+            response->setContentType("application/zip");
+        }
+        ctx->addCustomerHeader("Content-disposition", headerStr);
+    }
+
+    const char* fileToSent = noZIP ? localFileNameWithPath.str() : zipFileNameWithPath.str();
+    IFileIOStream* stream = createIOStreamFromFile(fileToSent, IFOread);
+    if (stream == nullptr)
+        throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Cannot open stream for file %s", fileToSent);
+    response->setContent(stream);
+    response->send();
+    if (tempDir)
+        recursiveRemoveDirectory(tempDir);
+}
+
+void CWsWuFileHelper::readWUIDRequest(CHttpRequest* request, StringBuffer& wuid)
+{
+    request->getParameter("Wuid", wuid);
+    if (wuid.trim().isEmpty())
+    {
+        StringBuffer querySet, queryReq;
+        request->getParameter("QuerySet", querySet);
+        request->getParameter("Query", queryReq);
+        if (queryReq.trim().isEmpty() || querySet.trim().isEmpty())
+            throw makeStringException(ECLWATCH_INVALID_INPUT, "WU ID or QuerySet/Query not specified");
+
+        Owned<IPropertyTree> registry = getQueryRegistry(querySet, false);
+        if (!registry)
+            throw makeStringExceptionV(ECLWATCH_QUERYSET_NOT_FOUND, "Queryset %s not found", querySet.str());
+        Owned<IPropertyTree> query = resolveQueryAlias(registry, queryReq);
+        if (!query)
+            throw makeStringExceptionV(ECLWATCH_QUERYID_NOT_FOUND, "Query %s not found", queryReq.str());
+        wuid.set(query->queryProp("@wuid"));
+    }
+
+    if (!looksLikeAWuid(wuid, 'W'))
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "Invalid Workunit ID");
+}
+
+void CWsWuFileHelper::readLocalFileToBuffer(const char* file, offset_t sizeLimit, MemoryBuffer &mb)
+{
+    OwnedIFile source = createIFile(file);
+    if (!source)
+        throw makeStringExceptionV(ECLWATCH_CANNOT_OPEN_FILE, "Cannot open %s.", file);
+
+    OwnedIFileIO sourceIO = source->openShared(IFOread,IFSHfull);
+    if (!sourceIO)
+        throw makeStringExceptionV(ECLWATCH_CANNOT_READ_FILE, "Cannot open %s.", file);
+
+    offset_t len = source->size();
+    if (len > sizeLimit)
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "The file size (%lld) exceeds the size limit (%lld).", len, sizeLimit);
+
+    if (read(sourceIO, 0, len, mb) != len)
+        throw MakeStringException(ECLWATCH_CANNOT_READ_FILE, "Cannot read %s.", file);
+}
+
+void CWsWuFileHelper::createHelperFileArchive(IEspContext& context, const char* wuid,
+    IArrayOf<IConstWUFileOption>& wuFileOptions, bool useGZip, const char* tempDirName,
+    StringBuffer& archiveFileName, StringBuffer& archiveFileNameWithPath)
+{
+    StringBuffer workingFolder;
+    workingFolder.set(tempDirName).append(PATHSEPCHAR).append("files");
+    Owned<IFile> workingDir = createIFile(workingFolder.str());
+    workingDir->createDirectory();
+
+    bool hasLogsAccess = context.validateFeatureAccess(LOG_ACCESS_FEATURE, SecAccess_Read, false);
+    WsWuInfo winfo(context, wuid);
+    unsigned filesAdded = 0;
+    ForEachItemIn(i, wuFileOptions)
+    {
+        StringBuffer fileName, fileMimeType;
+        try
+        {
+            CWUFileType fileType = wuFileOptions.item(i).getFileType();
+            switch (fileType)
+            {
+            case CWUFileType_ThorLog:
+            case CWUFileType_ThorSlaveLog:
+            case CWUFileType_EclAgentLog:
+            case CWUFileType_ComponentLog:
+                if (!hasLogsAccess)
+                    throw makeStringExceptionV(ECLWATCH_ACCESS_TO_FILE_DENIED,
+                        "Access to log files is denied. You are missing permission %s:READ - check with your system admin.",
+                        LOG_ACCESS_FEATURE);
+                break;
+            default:
+                break;
+            }
+            readWUFile(wuid, workingFolder.str(), winfo, wuFileOptions.item(i), fileName, fileMimeType);
+            filesAdded++;
+        }
+        catch (IException* e)
+        {
+            StringBuffer msg;
+            WARNLOG("Failed to read helper file for workunit %s: %s", wuid, e->errorMessage(msg).str());
+            e->Release();
+        }
+    }
+
+    if (filesAdded == 0)
+        throw makeStringExceptionV(ECLWATCH_INVALID_INPUT, "No helper files could be retrieved for workunit %s.", wuid);
+
+    StringBuffer userName;
+    if (context.queryUser())
+        userName.append(context.queryUser()->getName());
+    archiveFileName.set("WUHelpers_").append(wuid).append('_').append(userName.str());
+    archiveFileName.append(useGZip ? ".gz" : ".zip");
+    archiveFileNameWithPath.set(tempDirName).append(PATHSEPCHAR).append(archiveFileName.str());
+
+    int zipRet = zipAFolder(workingFolder.str(), useGZip, archiveFileNameWithPath.str());
+    cleanFolder(workingDir, true);
+
+    if (zipRet != 0)
+        throw makeStringExceptionV(ECLWATCH_CANNOT_COMPRESS_DATA, "Failed to create helper file archive for workunit %s.", wuid);
+}
+
 void CWsWuEmailHelper::send(const char* body, const void* attachment, size32_t lenAttachment, StringArray& warnings)
 {
     if (lenAttachment == 0)
-        sendEmail(to.get(), subject.get(), body, mailServer.get(), port, sender.get(), &warnings);
+        sendEmail(to.get(), subject.get(), body, mailServer.get(), port, sender.get(), &warnings, termOnJobFail);
     else
         sendEmailAttachData(to.get(), subject.get(), body, lenAttachment, attachment, mimeType.get(),
-            attachmentName.get(), mailServer.get(), port, sender.get(), &warnings);
+            attachmentName.get(), mailServer.get(), port, sender.get(), &warnings, termOnJobFail);
 }
 
 }

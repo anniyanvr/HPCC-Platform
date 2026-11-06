@@ -19,6 +19,7 @@
 #include <limits.h>
 #include "jio.hpp"
 #include "jlzw.hpp"
+#include "jstream.hpp"
 #include "jsort.hpp"
 #include "eclhelper.hpp"
 #include "slave.ipp"
@@ -30,6 +31,7 @@
 #include "thbufdef.hpp"
 #include "thsortu.hpp"
 #include "thorxmlread.hpp"
+#include "thorcommon.hpp"
 #include "thdiskbaseslave.ipp"
 
 class CXmlReadSlaveActivity : public CDiskReadSlaveActivityBase
@@ -37,7 +39,7 @@ class CXmlReadSlaveActivity : public CDiskReadSlaveActivityBase
     typedef CDiskReadSlaveActivityBase PARENT;
 
     IHThorXmlReadArg *helper;
-    IRowStream *out;
+    Owned<CSeqPartHandler> partSequencer;
     rowcount_t limit;
     rowcount_t stopAfter;
 
@@ -46,12 +48,12 @@ class CXmlReadSlaveActivity : public CDiskReadSlaveActivityBase
         CXmlReadSlaveActivity &activity;
         IXmlToRowTransformer *xmlTransformer;
         Linked<IColumnProvider> lastMatch;
-        Owned<ICrcIOStream> crcStream;
         Owned<IXMLParse> xmlParser;
         CRC32 inputCRC;
         OwnedIFileIO iFileIO;
-        Owned<IIOStream> inputIOstream;
+        Owned<ISimpleReadStream> inputIOstream;
         offset_t localOffset;  // not sure what this is for 
+        unsigned __int64 progress = 0;
         Linked<IEngineRowAllocator> allocator;
 
     public:
@@ -69,12 +71,13 @@ class CXmlReadSlaveActivity : public CDiskReadSlaveActivityBase
             CDiskPartHandlerBase::open();
 
             OwnedIFileIO partFileIO;
+            ICompressedFileIO *compressedIO = nullptr;
             if (compressed)
             {
-                partFileIO.setown(createCompressedFileReader(iFile, activity.eexp));
+                compressedIO = createCompressedFileReader(iFile, activity.eexp, useDefaultIoBufferSize, false, IFEnone);
+                partFileIO.setown(compressedIO);
                 if (!partFileIO)
                     throw MakeActivityException(&activity, 0, "Failed to open block compressed file '%s'", filename.get());
-                checkFileCrc = false;
             }
             else
                 partFileIO.setown(iFile->open(IFOread));
@@ -84,34 +87,50 @@ class CXmlReadSlaveActivity : public CDiskReadSlaveActivityBase
                 iFileIO.setown(partFileIO.getClear());
             }
 
-            Owned<IIOStream> stream = createIOStream(iFileIO);
-            if (stream && checkFileCrc)
+            unsigned numThreads;
+            size32_t chunkSize;
+            getPlaneReadAheadSizing(activity, iFile->queryFilename(), numThreads, chunkSize);
+            Owned<ISimpleReadStream> xmlStream;
+            if (compressedIO && numThreads>1)
+                xmlStream.setown(compressedIO->createParallelReadStream(numThreads, chunkSize));
+            if (!xmlStream)
             {
-                crcStream.setown(createCrcPipeStream(stream));
-                stream.set(crcStream);
+                if (compressed)
+                {
+                    // Row-diff compressed: no parallel expanding stream; fall back to sequential decompression.
+                    Owned<IIOStream> stream = createIOStream(iFileIO);
+                    xmlStream.setown(createBufferedIOStream(stream));
+                }
+                else
+                {
+                    // NB: createParallelRowInputStream falls back to createBufferedInputStream if numThreads is 1
+                    // XML/JSON parsing consumes the stream with bounded reads, so arbitrary-size peek buffering is unnecessary.
+                    xmlStream.setown(createParallelRowInputStream(iFileIO, numThreads, chunkSize, chunkSize));
+                }
             }
-            inputIOstream.setown(createBufferedIOStream(stream));
+            inputIOstream.setown(xmlStream.getClear());
             OwnedRoxieString xmlIterator(activity.helper->getXmlIteratorPath());
             if (activity.queryContainer().getKind()==TAKjsonread)
                 xmlParser.setown(createJSONParse(*inputIOstream.get(), xmlIterator, *this, (0 != (TDRxmlnoroot & activity.helper->getFlags()))?ptr_noRoot:ptr_none, 0 != (TDRusexmlcontents & activity.helper->getFlags())));
             else
                 xmlParser.setown(createXMLParse(*inputIOstream.get(), xmlIterator, *this, (0 != (TDRxmlnoroot & activity.helper->getFlags()))?ptr_noRoot:ptr_none, 0 != (TDRusexmlcontents & activity.helper->getFlags())));
+            progress = 0;
         }
         virtual void close(CRC32 &fileCRC)
         {
             xmlParser.clear();
             inputIOstream.clear();
-            if (checkFileCrc)
-            {
-                fileCRC.reset(~crcStream->queryCrc()); // MORE should prob. change stream to use CRC32
-                crcStream.clear();
-            }
             Owned<IFileIO> partFileIO;
             {
                 CriticalBlock block(inputCs);
                 partFileIO.setown(iFileIO.getClear());
             }
-            mergeStats(fileStats, partFileIO);
+            if (partFileIO)
+            {
+                mergeStats(closedPartFileStats, partFileIO);
+                closedPartFileStats.mergeStatistic(StNumDiskRowsRead, progress);
+                progress = 0;
+            }
         }
 
         const void *nextRow()
@@ -131,7 +150,7 @@ class CXmlReadSlaveActivity : public CDiskReadSlaveActivityBase
                         if (sz)
                         {
                             localOffset = 0;
-                            ++activity.diskProgress;
+                            ++progress;
                             return row.finalizeRowClear(sz);
                         }
                     }
@@ -201,12 +220,12 @@ class CXmlReadSlaveActivity : public CDiskReadSlaveActivityBase
             CriticalBlock block(inputCs);
             CDiskPartHandlerBase::gatherStats(merged);
             mergeStats(merged, iFileIO);
+            merged.mergeStatistic(StNumDiskRowsRead, progress);
         }
     };
 public:
     CXmlReadSlaveActivity(CGraphElementBase *_container) : CDiskReadSlaveActivityBase(_container, nullptr)
     {
-        out = NULL;
         helper = (IHThorXmlReadArg *)queryHelper();
         stopAfter = (rowcount_t)helper->getChooseNLimit();
         if (helper->getFlags() & TDRlimitskips)
@@ -217,7 +236,6 @@ public:
     }
     ~CXmlReadSlaveActivity()
     {
-        ::Release(out);
     }
     virtual void init(MemoryBuffer &data, MemoryBuffer &slaveData) override
     {
@@ -226,11 +244,7 @@ public:
     }
     virtual void kill()
     {
-        if (out)
-        {
-            out->Release();
-            out = NULL;
-        }
+        partSequencer.clear();
         CDiskReadSlaveActivityBase::kill();
     }
     
@@ -239,14 +253,14 @@ public:
     {
         ActivityTimer s(slaveTimerStats, timeActivities);
         CDiskReadSlaveActivityBase::start();
-        out = createSequentialPartHandler(partHandler, partDescs, false);
+        partSequencer.setown(createSequentialPartHandler(partHandler, partDescs, false));
     }
     virtual void stop() override
     {
-        if (out)
+        if (partSequencer)
         {
-            out->Release();
-            out = NULL;
+            partSequencer->stop();
+            partSequencer.clear();
         }
         PARENT::stop();
     }
@@ -254,8 +268,8 @@ public:
     CATCH_NEXTROW()
     {
         ActivityTimer t(slaveTimerStats, timeActivities);
-        OwnedConstThorRow row = out->nextRow();
-        if (!row)
+        OwnedConstThorRow row = partSequencer->nextRow();
+        if (unlikely(!row))
             return NULL;
         rowcount_t c = getDataLinkCount();
         if (stopAfter && (c >= stopAfter)) // NB: only slave limiter, global performed in chained choosen activity 

@@ -15,8 +15,6 @@
     limitations under the License.
 ############################################################################## */
 
-
-#define da_decl DECL_EXPORT
 #include "platform.h"
 #include "jlib.hpp"
 #include "jfile.hpp"
@@ -39,11 +37,19 @@
 #include "dadfs.hpp"
 #include "eclhelper.hpp"
 #include "seclib.hpp"
+#include "dameta.hpp"
 
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <unordered_map>
+#include <functional>
 #include <algorithm>
+#include <time.h>
+
+#ifdef _USE_CPPUNIT
+#include "unittests.hpp"
+#endif
 
 #ifdef _DEBUG
 //#define EXTRA_LOGGING
@@ -55,7 +61,7 @@
 #define SDS_TRANSACTION_RETRY (60000)
 #define SDS_UPDATEFS_TIMEOUT (10000)
 
-#define DEFAULT_NUM_DFS_THREADS 30
+#define DEFAULT_NUM_DFS_THREADS 100
 #define TIMEOUT_ON_CLOSEDOWN 120000 // On closedown, give up on trying to join a thread in CDaliDFSServer after two minutes
 #define MAX_PHYSICAL_DELETE_THREADS 1000
 
@@ -76,20 +82,22 @@ class CDistributedFile;
 
 enum MDFSRequestKind
 {
-    MDFS_ITERATE_FILES,
+    MDFS_ITERATE_FILES,        // legacy, will continue to be used by clients <= HPCC v9.14
     MDFS_UNUSED1,
     MDFS_GET_FILE_TREE,
     MDFS_GET_GROUP_TREE,
     MDFS_SET_FILE_ACCESSED,
     MDFS_ITERATE_RELATIONSHIPS,
     MDFS_SET_FILE_PROTECT,
-    MDFS_ITERATE_FILTEREDFILES,
+    MDFS_ITERATE_FILTEREDFILES, // legacy, no longer supported, not needed since HPCC v6.0
     MDFS_ITERATE_FILTEREDFILES2,
+    MDFS_GET_FILE_TREE2,
+    MDFS_ITERATE_FILTEREDFILES3,
     MDFS_MAX
 };
 
 // Mutex for physical operations (remove/rename)
-static CriticalSection physicalChange;
+static CriticalSection physicalChange{SYNC_LOCATION};
 
 #define MDFS_GET_FILE_TREE_V2 ((unsigned)1)
 
@@ -114,6 +122,19 @@ inline unsigned groupDistance(IGroup *grp1,IGroup *grp2)
     if (!grp1||!grp2)
         return (unsigned)-1;
     return grp1->distance(grp2);
+}
+
+inline StringBuffer &appendEnsurePathSepChar(StringBuffer &dest, StringBuffer &newPart, char psc)
+{
+    addPathSepChar(dest, psc);
+    if (newPart.length() > 0)
+    {
+        if (isPathSepChar(newPart.charAt(0)))
+            dest.append(newPart.str()+1);
+        else
+            dest.append(newPart);
+    }
+    return dest;
 }
 
 
@@ -175,7 +196,92 @@ static IPropertyTree *getEmptyAttr()
     return createPTree("Attr");
 }
 
-RemoteFilename &constructPartFilename(IGroup *grp,unsigned partno,unsigned partmax,const char *name,const char *partmask,const char *partdir,unsigned copy,ClusterPartDiskMapSpec &mspec,RemoteFilename &rfn)
+static IPropertyTree *getCostPropTree(const char *cluster)
+{
+    Owned<const IPropertyTree> plane = getStoragePlaneConfig(cluster, false);
+
+    if (plane)
+    {
+        IPropertyTree *cost = plane->queryPropTree("cost");
+        if (cost)
+            return LINK(cost);
+
+        // Ensure spill plane doesn't use global config
+        // (This is to make sure spill planes are only costed if they are
+        // specifically configured with cost config.)
+        if (strsame(plane->queryProp("@category"), "spill"))
+            return nullptr;
+
+        // drop-through to use global cost config
+    }
+    return getGlobalConfigSP()->getPropTree("cost");
+}
+
+extern da_decl cost_type calcFileAtRestCost(const char * cluster, double sizeGB, double fileAgeDays)
+{
+    Owned<const IPropertyTree> costPT = getCostPropTree(cluster);
+
+    if (costPT==nullptr)
+        return 0;
+    double atRestPrice = costPT->getPropReal("@storageAtRest", 0.0);
+    double storageCostDaily = atRestPrice * 12 / 365;
+    return money2cost_type(storageCostDaily * sizeGB * fileAgeDays);
+}
+
+extern da_decl cost_type calcFileAccessCost(const char * cluster, __int64 numDiskWrites, __int64 numDiskReads)
+{
+    Owned<const IPropertyTree> costPT = getCostPropTree(cluster);
+
+    if (costPT==nullptr)
+        return 0;
+    constexpr int accessPriceScalingFactor = 10000; // read/write pricing based on 10,000 operations
+    double readPrice =  costPT->getPropReal("@storageReads", 0.0);
+    double writePrice =  costPT->getPropReal("@storageWrites", 0.0);
+    return money2cost_type((readPrice * numDiskReads / accessPriceScalingFactor) + (writePrice * numDiskWrites / accessPriceScalingFactor));
+}
+
+extern da_decl cost_type calcFileAccessCost(IDistributedFile *f, __int64 numDiskWrites, __int64 numDiskReads)
+{
+    if (!numDiskWrites && !numDiskReads)
+        return 0;
+    StringBuffer clusterName;
+    // Should really specify the cluster number too, but this is the best we can do for now
+    f->getClusterName(0, clusterName);
+    return calcFileAccessCost(clusterName, numDiskWrites, numDiskReads);
+}
+
+extern da_decl cost_type calcDiskWriteCost(const StringArray & clusters, stat_type numDiskWrites)
+{
+    if (!numDiskWrites)
+        return 0;
+    cost_type writeCost = 0;
+    ForEachItemIn(idx, clusters)
+        writeCost += calcFileAccessCost(clusters.item(idx), numDiskWrites, 0);
+    return writeCost;
+}
+
+// Update logical file's costs and numReads
+// (numDiskReads and curReadCost required)
+extern da_decl cost_type updateCostAndNumReads(IDistributedFile *file, stat_type numDiskReads, cost_type curReadCost)
+{
+    const IPropertyTree & fileAttr = file->queryAttributes();
+
+    cost_type legacyReadCost = 0;
+    if (!fileAttr.hasProp(getDFUQResultFieldName(DFUQResultField::readCost)))
+    {
+        if (!isFileKey(fileAttr))
+        {
+            stat_type prevDiskReads = fileAttr.getPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskReads), 0);
+            legacyReadCost = calcFileAccessCost(file, 0, prevDiskReads);
+        }
+    }
+    file->addAttrValues({makeAttrValuePair(getDFUQResultFieldName(DFUQResultField::readCost), legacyReadCost + curReadCost),
+                         makeAttrValuePair(getDFUQResultFieldName(DFUQResultField::numDiskReads), (unsigned __int64)numDiskReads)});
+    return curReadCost;
+}
+
+// Deprecated and should be removed and new feature tested
+RemoteFilename &deprecatedConstructPartFilename(IGroup *grp,unsigned partno,unsigned partmax,const char *name,const char *partmask,const char *partdir,unsigned copy,ClusterPartDiskMapSpec &mspec,RemoteFilename &rfn)
 {
     partno--;
     StringBuffer tmp;
@@ -199,6 +305,63 @@ RemoteFilename &constructPartFilename(IGroup *grp,unsigned partno,unsigned partm
         ep=grp->queryNode(n).endpoint();
     rfn.setPath(ep,fullname.toLowerCase().str());
     return rfn;
+}
+
+RemoteFilename &constructPartFilename(IGroup *grp,unsigned partNo,unsigned max,unsigned node,unsigned replicateLevel,unsigned dirPerPartNum,const char *lname,const char *prefix,const char *pmask,unsigned stripeNum,RemoteFilename &rfn)
+{
+    partNo--;
+    StringBuffer partName;
+    const char *tailExt = nullptr;
+    if (isEmptyString(lname))
+    {
+        if (!pmask)
+        {
+            pmask = "!ERROR!._$P$_of_$N$";
+            IERRLOG("No partmask for constructPartFilename");
+        }
+        lname = expandMask(partName, pmask, partNo, max);
+    }
+    else if (!isEmptyString(pmask))
+    {
+        // pmask may contain trailing extensions that aren't in lname
+        const char *ext = strchr(pmask, '.');
+        assertex(ext); // pmask should have at least one extension for the part mask
+        tailExt = strchr(ext+1, '.');
+    }
+
+    StringBuffer fullname;
+    makePhysicalPartName(lname, partNo+1, max, fullname, 0, DFD_OSdefault, prefix, dirPerPartNum, stripeNum);
+
+    if (!isEmptyString(tailExt))
+        fullname.append(tailExt);
+
+    if (!isContainerized())
+        setReplicateFilename(fullname, replicateLevel);
+
+    SocketEndpoint ep;
+    if (grp)
+        ep = grp->queryNode(node).endpoint();
+    rfn.setPath(ep, fullname.str());
+
+    return rfn;
+}
+
+RemoteFilename &constructPartFilename(IGroup *grp,unsigned partNo,unsigned copy,unsigned max,unsigned lfnHash,int replicateOffset,bool dirPerPart,const char *lname,const char *prefix,const char *pmask,unsigned numDevices,RemoteFilename &rfn)
+{
+    // revisit: constructPartFilename should be refactored not to deal with replicate directories, by pre-determining the alternate prefix if copy>0
+    // If copy>0 it could do calcPartLocation, find the replicate plane, get its prefix, and pass it to makePhysicalPartName
+    unsigned node = 0;
+    unsigned replicateLevel = 0;
+    if (!isContainerized())
+    {
+        ClusterPartDiskMapSpec mspec;
+        mspec.replicateOffset = replicateOffset;
+        mspec.calcPartLocation(partNo-1, max, copy, grp?grp->ordinality():max, node, replicateLevel);
+    }
+
+    unsigned stripeNum = calcStripeNumber(partNo-1, lfnHash, numDevices);
+    unsigned dirPerPartNum = dirPerPart && (max>1) ? partNo : 0;
+    return constructPartFilename(grp, partNo, max, node, replicateLevel, dirPerPartNum, lname, prefix, pmask, stripeNum, rfn);
 }
 
 inline void LOGPTREE(const char *title,IPropertyTree *pt)
@@ -250,7 +413,7 @@ public:
         case DFSERR_LookupAccessDenied:
         {
             StringBuffer ip;
-            queryMyNode()->endpoint().getIpText(ip);
+            queryCoven().queryGroup().queryNode(0).endpoint().getHostText(ip);
             return str.appendf(" Lookup access denied for scope %s at Dali %s", errstr.str(), ip.str());
         }
         case DFSERR_CreateAccessDenied:
@@ -271,6 +434,14 @@ public:
             return str.append(": Failed to delete file: ").append(errstr);
         case DFSERR_RestrictedFileAccessDenied:
             return str.append(": Access to restricted file denied: ").append(errstr);
+        case DFSERR_EmptyStoragePlane:
+            return str.append(": Cluster does not have storage plane: ").append(errstr);
+        case DFSERR_MissingStoragePlane:
+            return str.append(": Storage plane missing: ").append(errstr);
+        case DFSERR_PhysicalCompressedPartInvalid:
+            return str.append(": Compressed part is not in the valid format: ").append(errstr);
+        case DFSERR_InvalidRemoteFileContext:
+            return str.append(": Lookup of remote files must use wsdfs::lookup - file: ").append(errstr);
         }
         return str.append("Unknown DFS Exception");
     }
@@ -766,13 +937,13 @@ static void foreignDaliSendRecv(const INode *foreigndali,CMessageBuffer &mb, uns
     Owned<ICommunicator> comm = createCommunicator(grp,true);
     if (!comm->verifyConnection(0,foreigndalitimeout)) {
         StringBuffer tmp;
-        IDFS_Exception *e = new CDFS_Exception(DFSERR_ForeignDaliTimeout, foreigndali->endpoint().getUrlStr(tmp).str());
+        IDFS_Exception *e = new CDFS_Exception(DFSERR_ForeignDaliTimeout, foreigndali->endpoint().getEndpointHostText(tmp).str());
         throw e;
     }
     comm->sendRecv(mb,0,MPTAG_DFS_REQUEST);
 }
 
-static bool isLocalDali(const INode *foreigndali)
+bool isLocalDali(const INode *foreigndali)
 {
     if (!foreigndali)
         return true;
@@ -871,7 +1042,7 @@ public:
             item(clusternum).queryPartDiskMapping() = spec;
     }
 
-    StringBuffer &getName(unsigned clusternum,StringBuffer &name)
+    StringBuffer &getName(unsigned clusternum,StringBuffer &name) const
     {
         if (clusternum<ordinality())
             item(clusternum).getClusterLabel(name);
@@ -884,29 +1055,65 @@ public:
         if (nc<=1)
             return;
         StringBuffer cname;
-        StringArray clustlist;
+        StringArray preferedClusterList;
         if (lfname.getCluster(cname).length())
-            clustlist.append(cname.str());
+            preferedClusterList.append(cname.str());
         unsigned i;
         if (clusters) {
+            // if any clusters listed in the 'clusters'(csv list) are not already present in LFN cluster list (from lfname.getCluster), add them.
+            // NB: lfname.getCluster will only contain any groups if the lfn has been specified as lfn@<cluster>
             for (;;) {
                 const char *s = clusters;
                 while (*s&&(*s!=','))
                     s++;
                 if (s!=clusters) {
                     cname.clear().append(s-clusters,clusters);
-                    for (i=0;i<clustlist.ordinality();i++)
-                        if (strcmp(clustlist.item(i),cname.str())==0)
+                    for (i=0;i<preferedClusterList.ordinality();i++)
+                        if (strcmp(preferedClusterList.item(i),cname.str())==0)
                             break;
-                    if (i==clustlist.ordinality())
-                        clustlist.append(cname.str());
+                    if (i==preferedClusterList.ordinality())
+                        preferedClusterList.append(cname.str());
                 }
                 if (!*s)
                     break;
                 clusters = s+1;
             }
         }
-        if (clustlist.ordinality()==0) {
+
+        unsigned done = 0;
+        StringBuffer clusterLabel;
+        if (isContainerized()) {
+            if (0 != preferedClusterList.ordinality()) {
+                // In containerized mode, only the group (aka plane) names are considered.
+                ForEachItemIn(ci,preferedClusterList) {
+                    const char *cls = preferedClusterList.item(ci);
+                    for (i=done;i<nc;i++) {
+                        IClusterInfo &info=item(i);
+                        if (strisame(info.getClusterLabel(clusterLabel.clear()).str(),cls))
+                            break;
+                    }
+                    if (i<nc) {
+                        // move found IClusterInfo up ('done' is either top or position of last moved item)
+                        if (i) {
+                            Linked<IClusterInfo> tmp = &item(i);
+                            remove(i);
+                            add(*tmp.getClear(),done);
+                        }
+                        done++;
+                        if (done+1>=nc)
+                            break;
+                    }
+                }
+            }
+            return;
+        }
+        // else !isContainerized() ..
+
+        // NB: The below (preferedClusterList empty) will be the common case, because:
+        //  a) LFN's are not routinely specified with @<cluster>
+        //  b) setPreferred is not by default passed a custom perferred 'clusters' list (in fact setDefaultPreferredClusters is not called anywhere)
+        // NB2: In Thor, this ip distance calculation is going to happen on the Thor master in relation to it's IP.
+        if (preferedClusterList.ordinality()==0) {
             // sort by closest to this node
             const IpAddress &myip = queryMyNode()->endpoint();
             unsigned *d=new unsigned[nc];
@@ -925,11 +1132,18 @@ public:
             return;
         }
         Owned<IGroup> firstgrp;
-        unsigned done = 0;
         StringBuffer name;
-        StringBuffer name2;
-        ForEachItemIn(ci,clustlist) {
-            const char *cls = clustlist.item(ci);
+
+        // this manipulates the IClusterInfo order, to promote them, if their group
+        // matches (or are a super or subset or intersection) of their namesake in the group store
+        // Assuming the supplied 'clusters' exist and are not 'GRdisjoint' with the file's cluster group(s),
+        // those IClusterInfo's will be promoted.
+        // e.g. setDefaultPreferredClusters is set to CLUSTERXX, CLUSTERYY, and the file has some of them,
+        // those clusters will be preferred.
+        // NB: If the LFN has cluster(s) (e.g. lfn@mycluster), those will take precedence the preferred clusters
+        // because they will have been added to 'preferedClusterList' 1st (see above)
+        ForEachItemIn(ci,preferedClusterList) {
+            const char *cls = preferedClusterList.item(ci);
             Owned<IGroup> grp = queryNamedGroupStore().lookup(cls);
             if (!grp) {
                 IERRLOG("IDistributedFile::setPreferred - cannot find cluster %s",cls);
@@ -939,13 +1153,15 @@ public:
                 firstgrp.set(grp);
             for (i=done;i<nc;i++) {
                 IClusterInfo &info=item(i);
-                if (stricmp(info.getClusterLabel(name2.clear()).str(),name.str())==0)
+                if (stricmp(info.getClusterLabel(clusterLabel.clear()).str(),name.str())==0) // JCS - name never set?? should probably be 'cls'
                     break;
                 IGroup *grp2 = info.queryGroup();
                 if (grp2&&(grp->compare(grp2)!=GRdisjoint))
                     break;
             }
             if (i<nc) {
+                // true if found a non-disjoint group above
+                // move it above disjoint groups ('done' is either top or position of last non-disjoint group moved)
                 if (i) {
                     Linked<IClusterInfo> tmp = &item(i);
                     remove(i);
@@ -1013,13 +1229,21 @@ interface IDistributedFileTransactionExt : extends IDistributedFileTransaction
     virtual void noteRename(IDistributedFile *file, const char *newName) = 0;
     virtual void validateAddSubFile(IDistributedSuperFile *super, IDistributedFile *sub, const char *subName) = 0;
     virtual bool isSubFile(IDistributedSuperFile *super, const char *subFile, bool sub) = 0;
-    virtual bool addDelayedDelete(CDfsLogicalFileName &lfn,unsigned timeoutms=INFINITE)=0; // used internally to delay deletes until commit
+    virtual bool addDelayedDelete(CDfsLogicalFileName &lfn,unsigned timeoutms=INFINITE, const DFSAuditContext &auditCtx = DFSAuditContext{})=0; // used internally to delay deletes until commit
     virtual bool prepareActions()=0;
     virtual void retryActions()=0;
     virtual void runActions()=0;
     virtual void commitAndClearup()=0;
     virtual ICodeContext *queryCodeContext()=0;
 };
+
+static IDistributedFileTransactionExt *queryTransactionExt(IDistributedFileTransaction *transaction)
+{
+    IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
+    verifyex(_transaction); // _transaction cannot be null as all IDistributedFileTransaction instances
+                            //  are IDistributedFileTransactionExtinstances.
+    return _transaction;
+}
 
 class CDistributedFileDirectory: implements IDistributedFileDirectory, public CInterface
 {
@@ -1044,55 +1268,47 @@ public:
     }
     unsigned queryDefaultTimeout() const { return defaultTimeout; }
 
-    IDistributedFile *dolookup(CDfsLogicalFileName &logicalname, IUserDescriptor *user, bool writeattr, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, unsigned timeout);
+    IDistributedFile *dolookup(CDfsLogicalFileName &logicalname, IUserDescriptor *user, AccessMode accessMode, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, unsigned timeout);
 
-    IDistributedFile *lookup(const char *_logicalname, IUserDescriptor *user, bool writeattr, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, bool privilegedUser, unsigned timeout) override;
-    IDistributedFile *lookup(CDfsLogicalFileName &logicalname, IUserDescriptor *user, bool writeattr, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, bool privilegedUser, unsigned timeout) override;
+    IDistributedFile *lookup(const char *_logicalname, IUserDescriptor *user, AccessMode accessMode, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, bool privilegedUser, unsigned timeout, const DFSAuditContext &auditCtx = DFSAuditContext{}) override;
+    IDistributedFile *lookup(CDfsLogicalFileName &logicalname, IUserDescriptor *user, AccessMode accessMode, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, bool privilegedUser, unsigned timeout, const DFSAuditContext &auditCtx = DFSAuditContext{}) override;
 
     /* createNew always creates an unnamed unattached distributed file
      * The caller must associated it with a name and credentials when it is attached (attach())
      */
-    IDistributedFile *createNew(IFileDescriptor * fdesc);
+    IDistributedFile *createNew(IFileDescriptor * fdesc, const char *optionalName=nullptr);
     IDistributedFile *createExternal(IFileDescriptor *desc, const char *name);
     IDistributedSuperFile *createSuperFile(const char *logicalname,IUserDescriptor *user,bool interleaved,bool ifdoesnotexist,IDistributedFileTransaction *transaction=NULL);
-    IDistributedSuperFile *createNewSuperFile(IPropertyTree *tree, const char *optionalName=nullptr);
+    IDistributedSuperFile *createNewSuperFile(IPropertyTree *tree, const char *optionalName=nullptr, IArrayOf<IDistributedFile> *subFiles=nullptr);
     void removeSuperFile(const char *_logicalname, bool delSubs, IUserDescriptor *user, IDistributedFileTransaction *transaction);
 
-    IDistributedFileIterator *getIterator(const char *wildname, bool includesuper,IUserDescriptor *user,bool isPrivilegedUser);
-    IDFAttributesIterator *getDFAttributesIterator(const char *wildname, IUserDescriptor *user, bool recursive, bool includesuper,INode *foreigndali,unsigned foreigndalitimeout);
-    IPropertyTreeIterator *getDFAttributesTreeIterator(const char *filters, DFUQResultField* localFilters, const char *localFilterBuf,
-        IUserDescriptor *user, bool recursive, bool& allMatchingFilesReceived, INode *foreigndali,unsigned foreigndalitimeout);
-    IDFAttributesIterator *getForeignDFAttributesIterator(const char *wildname, IUserDescriptor *user, bool recursive=true, bool includesuper=false, const char *foreigndali="", unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT)
-    {
-        Owned<INode> foreign;
-        if (foreigndali&&*foreigndali) {
-            SocketEndpoint ep(foreigndali);
-            foreign.setown(createINode(ep));
-        }
-        return getDFAttributesIterator(wildname, user, recursive, includesuper,foreign,foreigndalitimeout);
-    }
+    IDistributedFileIterator *getIterator(const char *wildname, bool includesuper,IUserDescriptor *user,bool isPrivilegedUser, AccessMode accessMode = AccessMode::readLogicalMeta) override;
+    IPropertyTreeIterator *getDFAttributesIterator(const char *wildname, IUserDescriptor *user, bool recursive, bool includesuper,INode *foreigndali,unsigned foreigndalitimeout);
+    IPropertyTreeIterator *getDFAttributesFilteredIterator(const char *filters, const char *localFilters, const DFUQResultField *fields,
+        IUserDescriptor *user, bool recursive, bool& allMatchingFilesReceived, unsigned *total, INode *foreigndali,unsigned foreigndalitimeout);
 
     IDFScopeIterator *getScopeIterator(IUserDescriptor *user, const char *subscope,bool recursive,bool includeempty);
     bool loadScopeContents(const char *scopelfn,StringArray *scopes,    StringArray *supers,StringArray *files, bool includeemptyscopes);
 
-    IPropertyTree *getFileTree(const char *lname,IUserDescriptor *user,const INode *foreigndali,unsigned foreigndalitimeout,bool expandnodes=false, bool appendForeign=true);
+    IPropertyTree *getFileTree(const char *lname,IUserDescriptor *user,AccessMode accessMode,const INode *foreigndali,unsigned foreigndalitimeout,GetFileTreeOpts opts = GetFileTreeOpts::expandNodes|GetFileTreeOpts::appendForeign);
     void setFileAccessed(CDfsLogicalFileName &dlfn, IUserDescriptor *user,const CDateTime &dt,const INode *foreigndali=NULL,unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT);
-    IFileDescriptor *getFileDescriptor(const char *lname,IUserDescriptor *user,const INode *foreigndali=NULL,unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT);
-    IDistributedFile *getFile(const char *lname,IUserDescriptor *user,const INode *foreigndali=NULL,unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT);
+    IDistributedFile *getFile(const char *lname, AccessMode accessMode, IUserDescriptor *user, const INode *foreigndali=NULL, unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT);
 
     bool exists(const char *_logicalname,IUserDescriptor *user,bool notsuper=false,bool superonly=false);
     bool existsPhysical(const char *_logicalname,IUserDescriptor *user);
 
     void addEntry(CDfsLogicalFileName &lfn,IPropertyTree *root,bool superfile, bool ignoreexists);
-    bool removeEntry(const char *name, IUserDescriptor *user, IDistributedFileTransaction *transaction=NULL, unsigned timeoutms=INFINITE, bool throwException=false);
-    void renamePhysical(const char *oldname,const char *newname,IUserDescriptor *user,IDistributedFileTransaction *transaction);
+    bool removeEntry(const char *name, IUserDescriptor *user, IDistributedFileTransaction *transaction=NULL, unsigned timeoutms=INFINITE, bool throwException=false, const DFSAuditContext &auditCtx = DFSAuditContext{});
+    void renamePhysical(const char *oldname, const char *newname, IUserDescriptor *user, IDistributedFileTransaction *transaction, const DFSAuditContext &auditCtx = DFSAuditContext{});
     void removeEmptyScope(const char *name);
 
-    IDistributedSuperFile *lookupSuperFile(const char *logicalname,IUserDescriptor *user,IDistributedFileTransaction *transaction,unsigned timeout=INFINITE);
+    IDistributedSuperFile *lookupSuperFile(const char *logicalname, IUserDescriptor *user, AccessMode accessMode, IDistributedFileTransaction *transaction, unsigned timeout=INFINITE);
 
     SecAccessFlags getFilePermissions(const char *lname,IUserDescriptor *user,unsigned auditflags);
-    SecAccessFlags getNodePermissions(const IpAddress &ip,IUserDescriptor *user,unsigned auditflags);
+    SecAccessFlags getFScopePermissions(const char *scope,IUserDescriptor *user,unsigned auditflags);
     SecAccessFlags getFDescPermissions(IFileDescriptor *,IUserDescriptor *user,unsigned auditflags=0);
+    SecAccessFlags getDLFNPermissions(CDfsLogicalFileName &dlfn,IUserDescriptor *user,unsigned auditflags=0);
+    SecAccessFlags getDropZoneScopePermissions(const char *dropZoneName,const char *dropZonePath,IUserDescriptor *user,unsigned auditflags=0);
     void setDefaultUser(IUserDescriptor *user);
     IUserDescriptor* queryDefaultUser();
 
@@ -1125,15 +1341,14 @@ public:
 
     void renameFileRelationships(const char *oldname,const char *newname,IFileRelationshipIterator *reliter, IUserDescriptor *user);
 
-    bool publishMetaFileXML(const CDfsLogicalFileName &logicalname,IUserDescriptor *user);
     IFileDescriptor *createDescriptorFromMetaFile(const CDfsLogicalFileName &logicalname,IUserDescriptor *user);
 
     bool isProtectedFile(const CDfsLogicalFileName &logicalname, unsigned timeout) ;
     IDFProtectedIterator *lookupProtectedFiles(const char *owner=NULL,bool notsuper=false,bool superonly=false);
-    IDFAttributesIterator* getLogicalFilesSorted(IUserDescriptor* udesc, DFUQResultField *sortOrder, const void *filterBuf, DFUQResultField *specialFilters,
-            const void *specialFilterBuf, unsigned startOffset, unsigned maxNum, __int64 *cacheHint, unsigned *total, bool *allMatchingFilesReceived);
-    IDFAttributesIterator* getLogicalFiles(IUserDescriptor* udesc, DFUQResultField *sortOrder, const void *filterBuf, DFUQResultField *specialFilters,
-            const void *specialFilterBuf, unsigned startOffset, unsigned maxNum, __int64 *cacheHint, unsigned *total, bool *allMatchingFilesReceived, bool recursive, bool sorted);
+    IPropertyTreeIterator* getLogicalFilesSorted(IUserDescriptor* udesc, DFUQResultField *sortOrder, const void *filter, const char *localFilters,
+            DFUQResultField *fields, unsigned startOffset, unsigned maxNum, __int64 *cacheHint, unsigned *total, bool *allMatchingFilesReceived);
+    IPropertyTreeIterator* getLogicalFiles(IUserDescriptor* udesc, DFUQResultField *sortOrder, const void *filter, const char *localFilters,
+            DFUQResultField *fields, unsigned startOffset, unsigned maxNum, __int64 *cacheHint, unsigned *total, bool *allMatchingFilesReceived, bool recursive, bool sorted);
 
     void setFileProtect(CDfsLogicalFileName &dlfn,IUserDescriptor *user, const char *owner, bool set, const INode *foreigndali=NULL,unsigned foreigndalitimeout=FOREIGN_DALI_TIMEOUT);
 
@@ -1144,17 +1359,20 @@ public:
         return ret;
     }
     virtual bool removePhysicalPartFiles(const char *logicalName, IFileDescriptor *fileDesc, IMultiException *mexcept, unsigned numParallelDeletes=0) override;
+    virtual void setFileAccessed(IUserDescriptor* udesc, const char *logicalName, const CDateTime &dt, const INode *foreigndali, unsigned foreigndalitimeout);
 };
 
 
 // === Transactions
 class CDFAction: public CInterface
 {
-    unsigned locked;
+    unsigned locked = 0;
+    unsigned timeoutCount = 0;
 protected:
-    IDistributedFileTransactionExt *transaction;
+    IDistributedFileTransactionExt *transaction = nullptr;
     IArrayOf<IDistributedFile> lockedFiles;
-    DFTransactionState state;
+    DFTransactionState state = TAS_NONE;
+    StringBuffer tracing;
     void addFileLock(IDistributedFile *file)
     {
         // derived's prepare must call this before locking
@@ -1174,7 +1392,13 @@ protected:
                 if (SDSExcpt_LockTimeout != e->errorCode())
                     throw;
                 e->Release();
-                PROGLOG("CDFAction lock timed out on %s",lockedFiles.item(i).queryLogicalName());
+                PROGLOG("CDFAction[%s] lock timed out on %s", tracing.str(), lockedFiles.item(i).queryLogicalName());
+
+                /* Can be v. useful to know what call stack is if stuck..
+                 * Trace after 30 timeouts (each timeout period ~60s)
+                 */
+                if (0 == (++timeoutCount % 30))
+                    PrintStackReport();
                 return false;
             }
             locked++;
@@ -1189,9 +1413,8 @@ protected:
         lockedFiles.kill();
     }
 public:
-    CDFAction() : locked(0), state(TAS_NONE)
+    CDFAction()
     {
-        transaction = NULL;
     }
     // Clear all locked files (when re-using transaction on auto-commit mode)
     virtual ~CDFAction()
@@ -1233,48 +1456,27 @@ public:
 
 static void setUserDescriptor(Linked<IUserDescriptor> &udesc,IUserDescriptor *user)
 {
+    logNullUser(user);//stack trace if NULL user
     if (!user)
     {
-#ifdef NULL_DALIUSER_STACKTRACE
-        StringBuffer sb;
-        if (user)
-            user->getUserName(sb);
-        if (sb.length()==0)
-        {
-            IERRLOG("UNEXPECTED USER (NULL) in dadfs.cpp setUserDescriptor() %d",__LINE__);
-            //following debug code to be removed
-            PrintStackReport();
-        }
-#endif
         user = queryDistributedFileDirectory().queryDefaultUser();
     }
     udesc.set(user);
 }
 
-static bool scopePermissionsAvail = true;
 static SecAccessFlags getScopePermissions(const char *scopename,IUserDescriptor *user,unsigned auditflags)
 {  // scope must be normalized already
-    SecAccessFlags perms = SecAccess_Full;
-    if (scopePermissionsAvail && scopename && *scopename) {
+    SecAccessFlags perms = SecAccess_None;
+    if (scopename && *scopename) {
         if (!user)
         {
-#ifdef NULL_DALIUSER_STACKTRACE
-            IERRLOG("UNEXPECTED USER (NULL) in dadfs.cpp getScopePermissions() line %d",__LINE__);
-            //following debug code to be removed
-            PrintStackReport();
-#endif
+            logNullUser(user);//stack trace if NULL user
             user = queryDistributedFileDirectory().queryDefaultUser();
         }
 
         perms = querySessionManager().getPermissionsLDAP(queryDfsXmlBranchName(DXB_Scope),scopename,user,auditflags);
-        if (perms<0) {
-            if (perms == SecAccess_Unavailable) {
-                scopePermissionsAvail=false;
-                perms = SecAccess_Full;
-            }
-            else
-                perms = SecAccess_None;
-        }
+        if (perms<0)
+            perms = SecAccess_None;
     }
     return perms;
 }
@@ -1289,20 +1491,27 @@ static void checkLogicalScope(const char *scopename,IUserDescriptor *user,bool r
         auditflags |= (DALI_LDAP_AUDIT_REPORT|DALI_LDAP_READ_WANTED);
     if (createreq)
         auditflags |= (DALI_LDAP_AUDIT_REPORT|DALI_LDAP_WRITE_WANTED);
-#ifdef NULL_DALIUSER_STACKTRACE
-    if (!user)
-    {
-        IERRLOG("UNEXPECTED USER (NULL) in dadfs.cpp checkLogicalScope() line %d",__LINE__);
-        PrintStackReport();
-    }
-#endif
-
+    logNullUser(user);//stack trace if NULL user
     SecAccessFlags perm = getScopePermissions(scopename,user,auditflags);
     IDFS_Exception *e = NULL;
     if (readreq&&!HASREADPERMISSION(perm))
-        e = new CDFS_Exception(DFSERR_LookupAccessDenied,scopename);
+    {
+        StringBuffer scopeDescription;
+        StringBuffer username("");
+        if (user)
+            user->getUserName(username);
+        scopeDescription.appendf("%s user '%s', assigned access %s (%d)", scopename, username.str(), getSecAccessFlagName(perm), perm);
+        e = new CDFS_Exception(DFSERR_LookupAccessDenied,scopeDescription);
+    }
     else if (createreq&&!HASWRITEPERMISSION(perm))
-        e = new CDFS_Exception(DFSERR_CreateAccessDenied,scopename);
+    {
+        StringBuffer scopeDescription;
+        StringBuffer username("");
+        if (user)
+            user->getUserName(username);
+        scopeDescription.appendf("%s user '%s', assigned access %s (%d)", scopename, username.str(), getSecAccessFlagName(perm), perm);
+        e = new CDFS_Exception(DFSERR_CreateAccessDenied,scopeDescription);
+    }
     if (e)
         throw e;
 }
@@ -1360,10 +1569,11 @@ class CDelayedDelete: public CInterface
     CDfsLogicalFileName lfn;
     Linked<IUserDescriptor> user;
     unsigned timeoutms;
+    DFSAuditContext auditCtx;
 
 public:
-    CDelayedDelete(CDfsLogicalFileName &_lfn,IUserDescriptor *_user,unsigned _timeoutms)
-        : user(_user), timeoutms(_timeoutms)
+    CDelayedDelete(CDfsLogicalFileName &_lfn,IUserDescriptor *_user,unsigned _timeoutms, const DFSAuditContext &_auditCtx)
+        : user(_user), timeoutms(_timeoutms), auditCtx(_auditCtx)
     {
         lfn.set(_lfn);
     }
@@ -1378,7 +1588,7 @@ public:
         for (;;)
         {
             // Transaction files have already been unlocked at this point, delete all remaining files
-            Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(lfn, user, true, false, true, nullptr, defaultPrivilegedUser, SDS_SUB_LOCK_TIMEOUT);
+            Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(lfn, user, AccessMode::erase, false, true, nullptr, defaultPrivilegedUser, SDS_SUB_LOCK_TIMEOUT, auditCtx.nested());
             if (!file.get())
                 return;
             StringBuffer reason;
@@ -1389,7 +1599,7 @@ public:
             // This will do the right thing for either super-files and logical-files.
             try
             {
-                file->detach(0, NULL); // 0 == timeout immediately if cannot get exclusive lock
+                file->detach(0, NULL, auditCtx); // 0 == timeout immediately if cannot get exclusive lock
                 return;
             }
             catch (ISDSException *e)
@@ -1432,7 +1642,7 @@ class CDistributedFileTransaction: implements IDistributedFileTransactionExt, pu
             IDistributedFile *file;
             StringAttr name;
         public:
-            HTMapping(const char *_name, IDistributedFile *_file) : name(_name), file(_file) { }
+            HTMapping(const char *_name, IDistributedFile *_file) : file(_file), name(_name) { }
             IDistributedFile &query() { return *file; }
             const char *queryFindString() const { return name; }
             const void *queryFindParam() const { return &file; }
@@ -1579,6 +1789,14 @@ class CDistributedFileTransaction: implements IDistributedFileTransactionExt, pu
             return NULL;
         return trackedFile->queryFile();
     }
+    void checkCachedLookupAccess(const char *name, AccessMode accessMode, IDistributedFile *file)
+    {
+        CDfsLogicalFileName logicalName;
+        logicalName.set(name);
+        checkLogicalName(logicalName, udesc, true, isWrite(accessMode), true, nullptr);
+        if (!isWrite(accessMode) && file->isRestrictedAccess() && !defaultPrivilegedUser)
+            throw new CDFS_Exception(DFSERR_RestrictedFileAccessDenied, logicalName.get());
+    }
     void deleteFiles()      // no rollback at this point
     {
         Owned<IMultiException> me = MakeMultiException("Transaction");
@@ -1597,7 +1815,7 @@ public:
     IMPLEMENT_IINTERFACE;
 
     CDistributedFileTransaction(IUserDescriptor *user, IDistributedSuperFile *_owner=NULL, ICodeContext *_codeCtx=NULL)
-        : isactive(false), depth(0), prepared(0), owner(_owner), codeCtx(_codeCtx)
+        : isactive(false), depth(0), prepared(0), codeCtx(_codeCtx), owner(_owner)
     {
         setUserDescriptor(udesc,user);
     }
@@ -1679,27 +1897,40 @@ public:
     {
         return isactive;
     }
-    virtual IDistributedFile *lookupFile(const char *name,unsigned timeout)
+
+    /*
+     * Transaction reuse is keyed by normalized logical name, so the cached file's
+     * construction-time AccessMode is retained. If storage-plane aliases that vary
+     * by AccessMode are used, physical path selection must be moved to operation
+     * context instead of relying on this cached state. See #37626.
+     */
+    virtual IDistributedFile *lookupFile(const char *name, AccessMode accessMode, unsigned timeout)
     {
         IDistributedFile *ret = findFile(name);
         if (ret)
+        {
+            checkCachedLookupAccess(name, accessMode, ret);
             return LINK(ret);
+        }
         else
         {
-            ret = queryDistributedFileDirectory().lookup(name, udesc, false, false, false, this, defaultPrivilegedUser, timeout);
+            ret = queryDistributedFileDirectory().lookup(name, udesc, accessMode, false, false, this, defaultPrivilegedUser, timeout);
             if (ret)
                 queryCreate(name, ret, true);
             return ret;
         }
     }
-    virtual IDistributedSuperFile *lookupSuperFile(const char *name, unsigned timeout)
+    virtual IDistributedSuperFile *lookupSuperFile(const char *name, AccessMode accessMode, unsigned timeout)
     {
         IDistributedFile *f = findFile(name);
         if (f)
+        {
+            checkCachedLookupAccess(name, accessMode, f);
             return LINK(f->querySuperFile());
+        }
         else
         {
-            IDistributedSuperFile *ret = queryDistributedFileDirectory().lookupSuperFile(name,udesc,this,timeout);
+            IDistributedSuperFile *ret = queryDistributedFileDirectory().lookupSuperFile(name, udesc, accessMode, this, timeout);
             if (ret)
                 addFile(ret);
             return ret;
@@ -1837,9 +2068,9 @@ public:
             return false;
         return trackedSuper->find(subFile, sub);
     }
-    virtual bool addDelayedDelete(CDfsLogicalFileName &lfn,unsigned timeoutms)
+    virtual bool addDelayedDelete(CDfsLogicalFileName &lfn,unsigned timeoutms, const DFSAuditContext &auditCtx = DFSAuditContext{})
     {
-        delayeddelete.append(*new CDelayedDelete(lfn,udesc,timeoutms));
+        delayeddelete.append(*new CDelayedDelete(lfn,udesc,timeoutms,auditCtx));
         return true;
     }
     virtual bool prepareActions()
@@ -1987,93 +2218,518 @@ public:
     }
 };
 
+
+// NB: the order must match the order of the enum DFUQResultField.
+// However, DFUQResultField's are always translated to these strings before being transmitted to Dali,
+// so they can be reordered without fear of breaking compatibility as long as DFUQResultField is in same order.
+// "includeAll" is a special field values that are used by field filtering on the server side,
+// but are only sent to a server version that supports them. NB: it can be negated, i.e. : -includeAll
+// These fields are used to specify sort order, and to specify which fields are to be returned.
+//
+// New fields must be added to this array, if they are not, they will be ignored and will not be serialized to
+// the client in serializeFileAttributes.
+
+struct DFUQFieldInfo
+{
+    DFUQResultField field;
+    std::string name;
+    DFUQResultFieldType type;
+    std::string attrPath;  // Full attribute path (e.g., "Attr/@name" or "@directory")
+};
+
+// enum field, name, type, attrPath
+static const DFUQFieldInfo dfuqFieldInfos[] =
+{
+    {DFUQResultField::name,            "@name",             DFUQResultFieldType::stringType,  "Attr/@name"},
+    {DFUQResultField::description,     "@description",      DFUQResultFieldType::stringType,  "Attr/@description"},
+    {DFUQResultField::nodegroups,      "@group",            DFUQResultFieldType::stringType,  "Attr/@group"},
+    {DFUQResultField::kind,            "@kind",             DFUQResultFieldType::stringType,  "Attr/@kind"},
+    {DFUQResultField::timemodified,    "@modified",         DFUQResultFieldType::stringType,  "@modified"},
+    {DFUQResultField::job,             "@job",              DFUQResultFieldType::stringType,  "Attr/@job"},
+    {DFUQResultField::owner,           "@owner",            DFUQResultFieldType::stringType,  "Attr/@owner"},
+    {DFUQResultField::recordcount,     "@DFUSFrecordCount", DFUQResultFieldType::numericType, ""},
+    {DFUQResultField::origrecordcount, "@recordCount",      DFUQResultFieldType::numericType, "Attr/@recordCount"},
+    {DFUQResultField::recordsize,      "@recordSize",       DFUQResultFieldType::numericType, "Attr/@recordSize"},
+    {DFUQResultField::size,            "@DFUSFsize",        DFUQResultFieldType::numericType, ""},
+    {DFUQResultField::origsize,        "@size",             DFUQResultFieldType::numericType, "Attr/@size"},
+    {DFUQResultField::workunit,        "@workunit",         DFUQResultFieldType::stringType,  "Attr/@workunit"},
+    {DFUQResultField::nodegroup,       "@DFUSFcluster",     DFUQResultFieldType::stringType,  ""},
+    {DFUQResultField::numsubfiles,     "@numsubfiles",      DFUQResultFieldType::numericType, "Attr/@numsubfiles"},
+    {DFUQResultField::accessed,        "@accessed",         DFUQResultFieldType::stringType,  "Attr/@accessed"},
+    {DFUQResultField::numparts,        "@numparts",         DFUQResultFieldType::numericType, "@numparts"},
+    {DFUQResultField::compressedsize,  "@compressedSize",   DFUQResultFieldType::numericType, "Attr/@compressedSize"},
+    {DFUQResultField::directory,       "@directory",        DFUQResultFieldType::stringType,  "@directory"},
+    {DFUQResultField::partmask,        "@partmask",         DFUQResultFieldType::stringType,  "@partmask"},
+    {DFUQResultField::superowners,     "@superowners",      DFUQResultFieldType::stringType,  "SuperOwner"},
+    {DFUQResultField::persistent,      "@persistent",       DFUQResultFieldType::boolType,    "Attr/@persistent"},
+    {DFUQResultField::protect,         "@protect",          DFUQResultFieldType::stringType,  "Attr/@protect"},
+    {DFUQResultField::iscompressed,    "@compressed",       DFUQResultFieldType::boolType,    "Attr/@compressed"},
+    {DFUQResultField::cost,            "@cost",             DFUQResultFieldType::floatType,   "Attr/@cost"},
+    {DFUQResultField::numDiskReads,    "@numDiskReads",     DFUQResultFieldType::numericType, "Attr/@numDiskReads"},
+    {DFUQResultField::numDiskWrites,   "@numDiskWrites",    DFUQResultFieldType::numericType, "Attr/@numDiskWrites"},
+    {DFUQResultField::atRestCost,      "@atRestCost",       DFUQResultFieldType::floatType,   "Attr/@atRestCost"},
+    {DFUQResultField::accessCost,      "@accessCost",       DFUQResultFieldType::floatType,   "Attr/@accessCost"},
+    {DFUQResultField::maxSkew,         "@maxSkew",          DFUQResultFieldType::numericType, "Attr/@maxSkew"},
+    {DFUQResultField::minSkew,         "@minSkew",          DFUQResultFieldType::numericType, "Attr/@minSkew"},
+    {DFUQResultField::maxSkewPart,     "@maxSkewPart",      DFUQResultFieldType::numericType, "Attr/@maxSkewPart"},
+    {DFUQResultField::minSkewPart,     "@minSkewPart",      DFUQResultFieldType::numericType, "Attr/@minSkewPart"},
+    {DFUQResultField::readCost,        "@readCost",         DFUQResultFieldType::floatType,   "Attr/@readCost"},
+    {DFUQResultField::writeCost,       "@writeCost",        DFUQResultFieldType::floatType,   "Attr/@writeCost"},
+    {DFUQResultField::expireDays,      "@expireDays",       DFUQResultFieldType::numericType, "Attr/@expireDays"},
+    {DFUQResultField::subfilenames,    "@subfilenames",     DFUQResultFieldType::stringType,  "Attr/@subfilenames"},
+    {DFUQResultField::blockCompressed, "@blockCompressed",  DFUQResultFieldType::boolType,    "Attr/@blockCompressed"},
+    {DFUQResultField::rowCompressed,   "@rowCompressed",    DFUQResultFieldType::boolType,    "Attr/@rowCompressed"},
+    {DFUQResultField::includeAll,      "includeAll",        DFUQResultFieldType::unknown,     ""}
+};
+const size_t dfuqFieldInfosCount = sizeof(dfuqFieldInfos)/sizeof(dfuqFieldInfos[0]);
+static_assert(dfuqFieldInfosCount == static_cast<size_t>(DFUQResultField::term),
+              "Field info array and enum out of sync!");
+
+//DFUQResultFieldMap a case-insensitive map : key = field name, value = pair<field, type>
+typedef std::unordered_map<std::string, std::pair<DFUQResultField, DFUQResultFieldType>, CaseInsensitiveHash, CaseInsensitiveEqual> DFUQResultFieldMap;
+
+/* Statically populate DFUQResultFieldMap by iterating over the dfuqFieldInfos array above.
+   Validate that the table above order matches DFUQResultField enum order.
+   key = field name (derived from attribute name without leading '@')
+   value = { field-enum, field-type }
+
+   This map is used to quickly lookup field enum and type by field name.
+ */
+static const DFUQResultFieldMap dfuResultFieldStringMap = []
+{
+    DFUQResultFieldMap map;
+    for (size_t i = 0; i < dfuqFieldInfosCount; ++i)
+    {
+        DFUQResultField field = dfuqFieldInfos[i].field;
+        assertex(field == (DFUQResultField)i);
+        map.emplace(dfuqFieldInfos[i].name, std::make_pair(field, dfuqFieldInfos[i].type));
+    }
+    return map;
+}();
+
+// Add plane fields using a stable convention: plane, plane2, plane3, ...
+static void addAuditPlaneFields(DFSAuditContext &ctx, IDistributedFile &file)
+{
+    unsigned nc = file.numClusters();
+    if (nc >= 1)
+    {
+        StringBuffer clusterName;
+        file.getClusterName(0, clusterName);
+        ctx.setValue("plane", clusterName.str());
+        for (unsigned i = 1; i < nc; i++)
+        {
+            file.getClusterName(i, clusterName.clear());
+            VStringBuffer planeKey("plane%u", i+1);
+            ctx.setValue(planeKey.str(), clusterName.str());
+        }
+    }
+}
+
+static void addAuditSizeFields(DFSAuditContext &ctx, IDistributedFile &file)
+{
+    __int64 fSize = file.getFileSize(false, false);
+    if ((offset_t)-1 != fSize)
+        ctx.setValue("fileSize", StringBuffer().append(fSize).str());
+    __int64 dSize = file.getDiskSize(false, false);
+    if ((offset_t)-1 != dSize)
+        ctx.setValue("diskSize", StringBuffer().append(dSize).str());
+}
+
+/* Field name to attribute path map: maps simple field names to their full File attribute paths
+   key = simple field name (e.g., "name", "size", "recordcount")
+   value = { full-attribute-path, field-type }
+
+   The full attribute path is:
+   - Direct attribute name for File-level attributes (e.g., "@directory", "@numparts")
+   - "Attr/" + attribute name for File/Attr properties (e.g., "Attr/@name", "Attr/@owner")
+
+   This map converts user-specified field names into the actual paths needed to access
+   the attributes in the File property tree structure.
+ */
+typedef std::unordered_map<std::string, std::tuple<std::string, DFUQResultField, DFUQResultFieldType>, CaseInsensitiveHash, CaseInsensitiveEqual> DFUQFieldAttrPathMap;
+
+static const DFUQFieldAttrPathMap dfuFieldAttrPathMap = []
+{
+    DFUQFieldAttrPathMap map;
+
+    // Derive field names from dfuqFieldInfos using pre-defined attribute paths
+    // Skip fields not exposed for filtering
+    for (size_t i = 0; i < dfuqFieldInfosCount; ++i)
+    {
+        DFUQResultField field = dfuqFieldInfos[i].field;
+        assertex(field == (DFUQResultField)i);
+
+        if (dfuqFieldInfos[i].attrPath.size() == 0)
+            continue;
+
+        const char *attrName = dfuqFieldInfos[i].name.c_str();
+        // Strip '@' prefix to get simple field name
+        const char* fieldName = (attrName[0] == '@') ? attrName + 1 : attrName;
+
+        // Use the pre-defined attribute path from dfuqFieldInfos
+        map.emplace(fieldName, std::make_tuple(dfuqFieldInfos[i].attrPath, field, dfuqFieldInfos[i].type));
+    }
+
+    // Add field name aliases that override the defaults
+    // "recordcount" -> origrecordcount (the actual file's record count, not @DFUSFrecordCount)
+    // "size" -> origsize (the actual file's size, not @DFUSFsize)
+    map["recordcount"] = std::make_tuple("Attr/@recordCount", DFUQResultField::origrecordcount, DFUQResultFieldType::numericType);
+    map["size"] = std::make_tuple("Attr/@size", DFUQResultField::origsize, DFUQResultFieldType::numericType);
+
+    return map;
+}();
+
+
+const char* getDFUQResultFieldName(DFUQResultField field)
+{
+    assertex(static_cast<size_t>(field) < static_cast<size_t>(DFUQResultField::term));
+    return dfuqFieldInfos[static_cast<size_t>(field)].name.c_str();
+}
+
+DFUQResultFieldType getDFUQResultFieldType(DFUQResultField field)
+{
+    assertex(static_cast<size_t>(field) < static_cast<size_t>(DFUQResultField::term));
+    return dfuqFieldInfos[static_cast<size_t>(field)].type;
+}
+
+DFUQResultField getDFUQResultField(const char *fieldName)
+{
+    auto it = dfuResultFieldStringMap.find(fieldName);
+    if (it != dfuResultFieldStringMap.end())
+        return it->second.first;
+    return DFUQResultField::unknown;
+}
+
+DFUQResultField getDFUQResultFieldAndType(const char *fieldName)
+{
+    auto it = dfuResultFieldStringMap.find(fieldName);
+    if (it != dfuResultFieldStringMap.end())
+        return it->second.first | it->second.second;
+    return DFUQResultField::unknown;
+}
+
+const char* getDFUQResultFieldTypeName(DFUQResultFieldType type)
+{
+    switch (type)
+    {
+        case DFUQResultFieldType::stringType: return "string";
+        case DFUQResultFieldType::numericType: return "numeric";
+        case DFUQResultFieldType::boolType: return "bool";
+        case DFUQResultFieldType::floatType: return "float";
+        default:
+            return "unknown";
+    }
+}
+
+bool getFileAttributePath(const char *fieldName, StringBuffer &attributePath, DFUQResultField &field, DFUQResultFieldType &type)
+{
+    if (isEmptyString(fieldName))
+        return false;
+
+    // Look up field name in the attribute path map
+    auto it = dfuFieldAttrPathMap.find(fieldName);
+    if (it != dfuFieldAttrPathMap.end())
+    {
+        attributePath.set(std::get<0>(it->second).c_str());
+        field = std::get<1>(it->second);
+        type = std::get<2>(it->second);
+        return true;
+    }
+
+    return false;
+}
+
+static std::vector<DFUQResultField> dfuQResultFieldsToVector(const DFUQResultField *fields, bool includeTerminator)
+{
+    std::vector<DFUQResultField> result;
+    if (fields)
+    {
+        while (true)
+        {
+            bool term = *fields == DFUQResultField::term;
+            if (term)
+            {
+                if (includeTerminator)
+                    result.push_back(*fields);
+                break;
+            }
+            result.push_back(*fields);
+            ++fields;
+        }
+    }
+    return result;
+}
+
 struct SerializeFileAttrOptions
 {
-    bool includeSuperOwner;
-    //Add more as needed
+    bool includeAll = false;
+    bool customFields = false;
+    std::vector<bool> fieldsList;
 
     SerializeFileAttrOptions()
     {
-        includeSuperOwner = false;
+        // this is default behavior for backward compatibility
+        // DFUQResultField::nodegroups is always required (client functionality depends on it)
+        fieldsList.assign(dfuqFieldInfosCount, true);
+        fieldsList[static_cast<unsigned>(DFUQResultField::superowners)] = false;
+        includeAll = true;
+    }
+    void readFields(const char *fieldList)
+    {
+        customFields = true;
+        includeAll = false; // default if custom fields specified.
+
+        // DFUQResultField::nodegroups is always required (client functionality depends on it)
+        std::fill(fieldsList.begin(), fieldsList.end(), false);
+        fieldsList[static_cast<unsigned>(DFUQResultField::nodegroups)] = true;
+
+        StringArray fieldsArray;
+        fieldsArray.appendList(fieldList, ",");
+        ForEachItemIn(i, fieldsArray)
+        {
+            const char *fieldStr = fieldsArray.item(i);
+            bool additive = true;
+            switch (fieldStr[0])
+            {
+                case '-':
+                    fieldStr++;
+                    additive = false;
+                    break;
+                case '+':
+                    fieldStr++;
+                    break;
+            }
+            DFUQResultField field = getDFUQResultField(fieldStr);
+            switch (field)
+            {
+                case DFUQResultField::unknown:
+                    // not sure this should this log a warning..
+                    break;
+                case DFUQResultField::includeAll:
+                    if (0 != i) // does not make sense to be anything but 1st specifier
+                        throw makeStringException(0, "SerializeFileAttrOptions::readFields 'includeAll' must be be leading specifier");
+                    std::fill(fieldsList.begin(), fieldsList.end(), additive);
+                    includeAll = additive;
+                    break;
+                case DFUQResultField::cost:
+                    fieldsList[static_cast<unsigned>(field)] = additive;
+                    if (additive)
+                    {
+                        // special handling if cost included, include other fields that are required for cost calculation
+                        // another reason it would be better to compute server side.
+                        // i.e. setCost could be moved to server during filtering/projecting, and then this could be removed.
+                        fieldsList[static_cast<unsigned>(DFUQResultField::timemodified)] = true;
+                        fieldsList[static_cast<unsigned>(DFUQResultField::compressedsize)] = true;
+                        fieldsList[static_cast<unsigned>(DFUQResultField::origsize)] = true;
+                        fieldsList[static_cast<unsigned>(DFUQResultField::readCost)] = true;
+                        fieldsList[static_cast<unsigned>(DFUQResultField::writeCost)] = true;
+                    }
+                    break;
+                case DFUQResultField::size:
+                    fieldsList[static_cast<unsigned>(field)] = additive;
+                    // special handling if DFUSFsize is included (which is calculated client side), to also include dependent origsize
+                    fieldsList[static_cast<unsigned>(DFUQResultField::origsize)] = additive;
+                    break;
+                case DFUQResultField::iscompressed:
+                    fieldsList[static_cast<unsigned>(field)] = additive;
+                    if (additive)
+                    {
+                        // The client uses these to decide if compressed or not.
+                        fieldsList[static_cast<unsigned>(DFUQResultField::kind)] = true;
+                        fieldsList[static_cast<unsigned>(DFUQResultField::blockCompressed)] = true;
+                    }
+                    break;
+                default:
+                {
+                    fieldsList[static_cast<unsigned>(field)] = additive;
+                    break;
+                }
+            }
+        }
+    }
+    void setField(DFUQResultField field, bool additive)
+    {
+        // 'customFields' deliberately not set, because setField is only called from code that is supporting legacy clients
+        fieldsList[static_cast<unsigned>(field)] = additive;
+    }
+    bool filterFields() const
+    {
+        // if false, then client did not specify fields, and will continue to return all in old format
+        // if true, then by implication, it is a newer client
+        return customFields;
+    }
+    bool includeField(DFUQResultField field) const
+    {
+        dbgassertex(static_cast<size_t>(field) < static_cast<size_t>(DFUQResultField::term));
+        return fieldsList[static_cast<unsigned>(field)];
     }
 };
 
-class CDFAttributeIterator: implements IDFAttributesIterator, public CInterface
+class CDFAttributeIterator: implements IPropertyTreeIterator, public CInterface
 {
     unsigned index;
     IArrayOf<IPropertyTree> attrs;
 public:
     IMPLEMENT_IINTERFACE;
 
-    static MemoryBuffer &serializeFileAttributes(MemoryBuffer &mb, IPropertyTree &root, const char *name, bool issuper, SerializeFileAttrOptions& option)
+    static MemoryBuffer &serializeFileAttributes(MemoryBuffer &mb, const IPropertyTree &root, const char *name, bool issuper, const SerializeFileAttrOptions& options)
     {
         StringBuffer buf;
         mb.append(name);
-        if (issuper) {
-            mb.append("!SF");
-            mb.append(root.getPropInt("@numsubfiles",0));
-            mb.append("");
+        unsigned count = 0;
+        size32_t countpos = 0;
+        if (!options.filterFields())
+        {
+            // legacy format
+            if (issuper)
+            {
+                mb.append("!SF");
+                mb.append(root.getPropInt("@numsubfiles",0));
+                mb.append("");
+            }
+            else
+            {
+                mb.append(root.queryProp("@directory"));
+                mb.append(root.getPropInt("@numparts",0));
+                mb.append(root.queryProp("@partmask"));
+            }
+            mb.append(root.queryProp("@modified"));
+            countpos = mb.length();
+            mb.append(count);
         }
-        else {
-            mb.append(root.queryProp("@directory"));
-            mb.append(root.getPropInt("@numparts",0));
-            mb.append(root.queryProp("@partmask"));
+        else
+        {
+            countpos = mb.length();
+            mb.append(count);
+            if (issuper)
+            {
+                if (options.includeField(DFUQResultField::numsubfiles))
+                {
+                    const char *propName = getDFUQResultFieldName(DFUQResultField::numsubfiles);
+                    mb.append(propName);
+                    const char *val = root.queryProp(propName);
+                    mb.append(val ? val : "0");
+                    ++count;
+                }
+                if (options.includeField(DFUQResultField::subfilenames))
+                {
+                    Owned<IPropertyTreeIterator> subIter = root.getElements("SubFile");
+                    ForEach(*subIter)
+                    {
+                        const char *subFileName = subIter->query().queryProp("@name");
+                        mb.append("SubFile");
+                        mb.append(subFileName);
+                        ++count;
+                    }
+                }
+            }
+            else
+            {
+                if (options.includeField(DFUQResultField::directory))
+                {
+                    const char *propName = getDFUQResultFieldName(DFUQResultField::directory);
+                    mb.append(propName).append(root.queryProp(propName));
+                    ++count;
+                }
+                if (options.includeField(DFUQResultField::numparts))
+                {
+                    const char *propName = getDFUQResultFieldName(DFUQResultField::numparts);
+                    const char *val = root.queryProp(propName);
+                    mb.append(propName).append(val ? val : "0");
+                    ++count;
+                }
+                if (options.includeField(DFUQResultField::partmask))
+                {
+                    const char *propName = getDFUQResultFieldName(DFUQResultField::partmask);
+                    mb.append(propName).append(root.queryProp(propName));
+                    ++count;
+                }
+            }
+            if (options.includeField(DFUQResultField::timemodified))
+            {
+                const char *propName = getDFUQResultFieldName(DFUQResultField::timemodified);
+                mb.append(propName).append(root.queryProp(propName));
+                ++count;
+            }
         }
-        mb.append(root.queryProp("@modified"));
-        Owned<IPropertyTree> attrs = root.getPropTree("Attr");;
+        Owned<IPropertyTree> attrs = root.getPropTree("Attr");
         Owned<IAttributeIterator> attriter;
         if (attrs)
             attriter.setown(attrs->getAttributes());
-        unsigned count=0;
-        size32_t countpos = mb.length();
-        mb.append(count);
-        if (attriter.get()&&attriter->first()) {
-            do {
-                mb.append(attriter->queryName());
-                mb.append(attriter->queryValue());
-                count++;
-            } while (attriter->next());
-        }
-        const char *ps = root.queryProp("@group");
-        if (ps&&*ps) {
-            count++;
-            mb.append("@group");
-            mb.append(ps);
-        }
-        // add protected
-        if (attrs) {
-            Owned<IPropertyTreeIterator> piter = attrs->getElements("Protect");
-            StringBuffer plist;
-            ForEach(*piter) {
-                const char *name = piter->get().queryProp("@name");
-                if (name&&*name) {
-                    if (plist.length())
-                        plist.append(',');
-                    plist.append(name);
+        if (attriter.get()&&attriter->first())
+        {
+            do
+            {
+                const char *attrName = attriter->queryName();
+                DFUQResultField field = getDFUQResultField(attrName);
+                if (DFUQResultField::unknown != field)
+                {
+                    if (options.includeField(field))
+                    {
+                        mb.append(attriter->queryName());
+                        mb.append(attriter->queryValue());
+                        count++;
+                    }
                 }
             }
-            if (plist.length()) {
+            while (attriter->next());
+        }
+        if (options.includeField(DFUQResultField::nodegroups))
+        {
+            const char *propName = getDFUQResultFieldName(DFUQResultField::nodegroups);
+            const char *ps = root.queryProp(propName);
+            if (ps&&*ps)
+            {
                 count++;
-                mb.append("@protect");
-                mb.append(plist.str());
+                mb.append(propName);
+                mb.append(ps);
             }
         }
-        if (option.includeSuperOwner) {
+        if (options.includeField(DFUQResultField::protect))
+        {
+            // add protected
+            if (attrs)
+            {
+                Owned<IPropertyTreeIterator> piter = attrs->getElements("Protect");
+                StringBuffer plist;
+                ForEach(*piter)
+                {
+                    const char *name = piter->get().queryProp("@name");
+                    if (name&&*name)
+                    {
+                        if (plist.length())
+                            plist.append(',');
+                        plist.append(name);
+                    }
+                }
+                if (plist.length())
+                {
+                    count++;
+                    mb.append(getDFUQResultFieldName(DFUQResultField::protect));
+                    mb.append(plist.str());
+                }
+            }
+        }
+        if (options.includeField(DFUQResultField::superowners))
+        {
             //add superowners
             StringBuffer soList;
             Owned<IPropertyTreeIterator> superOwners = root.getElements("SuperOwner");
-            ForEach(*superOwners) {
+            ForEach(*superOwners)
+            {
                 IPropertyTree &superOwner = superOwners->query();
                 const char *name = superOwner.queryProp("@name");
-                if (name&&*name) {
+                if (name&&*name)
+                {
                     if (soList.length())
                         soList.append(",");
                     soList.append(name);
                 }
             }
-            if (soList.length()) {
+            if (soList.length())
+            {
                 count++;
-                mb.append("@superowners");
+                mb.append(getDFUQResultFieldName(DFUQResultField::superowners));
                 mb.append(soList.str());
             }
         }
@@ -2081,42 +2737,64 @@ public:
         return mb;
     }
 
-    CDFAttributeIterator(MemoryBuffer &mb) // attrib not yet implemented
+    static void deserializeFileAttrCommon(IPropertyTree *attr, MemoryBuffer &mb)
     {
-        unsigned numfiles;
-        mb.read(numfiles);
-        while (numfiles--) {
-            IPropertyTree *attr = getEmptyAttr();
-            StringAttr val;
-            unsigned n;
-            mb.read(val);
-            attr->setProp("@name",val.get());
-            mb.read(val);
-            if (stricmp(val,"!SF")==0) {
-                mb.read(n);
-                attr->setPropInt("@numsubfiles",n);
-                mb.read(val);   // not used currently
-            }
-            else {
-                attr->setProp("@directory",val.get());
-                mb.read(n);
-                attr->setPropInt("@numparts",n);
+        unsigned count;
+        mb.read(count);
+        if (count)
+        {
+            StringBuffer prop;
+            StringBuffer val;
+            while (true)
+            {
+                mb.read(prop);
                 mb.read(val);
-                attr->setProp("@partmask",val.get());
+                attr->addProp(prop, val);
+                if (0 == --count)
+                    break;
+                prop.clear();
+                val.clear();
             }
-            mb.read(val);
-            attr->setProp("@modified",val.get());
-            unsigned count;
-            mb.read(count);
-            StringAttr at;
-            while (count--) {
-                mb.read(at);
-                mb.read(val);
-                attr->setProp(at.get(),val.get());
-            }
-            attrs.append(*attr);
         }
-        index = 0;
+    }
+
+    static IPropertyTree *deserializeFileAttrLegacy(MemoryBuffer &mb)
+    {
+        Owned<IPropertyTree> attr = getEmptyAttr();
+        StringAttr val;
+        unsigned n;
+        mb.read(val);
+        attr->setProp(getDFUQResultFieldName(DFUQResultField::name),val.get());
+        mb.read(val);
+        if (strieq(val,"!SF"))
+        {
+            mb.read(n);
+            attr->setPropInt(getDFUQResultFieldName(DFUQResultField::numsubfiles),n);
+            mb.read(val);   // not used currently
+        }
+        else
+        {
+            attr->setProp(getDFUQResultFieldName(DFUQResultField::directory),val.get());
+            mb.read(n);
+            attr->setPropInt(getDFUQResultFieldName(DFUQResultField::numparts),n);
+            mb.read(val);
+            attr->setProp(getDFUQResultFieldName(DFUQResultField::partmask),val.get());
+        }
+        mb.read(val);
+        attr->setProp(getDFUQResultFieldName(DFUQResultField::timemodified),val.get());
+        deserializeFileAttrCommon(attr, mb);
+        return attr.getClear();
+    }
+
+    static IPropertyTree *deserializeFileAttr(MemoryBuffer &mb)
+    {
+        Owned<IPropertyTree> attr = getEmptyAttr();
+        StringAttr val;
+        unsigned n;
+        mb.read(val);
+        attr->setProp(getDFUQResultFieldName(DFUQResultField::name),val.get());
+        deserializeFileAttrCommon(attr, mb);
+        return attr.getClear();
     }
 
     CDFAttributeIterator(IArrayOf<IPropertyTree>& trees)
@@ -2295,15 +2973,14 @@ public:
 
 // --------------------------------------------------------
 
-class CDistributedFilePart: public CInterface, implements IDistributedFilePart
+class CDistributedFilePart: implements IDistributedFilePart, public CInterface
 {
     unsigned partIndex;
     CDistributedFile &parent;
-    Owned<IPropertyTree> attr;
-    CriticalSection sect;
+    AtomicShared<IPropertyTree> attr;
     StringAttr overridename;    // may or not be relative to directory
     bool            dirty;      // whether needs updating in tree
-
+    std::vector<unsigned> stripeNumber;
     offset_t getSize(bool checkCompressed);
 
 public:
@@ -2366,7 +3043,7 @@ public:
 
     IPropertyTree *queryAttr()
     {
-        return attr;
+        return attr.query();
     }
 
     inline CDistributedFile &queryParent()
@@ -2385,6 +3062,8 @@ public:
         dirty = false;
         return ret;
     }
+    virtual StringBuffer &getStorageFilePath(StringBuffer & path, unsigned copy) override;
+    virtual unsigned getStripeNum(unsigned copy) override;
 };
 
 // --------------------------------------------------------
@@ -2499,11 +3178,12 @@ class CDistributedFileIterator: public CDistributedFileIteratorBase<IDistributed
     Linked<IUserDescriptor> udesc;
     Linked<IDistributedFileTransaction> transaction;
     bool isPrivilegedUser = false;
+    AccessMode accessMode;
 
     bool set()
     {
         while (isValid()) {
-            cur.setown(parent->lookup(queryName(),udesc, false, false, false, nullptr, isPrivilegedUser));
+            cur.setown(parent->lookup(queryName(),udesc, accessMode, false, false, nullptr, isPrivilegedUser));
             if (cur)
                 return true;
             index++;
@@ -2512,15 +3192,24 @@ class CDistributedFileIterator: public CDistributedFileIteratorBase<IDistributed
     }
 
 public:
-    CDistributedFileIterator(IDistributedFileDirectory *_dir,const char *wildname,bool includesuper,IUserDescriptor *user,bool _isPrivilegedUser, IDistributedFileTransaction *_transaction=NULL)
-        : isPrivilegedUser(_isPrivilegedUser), transaction(_transaction)
+    CDistributedFileIterator(IDistributedFileDirectory *_dir,const char *wildname,bool includesuper,IUserDescriptor *user,bool _isPrivilegedUser, AccessMode _accessMode=AccessMode::readLogicalMeta, IDistributedFileTransaction *_transaction=NULL)
+        : transaction(_transaction), isPrivilegedUser(_isPrivilegedUser), accessMode(_accessMode)
     {
         setUserDescriptor(udesc,user);
         if (!wildname||!*wildname)
             wildname = "*";
         parent = _dir;
         bool recursive = (stricmp(wildname,"*")==0);
-        Owned<IDFAttributesIterator> attriter = parent->getDFAttributesIterator(wildname,user,recursive,includesuper,NULL);
+
+        StringBuffer filterBuf;
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileNameWithPrefix).append(DFUQFilterSeparator).append(wildname).append(DFUQFilterSeparator);
+        if (!includesuper)
+            filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileType).append(DFUQFilterSeparator).append(DFUQFFTnonsuperfileonly).append(DFUQFilterSeparator);
+
+        bool allMatchingFilesReceived;
+        Owned<IPropertyTreeIterator> attriter = queryDistributedFileDirectory().getDFAttributesFilteredIterator(filterBuf,
+            nullptr, nullptr, user, recursive, allMatchingFilesReceived, nullptr);
+
         ForEach(*attriter) {
             IPropertyTree &pt = attriter->query();
             list.append(strdup(pt.queryProp("@name")));
@@ -2559,7 +3248,7 @@ class CDistributedSuperFileIterator: public CDistributedFileIteratorBase<IDistri
 
 public:
     CDistributedSuperFileIterator(IDistributedFile *_owner, CDistributedFileDirectory *_parent,IPropertyTree *root,IUserDescriptor *user, IDistributedFileTransaction *_transaction)
-        : owner(_owner), transaction(_transaction)
+        : transaction(_transaction), owner(_owner)
     {
         setUserDescriptor(udesc,user);
         parent = _parent;
@@ -2582,9 +3271,9 @@ public:
         // this should never be needed but match previous semantics
         // throwing an exception now, to catch the error early on
         if (transaction.get())
-            cur.setown(transaction->lookupSuperFile(queryName()));
+            cur.setown(transaction->lookupSuperFile(queryName(), AccessMode::readLogicalMeta));
         else
-            cur.setown(parent->lookupSuperFile(queryName(),udesc,NULL));
+            cur.setown(parent->lookupSuperFile(queryName(), udesc, AccessMode::readLogicalMeta, NULL));
 
         if (!cur.get())
             throw  MakeStringException(-1,"superFileIter: invalid super-file on query at %s", queryName());
@@ -2675,6 +3364,68 @@ static bool checkProtectAttr(const char *logicalname,IPropertyTree *froot,String
     return prot;
 }
 
+bool hasTLK(IDistributedFile *f)
+{
+    if (!isFileKey(f))
+        return false;
+
+    unsigned np = f->numParts();
+    if (np <= 1)
+        return false;
+
+    return isPartTLK(&f->queryPart(np-1));
+}
+
+//Ensure that enough time has passed from when the file was last modified for reads to be consistent
+//Important for blob storage or remote, geographically synchronized storage
+//Only used for lookups flagged AccessMode::external, where the parts are read outside this process
+//(and so are not covered by the per-part write-sync checks in jfile)
+//NB: operates on the raw file tree, so that it can be used both by CDistributedFile and by the
+//getFileTree client path (which never constructs a CDistributedFile)
+static void checkFileWriteSync(const IPropertyTree *fileTree, const char *logicalName)
+{
+    time_t modifiedTime = 0;
+    time_t now = 0;
+
+    Owned<IPropertyTreeIterator> iter = fileTree->getElements("Cluster");
+    ForEach(*iter)
+    {
+        const char * name = iter->query().queryProp("@name");
+        unsigned marginMs = getWriteSyncMarginMs(name);
+        if (marginMs)
+        {
+            if (0 == modifiedTime)
+            {
+                StringBuffer modifiedStr;
+                if (!fileTree->getProp("@modified", modifiedStr))
+                    return;
+                CDateTime modified;
+                modified.setString(modifiedStr);
+                modifiedTime = modified.getSimple();
+                if (0 == modifiedTime)
+                    return;
+            }
+
+            if (0 == now)
+                now = time(&now);
+
+            //Round the elapsed time down - so that a change on the last ms of one time period does not count as a whole second of elapsed time
+            //This could be avoided if the modified time was more granular
+            unsigned __int64 elapsedMs = now > modifiedTime ? (now - modifiedTime) * 1000 : 0; // guard against clock < @modified
+            if (elapsedMs >= 1000)
+                elapsedMs -= 999;
+
+            if (unlikely(elapsedMs < marginMs))
+            {
+                LOG(MCuserProgress, "Delaying external access to %s on %s for %ums to ensure write sync", logicalName, name, (unsigned)(marginMs - elapsedMs));
+                MilliSleep(marginMs - elapsedMs);
+                now = 0; // re-evaluate now - unlikely to actually happen
+            }
+        }
+    }
+}
+
+
 /**
  * A template class which implements the common methods of an IDistributedFile interface.
  * The actual interface (extended from IDistributedFile) is provided as a template argument.
@@ -2686,7 +3437,7 @@ protected:
     Owned<IPropertyTree> root;
     Owned<IRemoteConnection> conn;                  // kept connected during lifetime for attributes
     CDfsLogicalFileName logicalName;
-    CriticalSection sect;
+    mutable CriticalSection sect{SYNC_LOCATION};
     CDistributedFileDirectory *parent;
     unsigned proplockcount;
     unsigned transactionnest;
@@ -2765,7 +3516,21 @@ public:
     void resetHistory()
     {
         DistributedFilePropertyLock lock(this);
-        queryAttributes().removeTree(queryHistory());
+        IPropertyTree *history = queryHistory();
+        if (history)
+            queryAttributes().removeTree(history);
+    }
+    virtual void lockFileAttrLock(CFileAttrLock & attrLock)
+    {
+        if (!attrLock.init(logicalName, DXB_File, RTM_LOCK_WRITE, conn, defaultTimeout, "CDistributedFile::lockFileAttrLock"))
+        {
+            // In unlikely event File/Attr doesn't exist, must ensure created, commited and root connection is reloaded.
+            verifyex(attrLock.init(logicalName, DXB_File, RTM_LOCK_WRITE|RTM_CREATE_QUERY, conn, defaultTimeout, "CDistributedFile::lockFileAttrLock"));
+            attrLock.commit();
+            conn->commit();
+            conn->reload();
+            root.setown(conn->getRoot());
+        }
     }
 
 protected:
@@ -3125,6 +3890,47 @@ public:
         setAccessedTime(dt);
     }
 
+    virtual void addAttrValue(const char *attr, unsigned __int64 value) override
+    {
+        if (0==value)
+            return;
+        if (logicalName.isForeign())
+        {
+            // Note: it is not possible to update foreign attributes at the moment, so ignoring
+        }
+        else
+        {
+            CFileAttrLock attrLock;
+            if (conn)
+                lockFileAttrLock(attrLock);
+            unsigned __int64 currentVal = queryAttributes().getPropInt64(attr);
+            queryAttributes().setPropInt64(attr, currentVal+value);
+        }
+    }
+
+    virtual void addAttrValues(std::initializer_list<AttrValuePair> attrs) override
+    {
+        if (logicalName.isForeign())
+        {
+            // Note: it is not possible to update foreign attributes at the moment, so ignoring
+            return;
+        }
+
+        CFileAttrLock attrLock;
+        if (conn)
+            lockFileAttrLock(attrLock);
+        for (const auto& attr : attrs)
+        {
+            const char* attrName = attr.first;
+            unsigned __int64 value = attr.second;
+
+            if (0 == value)
+                continue;
+            unsigned __int64 currentVal = queryAttributes().getPropInt64(attrName);
+            queryAttributes().setPropInt64(attrName, currentVal + value);
+        }
+    }
+
     virtual StringBuffer &getColumnMapping(StringBuffer &mapping)
     {
         queryAttributes().getProp("@columnMapping",mapping);
@@ -3216,9 +4022,21 @@ public:
     virtual void setAccessedTime(const CDateTime &dt) = 0;                      // set date and time last accessed
     virtual bool isExternal() const { return external; }
 
-    virtual int getExpire()
+    virtual int getExpire(StringBuffer *expirationDate)
     {
-        return queryAttributes().getPropInt("@expireDays", -1);
+        int expireDays = queryAttributes().getPropInt("@expireDays", -1);
+        if (!expirationDate || (expireDays == -1))
+            return expireDays;
+
+        const char *lastAccessed = queryAttributes().queryProp("@accessed");
+        if (isEmptyString(lastAccessed))
+            return expireDays;
+
+        CDateTime expires;
+        expires.setString(lastAccessed);
+        expires.adjustTime(60*24*expireDays);
+        expires.getString(*expirationDate);
+        return expireDays;
     }
 
     virtual void setExpire(int expireDays)
@@ -3229,16 +4047,24 @@ public:
         else
             queryAttributes().setPropInt("@expireDays", expireDays);
     }
+
+    virtual IUserDescriptor *queryUser() const override
+    {
+        return udesc;
+    }
 };
 
 class CDistributedFile: public CDistributedFileBase<IDistributedFile>
 {
 protected:
     CDistributedFilePartArray parts;            // use queryParts to access
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     StringAttr directory;
     StringAttr partmask;
     FileClusterInfoArray clusters;
+    FileDescriptorFlags fileFlags = FileDescriptorFlags::none;
+    unsigned lfnHash = 0;
+    AccessMode accessMode = AccessMode::none;
 
     void savePartsAttr(bool force) override
     {
@@ -3254,13 +4080,17 @@ protected:
                 const char *grp = root->queryProp("@group");
                 if (!grp||!*grp) {
                     StringBuffer eps;
-                    pt->addProp("@node",part.queryNode(0)->endpoint().getUrlStr(eps).str()); // legacy
+                    pt->addProp("@node",part.queryNode(0)->endpoint().getEndpointHostText(eps).str()); // legacy
                 }
                 const char *override = part.queryOverrideName();
                 if (override&&*override)
                     pt->setProp("@name",override);
                 else {
                     pt->removeProp("@name");
+
+                    // JCSMORE - this makes little sense. @name -> overridename
+                    // It is being set here specifically for a 1 part file, but without it (tested) it will construct
+                    // the name from the mask as normal.
                     const char *mask=queryPartMask();
                     if (mask&&*mask) {
                         StringBuffer tmp;
@@ -3277,7 +4107,6 @@ protected:
             for (i1=0;i1<n;i1++) {
                 if (parts.item(i1).clearDirty()||force) {
                     MemoryBuffer mb;
-                    CriticalBlock block (sect);
                     ForEachItemIn(i2,parts)
                         serializePartAttr(mb,parts.item(i2).queryAttr());
                     root->setPropBin("Parts",mb.length(),mb.toByteArray());
@@ -3290,9 +4119,10 @@ protected:
                 parts.item(i1++).clearDirty();
         }
     }
-    void detach(unsigned timeoutMs, bool removePhysicals, ICodeContext *ctx)
+    void detach(unsigned timeoutMs, bool removePhysicals, ICodeContext *ctx, const DFSAuditContext &auditCtx)
     {
         // Removes either a cluster in case of multi cluster file or the whole File entry from DFS
+        StringBuffer lfnStr(logicalName.get()); // capture before logicalName.clear()
 
         assert(proplockcount == 0 && "CDistributedFile detach: Some properties are still locked");
         assertex(!isAnon()); // not attached!
@@ -3365,6 +4195,18 @@ protected:
             if (exceptions->ordinality())
                 throw exceptions.getClear();
         }
+
+        if (!auditCtx.isNested())
+        {
+            DFSAuditContext ctx = auditCtx;
+            ctx.setValue("lfn", lfnStr.str());
+            if (clusterName.length())
+                ctx.setValue("plane", clusterName.str());
+            else
+                addAuditPlaneFields(ctx, *this);
+            addAuditSizeFields(ctx, *this);
+            ctx.logFileAccess("DELETE");
+        }
     }
     bool removePhysicalPartFiles(IFileDescriptor *fileDesc, IMultiException *mexcept, unsigned numParallelDeletes=0)
     {
@@ -3385,25 +4227,39 @@ protected:
         if (0 == np)
             return false;
 
+        // Do not include the TLK in the skew calculation
+        if (hasTLK(this))
+            np--;
+
         offset_t maxPartSz = 0, minPartSz = (offset_t)-1, totalPartSz = 0;
 
-        maxSkewPart = 0;
-        minSkewPart = 0;
-        for (unsigned p=0; p<np; p++)
+        try
         {
-            IDistributedFilePart &part = queryPart(p);
-            offset_t size = part.getFileSize(true, false);
-            if (size > maxPartSz)
+            maxSkewPart = 0;
+            minSkewPart = 0;
+            for (unsigned p=0; p<np; p++)
             {
-                maxPartSz = size;
-                maxSkewPart = p;
+                IDistributedFilePart &part = queryPart(p);
+                offset_t size = part.getFileSize(true, false);
+                if (size > maxPartSz)
+                {
+                    maxPartSz = size;
+                    maxSkewPart = p;
+                }
+                if (size < minPartSz)
+                {
+                    minPartSz = size;
+                    minSkewPart = p;
+                }
+                totalPartSz += size;
             }
-            if (size < minPartSz)
-            {
-                minPartSz = size;
-                minSkewPart = p;
-            }
-            totalPartSz += size;
+        }
+        catch (IException *e)
+        {
+            // guard against getFileSize throwing an exception (if parts missing)
+            EXCLOG(e);
+            e->Release();
+            return false;
         }
         offset_t avgPartSz = totalPartSz / np;
         if (0 == avgPartSz)
@@ -3413,6 +4269,10 @@ protected:
             maxSkew = (unsigned)(10000.0 * (((double)maxPartSz-avgPartSz)/avgPartSz));
             minSkew = (unsigned)(10000.0 * ((avgPartSz-(double)minPartSz)/avgPartSz));
         }
+
+        // +1 because published part number references are 1 based.
+        maxSkewPart++;
+        minSkewPart++;
 
         return true;
     }
@@ -3444,9 +4304,10 @@ public:
     IMPLEMENT_IINTERFACE_O;
 
     // NB: this form is used for pre-existing file, by dolookup
-    CDistributedFile(CDistributedFileDirectory *_parent, IRemoteConnection *_conn,const CDfsLogicalFileName &lname,IUserDescriptor *user) // takes ownership of conn
+    CDistributedFile(CDistributedFileDirectory *_parent, IRemoteConnection *_conn,const CDfsLogicalFileName &lname,AccessMode _accessMode,IUserDescriptor *user) // takes ownership of conn
     {
         setUserDescriptor(udesc,user);
+        accessMode = _accessMode;
         logicalName.set(lname);
         parent = _parent;
         conn.setown(_conn);
@@ -3461,6 +4322,7 @@ public:
         LOGFDESC("CDistributedFile.a fdesc",fdesc);
 #endif
         setFileAttrs(fdesc,false);
+        setLFNHash(fdesc);
         setClusters(fdesc);
         setPreferredClusters(_parent->defprefclusters);
         setParts(fdesc,false);
@@ -3474,42 +4336,69 @@ public:
         LOGFDESC("CDistributedFile.b fdesc",fdesc);
 #endif
         parent = _parent;
+        accessMode = static_cast<AccessMode>(fdesc->queryProperties().getPropInt("@accessMode"));
         root.setown(createPTree(queryDfsXmlBranchName(DXB_File)));
         root->setPropTree("ClusterLock", createPTree());
 //      fdesc->serializeTree(*root,IFDSF_EXCLUDE_NODES);
         setFileAttrs(fdesc,true);
+        external = _external;
+        // External files are not attached, so retain their descriptor timestamp on the root; createNew files get a publish-time timestamp when attached.
+        if (external)
+        {
+            const char *modified = fdesc->queryProperties().queryProp("@modified");
+            if (modified)
+                root->setProp("@modified", modified);
+        }
+        else
+            setLFNHash(fdesc);
         setClusters(fdesc);
         setPreferredClusters(_parent->defprefclusters);
         saveClusters();
         setParts(fdesc,true);
         udesc.set(user);
-        external = _external;
 #ifdef EXTRA_LOGGING
         LOGPTREE("CDistributedFile.b root.1",root);
 #endif
-        offset_t totalsize=0;
+        offset_t totalsize = 0;
+        offset_t totalCompressedSize = 0;
+        offset_t totalUncompressedSize = 0;
         unsigned checkSum = ~0;
         bool useableCheckSum = true;
         MemoryBuffer pmb;
         unsigned n = fdesc->numParts();
-        for (unsigned i=0;i<n;i++) {
+        for (unsigned i=0;i<n;i++)
+        {
             IPropertyTree *partattr = &fdesc->queryPart(i)->queryProperties();
             if (!partattr)
             {
-                totalsize = (unsigned)-1;
+                totalsize = (offset_t)-1;
+                totalCompressedSize = (offset_t)-1;
                 useableCheckSum = false;
             }
             else
             {
-                offset_t psz;
-                if (totalsize!=(offset_t)-1) {
-                    psz = (offset_t)partattr->getPropInt64("@size", -1);
+                if (totalsize!=(offset_t)-1)
+                {
+                    offset_t psz = (offset_t)partattr->getPropInt64("@size", -1);
                     if (psz==(offset_t)-1)
                         totalsize = psz;
                     else
                         totalsize += psz;
+
+                    psz = (offset_t)partattr->getPropInt64("@compressedSize", -1);
+                    if (psz==(offset_t)-1)
+                        totalCompressedSize = psz;
+                    else
+                        totalCompressedSize += psz;
+
+                    psz = (offset_t)partattr->getPropInt64("@uncompressedSize", -1);
+                    if (psz==(offset_t)-1)
+                        totalUncompressedSize = psz;
+                    else
+                        totalUncompressedSize += psz;
                 }
-                if (useableCheckSum) {
+                if (useableCheckSum)
+                {
                     unsigned crc;
                     if (fdesc->queryPart(i)->getCrc(crc))
                         checkSum ^= crc;
@@ -3521,9 +4410,12 @@ public:
         shrinkFileTree(root);
         if (totalsize!=(offset_t)-1)
             queryAttributes().setPropInt64("@size", totalsize);
+        if ((totalCompressedSize!=(offset_t)-1) && (totalCompressedSize != 0))
+            queryAttributes().setPropInt64("@compressedSize", totalCompressedSize);
+        if ((totalUncompressedSize!=(offset_t)-1) && (totalUncompressedSize != 0))
+            queryAttributes().setPropInt64("@uncompressedSize", totalUncompressedSize);
         if (useableCheckSum)
             queryAttributes().setPropInt64("@checkSum", checkSum);
-        setModified();
 #ifdef EXTRA_LOGGING
         LOGPTREE("CDistributedFile.b root.2",root);
 #endif
@@ -3545,11 +4437,17 @@ public:
         clusters.kill();
     }
 
+    bool hasDirPerPart() const
+    {
+        return FileDescriptorFlags::none != (fileFlags & FileDescriptorFlags::dirperpart);
+    }
+
     IFileDescriptor *getFileDescriptor(const char *_clusterName) override
     {
         CriticalBlock block (sect);
         Owned<IFileDescriptor> fdesc = deserializeFileDescriptorTree(root,&queryNamedGroupStore(),0);
         fdesc->setTraceName(logicalName.get());
+        fdesc->queryProperties().setPropInt("@accessMode", static_cast<int>(accessMode));
         StringArray cnames;
         if (_clusterName&&*_clusterName)
         {
@@ -3561,6 +4459,17 @@ public:
             getClusterNames(cnames);
         fdesc->setClusterOrder(cnames,_clusterName&&*_clusterName);
         return fdesc.getClear();
+    }
+
+    void setLFNHash(IFileDescriptor *fdesc)
+    {
+        if (fdesc->queryProperties().hasProp("@lfnHash"))
+            lfnHash = fdesc->queryProperties().getPropInt("@lfnHash");
+        else
+        {
+            // this is a guard, just in case the file descriptor has the lfnHash missing
+            lfnHash = getFilenameHash(logicalName.get());
+        }
     }
 
     void setFileAttrs(IFileDescriptor *fdesc,bool save)
@@ -3575,45 +4484,64 @@ public:
                 partmask.set(mask);
             }
         }
-        if (!save)
-            return;
-        if (directory.isEmpty())
-            root->removeProp("@directory");
-        else
-            root->setProp("@directory",directory);
-        if (partmask.isEmpty())
-            root->removeProp("@partmask");
-        else
-            root->setProp("@partmask",partmask);
-        IPropertyTree *t = &fdesc->queryProperties();
-        if (isEmptyPTree(t))
-            resetFileAttr();
-        else
-            resetFileAttr(createPTreeFromIPT(t));
+        if (save)
+        {
+            if (directory.isEmpty())
+                root->removeProp("@directory");
+            else
+                root->setProp("@directory",directory);
+            if (partmask.isEmpty())
+                root->removeProp("@partmask");
+            else
+                root->setProp("@partmask",partmask);
+            IPropertyTree *t = &fdesc->queryProperties();
+            if (isEmptyPTree(t))
+                resetFileAttr();
+            else
+                resetFileAttr(createPTreeFromIPT(t));
+        }
+        // this change was not required, but it is more consistent to get the property from the deserialized passed in file descriptor
+        fileFlags = static_cast<FileDescriptorFlags>(fdesc->queryProperties().getPropInt("@flags"));
     }
 
     void setClusters(IFileDescriptor *fdesc)
     {
         clusters.clear();
         unsigned nc = fdesc->numClusters();
-        if (nc) {
-            for (unsigned i=0;i<nc;i++) {
+        if (nc)
+        {
+            unsigned flags = 0;
+            if (FileDescriptorFlags::none != (FileDescriptorFlags::foreign & fdesc->getFlags()))
+                flags = IFDSF_FOREIGN_GROUP;
+            for (unsigned i=0;i<nc;i++)
+            {
                 StringBuffer cname;
-                StringBuffer clabel;
-                IClusterInfo &cluster = *createClusterInfo(
-                                    fdesc->getClusterGroupName(i,cname,NULL).str(),
-                                    fdesc->queryClusterGroup(i),
-                                    fdesc->queryPartDiskMapping(i),
-                                    &queryNamedGroupStore()
-                                    );
-#ifdef EXTRA_LOGGING
-                PROGLOG("setClusters(%d,%s)",i,cname.str());
-#endif
+                fdesc->getClusterGroupName(i, cname, nullptr);
+                IClusterInfo *cluster;
+                if (cname.length())
+                    cluster = LINK(fdesc->queryClusterNum(i));
+                else
+                {
+                    // NB: this is non-standard, for situations where the cluster name is not known,
+                    // which happens where none has been provided/set to the file descriptor,
+                    // and the file descriptor has been built up of parts with ips.
+                    // createClusterInfo will perform a reverse lookup to Dali to try to discover
+                    // a group name.
+                    cluster = createClusterInfo(
+                                  nullptr,
+                                  fdesc->queryClusterGroup(i),
+                                  fdesc->queryPartDiskMapping(i),
+                                  &queryNamedGroupStore(),
+                                  flags
+                               );
 
-                if (!cluster.queryGroup(&queryNamedGroupStore())) {
-                    IERRLOG("IDistributedFileDescriptor cannot set cluster for %s",logicalName.get());
+                    if (!cluster->queryGroup(&queryNamedGroupStore()))
+                        IERRLOG("IDistributedFileDescriptor cannot set cluster for %s", logicalName.get());
                 }
-                clusters.append(cluster);
+#ifdef EXTRA_LOGGING
+                PROGLOG("setClusters(%d,%s)", i, cluster->queryGroupName());
+#endif
+                clusters.append(*cluster);
             }
         }
         else
@@ -3702,23 +4630,27 @@ public:
 
     virtual void addCluster(const char *clustername,const ClusterPartDiskMapSpec &mspec) override
     {
-        if (!clustername&&!*clustername)
+        if (isEmptyString(clustername))
             return;
-        CClustersLockedSection cls(CDistributedFileBase<IDistributedFile>::logicalName, true);
-        reloadClusters();
-        if (findCluster(clustername)!=NotFound) {
-            IDFS_Exception *e = new CDFS_Exception(DFSERR_ClusterAlreadyExists,clustername);
-            throw e;
+
+        {
+            CClustersLockedSection cls(CDistributedFileBase<IDistributedFile>::logicalName, true);
+            reloadClusters();
+            if (findCluster(clustername)!=NotFound) {
+                IDFS_Exception *e = new CDFS_Exception(DFSERR_ClusterAlreadyExists,clustername);
+                throw e;
+            }
+            Owned<IClusterInfo> cluster = createClusterInfo(clustername,NULL,mspec,&queryNamedGroupStore());
+            if (cluster->queryGroup(&queryNamedGroupStore())) {
+                clusters.append(*cluster.getClear());
+            }
+            else {
+                IDFS_Exception *e = new CDFS_Exception(DFSERR_ClusterNotFound,clustername);
+                throw e;
+            }
+            saveClusters();
         }
-        Owned<IClusterInfo> cluster = createClusterInfo(clustername,NULL,mspec,&queryNamedGroupStore());
-        if (cluster->queryGroup(&queryNamedGroupStore())) {
-            clusters.append(*cluster.getClear());
-        }
-        else {
-            IDFS_Exception *e = new CDFS_Exception(DFSERR_ClusterNotFound,clustername);
-            throw e;
-        }
-        saveClusters();
+        setModified(); // a new cluster's parts have been materialised - treat as modified
     }
 
     virtual bool removeCluster(const char *clustername) override
@@ -3791,7 +4723,7 @@ public:
     }
 
 
-    virtual StringBuffer &getClusterName(unsigned clusternum,StringBuffer &name) override
+    virtual StringBuffer &getClusterName(unsigned clusternum,StringBuffer &name) const override
     {
         return clusters.getName(clusternum,name);
     }
@@ -3924,9 +4856,9 @@ public:
 
     virtual IDistributedFilePart &queryPart(unsigned idx) override
     {
-        if (idx<parts.ordinality())
-            return queryParts().item(idx);
-        return *(IDistributedFilePart *)NULL;
+        if (idx>=parts.ordinality())
+            throwUnexpectedX("CDistributedFileBase::queryPart out of range");
+        return queryParts().item(idx);
     }
 
     virtual IDistributedFilePart* getPart(unsigned idx) override
@@ -3942,7 +4874,7 @@ public:
         return new CDistributedFilePartIterator(queryParts(),filter);
     }
 
-    virtual void rename(const char *_logicalname,IUserDescriptor *user) override
+    virtual void rename(const char *_logicalname,IUserDescriptor *user, const DFSAuditContext &auditCtx = DFSAuditContext{}) override
     {
         StringBuffer prevname;
         Owned<IFileRelationshipIterator> reliter;
@@ -3957,9 +4889,9 @@ public:
                 EXCLOG(e,"CDistributedFile::rename");
                 e->Release();
             }
-            detachLogical();
+            detachLogical(INFINITE, auditCtx.nested());
         }
-        attach(_logicalname,user);
+        attach(_logicalname, user, auditCtx.nested());
         if (prevname.length()) {
             DistributedFilePropertyLock lock(this);
             IPropertyTree &pt = queryAttributes();
@@ -3971,6 +4903,14 @@ public:
         if (reliter.get()) {
             // add back any relationships with new name
             parent->renameFileRelationships(prevname.str(),_logicalname,reliter,user);
+        }
+
+        if (!auditCtx.isNested()) {
+            DFSAuditContext ctx = auditCtx;
+            ctx.setValue("lfn", logicalName.get());
+            if (prevname.length())
+                ctx.setValue("lfn2", prevname.str());
+            ctx.logFileAccess("RENAME");
         }
     }
 
@@ -3996,7 +4936,7 @@ public:
         return (!logicalName.isSet());
     }
 
-    virtual void attach(const char *_logicalname,IUserDescriptor *user) override
+    virtual void attach(const char *_logicalname, IUserDescriptor *user, const DFSAuditContext &auditCtx) override
     {
         CriticalBlock block (sect);
         assertex(isAnon()); // already attached!
@@ -4007,24 +4947,57 @@ public:
         PROGLOG("CDistributedFile::attach(%s)",_logicalname);
         LOGPTREE("CDistributedFile::attach root.1",root);
 #endif
-        calculateSkew();
-        parent->addEntry(logicalName,root.getClear(),false,false);
-        killParts();
-        clusters.kill();
-        CFileLock fcl;
-        verifyex(fcl.init(logicalName, DXB_File, RTM_LOCK_READ, defaultTimeout, "CDistributedFile::attach"));
-        conn.setown(fcl.detach());
-        root.setown(conn->getRoot());
-        root->queryBranch(".");     // load branch
-        Owned<IFileDescriptor> fdesc = deserializeFileDescriptorTree(root,&queryNamedGroupStore(),0);
-        setFileAttrs(fdesc,false);
-        setClusters(fdesc);
-        setParts(fdesc,false);
-        setUserDescriptor(udesc, user);
+        try
+        {
+            calculateSkew();
+            // ensure lfnHash is present and published
+            if (queryAttributes().hasProp("@lfnHash"))
+                lfnHash = queryAttributes().getPropInt("@lfnHash");
+            else
+            {
+                lfnHash = getFilenameHash(logicalName.get());
+                queryAttributes().setPropInt("@lfnHash", lfnHash);
+            }
+            setModified(); // stamp @modified at publish (materialisation) time
+            parent->addEntry(logicalName,root.getClear(),false,false);
+            killParts();
+            clusters.kill();
+            CFileLock fcl;
+            verifyex(fcl.init(logicalName, DXB_File, RTM_LOCK_READ, defaultTimeout, "CDistributedFile::attach"));
+            conn.setown(fcl.detach());
+            root.setown(conn->getRoot());
+            root->queryBranch(".");     // load branch
+            Owned<IFileDescriptor> fdesc = deserializeFileDescriptorTree(root,&queryNamedGroupStore(),0);
+            setFileAttrs(fdesc,false);
+            setClusters(fdesc);
+            setParts(fdesc,false);
+            setUserDescriptor(udesc, user);
+            setAccessed();
+
+            if (!auditCtx.isNested())
+            {
+                DFSAuditContext ctx = auditCtx;
+                ctx.setValue("lfn", logicalName.get());
+                if (clusters.ordinality() == 1)
+                {
+                    StringBuffer clusterName;
+                    getClusterName(0, clusterName);
+                    ctx.setValue("plane", clusterName.str());
+                }
+                addAuditSizeFields(ctx, *this);
+                ctx.logFileAccess("PUBLISH");
+            }
 #ifdef EXTRA_LOGGING
-        LOGFDESC("CDistributedFile::attach fdesc",fdesc);
-        LOGPTREE("CDistributedFile::attach root.2",root);
+            LOGFDESC("CDistributedFile::attach fdesc",fdesc);
+            LOGPTREE("CDistributedFile::attach root.2",root);
 #endif
+        }
+        catch (IException *e)
+        {
+            EXCLOG(e, "CDistributedFile::attach");
+            logicalName.clear();
+            throw;
+        }
     }
 
     /*
@@ -4037,21 +5010,21 @@ public:
      * See removeLogical()
      */
 public:
-    void detachLogical(unsigned timeoutms=INFINITE)
+    void detachLogical(unsigned timeoutms=INFINITE, const DFSAuditContext &auditCtx = DFSAuditContext{})
     {
-        detach(timeoutms, false, NULL);
+        detach(timeoutms, false, NULL, auditCtx.nested());
     }
 
 public:
-    virtual void detach(unsigned timeoutMs=INFINITE, ICodeContext *ctx=NULL) override
+    virtual void detach(unsigned timeoutMs=INFINITE, ICodeContext *ctx=NULL, const DFSAuditContext &auditCtx = DFSAuditContext{}) override
     {
-        detach(timeoutMs, true, ctx);
+        detach(timeoutMs, true, ctx, auditCtx);
     }
 
     virtual bool existsPhysicalPartFiles(unsigned short port) override
     {
         unsigned width = numParts();
-        CriticalSection errcrit;
+        CriticalSection errcrit{SYNC_LOCATION};
         class casyncfor: public CAsyncFor
         {
             IDistributedFile *file;
@@ -4061,7 +5034,7 @@ public:
         public:
             bool ok;
             casyncfor(IDistributedFile *_file,unsigned _width,unsigned short _port,CriticalSection &_errcrit)
-                : errcrit(_errcrit)
+                : CAsyncFor(SYNC_LOCATION), errcrit(_errcrit)
             {
                 file = _file;
                 port = _port;
@@ -4095,7 +5068,7 @@ public:
                         CriticalBlock block(errcrit);
                         StringBuffer s("Failed to find file part ");
                         s.append(partfile->queryFilename()).append(" on ");
-                        rfn.queryEndpoint().getUrlStr(s);
+                        rfn.queryEndpoint().getEndpointHostText(s);
                         EXCLOG(e, s.str());
                         e->Release();
                     }
@@ -4156,42 +5129,71 @@ public:
         DFD_OS os = SepCharBaseOs(psc);
         StringBuffer basedir;
 
-        const char *myBase;
+        StringBuffer myBase;
         if (newbasedir)
         {
             diroverride = newbasedir;
-            myBase = newbasedir;
+            myBase.set(newbasedir);
         }
         else
-            myBase = queryBaseDirectory(grp_unknown, 0, os);
+        {
+#ifdef _CONTAINERIZED
+            IClusterInfo &iClusterInfo = clusters.item(0);
+            const char *planeName = iClusterInfo.queryGroupName();
+            if (!isEmptyString(planeName))
+            {
+                Owned<const IStoragePlane> plane = getDataStoragePlane(planeName, false);
+                if (plane)
+                {
+                    if (clusters.ordinality() > 1)
+                    {
+                        // NB: this may need revisiting if rename needs to support renaming of files on >1 cluster
+                        throwUnexpectedX("renamePhysicalPartFiles - not supported on files on multiple planes");
+                    }
+                    myBase.set(plane->queryPrefix());
+                }
+            }
+#else
+            myBase.set(queryUnknownBaseDirectory(0, os));
+#endif
+            diroverride = myBase;
+        }
 
         StringBuffer baseDir, newPath;
-        makePhysicalPartName(logicalName.get(), 0, 0, newPath, false, os, diroverride);
+        getLFNDirectoryUsingBaseDir(newPath, logicalName.get(), diroverride);
         if (!getBase(directory, newPath, baseDir))
             baseDir.append(myBase); // getBase returns false, if directory==newPath, so have common base
         getPartMask(newmask,newname,width);
         if (newmask.length()==0)
             return false;
-        makePhysicalPartName(newname, 0, 0, newPath.clear(), false, os, diroverride);
+        getLFNDirectoryUsingBaseDir(newPath.clear(), newname, diroverride);
         if (newPath.length()==0)
             return false;
         if (isPathSepChar(newPath.charAt(newPath.length()-1)))
             newPath.setLength(newPath.length()-1);
-        newPath.remove(0, strlen(myBase));
-        newdir.append(baseDir).append(newPath);
+        newPath.remove(0, myBase.length());
+        newdir.append(baseDir);
+        appendEnsurePathSepChar(newdir, newPath, psc);
         StringBuffer fullname;
         CIArrayOf<CIStringArray> newNames;
         unsigned i;
-        for (i=0;i<width;i++) {
+        for (i=0;i<width;i++)
+        {
             newNames.append(*new CIStringArray);
             CDistributedFilePart &part = parts.item(i);
-            for (unsigned copy=0; copy<part.numCopies(); copy++) {
-                makePhysicalPartName(newname, i+1, width, newPath.clear(), false, os, myBase);
-                newPath.remove(0, strlen(myBase));
+            for (unsigned copy=0; copy<part.numCopies(); copy++)
+            {
+                unsigned cn = copyClusterNum(i, copy, nullptr);
+                unsigned numStripedDevices = queryPartDiskMapping(cn).numStripedDevices;
+                unsigned stripeNum = calcStripeNumber(i, lfnHash, numStripedDevices);
+
+                makePhysicalPartName(newname, i+1, width, newPath.clear(), 0, os, myBase, hasDirPerPart() && (width>1) ? i+1 : 0, stripeNum);
+                newPath.remove(0, myBase.length());
 
                 StringBuffer copyDir(baseDir);
                 adjustClusterDir(i, copy, copyDir);
-                fullname.clear().append(copyDir).append(newPath);
+                fullname.clear().append(copyDir);
+                appendEnsurePathSepChar(fullname, newPath, psc);
                 newNames.item(i).append(fullname);
             }
         }
@@ -4200,7 +5202,7 @@ public:
 
         // first check file doestn't exist for any new part
 
-        CriticalSection crit;
+        CriticalSection crit{SYNC_LOCATION};
         class casyncforbase: public CAsyncFor
         {
         protected:
@@ -4217,15 +5219,15 @@ public:
             bool * donerep;
             IException *except;
 
-            casyncforbase(IDistributedFile *_file,CIArrayOf<CIStringArray> &_newNames,unsigned _width,IMultiException *_mexcept,CriticalSection &_crit,bool *_ignoreprim,bool *_ignorerep)
-                : newNames(_newNames),crit(_crit)
+            casyncforbase(const char * _syncName, IDistributedFile *_file,CIArrayOf<CIStringArray> &_newNames,unsigned _width,IMultiException *_mexcept,CriticalSection &_crit,bool *_ignoreprim,bool *_ignorerep)
+                : CAsyncFor(_syncName), crit(_crit), newNames(_newNames)
             {
                 width = _width;
                 file = _file;
                 ok = true;
                 mexcept = _mexcept;
-                doneprim = (bool *)calloc(sizeof(bool),width);
-                donerep = (bool *)calloc(sizeof(bool),width);
+                doneprim = (bool *)calloc(width, sizeof(bool));
+                donerep = (bool *)calloc(width, sizeof(bool));
                 except = NULL;
                 ignoreprim = _ignoreprim;
                 ignorerep = _ignorerep;
@@ -4301,7 +5303,7 @@ public:
         {
         public:
             casyncfor1(IDistributedFile *_file,CIArrayOf<CIStringArray> &_newNames,unsigned _width,IMultiException *_mexcept,CriticalSection &_crit,bool *_ignoreprim,bool *_ignorerep)
-                : casyncforbase(_file,_newNames,_width,_mexcept,_crit,_ignoreprim,_ignorerep)
+                : casyncforbase(SYNC_LOCATION, _file,_newNames,_width,_mexcept,_crit,_ignoreprim,_ignorerep)
             {
             }
             bool doPart(IDistributedFilePart *part,bool isrep,RemoteFilename &oldrfn,RemoteFilename &newrfn, bool &done)
@@ -4361,7 +5363,7 @@ public:
         {
         public:
             casyncfor2(IDistributedFile *_file,CIArrayOf<CIStringArray> &_newNames,unsigned _width,IMultiException *_mexcept,CriticalSection &_crit,bool *_ignoreprim,bool *_ignorerep)
-                : casyncforbase(_file,_newNames,_width,_mexcept,_crit,_ignoreprim,_ignorerep)
+                : casyncforbase(SYNC_LOCATION, _file,_newNames,_width,_mexcept,_crit,_ignoreprim,_ignorerep)
             {
             }
             bool doPart(IDistributedFilePart *part,bool isrep,RemoteFilename &oldrfn,RemoteFilename &newrfn, bool &done)
@@ -4372,8 +5374,9 @@ public:
                 StringBuffer newfn;
                 newrfn.getRemotePath(newfn);
                 Owned<IFile> f = createIFile(oldrfn);
+                Owned<IFile> destFile = createIFile(newrfn);
                 if (!isrep||f->exists()) { // ignore non-existant replicates
-                    f->move(newfn.str());
+                    f->move(destFile->queryFilename());
                     PROGLOG("Succeeded rename %s to %s",oldfn.str(),newfn.str());
                 }
                 done = true;
@@ -4389,11 +5392,8 @@ public:
             root->setProp("@partmask",newmask.str());
             partmask.set(newmask.str());
             directory.set(newdir.str());
-            StringBuffer mask;
-            for (unsigned i=0;i<width;i++) {
-                mask.appendf("Part[%d]/@name",i+1);
+            for (unsigned i=0;i<width;i++)
                 parts.item(i).clearOverrideName();
-            }
             savePartsAttr(false);
         }
         else {
@@ -4626,17 +5626,8 @@ public:
         {
             CFileAttrLock attrLock;
             if (conn)
-            {
-                if (!attrLock.init(logicalName, DXB_File, RTM_LOCK_WRITE, conn, defaultTimeout, "CDistributedFile::setAccessedTime"))
-                {
-                    // In unlikely event File/Attr doesn't exist, must ensure created, commited and root connection is reloaded.
-                    verifyex(attrLock.init(logicalName, DXB_File, RTM_LOCK_WRITE|RTM_CREATE_QUERY, conn, defaultTimeout, "CDistributedFile::setAccessedTime"));
-                    attrLock.commit();
-                    conn->commit();
-                    conn->reload();
-                    root.setown(conn->getRoot());
-                }
-            }
+                lockFileAttrLock(attrLock);
+
             if (dt.isNull())
                 queryAttributes().removeProp("@accessed");
             else
@@ -4678,7 +5669,150 @@ public:
         else
             return false;
     }
+    virtual void getCost(const char * cluster, cost_type & atRestCost, cost_type & accessCost) override
+    {
+        atRestCost = 0;
+        accessCost = 0;
+        CDateTime dt;
+        getModificationTime(dt);
+        double fileAgeDays = difftime(time(nullptr), dt.getSimple())/(24*60*60);
+        double sizeGB = getDiskSize(true, false) / ((double)1024 * 1024 * 1024);
+        const IPropertyTree *attrs = root->queryPropTree("Attr");
+
+        //This array must still exist when getReadCost() etc. is called, otherwise cluster will have been freed.
+        StringArray clusterNames;
+        if (isEmptyString(cluster))
+        {
+            unsigned countClusters = getClusterNames(clusterNames);
+            for (unsigned i = 0; i < countClusters; i++)
+                atRestCost += calcFileAtRestCost(clusterNames[i], sizeGB, fileAgeDays);
+            if (countClusters)
+                cluster = clusterNames[0];
+        }
+        else
+        {
+            atRestCost = calcFileAtRestCost(cluster, sizeGB, fileAgeDays);
+        }
+        if (attrs)
+            accessCost = ::getReadCost(*attrs, cluster) + ::getWriteCost(*attrs, cluster);
+    }
+
+    virtual bool getNumReads(stat_type &numReads) const override
+    {
+        const IPropertyTree *attrs = root->queryPropTree("Attr");
+        numReads = attrs ? attrs->getPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskReads)) : 0;
+        return numReads > 0;
+    }
+
+    virtual bool getNumWrites(stat_type &numWrites) const override
+    {
+        const IPropertyTree *attrs = root->queryPropTree("Attr");
+        numWrites = attrs ? attrs->getPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskWrites)) : 0;
+        return numWrites > 0;
+    }
+
+    virtual bool getReadCost(cost_type &cost, bool calculateIfMissing=false) const override
+    {
+        IPropertyTree *attrs = root->queryPropTree("Attr");
+        if (attrs)
+        {
+            cost = attrs->getPropInt64(getDFUQResultFieldName(DFUQResultField::readCost), (unsigned __int64)-1);
+            if ((unsigned __int64)-1 != cost)
+                return true;
+            if (calculateIfMissing)
+            {
+                StringBuffer clusterName;
+                getClusterName(0, clusterName);
+                cost = calcLegacyReadCost(*attrs, clusterName.str());
+                return true;
+            }
+        }
+        cost = 0;
+        return false;
+    }
+
+    virtual bool getWriteCost(cost_type &cost, bool calculateIfMissing=false) const override
+    {
+        const IPropertyTree *attrs = root->queryPropTree("Attr");
+        if (attrs)
+        {
+            cost = attrs->getPropInt64(getDFUQResultFieldName(DFUQResultField::writeCost), (unsigned __int64)-1);
+            if ((unsigned __int64)-1 != cost)
+                return true;
+            if (calculateIfMissing)
+            {
+                StringBuffer clusterName;
+                // getClusterName isn't const function, so need to cast this to non-const
+                getClusterName(0, clusterName);
+                cost = calcLegacyWriteCost(*attrs, clusterName.str());
+                return true;
+            }
+        }
+        cost = 0;
+        return false;
+    }
 };
+
+StringBuffer &CDistributedFilePart::getStorageFilePath(StringBuffer & path, unsigned copy)
+{
+    unsigned nc = copyClusterNum(copy, nullptr);
+    IClusterInfo &cluster = parent.clusters.item(nc);
+    const char *planeName = cluster.queryGroupName();
+    if (isEmptyString(planeName))
+    {
+        StringBuffer lname;
+        parent.getLogicalName(lname);
+        throw new CDFS_Exception(DFSERR_EmptyStoragePlane, lname.str());
+    }
+    // Need storage path(prefix) to work out path on storage plane
+    // (After removing prefix, the remaining path is the path on storage plane)
+    Owned<const IStoragePlane> storagePlane = getDataStoragePlane(planeName, false);
+    if (!storagePlane)
+        throw new CDFS_Exception(DFSERR_MissingStoragePlane, planeName);
+
+    path.append(parent.directory);
+    if (parent.hasDirPerPart())
+        addPathSepChar(path).append(partIndex+1); // part subdir 1 based
+    addPathSepChar(path);
+    getPartName(path);
+
+    unsigned prefixLength = strlen(storagePlane->queryPrefix());
+    path.remove(0, prefixLength);
+    return path;
+}
+
+unsigned CDistributedFilePart::getStripeNum(unsigned copy)
+{
+    if (copy >= stripeNumber.size() || stripeNumber[copy]==UINT_MAX)
+    {
+        unsigned nc = copyClusterNum(copy, nullptr);
+        IClusterInfo &cluster = parent.clusters.item(nc);
+        const char *planeName = cluster.queryGroupName();
+        if (isEmptyString(planeName))
+        {
+            StringBuffer lname;
+            parent.getLogicalName(lname);
+            throw new CDFS_Exception(DFSERR_EmptyStoragePlane, lname.str());
+        }
+        Owned<const IStoragePlane> storagePlane = getDataStoragePlane(planeName, false);
+        if (!storagePlane)
+            throw new CDFS_Exception(DFSERR_MissingStoragePlane, planeName);
+        if (copy >= stripeNumber.size())
+            stripeNumber.insert(stripeNumber.end(), copy - stripeNumber.size() + 1 , UINT_MAX); // create empty place holders
+        stripeNumber[copy] = calcStripeNumber(partIndex, parent.lfnHash, storagePlane->numDevices());
+    }
+    return stripeNumber[copy];
+}
+
+IndexReadOptions getIndexReadOptionsForPart(IDistributedFile &file, IDistributedFilePart &keyFile)
+{
+    if (isForeignFilename(file.queryLogicalName()))
+        return getForeignIndexReadOptions();
+
+    StringBuffer planeName;
+    file.getClusterName(keyFile.copyClusterNum(0), planeName);
+    return getIndexReadOptions(planeName);
+}
 
 static unsigned findSubFileOrd(const char *name)
 {
@@ -4719,17 +5853,18 @@ class CDistributedSuperFile: public CDistributedFileBase<IDistributedSuperFile>
         cAddSubFileAction(const char *_parentlname,const char *_subfile,bool _before,const char *_other)
             : parentlname(_parentlname), subfile(_subfile), before(_before), other(_other)
         {
+            tracing.appendf("AddSubFile: %s, to super: %s", _subfile, _parentlname);
         }
         virtual bool prepare()
         {
-            parent.setown(transaction->lookupSuperFile(parentlname));
+            parent.setown(transaction->lookupSuperFile(parentlname, AccessMode::writeLogicalMeta));
             if (!parent)
                 throw MakeStringException(-1,"addSubFile: SuperFile %s cannot be found",parentlname.get());
             if (!subfile.isEmpty())
             {
                 try
                 {
-                    sub.setown(transaction->lookupFile(subfile,SDS_SUB_LOCK_TIMEOUT));
+                    sub.setown(transaction->lookupFile(subfile, AccessMode::writeLogicalMeta, SDS_SUB_LOCK_TIMEOUT));
                     if (!sub)
                         throw MakeStringException(-1,"cAddSubFileAction: sub file %s not found", subfile.str());
                     // Must validate before locking for update below, to check sub is not already in parent (and therefore locked already)
@@ -4794,17 +5929,18 @@ class CDistributedSuperFile: public CDistributedFileBase<IDistributedSuperFile>
         cRemoveSubFileAction(const char *_parentlname,const char *_subfile,bool _remsub=false)
             : parentlname(_parentlname), subfile(_subfile), remsub(_remsub)
         {
+            tracing.appendf("RemoveSubFile: %s, from super: %s", _subfile, _parentlname);
         }
         virtual bool prepare()
         {
-            parent.setown(transaction->lookupSuperFile(parentlname));
+            parent.setown(transaction->lookupSuperFile(parentlname, AccessMode::writeLogicalMeta));
             if (!parent)
                 throw MakeStringException(-1,"removeSubFile: SuperFile %s cannot be found",parentlname.get());
             if (!subfile.isEmpty())
             {
                 try
                 {
-                    sub.setown(transaction->lookupFile(subfile,SDS_SUB_LOCK_TIMEOUT));
+                    sub.setown(transaction->lookupFile(subfile, remsub ? AccessMode::erase : AccessMode::writeLogicalMeta, SDS_SUB_LOCK_TIMEOUT));
                 }
                 catch (ISDSException *e)
                 {
@@ -4885,10 +6021,11 @@ class CDistributedSuperFile: public CDistributedFileBase<IDistributedSuperFile>
         cRemoveOwnedSubFilesAction(IDistributedFileTransaction *_transaction, const char *_parentlname,bool _remsub=false)
             : parentlname(_parentlname), remsub(_remsub)
         {
+            tracing.appendf("RemoveOwnedSubFiles: super: %s", _parentlname);
         }
         virtual bool prepare()
         {
-            parent.setown(transaction->lookupSuperFile(parentlname));
+            parent.setown(transaction->lookupSuperFile(parentlname, AccessMode::writeLogicalMeta));
             if (!parent)
                 throw MakeStringException(-1,"removeOwnedSubFiles: SuperFile %s cannot be found", parentlname.get());
             // Try to lock all files
@@ -4967,13 +6104,14 @@ class CDistributedSuperFile: public CDistributedFileBase<IDistributedSuperFile>
         cSwapFileAction(const char *_super1Name, const char *_super2Name)
             : super1Name(_super1Name), super2Name(_super2Name)
         {
+            tracing.appendf("SwapFile: super1: %s, super2: %s", _super1Name, _super2Name);
         }
         virtual bool prepare()
         {
-            super1.setown(transaction->lookupSuperFile(super1Name));
+            super1.setown(transaction->lookupSuperFile(super1Name, AccessMode::writeLogicalMeta));
             if (!super1)
                 throw MakeStringException(-1,"swapSuperFile: SuperFile %s cannot be found", super1Name.get());
-            super2.setown(transaction->lookupSuperFile(super2Name));
+            super2.setown(transaction->lookupSuperFile(super2Name, AccessMode::writeLogicalMeta));
             if (!super2)
             {
                 super1.clear();
@@ -5056,6 +6194,7 @@ class CDistributedSuperFile: public CDistributedFileBase<IDistributedSuperFile>
 protected:
     int interleaved; // 0 not interleaved, 1 interleaved old, 2 interleaved new
     IArrayOf<IDistributedFile> subfiles;
+    AccessMode accessMode = AccessMode::none;
 
     void clearSuperOwners(unsigned timeoutMs, ICodeContext *ctx)
     {
@@ -5073,6 +6212,8 @@ protected:
             {
                 CDfsLogicalFileName subfn;
                 subfn.set(name);
+                if (subfn.isForeign() || subfn.isExternal())
+                    continue; // can't be owned by a super in this environment, no locking
                 CFileLock fconnlockSub;
                 // JCSMORE - this is really not right, but consistent with previous version
                 // MORE: Use CDistributedSuperFile::linkSuperOwner(false) - ie. unlink
@@ -5143,9 +6284,9 @@ protected:
                 IPropertyTree &sub = *(orderedSubFiles[f]);
                 sub.getProp("@name",subname.clear());
                 Owned<IDistributedFile> subfile;
-                subfile.setown(transaction?transaction->lookupFile(subname.str(),timeout):parent->lookup(subname.str(), udesc, false, false, false, transaction, defaultPrivilegedUser, timeout));
+                subfile.setown(transaction?transaction->lookupFile(subname.str(), accessMode, timeout):parent->lookup(subname.str(), udesc, accessMode, false, false, transaction, defaultPrivilegedUser, timeout));
                 if (!subfile.get())
-                    subfile.setown(transaction?transaction->lookupSuperFile(subname.str(),timeout):parent->lookupSuperFile(subname.str(),udesc,transaction,timeout));
+                    subfile.setown(transaction?transaction->lookupSuperFile(subname.str(), accessMode, timeout):parent->lookupSuperFile(subname.str(), udesc, accessMode, transaction, timeout));
                 // Some files are ok not to exist
                 if (!subfile.get())
                 {
@@ -5160,7 +6301,7 @@ protected:
                         subfile.setown(queryDistributedFileDirectory().createNewSuperFile(dummySuperRoot, subname));
                         if (transaction)
                         {
-                            IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
+                            IDistributedFileTransactionExt *_transaction = queryTransactionExt(transaction);
                             _transaction->ensureFile(subfile);
                         }
                     }
@@ -5370,6 +6511,24 @@ protected:
             target.setProp(prop, value);
     }
 
+    IDistributedFilePart *unprotectedQueryPart(unsigned idx)
+    {
+        if (0 == subfiles.ordinality())
+            return nullptr;
+        else if ((1 == subfiles.ordinality()))
+        {
+            if (idx>=subfiles.item(0).numParts())
+                return nullptr;
+            else
+                return &subfiles.item(0).queryPart(idx);
+        }
+        if (partscache.ordinality()==0)
+            loadParts(partscache,NULL);
+        if (idx>=partscache.ordinality())
+            return nullptr;
+        else
+            return &partscache.item(idx);
+    }
 public:
 
     virtual void checkFormatAttr(IDistributedFile *sub, const char* exprefix="") override
@@ -5394,10 +6553,11 @@ public:
 
     IMPLEMENT_IINTERFACE_O;
 
-    void commonInit(CDistributedFileDirectory *_parent, IPropertyTree *_root)
+    void commonInit(CDistributedFileDirectory *_parent, IPropertyTree *_root, AccessMode _accessMode)
     {
         parent = _parent;
         root.set(_root);
+        accessMode = _accessMode;
         const char *val = root->queryProp("@interleaved");
         if (val&&isdigit(*val))
             interleaved = atoi(val);
@@ -5405,42 +6565,47 @@ public:
             interleaved = strToBool(val)?1:0;
     }
 
-    void init(CDistributedFileDirectory *_parent, IPropertyTree *_root, const CDfsLogicalFileName &_name, IUserDescriptor* user, IDistributedFileTransaction *transaction, unsigned timeout=INFINITE)
+    void init(CDistributedFileDirectory *_parent, IPropertyTree *_root, const CDfsLogicalFileName &_name, AccessMode accessMode, IUserDescriptor* user, IDistributedFileTransaction *transaction, unsigned timeout=INFINITE)
     {
         assertex(_name.isSet());
         setUserDescriptor(udesc,user);
         logicalName.set(_name);
-        commonInit(_parent, _root);
+        commonInit(_parent, _root, accessMode);
         loadSubFiles(transaction,timeout);
     }
 
-    CDistributedSuperFile(CDistributedFileDirectory *_parent, IPropertyTree *_root,const CDfsLogicalFileName &_name,IUserDescriptor* user)
+    CDistributedSuperFile(CDistributedFileDirectory *_parent, IPropertyTree *_root, const CDfsLogicalFileName &_name, AccessMode accessMode, IUserDescriptor* user)
     {
-        init(_parent,_root,_name,user,NULL);
+        init(_parent, _root, _name, accessMode, user, NULL);
     }
 
-    CDistributedSuperFile(CDistributedFileDirectory *_parent, IRemoteConnection *_conn,const CDfsLogicalFileName &_name,IUserDescriptor* user, IDistributedFileTransaction *transaction,unsigned timeout)
+    CDistributedSuperFile(CDistributedFileDirectory *_parent, IRemoteConnection *_conn, const CDfsLogicalFileName &_name, AccessMode accessMode, IUserDescriptor* user, IDistributedFileTransaction *transaction, unsigned timeout)
     {
         conn.setown(_conn);
-        init(_parent,conn->queryRoot(),_name,user,transaction,timeout);
+        init(_parent, conn->queryRoot(), _name, accessMode, user,transaction,timeout);
     }
 
-    CDistributedSuperFile(CDistributedFileDirectory *_parent, CDfsLogicalFileName &_name, IUserDescriptor* user, IDistributedFileTransaction *transaction)
+    CDistributedSuperFile(CDistributedFileDirectory *_parent, CDfsLogicalFileName &_name, AccessMode accessMode, IUserDescriptor* user, IDistributedFileTransaction *transaction)
     {
         // temp super file
         assertex(_name.isMulti());
         if (!_name.isExpanded())
             _name.expand(user);//expand wildcards
         Owned<IPropertyTree> tree = _name.createSuperTree();
-        init(_parent,tree,_name,user,transaction);
+        init(_parent, tree, _name, accessMode, user, transaction);
         updateFileAttrs();
     }
 
-    CDistributedSuperFile(CDistributedFileDirectory *_parent, IPropertyTree *_root, const char *optionalName)
+    CDistributedSuperFile(CDistributedFileDirectory *_parent, IPropertyTree *_root, AccessMode accessMode, const char *optionalName, IArrayOf<IDistributedFile> *subFiles)
     {
-        commonInit(_parent, _root);
+        commonInit(_parent, _root, accessMode);
         if (optionalName)
             logicalName.set(optionalName);
+        if (subFiles)
+        {
+            ForEachItemIn(i,*subFiles)
+                subfiles.append(OLINK(subFiles->item(i)));
+        }
     }
 
     ~CDistributedSuperFile()
@@ -5449,7 +6614,7 @@ public:
         subfiles.kill();
     }
 
-    virtual StringBuffer &getClusterName(unsigned clusternum,StringBuffer &name) override
+    virtual StringBuffer &getClusterName(unsigned clusternum,StringBuffer &name) const override
     {
         // returns the cluster name if all the same
         CriticalBlock block (sect);
@@ -5474,18 +6639,56 @@ public:
     virtual IFileDescriptor *getFileDescriptor(const char *clustername) override
     {
         CriticalBlock block (sect);
-        if (subfiles.ordinality()==1)
-            return subfiles.item(0).getFileDescriptor(clustername);
         // superfiles assume consistant replication & compression
         UnsignedArray subcounts;
         bool mixedwidth = false;
         unsigned width = 0;
         bool first = true;
+        bool hasLogicalFileModified = false;
+        CDateTime mostRecentLogicalFileModified;
         Owned<IPropertyTree> at = getEmptyAttr();
         Owned<IDistributedFileIterator> fiter = getSubFileIterator(true);
+        // Set groupName from the first detected plane name so lookups based on
+        // getClusterLabel/getGroupName resolve plane settings correctly.
+        // Without this, containerized files may end up with endpoint-derived
+        // labels (for example "localhost"); mismatches warn but do not fail.
+        bool firstClusterName = true;
+        bool warnedClusterNameMismatch = false;
+        StringAttr singleClusterName; // if not host based (e.g. azure api based), only 1 plane per super file is supported
         ForEach(*fiter)
         {
             IDistributedFile &file = fiter->query();
+            CDateTime logicalFileModified;
+            if (file.getModificationTime(logicalFileModified) && logicalFileModified.getSimple() &&
+                (!hasLogicalFileModified || logicalFileModified.compare(mostRecentLogicalFileModified) > 0))
+            {
+                mostRecentLogicalFileModified.set(logicalFileModified);
+                hasLogicalFileModified = true;
+            }
+            if (!logicalName.isForeign())
+            {
+                for (unsigned c = 0; c < file.numClusters(); c++)
+                {
+                    StringBuffer clusterName;
+                    file.getClusterGroupName(c, clusterName);
+                    if (firstClusterName)
+                    {
+                        singleClusterName.set(clusterName);
+                        firstClusterName = false;
+                    }
+                    else
+                    {
+                        if (!streq(singleClusterName.str(), clusterName.str()))
+                        {
+                            if (!warnedClusterNameMismatch)
+                            {
+                                WARNLOG("getFileDescriptor: SuperFile %s has subfiles with different plane names (%s and %s); continuing and defaulting to first plane name", logicalName.get(), singleClusterName.str(), clusterName.str());
+                                warnedClusterNameMismatch = true;
+                            }
+                        }
+                    }
+                }
+            }
             if (first)
             {
                 first = false;
@@ -5509,6 +6712,13 @@ public:
                 const char *ecl = file.queryAttributes().queryProp("ECL");
                 if (!isEmptyString(ecl))
                     addPropIfCommon(*at, "ECL", ecl);
+                IPropertyTree *_remoteStoragePlane = file.queryAttributes().queryPropTree("_remoteStoragePlane");
+                if (_remoteStoragePlane)
+                {
+                    // NB: CDistributedSuperFile sub-files in different environments are not permitted
+                    if (!at->hasProp("_remoteStoragePlane"))
+                       at->setPropTree("_remoteStoragePlane", LINK(_remoteStoragePlane));
+                }
             }
             unsigned np = file.numParts();
             if (0 == width)
@@ -5518,8 +6728,14 @@ public:
             subcounts.append(np);
         }
 
+        if (hasLogicalFileModified)
+        {
+            StringBuffer modifiedStr;
+            at->setProp("@modified", mostRecentLogicalFileModified.getString(modifiedStr).str());
+        }
+
         // need common attributes
-        Owned<ISuperFileDescriptor> fdesc=createSuperFileDescriptor(at.getClear());
+        Owned<ISuperFileDescriptor> fdesc=createSuperFileDescriptor(at.getClear(), logicalName.isForeign() ? FileDescriptorFlags::foreign : FileDescriptorFlags::none);
         if (interleaved&&(interleaved!=2))
             IWARNLOG("getFileDescriptor: Unsupported interleave value (1)");
         fdesc->setSubMapping(subcounts,interleaved!=0);
@@ -5553,12 +6769,15 @@ public:
             fdesc->setPart(n,part.getFilename(rfn,copy),&part.queryAttributes());
             n++;
         }
+        fdesc->queryProperties().setPropInt("@accessMode", static_cast<int>(accessMode));
         ClusterPartDiskMapSpec mspec;
         if (subfiles.ordinality()) {
             mspec = subfiles.item(0).queryPartDiskMapping(0);
         }
         mspec.interleave = numSubFiles(true);
         fdesc->endCluster(mspec);
+        if (singleClusterName.length() && fdesc->numClusters())
+            fdesc->setClusterGroupName(0, singleClusterName);
         if (mixedwidth) { // bleah - have to add replicate node numbers
             Owned<IGroup> group = fdesc->getGroup();
             unsigned gw = group->ordinality();
@@ -5597,19 +6816,16 @@ public:
     virtual IDistributedFilePart &queryPart(unsigned idx) override
     {
         CriticalBlock block(sect);
-        if (subfiles.ordinality()==1)
-            return subfiles.item(0).queryPart(idx);
-        if (partscache.ordinality()==0)
-            loadParts(partscache,NULL);
-        if (idx>=partscache.ordinality())
-            return *(IDistributedFilePart *)NULL;
-        return partscache.item(idx);
+        IDistributedFilePart *part = unprotectedQueryPart(idx);
+        if (nullptr == part)
+            throwUnexpectedX("CDistributedSuperFile::queryPart out of range");
+        return *part;
     }
 
     virtual IDistributedFilePart* getPart(unsigned idx) override
     {
-        IDistributedFilePart* ret = &queryPart(idx);
-        return LINK(ret);
+        CriticalBlock block(sect);
+        return LINK(unprotectedQueryPart(idx));
     }
 
     virtual IDistributedFilePartIterator *getIterator(IDFPartFilter *filter=NULL) override
@@ -5622,7 +6838,7 @@ public:
         return ret;
     }
 
-    virtual void rename(const char *_logicalname,IUserDescriptor *user) override
+    virtual void rename(const char *_logicalname,IUserDescriptor *user, const DFSAuditContext &auditCtx = DFSAuditContext{}) override
     {
         StringBuffer prevname;
         Owned<IFileRelationshipIterator> reliter;
@@ -5637,12 +6853,20 @@ public:
                 EXCLOG(e,"CDistributedFileDirectory::rename");
                 e->Release();
             }
-            detach();
+            detach(INFINITE, NULL, auditCtx.nested());
         }
-        attach(_logicalname,user);
+        attach(_logicalname, user, auditCtx.nested());
         if (reliter.get()) {
             // add back any relationships with new name
             parent->renameFileRelationships(prevname.str(),_logicalname,reliter,user);
+        }
+
+        if (!auditCtx.isNested()) {
+            DFSAuditContext ctx = auditCtx;
+            ctx.setValue("lfn", logicalName.get());
+            if (prevname.length())
+                ctx.setValue("lfn2", prevname.str());
+            ctx.logFileAccess("RENAME");
         }
     }
 
@@ -5684,25 +6908,34 @@ public:
         return ret;
     }
 
-    virtual void attach(const char *_logicalname,IUserDescriptor *user) override
+    virtual void attach(const char *_logicalname, IUserDescriptor *user, const DFSAuditContext &auditCtx) override
     {
         assertex(!conn.get()); // already attached
         CriticalBlock block (sect);
         StringBuffer tail;
         StringBuffer lfn;
         logicalName.set(_logicalname);
-        checkLogicalName(logicalName,user,true,true,false,"attach");
-        parent->addEntry(logicalName,root.getClear(),true,false);
-        conn.clear();
-        CFileLock fcl;
-        verifyex(fcl.init(logicalName, DXB_SuperFile, RTM_LOCK_READ, defaultTimeout, "CDistributedSuperFile::attach"));
-        conn.setown(fcl.detach());
-        assertex(conn.get()); // must have been attached
-        root.setown(conn->getRoot());
-        loadSubFiles(NULL, 0, true);
+        try
+        {
+            checkLogicalName(logicalName,user,true,true,false,"attach");
+            parent->addEntry(logicalName,root.getClear(),true,false);
+            conn.clear();
+            CFileLock fcl;
+            verifyex(fcl.init(logicalName, DXB_SuperFile, RTM_LOCK_READ, defaultTimeout, "CDistributedSuperFile::attach"));
+            conn.setown(fcl.detach());
+            assertex(conn.get()); // must have been attached
+            root.setown(conn->getRoot());
+            loadSubFiles(NULL, 0, true);
+        }
+        catch (IException *e)
+        {
+            EXCLOG(e, "CDistributedSuperFile::attach");
+            logicalName.clear();
+            throw;
+        }
     }
 
-    virtual void detach(unsigned timeoutMs=INFINITE, ICodeContext *ctx=NULL) override
+    virtual void detach(unsigned timeoutMs=INFINITE, ICodeContext *ctx=NULL, const DFSAuditContext &auditCtx = DFSAuditContext{}) override
     {
         assertex(conn.get()); // must be attached
         CriticalBlock block(sect);
@@ -5845,6 +7078,74 @@ public:
         return true;
     }
 
+    virtual bool getNumReads(stat_type &numReads) const override
+    {
+        const IPropertyTree *attrs = root->queryPropTree("Attr");
+        numReads = attrs->getPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskReads), (stat_type) -1);
+        if (numReads == (stat_type) -1)
+        {
+            numReads = 0;
+            ForEachItemIn(i,subfiles)
+            {
+                stat_type c;
+                if (subfiles.item(i).getNumReads(c))
+                    numReads += c;
+            }
+        }
+        return numReads > 0;
+    }
+
+    virtual bool getNumWrites(stat_type &numWrites) const override
+    {
+        const IPropertyTree *attrs = root->queryPropTree("Attr");
+        numWrites = attrs->getPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskWrites), (stat_type) -1);
+        if (numWrites == (stat_type) -1)
+        {
+            numWrites = 0;
+            ForEachItemIn(i,subfiles)
+            {
+                stat_type c;
+                if (subfiles.item(i).getNumWrites(c))
+                    numWrites += c;
+            }
+        }
+        return numWrites > 0;
+    }
+
+    virtual bool getReadCost(cost_type &cost, bool calculateIfMissing=false) const override
+    {
+        const IPropertyTree *attrs = root->queryPropTree("Attr");
+        cost = attrs->getPropInt64(getDFUQResultFieldName(DFUQResultField::readCost), (cost_type) -1);
+        if (cost == (stat_type) -1)
+        {
+            cost = 0;
+            ForEachItemIn(i,subfiles)
+            {
+                cost_type c;
+                if (subfiles.item(i).getReadCost(c,calculateIfMissing))
+                    cost += c;
+            }
+        }
+        return cost > 0;
+    }
+
+    virtual bool getWriteCost(cost_type &cost, bool calculateIfMissing=false) const override
+    {
+        const IPropertyTree *attrs = root->queryPropTree("Attr");
+        cost = attrs->getPropInt64(getDFUQResultFieldName(DFUQResultField::writeCost), (cost_type) -1);
+        if (cost == (stat_type) -1)
+        {
+            cost = 0;
+            ForEachItemIn(i,subfiles)
+            {
+                cost_type c;
+                if (subfiles.item(i).getWriteCost(c,calculateIfMissing))
+                    cost += c;
+            }
+        }
+        return cost > 0;
+    }
+
     virtual IDistributedSuperFile *querySuperFile() override
     {
         return this;
@@ -5853,22 +7154,27 @@ public:
     virtual IDistributedFile &querySubFile(unsigned idx,bool sub) override
     {
         CriticalBlock block (sect);
-        if (sub) {
-            ForEachItemIn(i,subfiles) {
+        if (sub)
+        {
+            unsigned subfilen = idx;
+            ForEachItemIn(i,subfiles)
+            {
                 IDistributedFile &f=subfiles.item(i);
                 IDistributedSuperFile *super = f.querySuperFile();
-                if (super) {
+                if (super)
+                {
                     unsigned ns = super->numSubFiles(true);
-                    if (ns>idx)
-                        return super->querySubFile(idx,true);
-                    idx -= ns;
+                    if (ns>subfilen)
+                        return super->querySubFile(subfilen,true);
+                    subfilen -= ns;
                 }
-                else if (idx--==0)
+                else if (subfilen--==0)
                     return f;
             }
-            // fall through to error
+            throw makeStringExceptionV(-1,"CDistributedSuperFile::querySubFile(%u) for superfile %s - subfile doesn't exist ", idx, logicalName.get());
         }
-        return subfiles.item(idx);
+        else
+            return subfiles.item(idx);
     }
 
     virtual IDistributedFile *querySubFileNamed(const char *name, bool sub) override
@@ -6028,6 +7334,19 @@ public:
         return new cSubFileIterator(subfiles,supersub);
     }
 
+    virtual void lockFileAttrLock(CFileAttrLock & attrLock) override
+    {
+        if (!attrLock.init(logicalName, DXB_SuperFile, RTM_LOCK_WRITE, conn, defaultTimeout, "CDistributedFile::lockFileAttrLock"))
+        {
+            // In unlikely event File/Attr doesn't exist, must ensure created, commited and root connection is reloaded.
+            verifyex(attrLock.init(logicalName, DXB_SuperFile, RTM_LOCK_WRITE|RTM_CREATE_QUERY, conn, defaultTimeout, "CDistributedFile::lockFileAttrLock"));
+            attrLock.commit();
+            conn->commit();
+            conn->reload();
+            root.setown(conn->getRoot());
+        }
+    }
+
     void updateFileAttrs()
     {
         if (subfiles.ordinality()==0) {
@@ -6042,6 +7361,7 @@ public:
         IPropertyTree &attrs = queryAttributes();
         attrs.removeProp("@size");
         attrs.removeProp("@compressedSize");
+        attrs.removeProp("@uncompressedSize");
         attrs.removeProp("@checkSum");
         attrs.removeProp("@recordCount");   // recordCount not currently supported by superfiles
         attrs.removeProp("@formatCrc");     // formatCrc set if all consistant
@@ -6052,6 +7372,11 @@ public:
         attrs.removeProp("@minSkew");
         attrs.removeProp("@maxSkewPart");
         attrs.removeProp("@minSkewPart");
+        attrs.removeProp(getDFUQResultFieldName(DFUQResultField::numDiskReads));
+        attrs.removeProp(getDFUQResultFieldName(DFUQResultField::numDiskWrites));
+        attrs.removeProp(getDFUQResultFieldName(DFUQResultField::readCost));
+        attrs.removeProp(getDFUQResultFieldName(DFUQResultField::writeCost));
+        attrs.removeProp("@lfnHash");
 
         __int64 fs = getFileSize(false,false);
         if (fs!=-1)
@@ -6079,6 +7404,16 @@ public:
             attrs.setPropBin("_record_layout", mb.length(), mb.bufferBase());
         if (getRecordLayout(mb, "_rtlType"))
             attrs.setPropBin("_rtlType", mb.length(), mb.bufferBase());
+        stat_type numReads, numWrites;
+        getNumReads(numReads);
+        attrs.setPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskReads), numReads);
+        getNumWrites(numWrites);
+        attrs.setPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskWrites), numWrites);
+        cost_type readCost, writeCost;
+        getReadCost(readCost, true);
+        attrs.setPropInt64(getDFUQResultFieldName(DFUQResultField::readCost), readCost);
+        getWriteCost(writeCost, true);
+        attrs.setPropInt64(getDFUQResultFieldName(DFUQResultField::writeCost), writeCost);
         const char *kind = nullptr;
         Owned<IDistributedFileIterator> subIter = getSubFileIterator(true);
         ForEach(*subIter)
@@ -6103,8 +7438,8 @@ public:
         StringBuffer pname;
         ForEach(*iter) {
             iter->query().getProp("@name",pname.clear());
-            Owned<IDistributedSuperFile> psfile = transaction?transaction->lookupSuperFile(pname.str()):
-                queryDistributedFileDirectory().lookupSuperFile(pname.str(),udesc,NULL);
+            Owned<IDistributedSuperFile> psfile = transaction?transaction->lookupSuperFile(pname.str(), AccessMode::writeLogicalMeta):
+                queryDistributedFileDirectory().lookupSuperFile(pname.str(), udesc, AccessMode::writeLogicalMeta, NULL);
             CDistributedSuperFile *file = QUERYINTERFACE(psfile.get(),CDistributedSuperFile);
             if (file) {
                 {
@@ -6256,22 +7591,22 @@ private:
                 subnames2.append(file->querySubFile(i, false).queryLogicalName());
         // Delete all files
         ForEachItemIn(d1,subnames1) {
-            Owned<IDistributedFile> sub = transaction->lookupFile(subnames1.item(d1));
+            Owned<IDistributedFile> sub = transaction->lookupFile(subnames1.item(d1), AccessMode::writeLogicalMeta);
             if (!doRemoveSubFile(sub->queryLogicalName(), transaction))
                 return false;
         }
         ForEachItemIn(d2,subnames2) {
-            Owned<IDistributedFile> sub = transaction->lookupFile(subnames2.item(d2));
+            Owned<IDistributedFile> sub = transaction->lookupFile(subnames2.item(d2), AccessMode::writeLogicalMeta);
             if (!file->doRemoveSubFile(sub->queryLogicalName(), transaction))
                 return false;
         }
         // Add files swapped
         ForEachItemIn(a1,subnames1) {
-            Owned<IDistributedFile> sub = transaction->lookupFile(subnames1.item(a1));
+            Owned<IDistributedFile> sub = transaction->lookupFile(subnames1.item(a1), AccessMode::writeLogicalMeta);
             file->doAddSubFile(LINK(sub), false, NULL, transaction);
         }
         ForEachItemIn(a2,subnames2) {
-            Owned<IDistributedFile> sub = transaction->lookupFile(subnames2.item(a2));
+            Owned<IDistributedFile> sub = transaction->lookupFile(subnames2.item(a2), AccessMode::writeLogicalMeta);
             doAddSubFile(LINK(sub), false, NULL, transaction);
         }
         return true;
@@ -6295,8 +7630,7 @@ public:
         Linked<IDistributedFileTransactionExt> localtrans;
         if (transaction)
         {
-            IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
-            localtrans.set(_transaction);
+            localtrans.set(queryTransactionExt(transaction));
         }
         else
             localtrans.setown(new CDistributedFileTransaction(udesc, this));
@@ -6306,7 +7640,7 @@ public:
         {
             localtrans->descend();
             StringArray subs;
-            Owned<IDistributedSuperFile> sfile = localtrans->lookupSuperFile(subfile);
+            Owned<IDistributedSuperFile> sfile = localtrans->lookupSuperFile(subfile, AccessMode::writeLogicalMeta);
             if (sfile)
             {
                 Owned<IDistributedFileIterator> iter = sfile->getSubFileIterator();
@@ -6342,8 +7676,7 @@ public:
         Linked<IDistributedFileTransactionExt> localtrans;
         if (transaction)
         {
-            IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
-            localtrans.set(_transaction);
+            localtrans.set(queryTransactionExt(transaction));
         }
         else
             localtrans.setown(new CDistributedFileTransaction(udesc, this));
@@ -6399,8 +7732,7 @@ public:
         Linked<IDistributedFileTransactionExt> localtrans;
         if (transaction)
         {
-            IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
-            localtrans.set(_transaction);
+            localtrans.set(queryTransactionExt(transaction));
         }
         else
             localtrans.setown(new CDistributedFileTransaction(udesc, this));
@@ -6429,8 +7761,7 @@ public:
         Linked<IDistributedFileTransactionExt> localtrans;
         if (transaction)
         {
-            IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
-            localtrans.set(_transaction);
+            localtrans.set(queryTransactionExt(transaction));
         }
         else
             localtrans.setown(new CDistributedFileTransaction(udesc, this));
@@ -6450,17 +7781,27 @@ public:
 
     void fillClustersCache()
     {
-        if (clusterscache.ordinality()==0) {
-            StringBuffer name;
-            ForEachItemIn(i,subfiles) {
+        if (clusterscache.ordinality()==0)
+        {
+            ForEachItemIn(i,subfiles)
+            {
                 StringArray clusters;
                 IDistributedFile &f=subfiles.item(i);
+                Owned<IFileDescriptor> fdesc = f.getFileDescriptor();
+                StringArray clusterNames;
+                f.getClusterNames(clusterNames);
                 unsigned nc = f.numClusters();
-                for(unsigned j=0;j<nc;j++) {
-                    f.getClusterName(j,name.clear());
-                    if (clusterscache.find(name.str())==NotFound) {
-                        IClusterInfo &cluster = *createClusterInfo(name.str(),f.queryClusterGroup(j),f.queryPartDiskMapping(j),&queryNamedGroupStore());
-                        clusterscache.append(cluster);
+                for(unsigned j=0;j<nc;j++)
+                {
+                    const char *name = clusterNames.item(j);
+                    if (clusterscache.find(name)==NotFound)
+                    {
+                        IClusterInfo *cluster;
+                        if (f.querySuperFile()) // because super descriptor has a combined single cluster
+                            cluster = createClusterInfo(name, f.queryClusterGroup(j), f.queryPartDiskMapping(j));
+                        else
+                            cluster = LINK(fdesc->queryClusterNum(j));
+                        clusterscache.append(*cluster);
                     }
                 }
             }
@@ -6621,6 +7962,19 @@ public:
     {
         return false;
     }
+
+    virtual void getCost(const char * cluster, cost_type & atRestCost, cost_type & accessCost) override
+    {
+        CriticalBlock block (sect);
+        ForEachItemIn(i,subfiles)
+        {
+            cost_type tmpAtRestcost, tmpAccessCost;
+            IDistributedFile &f = subfiles.item(i);
+            f.getCost(cluster, tmpAtRestcost, tmpAccessCost);
+            atRestCost += tmpAtRestcost;
+            accessCost += tmpAccessCost;
+        }
+    }
 };
 
 // --------------------------------------------------------
@@ -6687,9 +8041,15 @@ offset_t CDistributedFilePart::getSize(bool checkCompressed)
             Owned<IFile> partfile = createIFile(getFilename(rfn,copy));
             if (checkCompressed && compressed)
             {
-                Owned<ICompressedFileIO> compressedIO = createCompressedFileReader(partfile);
-                if (compressedIO)
-                    ret = compressedIO->size();
+                Owned<IFileIO> partFileIO = partfile->open(IFOread);
+                if (partFileIO)
+                {
+                    Owned<IFileIO> compressedIO = createCompressedFileReader(partFileIO, nullptr, useDefaultIoBufferSize);
+                    if (compressedIO)
+                        ret = compressedIO->size();
+                    else
+                        throw new CDFS_Exception(DFSERR_PhysicalCompressedPartInvalid, partfile->queryFilename());
+                }
             }
             else
                 ret = partfile->size();
@@ -6778,7 +8138,7 @@ StringBuffer &CDistributedFilePart::getPartDirectory(StringBuffer &ret,unsigned 
         if (odir.length()) {
             if (isAbsolutePath(pn))
                 dir.append(odir);
-            else if (defdir&&*defdir)
+            else if (!isEmptyString(defdir))
                 addPathSepChar(dir.append(defdir)).append(odir);
         }
         else
@@ -6786,8 +8146,48 @@ StringBuffer &CDistributedFilePart::getPartDirectory(StringBuffer &ret,unsigned 
     }
     if (dir.length()==0)
         IERRLOG("IDistributedFilePart::getPartDirectory unable to determine part directory");
-    else {
+    else
+    {
         parent.adjustClusterDir(partIndex,copy,dir);
+        unsigned cn = copyClusterNum(copy, nullptr);
+        IClusterInfo &cluster = parent.clusters.item(cn);
+        Owned<const IStoragePlane> plane;
+
+        // this is for the remote useDafilesrv case,
+        // where the remote storage plane may be needed to remap/stripe, see below.
+        // NB: striping only supported in containerized environments.
+        IPropertyTree *remoteStoragePlane = parent.queryAttributes().queryPropTree("_remoteStoragePlane");
+        if (remoteStoragePlane) // implies from containerized environment
+            plane.setown(createStoragePlane(remoteStoragePlane));
+        else // local environment
+        {
+            const char *planeName = cluster.queryGroupName();
+            if (!isEmptyString(planeName))
+                plane.setown(getDataStoragePlane(planeName, false));
+        }
+        if (plane)
+        {
+            StringBuffer planePrefix(plane->queryPrefix());
+            Owned<IStoragePlaneAlias> alias = plane->getAliasMatch(parent.accessMode);
+            if (alias)
+            {
+                StringBuffer tmp;
+                StringBuffer newPlanePrefix(alias->queryPrefix());
+                if (setReplicateDir(dir, tmp, false, planePrefix, newPlanePrefix))
+                {
+                    planePrefix.swapWith(newPlanePrefix);
+                    dir.swapWith(tmp);
+                }
+            }
+
+            StringBuffer stripeDir;
+            unsigned numStripedDevices = parent.queryPartDiskMapping(cn).numStripedDevices;
+            addStripeDirectory(stripeDir, dir, planePrefix, partIndex, parent.lfnHash, numStripedDevices);
+            if (!stripeDir.isEmpty())
+                dir.swapWith(stripeDir);
+        }
+        if (parent.hasDirPerPart())
+            addPathSepChar(dir).append(partIndex+1); // part subdir 1 based
         ret.append(dir);
     }
     return ret;
@@ -6813,15 +8213,18 @@ bool CDistributedFilePart::isHost(unsigned copy)
     return (queryNode(copy)->isHost());
 }
 
-
+//This is only ever used for an error condition - so no problem sharing with all instances
+static CriticalSection emptyAttrCritSec{SYNC_LOCATION};
 IPropertyTree &CDistributedFilePart::queryAttributes()
 {
-    CriticalBlock block (sect);     // avoid nested blocks
-    if (attr)
-        return *attr;
+    IPropertyTree * ret = attr.query();
+    if (ret)
+        return *ret;
+
     DBGLOG("CDistributedFilePart::queryAttributes missing part attributes");
+    CriticalBlock block (emptyAttrCritSec);     // avoid nested blocks
     attr.setown(getEmptyAttr());
-    return *attr;
+    return *attr.query();
 }
 
 RemoteFilename &CDistributedFilePart::getFilename(RemoteFilename &ret,unsigned copy)
@@ -6895,11 +8298,11 @@ offset_t CDistributedFilePart::getDiskSize(bool allowphysical,bool forcephysical
     if (!::isCompressed(parent.queryAttributes()))
         return getFileSize(allowphysical, forcephysical);
 
-    if (forcephysical && allowphysical)
-        return getSize(false); // i.e. only if force, because all compressed should have @compressedSize attribute
-
     // NB: compressSize is disk size
-    return queryAttributes().getPropInt64("@compressedSize", -1);
+    offset_t ret = (offset_t)((forcephysical && allowphysical) ? -1 : queryAttributes().getPropInt64("@compressedSize", -1));
+    if (allowphysical && ret == -1)
+        ret = getSize(false);
+    return ret;
 }
 
 bool CDistributedFilePart::getModifiedTime(bool allowphysical,bool forcephysical, CDateTime &dt)
@@ -6958,8 +8361,20 @@ class CNamedGroupIterator: implements INamedGroupIterator, public CInterface
 public:
     IMPLEMENT_IINTERFACE;
     CNamedGroupIterator(IRemoteConnection *_conn,IGroup *_matchgroup=NULL,bool _exactmatch=false)
-        : conn(_conn), matchgroup(_matchgroup)
+        : conn(_conn)
     {
+        if (_matchgroup)
+        {
+            // the matchgroup may contain ports, but they are never part of published groups and are not to be used for matching
+            SocketEndpointArray epa;
+            for (unsigned i=0; i<_matchgroup->ordinality(); i++)
+            {
+                SocketEndpoint ep = _matchgroup->queryNode(i).endpoint();
+                ep.port = 0;
+                epa.append(ep);
+            }
+            matchgroup.setown(createIGroup(epa));
+        }
         exactmatch = _exactmatch;
         pe.setown(conn->queryRoot()->getElements("Group"));
     }
@@ -7014,6 +8429,8 @@ GroupType translateGroupType(const char *groupType)
         return grp_roxie;
     else if (strieq(groupType, "hthor"))
         return grp_hthor;
+    else if (strieq(groupType, "dropzone"))
+        return grp_dropzone;
     else
         return grp_unknown;
 }
@@ -7034,7 +8451,7 @@ public:
     }
 
     CNamedGroupCacheEntry(IException *_exception, const char *_name)
-    : exception(_exception), name(_name), groupType(grp_unknown)
+    : name(_name), groupType(grp_unknown), exception(_exception)
     {
         cachedtime = msTick();
     }
@@ -7052,13 +8469,18 @@ protected:
 
 static unsigned loadGroup(const IPropertyTree *groupTree, SocketEndpointArray &epa, GroupType *type, StringAttr *groupDir)
 {
+    const char *groupName = nullText(groupTree->queryProp("@name"));
     if (type)
         *type = translateGroupType(groupTree->queryProp("@kind"));
     if (groupDir)
     {
         groupDir->set(groupTree->queryProp("@dir"));
         if (groupDir->isEmpty())
-            groupDir->set(queryBaseDirectory(*type));
+        {
+            Owned<const IStoragePlane> plane = getStoragePlaneByName(groupName, false);
+            if (plane)
+                groupDir->set(plane->queryPrefix());
+        }
     }
     Owned<IPropertyTreeIterator> pe = groupTree->getElements("Node");
     ForEach(*pe)
@@ -7067,8 +8489,7 @@ static unsigned loadGroup(const IPropertyTree *groupTree, SocketEndpointArray &e
         SocketEndpoint ep(host);
         if (ep.isNull())
         {
-            IWARNLOG("loadGroup: failed to resolve host '%s'", host);
-            return 0;
+            throw makeStringExceptionV(-1, "loadGroup: failed to resolve host '%s' in group '%s'", host, groupName);
         }
         epa.append(ep);
     }
@@ -7077,7 +8498,7 @@ static unsigned loadGroup(const IPropertyTree *groupTree, SocketEndpointArray &e
 
 class CNamedGroupStore: implements INamedGroupStore, public CInterface
 {
-    CriticalSection cachesect;
+    CriticalSection cachesect{SYNC_LOCATION};
     CIArrayOf<CNamedGroupCacheEntry> cache;
     unsigned defaultTimeout;
     unsigned defaultRemoteTimeout;
@@ -7313,7 +8734,7 @@ public:
                 ForEachItemIn(e, epa)
                 {
                     StringBuffer ipStr;
-                    epa.item(e).getIpText(ipStr);
+                    epa.item(e).getHostText(ipStr);
                     IPropertyTree *n = val->addPropTree("Node");
                     n->setProp("@ip", ipStr);
                 }
@@ -7339,7 +8760,7 @@ public:
             std::vector<std::string> ips;
             while (true)
             {
-                gi->query().endpoint().getIpText(ipStr.clear());
+                gi->query().endpoint().getHostText(ipStr.clear());
                 ips.push_back(ipStr.str());
                 if (!gi->next())
                     break;
@@ -7364,9 +8785,14 @@ public:
             return;
         Owned<IPropertyTree> groupTree = doAddHosts(connlock, name.str(), hosts, cluster, dir);
         SocketEndpointArray eps;
-        if (!loadGroup(groupTree, eps, nullptr, nullptr))
+        try
         {
-            IWARNLOG("CNamedGroupStore.add: failed to add group '%s', due to unresolved hosts", name.str());
+            loadGroup(groupTree, eps, nullptr, nullptr);
+        }
+        catch (IException *e)
+        {
+            IWARNLOG(e, "CNamedGroupStore.add");
+            e->Release();
             return;
         }
         Owned<IGroup> group = createIGroup(eps);
@@ -7466,8 +8892,16 @@ public:
         if (!groupTree)
             return 0;
         SocketEndpointArray epa;
-        if (!loadGroup(groupTree, epa, nullptr, nullptr))
+        try
+        {
+            loadGroup(groupTree, epa, nullptr, nullptr);
+        }
+        catch (IException *e)
+        {
+            IWARNLOG(e, "removeNode");
+            e->Release();
             return 0;
+        }
 
         unsigned numNodes = epa.ordinality();
         Owned<IGroup> group = createIGroup(epa);
@@ -7560,9 +8994,14 @@ public:
             group.getProp("@name", name);
 
             SocketEndpointArray eps;
-            if (!loadGroup(&group, eps, nullptr, nullptr))
+            try
             {
-                IWARNLOG("swapNode: failed to load group: '%s'", name.str());
+                loadGroup(&group, eps, nullptr, nullptr);
+            }
+            catch (IException *e)
+            {
+                IWARNLOG(e, "swapNode");
+                e->Release();
                 return;
             }
 
@@ -7644,20 +9083,21 @@ private:
 
 };
 
-static CNamedGroupStore *groupStore = NULL;
-static CriticalSection groupsect;
+static std::atomic<CNamedGroupStore *> groupStore{nullptr};
+static CriticalSection groupsect{SYNC_LOCATION};
+
 
 bool CNamedGroupIterator::match()
 {
     if (conn.get()) {
         if (matchgroup.get()) {
-            if (!groupStore)
+            if (!groupStore.load())
                 return false;
             const char *name = pe->query().queryProp("@name");
             if (!name||!*name)
                 return false;
             GroupType dummy;
-            Owned<IGroup> lgrp = groupStore->dolookup(name, conn, NULL, dummy);
+            Owned<IGroup> lgrp = groupStore.load()->dolookup(name, conn, NULL, dummy);
             if (lgrp) {
                 if (exactmatch)
                     return lgrp->equals(matchgroup);
@@ -7671,37 +9111,38 @@ bool CNamedGroupIterator::match()
     return false;
 }
 
-INamedGroupStore  &queryNamedGroupStore()
+INamedGroupStore &queryNamedGroupStore()
 {
-    if (!groupStore) {
+    if (!groupStore.load())
+    {
         CriticalBlock block(groupsect);
-        if (!groupStore)
-            groupStore = new CNamedGroupStore();
+        if (!groupStore.load())
+            groupStore.store(new CNamedGroupStore());
     }
-    return *groupStore;
+    return *(groupStore.load());
 }
 
 // --------------------------------------------------------
 
-IDistributedFile *CDistributedFileDirectory::lookup(const char *_logicalname, IUserDescriptor *user, bool writeattr, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, bool privilegedUser, unsigned timeout)
+IDistributedFile *CDistributedFileDirectory::lookup(const char *_logicalname, IUserDescriptor *user, AccessMode accessMode, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, bool privilegedUser, unsigned timeout, const DFSAuditContext &auditCtx)
 {
     CDfsLogicalFileName logicalname;
     logicalname.set(_logicalname);
-    return lookup(logicalname, user, writeattr, hold, lockSuperOwner, transaction, privilegedUser, timeout);
+    return lookup(logicalname, user, accessMode, hold, lockSuperOwner, transaction, privilegedUser, timeout, auditCtx);
 }
 
-IDistributedFile *CDistributedFileDirectory::dolookup(CDfsLogicalFileName &_logicalname, IUserDescriptor *user, bool writeattr, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, unsigned timeout)
+IDistributedFile *CDistributedFileDirectory::dolookup(CDfsLogicalFileName &_logicalname, IUserDescriptor *user, AccessMode accessMode, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, unsigned timeout)
 {
     CDfsLogicalFileName *logicalname = &_logicalname;
     if (logicalname->isMulti())
         // don't bother checking because the sub file creation will
-        return new CDistributedSuperFile(this,*logicalname,user,transaction); // temp superfile
+        return new CDistributedSuperFile(this, *logicalname, accessMode, user, transaction); // temp superfile
     if (strchr(logicalname->get(), '*')) // '*' only wildcard supported. NB: This is a temporary fix (See: HPCC-12523)
         throw MakeStringException(-1, "Invalid filename lookup: %s", logicalname->get());
     Owned<IDfsLogicalFileNameIterator> redmatch;
     for (;;)
     {
-        checkLogicalName(*logicalname,user,true,writeattr,true,NULL);
+        checkLogicalName(*logicalname,user,true,isWrite(accessMode),true,NULL);
         if (logicalname->isExternal()) {
             Owned<IFileDescriptor> fDesc = getExternalFileDescriptor(logicalname->get());
             if (!fDesc)
@@ -7709,7 +9150,7 @@ IDistributedFile *CDistributedFileDirectory::dolookup(CDfsLogicalFileName &_logi
             return queryDistributedFileDirectory().createExternal(fDesc, logicalname->get());
         }
         if (logicalname->isForeign()) {
-            IDistributedFile * ret = getFile(logicalname->get(),user,NULL);
+            IDistributedFile * ret = getFile(logicalname->get(), accessMode, user, NULL);
             if (ret)
                 return ret;
         }
@@ -7743,8 +9184,10 @@ IDistributedFile *CDistributedFileDirectory::dolookup(CDfsLogicalFileName &_logi
                                 break;
                         }
                     }
-                    CDistributedFile *ret = new CDistributedFile(this,fcl.detach(),*logicalname,user);  // found
+                    CDistributedFile *ret = new CDistributedFile(this,fcl.detach(),*logicalname,accessMode,user);  // found
                     ret->setSuperOwnerLock(superOwnerLock.detach());
+                    if (isExternalAccess(accessMode))
+                        checkFileWriteSync(ret->queryRoot(), ret->queryLogicalName());
                     return ret;
                 }
                 // now super file
@@ -7755,7 +9198,7 @@ IDistributedFile *CDistributedFileDirectory::dolookup(CDfsLogicalFileName &_logi
                 unsigned elapsed;
                 try
                 {
-                    CDistributedSuperFile *ret = new CDistributedSuperFile(this,fcl.detach(),*logicalname,user,transaction,SDS_SUB_LOCK_TIMEOUT);
+                    CDistributedSuperFile *ret = new CDistributedSuperFile(this, fcl.detach(), *logicalname, accessMode, user, transaction, SDS_SUB_LOCK_TIMEOUT);
                     ret->setSuperOwnerLock(superOwnerLock.detach());
                     return ret;
                 }
@@ -7788,20 +9231,55 @@ IDistributedFile *CDistributedFileDirectory::dolookup(CDfsLogicalFileName &_logi
     return NULL;
 }
 
-IDistributedFile *CDistributedFileDirectory::lookup(CDfsLogicalFileName &logicalname, IUserDescriptor *user, bool writeattr, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, bool privilegedUser, unsigned timeout)
+IDistributedFile *CDistributedFileDirectory::lookup(CDfsLogicalFileName &logicalname, IUserDescriptor *user, AccessMode accessMode, bool hold, bool lockSuperOwner, IDistributedFileTransaction *transaction, bool privilegedUser, unsigned timeout, const DFSAuditContext &auditCtx)
 {
-    Owned <IDistributedFile>distributedFile = dolookup(logicalname, user, writeattr, hold, lockSuperOwner, transaction, timeout);
+    if (logicalname.isRemote())
+    {
+        PrintStackReport(); // to help locate contexts it was called in
+        throw new CDFS_Exception(DFSERR_InvalidRemoteFileContext, logicalname.get());
+    }
+    Owned<IDistributedFile> distributedFile = dolookup(logicalname, user, accessMode, hold, lockSuperOwner, transaction, timeout);
+    if (!distributedFile)
+        return nullptr;
+
     // Restricted access is currently designed to stop users viewing sensitive information. It is not designed to stop users deleting or overwriting existing restricted files
-    if (writeattr==false && distributedFile && distributedFile->isRestrictedAccess() && !privilegedUser)
+    if (!isWrite(accessMode) && distributedFile->isRestrictedAccess() && !privilegedUser)
         throw new CDFS_Exception(DFSERR_RestrictedFileAccessDenied,logicalname.get());
+
+    if (!auditCtx.isNested() && isPhysicalAccessMode(accessMode))
+    {
+        const char *verb = (AccessMode::none != (accessMode & AccessMode::extend)) ? "EXTEND" : "READ";
+        // Emit for the resolved file (superfile or regular).
+        {
+            DFSAuditContext ctx = auditCtx;
+            ctx.setValue("lfn", logicalname.get());
+            addAuditPlaneFields(ctx, *distributedFile);
+            addAuditSizeFields(ctx, *distributedFile);
+            ctx.logFileAccess(verb);
+        }
+        // For superfiles, also emit one record per leaf subfile.
+        IDistributedSuperFile *sf = distributedFile->querySuperFile();
+        if (sf)
+        {
+            Owned<IDistributedFileIterator> iter = sf->getSubFileIterator(true); // true = recurse into supersubs
+            ForEach(*iter)
+            {
+                IDistributedFile &subFile = iter->query();
+                DFSAuditContext subCtx = auditCtx;
+                subCtx.setValue("lfn", subFile.queryLogicalName());
+                addAuditSizeFields(subCtx, subFile);
+                subCtx.logFileAccess(verb);
+            }
+        }
+    }
     return distributedFile.getClear();
 }
 
-IDistributedSuperFile *CDistributedFileDirectory::lookupSuperFile(const char *_logicalname,IUserDescriptor *user,IDistributedFileTransaction *transaction, unsigned timeout)
+IDistributedSuperFile *CDistributedFileDirectory::lookupSuperFile(const char *_logicalname, IUserDescriptor *user, AccessMode accessMode, IDistributedFileTransaction *transaction, unsigned timeout)
 {
     CDfsLogicalFileName logicalname;
     logicalname.set(_logicalname);
-    IDistributedFile *file = dolookup(logicalname, user, false, false, false, transaction, timeout);
+    IDistributedFile *file = dolookup(logicalname, user, accessMode, false, false, transaction, timeout);
     if (file) {
         IDistributedSuperFile *sf = file->querySuperFile();
         if (sf)
@@ -7816,7 +9294,7 @@ bool CDistributedFileDirectory::isSuperFile(    const char *logicalname,
                                                 INode *foreigndali,
                                                 unsigned timeout)
 {
-    Owned<IPropertyTree> tree = getFileTree(logicalname, user, foreigndali,timeout, false);
+    Owned<IPropertyTree> tree = getFileTree(logicalname, user, AccessMode::readLogicalMeta, foreigndali,timeout, GetFileTreeOpts::appendForeign);
     return tree.get()&&(strcmp(tree->queryName(),queryDfsXmlBranchName(DXB_SuperFile))==0);
 }
 
@@ -7835,7 +9313,7 @@ bool CDistributedFileDirectory::exists(const char *_logicalname,IUserDescriptor 
     if (foreign) {
         // Restricted access is currently designed to stop users viewing sensitive information. Assuming privileged user rights to allow
         // exists() operation to succeed regardless of user rights
-        Owned<IDistributedFile> file = lookup(_logicalname, user, false, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
+        Owned<IDistributedFile> file = lookup(_logicalname, user, AccessMode::readLogicalMeta, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
         if (file.get()==NULL)
             return false;
         if (file->querySuperFile()) {
@@ -7872,15 +9350,18 @@ bool CDistributedFileDirectory::existsPhysical(const char *_logicalname, IUserDe
 {
     // Restricted access is currently designed to stop users viewing sensitive information. Assuming privileged user rights to allow
     // existsPhysical() operation to succeed regardless of user rights
-    Owned<IDistributedFile> file = lookup(_logicalname, user, false, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
+    Owned<IDistributedFile> file = lookup(_logicalname, user, AccessMode::meta | AccessMode::readPhysicalMeta, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
     if (!file)
         return false;
     return file->existsPhysicalPartFiles(0);
 }
 
-IDistributedFile *CDistributedFileDirectory::createNew(IFileDescriptor *fdesc)
+IDistributedFile *CDistributedFileDirectory::createNew(IFileDescriptor *fdesc, const char *optName)
 {
-    return new CDistributedFile(this, fdesc, NULL, false);
+    CDistributedFile *ret = new CDistributedFile(this, fdesc, NULL, false);
+    if (optName)
+        ret->setLogicalName(optName);
+    return ret;
 }
 
 IDistributedFile *CDistributedFileDirectory::createExternal(IFileDescriptor *fdesc, const char *name)
@@ -7944,15 +9425,16 @@ public:
                            IUserDescriptor *_user,
                            const char *_flname,
                            bool _interleaved)
-        : parent(_parent), user(_user), created(false), interleaved(_interleaved)
+        : parent(_parent), user(_user), interleaved(_interleaved), created(false)
     {
+        tracing.appendf("CreateSuperFile: super: %s", _flname);
         logicalname.set(_flname);
     }
     IDistributedSuperFile *getSuper()
     {
         if (!super)
         {
-            Owned<IDistributedSuperFile> _super = transaction->lookupSuperFile(logicalname.get(), SDS_SUB_LOCK_TIMEOUT);
+            Owned<IDistributedSuperFile> _super = transaction->lookupSuperFile(logicalname.get(), AccessMode::writeLogicalMeta, SDS_SUB_LOCK_TIMEOUT);
             if (_super)
                 super.setown(_super.getClear());
             else
@@ -7964,7 +9446,7 @@ public:
                  */
                 Owned<IPropertyTree> root = createPTree();
                 root->setPropInt("@interleaved",interleaved?2:0); // this is ill placed
-                super.setown(new CDistributedSuperFile(parent, root, logicalname, user));
+                super.setown(new CDistributedSuperFile(parent, root, logicalname, AccessMode::writeLogicalMeta, user));
                 created = true;
                 super->setModified();
                 transaction->addFile(super);
@@ -8025,13 +9507,13 @@ class CRemoveSuperFileAction: public CDFAction
                 start();
         }
         // wrap rest of calls into parent transaction calls
-        virtual IDistributedFile *lookupFile(const char *lfn,unsigned timeout=INFINITE)
+        virtual IDistributedFile *lookupFile(const char *lfn, AccessMode accessMode, unsigned timeout=INFINITE)
         {
-            return transaction->lookupFile(lfn, timeout);
+            return transaction->lookupFile(lfn, accessMode, timeout);
         }
-        virtual IDistributedSuperFile *lookupSuperFile(const char *slfn,unsigned timeout=INFINITE)
+        virtual IDistributedSuperFile *lookupSuperFile(const char *slfn, AccessMode accessMode, unsigned timeout=INFINITE)
         {
-            return transaction->lookupSuperFile(slfn, timeout);
+            return transaction->lookupSuperFile(slfn, accessMode, timeout);
         }
         virtual IUserDescriptor *queryUser() { return transaction->queryUser(); }
         virtual void descend() { transaction->descend(); }
@@ -8067,9 +9549,9 @@ class CRemoveSuperFileAction: public CDFAction
         {
             return transaction->isSubFile(super, subFile, sub);
         }
-        virtual bool addDelayedDelete(CDfsLogicalFileName &lfn,unsigned timeoutms=INFINITE)
+        virtual bool addDelayedDelete(CDfsLogicalFileName &lfn,unsigned timeoutms=INFINITE, const DFSAuditContext &auditCtx = DFSAuditContext{})
         {
-            return transaction->addDelayedDelete(lfn, timeoutms);
+            return transaction->addDelayedDelete(lfn, timeoutms, auditCtx);
         }
     };
 
@@ -8079,12 +9561,13 @@ public:
                            bool _delSub)
         : user(_user), delSub(_delSub)
     {
+        tracing.appendf("RemoveSuperFile: super: %s", _flname);
         logicalname.set(_flname);
     }
     virtual bool prepare()
     {
         // We *have* to make sure the file exists here
-        super.setown(transaction->lookupSuperFile(logicalname.get(), SDS_SUB_LOCK_TIMEOUT));
+        super.setown(transaction->lookupSuperFile(logicalname.get(), AccessMode::writeLogicalMeta, SDS_SUB_LOCK_TIMEOUT));
         if (!super)
             ThrowStringException(-1, "Super File %s doesn't exist in the file system", logicalname.get());
         addFileLock(super);
@@ -8140,6 +9623,7 @@ class CRenameFileAction: public CDFAction
     CDistributedFileDirectory *parent;
     Linked<IDistributedFile> file;
     IUserDescriptor *user;
+    DFSAuditContext auditCtx;
     bool renamed;
     enum RenameAction { ra_regular, ra_splitfrom, ra_mergeinto } ra;
 
@@ -8147,9 +9631,11 @@ public:
     CRenameFileAction(CDistributedFileDirectory *_parent,
                       IUserDescriptor *_user,
                       const char *_flname,
-                      const char *_newname)
-        : user(_user), parent(_parent)
+                      const char *_newname,
+                      const DFSAuditContext &_auditCtx)
+        : parent(_parent), user(_user), auditCtx(_auditCtx)
     {
+        tracing.appendf("RenameFile: name: %s, newname: %s", _flname, _newname);
         fromName.set(_flname);
         // Basic consistency checking
         toName.set(_newname);
@@ -8167,7 +9653,7 @@ public:
     virtual bool prepare()
     {
         // We *have* to make sure the source file exists and can be renamed
-        file.setown(transaction->lookupFile(fromName.get(), SDS_SUB_LOCK_TIMEOUT));
+        file.setown(transaction->lookupFile(fromName.get(), AccessMode::erase, SDS_SUB_LOCK_TIMEOUT));
         if (!file)
             ThrowStringException(-1, "rename: file %s doesn't exist in the file system", fromName.get());
         if (file->querySuperFile())
@@ -8183,7 +9669,7 @@ public:
             fromName.getCluster(oldcluster);
             toName.getCluster(newcluster);
 
-            Owned<IDistributedFile> newFile = transaction->lookupFile(toName.get(), SDS_SUB_LOCK_TIMEOUT);
+            Owned<IDistributedFile> newFile = transaction->lookupFile(toName.get(), AccessMode::erase, SDS_SUB_LOCK_TIMEOUT);
             if (newFile)
             {
                 if (newcluster.length())
@@ -8225,6 +9711,14 @@ public:
     virtual void run()
     {
         doRename(fromName, toName, ra);
+
+        if (!auditCtx.isNested())
+        {
+            DFSAuditContext ctx = auditCtx;
+            ctx.setValue("lfn", toName.get());
+            ctx.setValue("lfn2", fromName.get());
+            ctx.logFileAccess("RENAME");
+        }
         renamed = true;
     }
     virtual void retry()
@@ -8290,18 +9784,18 @@ private:
             {
                 unlock();
                 oldfile->removeCluster(oldcluster.str());
-                file->attach(to.get(), user);
+                file->attach(to.get(), user, auditCtx.nested());
                 lock();
                 break;
             }
             case ra_mergeinto:
             {
-                Owned<IDistributedFile> newFile = transaction->lookupFile(to.get(), SDS_SUB_LOCK_TIMEOUT);
+                Owned<IDistributedFile> newFile = transaction->lookupFile(to.get(), AccessMode::erase, SDS_SUB_LOCK_TIMEOUT);
                 ClusterPartDiskMapSpec mspec = file->queryPartDiskMapping(0);
                 // Unlock the old file
                 unlock();
                 CDistributedFile *_file = dynamic_cast<CDistributedFile *>(file.get());
-                _file->detachLogical(INFINITE); // don't delete physicals, now used by newFile
+                _file->detachLogical(INFINITE, auditCtx.nested()); // don't delete physicals, now used by newFile
                 transaction->clearFile(file); // no long used in transaction
                 newFile->addCluster(newcluster.str(),mspec);
                 parent->fixDates(newFile);
@@ -8309,7 +9803,7 @@ private:
                 // TBD: Allow 'addCluster' 'fixDates' etc. to be delayed/work inside transaction
                 transaction->clearFile(newFile);
                 newFile.clear();
-                file.setown(transaction->lookupFile(to.get(), SDS_SUB_LOCK_TIMEOUT));
+                file.setown(transaction->lookupFile(to.get(), AccessMode::erase, SDS_SUB_LOCK_TIMEOUT));
                 addFileLock(file);
                 lock();
                 break;
@@ -8322,7 +9816,7 @@ private:
                  * TBD: Allow IDistributedFile::rename to work properly within transaction.
                  */
                 DistributedFilePropertyLockFree unlock(file);
-                file->rename(to.get(), user);
+                file->rename(to.get(), user, auditCtx.nested());
                 break;
             }
             default:
@@ -8346,13 +9840,12 @@ IDistributedSuperFile *CDistributedFileDirectory::createSuperFile(const char *_l
     Linked<IDistributedFileTransactionExt> localtrans;
     if (transaction)
     {
-        IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
-        localtrans.set(_transaction);
+        localtrans.set(queryTransactionExt(transaction));
     }
     else
         localtrans.setown(new CDistributedFileTransaction(user));
 
-    Owned<IDistributedSuperFile> sfile = localtrans->lookupSuperFile(logicalname.get());
+    Owned<IDistributedSuperFile> sfile = localtrans->lookupSuperFile(logicalname.get(), AccessMode::writeLogicalMeta);
     if (sfile)
     {
         if (ifdoesnotexist)
@@ -8368,9 +9861,9 @@ IDistributedSuperFile *CDistributedFileDirectory::createSuperFile(const char *_l
 }
 
 // MORE: This should be implemented in DFSAccess later on
-IDistributedSuperFile *CDistributedFileDirectory::createNewSuperFile(IPropertyTree *tree, const char *optionalName)
+IDistributedSuperFile *CDistributedFileDirectory::createNewSuperFile(IPropertyTree *tree, const char *optionalName, IArrayOf<IDistributedFile> *subFiles)
 {
-    return new CDistributedSuperFile(this, tree, optionalName);
+    return new CDistributedSuperFile(this, tree, AccessMode::writeLogicalMeta, optionalName, subFiles);
 }
 
 // MORE: This should be implemented in DFSAccess later on
@@ -8384,8 +9877,7 @@ void CDistributedFileDirectory::removeSuperFile(const char *_logicalname, bool d
     Linked<IDistributedFileTransactionExt> localtrans;
     if (transaction)
     {
-        IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
-        localtrans.set(_transaction);
+        localtrans.set(queryTransactionExt(transaction));
     }
     else
         localtrans.setown(new CDistributedFileTransaction(user));
@@ -8395,7 +9887,7 @@ void CDistributedFileDirectory::removeSuperFile(const char *_logicalname, bool d
     localtrans->autoCommit();
 }
 
-bool CDistributedFileDirectory::removeEntry(const char *name, IUserDescriptor *user, IDistributedFileTransaction *transaction, unsigned timeoutms, bool throwException)
+bool CDistributedFileDirectory::removeEntry(const char *name, IUserDescriptor *user, IDistributedFileTransaction *transaction, unsigned timeoutms, bool throwException, const DFSAuditContext &auditCtx)
 {
     CDfsLogicalFileName logicalname;
     logicalname.set(name);
@@ -8406,14 +9898,13 @@ bool CDistributedFileDirectory::removeEntry(const char *name, IUserDescriptor *u
     Linked<IDistributedFileTransactionExt> localtrans;
     if (transaction)
     {
-        IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
-        localtrans.set(_transaction);
+        localtrans.set(queryTransactionExt(transaction));
     }
     else
         localtrans.setown(new CDistributedFileTransaction(user));
 
     // Action will be executed at the end of the transaction (commit)
-    localtrans->addDelayedDelete(logicalname, timeoutms);
+    localtrans->addDelayedDelete(logicalname, timeoutms, auditCtx);
 
     try
     {
@@ -8445,15 +9936,11 @@ void CDistributedFileDirectory::removeEmptyScope(const char *scope)
     }
 }
 
-void CDistributedFileDirectory::renamePhysical(const char *oldname,const char *newname,IUserDescriptor *user,IDistributedFileTransaction *transaction)
+void CDistributedFileDirectory::renamePhysical(const char *oldname, const char *newname, IUserDescriptor *user, IDistributedFileTransaction *transaction, const DFSAuditContext &auditCtx)
 {
+    logNullUser(user);//stack trace if NULL user
     if (!user)
     {
-#ifdef NULL_DALIUSER_STACKTRACE
-        DBGLOG("UNEXPECTED USER (NULL) in dadfs.cpp CDistributedFileDirectory::renamePhysical %d",__LINE__);
-        //following debug code to be removed
-        PrintStackReport();
-#endif
         user = defaultudesc.get();
     }
     CDfsLogicalFileName oldlogicalname;
@@ -8464,13 +9951,12 @@ void CDistributedFileDirectory::renamePhysical(const char *oldname,const char *n
     Linked<IDistributedFileTransactionExt> localtrans;
     if (transaction)
     {
-        IDistributedFileTransactionExt *_transaction = dynamic_cast<IDistributedFileTransactionExt *>(transaction);
-        localtrans.set(_transaction);
+        localtrans.set(queryTransactionExt(transaction));
     }
     else
         localtrans.setown(new CDistributedFileTransaction(user));
 
-    CRenameFileAction *action = new CRenameFileAction(this, user, oldname, newname);
+    CRenameFileAction *action = new CRenameFileAction(this, user, oldname, newname, auditCtx);
     localtrans->addAction(action); // takes ownership
     localtrans->autoCommit();
 }
@@ -8479,7 +9965,7 @@ void CDistributedFileDirectory::fixDates(IDistributedFile *file)
 {
     // should do in parallel
     unsigned width = file->numParts();
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     class casyncfor: public CAsyncFor
     {
         IDistributedFile *file;
@@ -8488,7 +9974,7 @@ void CDistributedFileDirectory::fixDates(IDistributedFile *file)
     public:
         bool ok;
         casyncfor(IDistributedFile *_file,unsigned _width,CriticalSection &_errcrit)
-            : crit(_errcrit)
+            : CAsyncFor(SYNC_LOCATION), crit(_errcrit)
         {
             file = _file;
             ok = true;
@@ -8520,7 +10006,7 @@ void CDistributedFileDirectory::fixDates(IDistributedFile *file)
                     CriticalBlock block(crit);
                     StringBuffer s("Failed to find file part ");
                     s.append(partfile->queryFilename()).append(" on ");
-                    rfn.queryEndpoint().getUrlStr(s);
+                    rfn.queryEndpoint().getEndpointHostText(s);
                     EXCLOG(e, s.str());
                     e->Release();
                 }
@@ -8571,9 +10057,9 @@ void CDistributedFileDirectory::addEntry(CDfsLogicalFileName &dlfn,IPropertyTree
     }
 }
 
-IDistributedFileIterator *CDistributedFileDirectory::getIterator(const char *wildname, bool includesuper, IUserDescriptor *user,bool isPrivilegedUser)
+IDistributedFileIterator *CDistributedFileDirectory::getIterator(const char *wildname, bool includesuper, IUserDescriptor *user,bool isPrivilegedUser, AccessMode accessMode)
 {
-    return new CDistributedFileIterator(this,wildname,includesuper,user,isPrivilegedUser);
+    return new CDistributedFileIterator(this,wildname,includesuper,user,isPrivilegedUser,accessMode);
 }
 
 GetFileClusterNamesType CDistributedFileDirectory::getFileClusterNames(const char *_logicalname,StringArray &out)
@@ -8601,8 +10087,8 @@ GetFileClusterNamesType CDistributedFileDirectory::getFileClusterNames(const cha
 // --------------------------------------------------------
 
 
-static CDistributedFileDirectory *DFdir = NULL;
-static CriticalSection dfdirCrit;
+static std::atomic<CDistributedFileDirectory *> DFdir{nullptr};
+static CriticalSection dfdirCrit{SYNC_LOCATION};
 
 /**
  * Public method to control DistributedFileDirectory access
@@ -8611,38 +10097,47 @@ static CriticalSection dfdirCrit;
  */
 IDistributedFileDirectory &queryDistributedFileDirectory()
 {
-    if (!DFdir) {
+    if (!DFdir.load())
+    {
         CriticalBlock block(dfdirCrit);
-        if (!DFdir)
-            DFdir = new CDistributedFileDirectory();
+        if (!DFdir.load())
+        {
+            initDFSAudit();
+            DFdir.store(new CDistributedFileDirectory());
+        }
     }
-    return *DFdir;
+    return *DFdir.load();
 }
 
 /**
  * Shutdown distributed file system (root directory).
  */
-void closedownDFS()  // called by dacoven
+void closedownDFS() // called by dacoven
 {
-    CriticalBlock block(dfdirCrit);
-    try {
-        delete DFdir;
+    CriticalBlock bDFdir(dfdirCrit);
+    try
+    {
+        closeDFSAudit();
+        delete DFdir.load();
     }
-    catch (IMP_Exception *e) {
-        if (e->errorCode()!=MPERR_link_closed)
+    catch (IMP_Exception *e)
+    {
+        if (e->errorCode() != MPERR_link_closed)
             throw;
-        PrintExceptionLog(e,"closedownDFS");
+        PrintExceptionLog(e, "closedownDFS");
         e->Release();
     }
-    catch (IDaliClient_Exception *e) {
-        if (e->errorCode()!=DCERR_server_closed)
+    catch (IDaliClient_Exception *e)
+    {
+        if (e->errorCode() != DCERR_server_closed)
             throw;
         e->Release();
     }
-    DFdir = NULL;
-    CriticalBlock block2(groupsect);
-    ::Release(groupStore);
-    groupStore = NULL;
+    DFdir.store(nullptr);
+
+    CriticalBlock bGroupStore(groupsect);
+    ::Release(groupStore.load());
+    groupStore.store(nullptr);
 }
 
 class CDFPartFilter : implements IDFPartFilter, public CInterface
@@ -8688,9 +10183,11 @@ public:
                         partincluded[i] = true;
                     start = 0;
                 }
+                else if (pn == 0)
+                    throw makeStringExceptionV(0, "Invalid part filter: %s", filter);
                 else
-                    partincluded[pn-1] = true;
-                if (*s==0)
+                    partincluded[pn - 1] = true;
+                if (*s == 0)
                     break;
                 pn = 0;
             }
@@ -8736,53 +10233,71 @@ IDFPartFilter *createPartFilter(const char *filter)
 class CFileMatch : public CInterface
 {
     StringAttr name;
-    Linked<IPropertyTree> tree;
     bool isSuper;
+    MemoryBuffer serializedRowMb;
 public:
-    CFileMatch(const char *_name, IPropertyTree *_tree, bool _isSuper) : name(_name), tree(_tree), isSuper(_isSuper)
+    // Pre-serialize on construction so serialization work is done under scan-time locking.
+    CFileMatch(const char *_name, const IPropertyTree &tree, bool _isSuper, const SerializeFileAttrOptions &options)
+        : name(_name), isSuper(_isSuper)
     {
+        CDFAttributeIterator::serializeFileAttributes(serializedRowMb, tree, _name, _isSuper, options);
     }
-    IPropertyTree &queryFileTree() const { return *tree; }
     const char *queryName() const { return name; }
+    StringBuffer &getScopeName(StringBuffer &out) const // used for authentication only
+    {
+        const char *nameStr = name.get();
+        const char *lastColon = strrchr(nameStr, ':');
+        if (lastColon && lastColon > nameStr && *(lastColon - 1) == ':') // if lastColon, should always be true
+            out.append((size32_t)(lastColon - 1 - nameStr), nameStr);
+        return out;
+    }
     bool queryIsSuper() const { return isSuper; }
+    bool appendSerializedRow(MemoryBuffer &out) const
+    {
+        out.append(serializedRowMb);
+        return true;
+    }
 };
 typedef CIArrayOf<CFileMatch> CFileMatchArray;
 
-class CScope : public CInterface
+class CScopePermissionCache
 {
-    StringAttr name;
-    CIArrayOf<CFileMatch> files; // matches
-    CIArrayOf<CScope> subScopes;
+    // A short-lived cache used during massive DFS scans (e.g. iterateFiles) to avoid
+    // hitting the Session Manager (and triggering RPC/LDAP round-trips) for every
+    // single file when checking scope permissions.
+    IUserDescriptor *user = nullptr;
+    std::unordered_map<std::string, SecAccessFlags> cache;
 public:
-    CScope(const char *_name) : name(_name)
+    explicit CScopePermissionCache(IUserDescriptor *_user) : user(_user)
     {
     }
-    const char *getName() const { return name; }
-    void addMatch(const char *name, IPropertyTree &fileTree, bool isSuper)
+    SecAccessFlags queryPermission(const char *scopeName)
     {
-        files.append(*new CFileMatch(name, &fileTree, isSuper));
+        if (!scopeName)
+            scopeName = "";
+        auto it = cache.find(scopeName);
+        if (it != cache.end())
+            return it->second;
+        SecAccessFlags perm = getScopePermissions(scopeName, user, 0);     // don't audit
+        cache.emplace(scopeName, perm);
+        return perm;
     }
-    CScope *addScope(const char *scope)
+    bool queryHasReadPermission(const char *scopeName)
     {
-        CScope *subScope = new CScope(scope);
-        subScopes.append(*subScope);
-        return subScope;
+        return HASREADPERMISSION(queryPermission(scopeName));
     }
-    void popLastScope()
+    unsigned queryCachedScopeCount() const
     {
-        subScopes.pop();
+        return cache.size();
     }
-    CIArrayOf<CScope> &querySubScopes() { return subScopes; }
-    CFileMatchArray &queryFiles() { return files; }
 };
-typedef CIArrayOf<CScope> CScopeArray;
 
 
 const char* DFUQFilterFieldNames[] = { "", "@description", "@directory", "@group", "@modified", "@name", "@numclusters", "@numparts",
     "@partmask", "@OrigName", "Attr", "Attr/@job", "Attr/@owner", "Attr/@recordCount", "Attr/@recordSize", "Attr/@size",
     "Attr/@compressedsize", "Attr/@workunit", "Cluster", "Cluster/@defaultBaseDir", "Cluster/@defaultReplDir", "Cluster/@mapFlags",
     "Cluster/@name", "Part", "Part/@name", "Part/@num", "Part/@size", "SuperOwner", "SuperOwner/@name",
-    "SubFile", "SubFile/@name", "SubFile/@num", "Attr/@kind", "Attr/@accessed" };
+    "SubFile", "SubFile/@name", "SubFile/@num", "Attr/@kind", "Attr/@accessed", "Attr/@maxSkew", "Attr/@minSkew", "Attr/@expireDays" };
 
 extern da_decl const char* getDFUQFilterFieldName(DFUQFilterField feild)
 {
@@ -8809,9 +10324,9 @@ public:
     CDFUSFFilter(DFUQFilterType _filterType, const char *_attrPath, const char *_filterValue, const char *_filterValueHigh)
         : filterType(_filterType), attrPath(_attrPath), filterValue(_filterValue), filterValueHigh(_filterValueHigh) {};
     CDFUSFFilter(DFUQFilterType _filterType, const char *_attrPath, bool _hasFilter, const int _filterValue, bool _hasFilterHigh, const int _filterValueHigh)
-        : filterType(_filterType), attrPath(_attrPath), hasFilter(_hasFilter), filterValueInt(_filterValue), hasFilterHigh(_hasFilterHigh), filterValueHighInt(_filterValueHigh) {};
+        : filterType(_filterType), attrPath(_attrPath), hasFilter(_hasFilter), hasFilterHigh(_hasFilterHigh), filterValueInt(_filterValue), filterValueHighInt(_filterValueHigh) {};
     CDFUSFFilter(DFUQFilterType _filterType, const char *_attrPath, bool _hasFilter, const __int64 _filterValue, bool _hasFilterHigh, const __int64 _filterValueHigh)
-        : filterType(_filterType), attrPath(_attrPath), hasFilter(_hasFilter), filterValueInt64(_filterValue), hasFilterHigh(_hasFilterHigh), filterValueHighInt64(_filterValueHigh) {};
+        : filterType(_filterType), attrPath(_attrPath), hasFilter(_hasFilter), hasFilterHigh(_hasFilterHigh), filterValueInt64(_filterValue), filterValueHighInt64(_filterValueHigh) {};
     CDFUSFFilter(DFUQFilterType _filterType, const char *_attrPath, bool _filterValue)
         : filterType(_filterType), attrPath(_attrPath), filterValueBoolean(_filterValue) {};
     CDFUSFFilter(DFUQFilterType _filterType, const char *_attrPath, const char *_filterValue, const char *_sep, StringArray& _filterArray)
@@ -8825,23 +10340,23 @@ public:
         }
     };
 
-    DFUQFilterType getFilterType() { return filterType;}
-    const char * getAttrPath() { return attrPath.get();}
-    const char * getFilterValue() { return filterValue.get();}
-    const char * getFilterValueHigh() { return filterValueHigh.get();}
-    const int getFilterValueInt() { return filterValueInt;}
-    const int getFilterValueHighInt() { return filterValueHighInt;}
-    const __int64 getFilterValueInt64() { return filterValueInt64;}
-    const __int64 getFilterValueHighInt64() { return filterValueHighInt64;}
-    const bool getFilterValueBoolean() { return filterValueBoolean;}
-    const char * getSep() { return sep.get();}
-    void getFilterArray(StringArray &filters)
+    DFUQFilterType getFilterType() const { return filterType;}
+    const char * getAttrPath() const { return attrPath.get();}
+    const char * getFilterValue() const { return filterValue.get();}
+    const char * getFilterValueHigh() const { return filterValueHigh.get();}
+    const int getFilterValueInt() const { return filterValueInt;}
+    const int getFilterValueHighInt() const { return filterValueHighInt;}
+    const __int64 getFilterValueInt64() const { return filterValueInt64;}
+    const __int64 getFilterValueHighInt64() const { return filterValueHighInt64;}
+    const bool getFilterValueBoolean() const { return filterValueBoolean;}
+    const char * getSep() const { return sep.get();}
+    void getFilterArray(StringArray &filters) const
     {
         ForEachItemIn(c, filterArray)
             filters.append(filterArray.item(c));
     }
 
-    bool checkFilter(IPropertyTree &file)
+    bool checkFilter(const IPropertyTree &file) const
     {
         bool match = true;
         switch(filterType)
@@ -8867,10 +10382,13 @@ public:
         case DFUQFTinteger64Range:
             match = checkInteger64RangeFilter(file);
             break;
+        case DFUQFTinverseWildcardMatch:
+            match = doInverseWildMatch(file);
+            break;
         }
         return match;
     }
-    bool doWildMatch(IPropertyTree &file)
+    bool doWildMatch(const IPropertyTree &file) const
     {
         const char* filter = filterValue.get();
         if (!attrPath.get() || !filter || !*filter || streq(filter, "*"))
@@ -8881,21 +10399,32 @@ public:
             return true;
         return false;
     }
-    bool doBooleanMatch(IPropertyTree &file)
+    bool doInverseWildMatch(const IPropertyTree &file) const
+    {
+        const char* filter = filterValue.get();
+        if (!attrPath.get() || !filter || !*filter || streq(filter, "*"))
+            return true;
+
+        const char* prop = file.queryProp(attrPath.get());
+        if (prop && WildMatch(prop, filter, true))
+            return false;
+        return true;
+    }
+    bool doBooleanMatch(const IPropertyTree &file) const
     {
         if (!attrPath.get())
             return true;
 
         return filterValueBoolean == file.getPropBool(attrPath.get(), true);
     }
-    bool checkHasPropFilter(IPropertyTree &file)
+    bool checkHasPropFilter(const IPropertyTree &file) const
     {
         if (!attrPath.get())
             return true;
 
         return filterValueBoolean == file.hasProp(attrPath.get());
     }
-    bool checkContainStringFilter(IPropertyTree &file)
+    bool checkContainStringFilter(const IPropertyTree &file) const
     {
         if (!attrPath.get())
             return true;
@@ -8925,7 +10454,7 @@ public:
         }
         return found;
     }
-    bool checkStringRangeFilter(IPropertyTree &file)
+    bool checkStringRangeFilter(const IPropertyTree &file) const
     {
         if (!attrPath.get())
             return true;
@@ -8938,7 +10467,7 @@ public:
             return false;
         return true;
     }
-    bool checkIntegerRangeFilter(IPropertyTree &file)
+    bool checkIntegerRangeFilter(const IPropertyTree &file) const
     {
         if (!attrPath.get())
             return true;
@@ -8949,7 +10478,7 @@ public:
             return false;
         return true;
     }
-    bool checkInteger64RangeFilter(IPropertyTree &file)
+    bool checkInteger64RangeFilter(const IPropertyTree &file) const
     {
         if (!attrPath.get())
             return true;
@@ -8961,15 +10490,17 @@ public:
         return true;
     }
 };
-typedef CIArrayOf<CDFUSFFilter> CDFUSFFilterArray;
 
+typedef CIArrayOf<CDFUSFFilter> CDFUSFFilterArray;
+typedef IIteratorOf<CDFUSFFilter> IDFUFilterIterator;
 class CIterateFileFilterContainer : public CInterface
 {
     StringAttr filterBuf; //Hold original filter string just in case
     StringAttr wildNameFilter;
+    StringAttr fields; // fields to return. If empty means return all
     unsigned maxFilesFilter;
     DFUQFileTypeFilter fileTypeFilter;
-    CIArrayOf<CDFUSFFilter> filters;
+    CDFUSFFilterArray filters;
     //The 'filters' contains the file scan filters other than wildNameFilter and fileTypeFilter. Those filters are used for
     //filtering the files using File Attributes tree and CDFUSFFilter::checkFilter(). The wildNameFilter and fileTypeFilter need
     //special code to filter the files.
@@ -8988,25 +10519,11 @@ class CIterateFileFilterContainer : public CInterface
         }
         return true;
     }
-    void addOption(const char* optionStr)
-    {
-        if (!optionStr || !*optionStr || !isdigit(*optionStr))
-            return;
-
-        DFUQSerializeFileAttrOption option = (DFUQSerializeFileAttrOption) atoi(optionStr);
-        switch(option)
-        {
-        case DFUQSFAOincludeSuperOwner:
-            options.includeSuperOwner =  true;
-            break;
-        //Add more when needed
-        }
-    }
     void addFilter(DFUQFilterType filterType, const char* attr, const char* value, const char* valueHigh)
     {
         if (!attr || !*attr)
             return;
-        if ((DFUQFTwildcardMatch == filterType) || (DFUQFTstringRange == filterType))
+        if ((DFUQFTwildcardMatch == filterType) || (DFUQFTstringRange == filterType) || (DFUQFTinverseWildcardMatch == filterType))
         {
             filters.append(*new CDFUSFFilter(filterType, attr, value, valueHigh));
             return;
@@ -9078,7 +10595,7 @@ class CIterateFileFilterContainer : public CInterface
         }
     }
 
-    bool doWildMatch(const char* filter, const char* value)
+    bool doWildMatch(const char* filter, const char* value) const
     {
         if (!filter || !*filter || streq(filter, "*") || (value && WildMatch(value, filter, true)))
             return true;
@@ -9123,6 +10640,7 @@ public:
             case DFUQFThasProp:
             case DFUQFTbooleanMatch:
             case DFUQFTwildcardMatch:
+            case DFUQFTinverseWildcardMatch:
                 filterSize = 3;
                 if (filterFieldsToRead >= filterSize) //DFUQFilterType | filter name | filter value
                     addFilter(filterType, filterStringArray.item(i+1), (const char*)filterStringArray.item(i+2), NULL);
@@ -9133,10 +10651,15 @@ public:
                 if (filterFieldsToRead >= filterSize) //DFUQFilterType | filter name | from filter | to filter
                     addFilter(filterType, filterStringArray.item(i+1), (const char*)filterStringArray.item(i+2), (const char*)filterStringArray.item(i+3));
                 break;
-            case DFUQFTincludeFileAttr:
+            case DFUQFTincludeFileAttr: // legacy. Kept to support old clients only
                 filterSize = 2;
                 if (filterFieldsToRead >= filterSize) //DFUQFilterType | filter
-                    addOption(filterStringArray.item(i+1));
+                {
+                    const char *optionStr = filterStringArray.item(i+1);
+                    DFUQSerializeFileAttrOption option = (DFUQSerializeFileAttrOption) atoi(optionStr);
+                    if (option == DFUQSFAOincludeSuperOwner)
+                        options.setField(DFUQResultField::superowners, true);
+                }
                 break;
             case DFUQFTspecial:
                 filterSize = 3;
@@ -9148,7 +10671,11 @@ public:
             i += (filterSize - 1);
         }
     }
-    bool matchFileScanFilter(const char* name, IPropertyTree &file)
+    void readFields(const char *fields)
+    {
+        options.readFields(fields);
+    }
+    bool matchFileScanFilter(const char* name, const IPropertyTree &file) const
     {
         if (!doWildMatch(wildNameFilter.get(), name))
             return false;
@@ -9176,225 +10703,645 @@ public:
         return true;
     }
 
-    DFUQFileTypeFilter getFileTypeFilter() { return fileTypeFilter; }
-    unsigned getMaxFilesFilter() { return maxFilesFilter; }
+    DFUQFileTypeFilter getFileTypeFilter() const { return fileTypeFilter; }
+    unsigned getMaxFilesFilter() const { return maxFilesFilter; }
     void setFileTypeFilter(DFUQFileTypeFilter _fileType)
     {
         fileTypeFilter = _fileType;
     }
-    const char* getNameFilter() { return wildNameFilter.get(); }
+    const char* getNameFilter() const { return wildNameFilter.get(); }
     void setNameFilter(const char* _wildName)
     {
         if (!_wildName || !*_wildName)
             return;
         wildNameFilter.set(_wildName);
     }
-    SerializeFileAttrOptions& getSerializeFileAttrOptions() { return options; }
+    const SerializeFileAttrOptions& getSerializeFileAttrOptions() const { return options; }
+    IDFUFilterIterator *getFilterIterator()
+    {
+        return new ArrayIIteratorOf<const CDFUSFFilterArray, CDFUSFFilter, IDFUFilterIterator>(filters);
+    }
 };
 
 class CFileScanner
 {
-    bool recursive;
-    bool includesuper;
-    StringAttr wildname;
-    Owned<CScope> topLevelScope;
-    CScope *currentScope;
-    Owned<CIterateFileFilterContainer> iterateFileFilterContainer;
+    // CFileScanner traverses the DFS metadata tree in depth-first order and supports
+    // pagination by returning a continuation token when scanStepLimit stops a scan early.
+    //
+    // TraversalState is the continuation token. It stores one frame per active scope,
+    // ordered deepest-first, so state[0] is the deepest partially scanned scope and
+    // state.back() is the shallowest scope closest to the tree root. Each frame stores
+    // only the unconsumed suffix of direct children for that scope, plus the next sibling
+    // index within that suffix.
+    //
+    // begin() initializes the filter context and resets internal pagination state.
+    // nextPage() performs the first traversal and all subsequent resumes using the
+    // internally retained TraversalState cursor.
+    //
+    // scanScope() consumes the saved frames from the back of the vector as recursion
+    // descends from shallowest to deepest. When resuming a partially scanned scope, the
+    // current frame gives the next sibling index to process within the stored suffix.
+    // If the previous page stopped in a descendant scope, the frame also records the
+    // direct child to re-enter before continuing with later siblings.
+    //
+    // Orphan handling is part of the pagination contract. Children are captured when a
+    // batch starts, but a later resume may find that one of those linked child nodes has
+    // been deleted from Dali and is now orphaned. In that case the child is skipped.
+    // If the orphaned child is the pending partially scanned scope, the remaining saved
+    // frames belong only to that subtree and must be discarded so the next sibling does
+    // not accidentally consume them.
+    //
+    // New frames are pushed deepest-first whenever scanStepLimit is reached again, producing
+    // the next continuation token for the following resume call.
+    struct TraversalChild
+    {
+        Owned<IPropertyTree> tree;      // LINK'd reference to child node
+        bool isScope = false;
+        bool isSuper = false;
+    };
 
-    bool scopeMatch(const char *name)
-    {   // name has trailing '::'
-        if (!name || !*name)
-            return true;
-        const char *s1 = NULL;
-        if (!iterateFileFilterContainer)
-            s1 = wildname.get();
-        else
-            s1 = iterateFileFilterContainer->getNameFilter();
-        if (!s1 || !*s1)
-            return true;
-        const char *s2 = name;
-        while (*s2) {
-            if (*s1=='*') {
-                if (recursive)
-                    return true;
-                if (*s2==':')
-                    return false;
-                // '*' can only come at end of scope in non-recursive
-                while (*s1&&(*s1!=':'))
-                    s1++;
-                while (*s2&&(*s2!=':'))
-                    s2++;
-            }
-            else if ((*s1==*s2)||(*s1=='?')) {
-                s1++;
-                s2++;
-            }
+    struct TraversalStackLevel
+    {
+        std::vector<TraversalChild> children;  // Direct linked child references with child type metadata
+        size_t currentIndex = 0;               // Resume position within children at this level
+        static constexpr size_t noChild = static_cast<size_t>(-1);
+        size_t pendingChildIndex = noChild;     // Partially-scanned child to re-enter before currentIndex
+    };
+
+    using TraversalState = std::vector<TraversalStackLevel>;
+
+    static CConfigUpdateHook configHook;
+    static constexpr unsigned defaultTimingReportIntervalSeconds = 60 * 60;
+    static constexpr unsigned defaultScanStepBudget = 5000;
+    static constexpr unsigned uninitialized = static_cast<unsigned>(-1);
+    static std::atomic<unsigned> timingReportIntervalSeconds;
+    static std::atomic<unsigned> configuredScanStepBudget;
+    static CriticalSection timingCrit;
+    static unsigned __int64 timingCallCount;
+    static unsigned __int64 timingScanMs;
+    static unsigned __int64 timingAuthMs;
+    static unsigned __int64 timingSerializationMs;
+    static time_t timingNextReport;
+
+    TraversalState traversalState;
+    bool firstPagePending = false;
+    bool recursive = false;
+    const CIterateFileFilterContainer *iterateFileFilterContainer = nullptr;
+    const unsigned scanStepLimit; // Traversal work budget per scan/resume call (visited/collected children)
+    unsigned stepsTaken = 0;
+
+    static unsigned queryTimingReportIntervalSeconds()
+    {
+        unsigned configured = timingReportIntervalSeconds.load(std::memory_order_relaxed);
+        assertex(configured != uninitialized);
+        return configured;
+    }
+
+    static void updateConfig(const IPropertyTree *oldComponentConfiguration, const IPropertyTree *oldGlobalConfiguration)
+    {
+        Owned<IPropertyTree> componentConfig = getComponentConfigSP();
+
+        unsigned timingReport = static_cast<unsigned>(componentConfig->getPropInt("expert/@dfsIterateFilteredFilesTimingReportSeconds", defaultTimingReportIntervalSeconds));
+        unsigned effectiveTimingReport = timingReport ? timingReport : defaultTimingReportIntervalSeconds;
+        timingReportIntervalSeconds.store(effectiveTimingReport, std::memory_order_relaxed);
+
+        unsigned configuredBudget = static_cast<unsigned>(componentConfig->getPropInt("expert/@dfsIterateFilteredFilesScanStepBudget", defaultScanStepBudget));
+        unsigned effectiveBudget = configuredBudget ? configuredBudget : defaultScanStepBudget;
+        configuredScanStepBudget.store(effectiveBudget, std::memory_order_relaxed);
+    }
+
+    // Compares a segment of a logical file name against a wildcard filter segment.
+    // Supports '?' (single character) and '*' (zero or more characters, bounded to the current segment).
+    // The filter boundary is either explicit (filterSegmentEnd) or implicit (the next ':' or null terminator).
+    // On a match, filterCursor is advanced to the bounds of the current filter segment.
+    static bool matchSegmentCharacters(const char *nameSegment, size_t nameSegmentLen, const char *&filterCursor, const char *filterSegmentEnd)
+    {
+        // Safe access to the current filter character, enforcing the segment bounds
+        auto filterChar = [&]()
+        {
+            return (!filterSegmentEnd || filterCursor < filterSegmentEnd) ? *filterCursor : '\0';
+        };
+
+        // Advances the filter cursor past any remaining characters in the current segment
+        auto consumeToEndOfSegment = [&]()
+        {
+            if (filterSegmentEnd)
+                filterCursor = filterSegmentEnd;
             else
-                return false;
+            {
+                while (*filterCursor && (*filterCursor != ':'))
+                    filterCursor++;
+            }
+        };
+
+        size_t segPos = 0;
+        while (segPos < nameSegmentLen)
+        {
+            char segChar = nameSegment[segPos];
+            char fc = filterChar();
+
+            if (fc == '*')
+            {
+                consumeToEndOfSegment();
+                segPos = nameSegmentLen;
+                continue;
+            }
+
+            if (fc == segChar || fc == '?')
+            {
+                filterCursor++;
+                segPos++;
+                continue;
+            }
+
+            return false;
         }
+
+        // If the segment characters matched exactly, but the filter still has a trailing '*'
+        // for this segment (e.g. name="abc", filter="abc*"), consume the '*' up to the
+        // segment boundary. Otherwise the caller might incorrectly evaluate the '*' as a failed separator.
+        if (filterChar() == '*')
+            consumeToEndOfSegment();
+
         return true;
     }
 
-    bool processScopes(IPropertyTree &root,StringBuffer &name)
+    bool scopeMatchSegment(const char *scopeName, const char *&scopeFilter, bool &descendantScopesUnconstrained) const
     {
-        bool ret = false;
-        CScope *parentScope = currentScope;
-        if (parentScope)
-            currentScope = parentScope->addScope(name);
-        else
-        { // once only
-            topLevelScope.setown(new CScope(""));
-            currentScope = topLevelScope;
-        }
-        size32_t ns = name.length();
-        if (ns)
-            name.append("::");
-        size32_t ns2 = name.length();
+        // Match one scope segment as if it were "scopeName::" against the remaining
+        // wildcard filter. On success, advance scopeFilter to the first unconsumed
+        // filter character for the child scope.
+        //
+        // descendantScopesUnconstrained means the scope filter was fully consumed at an
+        // earlier depth, so deeper descendant scopes are no longer constrained by
+        // any remaining scope segments. It does NOT mean that seeing a '*' inside
+        // the current scope segment automatically satisfies later scope segments.
+        if (descendantScopesUnconstrained)
+            return true;
 
-        if (scopeMatch(name.str())) {
-            Owned<IPropertyTreeIterator> iter = root.getElements(queryDfsXmlBranchName(DXB_Scope));
-            if (iter->first()) {
-                do {
-                    IPropertyTree &scope = iter->query();
-                    if (scope.hasChildren()) {
-                        name.append(scope.queryProp("@name"));
-                        ret |= processScopes(scope, name);
-                        name.setLength(ns2);
-                    }
-                } while (iter->next());
-            }
-            if (!iterateFileFilterContainer)
-                ret |= processFiles(root,name);
-            else
-                ret |= processFilesWithFilters(root,name);
-        }
-        if (!ret && parentScope)
-            parentScope->popLastScope(); // discard scopes where no matches
-        currentScope = parentScope;
-        name.setLength(ns);
-        return ret;
-    }
+        const char *filter = scopeFilter;
+        if (isEmptyString(filter))
+            return false;
 
-    bool processFiles(IPropertyTree &root,StringBuffer &name)
-    {
-        bool ret = false;
-        const char *s1 = wildname.get();
-        size32_t ns = name.length();
-        Owned<IPropertyTreeIterator> iter = root.getElements(queryDfsXmlBranchName(DXB_File));
-        if (iter->first()) {
-            IPropertyTree &scope = iter->query();
-            do {
-                IPropertyTree &file = iter->query();
-                name.append(file.queryProp("@name"));
-                if (!s1||WildMatch(name.str(),s1,true)) {
-                    currentScope->addMatch(name,file,false);
-                    ret = true;
-                }
-                name.setLength(ns);
-            } while (iter->next());
-        }
-        if (includesuper) {
-            iter.setown(root.getElements(queryDfsXmlBranchName(DXB_SuperFile)));
-            if (iter->first()) {
-                do {
-                    IPropertyTree &file = iter->query();
-                    name.append(file.queryProp("@name"));
-                    if (!s1||WildMatch(name.str(),s1,true)) {
-                        currentScope->addMatch(name,file,true);
-                        ret = true;
-                    }
-                    name.setLength(ns);
-                } while (iter->next());
-            }
-        }
-        return ret;
-    }
+        // Phase 1: match scopeName characters.
+        size_t scopeNameLen = strlen(scopeName); // caller ensures scopeName is non-empty
+        if (!matchSegmentCharacters(scopeName, scopeNameLen, filter, nullptr))
+            return false;
 
-    bool processFilesWithFilters(IPropertyTree &root, StringBuffer &name)
-    {
-        bool ret = false;
-        size32_t ns = name.length();
-        DFUQFileTypeFilter fileTypeFilter = iterateFileFilterContainer->getFileTypeFilter();
-        if (fileTypeFilter != DFUQFFTsuperfileonly)
-            addMatchedFiles(root.getElements(queryDfsXmlBranchName(DXB_File)), false, name, ns, ret);
-        if ((fileTypeFilter == DFUQFFTall) || (fileTypeFilter == DFUQFFTsuperfileonly))
-            addMatchedFiles(root.getElements(queryDfsXmlBranchName(DXB_SuperFile)), true, name, ns, ret);
-        return ret;
-    }
-
-    void addMatchedFiles(IPropertyTreeIterator* files, bool isSuper, StringBuffer &name, size32_t ns, bool& ret)
-    {
-        Owned<IPropertyTreeIterator> iter = files;
-        ForEach(*iter)
+        if (isEmptyString(filter))
         {
-            IPropertyTree &file = iter->query();
-            name.append(file.queryProp("@name"));
-            if (iterateFileFilterContainer->matchFileScanFilter(name.str(), file))
+            descendantScopesUnconstrained = recursive;
+            scopeFilter = filter;
+            return true;
+        }
+
+        // Phase 2: match the mandatory "::" separator.
+        for (unsigned sepCount = 0; sepCount < 2; )
+        {
+            if (*filter == '*')
+                return false;  // non-recursive '*' cannot match ':'
+
+            if ((*filter != ':') && (*filter != '?'))
+                return false;
+
+            filter++;
+            sepCount++;
+        }
+
+        scopeFilter = filter;
+        return true;
+    }
+
+    bool includeScopeChild(const char *childScopeName, const char *scopeFilter, const char *scopeFilterFirstSeparator, const char *scopeFilterEnd, bool descendantScopesUnconstrained) const
+    {
+        if (descendantScopesUnconstrained)
+            return true;
+
+        if (isEmptyString(scopeFilter))
+            return false;
+
+        const char *filter = scopeFilter;
+        const char *filterSegmentEnd = scopeFilterFirstSeparator ? scopeFilterFirstSeparator : scopeFilterEnd;
+        size_t childScopeNameLen = strlen(childScopeName);
+        if (!matchSegmentCharacters(childScopeName, childScopeNameLen, filter, filterSegmentEnd))
+            return false;
+
+        if (filter == scopeFilterEnd)
+            return true;
+
+        // Must match the mandatory "::" separator (allowing '?' in separator positions).
+        for (unsigned sepCount = 0; sepCount < 2; )
+        {
+            if (filter == scopeFilterEnd)
+                return false;
+            if (*filter == '*')
+                return false;
+            if ((*filter == ':') || (*filter == '?'))
             {
-                currentScope->addMatch(name,file,isSuper);
-                ret = true;
+                filter++;
+                sepCount++;
+                continue;
             }
-            name.setLength(ns);
+            return false;
+        }
+
+        return true;
+    }
+
+    void collectChildren(const IPropertyTree &root, const char *scopeFilter, bool descendantScopesUnconstrained, std::vector<TraversalChild> &children)
+    {
+        // Caveat: child collection is intentionally eager per scope. For very wide scopes,
+        // one collection pass can consume more work than the configured page budget before
+        // we reach a safe yield point. We still account collection work in stepsTaken and
+        // stop at the next natural boundary (immediately after collection completes).
+        const bool hasScopeFilter = !isEmptyString(scopeFilter);
+        const char *scopeFilterFirstSeparator = hasScopeFilter ? strchr(scopeFilter, ':') : nullptr;
+        const char *scopeFilterEnd = hasScopeFilter ? (scopeFilter + strlen(scopeFilter)) : nullptr;
+
+        enum class LeafCollectionMode { includeAll, tailPattern, excludeAll };
+        LeafCollectionMode leafCollectionMode = LeafCollectionMode::excludeAll;
+        bool tailPatternIsAny = false;
+        if (descendantScopesUnconstrained)
+            leafCollectionMode = LeafCollectionMode::includeAll;
+        else if (hasScopeFilter && !scopeFilterFirstSeparator)
+        {
+            leafCollectionMode = LeafCollectionMode::tailPattern;
+            tailPatternIsAny = streq(scopeFilter, "*");
+        }
+
+        // Collect child files
+        DFUQFileTypeFilter fileTypeFilter = iterateFileFilterContainer->getFileTypeFilter();
+        if (((fileTypeFilter == DFUQFFTall) || (fileTypeFilter == DFUQFFTnonsuperfileonly)) && (leafCollectionMode != LeafCollectionMode::excludeAll))
+        {
+            Owned<IPropertyTreeIterator> files = root.getElements(queryDfsXmlBranchName(DXB_File));
+            if (files && files->first())
+            {
+                do
+                {
+                    if (scanStepLimit && (stepsTaken < scanStepLimit))
+                        ++stepsTaken;
+
+                    if (leafCollectionMode == LeafCollectionMode::tailPattern)
+                    {
+                        const char *fileName = files->query().queryProp("@name");
+                        if (!fileName)
+                            continue;
+                        if (!tailPatternIsAny && !WildMatch(fileName, scopeFilter, true))
+                            continue;
+                    }
+
+                    TraversalChild &child = children.emplace_back();
+                    child.tree.set(&files->query());
+                }
+                while (files->next());
+            }
+        }
+        if (((fileTypeFilter == DFUQFFTall) || (fileTypeFilter == DFUQFFTsuperfileonly)) && (leafCollectionMode != LeafCollectionMode::excludeAll))
+        {
+            Owned<IPropertyTreeIterator> supers = root.getElements(queryDfsXmlBranchName(DXB_SuperFile));
+            if (supers && supers->first())
+            {
+                do
+                {
+                    if (scanStepLimit && (stepsTaken < scanStepLimit))
+                        ++stepsTaken;
+
+                    if (leafCollectionMode == LeafCollectionMode::tailPattern)
+                    {
+                        const char *superName = supers->query().queryProp("@name");
+                        if (!superName)
+                            continue;
+                        if (!tailPatternIsAny && !WildMatch(superName, scopeFilter, true))
+                            continue;
+                    }
+
+                    TraversalChild &child = children.emplace_back();
+                    child.tree.set(&supers->query());
+                    child.isSuper = true;
+                }
+                while (supers->next());
+            }
+        }
+        // Collect child scopes
+        Owned<IPropertyTreeIterator> scopes = root.getElements(queryDfsXmlBranchName(DXB_Scope));
+        if (scopes && scopes->first())
+        {
+            do
+            {
+                if (scanStepLimit && (stepsTaken < scanStepLimit))
+                    ++stepsTaken;
+
+                IPropertyTree &scope = scopes->query();
+                const char *scopeName = scope.queryProp("@name");
+                if (scopeName && scope.hasChildren() && includeScopeChild(scopeName, scopeFilter, scopeFilterFirstSeparator, scopeFilterEnd, descendantScopesUnconstrained))
+                {
+                    TraversalChild &child = children.emplace_back();
+                    child.tree.set(&scope);
+                    child.isScope = true;
+                }
+            }
+            while (scopes->next());
         }
     }
+
+    bool scanScope(const IPropertyTree &root, StringBuffer &currentScopePath, const char *currentScopeTail, const char *scopeFilter, bool descendantScopesUnconstrained,
+        CFileMatchArray &matches, TraversalState &nextState)
+    {
+        size32_t baseLen = currentScopePath.length();
+        if (baseLen)
+            currentScopePath.append("::");
+        size32_t scopeLen = currentScopePath.length();
+
+        bool matched = true;
+        const char *remainingScopeFilter = scopeFilter;
+        bool scopeDescendantScopesUnconstrained = descendantScopesUnconstrained;
+        if (!isEmptyString(currentScopeTail))
+            matched = scopeMatchSegment(currentScopeTail, remainingScopeFilter, scopeDescendantScopesUnconstrained);
+        if (matched)
+        {
+            std::vector<TraversalChild> children;
+            size_t startIndex = 0;
+            size_t pendingIndex = TraversalStackLevel::noChild;  // partially-scanned child to re-enter when resuming
+            if (!nextState.empty())
+            {
+                // Reuse the captured children and resume from the saved position rather
+                // than restarting this scope from its first child.
+                TraversalStackLevel level = std::move(nextState.back());
+                nextState.pop_back();
+                children = std::move(level.children);
+                startIndex = level.currentIndex;
+                pendingIndex = level.pendingChildIndex;
+
+                // How the resume position is split across stack frames:
+                //
+                // When a previous batch stopped inside a nested scope, the unfinished work
+                // is NOT described by a single index. It is spread across one resume frame
+                // per level of the descent, ordered deepest-first in the resume cursor. Each frame
+                // stores the index of the NEXT SIBLING to process after the child that was
+                // active when the batch stopped - i.e. currentIndex points *past* the child
+                // that is still only partially scanned, because that child is represented by
+                // the next (deeper) frame, not by this frame.
+                //
+                // Therefore, when a deeper frame exists, the child that must be re-entered
+                // to finish its subtree is tracked explicitly in pendingChildIndex so the
+                // loop below revisits it first (descending with the deeper frame) and only
+                // afterwards continues with the normal siblings from startIndex onwards.
+                //
+                // Worked example - tree:
+                //     root
+                //     └─ a
+                //        ├─ b        (index 0)
+                //        ├─ c        (index 1)  -> f1, f2, f3
+                //        └─ d        (index 2)
+                // If a batch stopped after emitting c::f2, the saved frames are:
+                //     frame for c : currentIndex = 2   (next child inside c is f3)
+                //     frame for a : currentIndex = 2   (next sibling after c is d)
+                // Resuming at 'a': startIndex = 2 (d), pendingIndex = 1 (c). The loop first
+                // re-enters c to emit f3, then continues normally at d. Without pendingIndex,
+                // c::f3 would be skipped because a's cursor already points past c.
+                if (pendingIndex != TraversalStackLevel::noChild)
+                    assertex((pendingIndex < children.size()) && (startIndex == pendingIndex + 1));
+            }
+            else
+            {
+                collectChildren(root, remainingScopeFilter, scopeDescendantScopesUnconstrained, children);
+
+                // If collection consumed the page budget, yield before processing siblings.
+                // This preserves a stable resume point while still accounting collection cost.
+                if (scanStepLimit && (stepsTaken >= scanStepLimit) && !children.empty())
+                {
+                    captureCurrentState(nextState, std::move(children), 0, TraversalStackLevel::noChild);
+                    currentScopePath.setLength(baseLen);
+                    return false;
+                }
+            }
+
+            size_t loopStart = (pendingIndex != TraversalStackLevel::noChild) ? pendingIndex : startIndex;
+            for (size_t childIndex = loopStart; childIndex < children.size(); childIndex++)
+            {
+                TraversalChild &childRef = children[childIndex];
+                // Child references are captured when a batch starts. During pagination,
+                // concurrent DFS mutations can delete one of those children before we
+                // resume and visit it. In that case the linked child node becomes
+                // orphaned, so we skip it instead of dereferencing stale metadata.
+                // Consequence: under concurrent deletes, a resumed scan may return fewer
+                // rows than an immutable snapshot, but traversal remains safe and makes
+                // forward progress through the remaining siblings.
+                if (unlikely(childRef.tree->isOrphaned()))
+                {
+                    // If the orphaned child was the pending partially-scanned scope, the remaining
+                    // nextState frames belong exclusively to its subtree and must be discarded.
+                    // Otherwise the next sibling scope would incorrectly consume them.
+                    if (childIndex == pendingIndex)
+                        nextState.clear();
+                    continue;
+                }
+                const IPropertyTree &child = *childRef.tree;
+                const char *childName = child.queryProp("@name");
+                if (unlikely(!childName)) // prob. impossible
+                    continue;
+
+                currentScopePath.append(childName);
+                bool stopRequested = false;
+                bool reenterCurrentChild = false;
+
+                // Bound a batch by traversal work, not by match density.
+                // Re-entering a pending child must not consume another step:
+                // that child was already charged when first reached in a prior batch.
+                bool stepLimitReached = false;
+                bool pendingChild = (childIndex == pendingIndex);
+                if (scanStepLimit && !pendingChild)
+                {
+                    ++stepsTaken;
+                    stepLimitReached = (stepsTaken >= scanStepLimit);
+                }
+
+                if (childRef.isScope)
+                {
+                    if (stepLimitReached)
+                    {
+                        // Budget exhausted before descending into this child scope.
+                        // Preserve it as pending so next resume re-enters here.
+                        reenterCurrentChild = true;
+                    }
+                    else
+                    {
+                        // Re-enter the partially-scanned child with its deeper resume level;
+                        // all other children are new subtrees scanned from the beginning.
+                        // If this is not the pending child, nextState should already be empty
+                        // because the pending child consumed any remaining deeper frames.
+                        assertex(childIndex == pendingIndex || nextState.empty());
+                        if (!scanScope(child, currentScopePath, childName, remainingScopeFilter, scopeDescendantScopesUnconstrained, matches, nextState))
+                        {
+                            stopRequested = true;
+                            reenterCurrentChild = true;
+                        }
+                    }
+                }
+                else
+                {
+                    // This is a file or superfile
+                    const char *logicalName = currentScopePath.str();
+                    if (iterateFileFilterContainer->matchFileScanFilter(logicalName, child))
+                    {
+                        try
+                        {
+                            matches.append(*new CFileMatch(logicalName, child, childRef.isSuper, iterateFileFilterContainer->getSerializeFileAttrOptions()));
+                        }
+                        catch (IException *e)
+                        {
+                            VStringBuffer msg("Failed to capture serialized properties for file: %s", logicalName);
+                            EXCLOG(e, msg.str());
+                            e->Release();
+                        }
+                    }
+                }
+                currentScopePath.setLength(scopeLen);
+                if (!stopRequested)
+                    stopRequested = stepLimitReached;
+                if (stopRequested)
+                {
+                    // scanScope() stops early when traversal step budget is exhausted,
+                    // either before descending or within a descendant subtree.
+                    size_t capturedPendingIndex = reenterCurrentChild ? childIndex : TraversalStackLevel::noChild;
+                    // Capture current position for pause/resume
+                    captureCurrentState(nextState, std::move(children), childIndex + 1, capturedPendingIndex);
+
+                    currentScopePath.setLength(baseLen);
+                    return false;
+                }
+            }
+        }
+        currentScopePath.setLength(baseLen);
+        return true;
+    }
+
+    // Capture traversal state at current recursion depth
+    void captureCurrentState(TraversalState &nextState, std::vector<TraversalChild> &&children, size_t currentChildIndex, size_t pendingChildIndex)
+    {
+        // Build a stack level representing only the unconsumed suffix for this scope.
+        // If a pending child exists, keep it as the first element so resume can re-enter
+        // the unfinished subtree before continuing with later siblings.
+        TraversalStackLevel level;
+
+        size_t sliceStart = (pendingChildIndex != TraversalStackLevel::noChild) ? pendingChildIndex : currentChildIndex;
+        assertex(currentChildIndex <= children.size());
+        assertex(sliceStart <= currentChildIndex);
+        assertex((pendingChildIndex == TraversalStackLevel::noChild) || (currentChildIndex == pendingChildIndex + 1));
+        level.children.reserve(children.size() - sliceStart);
+        for (size_t childIndex = sliceStart; childIndex < children.size(); ++childIndex)
+            level.children.emplace_back(std::move(children[childIndex]));
+
+        level.currentIndex = currentChildIndex - sliceStart;
+        level.pendingChildIndex = (pendingChildIndex != TraversalStackLevel::noChild) ? (pendingChildIndex - sliceStart) : TraversalStackLevel::noChild;
+        nextState.push_back(std::move(level));
+    }
+
 public:
-    void scan(IPropertyTree *sroot, const char *_wildname,bool _recursive,bool _includesuper)
+    static void installConfigHookOnce()
     {
-        if (_wildname)
-            wildname.set(_wildname);
-        else
-            wildname.clear();
-        recursive = _recursive;
-        includesuper = _includesuper;
-        StringBuffer name;
-        topLevelScope.clear();
-        currentScope = NULL;
-        processScopes(*sroot->queryPropTree(querySdsFilesRoot()),name);
+        configHook.installOnce(updateConfig, true);
     }
-    void scan(IPropertyTree *sroot, CIterateFileFilterContainer* _iterateFileFilterContainer, bool _recursive)
-    {
-        iterateFileFilterContainer.setown(_iterateFileFilterContainer);
-        recursive = _recursive;
 
-        StringBuffer name;
-        topLevelScope.clear();
-        currentScope = NULL;
-        processScopes(*sroot->queryPropTree(querySdsFilesRoot()),name);
-    }
-    void _getResults(bool auth, IUserDescriptor *user, CScope &scope, CFileMatchArray &matchingFiles, StringArray &authScopes,
-        unsigned &count, bool checkFileCount)
+    static unsigned queryScanStepBudget()
     {
-        if (auth)
-        {
-            SecAccessFlags perm = getScopePermissions(scope.getName(),user,0);     // don't audit
-            if (!HASREADPERMISSION(perm))
-                return;
-            authScopes.append(scope.getName());
-        }
-        CFileMatchArray &files = scope.queryFiles();
-        ForEachItemIn(f, files)
-        {
-            if (checkFileCount && (count == iterateFileFilterContainer->getMaxFilesFilter()))
-                throw MakeStringException(DFSERR_PassIterateFilesLimit, "CFileScanner::_getResults() found >%d files.",
-                    iterateFileFilterContainer->getMaxFilesFilter());
+        unsigned configured = configuredScanStepBudget.load(std::memory_order_relaxed);
+        assertex(configured != uninitialized);
+        return configured;
+    }
 
-            CFileMatch *match = &files.item(f);
-            matchingFiles.append(*LINK(match));
-            ++count;
-        }
-        CScopeArray &subScopes = scope.querySubScopes();
-        ForEachItemIn(s, subScopes)
+    static void noteTiming(const char *trc, unsigned scanMs, unsigned authMs, unsigned serializationMs)
+    {
+        unsigned totalMs = scanMs + authMs + serializationMs;
+        bool logHourly = false;
+        unsigned __int64 totalCalls = 0;
+        unsigned __int64 totalScanMs = 0;
+        unsigned __int64 totalAuthMs = 0;
+        unsigned __int64 totalSerializationMs = 0;
+        unsigned __int64 hourlyTotalMs = 0;
+        time_t reportIntervalSeconds = queryTimingReportIntervalSeconds();
+
+        time_t now = time(nullptr);
         {
-            CScope &subScope = subScopes.item(s);
-            _getResults(auth, user, subScope, matchingFiles, authScopes, count, checkFileCount);
+            CriticalBlock block(timingCrit);
+            timingCallCount++;
+            timingScanMs += scanMs;
+            timingAuthMs += authMs;
+            timingSerializationMs += serializationMs;
+
+            if (!timingNextReport)
+                timingNextReport = now + reportIntervalSeconds;
+            else if (now >= timingNextReport)
+            {
+                logHourly = true;
+                totalCalls = timingCallCount;
+                totalScanMs = timingScanMs;
+                totalAuthMs = timingAuthMs;
+                totalSerializationMs = timingSerializationMs;
+                hourlyTotalMs = totalScanMs + totalAuthMs + totalSerializationMs;
+
+                timingCallCount = 0;
+                timingScanMs = 0;
+                timingAuthMs = 0;
+                timingSerializationMs = 0;
+                timingNextReport = now + reportIntervalSeconds;
+            }
+        }
+
+        if (totalMs > 100)
+            PROGLOG("TIMING(filescan): %s: took %u ms (scan=%u auth=%u serialization=%u)", trc, totalMs, scanMs, authMs, serializationMs);
+
+        if (logHourly)
+        {
+            PROGLOG("TIMING(filescan-hourly): last %u s calls=%llu total=%llu ms (scanLocked=%llu auth=%llu serialization=%llu)",
+                static_cast<unsigned>(reportIntervalSeconds), totalCalls, hourlyTotalMs, totalScanMs, totalAuthMs, totalSerializationMs);
         }
     }
-    unsigned getResults(bool auth, IUserDescriptor *user, CFileMatchArray &matchingFiles, StringArray &authScopes, unsigned &count, bool checkFileCount)
+
+    CFileScanner(unsigned _scanStepLimit = queryScanStepBudget()) : scanStepLimit(_scanStepLimit)
     {
-        _getResults(auth, user, *topLevelScope, matchingFiles, authScopes, count, checkFileCount);
-        return count;
+    }
+
+    void begin(const CIterateFileFilterContainer *_iterateFileFilterContainer, bool _recursive)
+    {
+        assertex(_iterateFileFilterContainer);
+        iterateFileFilterContainer = _iterateFileFilterContainer;
+        recursive = _recursive;
+        traversalState.clear();
+        firstPagePending = true;
+    }
+
+    bool nextPage(const IPropertyTree *sroot, CFileMatchArray &matches)
+    {
+        assertex(sroot);
+        assertex(iterateFileFilterContainer);
+        matches.kill();
+        stepsTaken = 0;
+
+        // Exhausted: no additional work remains for this configured traversal.
+        if (!firstPagePending && traversalState.empty())
+            return false;
+
+        firstPagePending = false;
+
+        const char *activeNameFilter = iterateFileFilterContainer->getNameFilter();
+        StringBuffer currentScopePath;
+        scanScope(*sroot->queryPropTree(querySdsFilesRoot()), currentScopePath, nullptr, activeNameFilter, false, matches, traversalState);
+
+        // true means the caller can request another page.
+        return !traversalState.empty();
     }
 };
+
+CConfigUpdateHook CFileScanner::configHook;
+std::atomic<unsigned> CFileScanner::timingReportIntervalSeconds{CFileScanner::uninitialized};
+std::atomic<unsigned> CFileScanner::configuredScanStepBudget{CFileScanner::uninitialized};
+CriticalSection CFileScanner::timingCrit("timingCrit");
+unsigned __int64 CFileScanner::timingCallCount = 0;
+unsigned __int64 CFileScanner::timingScanMs = 0;
+unsigned __int64 CFileScanner::timingAuthMs = 0;
+unsigned __int64 CFileScanner::timingSerializationMs = 0;
+time_t CFileScanner::timingNextReport = 0;
 
 StringBuffer &getClusterGroupName(const IPropertyTree &cluster, StringBuffer &groupName)
 {
@@ -9411,6 +11358,7 @@ StringBuffer &getClusterSpareGroupName(const IPropertyTree &cluster, StringBuffe
     return getClusterGroupName(cluster, groupName).append("_spares");
 }
 
+
 // JCSMORE - dfs group handling may be clearer if in own module
 class CInitGroups
 {
@@ -9419,6 +11367,7 @@ class CInitGroups
     StringArray clusternames;
     unsigned defaultTimeout;
     bool machinesLoaded;
+    bool writeLock;
 
     GroupType getGroupType(const char *type)
     {
@@ -9440,8 +11389,10 @@ class CInitGroups
         // see if identical
         const char *oldKind = oldClusterGroup->queryProp("@kind");
         const char *oldDir = oldClusterGroup->queryProp("@dir");
+        bool oldHasProtected = oldClusterGroup->hasProp("@protected");
         const char *newKind = newClusterGroup->queryProp("@kind");
         const char *newDir = newClusterGroup->queryProp("@dir");
+        bool newHasProtected = newClusterGroup->hasProp("@protected");
         if (oldKind)
         {
             if (newKind)
@@ -9466,7 +11417,15 @@ class CInitGroups
         }
         else if (NULL!=newDir)
             return false;
-
+        if (oldHasProtected != newHasProtected)
+            return false;
+        else if (oldHasProtected && newHasProtected)
+        {
+            bool oldProtected = oldClusterGroup->getPropBool("@protected");
+            bool newProtected = newClusterGroup->getPropBool("@protected");
+            if (oldProtected != newProtected)
+                return false;
+        }
         unsigned oldGroupCount = oldClusterGroup->getCount("Node");
         unsigned newGroupCount = newClusterGroup->getCount("Node");
         if (oldGroupCount != newGroupCount)
@@ -9494,6 +11453,8 @@ class CInitGroups
 
     void addClusterGroup(const char *name, IPropertyTree *newClusterGroup, bool realCluster)
     {
+        if (!writeLock)
+            throw makeStringException(0, "CInitGroups::addClusterGroup called in read-only mode");
         VStringBuffer prop("Group[@name=\"%s\"]", name);
         IPropertyTree *root = groupsconnlock.conn->queryRoot();
         IPropertyTree *old = root->queryPropTree(prop.str());
@@ -9587,6 +11548,9 @@ class CInitGroups
             case grp_hthor:
                 kind = "hthor";
                 break;
+            case grp_dropzone:
+                kind = "dropzone";
+                break;
         }
         if (kind)
             cluster->setProp("@kind",kind);
@@ -9613,7 +11577,31 @@ class CInitGroups
             addHostsToIPTFunc();
         return cluster.getClear();
     }
-
+    const char *getHostFromClusterEntry(const IPropertyTree &node, const char *clusterName)
+    {
+        const char *computer = node.queryProp("@computer");
+        if (!isEmptyString(computer))
+        {
+            auto it = machineMap.find(computer);
+            if (it == machineMap.end())
+            {
+                OERRLOG("Cannot construct %s, computer name %s not found\n", clusterName, computer);
+                return nullptr;
+            }
+            return it->second.c_str();
+        }
+        else
+        {
+            const char *host = node.queryProp("@netAddress");
+            if (isEmptyString(host))
+            {
+                OERRLOG("Cannot construct %s, missing computer spec on node\n", clusterName);
+                return nullptr;
+            }
+            else
+                return host;
+        }
+    }
     IPropertyTree *createClusterGroupFromEnvCluster(GroupType groupType, const IPropertyTree &cluster, const char *dir, bool realCluster, bool expand)
     {
         const char *processName=nullptr;
@@ -9628,49 +11616,51 @@ class CInitGroups
             case grp_roxie:
                 processName = "RoxieServerProcess";
                 break;
+            case grp_dropzone:
+                processName = "ServerList";
+                break;
             default:
                 throwUnexpected();
         }
         std::vector<std::string> hosts;
         Owned<IPropertyTreeIterator> nodes = cluster.getElements(processName);
-        ForEach(*nodes)
+        if (nodes->first())
         {
-            IPropertyTree &node = nodes->query();
-            const char *computer = node.queryProp("@computer");
-            const char *host = nullptr;
-            if (!isEmptyString(computer))
+            do
             {
-                auto it = machineMap.find(computer);
-                if (it == machineMap.end())
+                IPropertyTree &node = nodes->query();
+                const char *host = nullptr;
+                if (grp_dropzone == groupType)
+                    host = node.queryProp("@server");
+                else
+                    host = getHostFromClusterEntry(node, cluster.queryProp("@name"));
+                switch (groupType)
                 {
-                    OERRLOG("Cannot construct %s, computer name %s not found\n", cluster.queryProp("@name"), computer);
-                    return nullptr;
-                }
-                host = it->second.c_str();
-            }
-            else
-            {
-                host = node.queryProp("@netAddress");
-                if (isEmptyString(host))
-                {
-                    OERRLOG("Cannot construct %s, missing computer spec on node\n", cluster.queryProp("@name"));
-                    return nullptr;
-                }
-            }
-            switch (groupType)
-            {
-                case grp_roxie:
-                    // Redundant copies are located via the flags.
-                    // Old environments may contain duplicated sever information for multiple ports
-                    if (hosts.end() == std::find(hosts.begin(), hosts.end(), host)) // only add if not already there
+                    case grp_roxie:
+                        // Redundant copies are located via the flags.
+                        // Old environments may contain duplicated sever information for multiple ports
+                        if (hosts.end() == std::find(hosts.begin(), hosts.end(), host)) // only add if not already there
+                            hosts.push_back(host);
+                        break;
+                    case grp_thor:
+                    case grp_thorspares:
+                    case grp_dropzone:
                         hosts.push_back(host);
-                    break;
-                case grp_thor:
-                case grp_thorspares:
+                        break;
+                    default:
+                        throwUnexpected();
+                }
+            }
+            while (nodes->next());
+        }
+        else if (grp_dropzone == groupType)
+        {
+            // legacy support for DropZone's without ServerList
+            if (cluster.hasProp("@computer") || cluster.hasProp("@netAddress"))
+            {
+                const char *host = getHostFromClusterEntry(cluster, cluster.queryProp("@name"));
+                if (!isEmptyString(host))
                     hosts.push_back(host);
-                    break;
-                default:
-                    throwUnexpected();
             }
         }
         if (!hosts.size())
@@ -9681,6 +11671,7 @@ class CInitGroups
 
     bool constructGroup(const IPropertyTree &cluster, const char *altName, IPropertyTree *oldEnvCluster, GroupType groupType, bool force, StringBuffer &messages)
     {
+        dbgassertex(!isContainerized());
         /* a 'realCluster' is a cluster who's name matches it's nodeGroup
          * if the nodeGroup differs it implies it's sharing the nodeGroup with other thor instance(s).
          */
@@ -9691,22 +11682,29 @@ class CInitGroups
         switch (groupType)
         {
             case grp_thor:
-                getClusterGroupName(cluster, gname);
-                if (!streq(cluster.queryProp("@name"), gname.str()))
+                getClusterGroupName(cluster, gname); // NB: ensures lowercases
+                if (!strieq(cluster.queryProp("@name"), gname.str()))
                     realCluster = false;
                 if (oldEnvCluster)
                 {
-                    getClusterGroupName(*oldEnvCluster, oldGname);
-                    if (!streq(oldEnvCluster->queryProp("@name"), oldGname.str()))
+                    getClusterGroupName(*oldEnvCluster, oldGname); // NB: ensures lowercases
+                    if (!strieq(oldEnvCluster->queryProp("@name"), oldGname.str()))
                         oldRealCluster = false;
                 }
                 break;
             case grp_thorspares:
-                getClusterSpareGroupName(cluster, gname);
+                getClusterSpareGroupName(cluster, gname); // ensures lowercase
                 oldRealCluster = realCluster = false;
                 break;
             case grp_roxie:
                 gname.append(cluster.queryProp("@name"));
+                gname.toLowerCase();
+                break;
+            case grp_dropzone:
+                gname.append(cluster.queryProp("@name"));
+                gname.toLowerCase();
+                oldRealCluster = realCluster = false;
+                defDir = cluster.queryProp("@directory");
                 break;
             default:
                 throwUnexpected();
@@ -9717,6 +11715,10 @@ class CInitGroups
         IPropertyTree *existingClusterGroup = queryExistingGroup(gname);
         bool matchOldEnv = false;
         Owned<IPropertyTree> newClusterGroup = createClusterGroupFromEnvCluster(groupType, cluster, defDir, realCluster, true);
+        // All BM groups are protected by default, except dropzones.
+        // Meaning, they will not automatically be updated if the Environment cluster definition changes.
+        if (newClusterGroup && (grp_dropzone != groupType))
+            newClusterGroup->setPropBool("@protected", true);
         bool matchExisting = !force && clusterGroupCompare(newClusterGroup, existingClusterGroup);
         if (oldEnvCluster)
         {
@@ -9755,6 +11757,10 @@ class CInitGroups
             VStringBuffer msg("New cluster layout for cluster %s", gname.str());
             UWARNLOG("%s", msg.str());
             messages.append(msg).newline();
+            // All BM groups are protected by default, except dropzones.
+            // Meaning, they will not automatically be updated if the Environment cluster definition changes.
+            if (grp_dropzone != groupType)
+                newClusterGroup->setPropBool("@protected", true);
             addClusterGroup(gname.str(), newClusterGroup.getClear(), realCluster);
             return true;
         }
@@ -9781,6 +11787,7 @@ class CInitGroups
                     if (ins>1)
                         gname.append('_').append(ins);
                     Owned<IPropertyTree> clusterGroup = createClusterGroup(grp_hthor, { na }, nullptr, &cluster, true, false);
+                    clusterGroup->setPropBool("@protected", true);
                     addClusterGroup(gname.str(), clusterGroup.getClear(), true);
                 }
             }
@@ -9815,11 +11822,12 @@ class CInitGroups
         return root->queryPropTree(xpath.str());
     }
 public:
-    CInitGroups(unsigned _defaultTimeout)
-        : groupsconnlock("constructGroup",SDS_GROUPSTORE_ROOT,true,false,false,_defaultTimeout)
+    CInitGroups(unsigned _defaultTimeout, bool _writeLock)
+        : groupsconnlock("constructGroup",SDS_GROUPSTORE_ROOT,_writeLock,false,false,_defaultTimeout)
     {
         defaultTimeout = _defaultTimeout;
         machinesLoaded = false;
+        writeLock = _writeLock;
     }
 
     IPropertyTree *queryCluster(const IPropertyTree *env, const char *_clusterName, const char *type, const char *msg, StringBuffer &messages)
@@ -9855,6 +11863,7 @@ public:
     }
     bool resetClusterGroup(const char *clusterName, const char *type, bool spares, StringBuffer &messages)
     {
+        dbgassertex(!isContainerized());
         Owned<IRemoteConnection> conn = querySDS().connect("/Environment", myProcessSession(), RTM_LOCK_READ, SDS_CONNECT_TIMEOUT);
         if (!conn)
             return false;
@@ -9937,9 +11946,14 @@ public:
         {
             SocketEndpointArray existingGroupBoundEps;
             StringAttr groupDir;
-            if (!loadGroup(existing, existingGroupBoundEps, nullptr, nullptr))
+            try
             {
-                IWARNLOG("removeSpares: failed to load group: '%s'", groupName.str());
+                loadGroup(existing, existingGroupBoundEps, nullptr, nullptr);
+            }
+            catch (IException *e)
+            {
+                IWARNLOG(e, "removeSpares");
+                e->Release();
                 return false;
             }
             for (const auto &boundHostToRemove: boundHostsToRemove)
@@ -9965,8 +11979,61 @@ public:
         }
         return true;
     }
+    void clearUnprotectedGroups()
+    {
+        if (!writeLock)
+            throw makeStringException(0, "CInitGroups::clearUnprotectedGroups called in read-only mode");
+
+        Owned<IPropertyTree> globalConfig = getGlobalConfig();
+        IPropertyTree * storage = globalConfig->queryPropTree("storage");
+        if (!storage)
+            return;
+        std::vector<IPropertyTree *> toRemove;
+        IPropertyTree *groupsRoot = groupsconnlock.conn->queryRoot();
+        Owned<IPropertyTreeIterator> groups = groupsRoot->getElements("Group");
+        bool firstBareMetalProtectedRun = true;
+        if (isContainerized())
+            firstBareMetalProtectedRun = false;
+        else
+        {
+            // check if any protected groups. Unless this is the 1st BM run since this feature was added,
+            // there will be >0 (one for each cluster group in the environment from previous runs).
+            ForEach(*groups)
+            {
+                IPropertyTree &group = groups->query();
+                if (group.hasProp("@protected"))
+                {
+                    firstBareMetalProtectedRun = false;
+                    break;
+                }
+            }
+        }
+        ForEach(*groups)
+        {
+            IPropertyTree &group = groups->query();
+            bool doDelete = false;
+            if (firstBareMetalProtectedRun)
+            {
+                doDelete = strsame("dropzone", group.queryProp("@kind"));
+                if (!doDelete)
+                {
+                    // Protect all non dropzone BM groups created on 1st run
+                    // This preserves legacy semantics, where Dali groups will not automatically be
+                    // overwritten by a change in the topology in the environment.
+                    group.setPropBool("@protected", true);
+                }
+            }
+            else
+                doDelete = !group.getPropBool("@protected");
+            if (doDelete)
+                toRemove.push_back(&group);
+        }
+        for (auto &group: toRemove)
+            groupsRoot->removeTree(group);
+    }
     void constructGroups(bool force, StringBuffer &messages, IPropertyTree *oldEnvironment)
     {
+        dbgassertex(!isContainerized());
         Owned<IRemoteConnection> conn = querySDS().connect("/Environment/Software", myProcessSession(), RTM_LOCK_READ, SDS_CONNECT_TIMEOUT);
         if (!conn)
             return;
@@ -10017,6 +12084,26 @@ public:
                 }
             }
         }
+
+        //Walk the drop zones, and add them as storage groups if they have no servers configured, or "."
+        Owned<IPropertyTreeIterator> dropzones = conn->queryRoot()->getElements("DropZone");
+        ForEach(*dropzones)
+        {
+            IPropertyTree & dropZone = dropzones->query();
+            unsigned numServers = dropZone.getCount("ServerList");
+
+            //Allow url style drop zones, and drop zones with a single node.  Not sure what >1 would mean in legacy.
+            if (numServers <= 1)
+            {
+                IPropertyTree *oldDropZone = NULL;
+                if (oldEnvironment)
+                {
+                    VStringBuffer xpath("Software/DropZone[@name=\"%s\"]", dropZone.queryProp("@name"));
+                    oldDropZone = oldEnvironment->queryPropTree(xpath.str());
+                }
+                constructGroup(dropZone,NULL,oldDropZone,grp_dropzone,force,messages);
+            }
+        }
     }
 
     IPropertyTree * createStorageGroup(const char * name, size32_t size, const char * path)
@@ -10025,42 +12112,45 @@ public:
         return createClusterGroup(grp_unknown, hosts, path, nullptr, false, false);
     }
 
-    void ensureStorageGroup(bool force, const char * name, unsigned numDevices, const char * path, StringBuffer & messages)
+    void ensureConsistentStorageGroup(const char * name, IPropertyTree * newClusterGroup, StringBuffer & messages)
     {
         IPropertyTree *existingClusterGroup = queryExistingGroup(name);
-        Owned<IPropertyTree> newClusterGroup = createStorageGroup(name, numDevices, path);
         bool matchExisting = clusterGroupCompare(newClusterGroup, existingClusterGroup);
-        if (!existingClusterGroup || !matchExisting)
+        bool oldProtected = existingClusterGroup ? existingClusterGroup->getPropBool("@protected") : false;
+        bool newProtected = newClusterGroup->getPropBool("@protected");
+        if (!existingClusterGroup || !matchExisting || (oldProtected != newProtected))
         {
             if (!existingClusterGroup)
             {
                 VStringBuffer msg("New cluster layout for cluster %s", name);
                 UWARNLOG("%s", msg.str());
                 messages.append(msg).newline();
-                addClusterGroup(name, newClusterGroup.getClear(), false);
+                addClusterGroup(name, LINK(newClusterGroup), false);
             }
-            else if (force)
+            else if (!oldProtected || !newProtected) // i.e. allow overwrite if either old wasn't protected, or if was, but new isn't
             {
                 VStringBuffer msg("Forcing new group layout for storageplane %s", name);
                 UWARNLOG("%s", msg.str());
                 messages.append(msg).newline();
-                addClusterGroup(name, newClusterGroup.getClear(), false);
+                addClusterGroup(name, LINK(newClusterGroup), false);
             }
             else
             {
-                VStringBuffer msg("Active cluster '%s' group layout does not match stroageplane definition", name);
+                VStringBuffer msg("Active cluster '%s' group layout does not match storageplane definition", name);
                 UWARNLOG("%s", msg.str());                                                                        \
                 messages.append(msg).newline();
             }
         }
     }
 
-    void constructStorageGroups(bool force, StringBuffer &messages)
+    void constructStorageGroups(StringBuffer &messages)
     {
-        IPropertyTree & global = queryGlobalConfig();
-        IPropertyTree * storage = global.queryPropTree("storage");
+        Owned<IPropertyTree> globalConfig = getGlobalConfig();
+        IPropertyTree * storage = globalConfig->queryPropTree("storage");
         if (storage)
         {
+            normalizeHostGroups(globalConfig);
+
             Owned<IPropertyTreeIterator> planes = storage->getElements("planes");
             ForEach(*planes)
             {
@@ -10069,25 +12159,67 @@ public:
                 if (isEmptyString(name))
                     continue;
 
-                //Lower case the group name - see CnamedGroupStore::dolookup which lower cases before resolving.
+                //Lower case the group name - see CNamedGroupStore::dolookup which lower cases before resolving.
                 StringBuffer gname;
                 gname.append(name).toLowerCase();
 
                 //Two main type of storage plane - with a host group (bare metal) and without.
-                IPropertyTree *existingGroup = queryExistingGroup(gname);
-                const char * hosts = plane.queryProp("@hosts");
+                const char * hostGroup = plane.queryProp("@hostGroup");
                 const char * prefix = plane.queryProp("@prefix");
-                if (hosts)
+                Owned<IPropertyTree> newClusterGroup;
+                if (hostGroup)
                 {
-                    IPropertyTree *existingClusterGroup = queryExistingGroup(gname);
-                    if (!existingClusterGroup)
-                        UNIMPLEMENTED_X("Bare metal storage planes not yet supported");
+                    Owned<IPropertyTree> match = getHostGroup(hostGroup, true);
+                    std::vector<std::string> hosts;
+                    Owned<IPropertyTreeIterator> hostIter = match->getElements("hosts");
+                    ForEach (*hostIter)
+                        hosts.push_back(hostIter->query().queryProp(nullptr));
+
+                    //A bare-metal storage plane defined in terms of a hostGroup
+                    newClusterGroup.setown(createClusterGroup(grp_unknown, hosts, prefix, nullptr, false, false));
+                }
+                else if (plane.hasProp("hostGroup"))
+                {
+                    throw makeStringExceptionV(-1, "Use 'hosts' rather than 'hostGroup' for inline list of hosts for plane %s", gname.str());
+                }
+                else if (plane.hasProp("hosts"))
+                {
+                    //A bare-metal storage plane defined by an explicit list of ips (useful for landing zones)
+                    std::vector<std::string> hosts;
+                    Owned<IPropertyTreeIterator> iter = plane.getElements("hosts");
+                    ForEach(*iter)
+                        hosts.push_back(iter->query().queryProp(nullptr));
+                    newClusterGroup.setown(createClusterGroup(grp_unknown, hosts, prefix, nullptr, false, false));
                 }
                 else
                 {
+                    //Locally mounted, or url accessed storage plane - no associated hosts, localhost used as a placeholder
                     unsigned numDevices = plane.getPropInt("@numDevices", 1);
-                    ensureStorageGroup(force, gname, numDevices, prefix, messages);
+                    newClusterGroup.setown(createStorageGroup(gname, numDevices, prefix));
                 }
+                // Storage planes are the single source of truth for storage layout.
+                // Dali groups are created to reflect storage plane definitions.
+                // If a plane definition changes, the corresponding Dali group is overwritten
+                // (with a warning issued).
+                //
+                // Setting @protectGroup=true on an individual plane prevents a changed plane
+                // definition from overwriting the existing Dali group layout.
+                //
+                // Note: For bare-metal Environment-based groups, the existing group is protected
+                // by default. In containerized environments, the plane definition always takes
+                // precedence unless it is explicitly protected.
+                //
+                // The @protectGroup option should only be used if existing logical files reference
+                // an old plane layout and there is a need to prevent them from pointing to a new group
+                // layout (which could make physical file parts inaccessible). However, such plane
+                // topology changes should be avoided. Instead, a new plane should be defined, with the
+                // existing plane definition being left untouched, so that existing files that reference
+                // it are unaffected.
+                if (plane.getPropBool("@protectGroup"))
+                    newClusterGroup->setPropBool("@protected", true);
+                else
+                    newClusterGroup->removeProp("@protected");
+                ensureConsistentStorageGroup(gname, newClusterGroup, messages);
             }
         }
     }
@@ -10104,42 +12236,42 @@ public:
     }
 };
 
-void initClusterGroups(bool force, StringBuffer &response, IPropertyTree *oldEnvironment, unsigned timems)
+void initClusterAndStoragePlaneGroups(StringBuffer &response, bool force, IPropertyTree *oldEnvironment, unsigned timems)
 {
-    CInitGroups init(timems);
-    init.constructGroups(force, response, oldEnvironment);
-}
-
-void initClusterAndStoragePlaneGroups(bool force, IPropertyTree *oldEnvironment, unsigned timems)
-{
-    CInitGroups init(timems);
-
-    StringBuffer response;
-    init.constructGroups(force, response, oldEnvironment);
-    if (response.length())
-        MLOG("DFS group initialization : %s", response.str()); // should this be a syslog?
-
-    response.clear();
-    init.constructStorageGroups(false, response);
-    if (response.length())
-        MLOG("StoragePlane group initialization : %s", response.str()); // should this be a syslog?
+    CInitGroups init(timems, true);
+    // clearUnprotectedGroups clears all unprotected groups - BM hthor, thor, roxie Environment groups are
+    // protected to maintain existing semantics, and to protect logical files which reference them.
+    init.clearUnprotectedGroups();
+    if (!isContainerized())
+    {
+        // Create groups based on the Environment
+        // Detects mismatches between existing Dali groups and new Environment definitions
+        // and avoids replacing them unless forced. This is to avoid situations where existing
+        // logical files reference existing groups, changing their definition may render the
+        // logical file parts inaccessible.
+        // NB: these groups derived from Environment, are tagged with @kind thor, roxie, hthor, dropzone etc.
+        init.constructGroups(force, response, oldEnvironment);
+    }
+    // Create storage plane groups based on the global config storage/planes definitions
+    init.constructStorageGroups(response);
 }
 
 bool resetClusterGroup(const char *clusterName, const char *type, bool spares, StringBuffer &response, unsigned timems)
 {
-    CInitGroups init(timems);
+    dbgassertex(!isContainerized());
+    CInitGroups init(timems, true);
     return init.resetClusterGroup(clusterName, type, spares, response);
 }
 
 bool addClusterSpares(const char *clusterName, const char *type, const std::vector<std::string> &hosts, StringBuffer &response, unsigned timems)
 {
-    CInitGroups init(timems);
+    CInitGroups init(timems, true);
     return init.addSpares(clusterName, type, hosts, response);
 }
 
 bool removeClusterSpares(const char *clusterName, const char *type, const std::vector<std::string> &hosts, StringBuffer &response, unsigned timems)
 {
-    CInitGroups init(timems);
+    CInitGroups init(timems, true);
     return init.removeSpares(clusterName, type, hosts, response);
 }
 
@@ -10163,7 +12295,7 @@ static IGroup *getClusterNodeGroup(const char *clusterName, const char *type, bo
      * to DFS and elsewhere.
      */
     Owned<IGroup> nodeGroup = queryNamedGroupStore().lookup(nodeGroupName);
-    CInitGroups init(timems);
+    CInitGroups init(timems, false);
     Owned<IGroup> expandedClusterGroup = init.getGroupFromCluster(type, cluster, true);
     if (!expandedClusterGroup)
         throwStringExceptionV(0, "Failed to get group for '%s' cluster '%s'", type, clusterName);
@@ -10213,17 +12345,18 @@ class CDaliDFSServer: public Thread, public CTransactionLogTracker, implements I
     bool stopped;
     unsigned defaultTimeout;
     unsigned numThreads;
+    Owned<INode> dafileSrvNode;
+    CriticalSection dafileSrvNodeCS{SYNC_LOCATION};
 
 public:
 
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
 
-    CDaliDFSServer(IPropertyTree *config)
-        : Thread("CDaliDFSServer"), CTransactionLogTracker(MDFS_MAX)
+    CDaliDFSServer() : Thread("CDaliDFSServer"), CTransactionLogTracker(MDFS_MAX)
     {
         stopped = true;
         defaultTimeout = INFINITE; // server uses default
-        numThreads = config->getPropInt("DFS/@numThreads", DEFAULT_NUM_DFS_THREADS);
+        numThreads = getComponentConfigSP()->getPropInt("expert/@daliDfsPoolLimit", getComponentConfigSP()->getPropInt("dfs/@numThreads", DEFAULT_NUM_DFS_THREADS));
         PROGLOG("DFS Server: numThreads=%d", numThreads);
     }
 
@@ -10233,7 +12366,7 @@ public:
 
     void start()
     {
-        Thread::start();
+        Thread::start(false);
     }
 
     void ready()
@@ -10281,6 +12414,7 @@ public:
         return 0;
     }
 
+    // NB: this is legacy, only old clients < HPCC v9.14 will use, new clients use iterateFilteredFiles3
     void iterateFiles(CMessageBuffer &mb,StringBuffer &trc)
     {
         TransactionLog transactionLog(*this, MDFS_ITERATE_FILES, mb.getSender());
@@ -10306,102 +12440,188 @@ public:
         unsigned count=0;
         mb.append(count);
 
-        CFileScanner scanner;
-        CSDSServerLockBlock sdsLock; // lock sds while scanning
+        Owned<CIterateFileFilterContainer> iterateFileFilterContainer = new CIterateFileFilterContainer();
+        if (!isEmptyString(wildname))
+            iterateFileFilterContainer->setNameFilter(wildname);
+        if (!includesuper)
+            iterateFileFilterContainer->setFileTypeFilter(DFUQFFTnonsuperfileonly);
+
+        CFileScanner scanner(0); // 0 = no step budget: scan all files in one pass (legacy path has no pagination support)
+        CFileMatchArray matchingFiles;
         unsigned start = msTick();
-        scanner.scan(sdsLock, wildname.get(),recursive,includesuper);
+        {
+            CSDSServerLockBlock sdsLock; // lock sds while scanning to preserve a consistent snapshot
+            scanner.begin(iterateFileFilterContainer.get(), recursive);
+            (void) scanner.nextPage(sdsLock, matchingFiles); // NB: legacy iterateFiles does not support maxFiles, so pass 0 to scan all files, and no pagination
+        }
         unsigned tookMs = msTick()-start;
         if (tookMs>100)
             PROGLOG("TIMING(filescan): %s: took %dms",trc.str(), tookMs);
-        sdsLock.unlock(); // unlock to perform authentification
 
-        bool auth = scopePermissionsAvail && querySessionManager().checkScopeScansLDAP();
-        StringArray authScopes;
-        CIArrayOf<CFileMatch> matchingFiles;
-        start = msTick();
-        scanner.getResults(auth, udesc, matchingFiles, authScopes, count, false);
-        tookMs = msTick()-start;
-        if (tookMs>100)
-            PROGLOG("TIMING(LDAP): %s: took %dms, %d lookups, file matches = %d", trc.str(), tookMs, authScopes.ordinality(), count);
+        bool auth = querySessionManager().checkScopeScansLDAP();
+        CScopePermissionCache permissionCache(udesc);
 
-        sdsLock.lock(); // re-lock sds while serializing
         start = msTick();
-        SerializeFileAttrOptions options; //The options is needed for the serializeFileAttributes()
         ForEachItemIn(m, matchingFiles)
         {
             CFileMatch &fileMatch = matchingFiles.item(m);
-            CDFAttributeIterator::serializeFileAttributes(mb, fileMatch.queryFileTree(), fileMatch.queryName(), fileMatch.queryIsSuper(), options);
+            if (auth)
+            {
+                StringBuffer scopeName;
+                fileMatch.getScopeName(scopeName);
+                if (!permissionCache.queryHasReadPermission(scopeName.str()))
+                    continue;
+            }
+            assertex(fileMatch.appendSerializedRow(mb));
+            ++count;
         }
         tookMs = msTick()-start;
         if (tookMs>100)
-            PROGLOG("TIMING(filescan-serialization): %s: took %dms, %d files",trc.str(), tookMs, count);
+            PROGLOG("TIMING(filescan-ser): %s: took %ums, count=%u",trc.str(), tookMs, count);
 
         mb.writeDirect(0,sizeof(count),&count);
     }
 
-    void iterateFilteredFiles(TransactionLog &transactionLog, CMessageBuffer &mb,StringBuffer &trc, bool returnAllFilesFlag)
+    IPropertyTree *createLegacyIterFilesRequest(MemoryBuffer &mb)
     {
+        Owned<IPropertyTree> request = createPTree();
         Owned<IUserDescriptor> udesc;
         StringAttr filters;
         bool recursive;
         mb.read(filters).read(recursive);
-        trc.appendf("iterateFilteredFiles(%s,%s)",filters.str(),recursive?"recursive":"");
-        if (queryTransactionLogging())
-            transactionLog.log("%s", trc.str());
         if (mb.getPos()<mb.length())
         {
             udesc.setown(createUserDescriptor());
             udesc->deserialize(mb);
+            StringBuffer userName;
+            udesc->getUserName(userName);
+            request->setProp("@user", userName);
+        }
+        request->setProp("@filters", filters);
+        request->setPropBool("@recursive", recursive);
+        return request.getClear();
+    }
+
+    void iterateFilteredFilesCommon(TransactionLog &transactionLog, const IPropertyTree *request, CMessageBuffer &mb, StringBuffer &trc)
+    {
+        const char *filters = request->queryProp("@filters");
+        const char *fields = request->queryProp("@fields");
+        bool recursive = request->getPropBool("@recursive");
+        const char *userName = request->queryProp("@user");
+        Owned<IUserDescriptor> udesc;
+        if (!isEmptyString(userName))
+        {
+            udesc.setown(createUserDescriptor());
+            udesc->set(userName, nullptr);
         }
 
-        mb.clear();
-        unsigned count=0;
-        mb.append(count);
+        trc.appendf("iterateFilteredFiles(%s,%s)", filters, recursive ? "recursive" : "");
+        if (queryTransactionLogging())
+            transactionLog.log("%s", trc.str());
 
-        Owned<CIterateFileFilterContainer> iterateFileFilterContainer =  new CIterateFileFilterContainer();
+        Owned<CIterateFileFilterContainer> iterateFileFilterContainer = new CIterateFileFilterContainer();
         iterateFileFilterContainer->readFilters(filters);
+        if (!isEmptyString(fields))
+            iterateFileFilterContainer->readFields(fields);
 
-        CFileScanner scanner;
-        CSDSServerLockBlock sdsLock; // lock sds while scanning
-        unsigned start = msTick();
-        scanner.scan(sdsLock, iterateFileFilterContainer.getLink(), recursive);
-        unsigned tookMs = msTick()-start;
-        if (tookMs>100)
-            PROGLOG("TIMING(filescan): %s: took %dms",trc.str(), tookMs);
-        sdsLock.unlock(); // unlock to perform authentification
+        const unsigned maxFiles = iterateFileFilterContainer->getMaxFilesFilter();
+        CFileScanner::installConfigHookOnce();
+        const unsigned scanStepBudget = std::min(maxFiles, CFileScanner::queryScanStepBudget()); // Scanner traversal step budget per lock hold
+        bool auth = querySessionManager().checkScopeScansLDAP();
+        CScopePermissionCache permissionCache(udesc);
+        std::unordered_set<std::string_view> emittedNames; // views into CFileMatch::name, kept alive by matchingFiles
+        CFileMatchArray matchingFiles;
+        bool allMatchingFilesReceived = false;
+        bool hitClientMaxFiles = false;
 
-        bool auth = scopePermissionsAvail && querySessionManager().checkScopeScansLDAP();
-        StringArray authScopes;
-        CIArrayOf<CFileMatch> matchingFiles;
-        start = msTick();
-        bool returnAllMatchingFiles = true;
-        try
+        // Create scanner once outside loop for stack-retained pagination
+        CFileScanner scanner(scanStepBudget);
+        scanner.begin(iterateFileFilterContainer, recursive);
+        cycle_t scanCycles = 0;
+        cycle_t authCycles = 0;
+
+        CCycleTimer timer;
+        while (true)
         {
-            scanner.getResults(auth, udesc, matchingFiles, authScopes, count, true);
-        }
-        catch(IException *e)
-        {
-            if (DFSERR_PassIterateFilesLimit != e->errorCode())
-                throw;
-            e->Release();
-            returnAllMatchingFiles = false;
-        }
-        if (returnAllFilesFlag)
-            mb.append(returnAllMatchingFiles);
+            if (matchingFiles.ordinality() >= maxFiles)
+            {
+                hitClientMaxFiles = true;
+                break;
+            }
 
-        tookMs = msTick()-start;
-        if (tookMs>100)
-            PROGLOG("TIMING(LDAP): %s: took %dms, %d lookups, file matches = %d", trc.str(), tookMs, authScopes.ordinality(), count);
+            bool scanExhausted = false;
+            CFileMatchArray pageMatches;
+            {
+                // Acquiring the SDS lock blocks other Dali writes while this batch scans.
+                // We lock per-batch and release between batches to avoid starving writers
+                // during massive (millions of files) directory traversals. Because we release
+                // it across batches, the DFS tree may mutate between batches -- meaning
+                // a paginated scan might see an inconsistent view -- but it prevents
+                // the scanner from freezing the whole cluster.
+                //
+                // Unlike the old non-paginated approach which gathered all files then locked
+                // again during serialization, this approach locks once per batch and
+                // serializes eagerly under this lock. It also aborts the scan immediately
+                // upon reaching the batch traversal budget, avoiding wasted work. It will only
+                // resume for more pages if post-scan authorization pruning drops the total
+                // yield below the requested maxFiles.
+                //
 
-        sdsLock.lock(); // re-lock sds while serializing
-        start = msTick();
+                timer.reset();
+                CSDSServerLockBlock sdsLock;
+                scanExhausted = !scanner.nextPage(sdsLock, pageMatches);
+                scanCycles += timer.elapsedCycles();
+            }
+
+            timer.reset();
+            ForEachItemIn(m, pageMatches)
+            {
+                CFileMatch &fileMatch = pageMatches.item(m);
+                if (auth)
+                {
+                    StringBuffer scopeName;
+                    fileMatch.getScopeName(scopeName);
+                    if (!permissionCache.queryHasReadPermission(scopeName.str()))
+                        continue;
+                }
+                std::string_view name(fileMatch.queryName());
+                // Lock is released between pages, so concurrent DFS mutations can make a logical
+                // name re-appear in a later batch (e.g. delete/recreate of the same path).
+                if (!emittedNames.insert(name).second)
+                    continue;
+                matchingFiles.append(*LINK(&fileMatch));
+                if (matchingFiles.ordinality() >= maxFiles)
+                {
+                    hitClientMaxFiles = true;
+                    break;
+                }
+            }
+            authCycles += timer.elapsedCycles();
+
+            if (hitClientMaxFiles)
+                break;
+
+            // Completion is signaled by exhausted traversal state, not by match count.
+            if (scanExhausted)
+            {
+                allMatchingFilesReceived = true;
+                break;
+            }
+        }
+        unsigned count = 0;
+        unsigned startPos = mb.length();
+        mb.append(count);
+        mb.append(allMatchingFilesReceived);
+
+        timer.reset();
         ForEachItemIn(m, matchingFiles)
         {
             CFileMatch &fileMatch = matchingFiles.item(m);
             unsigned pos = mb.length();
             try
             {
-                CDFAttributeIterator::serializeFileAttributes(mb, fileMatch.queryFileTree(), fileMatch.queryName(), fileMatch.queryIsSuper(), iterateFileFilterContainer->getSerializeFileAttrOptions());
+                assertex(fileMatch.appendSerializedRow(mb));
+                ++count;
             }
             catch (IException *e)
             {
@@ -10409,26 +12629,30 @@ public:
                 LOG(MCuserWarning, e, errMsg.append(fileMatch.queryName()));
                 e->Release();
                 mb.setLength(pos);
-                --count;
             }
         }
-        tookMs = msTick()-start;
-        if (tookMs>100)
-            PROGLOG("TIMING(filescan-serialization): %s: took %dms, %d files",trc.str(), tookMs, count);
+        unsigned serializationMs = timer.elapsedMs();
+        unsigned scanMs = static_cast<unsigned>(cycle_to_millisec(scanCycles));
+        unsigned authMs = static_cast<unsigned>(cycle_to_millisec(authCycles));
+        CFileScanner::noteTiming(trc.str(), scanMs, authMs, serializationMs);
 
-        mb.writeDirect(0,sizeof(count),&count);
+        mb.writeDirect(startPos, sizeof(count), &count);
     }
 
-    void iterateFilteredFiles(CMessageBuffer &mb,StringBuffer &trc)
-    {
-        TransactionLog transactionLog(*this, MDFS_ITERATE_FILTEREDFILES, mb.getSender());
-        iterateFilteredFiles(transactionLog, mb, trc, false);
-    }
-
-    void iterateFilteredFiles2(CMessageBuffer &mb,StringBuffer &trc)
+    void iterateFilteredFiles2(CMessageBuffer &mb, StringBuffer &trc)
     {
         TransactionLog transactionLog(*this, MDFS_ITERATE_FILTEREDFILES2, mb.getSender());
-        iterateFilteredFiles(transactionLog, mb, trc, true);
+        Owned<IPropertyTree> request = createLegacyIterFilesRequest(mb);
+        mb.clear();
+        iterateFilteredFilesCommon(transactionLog, request, mb, trc);
+    }
+
+    void iterateFilteredFiles3(CMessageBuffer &mb, StringBuffer &trc)
+    {
+        TransactionLog transactionLog(*this, MDFS_ITERATE_FILTEREDFILES3, mb.getSender());
+        Owned<IPropertyTree> request = createPTree(mb);
+        mb.clear();
+        iterateFilteredFilesCommon(transactionLog, request, mb, trc);
     }
 
     void iterateRelationships(CMessageBuffer &mb,StringBuffer &trc)
@@ -10534,80 +12758,207 @@ public:
         }
     }
 
-    void getFileTree(CMessageBuffer &mb,StringBuffer &trc)
+    void getFileTree(CMessageBuffer &mb, StringBuffer &trc, unsigned version)
     {
         TransactionLog transactionLog(*this, MDFS_GET_FILE_TREE, mb.getSender());
+
+        GetFileTreeOpts opts = GetFileTreeOpts::none;
+        Owned<IUserDescriptor> udesc;
+
         StringAttr lname;
         mb.read(lname);
-        unsigned ver;
-        if (mb.length()<mb.getPos()+sizeof(unsigned))
-            ver = 0;
-        else {
-            mb.read(ver);
-            // this is a bit of a mess - for backward compatibility where user descriptor specified
-            if (ver>MDFS_GET_FILE_TREE_V2) {
-                mb.reset(mb.getPos()-sizeof(unsigned));
-                ver = 0;
+        if (version >= 2)
+        {
+            unsigned _opts;
+            mb.read(_opts);
+            opts = static_cast<GetFileTreeOpts>(_opts);
+            bool hasUser;
+            mb.read(hasUser);
+            if (hasUser)
+            {
+                udesc.setown(createUserDescriptor());
+                udesc->deserialize(mb);
+            }
+            if (version >= 3)
+            {
+                // Audit foreign read with client context info
+                AccessMode accessMode;
+                mb.read((unsigned &)accessMode);
+                if (isPhysicalAccessMode(accessMode))
+                {
+                    size32_t clientInfoLength;
+                    mb.read(clientInfoLength);
+
+                    DFSAuditContext context;
+                    if (clientInfoLength)
+                    {
+                        const char *clientInfo = (const char *)mb.readDirect(clientInfoLength);
+                        context = DFSAuditContext::fromLogfmt(clientInfo);
+                    }
+                    if (hasUser)
+                    {
+                        StringBuffer userName;
+                        context.setValue("user", udesc->getUserName(userName).str());
+                    }
+                    context.setValue("lfn", lname.str());
+                    context.setValue("component", "Foreign");
+                    context.logFileAccess("READ");
+                }
             }
         }
-        trc.appendf("getFileTree(%s,%d)",lname.str(),ver);
+        else // pre gft versioning/tidyup
+        {
+            // for ancient backward version compatibility
+            if (mb.length()<mb.getPos()+sizeof(unsigned))
+                version = 0;
+            else
+            {
+                mb.read(version);
+                // this is a bit of a mess - for backward compatibility where user descriptor specified
+                if (version>MDFS_GET_FILE_TREE_V2)
+                {
+                    mb.reset(mb.getPos()-sizeof(unsigned));
+                    version = 0;
+                }
+                else
+                {
+                    // NB: just for clarity - MDFS_GET_FILE_TREE_V2 is hardwired to 1
+                    // version >= 2 is cleaned up version.
+                    version = 1;
+                }
+            }
+            if (mb.getPos()<mb.length())
+            {
+                udesc.setown(createUserDescriptor());
+                udesc->deserialize(mb);
+            }
+        }
+        trc.appendf("getFileTree(%s, client gft version=%u)",lname.str(), version);
         if (queryTransactionLogging())
             transactionLog.log("%s", trc.str());
-        Owned<IUserDescriptor> udesc;
-        if (mb.getPos()<mb.length()) {
-            udesc.setown(createUserDescriptor());
-            udesc->deserialize(mb);
-        }
+
+        // This is Dali, and for foreign access (see below), if in use, this is likely to be false
+        bool secureService = getComponentConfigSP()->getPropBool("@tls");
+
         mb.clear();
         CDfsLogicalFileName dlfn;
         dlfn.set(lname);
         CDfsLogicalFileName *logicalname=&dlfn;
         Owned<IDfsLogicalFileNameIterator> redmatch;
-        for (;;) {
+        for (;;)
+        {
             StringBuffer tail;
             checkLogicalName(*logicalname,udesc,true,false,true,"getFileTree on");
             CScopeConnectLock sconnlock("getFileTree", *logicalname, false, false, false, defaultTimeout);
             IPropertyTree* sroot = sconnlock.conn()?sconnlock.conn()->queryRoot():NULL;
             logicalname->getTail(tail);
-            Owned<IPropertyTree> tree = getNamedPropTree(sroot,queryDfsXmlBranchName(DXB_File),"@name",tail.str(),false);
-            if (tree) {
-                if (ver>=MDFS_GET_FILE_TREE_V2) {
-                    Owned<IFileDescriptor> fdesc = deserializeFileDescriptorTree(tree,&queryNamedGroupStore(),IFDSF_EXCLUDE_CLUSTERNAMES);
-                    if (fdesc) {
-                        ver = MDFS_GET_FILE_TREE_V2;
-                        mb.append((int)-2).append(ver);
+            INamedGroupStore *groupResolver = &queryNamedGroupStore();
+            if (version >= 2)
+            {
+                Owned<IPropertyTree> tree = getNamedPropTree(sroot,queryDfsXmlBranchName(DXB_File),"@name",tail.str(),false);
+                if (tree)
+                {
+                    // This is for bare-metal clients using ~foreign pointing at a containerized/k8s setup,
+                    // asking for the returned meta data to be remapped to point to the dafilesrv service.
+                    if (isContainerized() && hasMask(opts, GetFileTreeOpts::remapToService))
+                    {
+                        tree.setown(createPTreeFromIPT(tree)); // copy live Dali tree, because it is about to be altered by remapGroupsToDafilesrv
+                        remapGroupsToDafilesrv(tree, true, secureService);
+                        groupResolver = nullptr; // do not attempt to resolve remapped group (it will not exist and cause addUnique to create a new anon one)
+
+                        const char *remotePlaneName = tree->queryProp("@group");
+                        Owned<const IPropertyTree> filePlane = getStoragePlaneConfig(remotePlaneName, true);
+
+                        // Used by DFS clients to determine if stripe and/or alias translation needed
+                        tree->setPropTree("Attr/_remoteStoragePlane", createPTreeFromIPT(filePlane));
+                    }
+                    else
+                        tree->removeProp("Attr/_remoteStoragePlane");
+
+                    Owned<IFileDescriptor> fdesc = deserializeFileDescriptorTree(tree,groupResolver,IFDSF_EXCLUDE_CLUSTERNAMES);
+                    mb.append((int)1); // 1 == standard file
+                    fdesc->serialize(mb);
+
+                    /* not sure why this attribute is special/here at top level
+                        and not part of the IFileDescriptor serialization itself */
+                    StringBuffer dts;
+                    tree->getProp("@modified", dts);
+                    unsigned l = dts.length();
+                    mb.append(l).append(l, dts.str());
+
+                    break;
+                }
+                else
+                {
+                    tree.setown(getNamedPropTree(sroot,queryDfsXmlBranchName(DXB_SuperFile),"@name",tail.str(),false));
+                    if (tree)
+                    {
+                        mb.append((int)2); // 2 == super
+                        tree->serialize(mb);
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                Owned<IPropertyTree> tree = getNamedPropTree(sroot,queryDfsXmlBranchName(DXB_File),"@name",tail.str(),false);
+                if (tree)
+                {
+                    if (version == MDFS_GET_FILE_TREE_V2)
+                    {
+                        if (isContainerized())
+                        {
+                            // NB: to be here, the client is by definition legacy, and should only be via ~foreign.
+                            // NB: foreignAccess is a auto-generated template setting, that is set to true if Dali and directio,
+                            // have been exposed in the helm chart for foreign access.
+                            if (getComponentConfigSP()->getPropBool("@foreignAccess"))
+                            {
+                                tree.setown(createPTreeFromIPT(tree)); // copy live Dali tree, because it is about to be altered by remapGroupsToDafilesrv
+                                remapGroupsToDafilesrv(tree, true, secureService);
+                                groupResolver = nullptr; // do not attempt to resolve remapped group (it will not exist and cause addUnique to create a new anon one)
+                            }
+                        }
+
+                        Owned<IFileDescriptor> fdesc = deserializeFileDescriptorTree(tree,groupResolver,IFDSF_EXCLUDE_CLUSTERNAMES);
+
+                        mb.append((int)-2).append(version);
+
                         fdesc->serialize(mb);
                         StringBuffer dts;
-                        if (tree->getProp("@modified",dts)) {
+                        if (tree->getProp("@modified",dts))
+                        {
                             CDateTime dt;
                             dt.setString(dts.str());
                             dt.serialize(mb);
                         }
                     }
-                    else
-                        ver = 0;
-                }
-                if (ver==0) {
-                    tree.setown(createPTreeFromIPT(tree));
-                    StringBuffer cname;
-                    logicalname->getCluster(cname);
-                    expandFileTree(tree,true,cname.str()); // resolve @node values that may not be set
-                    tree->serialize(mb);
-                }
-                break;
-            }
-            else {
-                tree.setown(getNamedPropTree(sroot,queryDfsXmlBranchName(DXB_SuperFile),"@name",tail.str(),false));
-                if (tree) {
-                    tree->serialize(mb);
+                    else if (version==0) // ancient version backward compatibility
+                    {
+                        tree.setown(createPTreeFromIPT(tree));
+                        StringBuffer cname;
+                        logicalname->getCluster(cname);
+                        expandFileTree(tree,true,cname.str()); // resolve @node values that may not be set
+                        tree->serialize(mb);
+                    }
                     break;
                 }
+                else
+                {
+                    tree.setown(getNamedPropTree(sroot,queryDfsXmlBranchName(DXB_SuperFile),"@name",tail.str(),false));
+                    if (tree)
+                    {
+                        tree->serialize(mb);
+                        break;
+                    }
+                }
             }
-            if (redmatch.get()) {
+            if (redmatch.get())
+            {
                 if (!redmatch->next())
                     break;
             }
-            else {
+            else
+            {
                 redmatch.setown(queryDistributedFileDirectory().queryRedirection().getMatch(logicalname->get()));
                 if (!redmatch.get())
                     break;
@@ -10658,14 +13009,18 @@ public:
                     iterateFiles(mb, trc);
                     break;
                 }
-                case MDFS_ITERATE_FILTEREDFILES: // legacy, newer clients will send MDFS_ITERATE_FILTEREDFILES2
+                case MDFS_ITERATE_FILTEREDFILES: // legacy, newer clients will send MDFS_ITERATE_FILTEREDFILES2/3
                 {
-                    iterateFilteredFiles(mb, trc);
-                    break;
+                    throw makeStringExceptionV(0, "MDFS_ITERATE_FILTEREDFILES is no longer supported. Please upgrade.");
                 }
                 case MDFS_ITERATE_FILTEREDFILES2:
                 {
                     iterateFilteredFiles2(mb, trc);
+                    break;
+                }
+                case MDFS_ITERATE_FILTEREDFILES3:
+                {
+                    iterateFilteredFiles3(mb, trc);
                     break;
                 }
                 case MDFS_ITERATE_RELATIONSHIPS:
@@ -10675,7 +13030,14 @@ public:
                 }
                 case MDFS_GET_FILE_TREE:
                 {
-                    getFileTree(mb, trc);
+                    getFileTree(mb, trc, 0);
+                    break;
+                }
+                case MDFS_GET_FILE_TREE2:
+                {
+                    unsigned clientGFTVersion;
+                    mb.read(clientGFTVersion);
+                    getFileTree(mb, trc, clientGFTVersion);
                     break;
                 }
                 case MDFS_GET_GROUP_TREE:
@@ -10711,7 +13073,7 @@ public:
         if (block0.slow())
         {
             SocketEndpoint ep = mb.getSender();
-            ep.getUrlStr(block0.appendMsg(trc).append(" from "));
+            ep.getEndpointHostText(block0.appendMsg(trc).append(" from "));
         }
     }
 
@@ -10731,6 +13093,8 @@ public:
             return ret.append("MDFS_ITERATE_FILTEREDFILES");
         case MDFS_ITERATE_FILTEREDFILES2:
             return ret.append("MDFS_ITERATE_FILTEREDFILES2");
+        case MDFS_ITERATE_FILTEREDFILES3:
+            return ret.append("MDFS_ITERATE_FILTEREDFILES3");
         case MDFS_ITERATE_RELATIONSHIPS:
             return ret.append("MDFS_ITERATE_RELATIONSHIPS");
         case MDFS_GET_FILE_TREE:
@@ -10754,31 +13118,19 @@ public:
 } *daliDFSServer = NULL;
 
 
-IDFAttributesIterator *CDistributedFileDirectory::getDFAttributesIterator(const char *wildname, IUserDescriptor *user, bool recursive, bool includesuper,INode *foreigndali,unsigned foreigndalitimeout)
+IPropertyTreeIterator *CDistributedFileDirectory::getDFAttributesIterator(const char *wildname, IUserDescriptor *user, bool recursive, bool includesuper,INode *foreigndali,unsigned foreigndalitimeout)
 {
-    if (!wildname||!*wildname||(strcmp(wildname,"*")==0)) {
+    if (!wildname||!*wildname||(strcmp(wildname,"*")==0))
         recursive = true;
-    }
-    CMessageBuffer mb;
-    mb.append((int)MDFS_ITERATE_FILES).append(wildname).append(recursive).append("").append(includesuper); // "" is legacy
-    if (user)
-    {
-        user->serializeWithoutPassword(mb);
-    }
-#ifdef NULL_DALIUSER_STACKTRACE
-    else
-    {
-        DBGLOG("UNEXPECTED USER (NULL) in dadfs.cpp getDFAttributesIterator() line %d",__LINE__);
-        PrintStackReport();
-    }
-#endif
 
-    if (foreigndali)
-        foreignDaliSendRecv(foreigndali,mb,foreigndalitimeout);
-    else
-        queryCoven().sendRecv(mb,RANK_RANDOM,MPTAG_DFS_REQUEST);
-    checkDfsReplyException(mb);
-    return new CDFAttributeIterator(mb);
+    StringBuffer filterBuf;
+    // all non-superfiles
+    if (!includesuper)
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileType).append(DFUQFilterSeparator).append(DFUQFFTnonsuperfileonly).append(DFUQFilterSeparator);
+    filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileNameWithPrefix).append(DFUQFilterSeparator).append(wildname).append(DFUQFilterSeparator);
+
+    bool allMatchingFilesReceived;
+    return getDFAttributesFilteredIterator(filterBuf, nullptr, nullptr, user, recursive, allMatchingFilesReceived, nullptr, foreigndali, foreigndalitimeout);
 }
 
 IDFScopeIterator *CDistributedFileDirectory::getScopeIterator(IUserDescriptor *user, const char *basescope, bool recursive,bool includeempty)
@@ -10894,22 +13246,24 @@ void CDistributedFileDirectory::setFileAccessed(CDfsLogicalFileName &dlfn,IUserD
     CMessageBuffer mb;
     mb.append((int)MDFS_SET_FILE_ACCESSED).append(lname);
     dt.serialize(mb);
+    logNullUser(user);//stack trace if NULL user
     if (user)
     {
         user->serializeWithoutPassword(mb);
     }
-#ifdef NULL_DALIUSER_STACKTRACE
-    else
-    {
-        DBGLOG("UNEXPECTED USER (NULL) in dadfs.cpp setFileAccessed() line %d",__LINE__);
-        PrintStackReport();
-    }
-#endif
+
     if (foreigndali)
         foreignDaliSendRecv(foreigndali,mb,foreigndalitimeout);
     else
         queryCoven().sendRecv(mb,RANK_RANDOM,MPTAG_DFS_REQUEST);
     checkDfsReplyException(mb);
+}
+
+void CDistributedFileDirectory::setFileAccessed(IUserDescriptor* udesc, const char *logicalName, const CDateTime &dt, const INode *foreigndali, unsigned foreigndalitimeout)
+{
+    CDfsLogicalFileName dlfn;
+    dlfn.set(logicalName);
+    setFileAccessed(dlfn, udesc, dt, foreigndali, foreigndalitimeout);
 }
 
 void CDistributedFileDirectory::setFileProtect(CDfsLogicalFileName &dlfn,IUserDescriptor *user, const char *owner, bool set, const INode *foreigndali,unsigned foreigndalitimeout)
@@ -10935,17 +13289,11 @@ void CDistributedFileDirectory::setFileProtect(CDfsLogicalFileName &dlfn,IUserDe
     if (!owner)
         owner = "";
     mb.append((int)MDFS_SET_FILE_PROTECT).append(lname).append(owner).append(set);
+    logNullUser(user);//stack trace if NULL user
     if (user)
     {
         user->serializeWithoutPassword(mb);
     }
-#ifdef NULL_DALIUSER_STACKTRACE
-    else
-    {
-        DBGLOG("UNEXPECTED USER (NULL) in dadfs.cpp setFileProtect() line %d",__LINE__);
-        PrintStackReport();
-    }
-#endif
     if (foreigndali)
         foreignDaliSendRecv(foreigndali,mb,foreigndalitimeout);
     else
@@ -10953,14 +13301,19 @@ void CDistributedFileDirectory::setFileProtect(CDfsLogicalFileName &dlfn,IUserDe
     checkDfsReplyException(mb);
 }
 
-IPropertyTree *CDistributedFileDirectory::getFileTree(const char *lname, IUserDescriptor *user, const INode *foreigndali,unsigned foreigndalitimeout, bool expandnodes, bool appendForeign)
+IPropertyTree *CDistributedFileDirectory::getFileTree(const char *lname, IUserDescriptor *user, AccessMode accessMode, const INode *foreigndali,unsigned foreigndalitimeout, GetFileTreeOpts opts)
 {
+    constexpr unsigned gftVersion = 3; // for future use (0 and 1 are reserved for legacy versions)
+    bool expandnodes = hasMask(opts, GetFileTreeOpts::expandNodes);
+    bool appendForeign = hasMask(opts, GetFileTreeOpts::appendForeign);
+
     // this accepts either a foreign dali node or a foreign lfn
     Owned<INode> fnode;
     CDfsLogicalFileName dlfn;
     SocketEndpoint ep;
     dlfn.set(lname);
-    if (dlfn.isForeign()) {
+    if (dlfn.isForeign())
+    {
         if (!dlfn.getEp(ep))
             throw MakeStringException(-1,"cannot resolve dali ip in foreign file name (%s)",lname);
         fnode.setown(createINode(ep));
@@ -10969,54 +13322,142 @@ IPropertyTree *CDistributedFileDirectory::getFileTree(const char *lname, IUserDe
     }
     if (isLocalDali(foreigndali))
         foreigndali = NULL;
-    CMessageBuffer mb;
-    mb.append((int)MDFS_GET_FILE_TREE).append(lname);
-    mb.append(MDFS_GET_FILE_TREE_V2);
-    if (user)
+
+    bool clientInfoAndAccessModeSupport;
+    bool getFileTree2Support;
+    if (!foreigndali)
     {
-        user->serializeWithoutPassword(mb);
+        getFileTree2Support = queryDaliServerVersion().compare("3.17") >= 0;
+        clientInfoAndAccessModeSupport = queryDaliServerVersion().compare("3.21") >= 0;
     }
-#ifdef NULL_DALIUSER_STACKTRACE
     else
     {
-        DBGLOG("UNEXPECTED USER (NULL) in dadfs.cpp getFileTree() line %d",__LINE__);
-        PrintStackReport();
+        CDaliVersion serverVersion, minClientVersion;
+        checkForeignDaliVersionInfo(foreigndali, serverVersion, minClientVersion);
+        getFileTree2Support = serverVersion.compare("3.17") >= 0;
+        clientInfoAndAccessModeSupport = serverVersion.compare("3.21") >= 0;
     }
-#endif
+
+    CMessageBuffer mb;
+
+    if (getFileTree2Support)
+    {
+        mb.append((int)MDFS_GET_FILE_TREE2);
+        mb.append(gftVersion);
+        mb.append(lname);
+        // if it's a foreign dali, and unless explicitly requested to remap or explicitly requested to suppress foreign remapping
+        // ensure the remap flag is sent.
+        if (foreigndali && !hasMask(opts, GetFileTreeOpts::remapToService | GetFileTreeOpts::suppressForeignRemapToService))
+            opts |= GetFileTreeOpts::remapToService;
+
+        mb.append(static_cast<unsigned>(opts));
+        logNullUser(user);//stack trace if NULL user
+        if (user)
+        {
+            mb.append(true);
+            user->serializeWithoutPassword(mb);
+        }
+        else
+        {
+            mb.append(false);
+        }
+        if (clientInfoAndAccessModeSupport)
+        {
+            mb.append((unsigned)accessMode);
+            if (foreigndali && isPhysicalAccessMode(accessMode)) // suppress building/sending client info if meta lookup (server ignores at the moment anyway [doesn't audit])
+            {
+                DFSAuditContext clientInfoItems;
+                buildClientInfoLogfmt(clientInfoItems);
+                DFSAuditContext selfCtx = queryDefaultDFSAuditContext();
+                clientInfoItems.setValue("clientComponent", selfCtx.queryValue("component"));
+                clientInfoItems.setValue("clientInstance", selfCtx.queryValue("instance"));
+                clientInfoItems.setValue("mode", "foreign");
+                StringBuffer clientInfo;
+                clientInfoItems.toLogfmt(clientInfo);
+                size32_t len = clientInfo.length();
+                mb.append(len);
+                if (len)
+                    mb.append(len+1, clientInfo.str()); // include null terminator
+            }
+            else
+                mb.append((size32_t)0); // no client info
+        }
+    }
+    else
+    {
+        mb.append((int)MDFS_GET_FILE_TREE).append(lname);
+        mb.append(MDFS_GET_FILE_TREE_V2);
+        if (user)
+            user->serializeWithoutPassword(mb);
+    }
     if (foreigndali)
         foreignDaliSendRecv(foreigndali,mb,foreigndalitimeout);
     else
         queryCoven().sendRecv(mb,RANK_RANDOM,MPTAG_DFS_REQUEST);
     checkDfsReplyException(mb);
     if (mb.length()==0)
-        return NULL;
-    unsigned ver = 0;
-    if ((mb.length()>=sizeof(int))&&(*(int *)mb.bufferBase()) == -2) { // version indicator
-        int i;
-        mb.read(i);
-        mb.read(ver);
-    }
+        return nullptr;
+
     Owned<IPropertyTree> ret;
-    if (ver==0)
-        ret.setown(createPTree(mb));
-    else {
-        Owned<IFileDescriptor> fdesc;
-        CDateTime modified;
-        if (ver==MDFS_GET_FILE_TREE_V2) { // no longer in use but support for back compatibility
+    Owned<IFileDescriptor> fdesc;
+    if (getFileTree2Support)
+    {
+        unsigned type; // 1 = regular file, 2 = super
+        mb.read(type);
+        if (1 == type)
+        {
             fdesc.setown(deserializeFileDescriptor(mb));
-            if (mb.remaining()>0)
-                modified.deserialize(mb);
+            ret.setown(createPTree(queryDfsXmlBranchName(DXB_File)));
+            fdesc->serializeTree(*ret,expandnodes?0:CPDMSF_packParts);
+            /* See server-side code, not sure why this attribute is special/here at top level
+            and not part of the IFileDescriptor serialization itself */
+            unsigned l;
+            mb.read(l);
+            if (l)
+            {
+                StringAttr v((const char *)mb.readDirect(l), l);
+                ret->setProp("@modified", v);
+            }
         }
         else
-            throw MakeStringException(-1,"Unknown GetFileTree serialization version %d",ver);
-        ret.setown(createPTree(queryDfsXmlBranchName(DXB_File)));
-        fdesc->serializeTree(*ret,expandnodes?0:CPDMSF_packParts);
-        if (!modified.isNull()) {
-            StringBuffer dts;
-            ret->setProp("@modified",modified.getString(dts).str());
+        {
+            verifyex(2 == type); // no other valid possibility
+            ret.setown(createPTree(mb));
         }
     }
-    if (expandnodes) {
+    else
+    {
+        unsigned ver = 0;
+        if ((mb.length()>=sizeof(int))&&(*(int *)mb.bufferBase()) == -2) // version indicator
+        {
+            int i;
+            mb.read(i);
+            mb.read(ver);
+        }
+        if (ver==0)
+            ret.setown(createPTree(mb));
+        else
+        {
+            CDateTime modified;
+            if (ver==MDFS_GET_FILE_TREE_V2) // no longer in use but support for back compatibility
+            {
+                fdesc.setown(deserializeFileDescriptor(mb));
+                if (mb.remaining()>0)
+                    modified.deserialize(mb);
+            }
+            else
+                throw MakeStringException(-1,"Unknown GetFileTree serialization version %d",ver);
+            ret.setown(createPTree(queryDfsXmlBranchName(DXB_File)));
+            fdesc->serializeTree(*ret,expandnodes?0:CPDMSF_packParts);
+            if (!modified.isNull())
+            {
+                StringBuffer dts;
+                ret->setProp("@modified",modified.getString(dts).str());
+            }
+        }
+    }
+    if (expandnodes)
+    {
         StringBuffer cname;
         dlfn.getCluster(cname);
         expandFileTree(ret,true,cname.str());
@@ -11028,39 +13469,20 @@ IPropertyTree *CDistributedFileDirectory::getFileTree(const char *lname, IUserDe
     }
     if (foreigndali && appendForeign)
         resolveForeignFiles(ret,foreigndali);
+    if (isExternalAccess(accessMode))
+        checkFileWriteSync(ret, lname);
     return ret.getClear();
 }
 
-IFileDescriptor *CDistributedFileDirectory::getFileDescriptor(const char *lname,IUserDescriptor *user,const INode *foreigndali,unsigned foreigndalitimeout)
+IDistributedFile *CDistributedFileDirectory::getFile(const char *lname, AccessMode accessMode, IUserDescriptor *user, const INode *foreigndali, unsigned foreigndalitimeout)
 {
-    Owned<IPropertyTree> tree = getFileTree(lname,user,foreigndali,foreigndalitimeout,false);
+    Owned<IPropertyTree> tree = getFileTree(lname, user, accessMode, foreigndali, foreigndalitimeout, GetFileTreeOpts::appendForeign);
     if (!tree)
         return NULL;
     if (strcmp(tree->queryName(),queryDfsXmlBranchName(DXB_SuperFile))==0) {
         CDfsLogicalFileName dlfn;
         dlfn.set(lname);
-        Owned<CDistributedSuperFile> sfile = new CDistributedSuperFile(this,tree, dlfn, user);
-        return sfile->getFileDescriptor(NULL);
-    }
-    if (strcmp(tree->queryName(),queryDfsXmlBranchName(DXB_File))!=0)
-        return NULL; // what is it?
-
-
-    IFileDescriptor * fdesc = deserializeFileDescriptorTree(tree,&queryNamedGroupStore(),0);
-    if (fdesc)
-        fdesc->setTraceName(lname);
-    return fdesc;
-}
-
-IDistributedFile *CDistributedFileDirectory::getFile(const char *lname,IUserDescriptor *user,const INode *foreigndali,unsigned foreigndalitimeout)
-{
-    Owned<IPropertyTree> tree = getFileTree(lname,user,foreigndali,foreigndalitimeout,false);
-    if (!tree)
-        return NULL;
-    if (strcmp(tree->queryName(),queryDfsXmlBranchName(DXB_SuperFile))==0) {
-        CDfsLogicalFileName dlfn;
-        dlfn.set(lname);
-        return new CDistributedSuperFile(this,tree, dlfn, user);
+        return new CDistributedSuperFile(this, tree, dlfn, accessMode, user);
     }
     if (strcmp(tree->queryName(),queryDfsXmlBranchName(DXB_File))!=0)
         return NULL; // what is it?
@@ -11069,6 +13491,7 @@ IDistributedFile *CDistributedFileDirectory::getFile(const char *lname,IUserDesc
     if (!fdesc)
         return NULL;
     fdesc->setTraceName(lname);
+    fdesc->queryProperties().setPropInt("@accessMode", static_cast<int>(accessMode));
     CDistributedFile *ret = new CDistributedFile(this, fdesc, user, false);
     ret->setLogicalName(lname);
     const char *date = tree->queryProp("@modified");
@@ -11123,27 +13546,14 @@ SecAccessFlags CDistributedFileDirectory::getFilePermissions(const char *lname,I
 {
     CDfsLogicalFileName dlfn;
     dlfn.set(lname);
-    StringBuffer scopes;
-    dlfn.getScopes(scopes);
-    return getScopePermissions(scopes.str(),user,auditflags);
-}
-
-SecAccessFlags CDistributedFileDirectory::getNodePermissions(const IpAddress &ip,IUserDescriptor *user,unsigned auditflags)
-{
-    if (ip.isNull())
-        return SecAccess_None;
-    CDfsLogicalFileName dlfn;
-    SocketEndpoint ep(0,ip);
-    dlfn.setExternal(ep,"/x");
-    StringBuffer scopes;
-    dlfn.getScopes(scopes,true);
-    return getScopePermissions(scopes.str(),user,auditflags);
+    return getDLFNPermissions(dlfn,user,auditflags);
 }
 
 SecAccessFlags CDistributedFileDirectory::getFDescPermissions(IFileDescriptor *fdesc,IUserDescriptor *user,unsigned auditflags)
 {
     // this checks have access to the nodes in the file descriptor
-    SecAccessFlags retPerms = SecAccess_Full;
+    bool accessSet = false;  // signal first permission set since the code below reduces the value
+    SecAccessFlags retPerms = SecAccess_None;   // default to no access
     unsigned np = fdesc->numParts();
     for (unsigned i=0;i<np;i++) {
         INode *node = fdesc->queryNode(i);
@@ -11171,18 +13581,40 @@ SecAccessFlags CDistributedFileDirectory::getFDescPermissions(IFileDescriptor *f
                         localpath.setCharAt(k,'_');
                 CDfsLogicalFileName dlfn;
                 dlfn.setExternal(rfn.queryEndpoint(),localpath.str());
-                StringBuffer scopes;
-                dlfn.getScopes(scopes);
-                SecAccessFlags perm = getScopePermissions(scopes.str(),user,auditflags);
-                if (perm < retPerms) {
+                SecAccessFlags perm = getDLFNPermissions(dlfn,user,auditflags);
+                if (!accessSet) {
                     retPerms = perm;
-                    if (retPerms == SecAccess_None)
-                        return SecAccess_None;
+                    accessSet = true;
                 }
+                else if (perm < retPerms) {
+                    retPerms = perm;
+                }
+
+                if (retPerms == SecAccess_None)
+                    return SecAccess_None;
             }
         }
     }
     return retPerms;
+}
+
+SecAccessFlags CDistributedFileDirectory::getDLFNPermissions(CDfsLogicalFileName &dlfn,IUserDescriptor *user,unsigned auditflags)
+{
+    StringBuffer scopes;
+    dlfn.getScopes(scopes);
+    return getScopePermissions(scopes,user,auditflags);
+}
+
+SecAccessFlags CDistributedFileDirectory::getDropZoneScopePermissions(const char *dropZoneName,const char *dropZonePath,IUserDescriptor *user,unsigned auditflags)
+{
+    CDfsLogicalFileName dlfn;
+    dlfn.setPlaneExternal(dropZoneName,dropZonePath);
+    return getScopePermissions(dlfn.get(),user,auditflags);
+}
+
+SecAccessFlags CDistributedFileDirectory::getFScopePermissions(const char *scope,IUserDescriptor *user,unsigned auditflags)
+{
+    return getScopePermissions(scope,user,auditflags);
 }
 
 void CDistributedFileDirectory::setDefaultUser(IUserDescriptor *user)
@@ -11203,100 +13635,10 @@ void CDistributedFileDirectory::setDefaultPreferredClusters(const char *clusters
     defprefclusters.set(clusters);
 }
 
-bool removePhysicalFiles(IGroup *grp,const char *_filemask,unsigned short port,ClusterPartDiskMapSpec &mspec,IMultiException *mexcept)
-{
-    // TBD this won't remove repeated parts
-
-
-    PROGLOG("removePhysicalFiles(%s)",_filemask);
-    if (!isAbsolutePath(_filemask))
-        throw MakeStringException(-1,"removePhysicalFiles: Filename %s must be complete path",_filemask);
-
-    size32_t l = strlen(_filemask);
-    while (l&&isdigit(_filemask[l-1]))
-        l--;
-    unsigned width=0;
-    if (l&&(_filemask[l-1]=='_'))
-        width = atoi(_filemask+l);
-    if (!width)
-        width = grp->ordinality();
-
-    CriticalSection errcrit;
-    class casyncfor: public CAsyncFor
-    {
-        unsigned short port;
-        CriticalSection &errcrit;
-        IMultiException *mexcept;
-        unsigned width;
-        StringAttr filemask;
-        IGroup *grp;
-        ClusterPartDiskMapSpec &mspec;
-    public:
-        bool ok;
-        casyncfor(IGroup *_grp,const char *_filemask,unsigned _width,unsigned short _port,ClusterPartDiskMapSpec &_mspec,IMultiException *_mexcept,CriticalSection &_errcrit)
-            : mspec(_mspec),filemask(_filemask),errcrit(_errcrit)
-        {
-            grp = _grp;
-            port = _port;
-            ok = true;
-            mexcept = _mexcept;
-            width = _width;
-        }
-        void Do(unsigned i)
-        {
-            for (unsigned copy = 0; copy < 2; copy++)   // ** TBD
-            {
-                RemoteFilename rfn;
-                constructPartFilename(grp,i+1,width,NULL,filemask,"",copy>0,mspec,rfn);
-                if (port)
-                    rfn.setPort(port); // if daliservix
-                Owned<IFile> partfile = createIFile(rfn);
-                StringBuffer eps;
-                try
-                {
-                    unsigned start = msTick();
-#if 1
-                    if (partfile->remove()) {
-                        PROGLOG("Removed '%s'",partfile->queryFilename());
-                        unsigned t = msTick()-start;
-                        if (t>5*1000)
-                            DBGLOG("Removing %s from %s took %ds", partfile->queryFilename(), rfn.queryEndpoint().getUrlStr(eps).str(), t/1000);
-                    }
-                    else
-                        IWARNLOG("Failed to remove file part %s from %s", partfile->queryFilename(),rfn.queryEndpoint().getUrlStr(eps).str());
-#else
-                    if (partfile->exists())
-                        PROGLOG("Would remove '%s'",partfile->queryFilename());
-#endif
-
-                }
-                catch (IException *e)
-                {
-                    CriticalBlock block(errcrit);
-                    if (mexcept)
-                        mexcept->append(*e);
-                    else {
-                        StringBuffer s("Failed to remove file part ");
-                        s.append(partfile->queryFilename()).append(" from ");
-                        rfn.queryEndpoint().getUrlStr(s);
-                        EXCLOG(e, s.str());
-                        e->Release();
-                    }
-                    ok = false;
-                }
-            }
-        }
-    } afor(grp,_filemask,width,port,mspec,mexcept,errcrit);
-    afor.For(width,10,false,true);
-    return afor.ok;
-}
-
-
-IDaliServer *createDaliDFSServer(IPropertyTree *config)
+IDaliServer *createDaliDFSServer()
 {
     assertex(!daliDFSServer); // initialization problem
-    daliDFSServer = new CDaliDFSServer(config);
-    return daliDFSServer;
+    return new CDaliDFSServer();
 }
 
 IDistributedFileTransaction *createDistributedFileTransaction(IUserDescriptor *user, ICodeContext *ctx)
@@ -11330,161 +13672,178 @@ static void encodeCompareResult(DistributedFileCompareResult &ret,bool differs,C
     }
 }
 
-DistributedFileCompareResult CDistributedFileDirectory::fileCompare(const char *lfn1,const char *lfn2,DistributedFileCompareMode mode,StringBuffer &errstr,IUserDescriptor *user)
+DistributedFileCompareResult compareDistributedFiles(IDistributedFile *file1, IDistributedFile *file2, DistributedFileCompareMode mode, StringBuffer &errstr)
 {
+    if (!file1 || !file2)
+    {
+        errstr.append("Invalid [null] file(s) supplied for comparison");
+        return DFS_COMPARE_RESULT_FAILURE;
+    }
+
     DistributedFileCompareResult ret = DFS_COMPARE_RESULT_SAME;
-    StringBuffer msg;
     try
     {
-        Owned<IDistributedFile> file1 = lookup(lfn1, user, false, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
-        Owned<IDistributedFile> file2 = lookup(lfn2, user, false, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
-        if (!file1)
+        const char *lfn1 = file1->queryLogicalName();
+        const char *lfn2 = file2->queryLogicalName();
+        unsigned np = file1->numParts();
+        if (np!=file2->numParts())
         {
-            errstr.appendf("File %s not found",lfn1);
-            ret = DFS_COMPARE_RESULT_FAILURE;
+            errstr.appendf("Files %s and %s have differing number of parts",lfn1,lfn2);
+            return DFS_COMPARE_RESULT_FAILURE;
         }
-        else if (!file2)
+        CDateTime newestdt1;
+        CDateTime newestdt2;
+        bool differs = false;
+        class casyncfor: public CAsyncFor
         {
-            errstr.appendf("File %s not found",lfn2);
-            ret = DFS_COMPARE_RESULT_FAILURE;
-        }
-        else
-        {
-            unsigned np = file1->numParts();
-            if (np!=file2->numParts())
+            CriticalSection crit{SYNC_LOCATION};
+            DistributedFileCompareResult &ret;
+            IDistributedFile *file1;
+            IDistributedFile *file2;
+            StringBuffer &errstr;
+            DistributedFileCompareMode mode;
+            bool physdatesize;
+            CDateTime &newestdt1;
+            CDateTime &newestdt2;
+            bool &differs;
+        public:
+            casyncfor(IDistributedFile *_file1,IDistributedFile *_file2,DistributedFileCompareMode _mode,DistributedFileCompareResult &_ret,StringBuffer &_errstr,
+                CDateTime &_newestdt1,CDateTime &_newestdt2,bool &_differs)
+                : CAsyncFor(SYNC_LOCATION), ret(_ret), errstr(_errstr),newestdt1(_newestdt1),newestdt2(_newestdt2),differs(_differs)
             {
-                errstr.appendf("Files %s and %s have differing number of parts",lfn1,lfn2);
-                ret = DFS_COMPARE_RESULT_FAILURE;
+                file1 = _file1;
+                file2 = _file2;
+                mode = _mode;
+                physdatesize = (mode==DFS_COMPARE_FILES_PHYSICAL)||(mode==DFS_COMPARE_FILES_PHYSICAL_CRCS);
             }
-            else
+            void Do(unsigned p)
             {
-                CDateTime newestdt1;
-                CDateTime newestdt2;
-                bool differs = false;
-                class casyncfor: public CAsyncFor
+                CriticalBlock block (crit);
+                Owned<IDistributedFilePart> part1 = file1->getPart(p);
+                Owned<IDistributedFilePart> part2 = file2->getPart(p);
+                CDateTime dt1;
+                RemoteFilename rfn;
+                bool ok;
                 {
-                    CriticalSection crit;
-                    DistributedFileCompareResult &ret;
-                    IDistributedFile *file1;
-                    IDistributedFile *file2;
-                    const char *lfn1;
-                    const char *lfn2;
-                    StringBuffer &errstr;
-                    DistributedFileCompareMode mode;
-                    bool physdatesize;
-                    CDateTime &newestdt1;
-                    CDateTime &newestdt2;
-                    bool &differs;
-                public:
-                    casyncfor(const char *_lfn1,const char *_lfn2,IDistributedFile *_file1,IDistributedFile *_file2,DistributedFileCompareMode _mode,DistributedFileCompareResult &_ret,StringBuffer &_errstr,
-                        CDateTime &_newestdt1,CDateTime &_newestdt2,bool &_differs)
-                        : ret(_ret), errstr(_errstr),newestdt1(_newestdt1),newestdt2(_newestdt2),differs(_differs)
+                    CriticalUnblock unblock(crit);
+                    ok = part1->getModifiedTime(true,physdatesize,dt1);
+                }
+                if (!ok)
+                {
+                    if (errstr.length()==0)
                     {
-                        lfn1 = _lfn1;
-                        lfn2 = _lfn2;
-                        file1 = _file1;
-                        file2 = _file2;
-                        mode = _mode;
-                        physdatesize = (mode==DFS_COMPARE_FILES_PHYSICAL)||(mode==DFS_COMPARE_FILES_PHYSICAL_CRCS);
+                        errstr.append("Could not find ");
+                        part1->getFilename(rfn);
+                        rfn.getPath(errstr);
                     }
-                    void Do(unsigned p)
-                    {
-                        CriticalBlock block (crit);
-                        StringBuffer msg;
-                        Owned<IDistributedFilePart> part1 = file1->getPart(p);
-                        Owned<IDistributedFilePart> part2 = file2->getPart(p);
-                        CDateTime dt1;
-                        RemoteFilename rfn;
-                        bool ok;
-                        {
-                            CriticalUnblock unblock(crit);
-                            ok = part1->getModifiedTime(true,physdatesize,dt1);
-                        }
-                        if (!ok) {
-                            if (errstr.length()==0) {
-                                errstr.append("Could not find ");
-                                part1->getFilename(rfn);
-                                rfn.getPath(errstr);
-                            }
-                            ret = DFS_COMPARE_RESULT_FAILURE;
-                        }
+                    ret = DFS_COMPARE_RESULT_FAILURE;
+                }
 
-                        CDateTime dt2;
-                        {
-                            CriticalUnblock unblock(crit);
-                            ok = part2->getModifiedTime(true,physdatesize,dt2);
-                        }
-                        if (!ok) {
-                            if (errstr.length()==0) {
-                                errstr.append("Could not find ");
-                                part2->getFilename(rfn);
-                                rfn.getPath(errstr);
-                            }
-                            ret = DFS_COMPARE_RESULT_FAILURE;
-                        }
-                        if (ret!=DFS_COMPARE_RESULT_FAILURE) {
-                            int cmp = dt1.compare(dt2,false);
-                            if (cmp>0) {
-                                if (newestdt1.isNull()||(dt1.compare(newestdt1,false)>0))
-                                    newestdt1.set(dt1);
-                            }
-                            else if (cmp<0) {
-                                if (newestdt2.isNull()||(dt2.compare(newestdt2,false)>0))
-                                    newestdt2.set(dt2);
-                            }
-                        }
-                        if ((ret!=DFS_COMPARE_RESULT_FAILURE)&&!differs) {
-                            offset_t sz1;
-                            offset_t sz2;
-                            {
-                                CriticalUnblock unblock(crit);
-                                sz1 = part1->getFileSize(true,physdatesize);
-                                sz2 = part2->getFileSize(true,physdatesize);
-                            }
-                            if (sz1!=sz2)
-                                differs = true;
-                        }
-                        if ((ret!=DFS_COMPARE_RESULT_FAILURE)&&!differs) {
-                            unsigned crc1;
-                            unsigned crc2;
-                            if (mode==DFS_COMPARE_FILES_PHYSICAL_CRCS) {
-                                {
-                                    CriticalUnblock unblock(crit);
-                                    crc1 = part1->getPhysicalCrc();
-                                    crc2 = part2->getPhysicalCrc();
-                                }
-                            }
-                            else {
-                                if (!part1->getCrc(crc1))
-                                    return;
-                                if (!part2->getCrc(crc2))
-                                    return;
-                            }
-                            if (crc1!=crc2)
-                                differs = true;
-                        }
+                CDateTime dt2;
+                {
+                    CriticalUnblock unblock(crit);
+                    ok = part2->getModifiedTime(true,physdatesize,dt2);
+                }
+                if (!ok)
+                {
+                    if (errstr.length()==0)
+                    {
+                        errstr.append("Could not find ");
+                        part2->getFilename(rfn);
+                        rfn.getPath(errstr);
                     }
-                } afor(lfn1,lfn2,file1,file2,mode,ret,errstr,newestdt1,newestdt2,differs);
-                afor.For(np,20,false,false);
-                encodeCompareResult(ret,differs,newestdt1,newestdt2);
+                    ret = DFS_COMPARE_RESULT_FAILURE;
+                }
+                if (ret!=DFS_COMPARE_RESULT_FAILURE)
+                {
+                    int cmp = dt1.compare(dt2,false);
+                    if (cmp>0)
+                    {
+                        if (newestdt1.isNull()||(dt1.compare(newestdt1,false)>0))
+                            newestdt1.set(dt1);
+                    }
+                    else if (cmp<0)
+                    {
+                        if (newestdt2.isNull()||(dt2.compare(newestdt2,false)>0))
+                            newestdt2.set(dt2);
+                    }
+                }
+                if ((ret!=DFS_COMPARE_RESULT_FAILURE)&&!differs)
+                {
+                    offset_t sz1;
+                    offset_t sz2;
+                    {
+                        CriticalUnblock unblock(crit);
+                        sz1 = part1->getFileSize(true,physdatesize);
+                        sz2 = part2->getFileSize(true,physdatesize);
+                    }
+                    if (sz1!=sz2)
+                        differs = true;
+                }
+                if ((ret!=DFS_COMPARE_RESULT_FAILURE)&&!differs)
+                {
+                    unsigned crc1;
+                    unsigned crc2;
+                    if (mode==DFS_COMPARE_FILES_PHYSICAL_CRCS)
+                    {
+                        CriticalUnblock unblock(crit);
+                        crc1 = part1->getPhysicalCrc();
+                        crc2 = part2->getPhysicalCrc();
+                    }
+                    else
+                    {
+                        if (!part1->getCrc(crc1))
+                            return;
+                        if (!part2->getCrc(crc2))
+                            return;
+                    }
+                    if (crc1!=crc2)
+                        differs = true;
+                }
             }
-        }
+        } afor(file1,file2,mode,ret,errstr,newestdt1,newestdt2,differs);
+        afor.For(np,20,false,false);
+        encodeCompareResult(ret,differs,newestdt1,newestdt2);
     }
-    catch (IException *e) {
+    catch (IException *e)
+    {
         if (errstr.length()==0)
             e->errorMessage(errstr);
         else
-            EXCLOG(e,"CDistributedFileDirectory::fileCompare");
+            EXCLOG(e,"compareDistributedFiles");
         e->Release();
         ret = DFS_COMPARE_RESULT_FAILURE;
     }
     return ret;
 }
 
+DistributedFileCompareResult CDistributedFileDirectory::fileCompare(const char *lfn1,const char *lfn2,DistributedFileCompareMode mode,StringBuffer &errstr,IUserDescriptor *user)
+{
+    AccessMode accessMode = AccessMode::readLogicalMeta;
+    if (mode == DFS_COMPARE_FILES_PHYSICAL_CRCS)
+        accessMode = AccessMode::readSequential;
+    else if (mode == DFS_COMPARE_FILES_PHYSICAL)
+        accessMode = AccessMode::meta | AccessMode::readPhysicalMeta;
+
+    Owned<IDistributedFile> file1 = lookup(lfn1, user, accessMode, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
+    if (!file1)
+    {
+        errstr.appendf("File %s not found",lfn1);
+        return DFS_COMPARE_RESULT_FAILURE;
+    }
+    Owned<IDistributedFile> file2 = lookup(lfn2, user, accessMode, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
+    if (!file2)
+    {
+        errstr.appendf("File %s not found",lfn2);
+        return DFS_COMPARE_RESULT_FAILURE;
+    }
+    return compareDistributedFiles(file1, file2, mode, errstr);
+}
+
 bool CDistributedFileDirectory::filePhysicalVerify(const char *lfn, IUserDescriptor *user, bool includecrc, StringBuffer &errstr)
 {
     bool differs = false;
-    Owned<IDistributedFile> file = lookup(lfn, user, false, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
+    Owned<IDistributedFile> file = lookup(lfn, user, AccessMode::meta|AccessMode::readPhysicalMeta, false, false, NULL, defaultPrivilegedUser, defaultTimeout);
     if (!file)
     {
         errstr.appendf("Could not find file: %s",lfn);
@@ -11495,7 +13854,7 @@ bool CDistributedFileDirectory::filePhysicalVerify(const char *lfn, IUserDescrip
         unsigned np = file->numParts();
         class casyncfor: public CAsyncFor
         {
-            CriticalSection crit;
+            CriticalSection crit{SYNC_LOCATION};
             IDistributedFile *file;
             const char *lfn;
             StringBuffer &errstr;
@@ -11505,7 +13864,7 @@ bool CDistributedFileDirectory::filePhysicalVerify(const char *lfn, IUserDescrip
         public:
             casyncfor(const char *_lfn,IDistributedFile *_file,StringBuffer &_errstr, bool _includecrc,
                         bool &_differs, unsigned _defaultTimeout)
-                : errstr(_errstr), differs(_differs)
+                : CAsyncFor(SYNC_LOCATION), errstr(_errstr), differs(_differs)
             {
                 lfn = _lfn;
                 file = _file;
@@ -11516,7 +13875,6 @@ bool CDistributedFileDirectory::filePhysicalVerify(const char *lfn, IUserDescrip
             void Do(unsigned p)
             {
                 CriticalBlock block (crit);
-                StringBuffer msg;
                 Owned<IDistributedFilePart> part = file->getPart(p);
                 CDateTime dt1; // logical
                 CDateTime dt2; // physical
@@ -11617,15 +13975,15 @@ bool CDistributedFileDirectory::filePhysicalVerify(const char *lfn, IUserDescrip
 }
 
 typedef MapStringTo<bool> SubfileSet;
-class CFilterAttrIterator: implements IDFAttributesIterator, public CInterface
+class CFilterAttrIterator: implements IPropertyTreeIterator, public CInterface
 {
-    Owned<IDFAttributesIterator> iter;
+    Owned<IPropertyTreeIterator> iter;
     Linked<IUserDescriptor> user;
     SubfileSet sfset;
     bool includesub;
 public:
     IMPLEMENT_IINTERFACE;
-    CFilterAttrIterator(IDFAttributesIterator *_iter,IUserDescriptor* _user,bool _includesub,unsigned timeoutms)
+    CFilterAttrIterator(IPropertyTreeIterator *_iter,IUserDescriptor* _user,bool _includesub,unsigned timeoutms)
         : iter(_iter), user(_user)
     {
         includesub = _includesub;
@@ -11673,7 +14031,7 @@ public:
     IPropertyTree  & query() { return iter->query(); }
 };
 
-IDFAttributesIterator *createSubFileFilter(IDFAttributesIterator *_iter,IUserDescriptor* _user, bool includesub, unsigned timeoutms)
+IPropertyTreeIterator *createSubFileFilter(IPropertyTreeIterator *_iter,IUserDescriptor* _user, bool includesub, unsigned timeoutms)
 {
     return new CFilterAttrIterator(_iter,_user,includesub,timeoutms);
 }
@@ -11961,7 +14319,7 @@ void CDistributedFileDirectory::promoteSuperFiles(unsigned numsf,const char **sf
     bool created = false;
     unsigned files = numsf;
     for (unsigned i=0; i<numsf; i++) {
-        Owned<IDistributedSuperFile> super = transaction->lookupSuperFile(sfnames[i]);
+        Owned<IDistributedSuperFile> super = transaction->lookupSuperFile(sfnames[i], AccessMode::writeLogicalMeta);
         if (!super.get()) {
             if (created && createonlyonesuperfile) {
                 files = i;
@@ -11973,7 +14331,7 @@ void CDistributedFileDirectory::promoteSuperFiles(unsigned numsf,const char **sf
     }
 
     // If last file had sub-files, clean and fill outlinked
-    Owned<IDistributedSuperFile> last = transaction->lookupSuperFile(sfnames[files-1]);
+    Owned<IDistributedSuperFile> last = transaction->lookupSuperFile(sfnames[files-1], AccessMode::writeLogicalMeta);
     assertex(last.get());
     unsigned lastSubs = last->numSubFiles();
     if (files == numsf && lastSubs > 0) {
@@ -11986,8 +14344,8 @@ void CDistributedFileDirectory::promoteSuperFiles(unsigned numsf,const char **sf
 
     // Move up, starting from last
     for (unsigned i=files-1; i; i--) {
-        Owned<IDistributedSuperFile> orig = transaction->lookupSuperFile(sfnames[i-1]);
-        Owned<IDistributedSuperFile> dest = transaction->lookupSuperFile(sfnames[i]);
+        Owned<IDistributedSuperFile> orig = transaction->lookupSuperFile(sfnames[i-1], AccessMode::writeLogicalMeta);
+        Owned<IDistributedSuperFile> dest = transaction->lookupSuperFile(sfnames[i], AccessMode::writeLogicalMeta);
         assertex(orig.get());
         assertex(dest.get());
         int common = hasCommonSubChildren(orig, dest);
@@ -11999,7 +14357,7 @@ void CDistributedFileDirectory::promoteSuperFiles(unsigned numsf,const char **sf
     }
 
     // Move new subs to first super, if any
-    Owned<IDistributedSuperFile> first = transaction->lookupSuperFile(sfnames[0]);
+    Owned<IDistributedSuperFile> first = transaction->lookupSuperFile(sfnames[0], AccessMode::writeLogicalMeta);
     assertex(first.get());
     StringArray toadd;
     toadd.appendListUniq(addsubnames, ",");
@@ -12485,102 +14843,6 @@ void CDistributedFileDirectory::renameFileRelationships(const char *oldname,cons
 }
 
 
-// JCSMORE what was this for, not called by anything afaics
-bool CDistributedFileDirectory::publishMetaFileXML(const CDfsLogicalFileName &logicalname,IUserDescriptor *user)
-{
-    if (logicalname.isExternal()||logicalname.isForeign()||logicalname.isQuery())
-        return false;
-    Owned<IPropertyTree> file = getFileTree(logicalname.get(),user,NULL,FOREIGN_DALI_TIMEOUT,true);
-    if (!file.get())
-        return false;
-    if (strcmp(file->queryName(),queryDfsXmlBranchName(DXB_SuperFile))==0)
-        return false;
-
-    unsigned max = file->getPropInt("@numparts");
-    SocketEndpointArray ips;
-    StringBuffer xpath;
-    StringBuffer ipstr;
-    for (unsigned i=0;i<max;i++) {  // probably could be done better
-        xpath.clear().append("Part[@num=\"").append(i+1).append("\"]");
-        Owned<IPropertyTree> child = file->getPropTree(xpath.str());
-        SocketEndpoint ep;
-        if (child.get()&&child->getProp("@node",ipstr.clear()))
-            ep.ipset(ipstr.str());
-        ips.append(ep);
-    }
-
-
-    Owned<IException> exc;
-    CriticalSection errcrit;
-    class casyncfor: public CAsyncFor
-    {
-        IPropertyTree* file;
-        CriticalSection &errcrit;
-        Owned<IException> &exc;
-        SocketEndpointArray &ips;
-    public:
-        casyncfor(IPropertyTree* _file,SocketEndpointArray &_ips,Owned<IException> &_exc,CriticalSection &_errcrit)
-            : ips(_ips), exc(_exc), errcrit(_errcrit)
-        {
-            file = _file;
-        }
-        void Do(unsigned i)
-        {
-            UnsignedArray parts;
-            const SocketEndpoint &ep = ips.item(i);
-            if (ep.isNull())
-                return;
-            ForEachItemIn(j,ips) {
-                if (j==i)
-                    parts.append(i);
-                else if (ep.ipequals(ips.item(j))) {
-                    if (j<i)
-                        return; // already done
-                    parts.append(j);
-                }
-            }
-            try {
-                StringBuffer path;
-                StringBuffer mask;
-                if (file->getProp("@directory",path)&&file->getProp("@partmask",mask)) {
-                    addPathSepChar(path).append(mask);
-                    StringBuffer outpath;
-                    StringBuffer tail("META__");
-                    splitFilename(path.str(), &outpath, &outpath, &tail, NULL);
-                    outpath.append(tail).append(".xml");
-                    Owned<IPropertyTree> pt = createPTreeFromIPT(file);
-                    filterParts(pt,parts);
-                    StringBuffer str;
-                    toXML(pt, str);
-                    RemoteFilename rfn;
-                    rfn.setPath(ep,outpath.str());
-                    Owned<IFile> out = createIFile(rfn);
-                    Owned<IFileIO> outio = out->open(IFOcreate);
-                    if (outio)
-                        outio->write(0,str.length(),str.str());
-
-                }
-            }
-            catch(IException *e)
-            {
-                CriticalBlock block(errcrit);
-                EXCLOG(e,"publishMetaFileXML");
-                if (!exc.get())
-                    exc.setown(e);
-                else
-                    e->Release();
-            }
-
-        }
-    } afor(file,ips,exc,errcrit);
-    afor.For(max,20);
-    if (exc)
-        throw exc.getClear();
-    return true;
-
-
-}
-
 IFileDescriptor *CDistributedFileDirectory::createDescriptorFromMetaFile(const CDfsLogicalFileName &logicalname,IUserDescriptor *user)
 {
     return NULL; // TBD
@@ -12601,31 +14863,23 @@ IDFProtectedIterator *CDistributedFileDirectory::lookupProtectedFiles(const char
     return new CDFProtectedIterator(owner,notsuper,superonly,defaultTimeout);
 }
 
-const char* DFUQResultFieldNames[] = { "@name", "@description", "@group", "@kind", "@modified", "@job", "@owner",
-    "@DFUSFrecordCount", "@recordCount", "@recordSize", "@DFUSFsize", "@size", "@workunit", "@DFUSFcluster", "@numsubfiles",
-    "@accessed", "@numparts", "@compressedSize", "@directory", "@partmask", "@superowners", "@persistent", "@protect", "@compressed" };
-
-extern da_decl const char* getDFUQResultFieldName(DFUQResultField feild)
-{
-    return DFUQResultFieldNames[feild];
-}
-
-IPropertyTreeIterator *deserializeFileAttrIterator(MemoryBuffer& mb, unsigned numFiles, DFUQResultField* localFilters, const char* localFilterBuf)
+static IPropertyTreeIterator *deserializeFileAttrIterator(MemoryBuffer& mb, unsigned numFiles, const char *localFilters, const char *fields)
 {
     class CFileAttrIterator: implements IPropertyTreeIterator, public CInterface
     {
         size32_t fileDataStart;
         Owned<IPropertyTree> cur;
         StringArray fileNodeGroups;
+        SerializeFileAttrOptions options;
 
-        void setFileNodeGroup(IPropertyTree *attr, const char* group, StringArray& nodeGroupFilter)
+        void setFileNodeGroup(IPropertyTree *attr, const char* group)
         {
             if (!group || !*group)
                 return;
 
             //The group may contain multiple clusters and some of them may match with the clusterFilter.
             if (nodeGroupFilter.length() == 1)
-                attr->setProp(getDFUQResultFieldName(DFUQRFnodegroup), nodeGroupFilter.item(0));//Filter has been handled on server side.
+                attr->setProp(getDFUQResultFieldName(DFUQResultField::nodegroup), nodeGroupFilter.item(0));//Filter has been handled on server side.
             else
             {
                 StringArray groups;
@@ -12642,7 +14896,7 @@ IPropertyTreeIterator *deserializeFileAttrIterator(MemoryBuffer& mb, unsigned nu
                     //if this file exists on multiple groups, set one of the groups as the "@DFUSFnodegroup" prop for
                     //this attr, leaving the rest inside the fileNodeGroups array. Those groups will be used by the
                     //duplicateFileAttrOnOtherNodeGroup() to duplicate this file attr on other groups.
-                    attr->setProp(getDFUQResultFieldName(DFUQRFnodegroup), fileNodeGroups.item(fileNodeGroups.length() -1));
+                    attr->setProp(getDFUQResultFieldName(DFUQResultField::nodegroup), fileNodeGroups.item(fileNodeGroups.length() -1));
                     fileNodeGroups.pop();
                 }
             }
@@ -12651,66 +14905,95 @@ IPropertyTreeIterator *deserializeFileAttrIterator(MemoryBuffer& mb, unsigned nu
         void setRecordCount(IPropertyTree* file)
         {
             __int64 recordCount = 0;
-            if (file->hasProp(getDFUQResultFieldName(DFUQRForigrecordcount)))
-                recordCount = file->getPropInt64(getDFUQResultFieldName(DFUQRForigrecordcount));
+            if (file->hasProp(getDFUQResultFieldName(DFUQResultField::origrecordcount)))
+                recordCount = file->getPropInt64(getDFUQResultFieldName(DFUQResultField::origrecordcount));
             else
             {
-                __int64 recordSize=file->getPropInt64(getDFUQResultFieldName(DFUQRFrecordsize),0);
+                __int64 recordSize=file->getPropInt64(getDFUQResultFieldName(DFUQResultField::recordsize),0);
                 if(recordSize)
                 {
-                    __int64 size=file->getPropInt64(getDFUQResultFieldName(DFUQRForigsize),-1);
+                    __int64 size=file->getPropInt64(getDFUQResultFieldName(DFUQResultField::origsize),-1);
                     recordCount = size/recordSize;
                 }
             }
-            file->setPropInt64(getDFUQResultFieldName(DFUQRFrecordcount),recordCount);
+            file->setPropInt64(getDFUQResultFieldName(DFUQResultField::recordcount),recordCount);
             return;
         }
 
         void setIsCompressed(IPropertyTree* file)
         {
             if (isCompressed(*file) || isFileKey(*file))
-                file->setPropBool(getDFUQResultFieldName(DFUQRFiscompressed), true);
+                file->setPropBool(getDFUQResultFieldName(DFUQResultField::iscompressed), true);
         }
 
-        IPropertyTree *deserializeFileAttr(MemoryBuffer &mb, StringArray& nodeGroupFilter)
+        void setCost(IPropertyTree* file, const char *nodeGroup)
         {
-            IPropertyTree *attr = getEmptyAttr();
-            StringAttr val;
-            unsigned n;
-            mb.read(val);
-            attr->setProp(getDFUQResultFieldName(DFUQRFname),val.get());
-            mb.read(val);
-            if (strieq(val,"!SF"))
+            // Set the following dynamic fields: atRestCost, accessCost, cost and for legacy files: readCost, writeCost
+            StringBuffer str;
+            double fileAgeDays = 0.0;
+            if (file->getProp(getDFUQResultFieldName(DFUQResultField::timemodified), str))
             {
-                mb.read(n);
-                attr->setPropInt(getDFUQResultFieldName(DFUQRFnumsubfiles),n);
-                mb.read(val);   // not used currently
+                CDateTime dt;
+                dt.setString(str.str());
+                fileAgeDays = difftime(time(nullptr), dt.getSimple())/(24*60*60);
             }
+            __int64 sizeDiskSize = 0;
+            if (isCompressed(*file))
+                sizeDiskSize = file->getPropInt64(getDFUQResultFieldName(DFUQResultField::compressedsize), 0);
             else
+                sizeDiskSize = file->getPropInt64(getDFUQResultFieldName(DFUQResultField::origsize), 0);
+            double sizeGB = sizeDiskSize / ((double)1024 * 1024 * 1024);
+            cost_type atRestCost = calcFileAtRestCost(nodeGroup, sizeGB, fileAgeDays);
+            file->setPropInt64(getDFUQResultFieldName(DFUQResultField::atRestCost), atRestCost);
+
+            cost_type readCost = getReadCost(*file, nodeGroup, true);
+            cost_type writeCost = getWriteCost(*file, nodeGroup, true);
+            cost_type accessCost = readCost + writeCost;
+            file->setPropInt64(getDFUQResultFieldName(DFUQResultField::accessCost), accessCost);
+            file->setPropInt64(getDFUQResultFieldName(DFUQResultField::cost), atRestCost + accessCost);
+        }
+
+        IPropertyTree *deserializeFileAttr(MemoryBuffer &mb)
+        {
+            Owned<IPropertyTree> attr;
+            if (options.filterFields())
+                attr.setown(CDFAttributeIterator::deserializeFileAttr(mb));
+            else
+                attr.setown(CDFAttributeIterator::deserializeFileAttrLegacy(mb));
+            const char *group = attr->queryProp(getDFUQResultFieldName(DFUQResultField::nodegroups));
+            if (group)
+                setFileNodeGroup(attr, group);
+
+            if (options.includeField(DFUQResultField::size))
             {
-                attr->setProp(getDFUQResultFieldName(DFUQRFdirectory),val.get());
-                mb.read(n);
-                attr->setPropInt(getDFUQResultFieldName(DFUQRFnumparts),n);
-                mb.read(val);
-                attr->setProp(getDFUQResultFieldName(DFUQRFpartmask),val.get());
+                // JCSMORE - I am not sure what the point of this is, with or without it, a blank @size does not affect sort order
+                // and EclWatch seems to use the @size (DFUQResultField::origsize) for size column anyway
+                // See special handling in SerializeFileAttrOptions::readFields() to include origsize if size is requested
+                const char *propName = getDFUQResultFieldName(DFUQResultField::size);
+                attr->setPropInt64(propName, attr->getPropInt64(getDFUQResultFieldName(DFUQResultField::origsize), -1));//Sort the files with empty size to front
             }
-            mb.read(val);
-            attr->setProp(getDFUQResultFieldName(DFUQRFtimemodified),val.get());
-            unsigned count;
-            mb.read(count);
-            StringAttr at;
-            while (count--)
+
+            if (options.includeField(DFUQResultField::recordcount))
             {
-                mb.read(at);
-                mb.read(val);
-                attr->setProp(at.get(),val.get());
-                if (strieq(at.get(), getDFUQResultFieldName(DFUQRFnodegroups)))
-                    setFileNodeGroup(attr, val.get(), nodeGroupFilter);
+                // JCSMORE - Is this really necessary/used? Sets @DFUSFrecordCount - if @recordSize missing, but @size and @recordCount present.. calculates..
+                setRecordCount(attr);
             }
-            attr->setPropInt64(getDFUQResultFieldName(DFUQRFsize), attr->getPropInt64(getDFUQResultFieldName(DFUQRForigsize), -1));//Sort the files with empty size to front
-            setRecordCount(attr);
-            setIsCompressed(attr);
-            return attr;
+
+            if (options.includeField(DFUQResultField::iscompressed))
+            {
+                // JCSMORE sets compressed if no compressed attribute, but is an index. Don't indexes already have this flag?
+                setIsCompressed(attr);
+            }
+
+            if (options.includeField(DFUQResultField::cost))
+            {
+                // JCSMORE - cost could be computed in Dali instead - would simplify filtering/projecting code
+                // see special handling in SerializeFileAttrOptions::readFields()
+                const char *firstNodeGroup = attr->queryProp(getDFUQResultFieldName(DFUQResultField::nodegroup));
+                if (!isEmptyString(firstNodeGroup))
+                    setCost(attr, firstNodeGroup);
+            }
+            return attr.getClear();
         }
 
         IPropertyTree *duplicateFileAttrOnOtherNodeGroup(IPropertyTree *previousAttr)
@@ -12719,7 +15002,13 @@ IPropertyTreeIterator *deserializeFileAttrIterator(MemoryBuffer& mb, unsigned nu
             Owned<IAttributeIterator> ai = previousAttr->getAttributes();
             ForEach(*ai)
                 attr->setProp(ai->queryName(),ai->queryValue());
-            attr->setProp(getDFUQResultFieldName(DFUQRFnodegroup), fileNodeGroups.item(fileNodeGroups.length()-1));
+
+            if (options.includeField(DFUQResultField::cost))
+            {
+                const char * nodeGroup = fileNodeGroups.item(fileNodeGroups.length()-1);
+                attr->setProp(getDFUQResultFieldName(DFUQResultField::nodegroup), nodeGroup);
+                setCost(attr, nodeGroup);
+            }
             fileNodeGroups.pop();
             return attr;
         }
@@ -12730,13 +15019,15 @@ IPropertyTreeIterator *deserializeFileAttrIterator(MemoryBuffer& mb, unsigned nu
         unsigned numfiles;
         StringArray nodeGroupFilter;
 
-        CFileAttrIterator(MemoryBuffer &_mb, unsigned _numfiles) : numfiles(_numfiles)
+        CFileAttrIterator(MemoryBuffer &_mb, unsigned _numfiles, const char *fields) : numfiles(_numfiles)
         {
             /* not particuarly nice, but buffer contains extra meta info ahead of serialized file info
              * record position to rewind to, if iterator reused.
              */
             fileDataStart = _mb.getPos();
             mb.swapWith(_mb);
+            if (fields)
+                options.readFields(fields);
         }
         bool first()
         {
@@ -12756,7 +15047,7 @@ IPropertyTreeIterator *deserializeFileAttrIterator(MemoryBuffer& mb, unsigned nu
             cur.clear();
             if (mb.getPos()>=mb.length())
                 return false;
-            cur.setown(deserializeFileAttr(mb, nodeGroupFilter));
+            cur.setown(deserializeFileAttr(mb));
             return true;
         }
 
@@ -12770,42 +15061,121 @@ IPropertyTreeIterator *deserializeFileAttrIterator(MemoryBuffer& mb, unsigned nu
             return *cur;
         }
 
-        void setLocalFilters(DFUQResultField* localFilters, const char* localFilterBuf)
+        void setLocalFilters(const char *localFilters)
         {
-            if (!localFilters || !localFilterBuf || !*localFilterBuf)
+            nodeGroupFilter.kill();
+            if (isEmptyString(localFilters))
                 return;
-
-            const char *fv = localFilterBuf;
-            for (unsigned i=0;localFilters[i]!=DFUQRFterm;i++)
+            // At the moment, only 1 special filter is allowed on group name
+            // of the form: DFUQFTwildcardMatch|DFUQFFgroup|'cluster'
+            // CFileAttrIterator treats this group list by duplicating the IPropertyTree for each group that matches, so seen as separate files
+            CIterateFileFilterContainer filterContainer;
+            filterContainer.readFilters(localFilters);
+            Owned<IDFUFilterIterator> iter = filterContainer.getFilterIterator();
+            ForEach(*iter)
             {
-                int fmt = localFilters[i];
-                int subfmt = (fmt&0xff);
-                if ((subfmt==DFUQRFnodegroup) && fv && *fv)
-                    nodeGroupFilter.appendListUniq(fv, ",");
-                //Add more if needed
-                fv = fv + strlen(fv)+1;
+                CDFUSFFilter &filter = iter->query();
+                if (filter.getFilterType() != DFUQFTwildcardMatch)
+                    throwUnimplemented();
+
+                if (!streq(getDFUQFilterFieldName(DFUQFFgroup), filter.getAttrPath()))
+                    throwUnimplemented();
+
+                if (nodeGroupFilter.ordinality())
+                    throwUnimplemented();
+
+                nodeGroupFilter.appendUniq(filter.getFilterValue());
             }
         }
-
-    } *fai = new CFileAttrIterator(mb, numFiles);
-    fai->setLocalFilters(localFilters, localFilterBuf);
+    } *fai = new CFileAttrIterator(mb, numFiles, fields);
+    fai->setLocalFilters(localFilters);
     return fai;
 }
 
-IPropertyTreeIterator *CDistributedFileDirectory::getDFAttributesTreeIterator(const char* filters, DFUQResultField* localFilters,
-    const char* localFilterBuf, IUserDescriptor* user, bool recursive, bool& allMatchingFilesReceived, INode* foreigndali, unsigned foreigndalitimeout)
+static StringBuffer &convertDFUQResultFields(StringBuffer &res, const DFUQResultField *fields)
+{
+    for (unsigned i=0;fields[i]!=DFUQResultField::term;i++)
+    {
+        if (res.length())
+            res.append(',');
+        DFUQResultField fmt = fields[i];
+        if ((hasMask(fmt, DFUQResultField::reverse)) || (hasMask(fmt, DFUQResultField::exclude))) // NB: either a sort field reverse, or a exclude field flag
+            res.append('-');
+        if (hasMask(fmt, DFUQResultField::include))
+            res.append('+');
+        if (hasMask(fmt, DFUQResultField::nocase))
+            res.append('?');
+        DFUQResultField type = fmt&DFUQResultField::typeMask;
+        switch (type)
+        {
+            case DFUQResultField::numericType:
+            case DFUQResultField::boolType: // same for now at least to preserve current semantics
+                res.append('#');
+                break;
+            case DFUQResultField::floatType:
+                res.append('~');
+                break;
+            case DFUQResultField::stringType: // no modifier, string is default
+            case (DFUQResultField)0:
+                break;
+            default:
+                throw makeStringExceptionV(-1, "Unknown DFUQResultField type value: %u", static_cast<unsigned>(type));
+        }
+        res.append(getDFUQResultFieldName(fmt&DFUQResultField::fieldMask));
+    }
+    return res;
+}
+
+IPropertyTreeIterator *CDistributedFileDirectory::getDFAttributesFilteredIterator(const char* filters, const char* localFilters, const DFUQResultField *fields,
+    IUserDescriptor* user, bool recursive, bool& allMatchingFilesReceived, unsigned *total, INode* foreigndali, unsigned foreigndalitimeout)
 {
     CMessageBuffer mb;
-    CDaliVersion serverVersionNeeded("3.13");
-    bool legacy = (queryDaliServerVersion().compare(serverVersionNeeded) < 0);
-    if (legacy)
-        mb.append((int)MDFS_ITERATE_FILTEREDFILES);
-    else
-        mb.append((int)MDFS_ITERATE_FILTEREDFILES2);
-    mb.append(filters).append(recursive);
-    if (user)
+    bool iptRquestFmtSupport = false;
+    bool useFields = false;
+    if (!foreigndali)
     {
-        user->serializeWithoutPassword(mb);
+        CDaliVersion serverVersionNeeded("3.18");
+        iptRquestFmtSupport = queryDaliServerVersion().compare(serverVersionNeeded) >= 0;
+        if (iptRquestFmtSupport && fields) // NB: if "fields" empty, easier to use old format (server dosn't need to check if client compat)
+        {
+            serverVersionNeeded.set("3.19"); // min version to support projected fields
+            useFields = queryDaliServerVersion().compare(serverVersionNeeded) >= 0;
+        }
+    }
+    // else, currently there's no check on the foreign Dali version, so always use the old format
+
+    if (!iptRquestFmtSupport)
+        mb.append((int)MDFS_ITERATE_FILTEREDFILES2);
+    else
+        mb.append((int)MDFS_ITERATE_FILTEREDFILES3);
+
+    // NB: field filter also happens on client-side in CFileAttrIterator, to suppress computed fields
+    StringBuffer fieldsStr;
+    if (iptRquestFmtSupport)
+    {
+        Owned<IPropertyTree> request = createPTree();
+        request->setProp("@filters", filters);
+        if (useFields)
+        {
+            convertDFUQResultFields(fieldsStr, fields);
+            request->setProp("@fields", fieldsStr);
+        }
+        request->setPropBool("@recursive", recursive);
+        if (user)
+        {
+            StringBuffer userName;
+            user->getUserName(userName);
+            request->setProp("@user", userName.str());
+        }
+        request->serialize(mb); // maybe I should serialize as xml or yaml
+    }
+    else
+    {
+        mb.append(filters).append(recursive);
+        if (user)
+        {
+            user->serializeWithoutPassword(mb);
+        }
     }
 
     if (foreigndali)
@@ -12816,19 +15186,18 @@ IPropertyTreeIterator *CDistributedFileDirectory::getDFAttributesTreeIterator(co
 
     unsigned numfiles;
     mb.read(numfiles);
-    if (legacy)
-        allMatchingFilesReceived = true; // don't know any better
-    else
-        mb.read(allMatchingFilesReceived);
-    return deserializeFileAttrIterator(mb, numfiles, localFilters, localFilterBuf);
+    if (total)
+        *total = numfiles;
+    mb.read(allMatchingFilesReceived);
+    return deserializeFileAttrIterator(mb, numfiles, localFilters, useFields ? fieldsStr.str() : nullptr);
 }
 
-IDFAttributesIterator* CDistributedFileDirectory::getLogicalFiles(
+IPropertyTreeIterator* CDistributedFileDirectory::getLogicalFiles(
     IUserDescriptor* udesc,
-    DFUQResultField *sortOrder, // list of fields to sort by (terminated by DFUSFterm)
+    DFUQResultField *sortOrder, // list of fields to sort by (terminated by DFUSFterm). NB: sort order fields are implicitly part of 'fields'
     const void *filters,  // (appended) string values for filters used by dali server
-    DFUQResultField *localFilters, //used for filtering query result received from dali server.
-    const void *localFilterBuf,
+    const char *localFilters, //used for filtering query result received from dali server.
+    DFUQResultField *fields, // list of fields to include in result (terminated by DFUSFterm)
     unsigned startOffset,
     unsigned maxNum,
     __int64 *cacheHint,
@@ -12842,8 +15211,8 @@ IDFAttributesIterator* CDistributedFileDirectory::getLogicalFiles(
         IUserDescriptor* udesc;
         //StringAttr clusterFilter;
         StringAttr filters;
-        DFUQResultField *localFilters;
-        StringAttr localFilterBuf;
+        StringAttr localFilters;
+        std::vector<DFUQResultField> fields;
         StringAttr sortOrder;
         bool recursive, sorted;
         bool allMatchingFilesReceived;
@@ -12851,16 +15220,17 @@ IDFAttributesIterator* CDistributedFileDirectory::getLogicalFiles(
     public:
         IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
 
-        CDFUPager(IUserDescriptor* _udesc, const char*_filters, DFUQResultField*_localFilters, const char*_localFilterBuf,
-            const char*_sortOrder, bool _recursive, bool _sorted) : udesc(_udesc), filters(_filters), localFilters(_localFilters), localFilterBuf(_localFilterBuf),
+        CDFUPager(IUserDescriptor* _udesc, const char*_filters, const char *_localFilters, const DFUQResultField *_fields,
+            const char*_sortOrder, bool _recursive, bool _sorted) : udesc(_udesc), filters(_filters), localFilters(_localFilters),
             sortOrder(_sortOrder), recursive(_recursive), sorted(_sorted)
         {
             allMatchingFilesReceived = true;
+            fields = dfuQResultFieldsToVector(_fields, true);
         }
         virtual IRemoteConnection* getElements(IArrayOf<IPropertyTree> &elements)
         {
-            Owned<IPropertyTreeIterator> fi = queryDistributedFileDirectory().getDFAttributesTreeIterator(filters.get(),
-                localFilters, localFilterBuf.get(), udesc, recursive, allMatchingFilesReceived);
+            Owned<IPropertyTreeIterator> fi = queryDistributedFileDirectory().getDFAttributesFilteredIterator(filters.get(),
+                localFilters, fields.data(), udesc, recursive, allMatchingFilesReceived, nullptr);
             StringArray unknownAttributes;
             sortElements(fi, sorted ? sortOrder.get() : NULL, NULL, NULL, unknownAttributes, elements);
             return NULL;
@@ -12869,42 +15239,48 @@ IDFAttributesIterator* CDistributedFileDirectory::getLogicalFiles(
     };
 
     StringBuffer so;
+    std::vector<DFUQResultField> fieldsWithSorted;
     if (sorted && sortOrder)
     {
-        for (unsigned i=0;sortOrder[i]!=DFUQRFterm;i++)
+        convertDFUQResultFields(so, sortOrder);
+        if (fields) // if pruning fields and sort order, then add sort order fields implicitly to included fields
         {
-            if (so.length())
-                so.append(',');
-            int fmt = sortOrder[i];
-            if (fmt&DFUQRFreverse)
-                so.append('-');
-            if (fmt&DFUQRFnocase)
-                so.append('?');
-            if (fmt&DFUQRFnumeric)
-                so.append('#');
-            so.append(getDFUQResultFieldName((DFUQResultField) (fmt&0xff)));
+            CDaliVersion serverVersionNeeded("3.19");
+            if (queryDaliServerVersion().compare(serverVersionNeeded) >= 0)
+            {
+                fieldsWithSorted = dfuQResultFieldsToVector(fields, false);
+
+                // NB: could add sort fields here, that are already in fields, that's okay, they will take precedence by being last
+                for (unsigned s=0; sortOrder[s] != DFUQResultField::term; s++)
+                {
+                    DFUQResultField sortField = sortOrder[s] & DFUQResultField::fieldMask;
+                    fieldsWithSorted.push_back(sortField);
+                }
+                fieldsWithSorted.push_back(DFUQResultField::term);
+                fields = fieldsWithSorted.data();
+            }
         }
     }
     IArrayOf<IPropertyTree> results;
-    Owned<IElementsPager> elementsPager = new CDFUPager(udesc, (const char*) filters, localFilters, (const char*) localFilterBuf,
+    Owned<IElementsPager> elementsPager = new CDFUPager(udesc, (const char*) filters, localFilters, fields,
         so.length()?so.str():NULL, recursive, sorted);
     Owned<IRemoteConnection> conn = getElementsPaged(elementsPager,startOffset,maxNum,NULL,"",cacheHint,results,total,allMatchingFiles,false);
     return new CDFAttributeIterator(results);
 }
 
-IDFAttributesIterator* CDistributedFileDirectory::getLogicalFilesSorted(
+IPropertyTreeIterator* CDistributedFileDirectory::getLogicalFilesSorted(
     IUserDescriptor* udesc,
     DFUQResultField *sortOrder, // list of fields to sort by (terminated by DFUSFterm)
     const void *filters,  // (appended) string values for filters used by dali server
-    DFUQResultField *localFilters, //used for filtering query result received from dali server.
-    const void *localFilterBuf,
+    const char *localFilters, //used for filtering query result received from dali server.
+    DFUQResultField *fields, // list of fields to sort by (terminated by DFUSFterm)
     unsigned startOffset,
     unsigned maxNum,
     __int64 *cacheHint,
     unsigned *total,
     bool *allMatchingFiles)
 {
-    return getLogicalFiles(udesc, sortOrder, filters, localFilters, localFilterBuf, startOffset, maxNum,
+    return getLogicalFiles(udesc, sortOrder, filters, localFilters, fields, startOffset, maxNum,
         cacheHint, total, allMatchingFiles, true, true);
 }
 
@@ -12913,12 +15289,12 @@ bool CDistributedFileDirectory::removePhysicalPartFiles(const char *logicalName,
     class casyncfor: public CAsyncFor
     {
         IFileDescriptor *fileDesc;
-        CriticalSection errcrit;
+        CriticalSection errcrit{SYNC_LOCATION};
         IMultiException *mexcept;
     public:
         bool ok;
         bool islazy;
-        casyncfor(IFileDescriptor *_fileDesc, IMultiException *_mexcept)
+        casyncfor(IFileDescriptor *_fileDesc, IMultiException *_mexcept) : CAsyncFor(SYNC_LOCATION)
         {
             fileDesc = _fileDesc;
             ok = true;
@@ -12939,12 +15315,12 @@ bool CDistributedFileDirectory::removePhysicalPartFiles(const char *logicalName,
                 {
                     unsigned start = msTick();
                     if (!partfile->remove()&&(copy==0)&&!islazy) // only warn about missing primary files
-                        LOG(MCwarning, unknownJob, "Failed to remove file part %s from %s", partfile->queryFilename(),rfn.queryEndpoint().getUrlStr(eps).str());
+                        LOG(MCwarning, "Failed to remove file part %s from %s", partfile->queryFilename(),rfn.queryEndpoint().getEndpointHostText(eps).str());
                     else
                     {
                         unsigned t = msTick()-start;
                         if (t>5*1000)
-                            LOG(MCwarning, unknownJob, "Removing %s from %s took %ds", partfile->queryFilename(), rfn.queryEndpoint().getUrlStr(eps).str(), t/1000);
+                            LOG(MCwarning, "Removing %s from %s took %ds", partfile->queryFilename(), rfn.queryEndpoint().getEndpointHostText(eps).str(), t/1000);
                     }
                 }
                 catch (IException *e)
@@ -12956,7 +15332,7 @@ bool CDistributedFileDirectory::removePhysicalPartFiles(const char *logicalName,
                     {
                         StringBuffer s("Failed to remove file part ");
                         s.append(partfile->queryFilename()).append(" from ");
-                        rfn.queryEndpoint().getUrlStr(s);
+                        rfn.queryEndpoint().getEndpointHostText(s);
                         EXCLOG(e, s.str());
                         e->Release();
                     }
@@ -12977,6 +15353,88 @@ bool CDistributedFileDirectory::removePhysicalPartFiles(const char *logicalName,
     return afor.ok;
 }
 
+void configurePreferredPlanes()
+{
+    StringBuffer preferredPlanes;
+    Owned<IPropertyTreeIterator> iter = getComponentConfigSP()->getElements("preferredDataReadPlanes");
+    if (iter->first())
+    {
+        preferredPlanes.append(iter->query().queryProp(nullptr));
+        while (iter->next())
+        {
+            preferredPlanes.append(',');
+            preferredPlanes.append(iter->query().queryProp(nullptr));
+        }
+        queryDistributedFileDirectory().setDefaultPreferredClusters(preferredPlanes);
+        PROGLOG("Preferred read planes: %s", preferredPlanes.str());
+    }
+}
+
+static bool doesPhysicalMatchMeta(IPropertyTree &partProps, IFile &iFile, offset_t expectedSize, offset_t &actualSize)
+{
+    constexpr unsigned delaySecs = 5;
+    // NB: temporary workaround for 'narrow' files publishing extra empty parts with the wrong @compressedSize(0)
+    // causing a new check introduced in HPCC-33064 to be hit (fixed in HPCC-33113, but will continue to affect exiting files)
+    unsigned __int64 size = partProps.getPropInt64("@size", unknownFileSize);
+    unsigned __int64 compressedSize = partProps.getPropInt64("@compressedSize", unknownFileSize);
+    if ((0 == size) && (0 == compressedSize))
+    {
+        // either this is a file from 9.10 where empty compressed files can be zero length (no header)
+        // or it's a pre 9.10 (and pre HPCC-33133 fix) dummy part created with incorrect a @compressedSize of 0
+        // (also in future empty physical files may legitimately not exist)
+        // If file exists check that the size is either 0, or the compressed header size (the size of an empty compressed file pre 9.10)
+        actualSize = iFile.size();
+        if (unknownFileSize != actualSize) // file exists. NB: ok not to exist for future compatibility where 0-length files not written
+        {
+            if (0 != actualSize) // could be zero if file from >= 9.10
+            {
+                constexpr size32_t nonEmptyCompressedFileSize = 56; // min size of a non-empty compressed file (with header) - 56 bytes
+                if (nonEmptyCompressedFileSize != actualSize)
+                {
+                    // in >= 9.8 - this could 1st check getWriteSyncMarginMs() and only check if not set.
+                    WARNLOG("Empty compressed file %s's size (%" I64F "u) is not expected size of 0 or %u - retry after %u second delay", iFile.queryFilename(), actualSize, nonEmptyCompressedFileSize, delaySecs);
+                    MilliSleep(delaySecs * 1000);
+                    actualSize = iFile.size();
+                    if ((0 != actualSize) && (nonEmptyCompressedFileSize != actualSize))
+                        return false; // including if unknownFileSize - no longer exists!
+                }
+            }
+        }
+        return true;
+    }
+    else if (expectedSize != unknownFileSize)
+    {
+        actualSize = iFile.size();
+        if (actualSize != expectedSize)
+        {
+            // in >= 9.8 - this could 1st check getWriteSyncMarginMs() and only check if not set.
+            WARNLOG("File %s's size (%" I64F "u) does not match meta size (%" I64F "u) - retry after %u second delay", iFile.queryFilename(), actualSize, expectedSize, delaySecs);
+            MilliSleep(delaySecs * 1000);
+            actualSize = iFile.size();
+            if (actualSize != expectedSize)
+                return false;
+        }
+    }
+    else
+        actualSize = unknownFileSize;
+
+    return true;
+}
+
+bool doesPhysicalMatchMeta(IPartDescriptor &partDesc, IFile &iFile, offset_t &expectedSize, offset_t &actualSize)
+{
+    IPropertyTree &partProps = partDesc.queryProperties();
+    expectedSize = partDesc.getDiskSize(false, false);
+    return doesPhysicalMatchMeta(partProps, iFile, expectedSize, actualSize);
+}
+
+bool doesPhysicalMatchMeta(IDistributedFilePart &part, IFile &iFile, offset_t &expectedSize, offset_t &actualSize)
+{
+    IPropertyTree &partProps = part.queryAttributes();
+    expectedSize = part.getDiskSize(false, false);
+    return doesPhysicalMatchMeta(partProps, iFile, expectedSize, actualSize);
+}
+
 
 #ifdef _USE_CPPUNIT
 /*
@@ -12986,10 +15444,957 @@ bool CDistributedFileDirectory::removePhysicalPartFiles(const char *logicalName,
  */
 extern da_decl void removeLogical(const char *fname, IUserDescriptor *user) {
     if (queryDistributedFileDirectory().exists(fname, user)) {
-        Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(fname, user, true, false, false, nullptr, defaultPrivilegedUser);
+        Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(fname, user, AccessMode::writeLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
         CDistributedFile *f = QUERYINTERFACE(file.get(),CDistributedFile);
         assert(f);
         f->detachLogical();
     }
 }
+
+class DaliFileScannerSelfContainedTests : public CppUnit::TestFixture
+{
+    static constexpr unsigned bulkAlphaScopeCount = 60;
+    static constexpr unsigned bulkAlphaFilesPerScope = 5;
+    static constexpr unsigned bulkAlphaSupersPerScope = 1;
+    static constexpr unsigned bulkGammaScopeCount = 20;
+    static constexpr unsigned bulkGammaFilesPerScope = 4;
+
+    static constexpr unsigned expectedAlphaMatches = 5 + (bulkAlphaScopeCount * (bulkAlphaFilesPerScope + bulkAlphaSupersPerScope));
+    static constexpr unsigned expectedTotalMatches = expectedAlphaMatches + 3 + (bulkGammaScopeCount * bulkGammaFilesPerScope);
+
+    CPPUNIT_TEST_SUITE(DaliFileScannerSelfContainedTests);
+    CPPUNIT_TEST(testCFileScannerBasicWildcardScan);
+    CPPUNIT_TEST(testIterateFilesLegacyMessageFlow);
+    CPPUNIT_TEST(testIterateFilteredFiles3StyleFullPayloadMessageFlow);
+    CPPUNIT_TEST(testIterateFilteredFiles3StyleAllMatchingFilesFlagTransitions);
+    CPPUNIT_TEST(testPaginationSparseMatchesDoNotStopOnEmptyPage);
+    // Phase 4: Comprehensive Mutation Tests
+    CPPUNIT_TEST(testPaginationNoMutations);
+    CPPUNIT_TEST(testPaginationWithDeletions);
+    CPPUNIT_TEST(testPaginationWithInsertions);
+    CPPUNIT_TEST(testPaginationDeepNesting);
+    CPPUNIT_TEST(testPaginationConsistency);
+    CPPUNIT_TEST(testPaginationNoDuplicateOrSkip);
+    CPPUNIT_TEST(testPaginationPartialChildReentryOrder);
+    CPPUNIT_TEST(testPaginationPendingScopeOrphaned);
+    CPPUNIT_TEST_SUITE_END();
+
+    static IPropertyTree *addNamedScope(IPropertyTree &parent, const char *name)
+    {
+        Owned<IPropertyTree> scope = createPTree(queryDfsXmlBranchName(DXB_Scope));
+        scope->setProp("@name", name);
+        return parent.addPropTree(queryDfsXmlBranchName(DXB_Scope), scope.getClear());
+    }
+
+    static IPropertyTree *addNamedFile(IPropertyTree &parent, const char *name, bool isSuper)
+    {
+        const char *branchName = queryDfsXmlBranchName(isSuper ? DXB_SuperFile : DXB_File);
+        Owned<IPropertyTree> file = createPTree(branchName);
+        file->setProp("@name", name);
+        file->setProp("@modified", "2026-07-15T10:00:00Z");
+
+        if (isSuper)
+        {
+            file->setPropInt("@numsubfiles", 2);
+            Owned<IPropertyTree> sub = createPTree("SubFile");
+            sub->setProp("@name", "alpha::beta::fileA");
+            file->addPropTree("SubFile", sub.getClear());
+        }
+        else
+        {
+            file->setProp("@directory", "/var/lib/HPCCSystems/hpcc-data");
+            file->setPropInt("@numparts", 3);
+            file->setProp("@partmask", "part_[1..3]");
+        }
+
+        Owned<IPropertyTree> attr = createPTree("Attr");
+        attr->setProp("@owner", "unittest");
+        attr->setPropInt64("@size", 1234);
+        attr->setProp("@job", "W20260715-100000");
+        file->addPropTree("Attr", attr.getClear());
+
+        return parent.addPropTree(branchName, file.getClear());
+    }
+
+    static IPropertyTree *createSyntheticStore()
+    {
+        Owned<IPropertyTree> storeRoot = createPTree("Store");
+        IPropertyTree *filesRoot = storeRoot->addPropTree(querySdsFilesRoot(), createPTree());
+
+        IPropertyTree *alpha = addNamedScope(*filesRoot, "alpha");
+        IPropertyTree *beta = addNamedScope(*alpha, "beta");
+        addNamedFile(*beta, "fileA", false);
+        addNamedFile(*beta, "fileB", false);
+        addNamedFile(*beta, "superAB", true);
+        addNamedFile(*alpha, "fileRoot", false);
+        addNamedFile(*alpha, "beta2", false); // Test collision with scope beta
+
+        IPropertyTree *gamma = addNamedScope(*filesRoot, "gamma");
+        addNamedFile(*gamma, "fileG", false);
+
+        IPropertyTree *trailingStarScope = addNamedScope(*filesRoot, "somescope");
+        IPropertyTree *trailingStarSubscope = addNamedScope(*trailingStarScope, "abc");
+        addNamedFile(*trailingStarSubscope, "def", false);
+        addNamedFile(*trailingStarScope, "abc", false);
+
+        for (unsigned scopeIndex = 0; scopeIndex < bulkAlphaScopeCount; scopeIndex++)
+        {
+            StringBuffer scopeName;
+            scopeName.appendf("bulkA%03u", scopeIndex);
+            IPropertyTree *bulkScope = addNamedScope(*alpha, scopeName.str());
+
+            for (unsigned fileIndex = 0; fileIndex < bulkAlphaFilesPerScope; fileIndex++)
+            {
+                StringBuffer fileName;
+                fileName.appendf("file%03u", fileIndex);
+                addNamedFile(*bulkScope, fileName.str(), false);
+            }
+
+            for (unsigned superIndex = 0; superIndex < bulkAlphaSupersPerScope; superIndex++)
+            {
+                StringBuffer superName;
+                superName.appendf("super%03u", superIndex);
+                addNamedFile(*bulkScope, superName.str(), true);
+            }
+        }
+
+        for (unsigned scopeIndex = 0; scopeIndex < bulkGammaScopeCount; scopeIndex++)
+        {
+            StringBuffer scopeName;
+            scopeName.appendf("bulkG%03u", scopeIndex);
+            IPropertyTree *bulkScope = addNamedScope(*gamma, scopeName.str());
+
+            for (unsigned fileIndex = 0; fileIndex < bulkGammaFilesPerScope; fileIndex++)
+            {
+                StringBuffer fileName;
+                fileName.appendf("file%03u", fileIndex);
+                addNamedFile(*bulkScope, fileName.str(), false);
+            }
+        }
+
+        return storeRoot.getClear();
+    }
+
+    static unsigned runIterateFilteredFiles3StyleRequest(IPropertyTree &storeRoot, const IPropertyTree &request, MemoryBuffer &replyMb)
+    {
+        const char *filters = request.queryProp("@filters");
+        const char *fields = request.queryProp("@fields");
+        bool recursive = request.getPropBool("@recursive");
+
+        Owned<CIterateFileFilterContainer> filterContainer = new CIterateFileFilterContainer();
+        filterContainer->readFilters(filters);
+        if (!isEmptyString(fields))
+            filterContainer->readFields(fields);
+
+        const unsigned maxFiles = filterContainer->getMaxFilesFilter();
+        const unsigned scanStepBudget = std::min(maxFiles, 5000u);
+
+        CFileScanner scanner(scanStepBudget);
+        scanner.begin(filterContainer, recursive);
+        CFileMatchArray matchingFiles;
+        std::unordered_set<std::string> emittedNames;
+        bool allMatchingFilesReceived = false;
+        bool hitClientMaxFiles = false;
+
+        while (true)
+        {
+            if (matchingFiles.ordinality() >= maxFiles)
+            {
+                hitClientMaxFiles = true;
+                break;
+            }
+
+            CIArrayOf<CFileMatch> pageMatches;
+            bool scanExhausted = !scanner.nextPage(&storeRoot, pageMatches);
+
+            ForEachItemIn(m, pageMatches)
+            {
+                CFileMatch &fileMatch = pageMatches.item(m);
+                std::string name(fileMatch.queryName());
+                if (!emittedNames.insert(name).second)
+                    continue;
+                matchingFiles.append(*LINK(&fileMatch));
+                if (matchingFiles.ordinality() >= maxFiles)
+                {
+                    hitClientMaxFiles = true;
+                    break;
+                }
+            }
+
+            if (hitClientMaxFiles)
+                break;
+
+            if (scanExhausted)
+            {
+                allMatchingFilesReceived = true;
+                break;
+            }
+        }
+
+        replyMb.clear();
+        unsigned count = matchingFiles.ordinality();
+        unsigned startPos = replyMb.length();
+        replyMb.append(count);
+        replyMb.append(allMatchingFilesReceived);
+
+        ForEachItemIn(m, matchingFiles)
+        {
+            CFileMatch &fileMatch = matchingFiles.item(m);
+            assertex(fileMatch.appendSerializedRow(replyMb));
+        }
+
+        replyMb.writeDirect(startPos, sizeof(count), &count);
+        return count;
+    }
+
+    static unsigned runIterateFilesLegacyStyleRequest(IPropertyTree &storeRoot, const char *wildname, bool recursive, bool includesuper, MemoryBuffer &replyMb)
+    {
+        Owned<CIterateFileFilterContainer> filterContainer = new CIterateFileFilterContainer();
+        if (!isEmptyString(wildname))
+            filterContainer->setNameFilter(wildname);
+        if (!includesuper)
+            filterContainer->setFileTypeFilter(DFUQFFTnonsuperfileonly);
+
+        CFileScanner scanner(0);
+        CIArrayOf<CFileMatch> matchingFiles;
+        scanner.begin(filterContainer.get(), recursive);
+        (void) scanner.nextPage(&storeRoot, matchingFiles);
+
+        replyMb.clear();
+        unsigned count = matchingFiles.ordinality();
+        unsigned startPos = replyMb.length();
+        replyMb.append(count);
+
+        ForEachItemIn(m, matchingFiles)
+            assertex(matchingFiles.item(m).appendSerializedRow(replyMb));
+
+        replyMb.writeDirect(startPos, sizeof(count), &count);
+        return count;
+    }
+
+    static bool readLegacyFileRow(MemoryBuffer &mb, StringBuffer &nameOut)
+    {
+        if (mb.getPos() >= mb.length())
+            return false;
+
+        Owned<IPropertyTree> row = CDFAttributeIterator::deserializeFileAttrLegacy(mb);
+        const char *name = row->queryProp(getDFUQResultFieldName(DFUQResultField::name));
+        if (isEmptyString(name))
+            return false;
+        nameOut.set(name);
+        return true;
+    }
+
+    static void readAllLegacyRows(MemoryBuffer &mb, StringArray &namesOut)
+    {
+        while (true)
+        {
+            StringBuffer name;
+            if (!readLegacyFileRow(mb, name))
+                break;
+            namesOut.append(name.str());
+        }
+    }
+
+    static IPropertyTree *createFlatStore(const char *scopeName, unsigned fileCount, unsigned nameWidth, IPropertyTree **scopeOut)
+    {
+        Owned<IPropertyTree> storeRoot = createPTree("Store");
+        IPropertyTree *filesRoot = storeRoot->addPropTree(querySdsFilesRoot(), createPTree());
+        IPropertyTree *scope = addNamedScope(*filesRoot, scopeName);
+
+        for (unsigned i = 0; i < fileCount; i++)
+        {
+            StringBuffer name;
+            name.appendf("file%0*u", nameWidth, i);
+            addNamedFile(*scope, name.str(), false);
+        }
+
+        if (scopeOut)
+            *scopeOut = scope;
+
+        return storeRoot.getClear();
+    }
+
+    static unsigned removeLastNFiles(IPropertyTree &scope, unsigned filesToDelete)
+    {
+        unsigned deleted = 0;
+        for (unsigned d = 0; d < filesToDelete; d++)
+        {
+            Owned<IPropertyTreeIterator> filesIter(scope.getElements(queryDfsXmlBranchName(DXB_File), iptiter_sort));
+            IPropertyTree *last = nullptr;
+            ForEach(*filesIter)
+                last = &filesIter->query();
+
+            if (!last)
+                break;
+
+            scope.removeTree(last);
+            deleted++;
+        }
+        return deleted;
+    }
+
+    using PageMutation = std::function<void(unsigned page, IPropertyTree &storeRoot, bool hasMorePages)>;
+
+    static void collectPagedNames(IPropertyTree &storeRoot, bool recursive, unsigned scanStepBudget, unsigned maxPages, const PageMutation &mutateBetweenPages, StringArray &namesOut)
+    {
+        Owned<CIterateFileFilterContainer> filterContainer = new CIterateFileFilterContainer();
+        filterContainer->readFilters("");
+
+        CFileScanner scanner(scanStepBudget);
+        scanner.begin(filterContainer.get(), recursive);
+
+        for (unsigned page = 0; page < maxPages; page++)
+        {
+            CIArrayOf<CFileMatch> pageMatches;
+            bool hasMorePages = scanner.nextPage(&storeRoot, pageMatches);
+
+            ForEachItemIn(i, pageMatches)
+                namesOut.append(pageMatches.item(i).queryName());
+
+            if (mutateBetweenPages)
+                mutateBetweenPages(page, storeRoot, hasMorePages);
+            if (!hasMorePages)
+                break;
+        }
+    }
+
+    static void collectPagedNames(IPropertyTree &storeRoot, bool recursive, unsigned scanStepBudget, unsigned maxPages, StringArray &namesOut)
+    {
+        collectPagedNames(storeRoot, recursive, scanStepBudget, maxPages, PageMutation(), namesOut);
+    }
+
+    static void assertNoDuplicateNames(const StringArray &names)
+    {
+        std::unordered_set<std::string> seen;
+        for (unsigned i = 0; i < names.ordinality(); i++)
+        {
+            bool inserted = seen.insert(names.item(i)).second;
+            CPPUNIT_ASSERT(inserted);
+        }
+    }
+
+    static void assertSequentialNames(const StringArray &names, const char *scopePrefix, unsigned count, unsigned width)
+    {
+        CPPUNIT_ASSERT_EQUAL(count, names.ordinality());
+        for (unsigned i = 0; i < count; i++)
+        {
+            StringBuffer expected;
+            expected.appendf("%s::file%0*u", scopePrefix, width, i);
+            CPPUNIT_ASSERT(streq(expected.str(), names.item(i)));
+        }
+    }
+
+    static void assertContainsSequentialNames(const StringArray &names, const char *scopePrefix, unsigned count, unsigned width)
+    {
+        for (unsigned i = 0; i < count; i++)
+        {
+            StringBuffer expected;
+            expected.appendf("%s::file%0*u", scopePrefix, width, i);
+            CPPUNIT_ASSERT(names.contains(expected.str()));
+        }
+    }
+
+    static void assertSameNameSet(const StringArray &lhs, const StringArray &rhs)
+    {
+        std::unordered_set<std::string> lhsSet;
+        std::unordered_set<std::string> rhsSet;
+
+        for (unsigned i = 0; i < lhs.ordinality(); i++)
+            lhsSet.insert(lhs.item(i));
+        for (unsigned i = 0; i < rhs.ordinality(); i++)
+            rhsSet.insert(rhs.item(i));
+
+        CPPUNIT_ASSERT_EQUAL(lhsSet.size(), rhsSet.size());
+        for (const auto &name : lhsSet)
+            CPPUNIT_ASSERT(rhsSet.find(name) != rhsSet.end());
+    }
+
+public:
+    void testCFileScannerBasicWildcardScan()
+    {
+        // Intent: validate direct CFileScanner wildcard filtering on a synthetic store.
+        // Verifies representative alpha::b* file/super matches are present in the result set,
+        // and that later scope segments still constrain matches after a wildcard scope segment.
+        Owned<IPropertyTree> storeRoot = createSyntheticStore();
+
+        Owned<CIterateFileFilterContainer> filterContainer = new CIterateFileFilterContainer();
+        filterContainer->setNameFilter("alpha::b*");
+
+        CIArrayOf<CFileMatch> matchingFiles;
+        CFileScanner scanner(0);
+        scanner.begin(filterContainer.get(), true);
+        (void) scanner.nextPage(storeRoot, matchingFiles);
+
+        unsigned expectedBPrefixMatches = expectedAlphaMatches - 1; // alpha::fileRoot excluded by alpha::b*
+        CPPUNIT_ASSERT_EQUAL(expectedBPrefixMatches, (unsigned) matchingFiles.ordinality());
+
+        StringArray names;
+        ForEachItemIn(i, matchingFiles)
+            names.append(matchingFiles.item(i).queryName());
+
+        CPPUNIT_ASSERT(names.contains("alpha::beta::fileA"));
+        CPPUNIT_ASSERT(names.contains("alpha::beta::fileB"));
+        CPPUNIT_ASSERT(names.contains("alpha::beta::superAB"));
+        CPPUNIT_ASSERT(names.contains("alpha::bulkA000::file000"));
+        CPPUNIT_ASSERT(names.contains("alpha::bulkA059::super000"));
+        CPPUNIT_ASSERT(names.contains("alpha::beta2"));
+        CPPUNIT_ASSERT(!names.contains("alpha::fileRoot"));
+        CPPUNIT_ASSERT(!names.contains("gamma::fileG"));
+
+        // Verify the scope segment wildcard edge case bug is fixed (trailing star matching exactly the bounds of the segment)
+        filterContainer.setown(new CIterateFileFilterContainer());
+        filterContainer->setNameFilter("somescope::abc*::*");
+        matchingFiles.kill();
+        scanner.begin(filterContainer.get(), true);
+        (void) scanner.nextPage(storeRoot, matchingFiles);
+        CPPUNIT_ASSERT_EQUAL(1u, (unsigned) matchingFiles.ordinality());
+        CPPUNIT_ASSERT_EQUAL(0, strcmp("somescope::abc::def", matchingFiles.item(0).queryName()));
+
+        filterContainer.setown(new CIterateFileFilterContainer());
+        filterContainer->setNameFilter("somescope::abc*");
+        matchingFiles.kill();
+        scanner.begin(filterContainer.get(), true);
+        (void) scanner.nextPage(storeRoot, matchingFiles);
+        CPPUNIT_ASSERT_EQUAL(2u, (unsigned) matchingFiles.ordinality());
+
+        filterContainer.setown(new CIterateFileFilterContainer());
+        filterContainer->setNameFilter("somescope::ab*");
+        matchingFiles.kill();
+        scanner.begin(filterContainer.get(), true);
+        (void) scanner.nextPage(storeRoot, matchingFiles);
+        CPPUNIT_ASSERT_EQUAL(2u, (unsigned) matchingFiles.ordinality());
+
+        // Test trailing wildcard on a non-final filter segment
+        filterContainer.setown(new CIterateFileFilterContainer());
+        filterContainer->setNameFilter("somescope*::abc::def");
+        matchingFiles.kill();
+        scanner.begin(filterContainer.get(), true);
+        (void) scanner.nextPage(storeRoot, matchingFiles);
+        CPPUNIT_ASSERT_EQUAL(1u, (unsigned) matchingFiles.ordinality());
+        CPPUNIT_ASSERT_EQUAL(0, strcmp("somescope::abc::def", matchingFiles.item(0).queryName()));
+
+        filterContainer.setown(new CIterateFileFilterContainer());
+        filterContainer->setNameFilter("somesco*::*bc::def*");
+        matchingFiles.kill();
+        scanner.begin(filterContainer.get(), true);
+        (void) scanner.nextPage(storeRoot, matchingFiles);
+        CPPUNIT_ASSERT_EQUAL(1u, (unsigned) matchingFiles.ordinality());
+        CPPUNIT_ASSERT_EQUAL(0, strcmp("somescope::abc::def", matchingFiles.item(0).queryName()));
+
+        // Add a focused nested case locally so this test can verify that a later scope segment
+        // ("::c::") is still enforced after matching a wildcard scope segment ("b*").
+        IPropertyTree *filesRoot = storeRoot->queryPropTree(querySdsFilesRoot());
+        CPPUNIT_ASSERT(filesRoot);
+
+        StringBuffer betaQuery;
+        betaQuery.append(queryDfsXmlBranchName(DXB_Scope)).append("[@name=\"alpha\"]/")
+            .append(queryDfsXmlBranchName(DXB_Scope)).append("[@name=\"beta\"]");
+        IPropertyTree *beta = filesRoot->queryPropTree(betaQuery.str());
+        CPPUNIT_ASSERT(beta);
+
+        IPropertyTree *c = addNamedScope(*beta, "c");
+        IPropertyTree *notc = addNamedScope(*beta, "notc");
+        IPropertyTree *nestedC = addNamedScope(*notc, "c");
+        addNamedFile(*c, "fileA", false);
+        addNamedFile(*notc, "fileA", false);
+        addNamedFile(*nestedC, "fileA", false);
+
+        Owned<CIterateFileFilterContainer> constrainedFilterContainer = new CIterateFileFilterContainer();
+        constrainedFilterContainer->setNameFilter("alpha::b*::c::fileA");
+
+        CIArrayOf<CFileMatch> constrainedMatches;
+        // This check validates wildcard scope-segment correctness, not pagination.
+        // Use an unbounded scan budget so assertion is deterministic.
+        CFileScanner constrainedScanner(0);
+        constrainedScanner.begin(constrainedFilterContainer.get(), true);
+        (void) constrainedScanner.nextPage(storeRoot, constrainedMatches);
+
+        CPPUNIT_ASSERT_EQUAL(1U, (unsigned) constrainedMatches.ordinality());
+        CPPUNIT_ASSERT(streq("alpha::beta::c::fileA", constrainedMatches.item(0).queryName()));
+        CPPUNIT_ASSERT(!streq("alpha::beta::notc::c::fileA", constrainedMatches.item(0).queryName()));
+    }
+
+    void testIterateFilteredFiles3StyleFullPayloadMessageFlow()
+    {
+        // Intent: validate the normal iterateFilteredFiles3 message contract end-to-end
+        // for an unrestricted request (count, allMatchingFiles flag, and representative rows).
+        Owned<IPropertyTree> storeRoot = createSyntheticStore();
+
+        Owned<IPropertyTree> request = createPTree();
+        request->setProp("@filters", "");
+        request->setPropBool("@recursive", true);
+
+        MemoryBuffer requestMb;
+        request->serialize(requestMb);
+
+        Owned<IPropertyTree> parsedRequest = createPTree(requestMb);
+
+        MemoryBuffer replyMb;
+        unsigned count = runIterateFilteredFiles3StyleRequest(*storeRoot, *parsedRequest, replyMb);
+        CPPUNIT_ASSERT_EQUAL(expectedTotalMatches, count);
+
+        unsigned wireCount = 0;
+        bool returnAllMatchingFiles = false;
+        replyMb.read(wireCount);
+        replyMb.read(returnAllMatchingFiles);
+
+        CPPUNIT_ASSERT_EQUAL(expectedTotalMatches, wireCount);
+        CPPUNIT_ASSERT(returnAllMatchingFiles);
+
+        StringArray names;
+        readAllLegacyRows(replyMb, names);
+
+        CPPUNIT_ASSERT_EQUAL(expectedTotalMatches, (unsigned)names.ordinality());
+        CPPUNIT_ASSERT(names.contains("alpha::beta::fileA"));
+        CPPUNIT_ASSERT(names.contains("alpha::beta::fileB"));
+        CPPUNIT_ASSERT(names.contains("alpha::beta::superAB"));
+        CPPUNIT_ASSERT(names.contains("alpha::fileRoot"));
+        CPPUNIT_ASSERT(names.contains("gamma::fileG"));
+        CPPUNIT_ASSERT(names.contains("alpha::bulkA000::file000"));
+        CPPUNIT_ASSERT(names.contains("alpha::bulkA059::super000"));
+        CPPUNIT_ASSERT(names.contains("gamma::bulkG019::file003"));
+    }
+
+    void testIterateFilesLegacyMessageFlow()
+    {
+        // Intent: validate legacy iterateFiles message behavior with and without superfiles.
+        // Verifies counts, wire count integrity, and expected inclusion/exclusion of results.
+        Owned<IPropertyTree> storeRoot = createSyntheticStore();
+
+        MemoryBuffer noSuperReply;
+        unsigned noSuperCount = runIterateFilesLegacyStyleRequest(*storeRoot, "alpha::*", true, false, noSuperReply);
+        CPPUNIT_ASSERT_EQUAL(expectedAlphaMatches - (1 + (bulkAlphaScopeCount * bulkAlphaSupersPerScope)), noSuperCount);
+
+        unsigned wireCount = 0;
+        noSuperReply.read(wireCount);
+        CPPUNIT_ASSERT_EQUAL(noSuperCount, wireCount);
+
+        StringArray noSuperNames;
+        readAllLegacyRows(noSuperReply, noSuperNames);
+
+        CPPUNIT_ASSERT_EQUAL(noSuperCount, (unsigned) noSuperNames.ordinality());
+        CPPUNIT_ASSERT(noSuperNames.contains("alpha::beta::fileA"));
+        CPPUNIT_ASSERT(noSuperNames.contains("alpha::beta::fileB"));
+        CPPUNIT_ASSERT(noSuperNames.contains("alpha::fileRoot"));
+        CPPUNIT_ASSERT(noSuperNames.contains("alpha::bulkA000::file000"));
+        CPPUNIT_ASSERT(!noSuperNames.contains("alpha::beta::superAB"));
+        CPPUNIT_ASSERT(!noSuperNames.contains("alpha::bulkA059::super000"));
+
+        MemoryBuffer withSuperReply;
+        unsigned withSuperCount = runIterateFilesLegacyStyleRequest(*storeRoot, "alpha::*", true, true, withSuperReply);
+        CPPUNIT_ASSERT_EQUAL(expectedAlphaMatches, withSuperCount);
+
+        wireCount = 0;
+        withSuperReply.read(wireCount);
+        CPPUNIT_ASSERT_EQUAL(withSuperCount, wireCount);
+
+        StringArray withSuperNames;
+        readAllLegacyRows(withSuperReply, withSuperNames);
+
+        CPPUNIT_ASSERT_EQUAL(withSuperCount, (unsigned) withSuperNames.ordinality());
+        CPPUNIT_ASSERT(withSuperNames.contains("alpha::beta::fileA"));
+        CPPUNIT_ASSERT(withSuperNames.contains("alpha::beta::fileB"));
+        CPPUNIT_ASSERT(withSuperNames.contains("alpha::beta::superAB"));
+        CPPUNIT_ASSERT(withSuperNames.contains("alpha::fileRoot"));
+        CPPUNIT_ASSERT(withSuperNames.contains("alpha::bulkA000::file000"));
+        CPPUNIT_ASSERT(withSuperNames.contains("alpha::bulkA059::super000"));
+    }
+
+    void testIterateFilteredFiles3StyleAllMatchingFilesFlagTransitions()
+    {
+        // Intent: validate allMatchingFiles flag transitions:
+        // full/unrestricted request -> true, maxFiles-limited request -> false.
+        Owned<IPropertyTree> storeRoot = createSyntheticStore();
+
+        Owned<IPropertyTree> fullRequest = createPTree();
+        fullRequest->setProp("@filters", "");
+        fullRequest->setPropBool("@recursive", true);
+
+        MemoryBuffer fullReply;
+        unsigned fullCount = runIterateFilteredFiles3StyleRequest(*storeRoot, *fullRequest, fullReply);
+        CPPUNIT_ASSERT_EQUAL(expectedTotalMatches, fullCount);
+
+        unsigned wireCount = 0;
+        bool allReceived = false;
+        fullReply.read(wireCount);
+        fullReply.read(allReceived);
+        CPPUNIT_ASSERT_EQUAL(expectedTotalMatches, wireCount);
+        CPPUNIT_ASSERT(allReceived);
+
+        StringBuffer limitedFilters;
+        limitedFilters.append(DFUQFTspecial).append(DFUQFilterSeparator)
+            .append(DFUQSFMaxFiles).append(DFUQFilterSeparator)
+            .append(10).append(DFUQFilterSeparator);
+
+        Owned<IPropertyTree> limitedRequest = createPTree();
+        limitedRequest->setProp("@filters", limitedFilters.str());
+        limitedRequest->setPropBool("@recursive", true);
+
+        MemoryBuffer limitedReply;
+        unsigned limitedCount = runIterateFilteredFiles3StyleRequest(*storeRoot, *limitedRequest, limitedReply);
+        CPPUNIT_ASSERT_EQUAL(10U, limitedCount);
+
+        wireCount = 0;
+        allReceived = true;
+        limitedReply.read(wireCount);
+        limitedReply.read(allReceived);
+        CPPUNIT_ASSERT_EQUAL(10U, wireCount);
+        CPPUNIT_ASSERT(!allReceived);
+    }
+
+    void testPaginationSparseMatchesDoNotStopOnEmptyPage()
+    {
+        // Intent: verify traversal-step pagination does not treat an empty match page as completion.
+        // Verifies first page can be empty with continuation state, and that later pages still return matches.
+        Owned<IPropertyTree> storeRoot = createPTree("Store");
+        IPropertyTree *filesRoot = storeRoot->addPropTree(querySdsFilesRoot(), createPTree());
+
+        // Build many non-matching scopes/files before the single matching file.
+        // Filter '*::needle' requires recursion and causes sparse match density.
+        for (unsigned i = 0; i < 12; i++)
+        {
+            StringBuffer scopeName;
+            scopeName.appendf("s%02u", i);
+            IPropertyTree *scope = addNamedScope(*filesRoot, scopeName.str());
+            addNamedFile(*scope, "other", false);
+        }
+
+        IPropertyTree *targetScope = addNamedScope(*filesRoot, "target");
+        addNamedFile(*targetScope, "needle", false);
+
+        Owned<CIterateFileFilterContainer> filterContainer = new CIterateFileFilterContainer();
+        filterContainer->setNameFilter("*::needle");
+
+        CFileScanner scanner(1);
+        scanner.begin(filterContainer.get(), true);
+
+        CIArrayOf<CFileMatch> page;
+        bool hasMorePages = scanner.nextPage(storeRoot, page);
+
+        // With tiny step budget and sparse matches, an empty page is expected.
+        CPPUNIT_ASSERT_EQUAL(0U, (unsigned)page.ordinality());
+        CPPUNIT_ASSERT(hasMorePages);
+
+        bool sawNeedle = false;
+        for (unsigned resumePage = 0; resumePage < 128; resumePage++)
+        {
+            page.kill();
+            hasMorePages = scanner.nextPage(storeRoot, page);
+
+            ForEachItemIn(i, page)
+            {
+                if (streq("target::needle", page.item(i).queryName()))
+                    sawNeedle = true;
+            }
+
+            if (!hasMorePages)
+                break;
+        }
+
+        CPPUNIT_ASSERT_MESSAGE("Expected to eventually find sparse match after empty pages", sawNeedle);
+        CPPUNIT_ASSERT_MESSAGE("Expected traversal to fully exhaust", !hasMorePages);
+    }
+
+    // Phase 4: Comprehensive Mutation Tests
+
+    void testPaginationNoMutations()
+    {
+        // Intent: establish pagination baseline with no concurrent store mutations.
+        // Verifies full coverage, no duplicates, and expected membership across pages.
+        Owned<IPropertyTree> storeRoot = createFlatStore("test", 100, 3, nullptr);
+        StringArray names;
+        collectPagedNames(*storeRoot, true, 20, 8, names);
+        assertNoDuplicateNames(names);
+        CPPUNIT_ASSERT_EQUAL(100U, names.ordinality());
+        assertContainsSequentialNames(names, "test", 100, 3);
+    }
+
+    void testPaginationWithDeletions()
+    {
+        // Intent: validate pagination robustness when files are deleted between page requests.
+        // Verifies no duplicates and sensible bounds on observed total results.
+        IPropertyTree *scope = nullptr;
+        Owned<IPropertyTree> storeRoot = createFlatStore("test", 100, 3, &scope);
+        unsigned totalDeleted = 0;
+
+        auto deleteAfterPage = [&](unsigned page, IPropertyTree &, bool hasMorePages)
+        {
+            if (!hasMorePages || page >= 4)
+                return;
+            totalDeleted += removeLastNFiles(*scope, (page % 3) + 1);
+        };
+
+        StringArray names;
+        collectPagedNames(*storeRoot, true, 20, 8, deleteAfterPage, names);
+        assertNoDuplicateNames(names);
+        CPPUNIT_ASSERT(names.ordinality() <= 100);
+        CPPUNIT_ASSERT(names.ordinality() >= (100 - totalDeleted));
+    }
+
+    void testPaginationWithInsertions()
+    {
+        // Intent: validate pagination behavior when files are inserted between page requests.
+        // Verifies no duplicates, bounded growth, and preservation of baseline file coverage.
+        IPropertyTree *scope = nullptr;
+        Owned<IPropertyTree> storeRoot = createFlatStore("test", 100, 3, &scope);
+
+        auto insertAfterPage = [&](unsigned page, IPropertyTree &, bool hasMorePages)
+        {
+            if (!hasMorePages || page >= 4)
+                return;
+
+            for (unsigned n = 0; n < 5; n++)
+            {
+                StringBuffer name;
+                name.appendf("newfile_p%u_%u", page, n);
+                addNamedFile(*scope, name.str(), false);
+            }
+        };
+
+        StringArray names;
+        collectPagedNames(*storeRoot, true, 20, 8, insertAfterPage, names);
+        assertNoDuplicateNames(names);
+        CPPUNIT_ASSERT(names.ordinality() >= 100);
+        CPPUNIT_ASSERT(names.ordinality() <= 120);
+        assertContainsSequentialNames(names, "test", 100, 3);
+    }
+
+    void testPaginationDeepNesting()
+    {
+        // Intent: verify pagination traverses deeply nested scope hierarchies correctly.
+        // Verifies all expected deep-leaf files are discovered without duplication.
+        Owned<IPropertyTree> storeRoot = createPTree("Store");
+        IPropertyTree *filesRoot = storeRoot->addPropTree(querySdsFilesRoot(), createPTree());
+
+        // Create 3 scope levels: a::b::c::
+        IPropertyTree *level = filesRoot;
+        const char *scopeNames[] = {"a", "b", "c"};
+        for (unsigned s = 0; s < 3; s++)
+        {
+            level = addNamedScope(*level, scopeNames[s]);
+        }
+
+        // Add 15 files at the deepest level
+        for (unsigned i = 0; i < 15; i++)
+        {
+            StringBuffer name;
+            name.appendf("file%02u", i);
+            addNamedFile(*level, name.str(), false);
+        }
+
+        StringArray names;
+        collectPagedNames(*storeRoot, true, 5, 8, names);
+        assertNoDuplicateNames(names);
+        CPPUNIT_ASSERT_EQUAL(15U, names.ordinality());
+        assertContainsSequentialNames(names, "a::b::c", 15, 2);
+    }
+
+    void testPaginationConsistency()
+    {
+        // Intent: verify pagination is stable across repeated runs over equivalent input data.
+        // Verifies consistent cardinality, uniqueness, expected membership, and set equality.
+        StringArray results[3];
+
+        for (unsigned run = 0; run < 3; run++)
+        {
+            Owned<IPropertyTree> storeRoot = createFlatStore("test", 50, 3, nullptr);
+            collectPagedNames(*storeRoot, true, 20, 8, results[run]);
+        }
+
+        CPPUNIT_ASSERT_EQUAL(results[0].ordinality(), results[1].ordinality());
+        CPPUNIT_ASSERT_EQUAL(results[1].ordinality(), results[2].ordinality());
+
+        assertNoDuplicateNames(results[0]);
+        assertNoDuplicateNames(results[1]);
+        assertNoDuplicateNames(results[2]);
+
+        CPPUNIT_ASSERT_EQUAL(50U, results[0].ordinality());
+        CPPUNIT_ASSERT_EQUAL(50U, results[1].ordinality());
+        CPPUNIT_ASSERT_EQUAL(50U, results[2].ordinality());
+
+        assertContainsSequentialNames(results[0], "test", 50, 3);
+        assertContainsSequentialNames(results[1], "test", 50, 3);
+        assertContainsSequentialNames(results[2], "test", 50, 3);
+
+        assertSameNameSet(results[0], results[1]);
+        assertSameNameSet(results[1], results[2]);
+    }
+
+    void testPaginationNoDuplicateOrSkip()
+    {
+        // Intent: validate that pagination neither duplicates nor skips entries.
+        // Verifies exact expected cardinality and complete membership coverage.
+        Owned<IPropertyTree> storeRoot = createFlatStore("test", 37, 3, nullptr);
+        StringArray names;
+        collectPagedNames(*storeRoot, true, 7, 16, names);
+        assertNoDuplicateNames(names);
+        CPPUNIT_ASSERT_EQUAL(37U, names.ordinality());
+        assertContainsSequentialNames(names, "test", 37, 3);
+    }
+
+    void testPaginationPartialChildReentryOrder()
+    {
+        // Intent: verify resume re-enters a partially scanned child scope before sibling scopes.
+        // Verifies emitted order across pages starts with remaining child entries,
+        // then proceeds to sibling scopes.
+        Owned<IPropertyTree> storeRoot = createPTree("Store");
+        IPropertyTree *filesRoot = storeRoot->addPropTree(querySdsFilesRoot(), createPTree());
+        IPropertyTree *a = addNamedScope(*filesRoot, "a");
+        IPropertyTree *b = addNamedScope(*a, "b");
+        IPropertyTree *d = addNamedScope(*a, "d");
+
+        addNamedFile(*b, "file00", false);
+        addNamedFile(*b, "file01", false);
+        addNamedFile(*b, "file02", false);
+        addNamedFile(*d, "file00", false);
+
+        Owned<CIterateFileFilterContainer> filterContainer = new CIterateFileFilterContainer();
+        filterContainer->readFilters("");
+
+        CFileScanner scanner(4);
+        scanner.begin(filterContainer.get(), true);
+
+        StringArray emitted;
+        for (unsigned page = 0; page < 16; page++)
+        {
+            CIArrayOf<CFileMatch> pageMatches;
+            bool hasMorePages = scanner.nextPage(storeRoot, pageMatches);
+            ForEachItemIn(i, pageMatches)
+                emitted.append(pageMatches.item(i).queryName());
+            if (!hasMorePages)
+                break;
+        }
+
+        CPPUNIT_ASSERT_EQUAL(4U, emitted.ordinality());
+        CPPUNIT_ASSERT(streq("a::b::file00", emitted.item(0)));
+        CPPUNIT_ASSERT(streq("a::b::file01", emitted.item(1)));
+        CPPUNIT_ASSERT(streq("a::b::file02", emitted.item(2)));
+        CPPUNIT_ASSERT(streq("a::d::file00", emitted.item(3)));
+    }
+
+    void testPaginationPendingScopeOrphaned()
+    {
+        // Intent: regression coverage for orphaned pending-scope handling during resume.
+        // Verifies stale deeper frames are not misapplied when the pending child is deleted.
+        // Regression test for: when the pending partially-scanned scope is deleted between pages,
+        // the remaining deeper resume frames in nextState must be discarded so the next sibling
+        // scope does not incorrectly consume them.
+        //
+        // Complex tree structure with multiple levels and multiple siblings:
+        //   a::b::c::{file00, file01, file02}
+        //   a::d::{file00, file01}
+        //   a::e::f::{file00, file01}
+        //   a::e::g::{file00}
+        //
+        // Page 1: scan with maxFiles=2 returns c::file00, c::file01, saves 3 frames:
+        //   frame[0] (deepest): c's children, currentIndex=2 (c::file02 is next)
+        //   frame[1]: b's children (just c), currentIndex=1 (no more siblings in b)
+        //   frame[2] (shallowest): a's children, currentIndex=1 (d is next after b)
+        // pendingIndex = 0 (b) on resume at a's level.
+        //
+        // Between pages: delete scope b. b becomes orphaned.
+        // On resume: b is the pendingIndex and is orphaned. Without the fix, frames[0..1]
+        // (the deeper c and b frames) are left in nextState and incorrectly applied to
+        // d's scanScope, causing assertion failure at the isScope check.
+        // With the fix, nextState is cleared when the pending orphaned child is skipped.
+        //
+        // Continues to verify d and e siblings are processed correctly after orphan skipping.
+        Owned<IPropertyTree> storeRoot = createPTree("Store");
+        IPropertyTree *filesRoot = storeRoot->addPropTree(querySdsFilesRoot(), createPTree());
+        IPropertyTree *a = addNamedScope(*filesRoot, "a");
+        IPropertyTree *b = addNamedScope(*a, "b");
+        IPropertyTree *c = addNamedScope(*b, "c");
+        IPropertyTree *d = addNamedScope(*a, "d");
+        IPropertyTree *e = addNamedScope(*a, "e");
+        IPropertyTree *f = addNamedScope(*e, "f");
+        IPropertyTree *g = addNamedScope(*e, "g");
+
+        // Deep nesting: b::c::{files}
+        addNamedFile(*c, "file00", false);
+        addNamedFile(*c, "file01", false);
+        addNamedFile(*c, "file02", false);
+
+        // Sibling after orphaned scope: d::{files}
+        addNamedFile(*d, "file00", false);
+        addNamedFile(*d, "file01", false);
+
+        // Deeper nesting in following siblings: e::f::{files}, e::g::{files}
+        addNamedFile(*f, "file00", false);
+        addNamedFile(*f, "file01", false);
+        addNamedFile(*g, "file00", false);
+
+        Owned<CIterateFileFilterContainer> filterContainer = new CIterateFileFilterContainer();
+        filterContainer->readFilters("");
+
+        CFileScanner scanner(5);
+        scanner.begin(filterContainer.get(), true);
+
+        bool hasMorePages = true;
+        bool sawExpectedPrefix = false;
+        for (unsigned page = 0; page < 32; page++)
+        {
+            CIArrayOf<CFileMatch> pageMatches;
+            hasMorePages = scanner.nextPage(storeRoot, pageMatches);
+
+            if ((pageMatches.ordinality() >= 2)
+                && streq("a::b::c::file00", pageMatches.item(0).queryName())
+                && streq("a::b::c::file01", pageMatches.item(1).queryName()))
+            {
+                sawExpectedPrefix = true;
+                break;
+            }
+
+            if (!hasMorePages)
+                break;
+        }
+        CPPUNIT_ASSERT_MESSAGE("Expected to reach page prefix a::b::c::file00,file01 before delete", sawExpectedPrefix);
+
+        // Simulate concurrent deletion of scope b between pages (orphaning the pending frame)
+        Linked<IPropertyTree> linkedB = b;
+        a->removeTree(b);
+        cppunitMarkTreeOrphaned(linkedB);
+
+        StringArray remaining;
+        for (unsigned page = 0; page < 64; page++)
+        {
+            CIArrayOf<CFileMatch> pageMatches;
+            hasMorePages = scanner.nextPage(storeRoot, pageMatches);
+            ForEachItemIn(i, pageMatches)
+                remaining.append(pageMatches.item(i).queryName());
+            if (!hasMorePages)
+                break;
+        }
+
+        auto findIndex = [&](const char *name) -> int
+        {
+            ForEachItemIn(i, remaining)
+            {
+                if (streq(name, remaining.item(i)))
+                    return (int)i;
+            }
+            return -1;
+        };
+
+        int d0 = findIndex("a::d::file00");
+        int d1 = findIndex("a::d::file01");
+        int f0 = findIndex("a::e::f::file00");
+        int f1 = findIndex("a::e::f::file01");
+
+        if (d0 < 0)
+            CPPUNIT_FAIL("Expected to find a::d::file00 after orphaning pending scope");
+        if (d1 < 0)
+            CPPUNIT_FAIL("Expected to find a::d::file01 after orphaning pending scope");
+        if (f0 < 0)
+            CPPUNIT_FAIL("Expected to find a::e::f::file00 after orphaning pending scope");
+        if (f1 < 0)
+            CPPUNIT_FAIL("Expected to find a::e::f::file01 after orphaning pending scope");
+
+        CPPUNIT_ASSERT(d0 < d1);
+        CPPUNIT_ASSERT(d1 < f0);
+        CPPUNIT_ASSERT(f0 < f1);
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(DaliFileScannerSelfContainedTests);
 #endif // _USE_CPPUNIT

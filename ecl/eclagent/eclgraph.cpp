@@ -37,10 +37,12 @@
 #include "thorfile.hpp"
 #include "commonext.hpp"
 #include "thorcommon.hpp"
+#include "anawu.hpp"
 
 #include <list>
 #include <string>
 #include <algorithm>
+#include <exception>
 
 using roxiemem::OwnedRoxieString;
 
@@ -53,7 +55,7 @@ static IHThorActivity * createActivity(IAgentContext & agent, unsigned activityI
     {
     case TAKdiskwrite:
     case TAKspillwrite:
-        return createDiskWriteActivity(agent, activityId, subgraphId, (IHThorDiskWriteArg &)arg, kind, graph);
+        return createDiskWriteActivity(agent, activityId, subgraphId, (IHThorGenericDiskWriteArg &)arg, kind, graph, node);
     case TAKsort:
         return createGroupSortActivity(agent, activityId, subgraphId, (IHThorSortArg &)arg, kind, graph);
     case TAKdedup:
@@ -144,10 +146,10 @@ static IHThorActivity * createActivity(IAgentContext & agent, unsigned activityI
     case TAKpipewrite:
         return createPipeWriteActivity(agent, activityId, subgraphId, (IHThorPipeWriteArg &)arg, kind, graph);
     case TAKcsvwrite:
-        return createCsvWriteActivity(agent, activityId, subgraphId, (IHThorCsvWriteArg &)arg, kind, graph);
+        return createCsvWriteActivity(agent, activityId, subgraphId, (IHThorCsvWriteArg &)arg, kind, graph, node);
     case TAKxmlwrite:
     case TAKjsonwrite:
-        return createXmlWriteActivity(agent, activityId, subgraphId, (IHThorXmlWriteArg &)arg, kind, graph);
+        return createXmlWriteActivity(agent, activityId, subgraphId, (IHThorXmlWriteArg &)arg, kind, graph, node);
     case TAKpipethrough:
         return createPipeThroughActivity(agent, activityId, subgraphId, (IHThorPipeThroughArg &)arg, kind, graph);
     case TAKchoosesetsenth:
@@ -161,7 +163,7 @@ static IHThorActivity * createActivity(IAgentContext & agent, unsigned activityI
     case TAKworkunitread:
         return createWorkunitReadActivity(agent, activityId, subgraphId, (IHThorWorkunitReadArg &)arg, kind, graph);
     case TAKspill:
-        return createSpillActivity(agent, activityId, subgraphId, (IHThorSpillArg &)arg, kind, graph);
+        return createSpillActivity(agent, activityId, subgraphId, (IHThorSpillArg &)arg, kind, graph, node);
     case TAKlimit:
         return createLimitActivity(agent, activityId, subgraphId, (IHThorLimitArg &)arg, kind, graph);
     case TAKskiplimit:
@@ -240,7 +242,9 @@ static IHThorActivity * createActivity(IAgentContext & agent, unsigned activityI
     case TAKspillread:
         return createDiskReadActivity(agent, activityId, subgraphId, (IHThorDiskReadArg &)arg, kind, graph, node);
     case TAKnewdiskread:
-        return createNewDiskReadActivity(agent, activityId, subgraphId, (IHThorNewDiskReadArg &)arg, kind, graph, node);
+        {
+            return createNewDiskReadActivity(agent, activityId, subgraphId, (IHThorNewDiskReadArg &)arg, kind, graph, node);
+        }
     case TAKdisknormalize:
         return createDiskNormalizeActivity(agent, activityId, subgraphId, (IHThorDiskNormalizeArg &)arg, kind, graph, node);
     case TAKdiskaggregate:
@@ -388,7 +392,7 @@ bool EclGraphElement::alreadyUpToDate(IAgentContext & agent)
     case TAKjsonwrite:
     case TAKspillwrite:
         {
-            IHThorDiskWriteArg * helper = static_cast<IHThorDiskWriteArg *>(arg.get());
+            IHThorGenericDiskWriteArg * helper = static_cast<IHThorGenericDiskWriteArg *>(arg.get());
             filename.set(helper->getFileName());
             helper->getUpdateCRCs(eclCRC, totalCRC);
             break;
@@ -397,7 +401,7 @@ bool EclGraphElement::alreadyUpToDate(IAgentContext & agent)
         UNIMPLEMENTED;
     }
 
-    Owned<ILocalOrDistributedFile> ldFile = agent.resolveLFN(filename.get(), "Read", true, false, false, nullptr, isCodeSigned);
+    Owned<ILocalOrDistributedFile> ldFile = agent.resolveLFN(filename.get(), "Read", true, false, AccessMode::readMeta, nullptr, isCodeSigned);
     if (!ldFile)
         return false;
     IDistributedFile * f = ldFile->queryDistributedFile();
@@ -418,7 +422,7 @@ bool EclGraphElement::alreadyUpToDate(IAgentContext & agent)
     }
 
     IPropertyTree & cur = f->queryAttributes();
-    if ((eclCRC != cur.getPropInt("@eclCRC")) || (totalCRC != cur.getPropInt64("@totalCRC")))
+    if ((eclCRC != (unsigned)cur.getPropInt("@eclCRC")) || (totalCRC != (unsigned __int64)cur.getPropInt64("@totalCRC")))
         return false;
     return true;
 }
@@ -494,7 +498,7 @@ void EclGraphElement::createActivity(IAgentContext & agent, EclSubGraph * owner)
             ForEachItemIn(i2, branches)
             {
                 EclGraphElement & input = branches.item(i2);
-                IHThorInput * probe = NULL;
+                IHThorInput * useInput = NULL;
 
                 if (probeManager)
                 {
@@ -507,18 +511,14 @@ void EclGraphElement::createActivity(IAgentContext & agent, EclSubGraph * owner)
                                                         0,//input.id,
                                                         0,//id,
                                                         0);
-                        probe = & dynamic_cast<IHThorInput &> (base->queryInput());
+                        useInput = & dynamic_cast<IHThorInput &> (base->queryInput());
                     }
                 }
                 else
                 {
-                    probe = subgraph->createLegacyProbe(input.queryOutput(branchIndexes.item(i2)),
-                                                    input.id,
-                                                    id,
-                                                    0,
-                                                    agent.queryWorkUnit());
+                    useInput = input.queryOutput(branchIndexes.item(i2));
                 }
-                activity->setInput(i2, probe);
+                activity->setInput(i2, useInput);
             }
             break;
         }
@@ -746,6 +746,24 @@ void EclGraphElement::ready()
         activity->ready();
 }
 
+void EclGraphElement::onStart(const byte * parentExtract, CHThorDebugContext * debugContext)
+{
+    savedParentExtract = parentExtract;
+    if (arg)
+    {
+        try
+        {
+            arg->onStart(parentExtract, NULL);
+        }
+        catch(IException * e)
+        {
+            if (debugContext)
+                debugContext->checkBreakpoint(DebugStateException, NULL, e);
+            throw makeWrappedException(e);
+        }
+    }
+}
+
 IHThorException * EclGraphElement::makeWrappedException(IException * e)
 {
     throw makeHThorException(kind, id, subgraph->id, e);
@@ -753,8 +771,8 @@ IHThorException * EclGraphElement::makeWrappedException(IException * e)
 
 //---------------------------------------------------------------------------
 
-EclSubGraph::EclSubGraph(IAgentContext & _agent, EclGraph & _parent, EclSubGraph * _owner, unsigned _seqNo, bool enableProbe, CHThorDebugContext * _debugContext, IProbeManager * _probeManager)
-    : parent(_parent), owner(_owner), seqNo(_seqNo), probeEnabled(enableProbe), debugContext(_debugContext), probeManager(_probeManager), isLoopBody(false)
+EclSubGraph::EclSubGraph(IAgentContext & _agent, EclGraph & _parent, EclSubGraph * _owner, unsigned _seqNo, CHThorDebugContext * _debugContext, IProbeManager * _probeManager)
+    : seqNo(_seqNo), parent(_parent), owner(_owner), debugContext(_debugContext), probeManager(_probeManager), isLoopBody(false)
 {
     executed = false;
     created = false;
@@ -763,6 +781,7 @@ EclSubGraph::EclSubGraph(IAgentContext & _agent, EclGraph & _parent, EclSubGraph
     elapsedGraphCycles = 0;
 
     subgraphCodeContext.set(_agent.queryCodeContext());
+    subgraphCodeContext.setWfid(parent.queryWfid());
     subgraphCodeContext.setContainer(this);
     subgraphAgentContext.setCodeContext(&subgraphCodeContext);
     subgraphAgentContext.set(&_agent);
@@ -800,7 +819,7 @@ void EclSubGraph::createFromXGMML(EclGraph * graph, ILoadedDllEntry * dll, IProp
             if (probeManager)
                 childProbe.setown(probeManager->startChildGraph(subGraphSeqNo, NULL));
 
-            Owned<EclSubGraph> subgraph = new EclSubGraph(*agent, *graph, this, subGraphSeqNo++, probeEnabled, debugContext, probeManager);
+            Owned<EclSubGraph> subgraph = new EclSubGraph(*agent, *graph, this, subGraphSeqNo++, debugContext, probeManager);
             subgraph->createFromXGMML(graph, dll, &cur, subGraphSeqNo, resultsGraph);
             if (probeManager)
                 probeManager->endChildGraph(childProbe, NULL);
@@ -878,25 +897,25 @@ void EclSubGraph::updateProgress()
         Owned<IWUGraphStats> progress = parent.updateStats(queryStatisticsComponentType(), queryStatisticsComponentName(), parent.queryWfid(), id);
         IStatisticGatherer & stats = progress->queryStatsBuilder();
         updateProgress(stats);
-
+        Owned<IStatisticCollection> statsCollection = stats.getResult();
+        agent->mergeAggregatorStats(*statsCollection, parent.queryWfid(), parent.queryGraphName(), id);
         if (startGraphTime || elapsedGraphCycles)
         {
             WorkunitUpdate lockedwu(agent->updateWorkUnit());
+            agent->updateAggregates(lockedwu);
             StringBuffer subgraphid;
             subgraphid.append(parent.queryGraphName()).append(":").append(SubGraphScopePrefix).append(id);
             if (startGraphTime)
                 parent.updateWUStatistic(lockedwu, SSTsubgraph, subgraphid, StWhenStarted, nullptr, startGraphTime);
+            StringBuffer scope;
+            scope.append(WorkflowScopePrefix).append(parent.queryWfid()).append(":").append(subgraphid);
             if (elapsedGraphCycles)
             {
                 unsigned __int64 elapsedTime = cycle_to_nanosec(elapsedGraphCycles);
                 parent.updateWUStatistic(lockedwu, SSTsubgraph, subgraphid, StTimeElapsed, nullptr, elapsedTime);
                 const cost_type cost = money2cost_type(calcCost(agent->queryAgentMachineCost(), nanoToMilli(elapsedTime)));
                 if (cost)
-                {
-                    StringBuffer scope;
-                    scope.append(WorkflowScopePrefix).append(parent.queryWfid()).append(":").append(subgraphid);
                     lockedwu->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTsubgraph, scope, StCostExecute, NULL, cost, 1, 0, StatsMergeReplace);
-                }
             }
         }
     }
@@ -924,6 +943,11 @@ void EclSubGraph::updateProgress(IStatisticGatherer &progress)
     }
     ForEachItemIn(i2, subgraphs)
         subgraphs.item(i2).updateProgress(progress);
+
+    Owned<IStatisticCollection> statsCollection = progress.getResult();
+    const cost_type costDiskAccess = statsCollection->aggregateStatistic(StCostFileAccess);
+    if (costDiskAccess)
+        progress.addStatistic(StCostFileAccess, costDiskAccess);
 }
 
 bool EclSubGraph::prepare(const byte * parentExtract, bool checkDependencies)
@@ -955,19 +979,7 @@ void EclSubGraph::doExecute(const byte * parentExtract, bool checkDependencies)
     ForEachItemIn(idx, elements)
     {
         EclGraphElement & cur = elements.item(idx);
-        if (cur.arg)
-        {
-            try
-            {
-                cur.arg->onStart(parentExtract, NULL);
-            }
-            catch(IException * e)
-            {
-                if (debugContext)
-                    debugContext->checkBreakpoint(DebugStateException, NULL, e);
-                throw cur.makeWrappedException(e);
-            }
-        }
+        cur.onStart(parentExtract, debugContext);
     }
 
     ForEachItemIn(ir, sinks)
@@ -994,10 +1006,12 @@ void EclSubGraph::doExecute(const byte * parentExtract, bool checkDependencies)
         else
             _e->Release();
     }
+
+    elapsedGraphCycles += (get_cycles_now() - startGraphCycles);
+
     if (e)
         throw e;
 
-    elapsedGraphCycles += (get_cycles_now() - startGraphCycles);
     executed = true;
 }
 
@@ -1021,16 +1035,28 @@ void EclSubGraph::execute(const byte * parentExtract)
         debugContext->checkBreakpoint(DebugStateGraphStart, NULL, parent.queryGraphName() );    //debug probes exist so we can now check breakpoints
     if (localResults)
         localResults->clear();
-    doExecute(parentExtract, false);
 
-    if(!owner)
-        PROGLOG("Completed subgraph %u", id);
-    if (!owner && !parent.queryLibrary())
+    try
     {
-        updateProgress();
-        cleanupActivities();
+        doExecute(parentExtract, false);
+
+        if(!owner)
+        {
+            PROGLOG("Completed subgraph %u", id);
+            if (!parent.queryLibrary())
+            {
+                updateProgress();
+                cleanupActivities();
+                agent->updateWULogfile(nullptr);//Update workunit logfile name in case of rollover
+            }
+        }
     }
-    agent->updateWULogfile(nullptr);//Update workunit logfile name in case of rollover
+    catch (...)
+    {
+        if (!owner && !parent.queryLibrary())
+            updateProgress();
+        throw;
+    }
 }
 
 
@@ -1165,7 +1191,7 @@ void EclGraph::associateSubGraph(EclSubGraph * subgraph)
     subgraphMap.setValue(subgraph->id, subgraph);
 }
 
-void EclGraph::createFromXGMML(ILoadedDllEntry * dll, IPropertyTree * xgmml, bool enableProbe)
+void EclGraph::createFromXGMML(ILoadedDllEntry * dll, IPropertyTree * xgmml)
 {
     Owned<IPropertyTreeIterator> iter = xgmml->getElements("node");
     unsigned subGraphSeqNo = 0;
@@ -1176,7 +1202,7 @@ void EclGraph::createFromXGMML(ILoadedDllEntry * dll, IPropertyTree * xgmml, boo
         if (probeManager)
             childProbe.setown(probeManager->startChildGraph(subGraphSeqNo, NULL));
 
-        Owned<EclSubGraph> subgraph = new EclSubGraph(*agent, *this, NULL, subGraphSeqNo++, enableProbe, debugContext, probeManager);
+        Owned<EclSubGraph> subgraph = new EclSubGraph(*agent, *this, NULL, subGraphSeqNo++, debugContext, probeManager);
         subgraph->createFromXGMML(this, dll, &iter->query(), subGraphSeqNo, NULL);
         if (probeManager)
             probeManager->endChildGraph(childProbe, NULL);
@@ -1246,53 +1272,71 @@ void EclGraph::execute(const byte * parentExtract)
         addTimeStamp(wu, SSTgraph, queryGraphName(), StWhenStarted, wfid);
     }
 
+    Owned<IException> exception;
+    unsigned startTime = msTick();
+
     try
     {
-        unsigned startTime = msTick();
-        aindex_t lastSink = -1;
         ForEachItemIn(idx, graphs)
         {
             EclSubGraph & cur = graphs.item(idx);
             if (cur.isSink)
                 cur.execute(parentExtract);
         }
-
-        {
-            unsigned elapsed = msTick()-startTime;
-
-            Owned<IWorkUnit> wu(agent->updateWorkUnit());
-
-            StringBuffer description;
-            formatGraphTimerLabel(description, queryGraphName(), 0, 0);
-
-            unsigned __int64 elapsedNs = milliToNano(elapsed);
-            updateWorkunitStat(wu, SSTgraph, queryGraphName(), StTimeElapsed, description.str(), elapsedNs, wfid);
-
-            const cost_type cost = money2cost_type(calcCost(agent->queryAgentMachineCost(), elapsed));
-            if (cost)
-            {
-                StringBuffer scope;
-                scope.append(WorkflowScopePrefix).append(wfid).append(":").append(queryGraphName());
-                wu->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTgraph, scope, StCostExecute, NULL, cost, 1, 0, StatsMergeReplace);
-            }
-        }
-
-        if (agent->queryRemoteWorkunit())
-            wu->setGraphState(queryGraphName(), wfid, WUGraphComplete);
     }
-    catch (...)
+    catch (IException * e)
+    {
+        exception.setown(e);
+    }
+
+    {
+        unsigned elapsed = msTick()-startTime;
+
+        Owned<IWorkUnit> wu(agent->updateWorkUnit());
+
+        StringBuffer description;
+        formatGraphTimerLabel(description, queryGraphName(), 0, 0);
+
+        unsigned __int64 elapsedNs = milliToNano(elapsed);
+        updateWorkunitStat(wu, SSTgraph, queryGraphName(), StTimeElapsed, description.str(), elapsedNs, wfid);
+
+        StringBuffer scope;
+        scope.append(WorkflowScopePrefix).append(wfid).append(":").append(queryGraphName());
+        const cost_type cost = money2cost_type(calcCost(agent->queryAgentMachineCost(), elapsed));
+        if (cost)
+            wu->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTgraph, scope, StCostExecute, NULL, cost, 1, 0, StatsMergeReplace);
+    }
+
+    publishFileReadProperties(exception != nullptr);
+
+    if (exception)
     {
         if (agent->queryRemoteWorkunit())
             wu->setGraphState(queryGraphName(), wfid, WUGraphFailed);
-        throw;
+        throw exception.getClear();
     }
+
+    if (agent->queryRemoteWorkunit())
+        wu->setGraphState(queryGraphName(), wfid, WUGraphComplete);
 }
 
 void EclGraph::executeLibrary(const byte * parentExtract, IHThorGraphResults * results)
 {
     assertex(graphs.ordinality() == 1);
     EclSubGraph & cur = graphs.item(0);
-    cur.executeLibrary(parentExtract, results);
+    Owned<IException> exception;
+    try
+    {
+        cur.executeLibrary(parentExtract, results);
+    }
+    catch (IException *e)
+    {
+        exception.setown(e);
+    }
+
+    publishFileReadProperties(exception != nullptr);
+    if (exception)
+        throw exception.getClear();
 }
 
 void EclGraph::abort()
@@ -1343,8 +1387,59 @@ void EclGraph::updateLibraryProgress()
     {
         EclSubGraph & cur = graphs.item(idx);
         unsigned wfid = cur.parent.queryWfid();
-        Owned<IWUGraphStats> progress = wu->updateStats(queryGraphName(), queryStatisticsComponentType(), queryStatisticsComponentName(), wfid, cur.id);
-        cur.updateProgress(progress->queryStatsBuilder());
+
+        Owned<IWUGraphStats> progress =  wu->updateStats(queryGraphName(), queryStatisticsComponentType(), queryStatisticsComponentName(), wfid, cur.id, false);
+        IStatisticGatherer & stats = progress->queryStatsBuilder();
+        cur.updateProgress(stats);
+        Owned<IStatisticCollection> statsCollection = stats.getResult();
+        agent->mergeAggregatorStats(*statsCollection, wfid, queryGraphName(), cur.id);
+    }
+}
+
+IFileReadPropertiesUpdater * EclGraph::queryFileReadPropsUpdater()
+{
+    return fileReadPropsUpdater.query([this] { return createFileReadPropertiesUpdater(this->agent->queryCodeContext()->queryUserDescriptor()); }, fileReadPropsUpdaterCrit);
+}
+
+IDistributedFileTransaction * EclGraph::queryReadFilesTransaction()
+{
+    return readFilesTransaction.query([this] { return createDistributedFileTransaction(this->agent->queryCodeContext()->queryUserDescriptor()); }, readFilesTransactionCrit);
+}
+
+void EclGraph::publishFileReadProperties(bool ignoreExceptions)
+{
+    COnScopeExit clearTransaction([this]
+    {
+        readFilesTransaction.clear();
+    });
+
+    Owned<IException> exception;
+    try
+    {
+        if (fileReadPropsUpdater.query())
+        {
+            // ensure reuse of the read files transaction to avoid repeating expensive DFS calls, particularly for superfiles
+            fileReadPropsUpdater.query()->publish(queryReadFilesTransaction());
+        }
+    }
+    catch (IException *e)
+    {
+        exception.setown(e);
+    }
+    catch (const std::exception &e)
+    {
+        exception.setown(makeStringExceptionV(0, "%s", e.what()));
+    }
+
+    if (exception)
+    {
+        fileReadPropsUpdater.clear();
+        if (ignoreExceptions)
+        {
+            IERRLOG(exception, "Failed to publish file-read properties");
+            return;
+        }
+        throw exception.getClear();
     }
 }
 
@@ -1430,7 +1525,7 @@ const void * GraphResult::getLinkedRowResult()
 
 GraphResults::GraphResults(unsigned _maxResults)
 {
-    results.ensure(_maxResults);
+    results.ensureCapacity(_maxResults);
 }
 
 void GraphResults::clear()
@@ -1486,7 +1581,7 @@ void GraphResults::setResult(unsigned id, IHThorGraphResult * result)
 
 IWUGraphStats *EclGraph::updateStats(StatisticCreatorType creatorType, const char * creator, unsigned activeWfid, unsigned subgraph)
 {
-    return wu->updateStats (queryGraphName(), creatorType, creator, activeWfid, subgraph);
+    return wu->updateStats(queryGraphName(), creatorType, creator, activeWfid, subgraph, false);
 }
 
 void EclGraph::updateWUStatistic(IWorkUnit *lockedwu, StatisticScopeType scopeType, const char * scope, StatisticKind kind, const char * descr, unsigned __int64 value)
@@ -1534,12 +1629,11 @@ EclGraph * EclAgent::loadGraph(const char * graphName, IConstWorkUnit * wu, ILoa
 {
     Owned<IConstWUGraph> wuGraph = wu->getGraph(graphName);
     assertex(wuGraph);
-    Owned<IPropertyTree> xgmml = wuGraph->getXGMMLTree(false);
-
-    bool probeEnabled = wuRead->getDebugValueBool("_Probe", false);
+    Owned<IPropertyTree> xgmml = wuGraph->getXGMMLTree(false, false);
 
     Owned<EclGraph> eclGraph = new EclGraph(*this, graphName, wu, isLibrary, debugContext, probeManager, wuGraph->getWfid());
-    eclGraph->createFromXGMML(dll, xgmml, probeEnabled);
+    eclGraph->createFromXGMML(dll, xgmml);
+    statsAggregator.loadExistingAggregates(*wu);
     return eclGraph.getClear();
 }
 
@@ -1559,15 +1653,14 @@ void EclAgent::updateWULogfile(IWorkUnit *outputWU)
             rlf.setLocalPath(logname);
             rlf.getRemotePath(logname.clear());
 
-            if (outputWU)
+            Owned<IWorkUnit> w;
+            if (!outputWU)
             {
-                outputWU->addProcess("EclAgent", agentTopology->queryProp("@name"), GetCurrentProcessId(), 0, nullptr, false, logname.str());
+                w.setown(updateWorkUnit());
+                outputWU = w;
             }
-            else
-            {
-                Owned<IWorkUnit> w = updateWorkUnit();
-                w->addProcess("EclAgent", agentTopology->queryProp("@name"), GetCurrentProcessId(), 0, nullptr, false, logname.str());
-            }
+
+            outputWU->addProcess("EclAgent", agentTopology->queryProp("@name"), GetCurrentProcessId(), 0, nullptr, false, logname.str());
         }
         else
         {
@@ -1595,7 +1688,19 @@ void EclAgent::executeGraph(const char * graphName, bool realThor, size32_t pare
     {
         if (isStandAloneExe)
             throw MakeStringException(0, "Cannot execute Thor Graph in standalone mode");
-        executeThorGraph(graphName, *wuRead, *agentTopology);
+        Owned<IConstWUGraph> graph = wuRead->getGraph(graphName);
+        unsigned wfid = graph ? graph->getWfid() : 0;
+        graph.clear();
+        try
+        {
+            executeThorGraph(graphName, *wuRead, *agentTopology);
+            runWorkunitAnalyser(*wuRead, getComponentConfigSP(), wfid, graphName, true, calculateThorCostPerHour(getNodes()));
+        }
+        catch (...)
+        {
+            runWorkunitAnalyser(*wuRead, getComponentConfigSP(), wfid, graphName, true, calculateThorCostPerHour(getNodes()));
+            throw;
+        }
     }
     else
     {

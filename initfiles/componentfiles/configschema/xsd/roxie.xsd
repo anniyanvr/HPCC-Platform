@@ -110,13 +110,14 @@
                                   hpcc:displayName="flushJHtreeCacheOnOOM" hpcc:presetValue="true"
                                   hpcc:tooltip="Should the index node memory allocation flush the cache and retry if memory allocation fails"/>
                     <xs:attribute name="fieldTranslationEnabled" hpcc:displayName="Enable Field Translation"
-                                  hpcc:presetValue="payload"
+                                  hpcc:presetValue="payloadRemoveOnly"
                                   hpcc:tooltip="Enables translation (where possible) of mismatched index layouts on-the-fly. Specify 'payload' to attempt to translate payload fields only">
                         <xs:simpleType>
                             <xs:restriction base="xs:string">
                                 <xs:enumeration value="false" hpcc:displayName="False" hpcc:desciption=""/>
-                                <xs:enumeration value="true" hpcc:displayName="true" hpcc:description=""/>
+                                <xs:enumeration value="true" hpcc:displayName="True" hpcc:description=""/>
                                 <xs:enumeration value="payload" hpcc:displayName="Payload" hpcc:description=""/>
+                                <xs:enumeration value="payloadRemoveOnly" hpcc:displayName="PayloadRemoveOnly" hpcc:description=""/>
                             </xs:restriction>
                         </xs:simpleType>
                     </xs:attribute>
@@ -277,6 +278,9 @@
                     <xs:attribute name="soapTraceLevel" type="xs:nonNegativeInteger" hpcc:displayName="Soap trace Level"
                                   hpcc:presetValue="1"
                                   hpcc:tooltip="Level of detail in reporting SOAPCALL information(set to 0 for none, 1 for normal, >1 or more for extended)"/>
+                    <xs:attribute name="soapAuthTraceLevel" type="xs:nonNegativeInteger" hpcc:displayName="SOAP authorization trace level"
+                                  hpcc:presetValue="1"
+                                  hpcc:tooltip="Enable logging authorization headers in SOAPCALL or HTTPCALL information (set to 0 to suppress, >0 to log)"/>
                     <xs:attribute name="traceTranslations" type="xs:boolean" hpcc:displayName="Trace record layout translations"
                                   hpcc:presetValue="true"
                                   hpcc:tooltip="Trace record layout translations to log file"/>
@@ -305,15 +309,15 @@
                     <xs:attribute name="udpFlowSocketsSize" type="xs:nonNegativeInteger"
                                   hpcc:displayName="UDP Flow Socket Size (bytes)" hpcc:presetValue="131071"
                                   hpcc:tooltip="Controls the read socket buffer size of the UDP layer flow control sockets"/>
-                    <xs:attribute name="udpInlineCollation" type="xs:boolean" hpcc:displayName="UDP Inline Collation"
-                                  hpcc:presetValue="false"
-                                  hpcc:tooltip="Controls whether UDP packets are collated on the reading thread or queued up for collation on a separate thread"/>
-                    <xs:attribute name="udpInlineCollationPacketLimit" type="xs:nonNegativeInteger"
-                                  hpcc:displayName="UDP Inline Colation Packet Limit" hpcc:presetValue="50"
-                                  hpcc:tooltip="Controls how many UDP packets requested at once when inline collation selected"/>
                     <xs:attribute name="udpLocalWriteSocketSize" type="xs:nonNegativeInteger"
                                   hpcc:displayName="UDP Local Write Socket Size (bytes)" hpcc:presetValue="131071"
                                   hpcc:tooltip="Controls the write socket buffer size of the local UDP sockets (Agent to Server on same node)"/>
+                    <xs:attribute name="tcpServerWorkerSendBufferSize" type="xs:nonNegativeInteger"
+                                  hpcc:displayName="TCP Worker Send Socket Size (bytes)" hpcc:presetValue="0"
+                                  hpcc:tooltip="Controls the write socket buffer size of the TCP worker connection sockets"/>
+                    <xs:attribute name="tcpServerWorkerRecvBufferSize" type="xs:nonNegativeInteger"
+                                  hpcc:displayName="TCP Worker Receive Socket Size (bytes)" hpcc:presetValue="0"
+                                  hpcc:tooltip="Controls the read socket buffer size of the TCP worker connection sockets"/>
                     <xs:attribute name="udpMaxRetryTimedoutReqs" type="xs:nonNegativeInteger"
                                   hpcc:displayName="UDP Max Retry Timedout Reqs" hpcc:presetValue="0"
                                   hpcc:tooltip="Controls the Max number of agent 'request to send' to be retried. 0 means keep retrying forever"/>
@@ -334,35 +338,22 @@
                     <xs:attribute name="udpRequestToSendAckTimeout" type="xs:nonNegativeInteger"
                                   hpcc:displayName="UDP Request To Send Ack Timeout (ms)" hpcc:presetValue="100"
                                   hpcc:tooltip="Controls the timeout value agent udp will wait for acknowledgement of a request to send from a Roxie server, in milliseconds"/>
-                    <xs:attribute name="udpResendEnabled" type="xs:boolean" hpcc:displayName="Enable UDP Resend"
-                                  hpcc:presetValue="false" hpcc:tooltip="UDP transport layer packet resend ability"/>
-                    <xs:attribute name="udpRetryBusySenders" type="xs:nonNegativeInteger"
-                                  hpcc:displayName="UDP Retry Busy Senders" hpcc:presetValue="0"
-                                  hpcc:tooltip="Controls the number of times Roxie server will repeat search for an idle sender when requesting new data"/>
+                    <xs:attribute name="udpResendLostPackets" type="xs:boolean" hpcc:displayName="Enable UDP Resend"
+                                  hpcc:presetValue="true" hpcc:tooltip="UDP transport layer resend lost packets"/>
+                    <xs:attribute name="udpResendTimeout" type="xs:nonNegativeInteger" hpcc:displayName="UDP resend timeout"
+                                  hpcc:presetValue="10" hpcc:tooltip="Time in milliseconds to assume a packet is in transit before assuming lost"/>
                     <xs:attribute name="udpSendQueueSize" type="xs:nonNegativeInteger"
                                   hpcc:displayName="UDP Send Queue Size" hpcc:presetValue="50"
                                   hpcc:tooltip="UDP transport layer send queue size"/>
-                    <xs:attribute name="udpSnifferEnabled" type="xs:boolean" hpcc:displayName="Enable UDP Sniffer"
-                                  hpcc:presetValue="true"
-                                  hpcc:tooltip="Enable the UDP multicast sniffer for tracking which senders are busy"/>
-                    <xs:attribute name="udpSnifferReadThreadPriority" type="xs:nonNegativeInteger"
-                                  hpcc:displayName="UDP Sniffer Read Thread Priority" hpcc:presetValue="3"
-                                  hpcc:tooltip="If non-zero, run the sniffer read thread at elevated priority level"/>
-                    <xs:attribute name="udpSnifferSendThreadPriority" type="xs:nonNegativeInteger"
-                                  hpcc:displayName="UDP Sniffer Send Thread Priority" hpcc:presetValue="3"
-                                  hpcc:tooltip="If non-zero, run the sniffer send thread at elevated priority level"/>
-                    <xs:attribute name="useAeron" type="xs:boolean" hpcc:displayName="Use Aeron"
-                                  hpcc:presetValue="false"
-                                  hpcc:tooltip="Use Aeron for slave->server communication"/>
+                    <xs:attribute name="udpStatsReportInterval" type="xs:nonNegativeInteger"
+                                  hpcc:displayName="UDP transport layer stats reporting interval" hpcc:presetValue="60000"
+                                  hpcc:tooltip="UDP transport layer send queue size"/>
                 </xs:attributeGroup>
 
                 <xs:attributeGroup name="cache" hpcc:groupByName="Cache">
                     <xs:attribute name="blobCacheMem" type="xs:nonNegativeInteger"
                                   hpcc:displayName="Blob Cache Memory Size (Mb)" hpcc:presetValue="0"
                                   hpcc:tooltip="Size (in Mb) of blob index page cache"/>
-                    <xs:attribute name="serverSideCacheSize" type="xs:nonNegativeInteger"
-                                  hpcc:displayName="Server Side Cache Size" hpcc:presetValue="0"
-                                  hpcc:tooltip="Number of agent results to cache on Roxie server"/>
                     <xs:attribute name="leafCacheMem" type="xs:nonNegativeInteger"
                                   hpcc:displayName="Leaf Cache Memory Size (Mb)" hpcc:presetValue="50"
                                   hpcc:tooltip="Size (in Mb) of leaf index page cache"/>
@@ -423,9 +414,6 @@
                     <xs:attribute name="defaultPrefetchProjectPreload" type="xs:nonNegativeInteger"
                                   hpcc:displayName="Default Prefetch Project Preload" hpcc:presetValue="10"
                                   hpcc:tooltip="Default prefetch value for PROJECT,PREFETCH activity"/>
-                    <xs:attribute name="diskReadBufferSize" type="xs:nonNegativeInteger"
-                                  hpcc:displayName="Disk Read Buffer Size (bytes)" hpcc:presetValue="65536"
-                                  hpcc:tooltip="Default buffer size for disk read operations"/>
                     <xs:attribute name="doIbytiDelay" type="xs:boolean" hpcc:displayName="Enable IBYTI Ddelay Logic"
                                   hpcc:presetValue="true" hpcc:tooltip="Enables the IBYTI delay logic in the agents"/>
                     <xs:attribute name="enableHeartBeat" type="xs:boolean" hpcc:displayName="Enable Heartbeat"
@@ -446,9 +434,9 @@
                     <xs:attribute name="jumboFrames" type="xs:boolean" hpcc:displayName="Jumbo Frames"
                                   hpcc:presetValue="false"
                                   hpcc:tooltip="Set to true if using jumbo frames (MTU=9000) on the network"/>
-                    <xs:attribute name="linuxYield" type="xs:boolean" hpcc:displayName="Linux Yield"
-                                  hpcc:presetValue="false"
-                                  hpcc:tooltip="Yield to scheduler in some tight loops. May help latency on uniprocessor machines"/>
+                    <xs:attribute name="indexYieldFrequency" type="xs:nonNegativeInteger" hpcc:displayName="Index Yield Frequency"
+                                  hpcc:presetValue="1"
+                                  hpcc:tooltip="Yield to scheduler in some tight index loops every N iterations. May help latency with few CPUs"/>
                     <xs:attribute name="maxBlockSize" type="xs:nonNegativeInteger"
                                   hpcc:displayName="Maximum Block Size (bytes)" hpcc:presetValue="10000000"
                                   hpcc:tooltip="Max size of block read from client socket"/>
@@ -467,9 +455,6 @@
                     <xs:attribute name="perChannelFlowLimit" type="xs:nonNegativeInteger"
                                   hpcc:displayName="Per Channel Flow Limit" hpcc:presetValue="10"
                                   hpcc:tooltip="Number of pending queries permitted per channel (per active activity) before blocking"/>
-                    <xs:attribute name="pingInterval" type="xs:nonNegativeInteger" hpcc:displayName="Ping Interval (s)"
-                                  hpcc:presetValue="60"
-                                  hpcc:tooltip="Interval (in seconds) between Roxie server ping tests"/>
                     <xs:attribute name="preabortIndexReadsThreshold" type="xs:nonNegativeInteger"
                                   hpcc:displayName="Pre Abort Index Reads Threshold" hpcc:presetValue="100"
                                   hpcc:tooltip="Use seek to precheck keyed limits (i.e. assume ,COUNT) on index reads if limit greater than this value"/>
@@ -591,6 +576,20 @@
                                           <!--hpcc:autoGenerateValue="ACL"/>-->
                         <!--</xs:complexType>-->
                     <!--</xs:element>-->
+                    <xs:element name="directAccessPlanes" type="xs:string" hpcc:displayName="Direct Access Planes"
+                                minOccurs="0" maxOccurs="unbounded"
+                                hpcc:tooltip="Storage planes Roxie can access directly without copying files to its default plane"/>
+                    <xs:element name="preferredPlanes" hpcc:displayName="Preferred Planes"
+                                minOccurs="0" maxOccurs="unbounded">
+                        <xs:complexType>
+                            <xs:attribute name="name" type="xs:string" use="required" hpcc:autoGenerateType="prefix_"
+                                          hpcc:autoGenerateValue="PreferredPlane"
+                                          hpcc:uniqueKey="roxiepreferredplane_name"
+                                          hpcc:tooltip="Name of the preferred storage plane"/>
+                            <xs:attribute name="priority" type="xs:integer" use="optional"
+                                          hpcc:tooltip="Priority (negative to disable)"/>
+                        </xs:complexType>
+                    </xs:element>
                     <xs:element name="PreferredCluster" hpcc:displayName="Preferred Clusters" maxOccurs="unbounded">
                         <xs:complexType>
                             <xs:attribute name="name" type="xs:string" use="required" hpcc:autoGenerateType="prefix_"

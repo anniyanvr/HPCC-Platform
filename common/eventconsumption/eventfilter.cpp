@@ -1,0 +1,2474 @@
+/*##############################################################################
+
+    Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#include "eventfilter.h"
+#include "eventindex.hpp"
+#include "eventmetaparser.hpp"
+#include "jregexp.hpp"
+#include "jtrace.hpp"
+#include "jutil.hpp"
+#include <map>
+#include <set>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+
+class CEventFilter : public CInterfaceOf<IEventFilter>
+{
+public:
+    CEventFilter(CMetaInfoState& _metaState)
+        : metaState(_metaState)
+    {
+        // NOTE:
+        //   - We initialize a synthetic event here using EventIndexEviction even though this
+        //     filter is concerned with EventIndexPayload. The eviction and payload events
+        //     share the same metadata schema and attribute layout for node kind, so an
+        //     EventIndexEviction instance is sufficient as a template object to obtain and
+        //     configure the EvAttrNodeKind attribute used during filtering.
+        //   - The value 1ULL assigned to EvAttrNodeKind is the protocol/metadata-defined
+        //     node kind value that corresponds to payload nodes in the event index. It is
+        //     treated as an encoded constant (see eventindex.hpp) and is used here solely
+        //     to restrict matching to EventIndexPayload-related entries.
+        payloadNodeKindEvent.reset(EventIndexEviction);
+        payloadNodeKindAttribute = &payloadNodeKindEvent.queryAttribute(EvAttrNodeKind);
+        payloadNodeKindAttribute->setValue(1ULL);
+    }
+
+protected:
+    class StringMatchHelper
+    {
+    public:
+        using PatternInfo = std::pair<std::string, FilterTermComparison>;
+
+    private:
+        std::set<PatternInfo> patterns;
+
+    public:
+        bool matches(const char* value) const
+        {
+            bool positiveMatch = false;
+            bool hasPositive = false;
+            bool hasNegative = false;
+            for (const PatternInfo& pattern : patterns)
+            {
+                switch (pattern.second)
+                {
+                case FilterTermComparison::Default:
+                case FilterTermComparison::Wildcard:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || WildMatch(value, pattern.first.c_str(), false);
+                    break;
+                case FilterTermComparison::Equal:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || strieq(value, pattern.first.c_str());
+                    break;
+                case FilterTermComparison::NotEqual:
+                    hasNegative = true;
+                    if (strieq(value, pattern.first.c_str()))
+                        return false;
+                    break;
+                case FilterTermComparison::LessThan:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (stricmp(value, pattern.first.c_str()) < 0);
+                    break;
+                case FilterTermComparison::LessThanOrEqual:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (stricmp(value, pattern.first.c_str()) <= 0);
+                    break;
+                case FilterTermComparison::GreaterThanOrEqual:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (stricmp(value, pattern.first.c_str()) >= 0);
+                    break;
+                case FilterTermComparison::GreaterThan:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (stricmp(value, pattern.first.c_str()) > 0);
+                    break;
+                default:
+                    throwUnexpected();
+                }
+            }
+
+            // Negations act as a deny-list: any matched negation already returned false above.
+            // If positive terms exist, the value must match at least one; otherwise any
+            // non-denied value is accepted.
+            if (hasPositive)
+                return positiveMatch;
+            if (hasNegative)
+                return true;
+            return false;
+        }
+
+        bool acceptToken(const char* token, FilterTermComparison comp)
+        {
+            switch (comp)
+            {
+            case FilterTermComparison::Default:
+            case FilterTermComparison::Wildcard:
+            case FilterTermComparison::Equal:
+            case FilterTermComparison::NotEqual:
+            case FilterTermComparison::LessThan:
+            case FilterTermComparison::LessThanOrEqual:
+            case FilterTermComparison::GreaterThanOrEqual:
+            case FilterTermComparison::GreaterThan:
+                break;
+            default:
+                return false;
+            }
+            (void)patterns.emplace(token, comp);
+            return true;
+        }
+
+        bool empty() const { return patterns.empty(); }
+    };
+
+    static bool acceptStringMatchValues(StringMatchHelper& helper, const char* values)
+    {
+        unsigned accepted = 0;
+        StringArray tokens;
+        tokens.appendList(values, ",", true);
+        ForEachItemIn(i, tokens)
+        {
+            const char* token = tokens.item(i);
+            if (isEmptyString(token))
+                continue;
+            FilterTermComparison comp = CEventFilter::extractComparison(token);
+            if (isEmptyString(token))
+                return false;
+            if (!helper.acceptToken(token, comp))
+                return false;
+            accepted++;
+        }
+        if (!accepted)
+            return false;
+        return true;
+    }
+
+    struct FilterTerm : public CInterface
+    {
+        FilterTerm(CMetaInfoState& _metaInfoState) : metaInfoState(_metaInfoState) {}
+        virtual void observe(const CEvent& event) const {}
+        virtual bool matches(const CEvent& event, const CEventAttribute& attribute) const { return true; }
+        virtual bool matches(const char*) const
+        {
+            throw makeStringException(-1, "filter term does not support text matching");
+        }
+        virtual bool accept(const char* values)
+        {
+            StringArray tokens;
+            tokens.appendList(values, ",", true);
+            ForEachItemIn(i, tokens)
+            {
+                const char* token = tokens.item(i);
+                if (isEmptyString(token))
+                    continue;
+                FilterTermComparison comp = CEventFilter::extractComparison(token);
+                if (isEmptyString(token))
+                    return false;
+                if (!acceptToken(token, comp))
+                    return false;
+            }
+            return true;
+        }
+        virtual bool acceptToken(const char* token, FilterTermComparison comp) = 0;
+        virtual bool preScanRequired() const { return false; }
+    protected:
+        CMetaInfoState& metaInfoState;
+    };
+
+    struct StringFilterTerm : public FilterTerm
+    {
+        struct StringViewLess
+        {
+            using is_transparent = void;
+
+            bool operator()(const std::string& lhs, const std::string& rhs) const { return lhs < rhs; }
+            bool operator()(const std::string& lhs, std::string_view rhs) const { return std::string_view(lhs) < rhs; }
+            bool operator()(std::string_view lhs, const std::string& rhs) const { return lhs < std::string_view(rhs); }
+            bool operator()(std::string_view lhs, std::string_view rhs) const { return lhs < rhs; }
+        };
+
+        StringMatchHelper helper;
+
+        // Cache of previously evaluated values used to avoid potentially redundant pattern
+        // matching. The transparent comparator allows string_view probes without allocating on
+        // cache hits. A map is used because C++17 does not provide portable heterogeneous lookup
+        // for unordered_map; the O(log N) lookup is the tradeoff for this allocation-free probe.
+        // The contents persist for the lifetime of the filter term. For values known to have a
+        // shorter lifetime, e.g., TraceId, a subclass may manage the cache differently.
+        //
+        // The map is mutable because it is used exclusively within a const method. The method is
+        // const because the base class requires it to be so. Concurrent access is not a concern
+        // because event traversal and iteration are not multi-threaded activities. Synchronization
+        // is not required.
+        mutable std::map<std::string, bool, StringViewLess> knownValues;
+
+        using FilterTerm::FilterTerm;
+
+        bool matches(const CEvent&, const CEventAttribute& attribute) const override
+        {
+            return matchesValue(attribute.queryTextValue());
+        }
+
+        bool matches(const char* value) const override
+        {
+            return matchesValue(value);
+        }
+
+        bool matchesValue(const char* value) const
+        {
+            std::string_view valueView(value ? value : "");
+            auto knownIt = knownValues.find(valueView);
+            if (knownIt != knownValues.end())
+                return knownIt->second;
+            std::string cachedValue(valueView);
+            bool match = helper.matches(cachedValue.c_str());
+            knownValues.emplace(std::move(cachedValue), match);
+            return match;
+        }
+
+        bool acceptToken(const char* token, FilterTermComparison comp) override
+        {
+            return helper.acceptToken(token, comp);
+        }
+    };
+
+    struct BoolFilterTerm : public FilterTerm
+    {
+        using FilterTerm::FilterTerm;
+
+        bool accepted[2]{false, false};
+
+        bool matches(const CEvent&, const CEventAttribute& attribute) const override
+        {
+            return accepted[attribute.queryBooleanValue()];
+        }
+
+        bool acceptToken(const char* token, FilterTermComparison comp) override
+        {
+            assertex(FilterTermComparison::Default == comp);
+            bool value = strToBool(token);
+            accepted[value] = true;
+            return true;
+        }
+    };
+
+    struct SearchFlagFilterTerm : public BoolFilterTerm
+    {
+        __uint64 mask;
+
+        SearchFlagFilterTerm(CMetaInfoState& metaState, __uint64 _mask)
+            : BoolFilterTerm(metaState), mask(_mask)
+        {
+        }
+
+        bool matches(const CEvent& event, const CEventAttribute&) const override
+        {
+            bool set = event.hasAttribute(EvAttrSearchFlags)
+                && (event.queryNumericValue(EvAttrSearchFlags) & mask);
+            return accepted[set];
+        }
+
+        bool matchesFlag(const CEvent& event) const
+        {
+            bool set = event.hasAttribute(EvAttrSearchFlags)
+                && (event.queryNumericValue(EvAttrSearchFlags) & mask);
+            return accepted[set];
+        }
+    };
+
+    struct UnsignedFilterTerm : public FilterTerm
+    {
+        std::set<std::pair<std::pair<__uint64, __uint64>, FilterTermComparison>> accepted;
+
+        using FilterTerm::FilterTerm;
+
+        bool matches(const CEvent&, const CEventAttribute& attribute) const override
+        {
+            __uint64 value = attribute.queryNumericValue();
+            bool positiveMatch = false;
+            bool hasPositive = false;
+            bool hasNegative = false;
+            for (const std::pair<std::pair<__uint64, __uint64>, FilterTermComparison>& range : accepted)
+            {
+                switch (range.second)
+                {
+                case FilterTermComparison::Default:
+                case FilterTermComparison::ElementOf:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (range.first.first <= value && value <= range.first.second);
+                    break;
+                case FilterTermComparison::NotElementOf:
+                    hasNegative = true;
+                    if (range.first.first <= value && value <= range.first.second)
+                        return false;
+                    break;
+                case FilterTermComparison::Equal:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (range.first.first == value);
+                    break;
+                case FilterTermComparison::NotEqual:
+                    hasNegative = true;
+                    if (range.first.first == value)
+                        return false;
+                    break;
+                case FilterTermComparison::LessThan:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (value < range.first.first);
+                    break;
+                case FilterTermComparison::LessThanOrEqual:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (value <= range.first.first);
+                    break;
+                case FilterTermComparison::GreaterThanOrEqual:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (range.first.second <= value);
+                    break;
+                case FilterTermComparison::GreaterThan:
+                    hasPositive = true;
+                    positiveMatch = positiveMatch || (range.first.second < value);
+                    break;
+                default:
+                    throwUnexpected();
+                }
+            }
+
+            // Negations act as a deny-list: any matched negation already returned false above.
+            // If positive terms exist, the value must match at least one; otherwise any
+            // non-denied value is accepted.
+            if (hasPositive)
+                return positiveMatch;
+            if (hasNegative)
+                return true;
+            return false;
+        }
+
+        bool acceptToken(const char* token, FilterTermComparison comp) override
+        {
+            char* next = nullptr;
+            const char* delim = strchr(token, '-');
+            if (!delim)
+            {
+                __uint64 first = strtoull(token, &next, 0);
+                if (*next == '\0')
+                    return acceptRange(first, first, comp);
+            }
+            else if (delim == token)
+            {
+                __uint64 last = strtoull(delim + 1, &next, 0);
+                if (*next == '\0')
+                    return acceptRange(0, last, comp);
+            }
+            else
+            {
+                __uint64 first = strtoull(token, &next, 0);
+                while (isspace(*next))
+                    next++;
+                if (*next == '-')
+                {
+                    if (!*(next + 1))
+                        return acceptRange(first, UINT64_MAX, comp);
+                    __uint64 last = strtoull(next + 1, &next, 0);
+                    if (*next == '\0')
+                        return acceptRange(first, last, comp);
+                }
+            }
+            return false;
+        }
+
+        bool acceptRange(__uint64 first, __uint64 last, FilterTermComparison comp)
+        {
+            switch (comp)
+            {
+            case FilterTermComparison::Default:
+            case FilterTermComparison::ElementOf:
+            case FilterTermComparison::NotElementOf:
+            case FilterTermComparison::LessThan:
+            case FilterTermComparison::LessThanOrEqual:
+            case FilterTermComparison::GreaterThanOrEqual:
+            case FilterTermComparison::GreaterThan:
+                break;
+            case FilterTermComparison::Equal:
+            case FilterTermComparison::NotEqual:
+                if (first != last)
+                    return false;
+                break;
+            default:
+                return false;
+            }
+            if (first <= last)
+                return accepted.insert({{first, last}, comp}).second;
+            return false;
+        }
+    };
+
+
+    struct PathFilterTerm : public StringFilterTerm
+    {
+        using StringFilterTerm::StringFilterTerm;
+
+        bool matches(const CEvent& event, const CEventAttribute& attribute) const override
+        {
+#if defined(_DEBUG)
+            assertex(attribute.queryId() == EvAttrPath);
+#endif
+            if (StringFilterTerm::matches(event, attribute))
+                return true;
+
+            if (event.queryType() == MetaFileInformation)
+            {
+                const char* logicalName = metaInfoState.queryLogicalFileName(event);
+                if (!isEmptyString(logicalName) && helper.matches(logicalName))
+                    return true;
+            }
+
+            return false;
+        }
+    };
+
+    struct FileIdFilterTerm : public UnsignedFilterTerm
+    {
+        using UnsignedFilterTerm::UnsignedFilterTerm;
+
+        virtual void observe(const CEvent& event) const override
+        {
+            // 2 of 3 values derived from FileId depend on PlaneInformation.
+            // 3 of 3 values derived from FileId depend on MetaFileInformation.
+            // PlaneInformation must precede FileInformation, which must precede any other event
+            // containing FileId. We observe all dependencies using MetaFileInformation events.
+            if (MetaFileInformation != event.queryType())
+                return;
+            __uint64 fileId = event.queryNumericValue(EvAttrFileId);
+            if (!pathHelper.empty())
+                observeMatchedText(pathHelper, event.queryTextValue(EvAttrPath), fileId);
+            if (!planeHelper.empty())
+                observeMatchedText(planeHelper, metaInfoState.queryPlane(event), fileId);
+            if (!logicalNameHelper.empty())
+                observeMatchedText(logicalNameHelper, metaInfoState.queryLogicalFileName(event), fileId);
+        }
+
+        bool matches(const CEvent& event, const CEventAttribute& attribute) const override
+        {
+#if defined(_DEBUG)
+            assertex(attribute.queryId() == EvAttrFileId);
+#endif
+            return matchedDerivations.count(attribute.queryNumericValue()) || UnsignedFilterTerm::matches(event, attribute);
+        }
+
+        bool acceptMetaPath(const char* values)
+        {
+            return acceptMetaValues(pathHelper, values);
+        }
+
+        bool acceptMetaPlane(const char* values)
+        {
+            return acceptMetaValues(planeHelper, values);
+        }
+
+        bool acceptMetaLogicalFileName(const char* values)
+        {
+            return acceptMetaValues(logicalNameHelper, values);
+        }
+
+    private:
+        bool acceptMetaValues(StringMatchHelper& helper, const char* values)
+        {
+            return acceptStringMatchValues(helper, values);
+        }
+
+        void observeMatchedText(const StringMatchHelper& helper, const char* text, __uint64 fileId) const
+        {
+            if (!isEmptyString(text) && helper.matches(text))
+                matchedDerivations.insert(fileId);
+        }
+
+        StringMatchHelper pathHelper;
+        StringMatchHelper planeHelper;
+        StringMatchHelper logicalNameHelper;
+        mutable std::set<__uint64> matchedDerivations;
+    };
+
+    struct TraceIdFilterTerm : public StringFilterTerm
+    {
+        using StringFilterTerm::StringFilterTerm;
+
+        virtual bool preScanRequired() const override
+        {
+            return !serviceNameHelper.empty();
+        }
+
+        bool acceptServiceName(const char* values)
+        {
+            return acceptStringMatchValues(serviceNameHelper, values);
+        }
+
+        // Override of the base class method to accept the corresponding service name, which is
+        // not required to exist, as a match. The base method cannot be used because it cannot
+        // convey whether a result of false indicates a known non-match or the value is previously
+        // unseen, forcing the subclass to repeat lookups.
+        bool matches(const CEvent& event, const CEventAttribute& attribute) const override
+        {
+            if (attribute.queryId() != EvAttrEventTraceId)
+                throw makeStringExceptionV(0, "TraceIdFilterTerm can only evaluate EventTraceId attributes, but received attribute ID: %u", unsigned(attribute.queryId()));
+            std::string traceId = attribute.queryTextValue();
+            auto knownIt = knownValues.find(traceId);
+            bool match;
+            if (knownIt != knownValues.end())
+            {
+                match = knownIt->second;
+                // A QueryStop event with an EventTraceId attribute is required to attempt to purge
+                // what is now presumed to be an inactive ID from the knownValues map. The cache
+                // cleanup cannot occur with any other combination of event type and attribute ID.
+                if (match && EventQueryStop == event.queryType())
+                    knownValues.erase(knownIt);
+            }
+            else
+            {
+                if (helper.matches(traceId.c_str()))
+                    match = true;
+                else if (!serviceNameHelper.empty())
+                {
+                    const char* serviceName = metaInfoState.queryServiceName(traceId.c_str());
+                    match = (!isEmptyString(serviceName) && serviceNameHelper.matches(serviceName));
+                }
+                else
+                    match = false;
+                // Only cache the result if this is not a QueryStop event, since QueryStop events
+                // trigger cache cleanup rather than cache population.
+                if (EventQueryStop != event.queryType())
+                    knownValues.emplace(std::move(traceId), match);
+            }
+            return match;
+        }
+
+    private:
+        StringMatchHelper serviceNameHelper;
+    };
+
+    struct TimestampFilterTerm : public UnsignedFilterTerm
+    {
+        using UnsignedFilterTerm::UnsignedFilterTerm;
+
+        bool acceptToken(const char* token, FilterTermComparison comp) override
+        {
+            // Digits and hyphen only is presumed to be a nanosecond timestamp range.
+            std::string tmp(token);
+            if (tmp.find_first_not_of("0123456789-") == std::string::npos)
+                return UnsignedFilterTerm::acceptToken(token, comp);
+
+            // All else is presumed to be a date/time string or a date/time range.
+            __uint64 first = 0, last = UINT64_MAX;
+            CDateTime dt;
+            const char* delim = nullptr;
+            if (*token == '-') // range starting at 0
+            {
+                dt.setString(token + 1, &delim);
+                if (delim && *delim) // bad content
+                    return false;
+                last = dt.getTimeStampNs();
+            }
+            else // single value or range not starting at 0
+            {
+                dt.setString(token, &delim);
+                first = dt.getTimeStampNs();
+                if (isEmptyString(delim)) // single value
+                    last = first;
+                else
+                {
+                    CEventFilter::skipSpaces(delim);
+                    if ('-' == *delim) // a range...
+                    {
+                        token = delim + 1;
+                        if (*token) // with bounded end
+                        {
+                            CEventFilter::skipSpaces(token);
+                            delim = nullptr;
+                            dt.setString(token, &delim);
+                            if (delim && *delim) // bad content
+                                return false;
+                            last = dt.getTimeStampNs();
+                        }
+                        else // with unbounded end
+                            last = UINT64_MAX;
+                    }
+                    else // bad content
+                        return false;
+                }
+            }
+            return acceptRange(first, last, comp);
+        }
+    };
+
+    struct NodeKindFilterTerm : public UnsignedFilterTerm
+    {
+        using UnsignedFilterTerm::UnsignedFilterTerm;
+
+        bool acceptToken(const char* token, FilterTermComparison comp) override
+        {
+            NodeKind kind = mapNodeKind(token);
+            return acceptRange(kind, kind, comp);
+        }
+    };
+
+public: // IEventVisitationLink
+    IMPLEMENT_IEVENTVISITATIONLINK;
+
+public: // IEventVisitor
+    virtual bool visitEvent(CEvent& event, const EventFileProperties& properties) override
+    {
+        // Allow all filter terms the opportunity to see the event before it may be filtered.
+        // Observation allows, for example, the relationship between file ID and path to be
+        // established for enhanced filtering of index events.
+        for (unsigned termIdx = EvAttrNone + 1; termIdx < EvAttrMax; termIdx++)
+        {
+            if (terms[termIdx])
+                terms[termIdx]->observe(event);
+        }
+
+        if (terms[EvExtAttrInputFileName] &&
+            !terms[EvExtAttrInputFileName]->matches(queryInputFileName(properties)))
+            return true;
+
+        // Apply event type filters. Event filters cannot cause the remainder of the file to be
+        // skipped, so non-acceptance implies coninuation.
+        if (!acceptedEvents.empty() && !acceptedEvents.count(event.queryType()))
+            return true;
+
+        // Apply attribute filters. Attribute filters do not cause the remainder of the file to be
+        // skipped, so non-acceptance implies coninuation.
+        for (const CEventAttribute& attr : event.assignedAttributes)
+        {
+            const FilterTerm* term = terms[attr.queryId()];
+            if (term && !term->matches(event, attr))
+                return true;
+        }
+
+        if (event.hasAttribute(EvAttrSearchFlags))
+        {
+            for (unsigned idx = 0; idx < queryIndexSearchFlagCount(); idx++)
+            {
+                const auto& flag = *queryIndexSearchFlagInfoByIndex(idx);
+                const auto* term = static_cast<const SearchFlagFilterTerm*>(terms[flag.attrId].get());
+                if (term && !term->matchesFlag(event))
+                    return true;
+            }
+        }
+
+        // Special case for implied attribute(s)
+        if (event.queryType() == EventIndexPayload)
+        {
+            const FilterTerm* term = terms[EvAttrNodeKind];
+            if (term && !term->matches(payloadNodeKindEvent, *payloadNodeKindAttribute))
+                return true;
+        }
+
+        // Forward the event to the next linked visitor.
+        return nextLink->visitEvent(event, properties);
+    }
+
+public: // IEventFilter
+    virtual void configure(const IPropertyTree& config) override
+    {
+        Owned<IPropertyTreeIterator> termsIt = config.getElements("*");
+        ForEach(*termsIt)
+        {
+            const IPTree& termNode = termsIt->query();
+            const char* termName = termNode.queryName();
+            if (streq(termName, "attribute"))
+            {
+                const char* idName = termNode.queryProp("@id");
+                const char* values = termNode.queryProp("@values");
+                if (isEmptyString(idName) && isEmptyString(values))
+                    throw makeStringException(-1, "missing event attribute filter id and values");
+                if (isEmptyString(idName))
+                    throw makeStringExceptionV(-1, "missing event attribute filter id for values '%s'", values);
+                if (isEmptyString(values))
+                    throw makeStringExceptionV(-1, "missing event attribute filter values for id '%s'", idName);
+                if (strncmp(idName, EVENT_META_PREFIX, sizeof(EVENT_META_PREFIX) - 1) == 0)
+                {
+                    if (!acceptMetaAttribute(idName, values))
+                        throw makeStringExceptionV(-1, "event filter meta attribute '%s' term '%s' unsupported", idName, values);
+                }
+                else if (const IndexSearchFlagInfo* flag = queryIndexSearchFlagInfo(idName))
+                {
+                    if (!ensureSearchFlagTerm(*flag, values))
+                        throw makeStringExceptionV(-1, "event filter attribute '%s' term '%s' not accepted", flag->name, values);
+                }
+                else
+                {
+                    EventAttr id = queryEventAttribute(idName);
+                    if (EvAttrNone != id)
+                    {
+                        if (!acceptAttribute(id, values))
+                            throw makeStringExceptionV(-1, "event filter attribute '%s' term '%s' not accepted", queryEventAttributeName(id), values);
+                    }
+                    else
+                    {
+                        unsigned extendedId = queryExtendedEventAttribute(idName);
+                        if (EvExtAttrMax == extendedId)
+                            throw makeStringExceptionV(-1, "unknown event or extended attribute filter id '%s'. Use 'evtool describe' to view recognized attribute names.", idName);
+                        if (!acceptExtendedAttribute(extendedId, values))
+                            throw makeStringExceptionV(-1, "extended attribute filter '%s' term '%s' not accepted", idName, values);
+                    }
+                }
+            }
+            else if (streq(termName, "event"))
+            {
+                if (termNode.hasProp("@list"))
+                {
+                    const char* token = termNode.queryProp("@list");
+                    if (!acceptEvents(token))
+                        throw makeStringExceptionV(-1, "event list term '%s' not accepted", token);
+                }
+                else if (termNode.hasProp("@type"))
+                {
+                    const char* token = termNode.queryProp("@type");
+                    FilterTermComparison comp = extractComparison(token);
+                    EventType type = queryEventType(token);
+                    if (EventNone == type)
+                        throw makeStringExceptionV(-1, "event filter event term has unknown type name '%s'", token);
+                    if (!acceptEvent(type, comp))
+                        throw makeStringExceptionV(-1, "event type term '%s' not accepted", token);
+                }
+                else if (termNode.hasProp("@context"))
+                {
+                    const char* token = termNode.queryProp("@context");
+                    FilterTermComparison comp = extractComparison(token);
+                    EventContext context = queryEventContext(token);
+                    if (EventCtxInvalid == context)
+                        throw makeStringExceptionV(-1, "event filter context term has unknown context name '%s'", token);
+                    if (!acceptEvents(context, comp))
+                        throw makeStringExceptionV(-1, "event context term '%s' not accepted", token);
+                }
+            }
+        }
+    }
+
+    virtual bool acceptEvent(EventType type, FilterTermComparison comp) override
+    {
+        switch (comp)
+        {
+        case FilterTermComparison::Default:
+        case FilterTermComparison::Equal:
+            (void)acceptedEvents.insert(type);
+            break;
+        case FilterTermComparison::Except:
+            (void)acceptedEvents.erase(type);
+            break;
+        case FilterTermComparison::NotEqual:
+            for (byte t = EventNone + 1; t < EventMax; t++)
+            {
+                if (EventType(t) != type)
+                    (void)acceptedEvents.insert(EventType(t));
+            }
+            break;
+        default:
+            return false;
+        }
+        return true;
+    }
+
+    virtual bool acceptEvents(EventContext context, FilterTermComparison comp) override
+    {
+        for (byte type = EventNone + 1; type < EventMax; type++)
+        {
+            bool matched = eventInAnyContext(EventType(type), context);
+            switch (comp)
+            {
+            case FilterTermComparison::Default:
+            case FilterTermComparison::ElementOf:
+                if (matched)
+                    (void)acceptedEvents.insert(EventType(type));
+                break;
+            case FilterTermComparison::Except:
+                if (matched)
+                    (void)acceptedEvents.erase(EventType(type));
+                break;
+            case FilterTermComparison::NotElementOf:
+                if (!matched)
+                    (void)acceptedEvents.insert(EventType(type));
+                break;
+            default:
+                return false;
+            }
+        }
+        return true;
+    }
+
+    virtual bool acceptEvents(const char* events) override
+    {
+        StringArray tokens;
+        tokens.appendList(events, ",", true);
+        ForEachItemIn(i, tokens)
+        {
+            const char* token = tokens.item(i);
+            FilterTermComparison comp = extractComparison(token);
+            EventContext context = queryEventContext(token);
+            if (context != EventCtxInvalid)
+            {
+                if (!acceptEvents(context, comp))
+                    return false;
+                continue;
+            }
+            EventType type = queryEventType(token);
+            if (EventNone == type || !acceptEvent(type, comp))
+                return false;
+        }
+        return true;
+    }
+
+    virtual bool preScanRequired() const override
+    {
+        for (unsigned termIdx = EvAttrNone + 1; termIdx < EvAttrMax; termIdx++)
+        {
+            if (terms[termIdx] && terms[termIdx]->preScanRequired())
+                return true;
+        }
+        return false;
+    }
+
+    virtual bool acceptAttribute(EventAttr id, const char* values) override
+    {
+        switch (id)
+        {
+        case EvAttrFileId:
+            return ensureTerm<FileIdFilterTerm>(id)->accept(values);
+        case EvAttrEventTraceId:
+            return ensureTerm<TraceIdFilterTerm>(id)->accept(values);
+        case EvAttrNodeKind:
+            return ensureTerm<NodeKindFilterTerm>(id)->accept(values);
+        case EvAttrPath:
+            return ensureTerm<PathFilterTerm>(id)->accept(values);
+        default:
+            switch (queryEventAttributeType(id))
+            {
+            case EATtraceid:
+            case EATstring:
+                return ensureTerm<StringFilterTerm>(id)->accept(values);
+            case EATbool:
+                return ensureTerm<BoolFilterTerm>(id)->accept(values);
+            case EATu1:
+            case EATu2:
+            case EATu4:
+            case EATu8:
+                return ensureTerm<UnsignedFilterTerm>(id)->accept(values);
+            case EATtimestamp:
+                return ensureTerm<TimestampFilterTerm>(id)->accept(values);
+            case EATnone:
+            case EATmax:
+                throw makeStringExceptionV(-1, "event attribute id %d has an invalid type %d", int(id), int(queryEventAttributeType(id)));
+            default:
+                throw makeStringExceptionV(-1, "event attribute id %d has an unknown type %d", int(id), int(queryEventAttributeType(id)));
+            }
+            break;
+        }
+        // The preceding switch statements must return or throw for all cases.
+    }
+
+    virtual bool acceptExtendedAttribute(unsigned id, const char* values) override
+    {
+        if (id == EvExtAttrLogicalFileName)
+            return acceptMetaAttribute(EVENT_META_LOGICAL_FILE_NAME, values);
+        if (id == EvExtAttrInputFileName)
+        {
+            if (!terms[id])
+                terms[id].setown(new StringFilterTerm(metaState));
+            return static_cast<StringFilterTerm*>(terms[id].get())->accept(values);
+        }
+        const IndexSearchFlagInfo* flag = queryIndexSearchFlagInfo(id);
+        if (!flag)
+            return false;
+        return ensureSearchFlagTerm(*flag, values) != nullptr;
+    }
+
+    virtual bool acceptMetaAttribute(const char* name, const char* values) override
+    {
+        if (streq(name, EVENT_META_PATH))
+            return ensureTerm<FileIdFilterTerm>(EvAttrFileId)->acceptMetaPath(values);
+        if (streq(name, EVENT_META_PLANE))
+            return ensureTerm<FileIdFilterTerm>(EvAttrFileId)->acceptMetaPlane(values);
+        if (streq(name, EVENT_META_LOGICAL_FILE_NAME))
+            return ensureTerm<FileIdFilterTerm>(EvAttrFileId)->acceptMetaLogicalFileName(values);
+        if (streq(name, EVENT_META_SERVICE_NAME))
+            return ensureTerm<TraceIdFilterTerm>(EvAttrEventTraceId)->acceptServiceName(values);
+        return false;
+    }
+
+protected:
+    template <typename term_type_t>
+    term_type_t* ensureTerm(EventAttr id)
+    {
+        if (id <= EvAttrNone || id >= EvAttrMax)
+            throw makeStringExceptionV(-1, "event attribute id %d out of range", int(id));
+        if (!terms[id])
+            terms[id].setown(new term_type_t(metaState));
+#if defined(_DEBUG)
+        else if (dynamic_cast<term_type_t*>(terms[id].get()) == nullptr)
+            throw makeStringExceptionV(-1, "event attribute id %d has a different type of filter term", int(id));
+#endif
+        return static_cast<term_type_t*>(terms[id].get());
+    }
+
+    SearchFlagFilterTerm* ensureSearchFlagTerm(const IndexSearchFlagInfo& flag, const char* values)
+    {
+        if (!terms[flag.attrId])
+            terms[flag.attrId].setown(new SearchFlagFilterTerm(metaState, flag.mask));
+        auto* term = static_cast<SearchFlagFilterTerm*>(terms[flag.attrId].get());
+        if (!term->accept(values))
+            return nullptr;
+        return term;
+    }
+
+    // Examines the given token string for an optional comparison designation at thestart of the
+    // token. If found, the designation text is translated into the corresponding enumerated value
+    // and the token is updated to advance beyond the designation.
+    //
+    // Given `[in]index` on input, the return value is FilterTermComparison::ElementOf and the
+    // input parameter is updated to `index`.
+    static FilterTermComparison extractComparison(const char*& token)
+    {
+        assertex(!isEmptyString(token));
+        skipSpaces(token);
+        if (token[0] != '[')
+            return FilterTermComparison::Default;
+        skipSpaces(token);
+        const char* close = strchr(token + 1, ']');
+        if (!close)
+            throw makeStringExceptionV(-1, "invalid filter term syntax - '%s' incomplete comparison selector", token);
+        StringBuffer compStr(close - token - 1, token + 1);
+        compStr.trim();
+        if (compStr.isEmpty())
+            return FilterTermComparison::Default;
+        std::map<std::string, FilterTermComparison>::const_iterator it = comparisonMap.find(compStr.str());
+        if (comparisonMap.end() == it)
+            throw makeStringExceptionV(-1, "invalid filter term syntax - '%s' has unknown comparison selector", token);
+        token = close + 1;
+        skipSpaces(token);
+        return it->second;
+    }
+
+    static void skipSpaces(const char*& token)
+    {
+        while (isspace(*token))
+            token++;
+    }
+
+protected:
+    static std::map<std::string, FilterTermComparison> comparisonMap;
+    Owned<FilterTerm> terms[EvExtAttrMax];
+    std::unordered_set<EventType> acceptedEvents;
+    CMetaInfoState& metaState;
+    CEvent payloadNodeKindEvent;
+    CEventAttribute* payloadNodeKindAttribute{nullptr};
+};
+
+std::map<std::string, FilterTermComparison> CEventFilter::comparisonMap{
+    // event attribute value comparisons
+    {"eq", FilterTermComparison::Equal},
+    {"neq", FilterTermComparison::NotEqual},
+    {"lt", FilterTermComparison::LessThan},
+    {"lte", FilterTermComparison::LessThanOrEqual},
+    {"gte", FilterTermComparison::GreaterThanOrEqual},
+    {"gt", FilterTermComparison::GreaterThan},
+    {"in", FilterTermComparison::ElementOf},
+    {"out", FilterTermComparison::NotElementOf},
+    {"wild", FilterTermComparison::Wildcard},
+    // event type comparison(s)
+    {"except", FilterTermComparison::Except},
+};
+
+IEventFilter* createEventFilter(CMetaInfoState& metaState)
+{
+    return new CEventFilter(metaState);
+}
+
+IEventFilter* createEventFilter(const IPropertyTree& config, CMetaInfoState& metaState)
+{
+    Owned<IEventFilter> filter = createEventFilter(metaState);
+    filter->configure(config);
+    return filter.getClear();
+}
+
+#ifdef _USE_CPPUNIT
+
+#include "eventunittests.hpp"
+
+class EventFilterTests : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(EventFilterTests);
+    CPPUNIT_TEST(testFilterByEventsUnfiltered);
+    CPPUNIT_TEST(testFilterByEventsByContext);
+    CPPUNIT_TEST(testFilterByEventsByType);
+    CPPUNIT_TEST(testFilterByEventsByContextComplement);
+    CPPUNIT_TEST(testFilterByEventsByMetaContext);
+    CPPUNIT_TEST(testFilterByEventsByMetaContextComplement);
+    CPPUNIT_TEST(testFilterByEventsByContextScopedMetaException);
+    CPPUNIT_TEST(testFilterByEventsByTypeComplement);
+    CPPUNIT_TEST(testFilterByEventsWithGoodException);
+    CPPUNIT_TEST(testFilterByEventsWithIrrelevantException);
+    CPPUNIT_TEST(testFilterByEventByCanceledTerms);
+    CPPUNIT_TEST(testFilterByEventByBadName);
+    CPPUNIT_TEST(testFilterByEventByBadContextName);
+    CPPUNIT_TEST(testFilterByEventByBadContextAttribute);
+    CPPUNIT_TEST(testFilterByEventByBadComparison);
+    CPPUNIT_TEST(testFilterByAttributeByFileId);
+    CPPUNIT_TEST(testFilterByAttributeByInputFileName);
+    CPPUNIT_TEST(testFilterByAttributeByInputFileNameNonMatch);
+    CPPUNIT_TEST(testFilterByAttributeByInputFileNameWindowsPath);
+    CPPUNIT_TEST(testFilterByAttributeByInputFileNameTrailingSeparator);
+    CPPUNIT_TEST(testFilterByAttributeByFileIdLogicalFilename);
+    CPPUNIT_TEST(testFilterByAttributeByFileIdLogicalFilenamePathMatch);
+    CPPUNIT_TEST(testFilterByAttributeByPath1);
+    CPPUNIT_TEST(testFilterByAttributeByPath2);
+    CPPUNIT_TEST(testFilterByAttributeByPathLogicalNameMatch);
+    CPPUNIT_TEST(testFilterByAttributeByPathEventTypeIsolation);
+    CPPUNIT_TEST(testFilterByAttributeByPathUnmappedLogicalName);
+    CPPUNIT_TEST(testFilterByAttributeByPath3);
+    CPPUNIT_TEST(testFilterByAttributeByBool1);
+    CPPUNIT_TEST(testFilterByAttributeByBool2);
+    CPPUNIT_TEST(testFilterBySearchFlagBit);
+    CPPUNIT_TEST(testFilterByAttributeByTimestamp1);
+    CPPUNIT_TEST(testFilterByAttributeByTimestamp2);
+    CPPUNIT_TEST(testFilterByAttributeByTimestamp3);
+    CPPUNIT_TEST(testFilterByAttributeByTraceIdPreScan);
+    CPPUNIT_TEST(testFilterByAttributeByTraceIdNoPreScan);
+    CPPUNIT_TEST(testFilterByAttributeByTraceId);
+    CPPUNIT_TEST(testFilterByAttributeByTraceIdPreScanDecisions);
+    CPPUNIT_TEST(testAcceptMetaAttributeRejectsUnsupportedNames);
+    CPPUNIT_TEST(testConfigureRejectsUnknownMetaAttributeName);
+    CPPUNIT_TEST(testConfigureRejectsEmptyMetaAttributeId);
+    CPPUNIT_TEST(testFilterByAttributeByStringNeq);
+    CPPUNIT_TEST(testFilterByAttributeByStringMultiNeq);
+    CPPUNIT_TEST(testFilterByAttributeByNumericMultiNeq);
+    CPPUNIT_TEST(testFilterByAttributeByNumericMultiOut);
+    CPPUNIT_TEST(testFilterByAttributeByNumericPositiveWithNegative);
+    CPPUNIT_TEST(testFilterByAttributeRejectsEmptyPostSelectorToken);
+    CPPUNIT_TEST(testFilterByAttributeByStringInRejected);
+    CPPUNIT_TEST(testFilterByAttributeByStringOutRejected);
+    CPPUNIT_TEST(testFilterByAttributeByFileIdNumericPathMatch);
+    CPPUNIT_TEST(testFilterByAttributeByFileIdPlaneMatch);
+    CPPUNIT_TEST(testFilterByAttributeByFileIdMetaPathPlaneOrMatch);
+    CPPUNIT_TEST_SUITE_END();
+
+    class EventFilterProbe : public CEventFilter
+    {
+    public:
+        EventFilterProbe(CMetaInfoState& _metaState) : CEventFilter(_metaState) {}
+    };
+
+public:
+    bool queryTraceIdPreScanRequired(const char* values)
+    {
+        CMetaInfoState metaInfoState;
+        Owned<IEventFilter> filter = createEventFilter(metaInfoState);
+        CPPUNIT_ASSERT(filter->acceptAttribute(EvAttrEventTraceId, values));
+        return filter->preScanRequired();
+    }
+
+    bool queryServiceNamePreScanRequired(const char* values)
+    {
+        CMetaInfoState metaInfoState;
+        Owned<IEventFilter> filter = createEventFilter(metaInfoState);
+        CPPUNIT_ASSERT(filter->acceptMetaAttribute(EVENT_META_SERVICE_NAME, values));
+        return filter->preScanRequired();
+    }
+
+    void testFilterByAttributeByFileIdPlaneMatch()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="meta.Plane" values="[eq]myplane"/>
+                </link>
+                <input>
+                    <event type="PlaneInformation" Plane="myplane" Path="/path/to/file/" IsStriped="0" />
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/some/logical/file::1"/>
+                    <event type="FileInformation" FileId="2" Path="/path/to/file/some/logical/file::2"/>
+                    <event type="FileInformation" FileId="3" Path="/other/to/file/some/logical/file::3"/>
+                    <event type="FileInformation" FileId="4" Path="/path/to/file/some/logical/file::4"/>
+                    <event type="FileInformation" FileId="5" Path="/other/to/file/some/logical/file::5"/>
+                    <event type="FileInformation" FileId="6" Path="/other/to/file/some/logical/file::6"/>
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="3"/>
+                    <event type="IndexCacheMiss" FileId="4"/>
+                </input>
+                <expect>
+                    <event type="PlaneInformation" Plane="myplane" Path="/path/to/file/" IsStriped="0" />
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/some/logical/file::1"/>
+                    <event type="FileInformation" FileId="2" Path="/path/to/file/some/logical/file::2"/>
+                    <event type="FileInformation" FileId="4" Path="/path/to/file/some/logical/file::4"/>
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="4"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByFileIdNumericPathMatch()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="fileId" values="[gt]4"/>
+                </link>
+                <input>
+                    <event type="FileInformation" FileId="1" Path="/path/1"/>
+                    <event type="FileInformation" FileId="5" Path="/path/5"/>
+                </input>
+                <expect>
+                    <event type="FileInformation" FileId="5" Path="/path/5"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByFileIdMetaPathPlaneOrMatch()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="meta.Path" values="*path/to/file/*"/>
+                    <attribute id="meta.Plane" values="[eq]otherplane"/>
+                </link>
+                <input>
+                    <event type="PlaneInformation" Plane="myplane" Path="/path/to/file/" IsStriped="0" />
+                    <event type="PlaneInformation" Plane="otherplane" Path="/other/to/file/" IsStriped="0" />
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/some/logical/file::1"/>
+                    <event type="FileInformation" FileId="2" Path="/other/to/file/some/logical/file::2"/>
+                    <event type="FileInformation" FileId="3" Path="/neither/to/file/some/logical/file::3"/>
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="2"/>
+                    <event type="IndexCacheMiss" FileId="3"/>
+                </input>
+                <expect>
+                    <event type="PlaneInformation" Plane="myplane" Path="/path/to/file/" IsStriped="0" />
+                    <event type="PlaneInformation" Plane="otherplane" Path="/other/to/file/" IsStriped="0" />
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/some/logical/file::1"/>
+                    <event type="FileInformation" FileId="2" Path="/other/to/file/some/logical/file::2"/>
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="2"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsUnfiltered()
+    {
+        EventType foo;
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsByContext()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="Index"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="IndexPayload"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsByType()
+    {
+        EventType foo;
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="IndexLoad,IndexEviction"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </input>
+                <expect>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsByContextComplement()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list=" [ out ] dali"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsByMetaContext()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="meta"/>
+                </link>
+                <input>
+                    <event type="MetaFileInformation"/>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                </input>
+                <expect>
+                    <event type="MetaFileInformation"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsByMetaContextComplement()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="[out]meta"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="MetaPlaneInformation"/>
+                    <event type="EventRecordingActive"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit"/>
+                    <event type="EventRecordingActive"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsByContextScopedMetaException()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="index,[except]meta"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="MetaFileInformation"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsByTypeComplement()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="[neq]RecordingActive"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="IndexPayload"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsWithGoodException()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="index,[except]IndexPayload"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="MetaFileInformation"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventsWithIrrelevantException()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="index,[except]DaliCommit"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="IndexPayload"/>
+                    <event type="MetaFileInformation"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventByCanceledTerms()
+    {
+        EventType foo;
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="[in]index"/>
+                    <event list="[out]index"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit"/>
+                    <event type="IndexCacheMiss"/>
+                    <event type="IndexLoad"/>
+                    <event type="IndexEviction"/>
+                    <event type="DaliChangeMode"/>
+                    <event type="DaliCommit"/>
+                    <event type="DaliConnect"/>
+                    <event type="DaliEnsureLocal"/>
+                    <event type="DaliGet"/>
+                    <event type="DaliGetChildren"/>
+                    <event type="DaliGetChildrenFor"/>
+                    <event type="DaliGetElements"/>
+                    <event type="DaliSubscribe"/>
+                    <event type="MetaFileInformation"/>
+                    <event type="EventRecordingActive"/>
+                    <event type="IndexPayload"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByEventByBadName()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="bogusname"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                </input>
+                <expect>
+                </expect>
+            </test>
+        )!!!";
+        CPPUNIT_ASSERT_MESSAGE("expected exception for bad event filter term name", testEventVisitationLinksThrowsIException(testData, PTEFlenientParsing));
+    }
+
+    void testFilterByEventByBadContextName()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="[in]bogus"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                </input>
+                <expect>
+                </expect>
+            </test>
+        )!!!";
+        CPPUNIT_ASSERT_MESSAGE("expected exception for bad event filter context name in event list", testEventVisitationLinksThrowsIException(testData, PTEFlenientParsing));
+    }
+
+    void testFilterByEventByBadContextAttribute()
+    {
+        Owned<IPropertyTree> config = createPTree("operation");
+        IPropertyTree* term = config->addPropTree("event", createPTree("event"));
+        term->setProp("@context", "bogus");
+
+        CMetaInfoState metaInfoState;
+        Owned<IEventFilter> filter = createEventFilter(metaInfoState);
+        try
+        {
+            filter->configure(*config);
+            CPPUNIT_FAIL("expected unknown context exception");
+        }
+        catch (IException* e)
+        {
+            StringBuffer msg;
+            e->errorMessage(msg);
+            e->Release();
+            CPPUNIT_ASSERT(strstr(msg.str(), "unknown context name 'bogus'") != nullptr);
+        }
+    }
+
+    void testFilterByEventByBadComparison()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <event list="[hih]Index"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit"/>
+                </input>
+                <expect>
+                </expect>
+            </test>
+        )!!!";
+        CPPUNIT_ASSERT_MESSAGE("expected exception for bad event filter term comparison", testEventVisitationLinksThrowsIException(testData, PTEFlenientParsing));
+    }
+
+    void testFilterByAttributeByFileId()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="fileId" values="[lte]1,3-4,[gt]7"/>
+                    <attribute id="meta.Path" values="*6*"/>
+                    <event list="[neq]FileInformation"/>
+                </link>
+                <input>
+                    <event type="FileInformation" FileId="1" Path="testfile_1.txt"/>
+                    <event type="FileInformation" FileId="2" Path="testfile_2.txt"/>
+                    <event type="FileInformation" FileId="3" Path="testfile_3.txt"/>
+                    <event type="FileInformation" FileId="4" Path="testfile_4.txt"/>
+                    <event type="FileInformation" FileId="5" Path="testfile_5.txt"/>
+                    <event type="FileInformation" FileId="6" Path="testfile_6.txt"/>
+                    <event type="FileInformation" FileId="7" Path="testfile_7.txt"/>
+                    <event type="FileInformation" FileId="8" Path="testfile_8.txt"/>
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="2"/>
+                    <event type="IndexCacheMiss" FileId="3"/>
+                    <event type="IndexCacheMiss" FileId="4"/>
+                    <event type="IndexCacheMiss" FileId="5"/>
+                    <event type="IndexCacheMiss" FileId="6"/>
+                    <event type="IndexCacheMiss" FileId="7"/>
+                    <event type="IndexCacheMiss" FileId="8"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="3"/>
+                    <event type="IndexCacheMiss" FileId="4"/>
+                    <event type="IndexCacheMiss" FileId="6"/>
+                    <event type="IndexCacheMiss" FileId="8"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByInputFileName()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="InputFileName" values="selected.evt"/>
+                </link>
+                <input filename="/tmp/selected.evt">
+                    <event type="IndexCacheMiss"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheMiss"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByInputFileNameNonMatch()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="InputFileName" values="selected.evt"/>
+                </link>
+                <input filename="/tmp/other.evt">
+                    <event type="IndexCacheMiss"/>
+                </input>
+                <expect/>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByInputFileNameWindowsPath()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="InputFileName" values="selected.evt"/>
+                </link>
+                <input filename="C:\\dir\\selected.evt">
+                    <event type="IndexCacheMiss"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheMiss"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByInputFileNameTrailingSeparator()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="InputFileName" values="selected.evt"/>
+                </link>
+                <input filename="C:\\dir\\">
+                    <event type="IndexCacheMiss"/>
+                </input>
+                <expect/>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByFileIdLogicalFilename()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="meta.LogicalFileName" values="[eq]some::logical::file::1,[gte]some::logical::file::7,*4*"/>
+                    <event list="[neq]FileInformation"/>
+                </link>
+                <input>
+                    <event type="PlaneInformation" Plane="myplane" Path="/path/to/file/" IsStriped="0" />
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/some/logical/file::1"/>
+                    <event type="FileInformation" FileId="2" Path="/path/to/file/some/logical/file::2"/>
+                    <event type="FileInformation" FileId="3" Path="/path/to/file/some/logical/file::3"/>
+                    <event type="FileInformation" FileId="4" Path="/path/to/file/some/logical/file::4"/>
+                    <event type="FileInformation" FileId="5" Path="/path/to/file/some/logical/file::5"/>
+                    <event type="FileInformation" FileId="6" Path="/path/to/file/some/logical/file::6"/>
+                    <event type="FileInformation" FileId="7" Path="/path/to/file/some/logical/file::7"/>
+                    <event type="FileInformation" FileId="8" Path="/path/to/file/some/logical/file::8"/>
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="2"/>
+                    <event type="IndexCacheMiss" FileId="3"/>
+                    <event type="IndexCacheMiss" FileId="4"/>
+                    <event type="IndexCacheMiss" FileId="5"/>
+                    <event type="IndexCacheMiss" FileId="6"/>
+                    <event type="IndexCacheMiss" FileId="7"/>
+                    <event type="IndexCacheMiss" FileId="8"/>
+                </input>
+                <expect>
+                    <event type="PlaneInformation" Plane="myplane" Path="/path/to/file/" IsStriped="0" />
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="4"/>
+                    <event type="IndexCacheMiss" FileId="7"/>
+                    <event type="IndexCacheMiss" FileId="8"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByFileIdLogicalFilenamePathMatch()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="meta.LogicalFileName" values="[eq]some::logical::file::1,[gte]some::logical::file::7,*4*"/>
+                </link>
+                <input>
+                    <event type="PlaneInformation" Plane="myplane" Path="/path/to/file/" IsStriped="0" />
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/some/logical/file::1"/>
+                    <event type="FileInformation" FileId="2" Path="/path/to/file/some/logical/file::2"/>
+                    <event type="FileInformation" FileId="3" Path="/path/to/file/some/logical/file::3"/>
+                    <event type="FileInformation" FileId="4" Path="/path/to/file/some/logical/file::4"/>
+                    <event type="FileInformation" FileId="5" Path="/path/to/file/some/logical/file::5"/>
+                    <event type="FileInformation" FileId="6" Path="/path/to/file/some/logical/file::6"/>
+                    <event type="FileInformation" FileId="7" Path="/path/to/file/some/logical/file::7"/>
+                    <event type="FileInformation" FileId="8" Path="/path/to/file/some/logical/file::8"/>
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="2"/>
+                    <event type="IndexCacheMiss" FileId="3"/>
+                    <event type="IndexCacheMiss" FileId="4"/>
+                    <event type="IndexCacheMiss" FileId="5"/>
+                    <event type="IndexCacheMiss" FileId="6"/>
+                    <event type="IndexCacheMiss" FileId="7"/>
+                    <event type="IndexCacheMiss" FileId="8"/>
+                </input>
+                <expect>
+                    <event type="PlaneInformation" Plane="myplane" Path="/path/to/file/" IsStriped="0" />
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/some/logical/file::1"/>
+                    <event type="FileInformation" FileId="4" Path="/path/to/file/some/logical/file::4"/>
+                    <event type="FileInformation" FileId="7" Path="/path/to/file/some/logical/file::7"/>
+                    <event type="FileInformation" FileId="8" Path="/path/to/file/some/logical/file::8"/>
+                    <event type="IndexCacheMiss" FileId="1"/>
+                    <event type="IndexCacheMiss" FileId="4"/>
+                    <event type="IndexCacheMiss" FileId="7"/>
+                    <event type="IndexCacheMiss" FileId="8"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByPath1()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="Path" values="[lt]testfile_2.txt,[gte]testfile_8.txt,testfile_3.txt,*5.txt"/>
+                </link>
+                <input>
+                    <event type="FileInformation" FileId="1" Path="testfile_1.txt"/>
+                    <event type="FileInformation" FileId="2" Path="testfile_2.txt"/>
+                    <event type="FileInformation" FileId="3" Path="testfile_3.txt"/>
+                    <event type="FileInformation" FileId="4" Path="testfile_4.txt"/>
+                    <event type="FileInformation" FileId="5" Path="testfile_5.txt"/>
+                    <event type="FileInformation" FileId="6" Path="testfile_6.txt"/>
+                    <event type="FileInformation" FileId="7" Path="testfile_7.txt"/>
+                    <event type="FileInformation" FileId="8" Path="testfile_8.txt"/>
+                </input>
+                <expect>
+                    <event type="FileInformation" FileId="1" Path="testfile_1.txt"/>
+                    <event type="FileInformation" FileId="3" Path="testfile_3.txt"/>
+                    <event type="FileInformation" FileId="5" Path="testfile_5.txt"/>
+                    <event type="FileInformation" FileId="8" Path="testfile_8.txt"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByPath2()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="Path" values="[gt]testfile_6.txt,[lte]testfile_3.txt"/>
+                </link>
+                <input>
+                    <event type="FileInformation" FileId="1" Path="testfile_1.txt"/>
+                    <event type="FileInformation" FileId="2" Path="testfile_2.txt"/>
+                    <event type="FileInformation" FileId="3" Path="testfile_3.txt"/>
+                    <event type="FileInformation" FileId="4" Path="testfile_4.txt"/>
+                    <event type="FileInformation" FileId="5" Path="testfile_5.txt"/>
+                    <event type="FileInformation" FileId="6" Path="testfile_6.txt"/>
+                    <event type="FileInformation" FileId="7" Path="testfile_7.txt"/>
+                    <event type="FileInformation" FileId="8" Path="testfile_8.txt"/>
+                </input>
+                <expect>
+                    <event type="FileInformation" FileId="1" Path="testfile_1.txt"/>
+                    <event type="FileInformation" FileId="2" Path="testfile_2.txt"/>
+                    <event type="FileInformation" FileId="3" Path="testfile_3.txt"/>
+                    <event type="FileInformation" FileId="7" Path="testfile_7.txt"/>
+                    <event type="FileInformation" FileId="8" Path="testfile_8.txt"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+
+    void testFilterByAttributeByPathLogicalNameMatch()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="Path" values="scope::logical::name::1"/>
+                </link>
+                <input>
+                    <event type="PlaneInformation" Plane="myplane" Path="/path/to/file/" IsStriped="0" />
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/scope/logical/name/1"/>
+                    <event type="FileInformation" FileId="2" Path="/path/to/file/scope/logical/name/2"/>
+                </input>
+                <expect>
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/scope/logical/name/1"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByPathEventTypeIsolation()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="Path" values="scope::logical::name"/>
+                </link>
+                <input>
+                    <!-- Provide a non-FileInformation event with a Path -> Should be rejected unless path literally matches -->
+                    <event type="PlaneInformation" Plane="myplane_iso" Path="/path/to/file/scope/logical/name" IsStriped="0" />
+                    <event type="PlaneInformation" Plane="myplane_iso2" Path="/path/to/file/other" IsStriped="0" />
+                </input>
+                <expect>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByPathUnmappedLogicalName()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="Path" values="some_value"/>
+                </link>
+                <input>
+                    <event type="FileInformation" FileId="1" Path="/path/to/file/some/logical/name/1"/>
+                </input>
+                <expect>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByPath3()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="Path" values="[neq]testfile_1.txt"/>
+                </link>
+                <input>
+                    <event type="FileInformation" FileId="1" Path="testfile_1.txt"/>
+                    <event type="FileInformation" FileId="2" Path="testfile_2.txt"/>
+                    <event type="FileInformation" FileId="3" Path="testfile_3.txt"/>
+                    <event type="FileInformation" FileId="4" Path="testfile_4.txt"/>
+                    <event type="FileInformation" FileId="5" Path="testfile_5.txt"/>
+                    <event type="FileInformation" FileId="6" Path="testfile_6.txt"/>
+                    <event type="FileInformation" FileId="7" Path="testfile_7.txt"/>
+                    <event type="FileInformation" FileId="8" Path="testfile_8.txt"/>
+                </input>
+                <expect>
+                    <event type="FileInformation" FileId="2" Path="testfile_2.txt"/>
+                    <event type="FileInformation" FileId="3" Path="testfile_3.txt"/>
+                    <event type="FileInformation" FileId="4" Path="testfile_4.txt"/>
+                    <event type="FileInformation" FileId="5" Path="testfile_5.txt"/>
+                    <event type="FileInformation" FileId="6" Path="testfile_6.txt"/>
+                    <event type="FileInformation" FileId="7" Path="testfile_7.txt"/>
+                    <event type="FileInformation" FileId="8" Path="testfile_8.txt"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByBool1()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="Enabled" values="true"/>
+                    <attribute id="FirstUse" values="false"/>
+                </link>
+                <input>
+                    <event type="RecordingActive" Enabled="true"/>
+                    <event type="IndexPayload" FirstUse="true"/>
+                    <event type="RecordingActive" Enabled="false"/>
+                    <event type="IndexPayload" FirstUse="false"/>
+                </input>
+                <expect>
+                    <event type="RecordingActive" Enabled="true"/>
+                    <event type="IndexPayload" FirstUse="false"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByBool2()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="Enabled" values="true,0"/>
+                    <attribute id="FirstUse" values="1,false"/>
+                </link>
+                <input>
+                    <event type="RecordingActive" Enabled="true"/>
+                    <event type="IndexPayload" FirstUse="true"/>
+                    <event type="RecordingActive" Enabled="false"/>
+                    <event type="IndexPayload" FirstUse="false"/>
+                </input>
+                <expect>
+                    <event type="RecordingActive" Enabled="true"/>
+                    <event type="IndexPayload" FirstUse="true"/>
+                    <event type="RecordingActive" Enabled="false"/>
+                    <event type="IndexPayload" FirstUse="false"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterBySearchFlagBit()
+    {
+        const IndexSearchFlagInfo* countFlag = queryIndexSearchFlagInfo(EvExtAttrSearchCount);
+        CPPUNIT_ASSERT(countFlag != nullptr);
+        VStringBuffer testData(R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="SearchFlags.Count" values="true"/>
+                </link>
+                <input>
+                    <event type="IndexCacheMiss" FileId="1" FileOffset="0" SearchFlags="%llu"/>
+                    <event type="IndexCacheMiss" FileId="2" FileOffset="0" SearchFlags="0"/>
+                    <event type="IndexCacheMiss" FileId="3" FileOffset="0"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheMiss" FileId="1" FileOffset="0" SearchFlags="%llu"/>
+                    <event type="IndexCacheMiss" FileId="3" FileOffset="0"/>
+                </expect>
+            </test>
+        )!!!", countFlag->mask, countFlag->mask);
+        testEventVisitationLinks(testData.str(), PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByTimestamp1()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="EventTimestamp" values="-2024-01-01T08:01:00"/>
+                    <attribute id="EventTimestamp" values="2024-01-01T10:30:00-"/>
+                    <attribute id="EventTimestamp" values="2024-01-01T09:00:00-2024-01-01T10:01:00"/>
+                    <attribute id="EventTimestamp" values="2024-01-01T08:30:45"/>
+                </link>
+                <input>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:00:00"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:15:30"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:30:45"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:45:12"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:00:25"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:15:38"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:30:50"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:45:05"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:00:18"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:15:33"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:30:47"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:45:59"/>
+                </input>
+                <expect>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:00:00"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:30:45"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:00:25"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:15:38"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:30:50"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:45:05"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:00:18"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:30:47"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:45:59"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByTimestamp2()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="EventTimestamp" values="[lt]2024-01-01T08:01:00"/>
+                    <attribute id="EventTimestamp" values="[gt]2024-01-01T10:30:00"/>
+                    <attribute id="EventTimestamp" values="2024-01-01T09:00:00-2024-01-01T10:01:00"/>
+                    <attribute id="EventTimestamp" values="2024-01-01T08:30:45"/>
+                </link>
+                <input>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:00:00"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:15:30"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:30:45"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:45:12"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:00:25"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:15:38"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:30:50"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:45:05"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:00:18"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:15:33"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:30:47"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:45:59"/>
+                </input>
+                <expect>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:00:00"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:30:45"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:00:25"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:15:38"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:30:50"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:45:05"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:00:18"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:30:47"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:45:59"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByTimestamp3()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="EventTimestamp" values="[out]2024-01-01T09:00:00-2024-01-01T10:01:00"/>
+                </link>
+                <input>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:00:00"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:15:30"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:30:45"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:45:12"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:00:25"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:15:38"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:30:50"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T09:45:05"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:00:18"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:15:33"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:30:47"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:45:59"/>
+                </input>
+                <expect>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:00:00"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:15:30"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:30:45"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T08:45:12"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:15:33"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:30:47"/>
+                    <event type="RecordingActive" EventTimestamp="2024-01-01T10:45:59"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByNodeKind()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="NodeKind" values="leaf,2"/>
+                </link>
+                <input>
+                    <event type="IndexCacheMiss" NodeKind="branch"/>
+                    <event type="IndexCacheMiss" NodeKind="0"/>
+                    <event type="IndexCacheMiss" NodeKind="leaf"/>
+                    <event type="IndexCacheMiss" NodeKind="1"/>
+                    <event type="IndexCacheMiss" NodeKind="blob"/>
+                    <event type="IndexCacheMiss" NodeKind="2"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheMiss" NodeKind="1"/>
+                    <event type="IndexCacheMiss" NodeKind="1"/>
+                    <event type="IndexCacheMiss" NodeKind="2"/>
+                    <event type="IndexCacheMiss" NodeKind="2"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByTraceIdPreScan()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="EventTraceId" values="trace-001"/>
+                    <attribute id="meta.ServiceName" values="dali*"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit" EventTraceId="trace-003"/>
+                    <event type="IndexCacheHit" EventTraceId="trace-001"/>
+                    <event type="QueryStart" EventTraceId="trace-003" ServiceName="dali-backend"/>
+                    <event type="QueryStart" EventTraceId="trace-001" ServiceName="roxie-service"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit" EventTraceId="trace-003"/>
+                    <event type="IndexCacheHit" EventTraceId="trace-001"/>
+                    <event type="QueryStart" EventTraceId="trace-003" ServiceName="dali-backend"/>
+                    <event type="QueryStart" EventTraceId="trace-001" ServiceName="roxie-service"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByTraceIdNoPreScan()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <noPreScan/>
+                <link kind="event-filter">
+                    <attribute id="EventTraceId" values="trace-001"/>
+                    <attribute id="meta.ServiceName" values="dali*"/>
+                </link>
+                <input>
+                    <event type="IndexCacheHit" EventTraceId="trace-003"/>
+                    <event type="IndexCacheHit" EventTraceId="trace-001"/>
+                    <event type="QueryStart" EventTraceId="trace-003" ServiceName="dali-backend"/>
+                    <event type="QueryStart" EventTraceId="trace-001" ServiceName="roxie-service"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheHit" EventTraceId="trace-001"/>
+                    <event type="QueryStart" EventTraceId="trace-001" ServiceName="roxie-service"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByTraceId()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="EventTraceId" values="trace-001"/>
+                    <attribute id="meta.ServiceName" values="dali*"/>
+                </link>
+                <input>
+                    <event type="QueryStart" EventTraceId="trace-001" ServiceName="roxie-service"/>
+                    <event type="QueryStart" EventTraceId="trace-002" ServiceName="thor-service"/>
+                    <event type="QueryStart" EventTraceId="trace-003" ServiceName="dali-backend"/>
+                    <event type="QueryStart" EventTraceId="trace-004" ServiceName="esp-service"/>
+                    <event type="IndexCacheHit" EventTraceId="trace-001"/>
+                    <event type="IndexCacheHit" EventTraceId="trace-002"/>
+                    <event type="IndexCacheHit" EventTraceId="trace-003"/>
+                    <event type="IndexCacheHit" EventTraceId="trace-004"/>
+                </input>
+                <expect>
+                    <event type="QueryStart" EventTraceId="trace-001" ServiceName="roxie-service"/>
+                    <event type="QueryStart" EventTraceId="trace-003" ServiceName="dali-backend"/>
+                    <event type="IndexCacheHit" EventTraceId="trace-001"/>
+                    <event type="IndexCacheHit" EventTraceId="trace-003"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByTraceIdPreScanDecisions()
+    {
+        START_TEST
+
+        // TraceId filtering alone never requires pre-scan.
+        CPPUNIT_ASSERT(!queryTraceIdPreScanRequired("00112233445566778899aabbccddeeff"));
+        CPPUNIT_ASSERT(!queryTraceIdPreScanRequired("00112233445566778899aabbccddee"));
+        CPPUNIT_ASSERT(!queryTraceIdPreScanRequired("00112233445566778899aabbccddeeff00"));
+        CPPUNIT_ASSERT(!queryTraceIdPreScanRequired("00112233445566778899aabbccddeefg"));
+        CPPUNIT_ASSERT(!queryTraceIdPreScanRequired("*service*"));
+
+        // ServiceName meta filtering requires pre-scan.
+        CPPUNIT_ASSERT(queryServiceNamePreScanRequired("dali*"));
+        CPPUNIT_ASSERT(queryServiceNamePreScanRequired("dali?backend"));
+        CPPUNIT_ASSERT(queryServiceNamePreScanRequired("roxie-service"));
+
+        END_TEST
+    }
+
+    void testAcceptMetaAttributeRejectsUnsupportedNames()
+    {
+        CMetaInfoState metaInfoState;
+        Owned<IEventFilter> filter = createEventFilter(metaInfoState);
+
+        CPPUNIT_ASSERT(!filter->acceptMetaAttribute("meta.Unknown", "foo"));
+        CPPUNIT_ASSERT(!filter->acceptMetaAttribute("meta.serviceName", "foo"));
+        CPPUNIT_ASSERT(!filter->acceptMetaAttribute("meta.Pathx", "foo"));
+    }
+
+    void testConfigureRejectsUnknownMetaAttributeName()
+    {
+        Owned<IPropertyTree> config = createPTree("operation");
+        IPropertyTree* term = config->addPropTree("attribute", createPTree("attribute"));
+        term->setProp("@id", "meta.Unknown");
+        term->setProp("@values", "foo");
+
+        CMetaInfoState metaInfoState;
+        Owned<IEventFilter> filter = createEventFilter(metaInfoState);
+        CPPUNIT_ASSERT_THROWS_IEXCEPTION(filter->configure(*config), "expected exception for unsupported meta attribute name");
+    }
+
+    void testConfigureRejectsEmptyMetaAttributeId()
+    {
+        Owned<IPropertyTree> config = createPTree("operation");
+        IPropertyTree* term = config->addPropTree("attribute", createPTree("attribute"));
+        term->setProp("@id", "");
+        term->setProp("@values", "foo");
+
+        CMetaInfoState metaInfoState;
+        Owned<IEventFilter> filter = createEventFilter(metaInfoState);
+        CPPUNIT_ASSERT_THROWS_IEXCEPTION(filter->configure(*config), "expected exception for empty attribute id");
+    }
+
+    void testFilterByAttributeByStringNeq()
+    {
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="EventTraceId" values="[neq]trace-002"/>
+                </link>
+                <input>
+                    <event type="QueryStart" EventTraceId="trace-001"/>
+                    <event type="QueryStart" EventTraceId="trace-002"/>
+                    <event type="QueryStart" EventTraceId="trace-003"/>
+                    <event type="QueryStart" EventTraceId="trace-004"/>
+                    <event type="QueryStart" EventTraceId="trace-005"/>
+                </input>
+                <expect>
+                    <event type="QueryStart" EventTraceId="trace-001"/>
+                    <event type="QueryStart" EventTraceId="trace-003"/>
+                    <event type="QueryStart" EventTraceId="trace-004"/>
+                    <event type="QueryStart" EventTraceId="trace-005"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByStringMultiNeq()
+    {
+        // Regression: with multiple [neq] terms the old code short-circuited on the first
+        // non-matching negation and incorrectly passed the excluded value.
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="EventTraceId" values="[neq]trace-002,[neq]trace-004"/>
+                </link>
+                <input>
+                    <event type="QueryStart" EventTraceId="trace-001"/>
+                    <event type="QueryStart" EventTraceId="trace-002"/>
+                    <event type="QueryStart" EventTraceId="trace-003"/>
+                    <event type="QueryStart" EventTraceId="trace-004"/>
+                    <event type="QueryStart" EventTraceId="trace-005"/>
+                </input>
+                <expect>
+                    <event type="QueryStart" EventTraceId="trace-001"/>
+                    <event type="QueryStart" EventTraceId="trace-003"/>
+                    <event type="QueryStart" EventTraceId="trace-005"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByNumericMultiNeq()
+    {
+        // Regression: same multi-negation bug in UnsignedFilterTerm.
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="NodeKind" values="[neq]branch,[neq]blob"/>
+                </link>
+                <input>
+                    <event type="IndexCacheMiss" NodeKind="branch"/>
+                    <event type="IndexCacheMiss" NodeKind="leaf"/>
+                    <event type="IndexCacheMiss" NodeKind="blob"/>
+                </input>
+                <expect>
+                    <event type="IndexCacheMiss" NodeKind="leaf"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByNumericMultiOut()
+    {
+        // Regression: multiple [out] ranges are deny-list terms and should be ANDed.
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="EventTimestamp" values="[out]2-4,[out]6-8"/>
+                </link>
+                <input>
+                    <event type="RecordingActive" EventTimestamp="1"/>
+                    <event type="RecordingActive" EventTimestamp="2"/>
+                    <event type="RecordingActive" EventTimestamp="3"/>
+                    <event type="RecordingActive" EventTimestamp="4"/>
+                    <event type="RecordingActive" EventTimestamp="5"/>
+                    <event type="RecordingActive" EventTimestamp="6"/>
+                    <event type="RecordingActive" EventTimestamp="7"/>
+                    <event type="RecordingActive" EventTimestamp="8"/>
+                    <event type="RecordingActive" EventTimestamp="9"/>
+                </input>
+                <expect>
+                    <event type="RecordingActive" EventTimestamp="1"/>
+                    <event type="RecordingActive" EventTimestamp="5"/>
+                    <event type="RecordingActive" EventTimestamp="9"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeByNumericPositiveWithNegative()
+    {
+        // Mixed semantics: apply deny-list first, then require a positive match.
+        constexpr const char* testData = R"!!!(
+            <test>
+                <link kind="event-filter">
+                    <attribute id="EventTimestamp" values="2-8,[out]4-6"/>
+                </link>
+                <input>
+                    <event type="RecordingActive" EventTimestamp="1"/>
+                    <event type="RecordingActive" EventTimestamp="2"/>
+                    <event type="RecordingActive" EventTimestamp="3"/>
+                    <event type="RecordingActive" EventTimestamp="4"/>
+                    <event type="RecordingActive" EventTimestamp="5"/>
+                    <event type="RecordingActive" EventTimestamp="6"/>
+                    <event type="RecordingActive" EventTimestamp="7"/>
+                    <event type="RecordingActive" EventTimestamp="8"/>
+                    <event type="RecordingActive" EventTimestamp="9"/>
+                </input>
+                <expect>
+                    <event type="RecordingActive" EventTimestamp="2"/>
+                    <event type="RecordingActive" EventTimestamp="3"/>
+                    <event type="RecordingActive" EventTimestamp="7"/>
+                    <event type="RecordingActive" EventTimestamp="8"/>
+                </expect>
+            </test>
+        )!!!";
+        testEventVisitationLinks(testData, PTEFlenientParsing);
+    }
+
+    void testFilterByAttributeRejectsEmptyPostSelectorToken()
+    {
+        CMetaInfoState metaInfoState;
+        Owned<IEventFilter> filter = createEventFilter(metaInfoState);
+        CPPUNIT_ASSERT(!filter->acceptAttribute(EvAttrEventTraceId, "[neq]"));
+        CPPUNIT_ASSERT(!filter->acceptAttribute(EvAttrEventTraceId, "[eq]   "));
+        CPPUNIT_ASSERT(!filter->acceptAttribute(EvAttrEventTimestamp, "[out]"));
+        CPPUNIT_ASSERT(!filter->acceptAttribute(EvAttrEventTimestamp, "[gte]   "));
+    }
+
+    void testFilterByAttributeByStringInRejected()
+    {
+        CMetaInfoState metaInfoState;
+        Owned<IEventFilter> filter = createEventFilter(metaInfoState);
+        CPPUNIT_ASSERT(!filter->acceptAttribute(EvAttrEventTraceId, "[in]trace-001,[in]trace-003"));
+    }
+
+    void testFilterByAttributeByStringOutRejected()
+    {
+        CMetaInfoState metaInfoState;
+        Owned<IEventFilter> filter = createEventFilter(metaInfoState);
+        CPPUNIT_ASSERT(!filter->acceptAttribute(EvAttrEventTraceId, "[out]trace-003,[out]trace-005"));
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(EventFilterTests);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(EventFilterTests, "eventfilter");
+
+#endif // _USE_CPPUNIT

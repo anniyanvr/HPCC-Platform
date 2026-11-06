@@ -22,6 +22,7 @@
 #include "eclhelper.hpp"
 #include "rtldynfield.hpp"
 #include "workunit.hpp"
+#include "dafsaudit.hpp"
 
 #if (ECLAGENT_ERROR_START != 5400 || ECLAGENT_ERROR_END != 5499)
 #error "ECLAGENT_ERROR_START has changed"
@@ -78,8 +79,20 @@ struct IEclLoopGraph : public IInterface
 interface IOrderedOutputSerializer;
 
 typedef enum { ofSTD, ofXML, ofRAW } outputFmts;
+enum class AccessMode : unsigned;
+interface IDistributedFileTransaction;
 
-struct IAgentContext : extends IGlobalCodeContext
+interface ITempFileHandler
+{
+    // name is the name/id of the temporary file, not the filename on disk.
+    virtual const char *noteTemporaryFile(const char *name) = 0;
+    // name is the name/id of the temporary file, not the filename on disk.
+    virtual const char *queryTemporaryFile(const char *name) = 0;
+    // fname is the temporary filename on disk returned from noteTemporaryFile or queryTemporaryFile.
+    virtual void removeTemporaryFile(const char *fname) = 0;
+};
+
+struct IAgentContext : extends IGlobalCodeContext, extends ITempFileHandler
 {
     virtual void reportProgress(const char *msg, unsigned flags=0) = 0;
     virtual bool queryResolveFilesLocally() = 0;
@@ -91,16 +104,13 @@ struct IAgentContext : extends IGlobalCodeContext
 
     virtual IConstWorkUnit *queryWorkUnit() const = 0;
     virtual IWorkUnit *updateWorkUnit() const = 0;
-    
-    virtual ILocalOrDistributedFile *resolveLFN(const char *logicalName, const char *errorTxt, bool optional, bool noteRead, bool write, StringBuffer * expandedlfn, bool isPrivilegedUser) = 0;
+
+    virtual ILocalOrDistributedFile *resolveLFN(const char *logicalName, const char *errorTxt, bool optional, bool noteRead, AccessMode accessMode, StringBuffer * expandedlfn, bool isPrivilegedUser, IDistributedFileTransaction * transaction=nullptr) = 0;
     virtual StringBuffer & getTempfileBase(StringBuffer & buff) = 0;
-    virtual const char *noteTemporaryFile(const char *fname) = 0;
-    virtual const char *noteTemporaryFilespec(const char *fname) = 0;
-    virtual const char *queryTemporaryFile(const char *fname) = 0;
     virtual void reloadWorkUnit() = 0;
 
     virtual char *resolveName(const char *in, char *out, unsigned outlen) = 0;
-    virtual void logFileAccess(IDistributedFile * file, char const * component, char const * type, EclGraph & graph) = 0;
+    virtual const DFSAuditContext & queryBaseAuditContext() const = 0;
     virtual void addWuException(const char * text, unsigned code, unsigned severity, char const * source) = 0;
 
     virtual IHThorGraphResults * executeLibraryGraph(const char * libraryName, unsigned expectedInterfaceHash, unsigned activityId, const char * embeddedGraphName, const byte * parentExtract) = 0;
@@ -109,20 +119,22 @@ struct IAgentContext : extends IGlobalCodeContext
     virtual void outputFormattedResult(const char *name, unsigned sequence, bool close) = 0;
 
     virtual const char *queryAllowedPipePrograms() = 0;
-    
+
     virtual IOrderedOutputSerializer * queryOutputSerializer() = 0;
 
     virtual IGroup *getHThorGroup(StringBuffer &grpnameout) = 0;
 
     virtual RecordTranslationMode getLayoutTranslationMode() const = 0;
     virtual unsigned __int64 queryStopAfter() = 0;
-    
+
     virtual const char *queryWuid() = 0;
 
     virtual void updateWULogfile(IWorkUnit *outputWU) = 0;
     virtual bool forceNewDiskReadActivity() const = 0;
     virtual void addWuExceptionEx(const char * text, unsigned code, unsigned severity, unsigned audience, char const * source) = 0;
     virtual double queryAgentMachineCost() const = 0;
+    virtual void updateAggregates(IWorkUnit* lockedwu) = 0;
+    virtual void mergeAggregatorStats(IStatisticCollection & stats, unsigned wfid, const char *graphname, unsigned sgId) = 0;
 };
 
 #endif // AGENTCTX_HPP_INCL

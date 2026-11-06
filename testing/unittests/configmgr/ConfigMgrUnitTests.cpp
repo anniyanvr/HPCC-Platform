@@ -31,7 +31,6 @@
 #include "jexcept.hpp"
 #include "Exceptions.hpp"
 #include "EnvironmentMgr.hpp"
-#include "build-config.h"
 #include <iterator>
 #include <algorithm>
 
@@ -50,30 +49,24 @@ class ConfigMgr2ValidateXSDs : public CppUnit::TestFixture
 
         void LoadAndParse()
         {
-            printf("\nConfigMgr 2.0 - Load and Parse - Verifying configuration XSDs are compliant...");
+            // ConfigMgr 2.0 - Load and parse tests - verify configuration XSDs are compliant
             //
             // Standard configuration for HPCC
             std::string CFG2_MASTER_CONFIG_FILE = "environment.xsd";
-            std::string CFG2_CONFIG_DIR = COMPONENTFILES_DIR  PATHSEPSTR "configschema" PATHSEPSTR "xsd" PATHSEPSTR;
-            std::string CFG2_SOURCE_DIR = CONFIG_SOURCE_DIR;
+            std::string CFG2_CONFIG_DIR = std::string(hpccBuildInfo.componentDir) + PATHSEPSTR + "configschema" + PATHSEPSTR + "xsd" + PATHSEPSTR;
+            std::string CFG2_SOURCE_DIR = hpccBuildInfo.configSourceDir;
 
             //
             // Create the environment
-            printf("\n  Creating XML environment manager instance");
             bool rc = true;
             m_pEnvMgr = getEnvironmentMgrInstance(EnvironmentType::XML);
             CPPUNIT_ASSERT_MESSAGE("Unable to allocate an environment manager", m_pEnvMgr != nullptr);
 
             //
             // Load all the XSDs to ensure they parse correctly
-            printf("\n  Loading XSDs");
             std::map<std::string, std::string> cfgParms;
             rc = m_pEnvMgr->loadSchema(CFG2_CONFIG_DIR, CFG2_MASTER_CONFIG_FILE, cfgParms);
             CPPUNIT_ASSERT_MESSAGE("Unable to load configuration schema, error = " + m_pEnvMgr->getLastSchemaMessage(), rc);
-
-            //
-            // Test complete
-            printf("\n  Test complete");
         }
 
 

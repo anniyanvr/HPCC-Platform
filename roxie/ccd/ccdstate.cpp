@@ -17,15 +17,17 @@
 
 #include <platform.h>
 #include <jlib.hpp>
-#include "build-config.h"
 
 #include "jisem.hpp"
+#include "jhash.hpp"
 #include "jsort.hpp"
 #include "jregexp.hpp"
+#include "jevent.hpp"
 
 #include "udptopo.hpp"
 #include "ccd.hpp"
 #include "ccdquery.hpp"
+#include "ccddali.hpp"
 #include "ccdstate.hpp"
 #include "ccdqueue.ipp"
 #include "ccdlistener.hpp"
@@ -41,6 +43,9 @@
 
 #include "pkgimpl.hpp"
 #include "roxiehelper.hpp"
+
+#include "ws_dfsclient.hpp"
+
 
 //-------------------------------------------------------------------------------------------
 // class CRoxiePluginCtx - provide the environments for plugins loaded by roxie. 
@@ -62,6 +67,13 @@ public:
 } PluginCtx;
 
 SafePluginMap *plugins;
+
+
+class ResolveFileCriticalSection : public CriticalSection
+{
+public:
+    ResolveFileCriticalSection() : CriticalSection(SYNC_LOCATION) {}
+};
 
 //================================================================================================
 
@@ -128,15 +140,18 @@ const char *queryNodeIndexName(const IPropertyTree &graphNode, ThorActivityKind 
 
 class DelayedReleaseQueueItem : public CInterfaceOf<IInterface>
 {
+    Owned<IInterface> holdAfter;
     Owned<IInterface> goer;
     time_t goTime;
+
 public:
-    DelayedReleaseQueueItem(IInterface *_goer, unsigned delaySeconds)
-    : goer(_goer)
+    DelayedReleaseQueueItem(IInterface *_goer, IInterface *_holdAfter, unsigned delaySeconds)
+    : holdAfter(_holdAfter), goer(_goer)
     {
         time(&goTime);
         goTime += delaySeconds;
     }
+
     unsigned remaining()
     {
         time_t now;
@@ -151,16 +166,14 @@ public:
 class DelayedReleaserThread : public Thread
 {
 private:
-    bool closing;
-    bool started;
-    CriticalSection lock;
+    std::atomic<bool> closing{false};
+    bool started = false;
+    CriticalSection lock{SYNC_LOCATION};
     IArrayOf<DelayedReleaseQueueItem> queue;
-    Semaphore sem;
+    Semaphore sem{SYNC_LOCATION};
 public:
     DelayedReleaserThread() : Thread("DelayedReleaserThread")
     {
-        closing = false;
-        started = false;
     }
 
     ~DelayedReleaserThread()
@@ -168,12 +181,18 @@ public:
         stop();
     }
 
+    bool hasPendingReleases()
+    {
+        CriticalBlock b(lock);
+        return queue.length() != 0;
+    }
+
     virtual int run()
     {
         if (traceLevel)
             DBGLOG("DelayedReleaserThread %p starting", this);
         unsigned nextTimeout = INFINITE;
-        while (!closing)
+        while (!closing || hasPendingReleases())
         {
             sem.wait(nextTimeout);
             CriticalBlock b(lock);
@@ -182,7 +201,7 @@ public:
             {
                 DelayedReleaseQueueItem &goer = queue.item(idx);
                 unsigned timeRemaining = goer.remaining();
-                if (!timeRemaining)
+                if (closing || !timeRemaining)
                     queue.remove(idx);
                 else if (timeRemaining < nextTimeout)
                     nextTimeout = timeRemaining;
@@ -198,26 +217,49 @@ public:
 
     void stop()
     {
-        if (started)
+        bool wasStarted = false;
         {
+            CriticalBlock b(lock);
             closing = true;
+            wasStarted = started;
+        }
+
+        if (wasStarted)
+        {
             sem.signal();
             join();
         }
     }
 
-    void delayedRelease(IInterface *goer, unsigned delaySeconds)
+    void delayedRelease(IInterface *goer, IInterface *holdAfter, unsigned delaySeconds)
     {
-        if (goer)
+        if (!goer)
+        {
+            ::Release(holdAfter);
+            return;
+        }
+
+        bool releaseNow = false;
         {
             CriticalBlock b(lock);
-            if (!started)
+            if (shuttingDown || closing)
+                releaseNow = true;
+            else
             {
-                start();
-                started = true;
+                if (!started)
+                {
+                    start(false);
+                    started = true;
+                }
+                queue.append(*new DelayedReleaseQueueItem(goer, holdAfter, delaySeconds));
+                sem.signal();
             }
-            queue.append(*new DelayedReleaseQueueItem(goer, delaySeconds));
-            sem.signal();
+        }
+
+        if (releaseNow)
+        {
+            ::Release(goer);
+            ::Release(holdAfter);
         }
     }
 };
@@ -236,6 +278,26 @@ void stopDelayedReleaser()
     delayedReleaser.clear();
 }
 
+
+//-------------------------------------------------------------------------
+
+bool startRoxieEventRecording(const char * options, const char * filename)
+{
+    unsigned mySubChannel = getMySubChannel(myChannel);
+    if (!startComponentRecording("roxie", options, filename, myChannel, mySubChannel+1, true))
+        return false;
+
+    //Generate information about all files that are already registered - others will be added as they are opened
+    recordEventIndexInformation();
+
+    queryRecorder().pauseRecording(false, false);
+    return true;
+}
+
+bool stopRoxieEventRecording(EventRecordingSummary * optSummary)
+{
+    return queryRecorder().stopRecording(optSummary, false);
+}
 
 //-------------------------------------------------------------------------
 
@@ -338,7 +400,7 @@ public:
 
 class CResolvedFileCache : implements IResolvedFileCache
 {
-    CriticalSection cacheLock;
+    ReadWriteLock cacheLock{SYNC_LOCATION};
     CopyMapStringToMyClass<IResolvedFile> files;
 
 public:
@@ -351,17 +413,18 @@ public:
     // Add a filename and the corresponding IResolvedFile to the cache
     virtual void addCache(const char *filename, const IResolvedFile *file)
     {
-        CriticalBlock b(cacheLock);
         IResolvedFile *add = const_cast<IResolvedFile *>(file);
+        WriteLockBlock b(cacheLock);
         add->setCache(this);
         files.setValue(filename, add);
     }
     // Remove an IResolvedFile from the cache
     virtual void removeCache(const IResolvedFile *file)
     {
-        CriticalBlock b(cacheLock);
-        if (traceLevel > 9)
+        if (doTrace(traceRoxieFiles, TraceFlags::Detailed))
             DBGLOG("removeCache %s", file->queryFileName());
+
+        WriteLockBlock b(cacheLock);
         // NOTE: it's theoretically possible for the final release to happen after a replacement has been inserted into hash table. 
         // So only remove from hash table if what we find there matches the item that is being deleted.
         IResolvedFile *goer = files.getValue(file->queryFileName());
@@ -372,15 +435,22 @@ public:
     // Lookup a filename in the cache
     virtual IResolvedFile *lookupCache(const char *filename)
     {
-        CriticalBlock b(cacheLock);
-        IResolvedFile *cache = files.getValue(filename);
-        if (cache)
+        bool traceNotAlive = false;
         {
-            if (cache->isAliveAndLink())
-                return cache;
-            if (traceLevel)
-                DBGLOG("Not returning %s from cache as isAlive() returned false", filename);
+            ReadLockBlock b(cacheLock);
+            IResolvedFile *cache = files.getValue(filename);
+            if (cache)
+            {
+                if (cache->isAliveAndLink())
+                    return cache;
+                if (traceLevel)
+                    traceNotAlive = true;
+            }
         }
+
+        if (traceNotAlive)
+            DBGLOG("Not returning %s from cache as isAlive() returned false", filename);
+
         return NULL;
     }
 };
@@ -390,13 +460,13 @@ public:
 // prior to a package reload, but the hits need not be (as the file will be locked as long as it
 // is in the cache)
 
-static CriticalSection daliMissesCrit;
+static CriticalSection daliMissesCrit{SYNC_LOCATION};
 static Owned<KeptLowerCaseAtomTable> daliMisses;
 
 static void noteDaliMiss(const char *filename)
 {
     CriticalBlock b(daliMissesCrit);
-    if (traceLevel > 9)
+    if (doTrace(traceRoxieFiles, TraceFlags::Max))
         DBGLOG("noteDaliMiss %s", filename);
     daliMisses->addAtom(filename);
 }
@@ -405,7 +475,7 @@ static bool checkCachedDaliMiss(const char *filename)
 {
     CriticalBlock b(daliMissesCrit);
     bool ret = daliMisses->find(filename) != NULL;
-    if (traceLevel > 9)
+    if (doTrace(traceRoxieFiles, TraceFlags::Max))
         DBGLOG("checkCachedDaliMiss %s returns %d", filename, ret);
     return ret;
 }
@@ -423,6 +493,7 @@ class CRoxiePackageNode : extends CPackageNode, implements IRoxiePackage
 {
 protected:
     static CResolvedFileCache daliFiles;
+    static ResolveFileCriticalSection daliLookupCrits[NUM_DALI_CRITS];
     mutable CResolvedFileCache fileCache;
     IArrayOf<IResolvedFile> files;  // Used when preload set
     IArrayOf<IKeyArray> keyArrays;  // Used when preload set
@@ -451,18 +522,20 @@ protected:
     }
 
     // Use dali to resolve subfile into physical file info
-    static IResolvedFile *resolveLFNusingDaliOrLocal(const char *fileName, bool useCache, bool cacheResult, bool writeAccess, bool alwaysCreate, bool resolveLocal, bool isPrivilegedUser)
+    static IResolvedFile *resolveLFNusingDaliOrLocal(const char *fileName, bool useCache, bool cacheResult, AccessMode accessMode, bool alwaysCreate, bool resolveLocal, bool isPrivilegedUser)
     {
+        unsigned hash = hashcz((const unsigned char *) fileName, 0x811C9DC5);
+        CriticalBlock b(daliLookupCrits[hash % NUM_DALI_CRITS]);
         // MORE - look at alwaysCreate... This may be useful to implement earlier locking semantics.
-        if (traceLevel > 9)
-            DBGLOG("resolveLFNusingDaliOrLocal %s %d %d %d %d", fileName, useCache, cacheResult, writeAccess, alwaysCreate);
+        if (doTrace(traceRoxieFiles, TraceFlags::Max))
+            DBGLOG("resolveLFNusingDaliOrLocal %s %d %d %x %d", fileName, useCache, cacheResult, (unsigned)accessMode, alwaysCreate);
         IResolvedFile* result = NULL;
         if (useCache)
         {
             result = daliFiles.lookupCache(fileName);
             if (result)
             {
-                if (traceLevel > 9)
+                if (doTrace(traceRoxieFiles, TraceFlags::Max))
                     DBGLOG("resolveLFNusingDaliOrLocal %s - cache hit", fileName);
                 return result;
             }
@@ -474,11 +547,11 @@ protected:
             {
                 if (daliHelper->connected())
                 {
-                    Owned<IDistributedFile> dFile = daliHelper->resolveLFN(fileName, cacheResult, writeAccess, isPrivilegedUser);
+                    Owned<IDistributedFile> dFile = daliHelper->resolveLFN(fileName, cacheResult, accessMode, isPrivilegedUser);
                     if (dFile)
-                        result = createResolvedFile(fileName, NULL, dFile.getClear(), daliHelper, !useCache, cacheResult, writeAccess);
+                        result = createResolvedFile(fileName, NULL, dFile.getClear(), daliHelper, !useCache, cacheResult, accessMode);
                 }
-                else if (!writeAccess)  // If we need write access and expect a dali, but don't have one, we should probably fail
+                else if (!isWrite(accessMode))  // If we need write access and expect a dali, but don't have one, we should probably fail
                 {
                     // we have no dali, we can't lock..
                     Owned<IFileDescriptor> fd = daliHelper->resolveCachedLFN(fileName);
@@ -513,7 +586,7 @@ protected:
         }
         if (cacheResult)
         {
-            if (traceLevel > 9)
+            if (doTrace(traceRoxieFiles, TraceFlags::Max))
                 DBGLOG("resolveLFNusingDaliOrLocal %s - cache add %d", fileName, result != NULL);
             if (result)
                 daliFiles.addCache(fileName, result);
@@ -524,15 +597,15 @@ protected:
     }
 
     // Use local package and its bases to resolve existing file into physical file info via all supported resolvers
-    IResolvedFile *lookupExpandedFileName(const char *fileName, bool useCache, bool cacheResult, bool writeAccess, bool alwaysCreate, bool checkCompulsory, bool isPrivilegedUser) const
+    IResolvedFile *lookupExpandedFileName(const char *fileName, bool useCache, bool cacheResult, AccessMode accessMode, bool alwaysCreate, bool checkCompulsory, bool isPrivilegedUser) const
     {
-        IResolvedFile *result = lookupFile(fileName, useCache, cacheResult, writeAccess, alwaysCreate, isPrivilegedUser);
+        IResolvedFile *result = lookupFile(fileName, useCache, cacheResult, accessMode, alwaysCreate, isPrivilegedUser);
         if (!result && (!checkCompulsory || !isCompulsory()))
-            result = resolveLFNusingDaliOrLocal(fileName, useCache, cacheResult, writeAccess, alwaysCreate, resolveLocally(), isPrivilegedUser);
+            result = resolveLFNusingDaliOrLocal(fileName, useCache, cacheResult, accessMode, alwaysCreate, resolveLocally(), isPrivilegedUser);
         return result;
     }
 
-    IResolvedFile *lookupFile(const char *fileName, bool useCache, bool cacheResult, bool writeAccess, bool alwaysCreate, bool isPrivilegedUser) const
+    IResolvedFile *lookupFile(const char *fileName, bool useCache, bool cacheResult, AccessMode accessMode, bool alwaysCreate, bool isPrivilegedUser) const
     {
         // Order of resolution: 
         // 1. Files named in package
@@ -560,9 +633,14 @@ protected:
                         // implies that a package file had ~ in subfile names - shouldn't really, but we allow it (and just strip the ~)
                         subFileName.remove(0,1);
                     }
-                    if (traceLevel > 9)
+                    //Catch the most likely cause of a recursive filename - which would otherwise cause a stack overflow
+                    if (strieq(fileName, subFileName.str()))
+                        throw makeStringExceptionV(ROXIE_FILE_ERROR, "Superfile %s contains itself as a subfile", fileName);
+
+                    if (doTrace(traceRoxieFiles, TraceFlags::Detailed))
                         DBGLOG("Looking up subfile %s", subFileName.str());
-                    Owned<const IResolvedFile> subFileInfo = lookupExpandedFileName(subFileName, useCache, cacheResult, false, false, false, isPrivilegedUser);  // NOTE - overwriting a superfile does NOT require write access to subfiles
+                    AccessMode subAccessMode = AccessMode::readRandom;   // NOTE - overwriting a superfile does NOT require write access to subfiles
+                    Owned<const IResolvedFile> subFileInfo = lookupExpandedFileName(subFileName, useCache, cacheResult, subAccessMode, false, false, isPrivilegedUser);
                     if (subFileInfo)
                     {
                         if (!super)
@@ -588,7 +666,7 @@ protected:
             const CRoxiePackageNode *basePackage = getBaseNode(i);
             if (!basePackage)
                 continue;
-            IResolvedFile *result = basePackage->lookupFile(fileName, useCache, cacheResult, writeAccess, alwaysCreate, isPrivilegedUser);
+            IResolvedFile *result = basePackage->lookupFile(fileName, useCache, cacheResult, accessMode, alwaysCreate, isPrivilegedUser);
             if (result)
                 return result;
         }
@@ -668,6 +746,54 @@ public:
         hash = newhash;
     }
 
+    // Returns a key identifying whether two packages will resolve logical file names identically,
+    // for use in deduplicating the file pre-resolution pass in CRoxieQuerySetManager::load().
+    //
+    // Problem: filenameSummaryMap in load() was keyed by package pointer. In typical production
+    // deployments each query has its own named package (e.g. "MyQuery_Service") that contains
+    // only <Base> references and no direct file content. All such packages share the same ordered
+    // set of base package objects and therefore resolve every logical file name identically.
+    // With N query packages and M files per query the resolution work is O(N*M) even though only
+    // O(M) unique resolutions exist. A representative production package map had 576 such query
+    // packages all with identical 266-base sets, giving a ~576x expansion of the work queue.
+    //
+    // Solution: key the map by a hash of the base package object POINTERS in order. Base objects
+    // are shared instances within a CRoxiePackageMap, so two packages referencing the same bases
+    // in the same order produce the same pointer sequence and therefore the same key. Only one
+    // representative from each equivalence class performs the actual lookupExpandedFileName calls,
+    // collapsing N*M entries to M. Packages that carry their own direct <SuperFile> or <File>
+    // content mix their own object pointer in first, ensuring they never share a key with a
+    // purely base-derived package even if the base sets happen to be identical.
+    //
+    // Why queryHash() cannot be used: the standard hash is seeded with the package's own
+    // serialised XML, which includes the @id attribute (the query name). Every query package
+    // therefore has a unique hash even when packages are file-resolution-equivalent. This is
+    // intentional for query factory cache keying, where two queries with different names must
+    // not share a cache entry, but that property makes it useless for this deduplication.
+    //
+    // NOTE: The following are not hashed because they are not used at this point - they are only
+    // used when the package map is deployed:
+    //          @daliip @remoteStorage @sourceCluster
+    virtual hash64_t queryFileResolutionKey() const override
+    {
+        hash64_t h = HASH64_INIT;
+        const bool compulsory = isCompulsory();
+        h = rtlHash64Data(sizeof(compulsory), &compulsory, h);
+        const bool resolveLocal = resolveLocally();
+        h = rtlHash64Data(sizeof(resolveLocal), &resolveLocal, h);
+        if (node->hasProp("SuperFile") || node->hasProp("File"))
+        {
+            const void *self = this;
+            h = rtlHash64Data(sizeof(self), &self, h);
+        }
+        for (aindex_t i = 0, n = getBaseCount(); i < n; i++)
+        {
+            const void *p = getBaseNode(i);
+            h = rtlHash64Data(sizeof(p), &p, h);
+        }
+        return h;
+    }
+
     virtual IPropertyTreeIterator *getInMemoryIndexInfo(const IPropertyTree &graphNode) const 
     {
         StringBuffer xpath;
@@ -675,14 +801,14 @@ public:
         return lookupElements(xpath.str(), "MemIndex");
     }
 
-    virtual const IResolvedFile *lookupFileName(const char *_fileName, bool opt, bool useCache, bool cacheResult, IConstWorkUnit *wu, bool ignoreForeignPrefix, bool isPrivilegedUser) const
+    virtual const IResolvedFile *lookupFileName(const char *_fileName, bool opt, bool useCache, bool cacheResult, IConstWorkUnit *wu, bool ignoreForeignPrefix, bool isPrivilegedUser) const override
     {
         StringBuffer fileName;
         expandLogicalFilename(fileName, _fileName, wu, false, ignoreForeignPrefix);
-        if (traceLevel > 5)
+        if (doTrace(traceRoxieFiles, TraceFlags::Max))
             DBGLOG("lookupFileName %s", fileName.str());
 
-        const IResolvedFile *result = lookupExpandedFileName(fileName, useCache, cacheResult, false, false, true, isPrivilegedUser);
+        const IResolvedFile *result = lookupExpandedFileName(fileName, useCache, cacheResult, AccessMode::readRandom, false, true, isPrivilegedUser);
         if (!result)
         {
             StringBuffer compulsoryMsg;
@@ -690,19 +816,19 @@ public:
                     compulsoryMsg.append(" (Package is compulsory)");
             if (!opt && !pretendAllOpt)
                 throw MakeStringException(ROXIE_FILE_ERROR, "Could not resolve filename %s%s", fileName.str(), compulsoryMsg.str());
-            if (traceLevel > 4)
+        if (doTrace(traceRoxieFiles))
                 DBGLOG("Could not resolve OPT filename %s%s", fileName.str(), compulsoryMsg.str());
         }
         return result;
     }
 
-    virtual IRoxieWriteHandler *createFileName(const char *_fileName, bool overwrite, bool extend, const StringArray &clusters, IConstWorkUnit *wu, bool isPrivilegedUser) const
+    virtual IRoxieWriteHandler *createWriteHandler(const char *_fileName, bool overwrite, bool extend, const StringArray &clusters, IConstWorkUnit *wu, bool isPrivilegedUser) const
     {
         StringBuffer fileName;
         expandLogicalFilename(fileName, _fileName, wu, false, false);
-        Owned<IResolvedFile> resolved = lookupFile(fileName, false, false, true, true, isPrivilegedUser);
+        Owned<IResolvedFile> resolved = lookupFile(fileName, false, false, AccessMode::writeSequential, true, isPrivilegedUser);
         if (!resolved)
-            resolved.setown(resolveLFNusingDaliOrLocal(fileName, false, false, true, true, resolveLocally(), isPrivilegedUser));
+            resolved.setown(resolveLFNusingDaliOrLocal(fileName, false, false, AccessMode::writeSequential, true, resolveLocally(), isPrivilegedUser));
         if (resolved)
         {
             if (resolved->exists())
@@ -731,7 +857,7 @@ public:
         else if (daliHelper)
             user = daliHelper->queryUserDescriptor();//predeployed query mode
 
-        Owned<ILocalOrDistributedFile> ldFile = createLocalOrDistributedFile(fileName, user, onlyLocal, onlyDFS, true, isPrivilegedUser);
+        Owned<ILocalOrDistributedFile> ldFile = createLocalOrDistributedFile(fileName, user, onlyLocal, onlyDFS, AccessMode::writeSequential, isPrivilegedUser, &clusters);
         if (!ldFile)
             throw MakeStringException(ROXIE_FILE_ERROR, "Cannot write %s", fileName.str());
         return createRoxieWriteHandler(daliHelper, ldFile.getClear(), clusters);
@@ -777,6 +903,7 @@ public:
 };
 
 CResolvedFileCache CRoxiePackageNode::daliFiles;
+ResolveFileCriticalSection CRoxiePackageNode::daliLookupCrits[NUM_DALI_CRITS];
 
 typedef CResolvedPackage<CRoxiePackageNode> CRoxiePackage;
 
@@ -844,7 +971,7 @@ public:
 
 static CRoxiePackageMap *emptyPackageMap;
 static CRoxiePackage *rootPackage;
-static SpinLock emptyPackageMapCrit;
+static SpinLock emptyPackageMapCrit{SYNC_LOCATION};
 static IRoxieDebugSessionManager *debugSessionManager;
 
 extern const IRoxiePackage &queryRootRoxiePackage()
@@ -918,7 +1045,7 @@ protected:
     unsigned channelNo;
     bool active;
     StringAttr querySetName;
-    CriticalSection crit;   // For parallel load
+    CriticalSection crit{SYNC_LOCATION};   // For parallel load
 
     void addQuery(const char *id, IQueryFactory *n)
     {
@@ -956,6 +1083,20 @@ public:
         channelNo = _channelNo;
     }
 
+    ~CRoxieQuerySetManager()
+    {
+        if (shuttingDown.load())
+        {
+            CriticalBlock b(crit);
+            HashIterator elems(queries);
+            for (elems.first(); elems.isValid(); elems.next())
+            {
+                IMapping &cur = elems.query();
+                queries.mapToValue(&cur)->clearSharedOnceContext();
+            }
+        }
+    }
+
     virtual const char *queryId() const
     {
         return querySetName;
@@ -966,13 +1107,203 @@ public:
         return active;
     }
 
+    const IRoxiePackage * queryPackage(const IPropertyTree *query, const IRoxiePackageMap &packages)
+    {
+        const char *id = query->queryProp("@id");
+        if (!id || !*id)
+            throw MakeStringException(ROXIE_QUERY_MODIFICATION, "dll and id must be specified");
+
+        const IHpccPackage *package = NULL;
+        const char *packageName = query->queryProp("@package");
+        if (packageName && *packageName)
+        {
+            package = packages.queryPackage(packageName); // if a package is specified, require exact match
+            if (!package)
+                throw MakeStringException(ROXIE_QUERY_MODIFICATION, "Package %s specified by query %s not found", packageName, id);
+        }
+        else
+        {
+            package = packages.queryPackage(id);  // Look for an exact match, then a fuzzy match, using query name as the package id
+            if(!package) package = packages.matchPackage(id);
+            if (!package) package = &queryRootRoxiePackage();
+        }
+        return dynamic_cast<const IRoxiePackage *>(package);
+    }
+
     virtual void load(const IPropertyTree *querySet, const IRoxiePackageMap &packages, hash64_t &hash, bool forceRetry)
     {
         unsigned numQueries = const_cast<IPropertyTree *>(querySet)->getCount("Query");
         if (numQueries)
         {
             std::vector<hash64_t> queryHashes(numQueries);
-            asyncFor(numQueries, parallelLoadQueries, [this, querySet, &packages, &queryHashes, forceRetry](unsigned i)
+            std::vector<Owned<const IQueryDll>> queryDlls(numQueries);
+            //The resolved files need to stay live otherwise they are removed from the cache
+            //Allocate an array to hold them - so they can be updated in parallel
+            std::unique_ptr<Owned<const IResolvedFile> []> resolvedFiles;
+
+            if (numResolveFilenameThreads)
+            {
+                //Load all the dlls in parallel, gathering a list of filenames for each package
+                //Currently keep a single critical section for all packages - could be optimized if necessary
+                CCycleTimer resolveTimer;
+                CriticalSection filenameCrit{SYNC_LOCATION};
+                std::map<hash64_t, std::pair<const IRoxiePackage *, SummaryMap>> filenameSummaryMap;
+
+                asyncFor("Async Gather Filenames", numQueries, parallelQueryLoadThreads, [this, querySet, &queryDlls, &filenameCrit, &filenameSummaryMap, &packages](unsigned i)
+                {
+                    VStringBuffer xpath("Query[%u]", i+1);
+                    const IPropertyTree *query = querySet->queryPropTree(xpath);
+                    const char *dllName = query->queryProp("@dll");
+                    const char *id = query->queryProp("@id");
+                    try
+                    {
+                        if (!dllName)
+                            return;
+
+                        const IQueryDll * dll = createQueryDll(dllName);
+                        queryDlls[i].setown(dll);
+
+                        //Now gather a list of filenames from the cached information
+                        IConstWorkUnit * wu = dll->queryWorkUnit();
+                        const IRoxiePackage *package = queryPackage(query, packages);
+                        if (!wu || !package)
+                            return;
+
+                        //The filename resolution depends on the package - so we need to create a unique list for each resolution-equivalent package class
+                        // Gather all the filenames from the workunit
+                        SummaryMap wuFilenameSummary;
+                        wu->getSummary(SummaryType::ReadIndex, wuFilenameSummary);
+                        wu->getSummary(SummaryType::ReadFile, wuFilenameSummary);
+
+                        // Group by file-resolution equivalence rather than object identity (see queryFileResolutionKey)
+                        CriticalBlock block(filenameCrit);
+                        auto &[representative, filenameSummary] = filenameSummaryMap[package->queryFileResolutionKey()];
+                        if (!representative)
+                            representative = package;
+                        StringBuffer expandedFilename;
+                        for (auto &entry : wuFilenameSummary)
+                        {
+                            bool ignoreForeignPrefix = true;
+                            expandedFilename.clear();
+                            expandLogicalFilename(expandedFilename, entry.first.c_str(), wu, false, ignoreForeignPrefix);
+
+                            SummaryFlags flags = entry.second;
+                            auto match = filenameSummary.find(expandedFilename.str());
+                            if (match == filenameSummary.end())
+                                filenameSummary[expandedFilename.str()] = flags;
+                            else
+                                match->second &= flags;
+                        }
+                    }
+                    catch (IException *E)
+                    {
+                        VStringBuffer msg("Failed to gather file dependencies for query %s from %s", id ? id : "(null)", dllName ? dllName : "(null)");
+                        EXCLOG(E, msg.str());
+                        E->Release();
+                    }
+                });
+
+                // Expand the nested maps of packages and filenames into a linear list that is easy to walk in parallel.
+                std::vector<std::pair<const IRoxiePackage *, const SummaryMap::value_type *>> filenames;
+                for (auto & [resKey, pkgEntry] : filenameSummaryMap)
+                {
+                    for (auto &entry : pkgEntry.second)
+                        filenames.emplace_back(pkgEntry.first, &entry);
+                }
+
+                resolvedFiles.reset(new Owned<const IResolvedFile> [filenames.size()]);
+                stat_type gatherNs = resolveTimer.elapsedNs();
+
+                struct
+                {
+                    CriticalSection cs{SYNC_LOCATION};
+                    unsigned numActiveIndexes{0};
+                    unsigned numIndexesOpened{0};
+                    unsigned totalParts{0};
+                    unsigned localParts{0};
+                    unsigned activeTotalParts{0};
+                    unsigned activeLocalParts{0};
+                } stats;
+
+                // Now resolve the filenames in parallel - on a system with remote files most of the time is spent retrieving the file sizes.
+                // The files will be added to the cache - so that the subsequent query load will match immediately
+                asyncFor("Async Resolve Filenames", filenames.size(), numResolveFilenameThreads, [this, &filenames, &resolvedFiles, &packages, &stats](unsigned i)
+                {
+                    const char *filename = nullptr;
+                    try
+                    {
+                        const auto & entry = filenames[i];
+                        const IRoxiePackage * package = entry.first;
+                        const SummaryMap::value_type * filenameEntry = entry.second;
+                        filename = filenameEntry->first.c_str();
+                        SummaryFlags flags = filenameEntry->second;
+                        bool isOpt = (flags & SummaryFlags::IsOpt) != 0;
+                        bool isCodeSigned = (flags & SummaryFlags::IsSigned) != 0;
+                        const IResolvedFile * resolved = package->lookupExpandedFileName(filename, true, true, AccessMode::readRandom, false, true, isCodeSigned);
+                        resolvedFiles[i].setown(resolved);
+
+                        if (resolved)
+                        {
+                            //MORE: Would this be better as a separate async loop?
+                            // This code does not check lazyOpen - because the purpose of that flag is to avoid opening files that are not needed.
+                            // this code checks that the package is active - so the files are needed.
+                            unsigned numOpened = 0;
+                            unsigned totalParts = resolved->getNumTotalParts();
+                            unsigned localParts = resolved->getNumLocalParts(channelNo);
+                            bool isActiveIndex = false;
+                            if (resolved->isKey())
+                            {
+                                isActiveIndex = packages.isActive();
+                                if (preopenActiveIndexes && isActiveIndex)
+                                {
+                                    Owned<IKeyArray> keySet = resolved->getKeyArray(isOpt, channelNo);
+                                    for (unsigned partNo = 0; partNo < keySet->length(); partNo++)
+                                    {
+                                        IKeyIndexBase *thisBase = keySet->queryKeyPart(partNo);
+                                        if (thisBase)
+                                        {
+                                            unsigned fileNo = 0;
+                                            IKeyIndex *thisKey = thisBase->queryPart(fileNo);
+                                            if (thisKey)
+                                            {
+                                                thisKey->ensureReady();
+                                                numOpened++;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            CriticalBlock block(stats.cs);
+                            stats.totalParts += totalParts;
+                            stats.localParts += localParts;
+                            stats.numIndexesOpened += numOpened;
+                            if (isActiveIndex)
+                            {
+                                stats.numActiveIndexes += 1;
+                                stats.activeTotalParts += totalParts;
+                                stats.activeLocalParts += localParts;
+                            }
+                        }
+                    }
+                    catch (IException *E)
+                    {
+                        VStringBuffer msg("Failed to resolve file %s", filename ? filename : "(unknown)");
+                        EXCLOG(E, msg.str());
+                        E->Release();
+                    }
+                });
+
+
+                stat_type resolveNs = resolveTimer.elapsedNs();
+                PROGLOG("Resolve files for channel %u files(%u, %u/%u) active(%u, %u/%u). %u opened on %u threads - gather %lluns, resolve %lluns",
+                        channelNo,
+                        (unsigned)filenames.size(), stats.localParts, stats.totalParts,
+                        stats.numActiveIndexes, stats.activeLocalParts, stats.activeTotalParts,
+                        stats.numIndexesOpened, numResolveFilenameThreads, gatherNs, resolveNs);
+            }
+
+            asyncFor("Async Load Query", numQueries, parallelQueryLoadThreads, [this, querySet, &packages, &queryHashes, &queryDlls, forceRetry](unsigned i)
             {
                 queryHashes[i] = 0;
                 VStringBuffer xpath("Query[%u]", i+1);
@@ -984,23 +1315,14 @@ public:
                 {
                     if (!id || !*id || !dllName || !*dllName)
                         throw MakeStringException(ROXIE_QUERY_MODIFICATION, "dll and id must be specified");
-                    Owned<const IQueryDll> queryDll = createQueryDll(dllName);
-                    const IHpccPackage *package = NULL;
-                    const char *packageName = query->queryProp("@package");
-                    if (packageName && *packageName)
-                    {
-                        package = packages.queryPackage(packageName); // if a package is specified, require exact match
-                        if (!package)
-                            throw MakeStringException(ROXIE_QUERY_MODIFICATION, "Package %s specified by query %s not found", packageName, id);
-                    }
-                    else
-                    {
-                        package = packages.queryPackage(id);  // Look for an exact match, then a fuzzy match, using query name as the package id
-                        if(!package) package = packages.matchPackage(id);
-                        if (!package) package = &queryRootRoxiePackage();
-                    }
-                    assertex(package && QUERYINTERFACE(package, const IRoxiePackage));
-                    IQueryFactory *qf = loadQueryFromDll(id, queryDll.getClear(), *QUERYINTERFACE(package, const IRoxiePackage), query, forceRetry);
+                    Owned<const IQueryDll> queryDll = queryDlls[i].getClear();
+                    if (!queryDll)
+                        queryDll.setown(createQueryDll(dllName));
+
+                    const IRoxiePackage *package = queryPackage(query, packages);
+                    assertex(package);
+
+                    IQueryFactory *qf = loadQueryFromDll(id, queryDll.getClear(), *package, query, forceRetry);
                     queryHashes[i] = qf->queryHash();
                     addQuery(id, qf);
                 }
@@ -1014,8 +1336,10 @@ public:
                     {
                         StringBuffer emsg;
                         E->errorMessage(emsg);
-                        Owned<IQueryFactory> dummyQuery = loadQueryFromDll(id, NULL, queryRootRoxiePackage(), NULL, false);
-                        dummyQuery->suspend(emsg.str());
+                        Owned<IPropertyTree> stateInfo = createPTree();
+                        stateInfo->setPropBool("@suspended", true);
+                        stateInfo->setProp("@loadFailedReason", emsg);
+                        Owned<IQueryFactory> dummyQuery = loadQueryFromDll(id, NULL, queryRootRoxiePackage(), stateInfo, false);
                         queryHashes[i] = dummyQuery->queryHash();
                         addQuery(id, dummyQuery.getClear());
                     }
@@ -1029,7 +1353,7 @@ public:
         if (numAliases)
         {
             std::vector<hash64_t> aliasHashes(numAliases);
-            asyncFor(numAliases, parallelLoadQueries, [this, querySet, &aliasHashes](unsigned i)
+            asyncFor(SYNC_LOCATION, numAliases, parallelQueryLoadThreads, [this, querySet, &aliasHashes](unsigned i)
             {
                 aliasHashes[i] = 0;
                 VStringBuffer xpath("Alias[%u]", i+1);
@@ -1060,14 +1384,12 @@ public:
             hash = rtlHash64VStr("active", hash);
     }
 
-    virtual void getStats(const char *queryName, const char *graphName, StringBuffer &reply, const IRoxieContextLogger &logctx) const
+    virtual void getStats(const char *queryName, const char *graphName, IConstWorkUnit *statsWu, unsigned channel, bool reset, const IRoxieContextLogger &logctx) const override
     {
         Owned<IQueryFactory> f = getQuery(queryName, NULL, logctx);
         if (f)
         {
-            reply.appendf("<Query id='%s'>\n", queryName);
-            f->getStats(reply, graphName);
-            reply.append("</Query>\n");
+            f->gatherStats(statsWu, graphName, channel, reset);
         }
         else
             throw MakeStringException(ROXIE_UNKNOWN_QUERY, "Unknown query %s", queryName);
@@ -1121,14 +1443,23 @@ public:
         }
     }
 
+    virtual void preloadOnce() const
+    {
+        HashIterator elems(queries);
+        for (elems.first(); elems.isValid(); elems.next())
+        {
+            IMapping &cur = elems.query();
+            IQueryFactory *query = queries.mapToValue(&cur);
+            query->preloadOnce();
+        }
+    }
+
     virtual IQueryFactory *getQuery(const char *id, StringBuffer *querySet, const IRoxieContextLogger &logctx) const
     {
         if (querySet && querySet->length() && !streq(querySet->str(), querySetName))
             return NULL;
         IQueryFactory *ret;
         ret = aliases.getValue(id);
-        if (ret && logctx.queryTraceLevel() > 5)
-            logctx.CTXLOG("Found query alias %s => %s", id, ret->queryQueryName());
         if (!ret)
             ret = queries.getValue(id);
         if (ret && querySet)
@@ -1217,6 +1548,13 @@ public:
                 managers[channel]->load(querySets, packages, hash, forceRetry); // MORE - this means the hash depends on the number of channels. Is that desirable?
     }
 
+    virtual void preloadOnce() override
+    {
+        for (unsigned channel = 0; channel < numChannels; channel++)
+            if (managers[channel])
+                managers[channel]->preloadOnce();
+    }
+
     virtual void getQueries(const char *id, IArrayOf<IQueryFactory> &queries, const IRoxieContextLogger &logctx) const
     {
         for (unsigned channel = 0; channel < numChannels; channel++)
@@ -1238,7 +1576,7 @@ private:
 class CRoxieDebugSessionManager : implements IRoxieDebugSessionManager, public CInterface
 {
 protected:
-    ReadWriteLock debugLock; 
+    ReadWriteLock debugLock{SYNC_LOCATION}; 
     MapStringToMyClass<IDebuggerContext> debuggerContexts;
 
 public:
@@ -1327,6 +1665,10 @@ public:
     }
 
 protected:
+    ~CRoxieQueryPackageManagerBase()
+    {
+        releaseManagersInOrder(agentManagers, serverManager);
+    }
 
     // Derived classes wanting to read serverManager or agentManagers must call this function to safely obtain their current values
 
@@ -1350,12 +1692,22 @@ protected:
             serverManager.setown(newServerManager);
             queryHash = newHash;
         }
-        if (agentQueryReleaseDelaySeconds)
-            delayedReleaser->delayedRelease(oldAgentManagers.getClear(), agentQueryReleaseDelaySeconds);
+        releaseManagersInOrder(oldAgentManagers, oldServerManager);
     }
 
 private:
-    mutable CriticalSection updateCrit;  // protects updates of agentManagers and serverManager, and queryHash. Must be held ONLY to link, release, or overwrite these values.
+    static void releaseManagersInOrder(Owned<CRoxieAgentQuerySetManagerSet> &_agentManagers, Owned<IRoxieQuerySetManager> &_serverManager)
+    {
+        if (agentQueryReleaseDelaySeconds && delayedReleaser && _agentManagers)
+            delayedReleaser->delayedRelease(_agentManagers.getClear(), _serverManager.getClear(), agentQueryReleaseDelaySeconds);
+        else
+        {
+            _agentManagers.clear();
+            _serverManager.clear();
+        }
+    }
+
+    mutable CriticalSection updateCrit{SYNC_LOCATION};  // protects updates of agentManagers and serverManager, and queryHash. Must be held ONLY to link, release, or overwrite these values.
     Owned<CRoxieAgentQuerySetManagerSet> agentManagers;
     Owned<IRoxieQuerySetManager> serverManager;
     hash64_t queryHash = 0;
@@ -1378,9 +1730,8 @@ public:
         return packages->queryPackageId();
     }
 
-    virtual void reload()
+    virtual void reloadIncremental()
     {
-        // Default is to do nothing...
     }
 
     virtual void load(bool forceReload) = 0;
@@ -1433,7 +1784,7 @@ public:
         return true;
     }
 
-    bool getStats(const char *queryId, const char *action, const char *graphName, StringBuffer &reply, const IRoxieContextLogger &logctx) const
+    bool getStats(const char *queryId, const char *graphName, StringBuffer &reply, const char *wuid, const IRoxieContextLogger &logctx) const
     {
         Owned<IRoxieQuerySetManager> serverManager;
         Owned<CRoxieAgentQuerySetManagerSet> agentManagers;
@@ -1443,18 +1794,48 @@ public:
             Owned<IQueryFactory> query = serverManager->getQuery(queryId, NULL, logctx);
             if (query)
             {
-                StringBuffer freply;
-                serverManager->getStats(queryId, graphName, freply, logctx);
-                Owned<IPropertyTree> stats = createPTreeFromXMLString(freply.str(), ipt_fast);
+                bool reset = false;  // MORE - tidy up around here.
+                Owned<IConstWorkUnit> statsWu;
+                if (wuid)
+                {
+                    Owned<IRoxieDaliHelper> daliHelper = ::connectToDali();
+                    if (!daliHelper->connected())
+                        throw makeStringException(ROXIE_CONTROL_MSG_ERROR, "Can't create stats WU - dali not connected");
+                    statsWu.setown(daliHelper->createStatsWorkUnit(wuid, query->queryDll()->queryName()));
+                }
+                else
+                {
+                    statsWu.setown(createLocalWorkUnitFromPTree(createPTreeFromIPT(queryExtendedWU(query->queryWorkUnit())->queryPTree())));
+                }
+                query->gatherStats(statsWu, graphName, -1, reset);
                 for (unsigned channel = 0; channel < numChannels; channel++)
                     if (agentManagers->item(channel))
+                        agentManagers->item(channel)->getStats(queryId, graphName, statsWu, channel+1, reset, logctx);
+                if (!wuid || *wuid=='*')
+                {
+                    WorkunitUpdate wu(&statsWu->lock());
+                    wu->setState(WUStateCompleted);   // We don't set the state when updating existing workunits
+                }
+                reply.appendf("<Query id='%s'>\n", queryId);
+                if (wuid)
+                    reply.appendf(" <wuid>%s</wuid>\n", statsWu->queryWuid());
+                else
+                {
+                    reply.appendf("<Graphs>\n");
+                    Owned<IConstWUGraphIterator> graphs = &statsWu->getGraphs(GraphTypeActivities);
+                    ForEach(*graphs)
                     {
-                        StringBuffer sreply;
-                        agentManagers->item(channel)->getStats(queryId, graphName, sreply, logctx);
-                        Owned<IPropertyTree> cstats = createPTreeFromXMLString(sreply.str(), ipt_fast);
-                        mergeStats(stats, cstats, 1);
+                        IConstWUGraph &graph = graphs->query();
+                        Owned<IPropertyTree> xgmml = graph.getXGMMLTree(true, false);  // We can't merge between nodes if we format the values
+                        unsigned wfid = xgmml->getPropInt("@wfid");
+                        SCMStringBuffer s;
+                        reply.appendf("<Graph name='%s' wfid='%u'>\n <xgmml>\n", graph.getName(s).str(), wfid);
+                        toXML(xgmml, reply, 2);
+                        reply.append(" </xgmml>\n</Graph>\n");
                     }
-                toXML(stats, reply);
+                    reply.appendf("</Graphs>\n");
+                }
+                reply.append("</Query>\n");
                 return true;
             }
         }
@@ -1517,6 +1898,7 @@ class CRoxieDaliQueryPackageManager : public CRoxieQueryPackageManager, implemen
 {
     Owned<IRoxieDaliHelper> daliHelper;
     Owned<IDaliPackageWatcher> notifier;
+    std::atomic<bool> dirty{false};
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -1534,19 +1916,27 @@ public:
 
     virtual ISafeSDSSubscription *linkIfAlive() override { return isAliveAndLink() ? this : nullptr; }
 
-    virtual void notify(SubscriptionId id, const char *xpath, SDSNotifyFlags flags, unsigned valueLen, const void *valueData)
+    virtual void notify(SubscriptionId id, const char *xpath, SDSNotifyFlags flags, unsigned valueLen, const void *valueData) override
     {
-        reload(false);
-        daliHelper->commitCache();
+        //Mark this queryset as potentially modified - and then request an incremental reload
+        dirty = true;
+        globalPackageSetManager->requestReload(false, false, true);
     }
 
-    virtual void load(bool forceReload)
+    virtual void load(bool forceReload) override
     {
         notifier.setown(daliHelper->getQuerySetSubscription(querySet, this));
         reload(forceReload);
     }
 
-    virtual void reload(bool forceRetry)
+    virtual void reloadIncremental() override
+    {
+        if (dirty.exchange(false))
+            reload(false);
+    }
+
+private:
+    void reload(bool forceRetry)
     {
         hash64_t newHash = numChannels;
         Owned<IPropertyTree> newQuerySet = daliHelper->getQuerySet(querySet);
@@ -1555,9 +1945,7 @@ public:
         newServerManager->load(newQuerySet, *packages, newHash, forceRetry);
         newAgentManagers->load(newQuerySet, *packages, newHash, forceRetry);
         reloadQueryManagers(newAgentManagers.getClear(), newServerManager.getClear(), newHash);
-        clearKeyStoreCache(false);   // Allows us to fully release files we no longer need because of unloaded queries
     }
-
 };
 
 class CStandaloneQueryPackageManager : public CRoxieQueryPackageManager
@@ -1575,7 +1963,7 @@ public:
     {
     }
 
-    virtual void load(bool forceReload)
+    virtual void load(bool forceReload) override
     {
         hash64_t newHash = numChannels;
         Owned<IPropertyTree> newQuerySet = createPTree("QuerySet", ipt_lowmem);
@@ -1589,7 +1977,7 @@ public:
     }
 };
 
-static SpinLock roxieDebugSessionManagerLock;
+static SpinLock roxieDebugSessionManagerLock{SYNC_LOCATION};
 extern IRoxieDebugSessionManager &queryRoxieDebugSessionManager()
 {
     SpinBlock b(roxieDebugSessionManagerLock);
@@ -1704,6 +2092,20 @@ public:
         }
     }
 
+    void preloadOnce() const
+    {
+        ForEachItemIn(idx, allQueryPackages)
+        {
+            Owned<IRoxieQuerySetManager> serverManager = allQueryPackages.item(idx).getRoxieServerManager();
+            if (serverManager->isActive())
+            {
+                serverManager->preloadOnce();
+                Owned<IRoxieQuerySetManagerSet> agentManagers = allQueryPackages.item(idx).getRoxieAgentManagers();
+                agentManagers->preloadOnce();
+            }
+        }
+    }
+
     void getActivityMetrics(StringBuffer &reply) const
     {
         ForEachItemIn(idx, allQueryPackages)
@@ -1723,11 +2125,11 @@ public:
         reply.append("</PackageSets>\n");
     }
 
-    void getStats(StringBuffer &reply, const char *id, const char *action, const char *graphName, const IRoxieContextLogger &logctx) const
+    void getStats(StringBuffer &reply, const char *id, const char *graphName, const char *wuid, const IRoxieContextLogger &logctx) const
     {
         ForEachItemIn(idx, allQueryPackages)
         {
-            if (allQueryPackages.item(idx).getStats(id, action, graphName, reply, logctx))
+            if (allQueryPackages.item(idx).getStats(id, graphName, reply, wuid, logctx))
                return;
         }
     }
@@ -1751,6 +2153,13 @@ public:
             throw MakeStringException(ROXIE_UNKNOWN_QUERY, "Unknown query %s", id);
     }
 
+    void reloadIncremental()
+    {
+        ForEachItemIn(idx, allQueryPackages)
+        {
+            allQueryPackages.item(idx).reloadIncremental();
+        }
+    }
 private:
     CIArrayOf<CRoxieQueryPackageManager> allQueryPackages;
     Linked<IRoxieDaliHelper> daliHelper;
@@ -1812,6 +2221,8 @@ private:
                             }
                             if (oldPackageManager && oldPackageManager->matches(xmlHash, isActive))
                             {
+                                //Check for any changes to the queryset
+                                oldPackageManager->reloadIncremental();
                                 if (traceLevel)
                                     DBGLOG("Package map %s, active %s already loaded", packageMapId, isActive ? "true" : "false");
                                 stateHash = rtlHash64Data(sizeof(stateHash), &stateHash, oldPackageManager->getHash());
@@ -1863,9 +2274,6 @@ public:
             daliHelper.setown(connectToDali());
         else
             daliHelper.setown(connectToDali(ROXIE_DALI_CONNECT_TIMEOUT));
-        atomic_set(&autoPending, 0);
-        atomic_set(&autoSignalsPending, 0);
-        forcePending = false;
         pSetsNotifier.setown(daliHelper->getPackageSetsSubscription(this));
         pMapsNotifier.setown(daliHelper->getPackageMapsSubscription(this));
     }
@@ -1882,17 +2290,32 @@ public:
 
     virtual ISafeSDSSubscription *linkIfAlive() override { return isAliveAndLink() ? this : nullptr; }
 
-    void requestReload(bool signal, bool force)
+    void requestReload(bool waitUntilComplete, bool forceRetry, bool incremental)
     {
-        if (force)
-            forcePending = true;    
-        if (signal)
-            atomic_inc(&autoSignalsPending);
-        atomic_inc(&autoPending);
+        assertex(!(incremental && forceRetry));
+        if (!incremental)
+            autoAllIncremental = false;
+        if (forceRetry)
+            autoForceRetry = true;
+        if (waitUntilComplete)
+            ++autoSignalsPending;
+        ++autoPending;
         autoReloadTrigger.signal();
-        if (signal)
+        if (waitUntilComplete)
             autoReloadComplete.wait();
     }
+
+    //Return if there is no active reload, or when a reload has been completed
+    void waitForReload()
+    {
+        if (autoPending == 0)
+            return;
+
+        ++autoSignalsPending;
+        autoReloadTrigger.signal();
+        autoReloadComplete.wait();
+    }
+
 
     virtual void load()
     {
@@ -1901,7 +2324,7 @@ public:
             reload(false);
             daliHelper->commitCache();
             controlSem.signal();
-            autoReloadThread.start();   // Don't want to overlap auto-reloads with the initial load
+            autoReloadThread.start(false);   // Don't want to overlap auto-reloads with the initial load
         }
         catch(IException *E)
         {
@@ -1954,7 +2377,7 @@ public:
 
     virtual void notify(SubscriptionId id, const char *xpath, SDSNotifyFlags flags, unsigned valueLen, const void *valueData)
     {
-        requestReload(false, false);
+        requestReload(false, false, false);
     }
 
 private:
@@ -1963,45 +2386,105 @@ private:
     Owned<IRoxieDaliHelper> daliHelper;
     Owned<IDaliPackageWatcher> pSetsNotifier;
     Owned<IDaliPackageWatcher> pMapsNotifier;
-    mutable ReadWriteLock packageCrit;
-    InterruptableSemaphore controlSem;
+    mutable ReadWriteLock packageCrit{SYNC_LOCATION};
+    InterruptableSemaphore controlSem{SYNC_LOCATION};
     Owned<CRoxiePackageSetWatcher> allQueryPackages;
 
-    Semaphore autoReloadTrigger;
-    Semaphore autoReloadComplete;
-    atomic_t autoSignalsPending;
-    atomic_t autoPending;
-    bool forcePending;
+    Semaphore autoReloadTrigger{SYNC_LOCATION};
+    Semaphore autoReloadComplete{SYNC_LOCATION};
+    std::atomic<unsigned> autoSignalsPending{0};
+    std::atomic<unsigned> autoPending{0};
+    std::atomic<bool> autoAllIncremental{true};
+    std::atomic<bool> autoForceRetry{false};
 
     class AutoReloadThread : public Thread
     {
-        bool closing;
+        static constexpr unsigned waitForReloadDelayMs = 500; // How long to wait for an explicit <control:reload>
+        static constexpr unsigned NotifyMergeDelayMs = 50; // How long to wait for other notifications before reloading the querySet
+        std::atomic<bool> closing{false};
         CRoxiePackageSetManager &owner;
     public:
         AutoReloadThread(CRoxiePackageSetManager &_owner)
         : Thread("AutoReloadThread"), owner(_owner)
         {
-            closing = false;
         }
 
         virtual int run()
         {
             if (traceLevel)
                 DBGLOG("AutoReloadThread %p starting", this);
+
             while (!closing)
             {
                 owner.autoReloadTrigger.wait();
                 if (closing)
                     break;
-                unsigned signalsPending = atomic_read(&owner.autoSignalsPending);
-                if (!signalsPending)
-                    Sleep(500); // Typically notifications come in clumps - this avoids reloading too often
-                if (atomic_read(&owner.autoPending))
+
+                //If there has been an update to a packagemap or queryset, there may also be a control:reload in quick succession, so wait for it.
+                //NOTE: control:reload generally locks the roxie connection and waits for a response, so it is unlikely that
+                //multiple control:reloads will be received at the same time.
+                CCycleTimer mergeTimer;
+                unsigned elapsedMs = 0;
+                //Keep waiting until we receive an explicit control:reload or the timeout expires
+                while (!owner.autoSignalsPending)
                 {
-                    atomic_set(&owner.autoPending, 0);
+                    owner.autoReloadTrigger.wait(waitForReloadDelayMs - elapsedMs);
+                    elapsedMs = mergeTimer.elapsedMs();
+                    if (elapsedMs >= waitForReloadDelayMs)
+                        break;
+                }
+
+                if (closing)
+                    break;
+
+                unsigned prevPending = owner.autoPending.load();
+                unsigned waits = 0;
+                if (prevPending)
+                {
+                    //Often there are many requests to reload query sets, and perform a global reload.
+                    //Iterate in a loop to combine all the requests within a time period to avoid repeated reloads.
+                    for (;;)
+                    {
+                        MilliSleep(NotifyMergeDelayMs);
+                        waits++;
+
+                        unsigned nextPending = owner.autoPending.load();
+                        //Check to see if any other requests came in during the small delay.
+                        if (prevPending == nextPending)
+                        {
+                            //If no more process all the notifications
+                            break;
+                        }
+                        prevPending = nextPending;
+                    }
+                }
+
+                // How many threads are waiting for a completed signal in response to control:reload?
+                // They can all be signalled when the reload is complete, and subsequent iterations will do nothing (but may signal).
+                unsigned signalsPending = owner.autoSignalsPending.exchange(0);
+
+                //Check if there are any requests from last time that have not been processed yet.
+                unsigned requestsPending = owner.autoPending.exchange(0);
+                if (requestsPending)
+                {
+                    //NOTE: Following are read in reverse order from the order they are set to avoid race conditions
+                    bool forceRetry = owner.autoForceRetry.exchange(false);
+                    bool incremental = owner.autoAllIncremental.exchange(true);
+
+                    if (traceLevel)
+                        DBGLOG("AutoReload: [%s] %u changes (%u waits) delayed %ums ", (forceRetry ? "force" : (incremental ? "incremental" : "reload")), requestsPending, waits, mergeTimer.elapsedMs());
+
+                    CCycleTimer timer;
                     try
                     {
-                        owner.reload(owner.forcePending);
+                        //If all the changes are incremental, then only update the querysets that have changed, otherwise reload everything
+                        if (incremental)
+                            owner.reloadIncremental();
+                        else
+                            owner.reload(forceRetry);
+
+                        if (traceLevel)
+                            DBGLOG("AutoReload: took %ums (signal %u threads)", timer.elapsedMs(), signalsPending);
                     }
                     catch (IException *E)
                     {
@@ -2013,13 +2496,15 @@ private:
                     {
                         IERRLOG("Unknown exception in AutoReloadThread");
                     }
-                    owner.forcePending = false;
                 }
-                if (signalsPending)
+                else
                 {
-                    atomic_dec(&owner.autoSignalsPending);
-                    owner.autoReloadComplete.signal();
+                    if (traceLevel)
+                       DBGLOG("AutoReload - nothing to do %u requests waiting", signalsPending);
                 }
+
+                if (signalsPending)
+                    owner.autoReloadComplete.signal(signalsPending);
             }
             if (traceLevel)
                 DBGLOG("AutoReloadThread %p exiting", this);
@@ -2059,7 +2544,34 @@ private:
             oldPackages.setown(allQueryPackages.getLink());  // Ensure we don't delete the old packages until after we have loaded the new
             allQueryPackages.setown(newPackages.getClear());
         }
-        daliHelper->commitCache();
+
+        //Release the old packages before clearing any unused entries.
+        oldPackages.clear();
+        completeReload();
+    }
+
+    void reloadIncremental()
+    {
+        {
+            ReadLockBlock b(packageCrit);
+            allQueryPackages->reloadIncremental();
+        }
+        completeReload();
+    }
+
+    void completeReload()
+    {
+        if (preloadOnceData)
+        {
+            ReadLockBlock readBlock(packageCrit);
+            allQueryPackages->preloadOnce();
+        }
+        // Avoid clearing keys and updating the cache file if we are just about to reload something
+        if (autoPending.load() == 0)
+        {
+            clearKeyStoreCache(false);   // Allows us to fully release files we no longer need because of unloaded queries
+            daliHelper->commitCache();
+        }
     }
 
     // Common code used by control:queries and control:getQueryXrefInfo
@@ -2128,7 +2640,7 @@ private:
             {
                 blobCacheMB = control->getPropInt("@val", 0);
                 topology->setPropInt("@blobCacheMem", blobCacheMB);
-                setBlobCacheMem(blobCacheMB * 0x100000);
+                setBlobCacheMem(blobCacheMB * 0x100000ULL);
             }
             else
                 unknown = true;
@@ -2266,16 +2778,6 @@ private:
                 unknown = true;
             break;
 
-        case 'E':
-            if (stricmp(queryName, "control:enableKeyDiff")==0)
-            {
-                enableKeyDiff = control->getPropBool("@val", true);
-                topology->setPropBool("@enableKeyDiff", enableKeyDiff);
-            }
-            else
-                unknown = true;
-            break;
-            
         case 'F':
             if (stricmp(queryName, "control:fieldTranslationEnabled")==0)
             {
@@ -2283,7 +2785,7 @@ private:
                 if (val)
                     fieldTranslationEnabled = getTranslationMode(val, false);
                 else
-                    fieldTranslationEnabled = RecordTranslationMode::Payload;
+                    fieldTranslationEnabled = RecordTranslationMode::PayloadRemoveOnly;
                 val = getTranslationModeText(fieldTranslationEnabled);
                 topology->setProp("@fieldTranslationEnabled", val);
             }
@@ -2339,7 +2841,11 @@ private:
             }
             else if (stricmp(queryName, "control:getBuildVersion")==0)
             {
-                reply.appendf("<version id='%s'/>", BUILD_TAG);
+                reply.appendf("<version id='%s'/>", hpccBuildInfo.buildTag);
+            }
+            else if (strieq(queryName, "control:getMemLocked"))
+            {
+                reply.appendf(" <heapLockMemory locked='%d'/>\n", roxiemem::getRoxieMemLocked());
             }
             else
                 unknown = true;
@@ -2365,7 +2871,7 @@ private:
             {
                 leafCacheMB = control->getPropInt("@val", 50);
                 topology->setPropInt("@leafCacheMem", leafCacheMB);
-                setLeafCacheMem(leafCacheMB * 0x100000);
+                setLeafCacheMem(leafCacheMB * 0x100000ULL);
             }
             else if (stricmp(queryName, "control:listFileOpenErrors")==0)
             {
@@ -2396,7 +2902,7 @@ private:
                 topology->setPropBool("@lockDali", true);
                 if (daliHelper)
                     daliHelper->disconnect();
-                saveTopology();
+                saveTopology(true);
             }
             else if (stricmp(queryName, "control:logfullqueries")==0)
             {
@@ -2440,22 +2946,39 @@ private:
                 miscDebugTraceLevel = control->getPropInt("@level", 0);
                 topology->setPropInt("@miscDebugTraceLevel", miscDebugTraceLevel);
             }
+            else if (strieq(queryName, "control:memlock"))
+            {
+                int srtn = roxiemem::lockRoxieMem(true);
+                if (!srtn)
+                {
+                    topology->setPropBool("@heapLockMemory", true);
+                    reply.append(" <heapLockMemory locked='1'/>\n");
+                }
+                else
+                    reply.appendf(" <heapLockMemory locked='%d' error='%d' descr='unable to lock roxie memory'/>\n", roxiemem::getRoxieMemLocked(), srtn);
+            }
+            else if (strieq(queryName, "control:memunlock"))
+            {
+                // ought to have some acl restriction / key for this ...
+                int srtn = roxiemem::lockRoxieMem(false);
+                if (!srtn)
+                {
+                    topology->setPropBool("@heapLockMemory", false);
+                    reply.append(" <heapLockMemory locked='0'/>\n");
+                }
+                else
+                    reply.appendf(" <heapLockMemory locked='%d' error='%d' descr='unable to unlock roxie memory'/>\n", roxiemem::getRoxieMemLocked(), srtn);
+            }
             else
                 unknown = true;
             break;
 
         case 'N':
-            if (stricmp(queryName, "control:nodeCachePreload")==0)
-            {
-                nodeCachePreload = control->getPropBool("@val", true);
-                topology->setPropBool("@nodeCachePreload", nodeCachePreload);
-                setNodeCachePreload(nodeCachePreload);
-            }
-            else if (stricmp(queryName, "control:nodeCacheMem")==0)
+            if (stricmp(queryName, "control:nodeCacheMem")==0)
             {
                 nodeCacheMB = control->getPropInt("@val", 100);
                 topology->setPropInt("@nodeCacheMem", nodeCacheMB);
-                setNodeCacheMem(nodeCacheMB * 0x100000);
+                setNodeCacheMem(nodeCacheMB * 0x100000ULL);
             }
             else if (stricmp(queryName, "control:numFilesToProcess")==0)
             { 
@@ -2477,18 +3000,20 @@ private:
                     parallelAggregate = 1;
                 topology->setPropInt("@parallelAggregate", parallelAggregate);
             }
-            else if (stricmp(queryName, "control:pingInterval")==0)
+            else if (stricmp(queryName, "control:pauseEventRecording")==0)
             {
-                unsigned newInterval = (unsigned) control->getPropInt64("@val", 0);
-                if (newInterval && !pingInterval)
-                {
-                    pingInterval = newInterval; // best to set before the start...
-                    startPingTimer();
-                }
-                else if (pingInterval && !newInterval)
-                    stopPingTimer();  // but after the stop
-                pingInterval = newInterval;
-                topology->setPropInt64("@pingInterval", pingInterval);
+                bool addEventForChange = control->getPropBool("@audit", false);
+                bool success = queryRecorder().pauseRecording(true, addEventForChange);
+                reply.appendf("<EventRecording success='%s'/>", boolToStr(success));
+            }
+            else if (stricmp(queryName, "control:perf")==0)
+            {
+                unsigned perfTime = (unsigned) control->getPropInt64("@time", 60);
+                PerfTracer perf;
+                double interval = control->getPropReal("@interval", 0.2);
+                perf.setInterval(interval);
+                perf.traceFor(perfTime);
+                reply.append(perf.queryResult().str());
             }
             else if (stricmp(queryName, "control:preabortIndexReadsThreshold")==0)
             {
@@ -2500,9 +3025,59 @@ private:
                 preabortKeyedJoinsThreshold = control->getPropInt("@val", 100);
                 topology->setPropInt("@preabortKeyedJoinsThreshold", preabortKeyedJoinsThreshold);
             }
-            else if (stricmp(queryName, "control:probeAllRows")==0)
+            else if (stricmp(queryName, "control:protraceClear")==0)
             {
-                probeAllRows = control->getPropBool("@val", true);
+                bool clearMetadata = control->getPropBool("@clearMetadata", false);
+                bool success = protraceClearRecording(clearMetadata);
+                reply.appendf("<Protrace success='%s'/>", boolToStr(success));
+            }
+            else if (stricmp(queryName, "control:protraceRecord")==0)
+            {
+                bool success = protraceClearRecording(false) && protraceResumeRecording();
+                reply.appendf("<Protrace success='%s'/>", boolToStr(success));
+            }
+            else if (stricmp(queryName, "control:protraceResume")==0)
+            {
+                bool success = protraceResumeRecording();
+                reply.appendf("<Protrace success='%s'/>", boolToStr(success));
+            }
+            else if (stricmp(queryName, "control:protraceSave")==0)
+            {
+                StringBuffer outputFilename;
+                bool success = false;
+                try
+                {
+                    bool continueRecording = control->getPropBool("@continue", false);
+                    protraceSaveRecording(outputFilename, control->queryProp("@filename"), continueRecording);
+                    success = true;
+                }
+                catch (const IException * e)
+                {
+                    StringBuffer errMsg;
+                    e->errorMessage(errMsg);
+                    StringBuffer encoded;
+                    encodeXML(errMsg.str(), encoded);
+                    reply.appendf("<Protrace success='false' error='%s'/>", encoded.str());
+                    e->Release();
+                }
+                if (success)
+                {
+                    StringBuffer encoded;
+                    encodeXML(outputFilename.str(), encoded);
+                    reply.appendf("<Protrace success='true' filename='%s'/>", encoded.str());
+                }
+            }
+            else if (stricmp(queryName, "control:protraceStatus")==0)
+            {
+                StringBuffer status;
+                StringBuffer encoded;
+                encodeXML(protraceStatus(status).str(), encoded);
+                reply.appendf("<Protrace status='%s'/>", encoded.str());
+            }
+            else if (stricmp(queryName, "control:protraceSuspend")==0)
+            {
+                bool success = protraceSuspendRecording();
+                reply.appendf("<Protrace success='%s'/>", boolToStr(success));
             }
             else
                 unknown = true;
@@ -2574,6 +3149,7 @@ private:
                 if (!id)
                     badFormat();
                 const char *action = control->queryProp("Query/@action");
+                const char *wuid = control->queryProp("Query/@wuid");
                 const char *graphName = 0;
                 if (action)
                 {
@@ -2588,7 +3164,7 @@ private:
                             ForEachItemIn(idx, graphNames)
                             {
                                 const char *graphName = graphNames.item(idx);
-                                reply.appendf("<Graph id='%s'/>", graphName);
+                                reply.appendf("<Graph name='%s'/>", graphName);
                             }
                             reply.appendf("</Query>\n");
                         }
@@ -2600,7 +3176,7 @@ private:
                         throw MakeStringException(ROXIE_CONTROL_MSG_ERROR, "invalid action in control:queryStats %s", action);
                 }
                 ReadLockBlock readBlock(packageCrit);
-                allQueryPackages->getStats(reply, id, action, graphName, logctx);
+                allQueryPackages->getStats(reply, id, graphName, wuid, logctx);
             }
             else if (stricmp(queryName, "control:queryWuid")==0)
             {
@@ -2613,18 +3189,18 @@ private:
         case 'R':
             if (stricmp(queryName, "control:reload")==0)
             {
-                requestReload(true, control->getPropBool("@forceRetry", false));
+                requestReload(true, control->getPropBool("@forceRetry", false), false);
                 if (daliHelper && daliHelper->connected())
                     reply.appendf("<Dali connected='1'/>");
                 else
                     reply.appendf("<Dali connected='0'/>");
-                unsigned __int64 thash = getTopologyHash();
                 unsigned __int64 shash;
                 {
                     ReadLockBlock readBlock(packageCrit);
                     shash = allQueryPackages->queryHash();
                 }
-                reply.appendf("<State hash='%" I64F "u' topologyHash='%" I64F "u'/>", shash, thash);
+                reply.appendf("<State hash='%" I64F "u' topologyHash='%" I64F "u' originalTopologyHash='%" I64F "u'/>", 
+                  shash, currentTopologyHash, originalTopologyHash);
             }
             else if (stricmp(queryName, "control:resetcache")==0)
             {
@@ -2665,6 +3241,12 @@ private:
             else if (stricmp(queryName, "control:restart")==0)
             {
                 FatalError("Roxie process restarted by operator request");
+            }
+            else if (stricmp(queryName, "control:resumeEventRecording")==0)
+            {
+                bool addEventForChange = control->getPropBool("@audit", false);
+                bool success = queryRecorder().pauseRecording(false, addEventForChange);
+                reply.appendf("<EventRecording success='%s'/>", boolToStr(success));
             }
             else if (stricmp(queryName, "control:retrieveActivityDetails")==0)
             {
@@ -2723,19 +3305,41 @@ private:
                 socketCheckInterval = (unsigned) control->getPropInt64("@val", 0);
                 topology->setPropInt64("@socketCheckInterval", socketCheckInterval);
             }
+            else if (stricmp(queryName, "control:startEventRecording")==0)
+            {
+                const char * options = control->queryProp("@options");
+                const char * filename = control->queryProp("@filename");
+                bool success = startRoxieEventRecording(options, filename);
+                reply.appendf("<EventRecording success='%s'/>", boolToStr(success));
+            }
+            else if (stricmp(queryName, "control:stopEventRecording")==0)
+            {
+                EventRecordingSummary summary;
+                bool success = stopRoxieEventRecording(&summary);
+                if (success)
+                {
+                    reply.appendf("<EventRecording success='true' numEvents='%u' filename='%s' size='%llu'/>", summary.numEvents, summary.filename.str(), summary.totalSize);
+                }
+                else
+                {
+                    StringBuffer encoded;
+                    encodeXML(summary.message.str(), encoded);
+                    reply.appendf("<EventRecording success='false' error='%s'/>", encoded.str());
+                }
+            }
             else if (stricmp(queryName, "control:state")==0)
             {
                 if (daliHelper && daliHelper->connected())
                     reply.appendf("<Dali connected='1'/>");
                 else
                     reply.appendf("<Dali connected='0'/>");
-                unsigned __int64 thash = getTopologyHash();
                 unsigned __int64 shash;
                 {
                     ReadLockBlock readBlock(packageCrit);
                     shash = allQueryPackages->queryHash();
                 }
-                reply.appendf("<State hash='%" I64F "u' topologyHash='%" I64F "u'/>", shash, thash);
+                reply.appendf("<State hash='%" I64F "u' topologyHash='%" I64F "u' originalTopologyHash='%" I64F "u'/>", 
+                  shash, currentTopologyHash, originalTopologyHash);
             }
             else if (stricmp(queryName, "control:steppingEnabled")==0)
             {
@@ -2762,7 +3366,7 @@ private:
         case 'T':
             if (stricmp(queryName, "control:testAgentFailure")==0)
             {
-                testAgentFailure = control->getPropInt("@val", 20);
+                testAgentFailure = control->getPropInt("@val", (unsigned) -1);
             }
             else if (stricmp(queryName, "control:timeActivities")==0)
             {
@@ -2803,11 +3407,6 @@ private:
                     traceLevel = MAXTRACELEVEL;
                 topology->setPropInt("@traceLevel", traceLevel);
             }
-            else if (stricmp(queryName, "control:traceSmartStepping")==0)
-            {
-                traceSmartStepping = control->getPropBool("@val", true);
-                topology->setPropInt("@traceSmartStepping", traceSmartStepping);
-            }
             else if (stricmp(queryName, "control:traceStartStop")==0)
             {
                 traceStartStop = control->getPropBool("@val", true);
@@ -2827,7 +3426,7 @@ private:
             {
                 topology->setPropBool("@lockDali", false);
                 // Dali will reattach via the timer that checks every so often if can reattach...
-                saveTopology();
+                saveTopology(false);
             }
             else if (stricmp(queryName, "control:unsuspend")==0)
             {
@@ -2854,6 +3453,10 @@ private:
             {
                 watchActivityId = control->getPropInt("@id", true);
             }
+            else if (stricmp(queryName, "control:waitForReload")==0)
+            {
+                waitForReload();
+            }
             else
                 unknown = true;
             break;
@@ -2862,6 +3465,7 @@ private:
             unknown = true;
             break;
         }
+        currentTopologyHash = getTopologyHash();
         if (unknown)
             throw MakeStringException(ROXIE_UNKNOWN_QUERY, "Unknown query %s", queryName);
     }
@@ -2869,13 +3473,6 @@ private:
     void badFormat()
     {
         throw MakeStringException(ROXIE_INVALID_INPUT, "Badly formated control query");
-    }
-
-    hash64_t getTopologyHash()
-    {
-        StringBuffer xml;
-        toXML(topology, xml, 0, XML_SortTags);
-        return rtlHash64Data(xml.length(), xml.str(), 707018);
     }
 };
 
@@ -2891,8 +3488,23 @@ extern void loadPlugins()
     DBGLOG("Preloading plugins from %s", pluginDirectory.str());
     if (pluginDirectory.length())
     {
-        plugins = new SafePluginMap(&PluginCtx, traceLevel >= 1);
-        plugins->loadFromList(pluginDirectory);
+        plugins = new SafePluginMap(&PluginCtx, traceLevel);
+        if (topology->hasProp("preload"))
+        {
+            Owned<IPropertyTreeIterator> preloads = topology->getElements("preload");
+            ForEach(*preloads)
+            {
+                const char *preload = preloads->query().queryProp(".");
+                if (!streq(preload, "none"))
+                {
+                    VStringBuffer soname(SharedObjectPrefix "%s" SharedObjectExtension, preload);
+                    if (!plugins->loadNamed(pluginDirectory, soname))
+                        DBGLOG("Could not preload plugin %s at any of the following locations: %s", soname.str(), pluginDirectory.str());
+                }
+            }
+        }
+        else
+            plugins->loadFromList(pluginDirectory);
     }
 }
 
@@ -2941,27 +3553,24 @@ void mergeNodes(IPropertyTree *s1, IPropertyTree *s2)
         {
             StringBuffer xpath;
             xpath.appendf("att[@name='%s']", name);
-            const char *type = e1.queryProp("@type");
-            if (type)
+            if (startsWith(name, "SizeMax"))
             {
                 IPropertyTree *e2 = s2->queryPropTree(xpath.str());
                 if (e2)
                 {
                     unsigned __int64 v2 = e2->getPropInt64("@value", 0);
-                    if (strcmp(name, "max")==0)
-                    {
-                        if (v2 > v1)
-                            e1.setPropInt64("@value", v2);
-                    }
-                    else if (strcmp(type, "min")==0)
-                    {
-                        if (v2 < v1)
-                            e1.setPropInt64("@value", v2);
-                    }
-                    else if (strcmp(type, "sum")==0)
-                        e1.setPropInt64("@value", v1+v2);
-                    else
-                        throw MakeStringException(ROXIE_UNKNOWN_QUERY, "Unknown type %s in graph statistics", type);
+                    if (v2 > v1)
+                        e1.setPropInt64("@value", v2);
+                    s2->removeTree(e2);
+                }
+            }
+            else if (startsWith(name, "Size") || startsWith(name, "Time") || startsWith(name, "Num"))
+            {
+                IPropertyTree *e2 = s2->queryPropTree(xpath.str());
+                if (e2)
+                {
+                    unsigned __int64 v2 = e2->getPropInt64("@value", 0);
+                    e1.setPropInt64("@value", v1+v2);
                     s2->removeTree(e2);
                 }
             }
@@ -3032,7 +3641,8 @@ void mergeNode(IPropertyTree *s1, IPropertyTree *s2, unsigned level);
 MergeInfo mergeTable[] =
 {
     {"Query", "@id", mergeStats},
-    {"Graph", "@id", mergeStats},
+    {"Graphs", NULL, mergeStats},
+    {"Graph", "@name", mergeStats},
     {"xgmml", NULL, mergeStats},
     {"graph", NULL, mergeStats},
     {"node",  "@id", mergeNode},
@@ -3136,7 +3746,8 @@ void mergeQueries(IPropertyTree *dest, IPropertyTree *src)
 static const char *g1 =
         "<Stats>"
         "<Query id='stats'>"
-        "<Graph id='graph1'>"
+        "<Graphs>"
+        "<Graph name='graph1'>"
          "<xgmml>"
           "<graph>"
            "<node id='1'>"
@@ -3151,7 +3762,7 @@ static const char *g1 =
               " <att name='_kind' value='1'>"   // TAKsubgraph
               "  <graph>"
               "   <node id='7696' label='Nested'>"
-              "    <att name='seeks' value='15' type='sum'/>"
+              "    <att name='NumSeeks' value='15'/>"
               "   </node>"
               "  </graph>"
               " </att>"
@@ -3163,23 +3774,23 @@ static const char *g1 =
               "</node>"
               "<att name='rootGraph' value='1'/>"
               "<edge id='2_0' source='2' target='3'>"
-               "<att name='count' value='15' type='sum'/>"
+               "<att name='NumRows' value='15'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
               "<edge id='3_0' source='3' target='5'>"
-               "<att name='count' value='15' type='sum'/>"
+               "<att name='NumRows' value='15'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
               "<edge id='5_0' source='5' target='6'>"
-               "<att name='count' value='3' type='sum'/>"
+               "<att name='NumRows' value='3'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
               "<edge id='5_1' source='5' target='7'>"
                "<att name='_sourceIndex' value='1'/>"
-               "<att name='count' value='15' type='sum'/>"
+               "<att name='NumRows' value='15'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
@@ -3189,12 +3800,14 @@ static const char *g1 =
           "</graph>"
          "</xgmml>"
         "</Graph>"
+        "</Graphs>"
         "</Query>"
         "</Stats>";
 static const char *g2 =
         "<Stats>"
         "<Query id='stats'>"
-        "<Graph id='graph1'>"
+        "<Graphs>"
+        "<Graph name='graph1'>"
          "<xgmml>"
           "<graph>"
            "<node id='1'>"
@@ -3209,7 +3822,7 @@ static const char *g2 =
               " <att name='_kind' value='1'>"   // TAKsubgraph
               "  <graph>"
               "   <node id='7696' label='Nested'>"
-              "    <att name='seeks' value='25' type='sum'/>"
+              "    <att name='NumSeeks' value='25'/>"
               "   </node>"
               "  </graph>"
               " </att>"
@@ -3221,17 +3834,17 @@ static const char *g2 =
               "</node>"
               "<att name='rootGraph' value='1'/>"
               "<edge id='2_0' source='2' target='3'>"
-               "<att name='count' value='15' type='sum'/>"
+               "<att name='NumRows' value='15'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
               "<edge id='3_0' source='3' target='5'>"
-               "<att name='count' value='15' type='sum'/>"
+               "<att name='NumRows' value='15'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
               "<edge id='5_0' source='5' target='6'>"
-               "<att name='count' value='3' type='sum'/>"
+               "<att name='NumRows' value='3'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
@@ -3241,12 +3854,14 @@ static const char *g2 =
           "</graph>"
          "</xgmml>"
         "</Graph>"
+        "</Graphs>"
         "</Query>"
         "</Stats>";
 static const char *expected =
         "<Stats>"
         "<Query id='stats'>"
-        "<Graph id='graph1'>"
+        "<Graphs>"
+        "<Graph name='graph1'>"
          "<xgmml>"
           "<graph>"
            "<node id='1'>"
@@ -3261,7 +3876,7 @@ static const char *expected =
               " <att name='_kind' value='1'>"   // TAKsubgraph
               "  <graph>"
               "   <node id='7696' label='Nested'>"
-              "    <att name='seeks' type='sum' value='40'/>"
+              "    <att name='NumSeeks' value='40'/>"
               "   </node>"
               "  </graph>"
               " </att>"
@@ -3278,23 +3893,23 @@ static const char *expected =
               "</node>"
               "<att name='rootGraph' value='1'/>"
               "<edge id='2_0' source='2' target='3'>"
-               "<att name='count' value='30' type='sum'/>"
+               "<att name='NumRows' value='30'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
               "<edge id='3_0' source='3' target='5'>"
-               "<att name='count' value='30' type='sum'/>"
+               "<att name='NumRows' value='30'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
               "<edge id='5_0' source='5' target='6'>"
-               "<att name='count' value='6' type='sum'/>"
+               "<att name='NumRows' value='6'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
               "<edge id='5_1' source='5' target='7'>"
                "<att name='_sourceIndex' value='1'/>"
-               "<att name='count' value='15' type='sum'/>"
+               "<att name='NumRows' value='15'/>"
                "<att name='started' value='1'/>"
                "<att name='stopped' value='1'/>"
               "</edge>"
@@ -3304,6 +3919,7 @@ static const char *expected =
           "</graph>"
          "</xgmml>"
         "</Graph>"
+        "</Graphs>"
         "</Query>"
         "</Stats>"
         ;

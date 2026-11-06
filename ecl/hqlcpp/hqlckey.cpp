@@ -97,7 +97,7 @@ bool isKeyableType(ITypeInfo * type)
     case type_unicode:
     case type_varunicode:
     case type_utf8:
-        return (type->getSize() != UNKNOWN_LENGTH);
+        return !isUnknownLength((type->getSize()));
     default:
         return false;
     }
@@ -121,7 +121,7 @@ void HqlCppTranslator::buildJoinMatchFunction(BuildCtx & ctx, const char * name,
         bindTableCursor(matchFunc.ctx, right, "right", no_right, selSeq);
 
         OwnedHqlExpr cseMatch = options.spotCSE ? spotScalarCSE(match, NULL, queryOptions().spotCseInIfDatasetConditions) : LINK(match);
-        traceExpression("join match", cseMatch);
+        traceExpression("joinMatch", cseMatch);
         buildReturn(matchFunc.ctx, cseMatch);
     }
 }
@@ -162,8 +162,11 @@ public:
     bool needToExtractJoinFields() const                    { return extractJoinFieldsTransform != NULL; }
     bool hasPostFilter() const                              { return monitors->queryExtraFilter() || fileFilter; }
     bool requireActivityForKey() const                      { return hasComplexIndex; }
+    bool isKeySigned()                                      { return key->hasAttribute(_signed_Atom); }
+    bool isFileSigned()                                     { return file && file->hasAttribute(_signed_Atom); }
 
     void reportFailureReason(IHqlExpression * cond)         { monitors->reportFailureReason(cond); }
+    bool useValueSets() const { return createValueSets; }
 
 protected:
     void buildClearRecord(BuildCtx & ctx, RecordSelectIterator & rawIter, RecordSelectIterator & keyIter);
@@ -203,6 +206,7 @@ protected:
     bool            canOptimizeTransfer;
     bool            hasComplexIndex;
     bool            keyHasFileposition;
+    bool            createValueSets;
 };
 
 KeyedJoinInfo::KeyedJoinInfo(HqlCppTranslator & _translator, IHqlExpression * _expr, bool _canOptimizeTransfer) : translator(_translator)
@@ -247,6 +251,10 @@ KeyedJoinInfo::KeyedJoinInfo(HqlCppTranslator & _translator, IHqlExpression * _e
     }
 
     keyHasFileposition = getBoolAttribute(key, filepositionAtom, true);
+
+    //Allow a hint on the join to override an option on the key,
+    createValueSets = getHintBool(key, createValueSetsAtom, translator.queryOptions().createValueSets);
+    createValueSets = getHintBool(expr, createValueSetsAtom, createValueSets);
 
     if (!originalKey)
         originalKey.set(key);
@@ -297,9 +305,46 @@ IHqlExpression * KeyedJoinInfo::querySimplifiedKey(IHqlExpression * expr)
     }
 }
 
+IHqlExpression * queryBaseIndexForKeyedJoin(IHqlExpression * expr)
+{
+    node_operator op = expr->getOperator();
+    if (op == no_if)
+    {
+        IHqlExpression * left = queryBaseIndexForKeyedJoin(expr->queryChild(1));
+        IHqlExpression * right = queryBaseIndexForKeyedJoin(expr->queryChild(2));
+        if (left && right)
+        {
+            //IF (cond, index) and IF(cond, null, index) should be allowed, and will return the index
+            if (left->getOperator() != no_null)
+                return left;
+            return right;
+        }
+        return nullptr;
+    }
+    else if (op == no_chooseds)
+    {
+        IHqlExpression * result = nullptr;
+        ForEachChildFrom(i, expr, 1)
+        {
+            IHqlExpression * match = queryBaseIndexForKeyedJoin(expr->queryChild(i));
+            if (!match)
+                return nullptr;
+            if (!result || result->getOperator() == no_null)
+                result = match;
+        }
+        return result;
+    }
+    else if (op == no_null)
+        return expr;
+    else if (op == no_split)
+        return queryBaseIndexForKeyedJoin(expr->queryChild(0));
+
+    return queryPhysicalRootTable(expr);
+}
+
 IHqlExpression * KeyedJoinInfo::createKeyFromComplexKey(IHqlExpression * expr)
 {
-    IHqlExpression * base = queryPhysicalRootTable(expr);
+    IHqlExpression * base = queryBaseIndexForKeyedJoin(expr);
     if (!base)
     {
         translator.throwError1(HQLERR_KeyedJoinNoRightIndex_X, getOpString(expr->getOperator()));
@@ -641,7 +686,7 @@ void KeyedJoinInfo::buildTransformBody(BuildCtx & ctx, IHqlExpression * transfor
         {
             OwnedHqlExpr rawTransform = expandDatasetReferences(transform, expandedFile);
             OwnedHqlExpr right = createSelector(no_right, rawFile, joinSeq);
-            ::gatherFieldUsage(fileUsage, rawTransform, right);
+            ::gatherFieldUsage(fileUsage, rawTransform, right, false);
         }
     }
     else
@@ -651,7 +696,7 @@ void KeyedJoinInfo::buildTransformBody(BuildCtx & ctx, IHqlExpression * transfor
         {
             OwnedHqlExpr rawTransform = expandDatasetReferences(transform, expandedKey);
             OwnedHqlExpr right = createSelector(no_right, rawKey, joinSeq);
-            ::gatherFieldUsage(keyUsage, rawTransform, right);
+            ::gatherFieldUsage(keyUsage, rawTransform, right, false);
         }
     }
 }
@@ -1074,9 +1119,14 @@ bool KeyedJoinInfo::processFilter()
 
     //Now extract the filters from it.
     OwnedHqlExpr extra;
-    monitors = new CppFilterExtractor(rawKey, translator, -(int)numPayloadFields(rawKey), false, false);
+    monitors = new CppFilterExtractor(rawKey, translator, -(int)numPayloadFields(rawKey), false, createValueSets);
     if (newFilter)
+    {
         monitors->extractFilters(newFilter, extra);
+        SourceFieldUsage * fieldUsage = translator.querySourceFieldUsage(rawKey);
+        if (fieldUsage)
+            monitors->noteKeyedFieldUsage(fieldUsage);
+    }
 
     if (atmostAttr && extra && (atmost.required || !monitors->isCleanlyKeyedExplicitly()))
     {
@@ -1107,7 +1157,7 @@ bool KeyedJoinInfo::processFilter()
     SourceFieldUsage * keyUsage = translator.querySourceFieldUsage(rawKey);
     if (keyUsage)
     {
-        gatherFieldUsage(keyUsage, newFilter, rawKey->queryNormalizedSelector());
+        gatherFieldUsage(keyUsage, newFilter, rawKey->queryNormalizedSelector(), false);
         if (isFullJoin())
             keyUsage->noteFilepos();
     }
@@ -1119,7 +1169,7 @@ bool KeyedJoinInfo::processFilter()
         {
             OwnedHqlExpr rawFilter = expandDatasetReferences(fileFilter, expandedFile);
             OwnedHqlExpr fileRight = createSelector(no_right, rawFile, joinSeq);
-            gatherFieldUsage(fileUsage, rawFilter, fileRight);
+            gatherFieldUsage(fileUsage, rawFilter, fileRight, false);
         }
     }
 
@@ -1186,7 +1236,7 @@ void HqlCppTranslator::buildKeyedJoinExtra(ActivityInstance & instance, IHqlExpr
 
     //virtual const char * getFileName() = 0;                   // Returns filename of raw file fpos'es refer into
     if (info->isFullJoin())
-        buildFilenameFunction(instance, instance.createctx, WaFilename, "getFileName", info->queryFileFilename(), hasDynamicFilename(info->queryFile()));
+        buildFilenameFunction(instance, instance.createctx, WaFilename, "getFileName", info->queryFileFilename(), hasDynamicFilename(info->queryFile()), SummaryType::ReadFile, info->isKeyOpt(), info->isFileSigned());
 
     //virtual bool diskAccessRequired() = 0;
     if (info->isFullJoin())
@@ -1223,10 +1273,10 @@ void HqlCppTranslator::buildKeyJoinIndexReadHelper(ActivityInstance & instance, 
     info->buildExtractIndexReadFields(instance.startctx);
 
     //virtual const char * getIndexFileName() = 0;
-    buildFilenameFunction(instance, instance.startctx, WaIndexname, "getIndexFileName", info->queryKeyFilename(), hasDynamicFilename(info->queryKey()));
+    buildFilenameFunction(instance, instance.startctx, WaIndexname, "getIndexFileName", info->queryKeyFilename(), hasDynamicFilename(info->queryKey()), SummaryType::ReadIndex, info->isKeyOpt(), info->isKeySigned());
 
     //virtual IOutputMetaData * queryIndexRecordSize() = 0;
-    LinkedHqlExpr indexExpr = info->queryOriginalKey();
+    LinkedHqlExpr indexExpr = info->queryKey();
     OwnedHqlExpr serializedRecord;
     unsigned numPayload = numPayloadFields(indexExpr);
     if (numPayload)
@@ -1353,7 +1403,7 @@ ABoundActivity * HqlCppTranslator::doBuildActivityKeyedJoinOrDenormalize(BuildCt
         flags.append("|JFdynamicindexfilename");
     if (boundIndexActivity)
         flags.append("|JFindexfromactivity");
-    if (options.createValueSets)
+    if (info.useValueSets())
         flags.append("|JFnewfilters");
     if (flags.length())
         doBuildUnsignedFunction(instance->classctx, "getJoinFlags", flags.str()+1);
@@ -1476,14 +1526,14 @@ ABoundActivity * HqlCppTranslator::doBuildActivityKeyedDistribute(BuildCtx & ctx
         flags.append("|KDFvarindexfilename");
     if (dynamic)
         flags.append("|KDFdynamicindexfilename");
-    if (options.createValueSets)
+    if (info.useValueSets())
         flags.append("|KDFnewfilters");
 
     if (flags.length())
         doBuildUnsignedFunction(instance->classctx, "getFlags", flags.str()+1);
 
     //virtual const char * getIndexFileName() = 0;
-    buildFilenameFunction(*instance, instance->startctx, WaIndexname, "getIndexFileName", keyFilename, dynamic);
+    buildFilenameFunction(*instance, instance->startctx, WaIndexname, "getIndexFileName", keyFilename, dynamic, SummaryType::ReadIndex, info.isKeyOpt(), info.isKeySigned());
 
     //virtual IOutputMetaData * queryIndexRecordSize() = 0;
     LinkedHqlExpr indexExpr = info.queryRawKey();
@@ -1577,7 +1627,7 @@ ABoundActivity * HqlCppTranslator::doBuildActivityKeyDiff(BuildCtx & ctx, IHqlEx
     noteAllFieldsUsed(updated);
 
     //virtual const char * getOutputName() = 0;
-    buildFilenameFunction(*instance, instance->startctx, WaOutputFilename, "getOutputName", output, hasDynamicFilename(expr));
+    buildFilenameFunction(*instance, instance->startctx, WaOutputFilename, "getOutputName", output, hasDynamicFilename(expr), SummaryType::WriteFile, false, expr->hasAttribute(_signed_Atom));
 
     //virtual int getSequence() = 0;
     doBuildSequenceFunc(instance->classctx, querySequence(expr), false);
@@ -1620,10 +1670,10 @@ ABoundActivity * HqlCppTranslator::doBuildActivityKeyPatch(BuildCtx & ctx, IHqlE
     noteAllFieldsUsed(original);
 
     //virtual const char * getPatchName() = 0;
-    buildFilenameFunction(*instance, instance->startctx, WaPatchFilename, "getPatchName", patch, true);
+    buildFilenameFunction(*instance, instance->startctx, WaPatchFilename, "getPatchName", patch, true, SummaryType::ReadFile, false, false);
 
     //virtual const char * getOutputName() = 0;
-    buildFilenameFunction(*instance, instance->startctx, WaOutputFilename, "getOutputName", output, hasDynamicFilename(expr));
+    buildFilenameFunction(*instance, instance->startctx, WaOutputFilename, "getOutputName", output, hasDynamicFilename(expr), SummaryType::WriteIndex, false, false);
 
     //virtual int getSequence() = 0;
     doBuildSequenceFunc(instance->classctx, querySequence(expr), false);

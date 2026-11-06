@@ -1,18 +1,10 @@
-import * as declare from "dojo/_base/declare";
-import * as on from "dojo/on";
-
-// @ts-ignore
-import * as _StoreMixin from "dgrid/_StoreMixin";
-// @ts-ignore
-import * as DGridPagination from "dgrid/extensions/Pagination";
-// @ts-ignore
-import * as DGrid from "dgrid/Grid";
+import { declare, on, StoreMixin, Pagination as DGridPagination } from "src-dojo/index";
 
 export const Pagination = declare([DGridPagination], {
     refresh() {
         const context = this;
 
-        _StoreMixin.prototype.refresh.apply(this, arguments);
+        StoreMixin.prototype.refresh.apply(this, arguments);
 
         if (!this.store) {
             console.warn("Pagination requires a store to operate.");

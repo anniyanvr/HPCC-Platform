@@ -2,10 +2,10 @@
 <!DOCTYPE book PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
 "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <book lang="en_US" xml:base="../">
-  <title>HPCC Data Tutorial</title>
+  <title>HPCC Systems<superscript>®</superscript> Tutorial de dados</title>
 
   <bookinfo>
-    <title>HPCC Data Tutorial</title>
+    <title>HPCC Systems<superscript>®</superscript> Tutorial de dados</title>
 
     <mediaobject>
       <imageobject>
@@ -19,8 +19,7 @@
 
     <legalnotice>
       <para>Sua opinião e comentários sobre este documento são muito
-      bem-vindos e podem ser enviados por e-mail para
-      <email>docfeedback@hpccsystems.com</email></para>
+      bem-vindos e podem ser enviados por e-mail para <email>docfeedback@hpccsystems.com</email></para>
 
       <para>Inclua a frase <emphasis role="bold">Feedback sobre
       documentação</emphasis> na linha de assunto e indique o nome do
@@ -105,8 +104,8 @@
 
       <itemizedlist>
         <listitem>
-          <para>Você tem um HPCC em execução. Ele pode ser a VM Edition ou uma
-          plataforma HPCC com um ou mais nós</para>
+          <para>Você tem um HPCC em execução. Isso pode ser uma implantação de
+          plataforma HPCC Systems de um ou vários nós.</para>
         </listitem>
       </itemizedlist>
 
@@ -123,7 +122,7 @@
           <para>Baixar um arquivo de dados bruto</para>
 
           <para>Há links para arquivos de dados disponíveis na página <ulink
-          url="http://hpccsystems.com/community/docs/data-tutorial-guide">http://hpccsystems.com/community/docs/data-tutorial-guide</ulink></para>
+          url="https://hpccsystems.com/training/documentation/learning-ecl">https://hpccsystems.com/training/documentation/learning-ecl</ulink></para>
 
           <para>O download tem cerca de 30 MB (compactado) e está disponível
           nos formatos ZIP ou .tar.gz. Selecione o link correto.</para>
@@ -289,7 +288,7 @@
 
             <para>O arquivo de dados está disponível nos links na página
             <ulink
-            url="http://hpccsystems.com/community/docs/data-tutorial-guide">http://hpccsystems.com/community/docs/data-tutorial-guide</ulink>.
+            url="https://hpccsystems.com/training/documentation/tutorials">https://hpccsystems.com/training/documentation/tutorials</ulink>.
             O download tem cerca de 30 MB (compactado) e está disponível nos
             formatos ZIP ou .tar.gz.(<emphasis
             role="bold">OriginalPerson.tar.gz </emphasis> ou <emphasis
@@ -490,12 +489,16 @@
 
           <listitem>
             <para>Selecione o cluster mythor na lista suspensa <emphasis
-            role="bold">Group</emphasis> .</para>
+            role="bold">Group</emphasis>.</para>
           </listitem>
 
           <listitem>
-            <para>Preencher o <emphasis role="bold">Tamanho do
-            registro</emphasis> (124).</para>
+            <para>Se houver várias filas, selecione uma na lista.</para>
+          </listitem>
+
+          <listitem>
+            <para>Preencha o <emphasis role="bold">Record Length</emphasis>
+            (124).</para>
           </listitem>
 
           <listitem>
@@ -663,7 +666,7 @@
       STRING42 Street;
       STRING20 City;
       STRING2  State;
-END;  </programlisting> <figure>
+END;    </programlisting> <figure>
               <title>Programar na janela do Compilador</title>
 
               <mediaobject>
@@ -761,7 +764,7 @@ DATASET('~tutorial::YN::OriginalPerson',TutorialYourName.Layout_People,THOR);
             código a seguir (lembre-se de substituir <emphasis>YourName
             </emphasis> pelo seu nome)</para>
 
-            <programlisting>IMPORT TutorialYourName; 
+            <programlisting>IMPORT TutorialYourName;
 COUNT(TutorialYourName.File_OriginalPerson);
 </programlisting>
           </listitem>
@@ -965,17 +968,13 @@ OUTPUT(UpperedDataset,,'~tutorial::YN::TutorialPerson',OVERWRITE);
 EXPORT File_TutorialPerson :=
 DATASET('~tutorial::YN::TutorialPerson',
        {TutorialYourName.Layout_People,
-        UNSIGNED8 fpos {virtual(fileposition)}},THOR);</programlisting></para>
+        UNSIGNED8 fpos {virtual(fileposition)}},THOR);
+</programlisting></para>
           </listitem>
 
           <listitem>
-            <para>Verifique a sintaxe e, se não houver erros, pressione o
-            botão <emphasis role="bold">Submit</emphasis> .</para>
-          </listitem>
-
-          <listitem>
-            <para>Depois de concluir, ela aparece com uma marca de verificação
-            verde <inlinegraphic fileref="images/DT173-15.jpg"/>.</para>
+            <para>Verifique a sintaxe e, se não houver erros, você pode
+            continuar.</para>
           </listitem>
         </orderedlist>
       </sect2>

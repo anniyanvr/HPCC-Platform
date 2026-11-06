@@ -52,7 +52,8 @@
             <entry><emphasis>name</emphasis></entry>
 
             <entry>Uma constante de string que contém o rótulo do
-            resultado.</entry>
+            resultado. Deve ser um rótulo válido (consulte <link linkend="Attribute_Name_Rules">Definition
+            Name Rules</link>)</entry>
           </row>
 
           <row>
@@ -131,8 +132,8 @@
   <para>Quando há um número excessivamente amplo de valores distintos, a ação
   retorna uma estimativa na seguinte forma:</para>
 
-  <para><programlisting>&lt;XML&gt;
- &lt;Field name="seqnum" estimate="4000000"/&gt; 
+  <para><programlisting lang="XML">&lt;XML&gt;
+  &lt;Field name="seqnum" estimate="4000000"/&gt;
 &lt;/XML&gt;</programlisting></para>
 
   <para>O tipo de dado DECIMAL não é suportado por esta ação.
@@ -140,7 +141,7 @@
 
   <para>Exemplo:</para>
 
-  <programlisting>SomeFile := DATASET([{'C','G'},{'C','C'},{'A','X'},{'B','G'}],
+  <programlisting lang="ECL_Runnable">SomeFile := DATASET([{'C','G'},{'C','C'},{'A','X'},{'B','G'}],
      {STRING1 Value1,STRING1 Value2});
 DISTRIBUTION(SomeFile);
 /* The result comes back looking like this:
@@ -171,7 +172,7 @@ namesTable := DATASET([
   {'Salter','Abi',10},
   {'X','Z',5}], namesRecord);
 
-DISTRIBUTION(namesTable, surname, forename, NAMED('Stats'));
+doFirst := DISTRIBUTION(namesTable, surname, forename, NAMED('Stats'));
 /* The result comes back looking like this:
 &lt;XML&gt;
 &lt;Field name="surname" distinct="3"&gt;
@@ -196,7 +197,7 @@ res := RECORD
   STRING Cnt := XMLTEXT('@distinct');
 END;
 
-out := PARSE(x, line, res, XML('XML/Field'));
-out;
+DoNext := PARSE(x, line, res, XML('XML/Field'));
+SEQUENTIAL(DoFirst,OUTPUT(DoNext));
 </programlisting>
 </sect1>

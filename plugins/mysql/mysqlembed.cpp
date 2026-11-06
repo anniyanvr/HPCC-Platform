@@ -16,8 +16,8 @@
 ############################################################################## */
 
 #include "platform.h"
-#include "mysql.h"
-#include "mysqld_error.h"
+#include <mysql/mysql.h>
+#include <mysql/mysqld_error.h>
 #include "jexcept.hpp"
 #include "jthread.hpp"
 #include "hqlplugins.hpp"
@@ -206,6 +206,10 @@ class MySQLConnectionCloserThread : public Thread
 {
     virtual int run() override;
 public:
+    MySQLConnectionCloserThread() : Thread("MySQLConnectionCloserThread")
+    {
+    }
+
     static Semaphore closing;
 } *connectionCloserThread = nullptr;
 
@@ -245,7 +249,7 @@ public:
                     if (!connectionCloserThread)
                     {
                         connectionCloserThread = new MySQLConnectionCloserThread;
-                        connectionCloserThread->start();
+                        connectionCloserThread->start(false);
                     }
                 }
             }
@@ -465,9 +469,9 @@ private:
 };
 
 CIArrayOf<MySQLConnection> MySQLConnection::globalCachedConnections;
-CriticalSection MySQLConnection::globalCacheCrit;
+CriticalSection MySQLConnection::globalCacheCrit(SYNC_LOCATION);
 
-Semaphore MySQLConnectionCloserThread::closing;
+Semaphore MySQLConnectionCloserThread::closing(SYNC_LOCATION);
 
 int MySQLConnectionCloserThread::run()
 {
@@ -534,6 +538,10 @@ public:
     {
         return stmt;
     }
+    uint64_t getAffectedRows()
+    {
+        return (stmt) ? mysql_stmt_affected_rows(stmt) : 0;
+    }
 private:
     MySQLStatement(const MySQLStatement &);
     MYSQL_STMT *stmt;
@@ -596,6 +604,7 @@ public:
             default:
                 bindinfo[i].buffer_type = col->type;
                 bindinfo[i].buffer_length = col->length;
+                bindinfo[i].is_unsigned = col->flags&UNSIGNED_FLAG;
                 break;
             }
             bindinfo[i].buffer = rtlMalloc(bindinfo[i].buffer_length);
@@ -730,6 +739,14 @@ public:
     {
         return *res != NULL;
     }
+    inline const MySQLResult *queryResultInfo() const
+    {
+        return res;
+    }
+    uint64_t getAffectedRows()
+    {
+        return (stmt) ? stmt->getAffectedRows() : 0;
+    }
 protected:
     Linked<MySQLConnection> conn;
     Linked<MySQLStatement> stmt;
@@ -791,6 +808,9 @@ static bool isString(enum_field_types type)
     case MYSQL_TYPE_BLOB:
     case MYSQL_TYPE_STRING:
     case MYSQL_TYPE_VAR_STRING:
+#if MYSQL_VERSION_ID >= 50709
+    case MYSQL_TYPE_JSON:
+#endif
         return true;
     default:
         return false;
@@ -1140,6 +1160,107 @@ protected:
     int colIdx;
 };
 
+class MySQLXmlRowBuilder : public CInterface
+{
+public:
+    MySQLXmlRowBuilder(const MySQLResult *_result, const MySQLBindingArray &_boundInfo)
+    : boundInfo(_boundInfo), result(_result), colIdx(-1)
+    {
+    }
+    virtual void writeXmlColumn(IXmlWriter *writer, const MYSQL_FIELD &col, const MYSQL_BIND &bound)
+    {
+        if (*bound.is_null)
+            return;
+        switch (bound.buffer_type)
+        {
+            case MYSQL_TYPE_TINY:
+            case MYSQL_TYPE_SHORT:
+            case MYSQL_TYPE_LONG:
+            case MYSQL_TYPE_LONGLONG:
+            case MYSQL_TYPE_INT24:
+            {
+                if (bound.is_unsigned)
+                    writer->outputUInt(rtlReadUInt(bound.buffer, *bound.length), *bound.length, col.name);
+                else
+                    writer->outputInt(rtlReadInt(bound.buffer, *bound.length), *bound.length, col.name);
+                break;
+            }
+            case MYSQL_TYPE_BIT:
+                writer->outputUInt(rtlReadSwapUInt(bound.buffer, *bound.length), *bound.length, col.name);
+                break;
+            case MYSQL_TYPE_FLOAT:
+                writer->outputReal(* (float *) bound.buffer, col.name);
+                break;
+            case MYSQL_TYPE_DOUBLE:
+                writer->outputReal(* (double *) bound.buffer, col.name);
+                break;
+            case MYSQL_TYPE_VARCHAR:
+            case MYSQL_TYPE_ENUM:
+            case MYSQL_TYPE_SET:
+            case MYSQL_TYPE_TINY_BLOB:
+            case MYSQL_TYPE_MEDIUM_BLOB:
+            case MYSQL_TYPE_LONG_BLOB:
+            case MYSQL_TYPE_BLOB:
+            case MYSQL_TYPE_VAR_STRING:
+            case MYSQL_TYPE_STRING:
+            case MYSQL_TYPE_GEOMETRY:
+            {
+                const char *text = (const char *) bound.buffer;
+                //For XML treat all strings as UTF-8, caller does have to get the characterset of the datase right if it's not utf8
+                //  (for example by setting MYSQL_SET_CHARSET_NAME="latin1"), may need improving as we get experience writing ESDL scripts that use it,
+                //  but I did test with both utf8 and latin1 databases
+                writer->outputUtf8(rtlUtf8Length(*bound.length, text), text, col.name);
+                break;
+            }
+            case MYSQL_TYPE_TIMESTAMP:
+            case MYSQL_TYPE_DATETIME:
+            case MYSQL_TYPE_DATE:
+            case MYSQL_TYPE_TIME:
+            {
+                const MYSQL_TIME * time = (const MYSQL_TIME *) bound.buffer;
+                char temp[20];
+                switch (bound.buffer_type)
+                {
+                    case MYSQL_TYPE_TIMESTAMP:
+                    case MYSQL_TYPE_DATETIME:
+                        _snprintf(temp, sizeof(temp), "%4u-%02u-%02u %02u:%02u:%02u", time->year, time->month, time->day, time->hour, time->minute, time->second);
+                        break;
+                    case MYSQL_TYPE_DATE:
+                        _snprintf(temp, sizeof(temp), "%4u-%02u-%02u", time->year, time->month, time->day);
+                        break;
+                    case MYSQL_TYPE_TIME:
+                        _snprintf(temp, sizeof(temp), "%02u:%02u:%02u", time->hour, time->minute, time->second);
+                        break;
+                }
+                writer->outputCString((const char *)temp, col.name);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+   virtual void writeXmlRow(IXmlWriter *writer)
+    {
+        if (!result)
+            return;
+        writer->outputBeginNested("Row", true);
+        for (int colIdx=0; colIdx < boundInfo.numColumns(); colIdx++)
+        {
+            const MYSQL_FIELD *col = mysql_fetch_field_direct(*result, colIdx);
+            if (!col)
+                continue;
+            const MYSQL_BIND &bound = boundInfo.queryColumn(colIdx, nullptr);
+            writeXmlColumn(writer, *col, bound);
+        }
+        writer->outputEndNested("Row");
+    }
+protected:
+    const MySQLBindingArray &boundInfo;
+    const MySQLResult *result;
+    int colIdx;
+};
+
 // Bind MySQL variables from an ECL record
 
 class MySQLRecordBinder : public CInterfaceOf<IFieldProcessor>
@@ -1303,7 +1424,7 @@ class MySQLDatasetBinder : public MySQLRecordBinder
 {
 public:
     MySQLDatasetBinder(IRowStream * _input, const RtlTypeInfo *_typeInfo, const MySQLBindingArray &_bindings, int _firstParam)
-      : input(_input), MySQLRecordBinder(_typeInfo, _bindings, _firstParam)
+      : MySQLRecordBinder(_typeInfo, _bindings, _firstParam), input(_input)
     {
     }
     bool bindNext()
@@ -1394,11 +1515,76 @@ protected:
     bool eof;
 };
 
+class MySQLXmlWriter : public CInterface
+{
+public:
+    MySQLXmlWriter(MySQLDatasetBinder *_inputStream, MySQLPreparedStatement *_stmtInfo, IXmlWriter *_writer)
+    : inputStream(_inputStream), stmtInfo(_stmtInfo), writer(_writer)
+    {
+        executePending = true;
+        eof = false;
+    }
+    bool nextRow()
+    {
+        // leave the streaming input support as is for possible future use, but not being used now
+        if (eof)
+            return false;
+        for (;;)
+        {
+            if (executePending)
+            {
+                executePending = false;
+                if (inputStream && !inputStream->bindNext())
+                {
+                    noteEOF();
+                    return false;
+                }
+                stmtInfo->execute();
+            }
+            if (!stmtInfo->hasResult())
+            {
+                writer->outputUInt(stmtInfo->getAffectedRows(), 64, "@affectedRows");
+                noteEOF();
+                return false;
+            }
+            if (stmtInfo->next())
+                break;
+            if (inputStream)
+                executePending = true;
+            else
+            {
+                noteEOF();
+                return false;
+            }
+        }
+
+        MySQLXmlRowBuilder mysqlXmlRowBuilder(stmtInfo->queryResultInfo(), stmtInfo->queryResultBindings());
+        mysqlXmlRowBuilder.writeXmlRow(writer);
+        return true;
+    }
+    void write()
+    {
+        while (nextRow());
+    }
+
+protected:
+    void noteEOF()
+    {
+        if (!eof)
+            eof = true;
+    }
+    Linked<MySQLDatasetBinder> inputStream;
+    Linked<MySQLPreparedStatement> stmtInfo;
+    Linked<IXmlWriter> writer;
+    bool executePending;
+    bool eof;
+};
+
 // Each call to a MySQL function will use a new MySQLEmbedFunctionContext object
 
 static bool mysqlInitialized = false;
 static __thread bool mysqlThreadInitialized = false;
-static CriticalSection initCrit;
+static CriticalSection initCrit{SYNC_LOCATION};
 
 static bool terminateMySqlThread(bool isPooled)
 {
@@ -1430,7 +1616,7 @@ class MySQLEmbedFunctionContext : public CInterfaceOf<IEmbedFunctionContext>
 {
 public:
     MySQLEmbedFunctionContext(const IThorActivityContext *_ctx, unsigned _flags, const char *options)
-      : flags(_flags), nextParam(0), activityCtx(_ctx)
+      : activityCtx(_ctx), flags(_flags), nextParam(0)
     {
         initializeMySqlThread();
         conn.setown(MySQLConnection::findCachedConnection(options, false));
@@ -1627,8 +1813,15 @@ public:
     virtual void paramWriterCommit(IInterface *writer)
     {
     }
-    virtual void writeResult(IInterface *esdl, const char *esdlservice, const char *esdltype, IInterface *writer)
+    virtual void writeResult(IInterface *esdl, const char *esdlservice, const char *esdltype, IInterface *iifWriter)
     {
+        if (esdl)
+            UNSUPPORTED("ESDL defined result formatting");
+
+        IXmlWriter *writer = dynamic_cast<IXmlWriter*>(iifWriter);
+        MySQLXmlWriter xmlWriter(inputStream, stmtInfo, writer);
+        xmlWriter.write();
+        nextParam = 0; //if you start binding parameters again after writing the result you are working on the next call
     }
 
     virtual void importFunction(size32_t lenChars, const char *text)
@@ -1759,6 +1952,13 @@ extern DECL_EXPORT IEmbedContext* getEmbedContext()
 extern DECL_EXPORT bool syntaxCheck(const char *script)
 {
     return true; // MORE
+}
+
+// Used for dynamically loading in ESDL
+
+extern "C" DECL_EXPORT IEmbedContext *getEmbedContextDynamic()
+{
+    return mysqlembed::getEmbedContext();
 }
 
 } // namespace

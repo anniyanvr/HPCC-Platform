@@ -18,6 +18,8 @@
 #pragma warning(disable:4786)
 #include "platform.h"
 #include "aci.ipp"
+#include "ldapsanitization.hpp"
+#include "ldapquerybuilders.hpp"
 #include "ldapsecurity.ipp"
 
 /****************************************************************
@@ -63,18 +65,6 @@ http://www.openldap.org/faq/data/cache/634.html
 3 - The ietf draft that none of them conform to (openldap is close) -
 http://www.ietf.org/proceedings/02mar/I-D/draft-ietf-ldapext-acl-model-08.txt
 *****************************************************************/
-
-interface IAci : implements IInterface
-{
-    virtual StringBuffer& target() = 0;
-    virtual StringArray& userdns() = 0;
-    virtual StringArray& groupdns() = 0;
-    virtual bool isDeny() = 0;
-    virtual int permission() = 0;
-
-    virtual StringBuffer& serialize(StringBuffer& acibuf) = 0;
-    virtual void debugPrintout() = 0;
-};
 
 /****************************************************************
  *    Class CAci
@@ -380,6 +370,18 @@ public:
     }
 };
 
+#ifdef _USE_CPPUNIT
+IAci* createAciForTest(const char* acistr)
+{
+    return new CAci(acistr);
+}
+
+IAci* createAciForTest(bool isDeny, int perm, ACT_TYPE actType, const char* dn)
+{
+    return new CAci(isDeny, perm, actType, dn);
+}
+#endif
+
 /****************************************************************
  *    Class COpenLdapAci
  ****************************************************************/
@@ -642,6 +644,9 @@ public:
             while(acistr[ci] == '\0' && ci < len)
                 ci++;
         }
+#ifdef _DEBUG
+        debugPrintout();
+#endif
     }
 
     bool getPermissions(ISecUser& user, ISecResource& resource, ILdapClient* ldapclient, const char* dn)
@@ -649,17 +654,21 @@ public:
         const char* res_name = resource.getName();
         ILdapConfig* ldapconfig = ldapclient->getLdapConfig();
 
-        if(stricmp(ldapconfig->getSysUser(), user.getName()) == 0)
+        if(ldapclient->isSuperUser(&user))
         {
             resource.setAccessFlags(SecAccess_Full);
             return true;
         }
-
+#ifdef _DEBUG
+        DBGLOG("LDAP::aci:getPermissions USER %s, dn %s", user.getName(), dn);
+        StringBuffer dbgMsg;
+#endif
         int perm = 0;
         SecAccessFlags perms = SecAccess_None;
         if(m_acilist.length() == 0)
         {
-            perm = SecAccess_Unavailable;
+            resource.setAccessFlags(SecAccess_Unavailable);
+            return true;
         }
         else
         {
@@ -676,12 +685,15 @@ public:
 
                 //check if this aci is applicable to this user
                 StringBuffer userdn;
-                userdn.append("uid=").append(user.getName()).append(",").append(ldapconfig->getUserBasedn());
+                appendUserUidDn(user.getName(), ldapconfig->getUserBasedn(), userdn);
                 ForEachItemIn(z, aci.userdns())
                 {
                     const char* onedn = aci.userdns().item(z);
                     if(onedn != NULL && (stricmp(onedn, "anyone") == 0 || stricmp(onedn, userdn.str()) == 0))
                     {
+#ifdef _DEBUG
+                        dbgMsg.appendf("Applying USER '%s', '%s' perm %d", onedn, aci.isDeny() ? "Deny" : "Allow", aci.permission());
+#endif
                         applicable = true;
                         break;
                     }
@@ -697,6 +709,9 @@ public:
                             continue;
                         if(ldapclient->userInGroup(userdn.str(), onegdn))
                         {
+#ifdef _DEBUG
+                            dbgMsg.appendf("Applying GROUP '%s', '%s' perm %d", onegdn, aci.isDeny() ? "Deny" : "Allow", aci.permission());
+#endif
                             applicable =true;
                             break;
                         }
@@ -705,6 +720,10 @@ public:
 
                 if(applicable)
                 {
+#ifdef _DEBUG
+                    DBGLOG("LDAP::aci:getPermissions %s", dbgMsg.str());
+                    dbgMsg.clear();
+#endif
                     if(aci.isDeny())
                         deny |= aci.permission();
                     else
@@ -862,9 +881,10 @@ public:
     {
         ForEachItemIn(x, m_acilist)
         {
-            printf("---------\n");
+            printf("LDAP::CAciList:dump ACI ---------\n");
             IAci& aci = m_acilist.item(x);
             aci.debugPrintout();
+            printf("---------\n");
         }
     }
 
@@ -917,7 +937,7 @@ bool AciProcessor::getPermissions(ISecUser& user, IArrayOf<CSecurityDescriptor>&
 
 CSecurityDescriptor* AciProcessor::createDefaultSD(ISecUser * const user, ISecResource* resource, SecPermissionType ptype)
 {
-    return createDefaultSD(user, resource->getName(), ptype);   
+    return createDefaultSD(user, resource->getName(), ptype);
 }
 
 StringBuffer& AciProcessor::sec2aci(SecAccessFlags secperm, StringBuffer& aciperm)
@@ -926,6 +946,11 @@ StringBuffer& AciProcessor::sec2aci(SecAccessFlags secperm, StringBuffer& aciper
 }
 
 CSecurityDescriptor* AciProcessor::createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype)
+{
+    return createDefaultSD(user, name, ptype, nullptr);
+}
+
+CSecurityDescriptor* AciProcessor::createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype, LDAP* ld)
 {
     throw MakeStringException(-1, "You should call the implementation of the child class");
 }
@@ -940,10 +965,7 @@ bool AciProcessor::retrieveUserInfo(ISecUser& user)
     CLdapSecUser* ldapuser = (CLdapSecUser*)&user;
     const char* username = user.getName();
     if(username == NULL || strlen(username) == 0)
-    {
-        DBGLOG("AciProcessor::retrieveUserInfo : username is empty");
         return false;
-    }
 
     const char* fullname = user.getFullName();
     if((fullname == NULL || *fullname == '\0') && m_ldap_client != NULL)
@@ -974,6 +996,11 @@ void AciProcessor::cacheSid(const char* name, int len, const void* sidbuf)
 }
 
 void AciProcessor::lookupSid(const char* act_name, MemoryBuffer& act_sid, ACT_TYPE acttype)
+{
+    lookupSid(act_name, act_sid, acttype, nullptr);
+}
+
+void AciProcessor::lookupSid(const char* act_name, MemoryBuffer& act_sid, ACT_TYPE acttype, LDAP* ld)
 {
     throw MakeStringException(-1, "You shouldn't need function lookupSid");
 /*preserve dead code for reference
@@ -1076,6 +1103,12 @@ StringBuffer& CIPlanetAciProcessor::sec2aci(SecAccessFlags secperm, StringBuffer
     return aciperm;
 }
 
+CSecurityDescriptor* CIPlanetAciProcessor::createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype, LDAP* ld)
+{
+    // 'ld' is unused: ACI generation here is pure string construction with no LDAP calls.
+    return createDefaultSD(user, name, ptype);
+}
+
 CSecurityDescriptor* CIPlanetAciProcessor::createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype)
 {
     CSecurityDescriptor* csd = new CSecurityDescriptor(name);
@@ -1127,9 +1160,7 @@ CSecurityDescriptor* CIPlanetAciProcessor::createDefaultSD(ISecUser * const user
         sec2aci(DEFAULT_OWNER_PERMISSION, defaultperm);
         StringBuffer default_sd;
         default_sd.append("(targetattr = \"*\") (version 3.0;acl \"default_aci\";allow (").append(defaultperm.str()).append(")");
-        default_sd.append("(userdn = \"ldap:///");
-        default_sd.append("uid=").append(user->getName());
-        default_sd.append(",").append(userbasedn).append("\");)");
+        appendAciUserdnClause(user->getName(), userbasedn, default_sd);
         csd->appendDescriptor(default_sd.length(), (void*)default_sd.str());
     }
     return csd;
@@ -1166,6 +1197,12 @@ StringBuffer& COpenLdapAciProcessor::sec2aci(SecAccessFlags secperm, StringBuffe
     }
     
     return aciperm;
+}
+
+CSecurityDescriptor* COpenLdapAciProcessor::createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype, LDAP* ld)
+{
+    // 'ld' is unused: ACI generation here is pure string construction with no LDAP calls.
+    return createDefaultSD(user, name, ptype);
 }
 
 CSecurityDescriptor* COpenLdapAciProcessor::createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype)
@@ -1217,8 +1254,10 @@ CSecurityDescriptor* COpenLdapAciProcessor::createDefaultSD(ISecUser * const use
     {
         StringBuffer defaultperm;
         sec2aci(DEFAULT_OWNER_PERMISSION, defaultperm);
+        StringBuffer escapedName;
+        escapeLdapDistinguishedName(user->getName(), escapedName);
         StringBuffer default_sd;
-        default_sd.appendf("default_aci#entry#grant;%s;[all]#access-id#uid=%s,%s", defaultperm.str(), user->getName(), userbasedn);
+        default_sd.appendf("default_aci#entry#grant;%s;[all]#access-id#uid=%s,%s", defaultperm.str(), escapedName.str(), userbasedn);
         csd->appendDescriptor(default_sd.length(), (void*)default_sd.str());
     }
     return csd;

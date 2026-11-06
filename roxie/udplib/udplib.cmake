@@ -25,25 +25,27 @@
 
 project( udplib ) 
 
-set (    SRCS 
-         udpmsgpk.cpp 
-         udpaeron.cpp 
-         udpsha.cpp 
-         udptrr.cpp 
-         udptrs.cpp
-	 udptopo.cpp
-	 udpipmap.cpp
+set (   SRCS
+        tcptrr.cpp
+        tcptrs.cpp
+        udpmsgpk.cpp
+        udppack.cpp
+        udpsha.cpp
+        udptrr.cpp
+        udptrs.cpp
+	    udptopo.cpp
+	    udpipmap.cpp
+        udpwrk.cpp
     )
 
 include_directories ( 
-         ./../../roxie/roxiemem 
-         ./../../system/include 
-         ./../../system/jlib 
-         ./../../roxie/ccd
+         ${HPCC_SOURCE_DIR}/roxie/roxiemem
+         ${HPCC_SOURCE_DIR}/system/include
+         ${HPCC_SOURCE_DIR}/system/jlib
+         ${HPCC_SOURCE_DIR}/roxie/ccd
          ${HPCC_SOURCE_DIR}/testing/unittests
-         ./../../roxie/roxie
-         ./../../system/aeron/aeron-client/src/main/cpp 
-         ./../../system/aeron/aeron-driver/src/main/c/
+         ${HPCC_SOURCE_DIR}/roxie/roxie
+         ${HPCC_SOURCE_DIR}/system/security/securesocket
     )
 
 HPCC_ADD_LIBRARY( udplib SHARED ${SRCS} )
@@ -52,17 +54,9 @@ set_target_properties( udplib PROPERTIES
     DEFINE_SYMBOL UDPLIB_EXPORTS )
 install ( TARGETS udplib RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
 
-target_link_libraries ( udplib 
+target_link_libraries ( udplib PRIVATE 
          jlib
-         roxiemem 
+         roxiemem
+         securesocket
+         ${CppUnit_LIBRARIES}
     )
-    
-if (USE_AERON)
-  target_link_libraries ( udplib 
-         aeron_client
-         aeron_driver
-    )
-
-  install( TARGETS aeron_driver RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-endif()    
-

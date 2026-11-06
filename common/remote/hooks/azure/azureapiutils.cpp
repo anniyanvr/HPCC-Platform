@@ -1,0 +1,234 @@
+/*##############################################################################
+
+    HPCC SYSTEMS software Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#include "platform.h"
+#include "azureapiutils.hpp"
+#include "jlib.hpp"
+#include "jexcept.hpp"
+#include "jstring.hpp"
+#include "jlog.hpp"
+#include "jfile.hpp"
+#include "jmutex.hpp"
+#include "jplane.hpp"
+#include "jsecrets.hpp"
+#include <cstdlib>
+
+using namespace std::chrono;
+
+// Common utility functions shared by both blob and file implementations
+//---------------------------------------------------------------------------------------------------------------------
+
+void setAzureRetryOptions(Azure::Core::Http::Policies::RetryOptions & retryOptions, const StorageApiConfig & config)
+{
+    retryOptions.MaxRetries = config.maxRetries;
+    retryOptions.RetryDelay = std::chrono::milliseconds(config.retryDelayMs);
+    retryOptions.MaxRetryDelay = std::chrono::milliseconds(config.maxRetryDelayMs);
+}
+
+bool areManagedIdentitiesEnabled()
+{
+    static bool hasIMDS = []() {
+        // Check for Azure AD Workload Identity or legacy managed identity
+        if (std::getenv("AZURE_CLIENT_ID") && std::getenv("AZURE_TENANT_ID") && std::getenv("AZURE_FEDERATED_TOKEN_FILE"))
+            return true;
+
+        // Check for App Service / Container Instances managed identity
+        if (std::getenv("MSI_ENDPOINT") || std::getenv("IDENTITY_ENDPOINT"))
+            return true;
+
+        // Check for Azure VM managed identity via IMDS (Instance Metadata Service) probe (once).
+        // 169.254.169.254 is a non-routable link-local address that Azure uses to expose the
+        // IMDS to VMs running on its platform. It is only reachable from within an Azure VM.
+        // See: https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token#get-a-token-using-http
+        try
+        {
+            Azure::Core::Http::Request request(Azure::Core::Http::HttpMethod::Get, Azure::Core::Url("http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"));
+            request.SetHeader("Metadata", "true");
+
+            auto transport = std::make_shared<Azure::Core::Http::CurlTransport>();
+            Azure::Core::Context context;
+            // Use a short timeout to avoid blocking startup if not on Azure
+            context = context.WithDeadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+
+            auto response = transport->Send(request, context);
+            auto statusCode = response->GetStatusCode();
+            // 200 = identity assigned and working
+            // 400 = IMDS reachable but identity may not be properly configured
+            if (statusCode == Azure::Core::Http::HttpStatusCode::BadRequest)
+                OWARNLOG("Azure IMDS probe returned 400 (Bad Request) — managed identity endpoint is reachable but may not be properly configured");
+            return statusCode == Azure::Core::Http::HttpStatusCode::Ok;
+        }
+        catch (...)
+        {
+            // Connection refused, timeout, not on Azure — IMDS not available
+            return false;
+        }
+    }();
+
+    return hasIMDS;
+}
+
+std::shared_ptr<Azure::Storage::StorageSharedKeyCredential> getAzureSharedKeyCredential(const char * accountName, const char * secretName)
+{
+    // MORE: Should we create a cache of credentials?  We would need to be careful about the lifetime of the shared key credential
+
+    StringBuffer key;
+    getSecretValue(key, "storage", secretName, "key", true);
+    //Trim trailing whitespace/newlines in case the secret has been entered by hand e.g. on bare metal
+    size32_t len = key.length();
+    for (;;)
+    {
+        if (!len)
+            break;
+        if (isBase64Char(key.charAt(len-1)))
+            break;
+        len--;
+    }
+    key.setLength(len);
+
+    try
+    {
+        return std::make_shared<Azure::Storage::StorageSharedKeyCredential>(accountName, key.str());
+    }
+    catch (const Azure::Core::RequestFailedException& e)
+    {
+        IException * error = makeStringExceptionV(-1, "Azure access: %s (%d)", e.ReasonPhrase.c_str(), static_cast<int>(e.StatusCode));
+        throw error;
+    }
+}
+
+static std::shared_ptr<Azure::Core::Credentials::TokenCredential> cachedManagedIdentityCredential;
+static CriticalSection managedIdentityCredentialCS{SYNC_LOCATION};
+
+std::shared_ptr<Azure::Core::Credentials::TokenCredential> getAzureManagedIdentityCredential()
+{
+    // Cache the credential object so that the Azure SDK's internal token caching is effective.
+    // Without this, every blob/file client creation allocates a new credential and triggers a
+    // fresh token request to the IMDS endpoint, which quickly leads to HTTP 429 throttling.
+    CriticalBlock block(managedIdentityCredentialCS);
+    if (cachedManagedIdentityCredential)
+        return cachedManagedIdentityCredential;
+
+    // Azure SDK credential objects handle token refresh automatically
+    const char * federatedTokenFile = std::getenv("AZURE_FEDERATED_TOKEN_FILE");
+    if (federatedTokenFile)
+    {
+        // Workload Identity
+        const char * clientId = std::getenv("AZURE_CLIENT_ID");
+        const char * tenantId = std::getenv("AZURE_TENANT_ID");
+        try
+        {
+#ifdef AZURE_HAS_WORKLOAD_IDENTITY_CREDENTIAL
+            DBGLOG("Using Azure Workload Identity authentication (clientId=%s, tenantId=%s, tokenFile=%s)",
+                clientId ? clientId : "<none>", tenantId ? tenantId : "<none>", federatedTokenFile);
+            cachedManagedIdentityCredential = std::make_shared<Azure::Identity::WorkloadIdentityCredential>();
+#else
+            // SDK doesn't have WorkloadIdentityCredential - check if workload identity environment is configured
+            DBGLOG("Using DefaultAzureCredential for Workload Identity (SDK < 1.6.0) (clientId=%s, tenantId=%s, tokenFile=%s)",
+                clientId ? clientId : "<none>", tenantId ? tenantId : "<none>", federatedTokenFile);
+            cachedManagedIdentityCredential = std::make_shared<Azure::Identity::DefaultAzureCredential>();
+#endif
+        }
+        catch (const Azure::Core::RequestFailedException& e)
+        {
+            throw makeStringExceptionV(-1, "Azure authentication failed: %s (%d)",
+                e.ReasonPhrase.c_str(), static_cast<int>(e.StatusCode));
+        }
+        return cachedManagedIdentityCredential;
+    }
+    // else fall through
+
+    // Use ManagedIdentityCredential for legacy managed identity
+    // Only pass clientId if MSI/IDENTITY endpoints are set (true managed identity scenario)
+    const char * msiEndpoint = std::getenv("MSI_ENDPOINT");
+    const char * identityEndpoint = std::getenv("IDENTITY_ENDPOINT");
+    const char * clientId = (msiEndpoint || identityEndpoint) ? std::getenv("AZURE_CLIENT_ID") : nullptr;
+    DBGLOG("Using Azure Managed Identity authentication (clientId=%s, MSI_ENDPOINT=%s, IDENTITY_ENDPOINT=%s)",
+           clientId ? clientId : "<none>",
+           msiEndpoint ? msiEndpoint : "<none>",
+           identityEndpoint ? identityEndpoint : "<none>");
+    try
+    {
+        if (clientId)
+            cachedManagedIdentityCredential = std::make_shared<Azure::Identity::ManagedIdentityCredential>(clientId);
+        else
+            cachedManagedIdentityCredential = std::make_shared<Azure::Identity::ManagedIdentityCredential>();
+    }
+    catch (const Azure::Core::RequestFailedException& e)
+    {
+        throw makeStringExceptionV(-1, "Azure Managed Identity authentication failed: %s (%d)",
+            e.ReasonPhrase.c_str(), static_cast<int>(e.StatusCode));
+    }
+    return cachedManagedIdentityCredential;
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+// Global transport instance for connection reuse across all Azure storage operations.
+// Existing clients retain their transport after a configuration reload; the next client receives
+// a replacement transport if the configured connection timeout changed.
+static std::shared_ptr<Azure::Core::Http::HttpTransport> globalAzureTransport;
+static unsigned globalAzureTransportConnectionTimeoutMs = 0;
+static CriticalSection globalTransportCS{SYNC_LOCATION};
+
+std::shared_ptr<Azure::Core::Http::HttpTransport> getHttpTransport()
+{
+    unsigned connectionTimeoutMs = getGlobalConnectionTimeoutMs();
+    CriticalBlock block(globalTransportCS);
+    if (!globalAzureTransport || globalAzureTransportConnectionTimeoutMs != connectionTimeoutMs)
+    {
+        // Create shared transport with optimized settings for all Azure operations
+        Azure::Core::Http::CurlTransportOptions transportOptions;
+        transportOptions.ConnectionTimeout = std::chrono::milliseconds(connectionTimeoutMs);
+        transportOptions.NoSignal = true;  // Avoid signal interference
+        // Note: libcurl automatically handles connection pooling and keep-alive
+        // Sharing the transport instance ensures maximum connection reuse
+        globalAzureTransport = std::make_shared<Azure::Core::Http::CurlTransport>(transportOptions);
+        globalAzureTransportConnectionTimeoutMs = connectionTimeoutMs;
+    }
+    return globalAzureTransport;
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+bool isBase64Char(char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (c == '+') || (c == '/') || (c == '=');
+}
+
+void throwRequestException(const Azure::Core::RequestFailedException& e, const char * op, const char * filename, offset_t pos, offset_t len)
+{
+    throw makeStringExceptionV(1234, "%s failed for file %s at offset %llu, len %llu: %s (%d)",
+                              op, filename, pos, len, e.ReasonPhrase.c_str(), static_cast<int>(e.StatusCode));
+}
+
+void throwRequestException(const std::exception& e, const char * op, const char * filename, offset_t pos, offset_t len)
+{
+    throw makeStringExceptionV(1234, "%s failed for file %s at offset %llu, len %llu: %s",
+                              op, filename, pos, len, e.what());
+}
+
+void throwRequestException(const Azure::Core::RequestFailedException& e, const char * op, const char * filename)
+{
+    throw makeStringExceptionV(1234, "%s failed for file %s: %s (%d)",
+                              op, filename, e.ReasonPhrase.c_str(), static_cast<int>(e.StatusCode));
+}
+
+void throwRequestException(const std::exception& e, const char * op, const char * filename)
+{
+    throw makeStringExceptionV(1234, "%s failed for file %s: %s", op, filename, e.what());
+}

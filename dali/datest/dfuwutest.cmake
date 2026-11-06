@@ -38,18 +38,21 @@ include_directories (
          ./../../system/jlib 
          ./../../common/workunit 
          ../../common/environment 
+         ${HPCC_SOURCE_DIR}/esp/clients/ws_dfsclient
     )
 
 HPCC_ADD_EXECUTABLE ( dfuwutest ${SRCS} )
 set_target_properties (dfuwutest PROPERTIES COMPILE_FLAGS -D_CONSOLE)
-target_link_libraries ( dfuwutest
+target_link_libraries ( dfuwutest PRIVATE
          workunit
          jlib
          mp 
-         hrpc 
          dafsclient 
          dalibase 
          dfuwu 
-         environment 
+         ws_dfsclient
     )
 
+if (NOT CONTAINERIZED)
+    target_link_libraries ( dfuwutest PRIVATE environment )
+endif()

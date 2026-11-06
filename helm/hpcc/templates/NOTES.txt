@@ -1,22 +1,72 @@
-
-Thank you for installing the HPCC chart.
+{{- $defaultImage :=  include "hpcc.imageName" (dict "root" $ "me" dict ) | quote }}
+{{- $defaultVersion :=  .Values.global.image.version | default .Chart.Version }}
+Thank you for installing the HPCC chart version {{ .Chart.Version }} using image {{ $defaultImage }}
+{{- include "hpcc.printWarnings" (dict "root" $) | indent 4 }}
 
 This chart has defined the following HPCC components:
 {{- $names := dict -}}
 {{- range $sectionName, $section := .Values -}}
-{{-  if hasPrefix "[]" (typeOf $section) -}}
-{{-   range $component := $section -}}
-{{-    if hasKey $component "name" -}}
-{{-     if not $component.disabled -}}
-{{-      if hasKey $names $component.name -}}
-{{-       required ( printf "Component name %s in section %s was already seen in section %s" $component.name $sectionName (get $names $component.name)) nil -}}
-{{-      else }}
+ {{- if hasPrefix "[]" (typeOf $section) -}}
+  {{- range $component := $section -}}
+   {{- if hasKey $component "name" -}}
+    {{- if not $component.disabled -}}
+     {{- if hasKey $names $component.name -}}
+      {{- required ( printf "Component name %s in section %s was already seen in section %s" $component.name $sectionName (get $names $component.name)) nil -}}
+     {{- else }}
   {{ $sectionName }}.{{ $component.name }}
-{{-       $_ := set $names $component.name $sectionName -}}
-{{-      end -}}
-{{-     end -}}
-{{-    end -}}
-{{-   end -}}
-{{-  end -}}
+      {{- $localImage := include "hpcc.imageName" (dict "root" $ "me" $component ) | quote }}
+      {{- if not ( eq $defaultImage $localImage ) -}}
+       {{- printf " using overridden image %s" $localImage -}}
+      {{- end }}
+      {{- $_ := set $names $component.name $sectionName -}}
+     {{- end -}}
+    {{- end -}}
+   {{- end -}}
+  {{- end -}}
+ {{- end -}}
 {{- end }}
+
+{{- range $dali := (.Values.dali | default dict) }}
+ {{- if and (not $dali.disabled) (hasKey $dali "services") -}}
+  {{- $daliSashaServicesCtx := dict "services" ($dali.services | default dict) -}}
+  {{- include "hpcc.getSashaServices" $daliSashaServicesCtx -}}
+  {{- range $serviceName, $_service := $daliSashaServicesCtx.services }}
+   {{- $service := ($_service | default dict) -}}
+   {{- if hasKey $names $serviceName -}}
+    {{- required ( printf "Component name %s in dali services was already seen in section %s" $serviceName (get $names $serviceName)) nil -}}
+   {{- else }}
+  dali.sasha.{{ $serviceName }}
+    {{- $_ := set $names $serviceName (printf "dali.%s" $dali.name) -}}
+    {{- $localImage := include "hpcc.imageName" (dict "root" $ "me" $dali ) | quote }}
+    {{- if not ( eq $defaultImage $localImage ) -}}
+     {{- printf " using overridden image %s" $localImage -}}
+    {{- end }}
+   {{- end -}}
+  {{- end -}}
+ {{- end -}}
+{{- end -}}
+
+{{- $sashaServicesCtx := dict "services" ($.Values.sasha | default dict) -}}
+{{- include "hpcc.getSashaServices" $sashaServicesCtx -}}
+{{- range $serviceName, $_service := $sashaServicesCtx.services }}
+ {{- $service := ($_service | default dict) -}}
+ {{- if hasKey $names $serviceName -}}
+  {{- required ( printf "Component name %s in section sasha was already seen in section %s" $serviceName (get $names $serviceName)) nil -}}
+ {{- else }}
+  sasha.{{ $serviceName }}
+  {{- $localImage := include "hpcc.imageName" (dict "root" $ "me" $service ) | quote }}
+  {{- if not ( eq $defaultImage $localImage ) -}}
+   {{- printf " using overridden image %s" $localImage -}}
+  {{- end }}
+ {{- end -}}
+{{- end }}
+
+{{- /* Ensure numWorkersPerPod is a factor of numWorkers */ -}}
+{{- range $thor := .Values.thor -}}
+ {{- $numWorkers := $thor.numWorkers | default 1 | int -}}
+ {{- $numWorkersPerPod := $thor.numWorkersPerPod | default 1 | int -}}
+ {{- if ne (mod $numWorkers $numWorkersPerPod) 0 -}}
+  {{- required ( printf "numWorkersPerPod(%d) is not a factor of numWorkers(%d) for Thor component '%s'" $numWorkersPerPod $numWorkers $thor.name ) nil -}}
+ {{- end -}}
+{{- end -}}
 

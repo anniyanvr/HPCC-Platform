@@ -1,0 +1,98 @@
+/*##############################################################################
+
+    HPCC SYSTEMS software Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#ifndef JIOURING_HPP
+#define JIOURING_HPP
+
+#include <vector>
+#include "jptree.hpp"
+
+#if defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
+#include <sys/uio.h>
+#else
+//Define the iovec structure for windows/
+struct iovec {
+    void   *iov_base;  /* Starting address */
+    size_t  iov_len;   /* Size of the memory pointed to by iov_base. */
+};
+#endif
+
+interface IAsyncProcessor;
+// Callback interface for async I/O completions
+interface IAsyncCallback
+{
+    // Called when an async operation completes
+    // result: Result of the operation (>=0 for success, negative error code for failure)
+    // Returns: true if afterCompletion() should be called, false otherwise
+    virtual bool onAsyncComplete(int result) = 0;
+    
+    // Called after onAsyncComplete() returns true to perform cleanup
+    // Default implementation does nothing. Override to call Release() if needed.
+    virtual void afterCompletion() {}
+};
+
+//-----------------------------------------------------------------------------------------------
+
+struct sockaddr;
+interface IAsyncProcessor : public IInterface
+{
+// Functions for each of the asynchronous actions that can be queued
+    virtual void enqueueCallbackCommand(IAsyncCallback & callback) = 0;
+    virtual void enqueueCallbackCommands(const std::vector<IAsyncCallback *> & callbacks) = 0;
+    
+    // Enqueue an asynchronous socket connect operation
+    // socket: The socket to connect (must be created with createForAsyncConnect)
+    // addr: Socket address to connect to (caller must free with free() after calling this)
+    // addrlen: Length of the socket address structure
+    // callback: Will be called when connect completes (result = 0 for success, negative error code for failure)
+    virtual void enqueueSocketConnect(ISocket * socket, const struct sockaddr * addr, size32_t addrlen, IAsyncCallback & callback) = 0;
+    
+    virtual void enqueueSocketRead(ISocket * socket, void * buf, size32_t len, IAsyncCallback & callback) = 0;
+    virtual void enqueueSocketWrite(ISocket * socket, const void * buf, size32_t len, IAsyncCallback & callback) = 0;
+    virtual void enqueueSocketWriteMany(ISocket * socket, const iovec * buffers, unsigned numBuffers, IAsyncCallback & callback) = 0;
+    
+    // Enqueue a single-shot accept operation
+    // socket: Listening socket to accept connections on
+    // callback: Will be called once when a connection is accepted (result = file descriptor for new connection)
+    virtual void enqueueSocketAccept(ISocket * socket, IAsyncCallback & callback) = 0;
+    
+    // Enqueue a multishot accept operation that continuously accepts connections
+    // socket: Listening socket to accept connections on
+    // callback: Will be called for each accepted connection (result = file descriptor for new connection)
+    //           Also called once with -ECANCELED when the operation is cancelled
+    //           IMPORTANT: The callback object must remain valid until the operation is cancelled
+    //           or the processor is terminated. Caller is responsible for ensuring callback lifetime.
+    virtual void enqueueSocketMultishotAccept(ISocket * socket, IAsyncCallback & callback) = 0;
+    
+    // Cancel active accept operations on a socket (works for both single-shot and multishot)
+    // socket: The listening socket to cancel accept operations for
+    virtual void cancelAccept(ISocket * socket) = 0;
+
+// Functions for managing the completion queue - particularly non-threaded urings
+    virtual void checkForCompletions() = 0;
+    virtual void lockMemory(const void * buffer, size_t len) = 0; // Avoid memcpy by locking the memory
+    virtual void terminate() = 0;
+};
+
+// Create an instance of the IAsyncProcessor interface - may return null if not supported
+extern jlib_decl IAsyncProcessor * createURingProcessor(const IPropertyTree * config, bool threaded);
+
+// Helper that checks expert/@useIOUring configuration before creating URing processor
+// Returns null if disabled via configuration or if not supported on platform
+extern jlib_decl IAsyncProcessor * createURingProcessorIfEnabled(const IPropertyTree * config, bool threaded);
+
+#endif

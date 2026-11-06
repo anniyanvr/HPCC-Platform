@@ -22,6 +22,7 @@
 #include "jfile.hpp"
 #include "jmutex.hpp"
 #include "jio.ipp"
+#include "jplane.hpp"
 #include <atomic>
 
 #ifndef _WIN32
@@ -29,10 +30,11 @@
 #include <dirent.h>
 #endif
 
-
 class jlib_decl CFile : implements IFile, public CInterface
 {
-    HANDLE openHandle(IFOmode mode, IFSHmode share, bool async, int stdh=-1);
+    HANDLE openHandle(IFOmode mode, IFSHmode share, bool async);
+    HANDLE openHandle(IFOmode mode, IFSHmode share, bool async, int stdh, WriteSyncDetails &writeSync);
+    HANDLE openHandleOnce(IFOmode mode, IFSHmode share, bool async, int stdh, const WriteSyncDetails &writeSync);
 public:
     CFile(const char * _filename);
     IMPLEMENT_IINTERFACE
@@ -87,36 +89,40 @@ protected:
     unsigned flags;
 };
 
-
 class jlib_decl CFileIO : implements IFileIO, public CInterface
 {
 public:
-    CFileIO(HANDLE,IFOmode _openmode,IFSHmode _sharemode,IFEflags _extraFlags);
+    CFileIO(IFile * _creator,HANDLE,IFOmode _openmode,IFSHmode _sharemode,IFEflags _extraFlags);
+    CFileIO(IFile * _creator,HANDLE,IFOmode _openmode,IFSHmode _sharemode,IFEflags _extraFlags,const WriteSyncDetails &_writeSync);
     ~CFileIO();
     IMPLEMENT_IINTERFACE
 
-    virtual size32_t read(offset_t pos, size32_t len, void * data);
-    virtual offset_t size();
-    virtual size32_t write(offset_t pos, size32_t len, const void * data);
-    virtual void setSize(offset_t size);
-    virtual offset_t appendFile(IFile *file,offset_t pos,offset_t len);
-    virtual void flush();
-    virtual void close();
-    virtual unsigned __int64 getStatistic(StatisticKind kind);
-
-    bool create(const char * filename, bool replace);
-    bool open(const char * filename);
+    virtual size32_t read(offset_t pos, size32_t len, void * data) override;
+    virtual offset_t size() override;
+    virtual size32_t write(offset_t pos, size32_t len, const void * data) override;
+    virtual void setSize(offset_t size) override;
+    virtual void flush() override;
+    virtual void close() override;
+    virtual unsigned __int64 getStatistic(StatisticKind kind) override;
+    virtual IFile * queryFile() const override { return creator; }
 
     HANDLE queryHandle() { return file; } // for debugging
-
+    const char * queryFilename() const { return creator ? creator->queryFilename() : nullptr; }
+    const char * querySafeFilename() const
+    {
+        const char * name = queryFilename();
+        return name ? name : "<unknown>";
+    }
 
 protected:
-    CriticalSection     cs;
+    CriticalSection     cs{SYNC_LOCATION};
+    Linked<IFile>       creator;
     HANDLE              file;
     bool                throwOnError;
     IFSHmode            sharemode;
     IFOmode             openmode;
     IFEflags            extraFlags;
+    WriteSyncDetails    writeSync;
     FileIOStats         stats;
     RelaxedAtomic<unsigned> unflushedReadBytes; // more: If this recorded flushedReadBytes it could have a slightly lower overhead
     RelaxedAtomic<unsigned> unflushedWriteBytes;
@@ -125,25 +131,90 @@ private:
 
 };
 
-class jlib_decl CFileRangeIO : implements IFileIO, public CInterface
+class CNullFileIO final : implements CSimpleInterfaceOf<IFileIO>
+{
+public:
+    virtual size32_t read(offset_t pos, size32_t len, void * data) override;
+    virtual offset_t size() override;
+    virtual size32_t write(offset_t pos, size32_t len, const void * data) override;
+    virtual void setSize(offset_t size) override;
+    virtual void flush() override;
+    virtual void close() override;
+    virtual unsigned __int64 getStatistic(StatisticKind kind) override;
+    virtual IFile * queryFile() const;
+};
+
+class CIndirectFileIO : implements CSimpleInterfaceOf<IFileIO>
+{
+public:
+    CIndirectFileIO(IFileIO * _base);
+
+    virtual size32_t read(offset_t pos, size32_t len, void * data) override;
+    virtual offset_t size() override;
+    virtual size32_t write(offset_t pos, size32_t len, const void * data) override;
+    virtual void setSize(offset_t size) override;
+    virtual void flush() override;
+    virtual void close() override;
+    virtual unsigned __int64 getStatistic(StatisticKind kind) override;
+    virtual IFile * queryFile() const;
+
+protected:
+    Linked<IFileIO>     io;
+};
+
+
+// This class is for testing to allow a delay to be added to all reads and writes
+class CDelayedFileIO final : public CIndirectFileIO
+{
+public:
+    CDelayedFileIO(IFileIO * _io, unsigned _delayNs);
+
+    virtual size32_t read(offset_t pos, size32_t len, void * data);
+    virtual size32_t write(offset_t pos, size32_t len, const void * data);
+
+protected:
+    unsigned delayNs;
+};
+
+
+class CFileRangeIO final : public CIndirectFileIO
 {
 public:
     CFileRangeIO(IFileIO * _io, offset_t _headerSize, offset_t _maxLength);
-    IMPLEMENT_IINTERFACE
 
     virtual size32_t read(offset_t pos, size32_t len, void * data);
     virtual offset_t size();
     virtual size32_t write(offset_t pos, size32_t len, const void * data);
-    virtual void setSize(offset_t size) { UNIMPLEMENTED; }
-    virtual offset_t appendFile(IFile *file,offset_t pos,offset_t len) { UNIMPLEMENTED; return 0; }
-    virtual void flush() { io->flush(); }
-    virtual void close() { io->close(); }
-    virtual unsigned __int64 getStatistic(StatisticKind kind) { return io->getStatistic(kind); }
 
 protected:
-    Linked<IFileIO>     io;
     offset_t            headerSize;
     offset_t            maxLength;
+};
+
+//A wrapper class than can be used to ensure the interface is used in a sensible way - e.g.
+//files are closed before destruction when writing.  Sensible buffering is in place.
+class jlib_decl CCheckingFileIO : public CIndirectFileIO
+{
+public:
+    CCheckingFileIO(const char * _filename, IFileIO * _io) : CIndirectFileIO(_io), filename(_filename) {}
+    ~CCheckingFileIO();
+
+    virtual size32_t read(offset_t pos, size32_t len, void * data) override;
+    virtual size32_t write(offset_t pos, size32_t len, const void * data) override;
+    virtual void close() override;
+
+protected:
+    void report(const char * format, ...) __attribute__((format(printf, 2, 3)));
+
+protected:
+    CriticalSection cs{SYNC_LOCATION};
+    StringAttr filename;
+    bool closed = false;
+    bool traced = false;
+    unsigned minSeqReadSize = 0x10000;
+    unsigned minWriteSize = 0x010000;
+    offset_t lastReadPos = (offset_t)-1;
+    size32_t lastWriteSize = 0;
 };
 
 
@@ -157,10 +228,10 @@ public:
     virtual size32_t read(offset_t pos, size32_t len, void * data);
     virtual offset_t size();
     virtual size32_t write(offset_t pos, size32_t len, const void * data);
-    virtual offset_t appendFile(IFile *file,offset_t pos,offset_t len);
     virtual void flush();
     virtual void close();
     virtual unsigned __int64 getStatistic(StatisticKind kind);
+    virtual IFile * queryFile() const { return nullptr; }
 
     virtual void setSize(offset_t size);
     virtual IFileAsyncResult *readAsync(offset_t pos, size32_t len, void * data);
@@ -171,7 +242,7 @@ public:
 
 protected: friend class CFileAsyncResult;
 
-    CriticalSection         cs;
+    CriticalSection         cs{SYNC_LOCATION};
     HANDLE              file;
     bool                    throwOnError;
     IArrayOf<IFileAsyncResult>  results;
@@ -190,7 +261,8 @@ public:
     virtual offset_t size();
     virtual offset_t tell();
     virtual size32_t write(size32_t len, const void * data);
-
+    virtual unsigned __int64 getStatistic(StatisticKind kind) { return io->getStatistic(kind); }
+    virtual void close() override { io->close(); }
 protected:
     Linked<IFileIO>     io;
     offset_t            curOffset;
@@ -209,38 +281,11 @@ public:
     virtual offset_t size();
     virtual offset_t tell();
     virtual size32_t write(size32_t len, const void * data);
-
+    virtual unsigned __int64 getStatistic(StatisticKind kind) { return stream->getStatistic(kind); }
+    virtual void close() override { stream->close(); }
 protected:
     Linked<IFileIOStream>     stream;
 };
-
-
-class jlib_decl CIOStreamReadWriteSeq : public IWriteSeq, public IReadSeq, public CInterface
-{
-public:
-    IMPLEMENT_IINTERFACE;
-
-    CIOStreamReadWriteSeq(IFileIOStream * _stream, offset_t _offset, size32_t _size);
-
-    virtual void put(const void *src);
-    virtual void putn(const void *src, unsigned n);
-    virtual void flush();
-    virtual size32_t getRecordSize() { return size; }
-    virtual offset_t getPosition();
-
-    virtual bool get(void *dst);
-    virtual unsigned getn(void *dst, unsigned n);
-    virtual void reset();
-    virtual void stop() {} // no action required
-
-private:
-    offset_t offset;
-    size32_t    size;
-    Linked<IFileIOStream> stream;
-};
-
-
-
 
 
 class jlib_decl DirectBufferI : implements IFileIO, public CInterface

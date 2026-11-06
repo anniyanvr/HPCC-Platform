@@ -110,7 +110,8 @@ enum class RecordTranslationMode : byte
     Payload = 2,    // Translate all fields in datasets, and only payload fields in indexes
     AlwaysDisk = 3, // Always translate - even if wouldn't normally (e.g. csv/xml source read as binary), or crcs happen to match
     AlwaysECL = 4,  // Ignore the published format - can make sense to force no translation e.g. when field names have changed
-    Unspecified = 5
+    PayloadRemoveOnly = 5, // Allow fields to be removed from the incoming dataset, but not allow fields to be missing
+    Unspecified = 6
 };  // AlwaysDisk and AlwaysECL are for testing purposes only, and can only be set per file (not globally)
 
 extern ECLRTL_API RecordTranslationMode getTranslationMode(const char *modeStr, bool isLocal);
@@ -133,12 +134,14 @@ interface IDynamicTransform : public IInterface
 {
     virtual void describe() const = 0;
     virtual size32_t translate(ARowBuilder &builder, IVirtualFieldCallback & callback, const byte *sourceRec) const = 0;
-    virtual size32_t translate(ARowBuilder &builder, IVirtualFieldCallback & callback, const RtlRow &sourceRow) const = 0;
-    virtual size32_t translate(ARowBuilder &builder, IVirtualFieldCallback & callback, const IDynamicFieldValueFetcher & fetcher) const = 0;
+    virtual size32_t translate(ARowBuilder &builder, IVirtualFieldCallback & callback, const RtlRow &sourceRow) const = 0;  // allows offsets to be reused if already calculated
+    virtual size32_t translate(ARowBuilder &builder, IVirtualFieldCallback & callback, const IDynamicFieldValueFetcher & fetcher) const = 0; // called when reading from non binary e.g. xml/csv
     virtual bool canTranslate() const = 0;
     virtual bool needsTranslate() const = 0;
     virtual bool keyedTranslated() const = 0;
     virtual bool needsNonVirtualTranslate() const = 0;
+    virtual bool hasNewFields() const = 0;
+    virtual const RtlRecord & querySourceMeta() const = 0;
 };
 
 interface IKeyTranslator : public IInterface
@@ -181,6 +184,8 @@ interface IDynamicTransformViaCallback : public IInterface
 };
 
 extern ECLRTL_API const IDynamicTransform *createRecordTranslator(const RtlRecord &_destRecInfo, const RtlRecord &_srcRecInfo);
+extern ECLRTL_API const IDynamicTransform *createRecordBlobTranslator(const RtlRecord &_destRecInfo, const RtlRecord &_srcRecInfo, IBlobCreator * blobCreator);
+extern ECLRTL_API const IDynamicTransform *createCloneVirtualRecordTranslator(const RtlRecord &_destRecInfo, IOutputMetaData & _source);
 extern ECLRTL_API const IDynamicTransform *createRecordTranslatorViaCallback(const RtlRecord &_destRecInfo, const RtlRecord &_srcRecInfo, type_vals rawType);
 extern ECLRTL_API void throwTranslationError(const RtlRecord &_destRecInfo, const RtlRecord &_srcRecInfo, const char * filename);
 

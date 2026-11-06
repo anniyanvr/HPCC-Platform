@@ -45,6 +45,12 @@ void ExitModuleObjects(SoContext ctx)
 
 void ExitModuleObjects() { ExitModuleObjects(0); }
 
+void ClearModuleObjects()
+{
+    if (_initTable)
+        _initTable->clear();
+}
+
 void _InitModuleObjects()
 {
     try
@@ -102,13 +108,18 @@ void InitTable::exit(SoContext ctx)
         InitializerType &iT = initializers.element(i);
         if (iT.soCtx == ctx)
         {
-            assertex(iT.state == ITS_Initialized);
-
-            if (iT.modExit && iT.modExit->func)
+            if (iT.state == ITS_Initialized)
             {
-                //printf("::exit - destroying prior = %d\n", iT.priority);
-                iT.modExit->func();
-                iT.modExit->func = NULL;
+                if (iT.modExit && iT.modExit->func)
+                {
+                    //printf("::exit - destroying prior = %d\n", iT.priority);
+                    iT.modExit->func();
+                    iT.modExit->func = NULL;
+                }
+            }
+            else
+            {
+                fprintf(stderr, "InitTable::exit %p state is %d\n", ctx, (int) iT.state);
             }
             initializers.remove(i);
         }
@@ -125,6 +136,11 @@ int InitTable::sortFuncAscending(InitializerType const *i1, InitializerType cons
 {
     int ret = i1->modpriority - i2->modpriority;
     return ret ? ret : i1->priority - i2->priority;
+}
+
+void InitTable::clear()
+{
+    initializers.clear();
 }
 
 void InitTable::add(InitializerType &iT)

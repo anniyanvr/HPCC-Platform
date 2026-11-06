@@ -1,0 +1,11 @@
+global:
+  tracing:
+    exporters:
+    - type: OTLP-GRPC
+      endpoint: "localhost:4317"
+      useSslCredentials: false
+      batch:
+        enabled: true
+        maxQueueSize: 4096
+        scheduledDelayMillis: 6000
+        maxExportBatchSize: 512

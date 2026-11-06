@@ -136,13 +136,19 @@ __int64 Http::receiveData(ISocket* socket, IByteOutputStream* ostream, bool isCl
 
     Owned<IFileIOStream> full_stream = NULL;
     if(full_output)
-        full_stream.setown(createIOStream(full_output));
+        full_stream.setown(createBufferedIOStream(full_output));
     Owned<IFileIOStream> content_stream = NULL;
     if(content_output)
-        content_stream.setown(createIOStream(content_output));
+        content_stream.setown(createBufferedIOStream(content_output));
 
     char oneline[2049];
-    bsocket->read(oneline, 4);
+    unsigned readlen = bsocket->read(oneline, 4);
+    if (readlen < 4)
+    {
+        printf("Failed to read HTTP Method.\n");
+        return -1;
+    }
+
     if(alwayshttp)
         isRoxie = false;
     else if(strncmp(oneline, "GET", 3) == 0 || strncmp(oneline, "POST", 4) == 0 || strncmp(oneline, "HTTP", 4) == 0)
@@ -445,8 +451,7 @@ void Http::SplitURL(const char* url, StringBuffer& protocol,StringBuffer& UserNa
         UserName.append(username);
     }
 
-    if(hostptr)
-        host.append(hostptr);
+    host.append(hostptr);
 
     if(portptr)
         port.append(portptr);
@@ -461,7 +466,7 @@ HttpClient::HttpClient(IProperties* globals, const char* url, const char* inname
                        const char* outdir, const char* outfilename, bool writeToFiles,
                        int doValidation, const char* xsdpath, bool isEspLogFile) : m_stopstress(false)
 {
-    m_globals = globals;
+    m_globals.setown(globals ? LINK(globals) : createProperties(true));
     if(url && *url)
         m_url.append(url);
     if(inname)
@@ -494,16 +499,13 @@ HttpClient::HttpClient(IProperties* globals, const char* url, const char* inname
             if(m_ssctx.get() == NULL)
             {
                 Owned<IPropertyTree> cfgtree = nullptr;
-                if (globals->hasProp("cfg"))
+                if (m_globals->hasProp("cfg"))
                 {
-                    const char* cfg = globals->queryProp("cfg");
+                    const char* cfg = m_globals->queryProp("cfg");
                     if (cfg && *cfg)
                         cfgtree.setown(createPTreeFromXMLFile(cfg));
                 }
-                if (cfgtree)
-                    m_ssctx.setown(createSecureSocketContextEx2(cfgtree, ClientSocket));
-                else
-                    m_ssctx.setown(createSecureSocketContext(ClientSocket));
+                m_ssctx.setown(createSecureSocketContextEx2(cfgtree, ClientSocket));
             }
 #else
         throw MakeStringException(-1, "HttpClient: failure to create SSL socket - OpenSSL not enabled in build");
@@ -528,10 +530,10 @@ HttpClient::HttpClient(IProperties* globals, const char* url, const char* inname
     if(xsdpath !=  NULL)
         m_xsdpath.append(xsdpath);
 
-    if(globals && globals->hasProp("stressduration"))
+    if (m_globals->hasProp("stressduration"))
     {
-        m_stressthreads = globals->getPropInt("stressthreads", 0);
-        m_stressduration = globals->getPropInt("stressduration", 0);
+        m_stressthreads = m_globals->getPropInt("stressthreads", 0);
+        m_stressduration = m_globals->getPropInt("stressduration", 0);
     }
     else
     {
@@ -629,7 +631,7 @@ void HttpClient::start()
         }
     }
 
-    bool autogen = m_globals ? m_globals->getPropBool("autogen", false) : false;
+    bool autogen = m_globals->getPropBool("autogen");
 
     if(autogen && !m_isEspLogFile)
     {
@@ -679,7 +681,7 @@ void HttpClient::start()
             }
             int ind = 0;
             char seqbuf[20];
-            if(!(m_globals && m_globals->getPropBool("useDefault")))
+            if (!m_globals->getPropBool("useDefault"))
             {
                 fprintf(stderr, "Pick one method, or just press enter to generate a request for each method:\n");
                 if (fgets(seqbuf, 19, stdin)) {
@@ -880,7 +882,7 @@ void HttpClient::addEspRequest(const char* requestId, const char* service, const
         fname.append(".xml");
         Owned<IFile> file = createIFile(fname.str());
         Owned<IFileIO> io;
-        io.setown(file->open(IFOcreaterw));
+        io.setown(file->open(IFOcreate));
 
         if (io.get())
             io->write(0, request.length(), request.str());
@@ -898,7 +900,7 @@ private:
     HttpClient* m_client;
 
 public:
-    CHttpStressThread(HttpClient* client): m_client(client)
+    CHttpStressThread(HttpClient* client) : Thread("CHttpStressThread"), m_client(client)
     {
         m_stat.setown(new HttpStat());
     }
@@ -914,39 +916,36 @@ public:
         }
 
         Owned<CSimpleSocket> persistent_socket = nullptr;
-        if(m_client)
+        for(;;)
         {
-            for(;;)
+            IArrayOf<CRequest>& requests = m_client->queryStressRequests();
+            ForEachItemIn(x, requests)
             {
-                IArrayOf<CRequest>& requests = m_client->queryStressRequests();
-                ForEachItemIn(x, requests)
-                {
-                    if(m_client->queryStopStress())
-                        break;
-
-                    CRequest& req = requests.item(x);
-                    if(STRESS_USE_JSOCKET)
-                        m_client->sendRequest(req.queryReqbuf(), req.getName(), m_stat.get());
-                    else
-                        m_client->sendStressRequest(req.queryReqbuf(), m_stat.get(), persistent_socket);
-                    if(delaymax > 0 && !m_client->queryStopStress())
-                    {
-                        int delay = 0;
-                        if(delaymin < delaymax)
-                        {
-                            delay = delaymin + (fastRand() % (delaymax - delaymin));
-                        }
-                        else
-                        {
-                            delay = delaymin;
-                        }
-
-                        Sleep(delay);
-                    }
-                }
                 if(m_client->queryStopStress())
                     break;
+
+                CRequest& req = requests.item(x);
+                if(STRESS_USE_JSOCKET)
+                    m_client->sendRequest(req.queryReqbuf(), req.getName(), m_stat.get());
+                else
+                    m_client->sendStressRequest(req.queryReqbuf(), m_stat.get(), persistent_socket);
+                if(delaymax > 0 && !m_client->queryStopStress())
+                {
+                    int delay = 0;
+                    if(delaymin < delaymax)
+                    {
+                        delay = delaymin + (fastRand() % (delaymax - delaymin));
+                    }
+                    else
+                    {
+                        delay = delaymin;
+                    }
+
+                    Sleep(delay);
+                }
             }
+            if(m_client->queryStopStress())
+                break;
         }
 
         return 0;
@@ -1013,7 +1012,7 @@ int HttpClient::sendStressRequests(HttpStat* overall_stat)
 
     //__int64 start = msTick();
     for(i = 0; i < m_stressthreads; i++)
-        thrdlist[i]->start();
+        thrdlist[i]->start(false);
 
     if(http_tracelevel > 0)
         fprintf(m_logfile, "Started %d stress test threads.\n", m_stressthreads);
@@ -1088,14 +1087,13 @@ class CSimpleSocket : public CInterface, implements IInterface
     ISecureSocketContext* m_ssctx;
     bool m_isSSL;
     FILE* m_logfile;
-    int m_sockfd;
-    Owned<ISecureSocket> m_securesocket;
+    Owned<ISocket> m_socket;
     bool m_connected;
 
 public:
     IMPLEMENT_IINTERFACE;
 
-    CSimpleSocket(ISecureSocketContext* ssctx, FILE* logfile) : m_connected (false)
+    CSimpleSocket(ISecureSocketContext* ssctx, FILE* logfile) : m_connected(false)
     {
         m_ssctx = ssctx;
         if(ssctx)
@@ -1103,13 +1101,6 @@ public:
         else
             m_isSSL = false;
         m_logfile = logfile;
-        m_sockfd = -1;
-    }
-
-    virtual ~CSimpleSocket()
-    {
-        if(m_sockfd > 0)
-            ::closesocket(m_sockfd);
     }
 
     int connect(CAddress* address)
@@ -1117,115 +1108,63 @@ public:
         if(!address)
             return -1;
 
-        m_sockfd = socket(AF_INET, SOCK_STREAM, 0);
-        int ret = ::connect(m_sockfd, (struct sockaddr *)(address->m_addr), sizeof(*(address->m_addr)));
-        if(ret < 0)
+        SocketEndpoint ep(address->m_fqdn, address->m_port);
+        try
         {
-            char errbuf[512];
-            GetLastErrorAndMessage(errbuf);
-            fprintf(m_logfile, "Error: failed to connect to %s:%d - %s", address->m_ip.str(), address->m_port, errbuf);
+            m_socket.setown(ISocket::connect(ep));
+        }
+        catch (IJSOCK_Exception *e)
+        {
+            EXCLOG(e);
+            e->Release();
             return -1;
         }
         
         if(m_ssctx != NULL)
         {
-            m_securesocket.setown(m_ssctx->createSecureSocket(m_sockfd));
+            Owned<ISecureSocket> m_securesocket = m_ssctx->createSecureSocket(m_socket.getClear(), SSLogNormal, address->m_fqdn.str());
             int res = m_securesocket->secure_connect();
             if(res < 0)
             {
                 fprintf(m_logfile, "Error: failed to establish ssl connection\n");
                 return -1;
             }
+            m_socket.setown(m_securesocket.getClear());
         }
         m_connected = true;
 
         return 0;
     }
 
-    ssize_t readn(int fd, void *vptr, size_t min, size_t n)
+    ssize_t writen(const void *vptr, size_t n)
     {
-        if (min > n)
-            return 0;
-
-        size_t  nleft;
-        ssize_t nread;
-        char   *ptr;
-
-        ptr = (char *)vptr;
-        nleft = n;
-        while (nleft > 0)
+        try
         {
-            if ((nread = ::recv(fd, ptr, nleft, 0)) < 0)
-            {
-                if (errno == EINTR)
-                {
-                    nread = 0;      /* and call read() again */
-                    continue;
-                }
-                else
-                {
-                    close();
-                    return (-1);
-                }
-            }
-            else if (nread == 0)
-            {
-                close();
-                break;              /* EOF */
-            }
-
-            nleft -= nread;
-            ptr += nread;
-            if (n - nleft >= min)
-                break;
+            return m_socket->write(vptr, n);
         }
-        return (n - nleft);         /* return >= 0 */
-    }
-
-    ssize_t readn(int fd, void *vptr, size_t n)
-    {
-        return readn(fd, vptr, n, n);
-    }
-
-    ssize_t writen(int fd, const void *vptr, size_t n)
-    {
-        size_t nleft;
-        ssize_t nwritten;
-        const char *ptr;
-
-        ptr = (char *)vptr;
-        nleft = n;
-        while (nleft > 0)
+        catch (IJSOCK_Exception *e)
         {
-            if ( (nwritten = ::send(fd, ptr, nleft, 0)) <= 0)
-            {
-                if (nwritten < 0 && errno == EINTR)
-                    nwritten = 0;   /* and call write() again */
-                else
-                {
-                    close();
-                    return (-1);    /* error */
-                }
-            }
-
-            nleft -= nwritten;
-            ptr += nwritten;
+            EXCLOG(e);
+            e->Release();
+            return -1;
         }
-        return (n);
     }
 
     int send(StringBuffer& data)
     {
-        int sent = 0;
-        if(!m_isSSL)
-        {
-            // sent = ::send(m_sockfd, data.str(), data.length(), 0);
-            sent = writen(m_sockfd, data.str(), data.length());
-        }
-        else
-            sent = m_securesocket->write(data.str(), data.length());
-        
-        return sent;
+        return writen(data.str(), data.length());
+    }
+
+    int receive(char* buf, int min, int buflen)
+    {
+        if ((min > buflen) || !m_socket)
+            return 0;
+
+        unsigned int len = 0;
+        if (readtmsAllowClose(m_socket, buf, min, buflen, len, WAIT_FOREVER) || (len <= 0))
+            close();
+
+        return len;
     }
 
     int receive(char* buf, int buflen)
@@ -1233,33 +1172,12 @@ public:
         return receive(buf, buflen, buflen);
     }
 
-    int receive(char* buf, int min, int buflen)
-    {
-        if (min > buflen)
-            return 0;
-
-        unsigned int len = 0;
-        if (!m_isSSL)
-        {
-            //len = ::recv(m_sockfd, buf, buflen, 0);
-            len = readn(m_sockfd, buf, min, buflen);
-        }
-        else
-        {
-            m_securesocket->read(buf, min, buflen, len, WAIT_FOREVER);
-            if(len <= 0)
-                close();
-        }
-
-        return len;
-    }
-
     void close()
     {
-        if(m_sockfd > 0)
+        if (m_socket)
         {
-            ::closesocket(m_sockfd);
-            m_sockfd = -1;
+            m_socket->close();
+            m_socket.clear();
         }
         m_connected = false;
     }
@@ -1312,100 +1230,71 @@ int HttpClient::sendStressRequest(StringBuffer& request, HttpStat* stat, Owned<C
     {
         int len = 0;
         char recvbuf[2048];
-        if (!isPersistent)
+        StringBuffer headersbuf;
+        unsigned int searchStart = 0;
+        while (1)
         {
-            while (1)
+            len = sock->receive(recvbuf, 1, 2047);
+            if (len > 0)
             {
-                len = sock->receive(recvbuf, 0, 2047);
-                if (len > 0)
+                total_len += len;
+                recvbuf[len] = 0;
+                if (http_tracelevel >= 10)
+                    fprintf(m_logfile, "%s", recvbuf);
+                headersbuf.append(recvbuf);
+                char* endofheaders = strstr((char*)(headersbuf.str()+searchStart), "\r\n\r\n");
+                searchStart += len>3?(len-3):0;
+                if (endofheaders != nullptr)
                 {
-                    total_len += len;
-                    recvbuf[len] = 0;
-                    if (m_doValidation)
-                        xml.append(len, recvbuf);
-                    if (http_tracelevel >= 10)
-                        fprintf(m_logfile, "%s", recvbuf);
-                }
-                else
-                {
-                    if (total_len == 0)
+                    int conlen = 0;
+                    const char* conlenstr = strstr((char*)headersbuf.str(), "Content-Length:");
+                    if (conlenstr != nullptr)
+                        conlen = atoi(conlenstr+15);
+                    else
+                        shouldClose = true;
+                    if (conlen > 0)
                     {
-                        if (stat)
-                            stat->numfails++;
-                        return -1;
+                        int content_read = headersbuf.length() - (endofheaders+4 - headersbuf.str());
+                        if (m_doValidation && content_read > 0)
+                            xml.append(content_read, endofheaders+4);
+                        while (content_read < conlen)
+                        {
+                            int remaining = conlen - content_read;
+                            len = sock->receive(recvbuf, 2047>remaining?remaining:2047);
+                            if (len > 0)
+                            {
+                                content_read += len;
+                                total_len += len;
+                                recvbuf[len] = 0;
+                                if (m_doValidation)
+                                    xml.append(len, recvbuf);
+                                if (http_tracelevel >= 10)
+                                    fprintf(m_logfile, "%s", recvbuf);
+                            }
+                            else
+                            {
+                                sock->close();
+                                if (stat)
+                                    stat->numfails++;
+                                return -1;
+                            }
+                        }
                     }
                     break;
                 }
+                else if (total_len >= 1000000) // Still haven't reached end of headers
+                {
+                    fprintf(m_logfile, "HTTP headers too long.\n");
+                    shouldClose = true;
+                    break;
+                }
             }
-        }
-        else
-        {
-            StringBuffer headersbuf;
-            unsigned int searchStart = 0;
-            while (1)
+            else
             {
-                len = sock->receive(recvbuf, 0, 2047);
-                if (len > 0)
-                {
-                    total_len += len;
-                    recvbuf[len] = 0;
-                    if (http_tracelevel >= 10)
-                        fprintf(m_logfile, "%s", recvbuf);
-                    headersbuf.append(recvbuf);
-                    char* endofheaders = strstr((char*)(headersbuf.str()+searchStart), "\r\n\r\n");
-                    searchStart += len>3?(len-3):0;
-                    if (endofheaders != nullptr)
-                    {
-                        int conlen = 0;
-                        const char* conlenstr = strstr((char*)headersbuf.str(), "Content-Length:");
-                        if (conlenstr != nullptr)
-                            conlen = atoi(conlenstr+15);
-                        else
-                            shouldClose = true;
-                        if (conlen > 0)
-                        {
-                            int content_read = headersbuf.length() - (endofheaders+4 - headersbuf.str());
-                            if (m_doValidation && content_read > 0)
-                                xml.append(content_read, endofheaders+4);
-                            while (content_read < conlen)
-                            {
-                                int remaining = conlen - content_read;
-                                len = sock->receive(recvbuf, 2047>remaining?remaining:2047);
-                                if (len > 0)
-                                {
-                                    content_read += len;
-                                    total_len += len;
-                                    recvbuf[len] = 0;
-                                    if (m_doValidation)
-                                        xml.append(len, recvbuf);
-                                    if (http_tracelevel >= 10)
-                                        fprintf(m_logfile, "%s", recvbuf);
-                                }
-                                else
-                                {
-                                    sock->close();
-                                    if (stat)
-                                        stat->numfails++;
-                                    return -1;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    else if (total_len >= 1000000) // Still haven't reached end of headers
-                    {
-                        fprintf(m_logfile, "HTTP headers too long.\n");
-                        shouldClose = true;
-                        break;
-                    }
-                }
-                else
-                {
-                    sock->close();
-                    if (stat && len < 0)
-                        stat->numfails++;
-                    return -1;
-                }
+                sock->close();
+                if (stat && len < 0)
+                    stat->numfails++;
+                return -1;
             }
         }
         if (m_doValidation && xml.length() > 0)
@@ -1461,7 +1350,7 @@ int HttpClient::sendRequest(StringBuffer& request, const char* fname, HttpStat* 
         fname1.append("request").append(PATHSEPCHAR);
         fname1.append(fname);
         Owned<IFile> file1 = createIFile(fname1.str());
-        io_o1.setown(file1->open(IFOcreaterw));
+        io_o1.setown(file1->open(IFOcreate));
         if(io_o1.get() == NULL)
         {
             fprintf(m_logfile, "file %s can't be created", file1->queryFilename());
@@ -1472,7 +1361,7 @@ int HttpClient::sendRequest(StringBuffer& request, const char* fname, HttpStat* 
         fname2.append("response_full").append(PATHSEPCHAR);
         fname2.append(fname);
         Owned<IFile> file2 = createIFile(fname2.str());
-        io_o2.setown(file2->open(IFOcreaterw));
+        io_o2.setown(file2->open(IFOcreate));
         if(io_o2.get() == NULL)
         {
             fprintf(m_logfile, "file %s can't be created", file2->queryFilename());
@@ -1484,7 +1373,7 @@ int HttpClient::sendRequest(StringBuffer& request, const char* fname, HttpStat* 
         fname3.append("response_content").append(PATHSEPCHAR);
         fname3.append(fname);
         Owned<IFile> file3 = createIFile(fname3.str());
-        io_o3.setown(file3->open(IFOcreaterw));
+        io_o3.setown(file3->open(IFOcreate));
         if(io_o3.get() == NULL)
         {
             fprintf(m_logfile, "file %s can't be created", file3->queryFilename());
@@ -1650,7 +1539,7 @@ int HttpClient::validate(StringBuffer& xml)
                 int line = 0, col =0;
                 const char* pElemStr = bptr;
 
-                if (msg.length() > 0 && pElemStr)
+                if (msg.length() > 0)
                 {
                     sscanf(strstr(msg.str(), "line"), "line %d, char %d:",&line, &col);
 
@@ -1759,7 +1648,7 @@ int HttpClient::sendRequest(StringBuffer& req, IFileIO* request_output, IFileIO*
         socket.setown(ISocket::connect(ep));
         if(m_ssctx.get() != NULL)
         {
-            Owned<ISecureSocket> securesocket = m_ssctx->createSecureSocket(socket.getLink());
+            Owned<ISecureSocket> securesocket = m_ssctx->createSecureSocket(socket.getLink(), SSLogNormal, m_host.str());
             int res = securesocket->secure_connect();
             if(res >= 0)
             {
@@ -1782,7 +1671,7 @@ int HttpClient::sendRequest(StringBuffer& req, IFileIO* request_output, IFileIO*
     if(socket.get() == NULL)
     {
         StringBuffer urlstr;
-        OERRLOG("Can't connect to %s", ep.getUrlStr(urlstr).str());
+        OERRLOG("Can't connect to %s", ep.getEndpointHostText(urlstr).str());
         return -1;
     }
 
@@ -1826,8 +1715,7 @@ int HttpClient::sendRequest(StringBuffer& req, IFileIO* request_output, IFileIO*
 
         if(!isPersist || iter >= numReq - 1)
         {
-            socket->shutdown();
-            socket->close();
+            shutdownAndCloseNoThrow(socket);
         }
 
         unsigned end1 = msTick();
@@ -1907,9 +1795,7 @@ int SimpleServer::start()
 {
     const char* fname = NULL;
 
-    bool abortEarly = false;
-    if(m_globals)
-        abortEarly = m_globals->getPropBool("abortEarly", false);
+    bool abortEarly = m_globals->getPropBool("abortEarly");
 
     Owned<IFile> server_infile = NULL;
 
@@ -2183,7 +2069,7 @@ int SimpleServer::start()
             }
 
             Owned<IFile> req_f = createIFile(req_outfname.str());
-            Owned<IFileIO>req_io = req_f->open(IFOcreaterw);
+            Owned<IFileIO>req_io = req_f->open(IFOcreate);
             if(req_io.get() == NULL)
             {
                 fprintf(m_logfile, "file %s can't be created", req_outfname.str());
@@ -2191,7 +2077,7 @@ int SimpleServer::start()
             }
             req_io->write(0, requestbuf.length(), requestbuf.str());
             Owned<IFile> resp_f = createIFile(resp_outfname.str());
-            Owned<IFileIO>resp_io = resp_f->open(IFOcreaterw);
+            Owned<IFileIO>resp_io = resp_f->open(IFOcreate);
             if(resp_io.get() == NULL)
             {
                 fprintf(m_logfile, "file %s can't be created", resp_outfname.str());
@@ -2216,4 +2102,3 @@ int SimpleServer::start()
 
     return 0;
 }
-

@@ -20,6 +20,7 @@
 
 #include "jfile.hpp"
 #include "jlzw.hpp"
+#include "jplane.hpp"
 #include "jset.hpp"
 
 #include "commonext.hpp"
@@ -61,11 +62,13 @@ class CRowStreamLookAhead : public CSimpleInterfaceOf<IStartableEngineRowStream>
     CSlaveActivity &activity;
     bool allowspill, preserveGrouping;
     ILookAheadStopNotify *notify;
-    bool running = false;
+    std::atomic<bool> running{false};
     bool started = false;
     rowcount_t required;
-    Semaphore startSem;
+    Semaphore startSem{SYNC_LOCATION};
     Owned<IException> getexception;
+    LookAheadOptions options;
+    bool newLookAhead = false;
 
     class CThread: public Thread
     {
@@ -94,12 +97,19 @@ public:
     {
         try
         {
-            StringBuffer temp;
-            if (allowspill)
-                GetTempName(temp,"lookahd",true);
             assertex(bufsize);
             if (allowspill)
-                smartbuf.setown(createSmartBuffer(&activity, temp.str(), bufsize, rowIf));
+            {
+                StringBuffer temp;
+                GetTempFilePath(temp,"lookahd");
+                if (newLookAhead)
+                {
+                    ICompressHandler *compressHandler = options.totalCompressionBufferSize ? queryDefaultCompressHandler() : nullptr;
+                    smartbuf.setown(createCompressedSpillingRowStream(&activity, temp.str(), preserveGrouping, rowIf, options, compressHandler));
+                }
+                else
+                    smartbuf.setown(createSmartBuffer(&activity, temp.str(), bufsize, rowIf));
+            }
             else
                 smartbuf.setown(createSmartInMemoryBuffer(&activity, rowIf, bufsize));
             startSem.signal();
@@ -110,15 +120,23 @@ public:
             {
                 while (requiredLeft&&running)
                 {
-                    OwnedConstThorRow row = inputStream->nextRow();
-                    if (!row)
+                    OwnedConstThorRow row;
+                    bool eog = false;
                     {
+                        LookAheadTimer timer(activity.getActivityTimerAccumulator(), activity.queryTimeActivities());
                         row.setown(inputStream->nextRow());
                         if (!row)
-                            break;
-                        else
-                            writer->putRow(NULL); // eog
+                        {
+                            row.setown(inputStream->nextRow());
+                            if (!row)
+                                break;
+                            eog = true;
+                        }
                     }
+
+                    if (unlikely(eog))
+                        writer->putRow(NULL);
+
                     ++count;
                     writer->putRow(row.getClear());
                     if (requiredLeft!=RCUNBOUND)
@@ -129,7 +147,11 @@ public:
             {
                 while (requiredLeft&&running)
                 {
-                    OwnedConstThorRow row = inputStream->ungroupedNextRow();
+                    OwnedConstThorRow row;
+                    {
+                        LookAheadTimer timer(activity.getActivityTimerAccumulator(), activity.queryTimeActivities());
+                        row.setown(inputStream->ungroupedNextRow());
+                    }
                     if (!row)
                         break;
                     ++count;
@@ -159,7 +181,7 @@ public:
         public:
             CNotifyThread(CRowStreamLookAhead &_owner) : threaded("Lookahead-CNotifyThread"), owner(_owner)
             {
-                threaded.init(this);
+                threaded.init(this, true);
             }
             ~CNotifyThread()
             {
@@ -167,7 +189,7 @@ public:
                 {
                     if (threaded.join(60000))
                         break;
-                    PROGLOG("Still waiting on lookahead CNotifyThread thread to complete");
+                    DBGLOG("Still waiting on lookahead CNotifyThread thread to complete");
                 }
             }
         // IThreaded impl.
@@ -193,7 +215,7 @@ public:
         return 0;
     }
 
-    CRowStreamLookAhead(CSlaveActivity &_activity, IEngineRowStream *_inputStream, IThorRowInterfaces *_rowIf, size32_t _bufsize, bool _allowspill, bool _preserveGrouping, rowcount_t _required, ILookAheadStopNotify *_notify, IDiskUsage *_iDiskUsage)
+    CRowStreamLookAhead(CSlaveActivity &_activity, IEngineRowStream *_inputStream, IThorRowInterfaces *_rowIf, size32_t _bufsize, bool _allowspill, bool _preserveGrouping, rowcount_t _required, ILookAheadStopNotify *_notify)
         : thread(*this), activity(_activity), inputStream(_inputStream), rowIf(_rowIf)
     {
 #ifdef _FULL_TRACE
@@ -207,6 +229,15 @@ public:
         running = true;
         required = _required;
         count = 0;
+
+        newLookAhead = activity.getOptBool(THOROPT_NEWLOOKAHEAD, defaultNewLookAhead);
+        if (activity.getOptBool(THOROPT_FORCE_NEWLOOKAHEAD))
+        {
+            newLookAhead = true;
+            allowspill = true;
+        }
+
+        populateLookAheadOptions(activity, options);
     }
     ~CRowStreamLookAhead()
     {
@@ -216,7 +247,15 @@ public:
 // IEngineRowStream
     virtual const void *nextRow() override
     {
-        OwnedConstThorRow row = smartbuf->nextRow();
+        OwnedConstThorRow row;
+        {
+            // smartbuf->nextRow should return immediately if a row is available.
+            // smartbuf->nextRow will take time if blocked, so record time taken as blocked time.
+            // N.b. smartbuf->next may take a trivial amount of time if row is available but
+            // for the purposes of stats this will still be considered blocked.
+            BlockedActivityTimer timer(activity.getActivityTimerAccumulator(), activity.queryTimeActivities());
+            row.setown(smartbuf->nextRow());
+        }
         if (getexception)
             throw getexception.getClear();
         if (!row)
@@ -236,7 +275,7 @@ public:
 #endif
         started = true;
         running = true;
-        thread.start();
+        thread.start(true);
         startSem.wait();
     }
 // IEngineRowStream
@@ -267,9 +306,9 @@ public:
 };
 
 
-IStartableEngineRowStream *createRowStreamLookAhead(CSlaveActivity *activity, IEngineRowStream *inputStream, IThorRowInterfaces *rowIf, size32_t bufsize, bool allowspill, bool preserveGrouping, rowcount_t maxcount, ILookAheadStopNotify *notify, IDiskUsage *iDiskUsage)
+IStartableEngineRowStream *createRowStreamLookAhead(CSlaveActivity *activity, IEngineRowStream *inputStream, IThorRowInterfaces *rowIf, size32_t bufsize, bool allowspill, bool preserveGrouping, rowcount_t maxcount, ILookAheadStopNotify *notify)
 {
-    return new CRowStreamLookAhead(*activity, inputStream, rowIf, bufsize, allowspill, preserveGrouping, maxcount, notify, iDiskUsage);
+    return new CRowStreamLookAhead(*activity, inputStream, rowIf, bufsize, allowspill, preserveGrouping, maxcount, notify);
 }
 
 void initMetaInfo(ThorDataLinkMetaInfo &info)
@@ -609,25 +648,15 @@ class CWriteHandler : implements IFileIO, public CInterface
     bool remote;
     CFIPScope fipScope;
     unsigned twFlags;
+    bool closed = false;
 
-public:
-    IMPLEMENT_IINTERFACE_USING(CInterface);
-
-    CWriteHandler(CActivityBase &_activity, IPartDescriptor &_partDesc, IFile *_primary, IFileIO *_primaryio, ICopyFileProgress *_iProgress, unsigned _twFlags, bool *_aborted)
-        : activity(_activity), partDesc(_partDesc), primary(_primary), primaryio(_primaryio), iProgress(_iProgress), twFlags(_twFlags), aborted(_aborted), fipScope(primary->queryFilename())
+    void checkAndHandleClose()
     {
-        RemoteFilename rfn;
-        partDesc.getFilename(0, rfn);
-        remote = !rfn.isLocal();
-        rfn.getPath(primaryName);
-        if (globals->getPropBool("@replicateAsync", true))
-            cancelReplicates(&activity, partDesc);
-    }
-    virtual void beforeDispose() override
-    {
-        // Can't throw in destructor...
-        // Note that if we do throw the CWriteHandler object is liable to be leaked...
-        primaryio.clear(); // should close
+        if (closed)
+            return;
+        closed = true;
+        primaryio->close();
+        // NB: do not clear 'primaryio', keep around after close for this object's getStatistic calls.
         if (aborted && *aborted)
         {
             primary->remove(); // i.e. never completed, so remove partial (temp) primary
@@ -692,18 +721,59 @@ public:
         if (partDesc.numCopies()>1)
             _doReplicate(&activity, partDesc, iProgress);
     }
+
+public:
+    IMPLEMENT_IINTERFACE_USING(CInterface);
+
+    CWriteHandler(CActivityBase &_activity, IPartDescriptor &_partDesc, IFile *_primary, IFileIO *_primaryio, ICopyFileProgress *_iProgress, unsigned _twFlags, bool *_aborted)
+        : activity(_activity), partDesc(_partDesc), primary(_primary), primaryio(_primaryio), iProgress(_iProgress), twFlags(_twFlags), aborted(_aborted), fipScope(primary->queryFilename())
+    {
+        RemoteFilename rfn;
+        partDesc.getFilename(0, rfn);
+        remote = !rfn.isLocal();
+        rfn.getPath(primaryName);
+        if (globals->getPropBool("@replicateAsync", true))
+            cancelReplicates(&activity, partDesc);
+    }
+    virtual void beforeDispose() override
+    {
+        // Can't throw in destructor...
+        // Note that if we do throw the CWriteHandler object is liable to be leaked...
+        try
+        {
+            checkAndHandleClose();
+        }
+        catch (IException *e)
+        {
+            DISLOG(e, "CWriteHandler::beforeDispose");
+            e->Release();
+        }
+    }
 // IFileIO impl.
     virtual size32_t read(offset_t pos, size32_t len, void * data) { return primaryio->read(pos, len, data); }
     virtual offset_t size() { return primaryio->size(); }
     virtual size32_t write(offset_t pos, size32_t len, const void * data) { return primaryio->write(pos, len, data); }
-    virtual offset_t appendFile(IFile *file,offset_t pos=0,offset_t len=-1) { return primaryio->appendFile(file, pos, len); }
     virtual unsigned __int64 getStatistic(StatisticKind kind) { return primaryio->getStatistic(kind); }
     virtual void setSize(offset_t size) { primaryio->setSize(size); }
     virtual void flush() { primaryio->flush(); }
-    virtual void close() { primaryio->close(); }
+    virtual void close() 
+    {
+        checkAndHandleClose();
+    }
+    virtual IFile * queryFile() const override
+    {
+        return primaryio->queryFile();
+    }
 };
 
-IFileIO *createMultipleWrite(CActivityBase *activity, IPartDescriptor &partDesc, unsigned recordSize, unsigned twFlags, bool &compress, ICompressor *ecomp, ICopyFileProgress *iProgress, bool *aborted, StringBuffer *_outLocationName)
+// This function creates an output stream for writing, and wraps it in a class that renames the file, and copies it
+// to any other copies when the stream is destroyed.
+// GH->JCS. If there are no copies, and the file is not being renamed this could be avoided.
+// GH->JCS. Now that we always call close, should this log an error if close is not called before beforeDispose()?
+// GH->JCS. It would be better if this wrapped the base IFileIO, rather than the compressed IFileIO - otherwise each write goes through
+//          an extra layer of virtual calls.
+
+IFileIO *createMultipleWrite(CActivityBase *activity, IPartDescriptor &partDesc, unsigned twFlags, bool &compress, ICompressor *ecomp, ICopyFileProgress *iProgress, bool *aborted, StringBuffer *_outLocationName, CompressionMethod * compMethodResult)
 {
     StringBuffer outLocationNameI;
     StringBuffer &outLocationName = _outLocationName?*_outLocationName:outLocationNameI;
@@ -712,7 +782,7 @@ IFileIO *createMultipleWrite(CActivityBase *activity, IPartDescriptor &partDesc,
     partDesc.getFilename(0, rfn);
     StringBuffer primaryName;
     rfn.getPath(primaryName);
-    if (isUrl(primaryName))
+    if (!getRenameSupportedFromPath(primaryName))
     {
         twFlags &= ~TW_RenameToPrimary;
         twFlags |= TW_Direct;
@@ -726,50 +796,77 @@ IFileIO *createMultipleWrite(CActivityBase *activity, IPartDescriptor &partDesc,
     else
     {
         // use temp name
-        GetTempName(outLocationName, "partial");
         if (rfn.isLocal() || (twFlags & TW_External))
-        { // ensure local tmp in same directory as target
+        {
+            // ensure local tmp in same directory (and plane) as target
             StringBuffer dir;
             splitDirTail(primaryName, dir);
             addPathSepChar(dir);
-            dir.append(pathTail(outLocationName));
+            GetTempFileName(dir, "partial");
             outLocationName.swapWith(dir);
         }
+        else
+            GetTempFilePath(outLocationName, "partial");
+
         assertex(outLocationName.length());
-        ensureDirectoryForFile(outLocationName.str());
     }
+    ensureDirectoryForFile(outLocationName.str());
+
+    StringBuffer planeName;
+    partDesc.queryOwner().queryClusterNum(0)->getGroupName(planeName);
+    size32_t blockedIoSize = getBlockedFileIOSize(planeName, (size32_t)-1);
+
     OwnedIFile file = createIFile(outLocationName.str());
     Owned<IFileIO> fileio;
+    CompressionMethod compMethod = COMPRESS_METHOD_NONE;
     if (compress)
     {
-        unsigned compMethod = COMPRESS_METHOD_LZ4;
+        compMethod = COMPRESS_METHOD_LZ4;
         // rowdif used if recordSize > 0, else fallback to compMethod
         if (!ecomp)
         {
-            if (twFlags & TW_Temporary)
-            {
-                // if temp file then can use newer compressor
-                StringBuffer compType;
-                activity->getOpt(THOROPT_COMPRESS_SPILL_TYPE, compType);
-                compMethod = getCompMethod(compType);
-            }
             // force
-            if (activity->getOptBool(THOROPT_COMP_FORCELZW, false))
-            {
-                recordSize = 0; // by default if fixed length (recordSize set), row diff compression is used. This forces compMethod.
+            StringBuffer compressionType;
+            if (activity->getOpt(THOROPT_COMPRESS_FORMAT, compressionType))
+                compMethod = getCompMethod(compressionType);
+            else if (activity->getOptBool(THOROPT_COMP_FORCELZW, false))
                 compMethod = COMPRESS_METHOD_LZW;
-            }
             else if (activity->getOptBool(THOROPT_COMP_FORCEFLZ, false))
                 compMethod = COMPRESS_METHOD_FASTLZ;
             else if (activity->getOptBool(THOROPT_COMP_FORCELZ4, false))
                 compMethod = COMPRESS_METHOD_LZ4;
             else if (activity->getOptBool(THOROPT_COMP_FORCELZ4HC, false))
                 compMethod = COMPRESS_METHOD_LZ4HC;
+            else // if not configured by HINT, #options or global config settings
+            {
+                Owned<const IStoragePlane> storagePlane = getStoragePlaneByName(planeName, false);
+                CompressionMethod planeCompressionMethod = COMPRESS_METHOD_NONE;
+                if (storagePlane)
+                {
+                    const char *compression = storagePlane->queryCompression();
+                    if (!isEmptyString(compression))
+                        compMethod = planeCompressionMethod = getCompMethod(compression);
+                }
+                if (planeCompressionMethod == COMPRESS_METHOD_NONE)
+                {
+                    if (twFlags & TW_Temporary)
+                    {
+                        StringBuffer compType;
+                        activity->getOpt(THOROPT_COMPRESS_SPILL_TYPE, compType);
+                        compMethod = getCompMethod(compType); // NB: defaults to LZ4 if unset/blank
+                    }
+                    else if (twFlags & (TW_JobTemp|TW_Persist))
+                        compMethod = COMPRESS_METHOD_ZSTD;
+                }
+            }
         }
-        fileio.setown(createCompressedFileWriter(file, recordSize, 0 != (twFlags & TW_Extend), true, ecomp, compMethod));
+        size32_t compressBlockSize = 0; // i.e. default.
+        IFEflags fileIOExtaFlags = IFEnone;
+        fileio.setown(createCompressedFileWriter(file, 0 != (twFlags & TW_Extend), true, ecomp, compMethod, compressBlockSize, blockedIoSize, fileIOExtaFlags));
         if (!fileio)
         {
             compress = false;
+            compMethod = COMPRESS_METHOD_NONE;
             Owned<IThorException> e = MakeActivityWarning(activity, TE_LargeBufferWarning, "Could not write file '%s' compressed", outLocationName.str());
             activity->fireException(e);
             fileio.setown(file->open((twFlags & TW_Extend)&&file->exists()?IFOwrite:IFOcreate));
@@ -779,26 +876,14 @@ IFileIO *createMultipleWrite(CActivityBase *activity, IPartDescriptor &partDesc,
         fileio.setown(file->open((twFlags & TW_Extend)&&file->exists()?IFOwrite:IFOcreate));
     if (!fileio)
         throw MakeActivityException(activity, TE_FileCreationFailed, "Failed to create file for write (%s) error = %d", outLocationName.str(), GetLastError());
+
+    if (compMethodResult)
+        *compMethodResult = compMethod;
+
     StringBuffer compStr;
     if (compress)
     {
-        ICompressedFileIO *icompfio = QUERYINTERFACE(fileio.get(), ICompressedFileIO);
-        if (icompfio)
-        {
-            unsigned compMeth2 = icompfio->method();
-            if (COMPRESS_METHOD_FASTLZ == compMeth2)
-                compStr.append("flz");
-            else if (COMPRESS_METHOD_LZ4 == compMeth2)
-                compStr.append("lz4");
-            else if (COMPRESS_METHOD_LZW == compMeth2)
-                compStr.append("lzw");
-            else if (COMPRESS_METHOD_ROWDIF == compMeth2)
-                compStr.append("rdiff");
-            else
-                compStr.append("unknown");
-        }
-        else
-            compStr.append("unknown");
+        compStr.append(translateFromCompMethod(compMethod));
     }
     else
         compStr.append("false");
@@ -811,7 +896,7 @@ StringBuffer &locateFilePartPath(CActivityBase *activity, const char *logicalFil
 {
     unsigned location;
     OwnedIFile ifile;
-    if (globals->getPropBool("@autoCopyBackup", true)?ensurePrimary(activity, partDesc, ifile, location, filePath):getBestFilePart(activity, partDesc, ifile, location, filePath, activity))
+    if (globals->getPropBool("@autoCopyBackup", !isContainerized())?ensurePrimary(activity, partDesc, ifile, location, filePath):getBestFilePart(activity, partDesc, ifile, location, filePath, activity))
         ActPrintLog(activity, "reading physical file '%s' (logical file = %s)", filePath.str(), logicalFilename);
     else
     {
@@ -823,73 +908,84 @@ StringBuffer &locateFilePartPath(CActivityBase *activity, const char *logicalFil
     return filePath;
 }
 
-
-IRowStream *createSequentialPartHandler(CPartHandler *partHandler, IArrayOf<IPartDescriptor> &partDescs, bool grouped)
+CSeqPartHandler::CSeqPartHandler(CPartHandler *_partHandler, IArrayOf<IPartDescriptor> &_partDescs, bool _grouped)
+    : partDescs(_partDescs), partHandler(_partHandler), grouped(_grouped)
 {
-    class CSeqPartHandler : implements IRowStream, public CSimpleInterface
+    part = 0;
+    someInGroup = false;
+    if (0==numParts())
     {
-        IArrayOf<IPartDescriptor> &partDescs;
-        int part, parts;
-        bool eof, grouped, someInGroup;
-        Linked<CPartHandler> partHandler;
+        eof = true;
+    }
+    else
+    {
+        eof = false;
+        partHandler->setPart(&partDescs.item(0));
+    }
+}
 
-        IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
-    public:
-        CSeqPartHandler(CPartHandler *_partHandler, IArrayOf<IPartDescriptor> &_partDescs, bool _grouped) 
-            : partDescs(_partDescs), partHandler(_partHandler), grouped(_grouped)
+void CSeqPartHandler::stop()
+{
+    if (partHandler)
+    {
+        partHandler->stop();
+        partHandler.clear();
+    }
+}
+
+const void * CSeqPartHandler::nextRow()
+{
+    if (unlikely(eof))
+    {
+        return NULL;
+    }
+    for (;;)
+    {
+        OwnedConstThorRow row = partHandler->nextRow();
+        if (likely(row))
         {
-            part = 0;
-            parts = partDescs.ordinality();
+            someInGroup = true;
+            return row.getClear();
+        }
+        if (grouped && someInGroup)
+        {
             someInGroup = false;
-            if (0==parts)
-            {
-                eof = true;
-            }
-            else
-            {
-                eof = false;
-                partHandler->setPart(&partDescs.item(0));
-            }
+            return NULL;
         }
-        virtual void stop()
+        ++part;
+        if (part >= numParts())
         {
-            if (partHandler)
-            {
-                partHandler->stop();
-                partHandler.clear();
-            }
+            partHandler->stop();
+            partHandler.clear();
+            eof = true;
+            return NULL;
         }
-        const void *nextRow()
-        {
-            if (eof)
-            {
-                return NULL;
-            }
-            for (;;)
-            {
-                OwnedConstThorRow row = partHandler->nextRow();
-                if (row)
-                {
-                    someInGroup = true;
-                    return row.getClear();
-                }
-                if (grouped && someInGroup)
-                {
-                    someInGroup = false;
-                    return NULL;
-                }
-                ++part;
-                if (part >= parts)
-                {
-                    partHandler->stop();
-                    partHandler.clear();
-                    eof = true;
-                    return NULL;
-                }
-                partHandler->setPart(&partDescs.item(part));
-            }
-        }
-    };
+        partHandler->setPart(&partDescs.item(part));
+    }
+}
+
+CSeqPartHandler *createSequentialPartHandler(CPartHandler *partHandler, IArrayOf<IPartDescriptor> &partDescs, bool grouped)
+{
     return new CSeqPartHandler(partHandler, partDescs, grouped);
 }
 
+/////
+
+void getPlaneReadAheadSizing(CActivityBase &activity, const char *filename, unsigned &numThreads, size32_t &chunkSize)
+{
+    numThreads = 0;
+    chunkSize = 0;
+
+    Owned<const IStoragePlane> plane = getStoragePlaneFromPath(filename, false);
+    if (plane)
+    {
+        const char *planeName = plane->queryName();
+        VStringBuffer optName("%s.%s", planeName, THOROPT_PLANE_READAHEAD_THREADS);
+        numThreads = activity.getOptInt(optName);
+        optName.clear().appendf("%s.%s", planeName, THOROPT_PLANE_READAHEAD_CHUNK_SIZE);
+        chunkSize = activity.getOptInt(optName) * 1024;
+    }
+
+    // if numThreads/chunkSize are unset, this will determine appropriate values based on plane configuration
+    getPlaneReadAheadSizing(plane, numThreads, chunkSize);
+}

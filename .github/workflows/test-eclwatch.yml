@@ -1,0 +1,102 @@
+name: Test ECL Watch (test-eclwatch.yml)
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        type: string
+        description: 'Operating System'
+        required: false
+        default: 'ubuntu-22.04'
+      asset-name:
+        type: string
+        description: 'Asset Name'
+        required: false
+        default: 'build-docker-package'
+      dependencies:
+        type: string
+        description: 'Dependencies'
+        required: false
+        default: 'bison flex build-essential binutils-dev curl lsb-release libcppunit-dev python3-dev default-jdk r-base-dev r-cran-rcpp r-cran-rinside r-cran-inline libtool autotools-dev automake git cmake xmlstarlet'
+
+permissions:
+  contents: read
+
+jobs:
+
+  build:
+    name: "Test eclwatch"
+    runs-on: ${{ inputs.os }}
+
+    strategy:
+      matrix:
+        node-version: [22, 24, 26]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: "recursive"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ github.workspace }}/esp/src/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: ${{ github.workspace }}/esp/src
+        run: npm ci
+
+      - name: Download Package
+        if: ${{ matrix.node-version == 22 }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.asset-name }}
+          path: ${{ inputs.asset-name }}
+
+      - name: Install Package
+        if: ${{ matrix.node-version == 22 }}
+        shell: "bash"
+        run: |
+          sudo apt-get install -y xmlstarlet
+          sudo apt-get install -y -f ./${{ inputs.asset-name }}/*.deb
+          sudo chown -R $USER:$USER /opt/HPCCSystems
+          sudo xmlstarlet ed -L -u 'Environment/Software/ThorCluster/@slavesPerNode' -v 2 -u 'Environment/Software/ThorCluster/@channelsPerSlave' -v 1 /etc/HPCCSystems/environment.xml
+
+      - name: Start HPCC-Platform
+        if: ${{ matrix.node-version == 22 }}
+        shell: "bash"
+        run: |
+          export LANG="en_US.UTF-8"
+          sudo update-locale
+          sudo /etc/init.d/hpcc-init start
+
+      - name: Lint
+        if: ${{ matrix.node-version == 22 }}
+        working-directory: ${{ github.workspace }}/esp/src
+        run: npm run lint
+
+      - name: Install Playwright browsers
+        if: ${{ matrix.node-version == 22 }}
+        working-directory: ${{ github.workspace }}/esp/src
+        run: CI=1 npx playwright install --with-deps
+
+      - name: Set Server IP
+        if: ${{ matrix.node-version == 22 }}
+        working-directory: ${{ github.workspace }}/esp/src
+        run: |
+          echo "http://localhost:8010" > lws.target.txt
+          echo "" >> lws.target.txt
+
+      - name: Test
+        if: ${{ matrix.node-version == 22 }}
+        working-directory: ${{ github.workspace }}/esp/src
+        run: npm run test-ci
+
+      - name: Upload Playwright test results
+        if: ${{ (matrix.node-version == 22) && (failure() || cancelled()) }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: eclwatch-test-results
+          path: ${{ github.workspace }}/esp/src/test-results/*
+          if-no-files-found: warn

@@ -43,9 +43,10 @@ KeyCompressor::~KeyCompressor()
     }
 }
 
-void KeyCompressor::open(void *blk,int blksize,bool _isVariable, bool rowcompression)
+void KeyCompressor::open(void *blk,int blksize,bool _isVariable, bool rowcompression, size32_t _fixedRowSize)
 {
     isVariable = _isVariable;
+    fixedRowSize = _fixedRowSize;
     isBlob = false;
     curOffset = 0;
     ::Release(comp);
@@ -58,47 +59,126 @@ void KeyCompressor::open(void *blk,int blksize,bool _isVariable, bool rowcompres
     }
     else
         comp = createLZWCompressor(true);
-    comp->open(blk,blksize);
+    comp->open(blk,blksize,_fixedRowSize, false );
+    method = comp->getCompressionMethod();
 }
 
-void KeyCompressor::openBlob(void *blk,int blksize)
+void KeyCompressor::open(void *blk,int blksize, ICompressHandler * compressionHandler, const char * options, bool _isVariable, size32_t _fixedRowSize)
+{
+    isVariable = _isVariable;
+    isBlob = false;
+    curOffset = 0;
+    ::Release(comp);
+    comp = compressionHandler->getCompressor(options);
+    comp->open(blk,blksize, _fixedRowSize, false);
+    method = comp->getCompressionMethod();
+    fixedRowSize = _fixedRowSize;
+}
+
+void KeyCompressor::open(void *blk,int blksize, ICompressor * compressor, bool _isVariable, size32_t _fixedRowSize)
+{
+    isVariable = _isVariable;
+    isBlob = false;
+    curOffset = 0;
+    ::Release(comp);
+    comp = LINK(compressor);
+    comp->open(blk,blksize, _fixedRowSize, false);
+    method = comp->getCompressionMethod();
+    fixedRowSize = _fixedRowSize;
+}
+
+void KeyCompressor::openBlob(CompressionMethod compression, void *blk,int blksize)
 {
     isVariable = false;
     isBlob = true;
     curOffset = 0;
     ::Release(comp);
     comp = NULL;
-    comp = createLZWCompressor(true);
-    comp->open(blk,blksize);
+    comp = queryCompressHandler(compression)->getCompressor();
+    comp->open(blk,blksize,0, true);
+    method = comp->getCompressionMethod();
 }
 
-int KeyCompressor::writekey(offset_t fPtr, const char *key, unsigned datalength, unsigned __int64 sequence)
+int KeyCompressor::writekey(offset_t fPtr, const char *key, unsigned datalength, unsigned options, unsigned keyedDelta)
 {
     assert(!isBlob);
-    comp->startblock(); // start transaction
-    // first write out length if variable
-    if (isVariable) {
-        KEYRECSIZE_T rs = datalength;
-        _WINREV(rs);
-        if (comp->write(&rs, sizeof(rs))!=sizeof(rs)) {
-            close();
-            return 0;
+    assertex(__BYTE_ORDER == __LITTLE_ENDIAN); // otherwise the following code is wrong.
+
+    //Copy the data into a buffer so all the data is written in a single write()
+    tempKeyBuffer.clear();
+    if (isVariable)
+    {
+        if (keyedDelta)
+        {
+            unsigned payloadLength = datalength - keyedDelta;
+            assertex(payloadLength <= 0x7FFF);
+            if (payloadLength < 0x80)
+            {
+                tempKeyBuffer.append((byte)payloadLength);
+            }
+            else
+            {
+                byte firstByte = (byte)(payloadLength >> 8) | 0x80;
+                tempKeyBuffer.append(firstByte);
+                tempKeyBuffer.append((byte)payloadLength);
+            }
+        }
+        else
+        {
+            KEYRECSIZE_T rs = datalength;
+            tempKeyBuffer.appendSwap(sizeof(rs), &rs);
         }
     }
-    // then write out fpos and key
-    _WINREV(fPtr);
-    if (comp->write(&fPtr,sizeof(offset_t))!=sizeof(offset_t)) {
-        close();
-        return 0;
-    }
-    if (comp->write(key,datalength)!=datalength) {
-        close();
-        return 0;
-    }
-    comp->commitblock();    // end transaction
 
+    if (options & LeadingFilePosition)
+        tempKeyBuffer.appendSwap(sizeof(offset_t), &fPtr);
+    tempKeyBuffer.append(datalength, key);
+    if (options & TrailingFilePosition)
+        tempKeyBuffer.appendSwap(sizeof(offset_t), &fPtr);
+
+    size32_t toWrite = tempKeyBuffer.length();
+    if (comp->write(tempKeyBuffer.bufferBase(),toWrite)!=toWrite)
+    {
+        close();
+        return 0;
+    }
     return 1;
 }
+
+bool KeyCompressor::compressBlock(size32_t destSize, void * dest, size32_t srcSize, const void * src, ICompressHandler * compressionHandler, const char * options, bool isVariable, size32_t fixedSize)
+{
+    bool ok = false;
+    Owned<ICompressor> compressor = compressionHandler->getCompressor(options);
+    if (compressor->supportsBlockCompression())
+    {
+        size32_t written = compressor->compressBlock(destSize, dest, srcSize, src);
+        if (written)
+        {
+            bufp = dest;
+            bufl = written;
+            method = compressor->getCompressionMethod();
+            ok = true;
+        }
+    }
+    else
+    {
+        open(dest, destSize, compressionHandler, options, isVariable, fixedSize);
+        ok = write(src, srcSize);
+        close();
+    }
+    return ok;
+}
+
+bool KeyCompressor::write(const void * data, size32_t datalength)
+{
+    if (comp->write(data,datalength)!=datalength)
+    {
+        close();
+        return false;
+    }
+    return true;
+}
+
 
 unsigned KeyCompressor::writeBlob(const char *data, unsigned datalength)
 {
@@ -107,18 +187,17 @@ unsigned KeyCompressor::writeBlob(const char *data, unsigned datalength)
     if (!comp)
         return 0;
 
-
     unsigned originalOffset = curOffset;
-    comp->startblock(); // start transaction
-    char zero = 0;
-    while (curOffset & 0xf)
+    unsigned zeroPadding = (16 - (curOffset & 0xf)) & 0xf;
+    if (zeroPadding)
     {
-        if (comp->write(&zero,sizeof(zero))!=sizeof(zero)) {
+        char zeros[16] = { 0 };
+        if (comp->write(zeros, zeroPadding) != zeroPadding)
+        {
             close();
-            curOffset = originalOffset;
             return 0;
         }
-        curOffset++;
+        curOffset += zeroPadding;
     }
 
     unsigned rdatalength = datalength;
@@ -146,14 +225,17 @@ unsigned KeyCompressor::writeBlob(const char *data, unsigned datalength)
         curOffset++;
         written++;
         data++;
-        comp->startblock();
     }
-    comp->commitblock();
     if (written != datalength)
         close();
     return written;
 }
 
+
+bool KeyCompressor::adjustLimit(size32_t newLimit)
+{
+    return comp && comp->adjustLimit(newLimit);
+}
 
 void KeyCompressor::close()
 { // gets called either when write failed or explicitly by client

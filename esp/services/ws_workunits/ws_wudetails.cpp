@@ -22,6 +22,9 @@
 #include "workunit.hpp"
 #include "jset.hpp"
 #include "jstatcodes.h"
+#include "sysinfologger.hpp"
+
+#define COMPONENT_NOTE_MASK 0x80000000
 
 typedef std::pair<WuAttr, StringBuffer> AttribValuePair;
 bool operator==(const AttribValuePair & p1, const AttribValuePair & p2)
@@ -383,9 +386,9 @@ void WUDetailsVisitor::buildAttribListToReturn(IConstWUPropertiesToReturn & prop
         return;
 
     if (statisticsPostFilterRequired)
-        propertiesToReturnStats.set(createBitSet(StatisticFilterMaskSize));
+        propertiesToReturnStats.setown(createBitSet(StatisticFilterMaskSize));
     if (attributesPostFilterRequired)
-        propertiesToReturnAttribs.set(createBitSet(AttributeFilterMaskSize));
+        propertiesToReturnAttribs.setown(createBitSet(AttributeFilterMaskSize));
 
     StringArray & propertiesToReturnList = propertiesToReturn.getProperties();
     ForEachItemIn(idx1,propertiesToReturnList)
@@ -415,8 +418,8 @@ void WUDetailsVisitor::resetScope()
     currentStatisticScopeType = SSTnone;
     extraStatisticsForCurScope = nullptr;
     extraAttributesForCurScope = nullptr;
-    EspWUResponseProperties.clear();
-    EspWUResponseNotes.clear();
+    EspWUResponseProperties.kill();
+    EspWUResponseNotes.kill();
     endListAttr();
 }
 
@@ -439,47 +442,107 @@ void WUDetails::processRequest(IEspWUDetailsRequest &req, IEspWUDetailsResponse 
     const bool includeScopeType = scopeOptions.getIncludeScopeType();
     const bool includeId = scopeOptions.getIncludeId();
 
-    buildWuScopeFilter(req.getScopeFilter(), req.getNestedFilter(), req.getPropertiesToReturn(),
-                       req.getFilter(), scopeOptions);
-
-    StringBuffer filter;
-    PROGLOG("WUDetails: %s", wuScopeFilter.describe(filter).str());
-
     IArrayOf<IEspWUResponseScope> respScopes;
-    WUDetailsVisitor wuDetailsVisitor(req.getPropertyOptions(), req.getPropertiesToReturn());
-    Owned<IConstWUScopeIterator> iter = &workunit->getScopeIterator(wuScopeFilter);
-    ForEach(*iter)
-    {
-        StatisticScopeType scopeType = iter->getScopeType();
-        const char * scope = iter->queryScope();
-        assertex(scope);
-
-        wuDetailsVisitor.noteScopeType(scopeType);
-        iter->playProperties(wuDetailsVisitor);
-
-        Owned<IEspWUResponseScope> respScope = createWUResponseScope("","");
-        if (includeScope)
-            respScope->setScopeName(scope);
-        if (includeScopeType)
-            respScope->setScopeType(queryScopeTypeName(scopeType));
-        if (includeId)
-            respScope->setId(queryScopeTail(scope));
-
-        IArrayOf<IEspWUResponseProperty> & properties = wuDetailsVisitor.getResponseProperties();
-        if (!properties.empty())
-            respScope->setProperties(properties);
-
-        IArrayOf<IEspWUResponseNote> & notes = wuDetailsVisitor.getResponseNotes();
-        if (!notes.empty())
-            respScope->setNotes(notes);
-
-        respScopes.append(*respScope.getClear());
-
-        wuDetailsVisitor.resetScope();
-    }
     StringBuffer maxVersion;
-    maxVersion.append(wuDetailsVisitor.getMaxTimestamp());
+    if (workunit)
+    {
+        buildWuScopeFilter(req.getScopeFilter(), req.getNestedFilter(), req.getPropertiesToReturn(),
+                           req.getFilter(), scopeOptions);
 
+        StringBuffer filter;
+        PROGLOG("WUDetails: %s", wuScopeFilter.describe(filter).str());
+        WUDetailsVisitor wuDetailsVisitor(req.getPropertyOptions(), req.getPropertiesToReturn());
+        Owned<IConstWUScopeIterator> iter = &workunit->getScopeIterator(wuScopeFilter);
+        ForEach(*iter)
+        {
+            StatisticScopeType scopeType = iter->getScopeType();
+            const char * scope = iter->queryScope();
+            assertex(scope);
+
+            wuDetailsVisitor.noteScopeType(scopeType);
+            iter->playProperties(wuDetailsVisitor);
+
+            Owned<IEspWUResponseScope> respScope = createWUResponseScope("","");
+            if (includeScope)
+                respScope->setScopeName(scope);
+            if (includeScopeType)
+                respScope->setScopeType(queryScopeTypeName(scopeType));
+            if (includeId)
+                respScope->setId(queryScopeTail(scope));
+
+            IArrayOf<IEspWUResponseProperty> & properties = wuDetailsVisitor.getResponseProperties();
+            if (!properties.empty())
+                respScope->setProperties(properties);
+
+            IArrayOf<IEspWUResponseNote> & notes = wuDetailsVisitor.getResponseNotes();
+            if (!notes.empty())
+                respScope->setNotes(notes);
+
+            respScopes.append(*respScope.getClear());
+
+            wuDetailsVisitor.resetScope();
+        }
+        maxVersion.append(wuDetailsVisitor.getMaxTimestamp());
+    }
+    else
+    {
+        if (req.getPropertiesToReturn().getAllNotes())
+        {
+            Owned<IPropertyTree> componentConfig = getComponentConfig();
+            IArrayOf<IEspWUResponseNote> espWuResponseNotes;
+            // Global messages
+            // Note: there are 2 types of 'notes':
+            // 1) static component warnings (usually from Helm templates)
+            // 2) dynamic global messages generated from executing components
+            // Static component messages will have COMPONENT_NOTE_MASK.
+            Owned<IPropertyTreeIterator> iter = componentConfig->getElements("warnings");
+            unsigned __int64 entry_num=1;
+            CDateTime dt;
+            dt.setNow();
+            timestamp_type ts = dt.getTimeStamp();
+            ForEach(*iter)
+            {
+                IPropertyTree & cur = iter->query();
+
+                Owned<IEspWUResponseNote> espWuResponseNote = createWUResponseNote("","");
+                espWuResponseNote->setSource(cur.queryProp("@source"));
+                espWuResponseNote->setMessage(cur.queryProp("@msg"));
+                if (cur.hasProp("@code"))
+                    espWuResponseNote->setErrorCode(cur.getPropInt64("@code"));
+                else
+                    espWuResponseNote->setErrorCode_null();
+                espWuResponseNote->setSeverity(cur.queryProp("@severity"));
+                espWuResponseNote->setCost(0);
+                VStringBuffer idstr("%" I64F "u", makeMessageId(ts, entry_num, true));
+                espWuResponseNote->setId(idstr.str());
+                espWuResponseNotes.append(*espWuResponseNote.getClear());
+                entry_num++;
+            }
+            Owned<ISysInfoLoggerMsgFilter> msgFilter = createSysInfoLoggerMsgFilter();
+            msgFilter->setVisibleOnly();
+            Owned<ISysInfoLoggerMsgIterator> msgIter = createSysInfoLoggerMsgIterator(msgFilter);
+            ForEach(*msgIter)
+            {
+                ISysInfoLoggerMsg & sysInfoMsg = msgIter->query();
+                Owned<IEspWUResponseNote> espWuResponseNote = createWUResponseNote("","");
+                StringBuffer tmpbuf;
+                encodeXML(sysInfoMsg.queryMsg(), tmpbuf, ENCODE_NEWLINES, strlen(sysInfoMsg.queryMsg()), true);
+                espWuResponseNote->setSource(sysInfoMsg.querySource());
+                espWuResponseNote->setMessage(tmpbuf.str());
+                espWuResponseNote->setErrorCode(sysInfoMsg.queryLogMsgCode());
+                espWuResponseNote->setSeverity(LogMsgClassToVarString(sysInfoMsg.queryClass()));
+                espWuResponseNote->setCost(0);
+                VStringBuffer idstr("%" I64F "u", sysInfoMsg.queryLogMsgId());
+                espWuResponseNote->setId(idstr.str());
+                espWuResponseNotes.append(*espWuResponseNote.getClear());
+            }
+            Owned<IEspWUResponseScope> respScope = createWUResponseScope("","");
+            respScope->setScopeName("");
+            respScope->setNotes(espWuResponseNotes);
+            respScopes.append(*respScope.getClear());
+        }
+        maxVersion.append(0);
+    }
     resp.setWUID(wuid.str());
     resp.setMaxVersion(maxVersion.str());
     resp.setScopes(respScopes);

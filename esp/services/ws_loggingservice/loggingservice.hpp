@@ -42,11 +42,6 @@ class CWsLoggingServiceEx : public CWsLoggingService
     typedef std::vector<IUpdateLogThread*> LOGGING_AGENTTHREADS;
     LOGGING_AGENTTHREADS  loggingAgentThreads;
 
-    unsigned loggingServiceThreadPoolSize;
-    unsigned loggingServiceThreadWaitingTimeOut;
-    unsigned loggingServiceThreadPoolStackSize;
-    Owned<IThreadPool> loggingServiceThreadPool;
-
     IEspLogAgent* loadLoggingAgent(const char* name, const char* dll);
 
 public:
@@ -65,6 +60,10 @@ public:
     };
 
     virtual bool init(const char* name, const char* type, IPropertyTree* cfg, const char* process);
+    void initLogAgent(IPropertyTree &ptree, const char *process, const char *service);
+    void initLogAgentSet(IPropertyTree &ptree, const char *process, const char *service);
+    void initLogAgentDirectory(const char *agentdir, const char *mask, const char *process, const char *service);
+
 
     //interface IEspLoggingService
     bool onGetTransactionSeed(IEspContext& context, IEspGetTransactionSeedRequest& req, IEspGetTransactionSeedResponse& resp);

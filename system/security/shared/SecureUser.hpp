@@ -46,12 +46,12 @@ private:
     static const SecFeatureSet s_safeFeatures = SUF_ALL_FEATURES;
     static const SecFeatureSet s_implementedFeatures = (s_safeFeatures & ~(SUF_GetDataElement | SUF_GetDataElements | SUF_SetData));
 
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
 public:
     IMPLEMENT_IINTERFACE
 
     CSecureUser(const char *name, const char *pw) :
-        m_name(name), m_pw(pw), m_authenticateStatus(AS_UNKNOWN), m_userID(0), m_status(SecUserStatus_Unknown), m_sessionToken(0), m_parameters(createProperties(false))
+        m_name(name), m_pw(pw), m_authenticateStatus(AS_UNKNOWN), m_userID(0), m_status(SecUserStatus_Unknown), m_parameters(createProperties(false)), m_sessionToken(0)
     {
     }
 
@@ -327,6 +327,11 @@ public:
     bool setData(IPropertyTree* data) override
     {
         return false;
+    }
+
+    virtual bool isCanonicalMatch(const char* name) const override
+    {
+        return (name && strieq(m_name.str(), name));
     }
 };
 

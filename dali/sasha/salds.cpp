@@ -5,7 +5,6 @@
 #include "jmisc.hpp"
 #include "jstring.hpp"
 
-#include "saserver.hpp"
 #include "salds.hpp"
 
 // MORE TBD
@@ -20,13 +19,20 @@ class CLargeDataStore: public CInterface, implements ILargeDataStore
     void initBase()
     {
         if (!LdsBaseDir.get()) {
+#ifdef _CONTAINERIZED
+            StringBuffer path;
+            getComponentConfigSP()->getProp("@storagePath", path);
+            assertex(!isEmptyString(path));
+            addPathSepChar(path);
+            LdsBaseDir.set(path);
+#else
             StringBuffer basedir;
             const char *ldsrootdir="LDS";
-            IPropertyTree *ldsprops = serverConfig->queryPropTree("LDS");
+            Owned<IPropertyTree> ldsprops = getComponentConfigSP()->getPropTree("LDS");
             if (ldsprops&&ldsprops->hasProp("@rootdir"))
                 ldsrootdir = ldsprops->queryProp("@rootdir");
             StringBuffer dataPath;
-            if (getConfigurationDirectory(serverConfig->queryPropTree("Directories"),"data","sasha",serverConfig->queryProp("@name"),dataPath)) 
+            if (getConfigurationDirectory(getComponentConfigSP()->queryPropTree("Directories"),"data","sasha",getComponentConfigSP()->queryProp("@name"),dataPath)) 
                 ldsrootdir=dataPath.str();
             if (!isAbsolutePath(ldsrootdir)) {
                 char cpath[_MAX_DIR];
@@ -48,6 +54,7 @@ class CLargeDataStore: public CInterface, implements ILargeDataStore
                 ldsrootdir++;
             }
             LdsBaseDir.set(basedir.str(),basedir.length());
+#endif
         }
     }
 

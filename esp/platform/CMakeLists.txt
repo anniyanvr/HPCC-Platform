@@ -42,6 +42,7 @@ include_directories (
          ./../../system/jlib 
          ./../bindings/http/platform 
          ./../../common/environment 
+         ./../../common/workunit
          ./../../system/mp 
          ./../../fs/dafsclient
          ${CMAKE_BINARY_DIR}
@@ -52,14 +53,22 @@ ADD_DEFINITIONS( -D_CONSOLE -DESPCFG_EXPORTS)
 
 HPCC_ADD_EXECUTABLE ( esp ${SRCS} )
 install ( TARGETS esp RUNTIME DESTINATION ${EXEC_DIR} )
-target_link_libraries ( esp 
+target_link_libraries ( esp PRIVATE 
          jlib
          mp 
+         dafsclient
          ${XALAN_LIBRARIES} ${XERCES_LIBRARIES}
          xmllib 
          esphttp 
-         hrpc 
          remote 
          dalibase 
-         environment 
+         workunit
     ) 
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( esp PRIVATE environment )
+endif()
+
+if (CMAKE_DL_LIBS)
+    target_link_libraries ( esp PRIVATE ${CMAKE_DL_LIBS} )
+endif()

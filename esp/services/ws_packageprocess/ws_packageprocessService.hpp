@@ -34,8 +34,8 @@ class PackageMapAndSet : public CInterface, implements ISDSSubscription
     Owned<IPropertyTree> tree;
     SubscriptionId pmChange;
     SubscriptionId psChange;
-    mutable CriticalSection crit;
-    mutable CriticalSection dirtyCrit; //if there were an atomic_or I would just use atomic
+    mutable CriticalSection crit{SYNC_LOCATION};
+    mutable CriticalSection dirtyCrit{SYNC_LOCATION}; //if there were an atomic_or I would just use atomic
     unsigned dirty;
 
     void load(unsigned flags);
@@ -140,14 +140,14 @@ public:
 
     virtual void getNavigationData(IEspContext &context, IPropertyTree & data)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
         {
             CHttpSoapBinding::getNavigationData(context, data);
             return;
         }
         //Add navigation link here
         IPropertyTree *folderQueryset = ensureNavFolder(data, "Queries", NULL);
-        CEspBinding::ensureNavLink(*folderQueryset, "Package Maps", "/esp/files/stub.htm?Widget=PackageMapQueryWidget", "Browse Package Maps", NULL, NULL, 2);
+        CEspBinding::ensureNavLink(*folderQueryset, "Package Maps", "/esp/files/stub.html?Widget=PackageMapQueryWidget", "Browse Package Maps", NULL, NULL, 2);
     }
     int onFinishUpload(IEspContext &ctx, CHttpRequest* request, CHttpResponse* response, const char *service,
         const char *method, StringArray& fileNames, StringArray& files, IMultiException *me);

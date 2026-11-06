@@ -24,9 +24,11 @@
 
 project( memcachedplugin )
 
-if (MEMCACHED)
-    ADD_PLUGIN(memcached PACKAGES LIBMEMCACHED MINVERSION ${LIBMEMCACHED_MINVERSION})
-    if(MAKE_MEMCACHED)
+if (MEMCACHED OR USE_LIBMEMCACHED)
+    ADD_PLUGIN(memcached)
+    if(MAKE_MEMCACHED OR USE_LIBMEMCACHED)
+
+        find_package(LIBMEMCACHED ${LIBMEMCACHED_MINVERSION} REQUIRED)
 
         set(
             SRCS
@@ -43,10 +45,6 @@ if (MEMCACHED)
 
         add_definitions(-D_USRDLL -DECL_MEMCACHED_EXPORTS)
 
-        #libmemcached-1.0.18 includes the header <cinttypes> which translates to <bits/cinttypes> requiring ISO C++ 2011 standard to build.
-        #All lesser versions explicitly include <tr1/cinttypes> which does not.
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++0x")
-
         HPCC_ADD_LIBRARY(memcachedplugin SHARED ${SRCS})
         if(${CMAKE_VERSION} VERSION_LESS "2.8.9")
             message(WARNING "Cannot set NO_SONAME. shlibdeps will give warnings when package is installed")
@@ -62,7 +60,8 @@ if (MEMCACHED)
 
         install(
             TARGETS memcachedplugin
-            DESTINATION plugins)
+            DESTINATION plugins
+            CALC_DEPS)
 
 	if(TARGET generate-libmemcached)
             target_link_libraries(memcachedplugin libmemcached libmemcachedutil)

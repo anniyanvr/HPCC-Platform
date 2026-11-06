@@ -25,6 +25,7 @@
 #include "hqlcerrors.hpp"
 #include "thorplugin.hpp"
 #include "codesigner.hpp"
+#include "hqlmanifest.hpp"
 
 #define BIGSTRING_BASE 101
 #define MANIFEST_BASE 1000
@@ -82,6 +83,8 @@ void ResourceManager::addNamed(const char * type, unsigned len, const void * dat
     MemoryBuffer mb;
     appendResource(mb, len, data, compressed);
     resources.append(*new ResourceItem(type, id, mb.length(), mb.toByteArray()));
+    if (doTrace(traceResources))
+        DBGLOG("Add resource %s:%u (%u bytes)%s", type, id, len, compressed ? " compressed" : "");
 }
 
 bool ResourceManager::addCompress(const char * type, unsigned len, const void * data, IPropertyTree *manifestEntry, unsigned id, bool addToManifest)
@@ -97,6 +100,45 @@ static void loadResource(const char *filepath, MemoryBuffer &content)
     if (!fio)
         throw makeStringExceptionV(0, "Failed to open resource file %s", filepath);
     read(fio, 0, (size32_t) f->size(), content);
+}
+
+static bool isSourceResource(const char *type)
+{
+    return type && (strieq(type, "CPP") || strieq(type, "C"));
+}
+
+static bool isHeaderResource(const char *type)
+{
+    return type && (strieq(type, "H") || strieq(type, "HPP"));
+}
+
+static void ensureManifestTempDir(StringBuffer &tempDir, IHqlCppInstance &cppInstance)
+{
+    if (tempDir.length())
+        return;
+
+    getTempFilePath(tempDir, "eclcc", nullptr);
+    tempDir.append(PATHSEPCHAR).append("tmp.XXXXXX");
+    if (!mkdtemp((char *) tempDir.str()))
+        throw makeStringExceptionV(0, "Failed to create temporary directory %s (error %d)", tempDir.str(), errno);
+    cppInstance.addTemporaryDir(tempDir.str());
+    cppInstance.addIncludeDirectory(tempDir.str());
+}
+
+static void appendRelativeResourcePath(StringBuffer &target, const char *tempDir, const char *relativeName, const char *fallbackName)
+{
+    target.append(tempDir).append(PATHSEPCHAR);
+    if (relativeName && *relativeName)
+        target.append(relativeName);
+    else if (fallbackName && *fallbackName)
+    {
+        const char *tail = pathTail(fallbackName);
+        if (!tail || !*tail)
+            throw makeStringExceptionV(0, "Failed to resolve resource filename for %s", fallbackName);
+        target.append(tail);
+    }
+    else
+        throw makeStringException(0, "Failed to determine resource filename");
 }
 
 bool ResourceManager::getDuplicateResourceId(const char *srctype, const char *respath, const char *filepath, int &id)
@@ -171,7 +213,8 @@ void ResourceManager::addManifestFile(const char *filename, ICodegenContextCallb
 {
     StringBuffer fileContents;
     StringBuffer strippedFileContents;
-    fileContents.loadFile(filename, false);
+    Owned<IFile> manifestFile = createIFile(filename);
+    fileContents.loadFile(manifestFile);
     bool isSigned = false;
     const char *useContents = fileContents;
     // Check for signature
@@ -234,45 +277,76 @@ void ResourceManager::addManifestFile(const char *filename, ICodegenContextCallb
     }
 
     Owned<IPropertyTreeIterator> resources = manifestSrc->getElements("Resource[@filename]");
+    StringBuffer manifestTempDir;
     ForEach(*resources)
     {
         IPropertyTree &item = resources->query();
-        const char *resourceFilename = item.queryProp("@originalFilename");
-        const char *md5 = item.queryProp("@md5");
-        if (md5)
-        {
-            StringBuffer calculated;
-            md5_filesum(resourceFilename, calculated);
-            if (!strieq(calculated, md5))
-                throw makeStringExceptionV(0, "MD5 mismatch on file %s in manifest %s", item.queryProp("@filename"), filename);
-        }
-        else if (isSigned)
-            throw makeStringExceptionV(0, "MD5 must be supplied for file %s in signed manifest %s", item.queryProp("@filename"), filename);
 
-        if (!item.hasProp("@type"))
-            item.setProp("@type", "UNKNOWN");
-        int id;
-        if (getDuplicateResourceId(item.queryProp("@type"), item.queryProp("@resourcePath"), NULL, id))
+        if (item.hasProp("@jfrogUser"))
         {
-            item.setPropInt("@id", id);
             manifest->addPropTree("Resource", LINK(&item));
         }
         else
         {
-            const char *type = item.queryProp("@type");
-            if (strieq(type, "CPP") || strieq(type, "C"))
+            const char *resourceFilename = item.queryProp("@originalFilename");
+            const char *md5 = item.queryProp("@md5");
+            if (md5)
             {
-                if (!ctxCallback->allowAccess("cpp", isSigned))
-                    throw makeStringExceptionV(0, "Embedded code via manifest file not allowed");
-                cppInstance.useSourceFile(resourceFilename, item.queryProp("@compileFlags"), false);
+                StringBuffer calculated;
+                md5_filesum(resourceFilename, calculated);
+                if (!strieq(calculated, md5))
+                    throw makeStringExceptionV(0, "MD5 mismatch on file %s in manifest %s", item.queryProp("@filename"), filename);
+            }
+            else if (isSigned)
+                throw makeStringExceptionV(0, "MD5 must be supplied for file %s in signed manifest %s", item.queryProp("@filename"), filename);
+
+            if (!item.hasProp("@type"))
+                item.setProp("@type", "UNKNOWN");
+            int id;
+            if (getDuplicateResourceId(item.queryProp("@type"), item.queryProp("@resourcePath"), NULL, id))
+            {
+                item.setPropInt("@id", id);
+                manifest->addPropTree("Resource", LINK(&item));
             }
             else
             {
-                if ((strieq(type, "jar") || strieq(type, "pyzip")) && !ctxCallback->allowAccess(type, isSigned))
-                    throw makeStringExceptionV(0, "Embedded %s files via manifest file not allowed", type);
-                MemoryBuffer content;
-                loadResource(resourceFilename, content);
-                addCompress(type, content.length(), content.toByteArray(), &item); // MORE - probably should not recompress files known to be compressed, like jar
+                const char *type = item.queryProp("@type");
+                bool isSource = isSourceResource(type);
+                bool isHeader = isHeaderResource(type);
+
+                if (isSource || isHeader)
+                {
+                    if (!ctxCallback->allowAccess("cpp", isSigned))
+                        throw makeStringExceptionV(0, "Embedded code via manifest file not allowed");
+                    ensureManifestTempDir(manifestTempDir, cppInstance);
+                    StringBuffer tempFileName;
+                    appendRelativeResourcePath(tempFileName, manifestTempDir.str(), item.queryProp("@filename"), resourceFilename);
+                    if (!recursiveCreateDirectoryForFile(tempFileName))
+                        throw makeStringExceptionV(0, "Failed to create temporary file %s (error %d)", tempFileName.str(), errno);
+                    try
+                    {
+                        copyFile(tempFileName.str(), resourceFilename);
+                    }
+                    catch (IException *e)
+                    {
+                        StringBuffer msg;
+                        e->errorMessage(msg);
+                        e->Release();
+                        throw makeStringExceptionV(0, "Failed to copy manifest resource %s to %s: %s", resourceFilename, tempFileName.str(), msg.str());
+                    }
+                    if (isSource)
+                    {
+                        cppInstance.useSourceFile(tempFileName, item.queryProp("@compileFlags"), true);
+                    }
+                }
+                else
+                {
+                    if ((strieq(type, "jar") || strieq(type, "pyzip")) && !ctxCallback->allowAccess(type, isSigned))
+                        throw makeStringExceptionV(0, "Embedded %s files via manifest file not allowed", type);
+                    MemoryBuffer content;
+                    loadResource(resourceFilename, content);
+                    addCompress(type, content.length(), content.toByteArray(), &item); // MORE - probably should not recompress files known to be compressed, like jar
+                }
             }
         }
     }
@@ -358,7 +432,15 @@ void ResourceManager::addManifestsFromArchive(IPropertyTree *archive, ICodegenCo
                 else
                     filename = item.queryProp("@filename");
                 int id;
-                if (getDuplicateResourceId(item.queryProp("@type"), NULL, filename, id))
+                if (item.hasProp("@jfrogUser"))
+                {
+                    MemoryBuffer content;
+                    getTempFilePath(tempDir, "jfrog", nullptr);
+                    getResourceFromJfrog(tempDir.append(PATHSEPCHAR).append(item.queryProp("@filename")), item);
+                    loadResource(tempDir, content);
+                    addCompress(item.queryProp("@type"), content.length(), content.toByteArray(), &item);
+                }
+                else if (getDuplicateResourceId(item.queryProp("@type"), NULL, filename, id))
                 {
                     item.setPropInt("@id", (int)id);
                     manifest->addPropTree("Resource", LINK(&item));
@@ -386,26 +468,26 @@ void ResourceManager::addManifestsFromArchive(IPropertyTree *archive, ICodegenCo
                             throw makeStringExceptionV(0, "MD5 mismatch %s in archive", filename);
                     }
                     const char *type = item.queryProp("@type");
-                    if (strieq(type, "CPP") || strieq(type, "C"))
+                    bool isSource = isSourceResource(type);
+                    bool isHeader = isHeaderResource(type);
+                    if (isSource || isHeader)
                     {
                         if (!ctxCallback->allowAccess("cpp", isSigned))
                             throw makeStringExceptionV(0, "Embedded code via manifest file not allowed");
-                        if (!tempDir.length())
-                        {
-                            getTempFilePath(tempDir, "eclcc", nullptr);
-                            tempDir.append(PATHSEPCHAR).append("tmp.XXXXXX"); // Note - we share same temp dir for all from this manifest
-                            if (!mkdtemp((char *) tempDir.str()))
-                                throw makeStringExceptionV(0, "Failed to create temporary directory %s (error %d)", tempDir.str(), errno);
-                            cppInstance.addTemporaryDir(tempDir.str());
-                        }
+                        ensureManifestTempDir(tempDir, cppInstance);
                         StringBuffer tempFileName;
-                        tempFileName.append(tempDir).append(PATHSEPCHAR).append(item.queryProp("@filename"));
+                        appendRelativeResourcePath(tempFileName, tempDir.str(), item.queryProp("@filename"), filename);
                         if (!recursiveCreateDirectoryForFile(tempFileName))
                             throw makeStringExceptionV(0, "Failed to create temporary file %s (error %d)", tempFileName.str(), errno);
-                        FILE *source = fopen(tempFileName.str(), "wt");
-                        fwrite(content.toByteArray(), content.length(), 1, source);
-                        fclose(source);
-                        cppInstance.useSourceFile(tempFileName, item.queryProp("@compileFlags"), true);
+                        Owned<IFile> tempFile = createIFile(tempFileName.str());
+                        Owned<IFileIO> io = tempFile->open(IFOcreate);
+                        if (!io)
+                            throw makeStringExceptionV(errno, "Failed to create file %s", tempFileName.str());
+                        io->write(0, content.length(), content.toByteArray());
+                        if (isSource)
+                        {
+                            cppInstance.useSourceFile(tempFileName, item.queryProp("@compileFlags"), true);
+                        }
                     }
                     else
                     {
@@ -527,7 +609,7 @@ void ResourceManager::flushAsText(const char *filename)
     fclose(f);
 }
 
-bool ResourceManager::flush(StringBuffer &filename, const char *basename, bool flushText, bool target64bit)
+bool ResourceManager::flush(StringBuffer &filename, const char *basename, bool flushText, bool target64bit, CompilerType compilerType)
 {
     finalize();
 
@@ -588,11 +670,6 @@ bool ResourceManager::flush(StringBuffer &filename, const char *basename, bool f
         throwError1(HQLERR_ResourceCreateFailed, filename.str());
 
     //MORE: This should really use targetCompiler instead
-#if defined(__APPLE__)
-    const bool generateClang = true;
-#else
-    const bool generateClang = false;
-#endif
     ForEachItemIn(idx, resources)
     {
         ResourceItem &s = (ResourceItem &) resources.item(idx);
@@ -600,22 +677,31 @@ bool ResourceManager::flush(StringBuffer &filename, const char *basename, bool f
         unsigned id = s.id;
         VStringBuffer binfile("%s_%s_%u.bin", filename.str(), type, id);
         VStringBuffer label("%s_%u_txt_start", type, id);
-        if (generateClang)
+
+        //Note on targets where the @ character is the start of a comment (eg ARM) then another character is used instead. For example the ARM port uses the % character.
+#if defined(__arm__) || defined(__aarch64__)
+        const char typePrefix = '%';
+#else
+        const char typePrefix = '@';
+#endif
+
+        if (compilerType == ClangCppCompiler)
         {
 #ifdef __APPLE__
             if (id <= 1200)  // There is a limit of 255 sections before linker complains - and some are used elsewhere
-#endif
                 fprintf(f, " .section __TEXT,%s_%u\n", type, id);
+
             fprintf(f, " .global _%s\n", label.str());  // For some reason apple needs a leading underbar and linux does not
             fprintf(f, "_%s:\n", label.str());
+#else
+            fprintf(f, " .section %s_%u,\"a\",%cprogbits\n", type, id, typePrefix);
+            fprintf(f, " .global %s\n", label.str());
+            fprintf(f, "%s:\n", label.str());
+#endif
         }
         else
         {
-#if defined(__linux__) && defined(__GNUC__) && defined(__arm__)
-            fprintf(f, " .section .note.GNU-stack,\"\",%%progbits\n");   // Prevent the stack from being marked as executable
-#else
-            fprintf(f, " .section .note.GNU-stack,\"\",@progbits\n");   // Prevent the stack from being marked as executable
-#endif
+            fprintf(f, " .section .note.GNU-stack,\"\",%cprogbits\n", typePrefix);   // Prevent the stack from being marked as executable
             fprintf(f, " .section %s_%u,\"a\"\n", type, id);
             fprintf(f, " .global %s\n", label.str());
             fprintf(f, " .type %s,STT_OBJECT\n", label.str());
@@ -630,6 +716,8 @@ bool ResourceManager::flush(StringBuffer &filename, const char *basename, bool f
         }
         fwrite(s.data.get(), 1, s.data.length(), bin);
         fclose(bin);
+        if (compilerType != ClangCppCompiler)
+            fprintf(f, " .size %s,%u\n", label.str(), (unsigned)s.data.length());
     }
     fclose(f);
 #endif

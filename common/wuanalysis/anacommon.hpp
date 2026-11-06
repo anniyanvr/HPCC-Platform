@@ -23,12 +23,15 @@
 #include "eclhelper.hpp"
 #include "anaerrorcodes.hpp"
 
+constexpr char CostOptimizerName[] = "Cost Optimizer";
 
 interface IWuScope
 {
     virtual stat_type getStatRaw(StatisticKind kind, StatisticKind variant = StKindNone) const = 0;
     virtual unsigned getAttr(WuAttr kind) const = 0;
     virtual void getAttr(StringBuffer & result, WuAttr kind) const = 0;
+    virtual const char * getFullScopeName(StringBuffer & fullScopeName) const = 0;
+    virtual const char * queryName() const = 0;
 };
 
 interface IWuActivity;
@@ -38,18 +41,21 @@ interface IWuEdge : public IWuScope
     virtual IWuActivity * queryTarget() = 0;
 };
 
+interface IWuSubGraph : public IWuScope
+{
+};
+
 interface IWuActivity : public IWuScope
 {
-    virtual const char * queryName() const = 0;
-    virtual const char * getFullScopeName(StringBuffer & fullScopeName) const = 0;
     virtual IWuEdge * queryInput(unsigned idx) = 0;
     virtual IWuEdge * queryOutput(unsigned idx) = 0;
+
     inline IWuActivity * queryInputActivity(unsigned idx)
     {
         IWuEdge * edge = queryInput(idx);
         return edge ? edge->querySource() : nullptr;
     }
-    inline ThorActivityKind queryThorActivityKind()
+    inline ThorActivityKind queryThorActivityKind() const
     {
         return (ThorActivityKind) getAttr(WaKind);
     }
@@ -62,10 +68,11 @@ public:
     void print() const;
     void createException(IWorkUnit * we);
 
-    void set(AnalyzerErrorCode _errorCode, stat_type _cost, const char * msg, ...) __attribute__((format(printf, 4, 5)));
+    void set(AnalyzerErrorCode _errorCode, stat_type _timePenalty, cost_type _costPenalty, const char * msg, ...) __attribute__((format(printf, 5, 6)));
     void setLocation(const char * definition);
     void setScope(const char *_scope) { scope.set(_scope); }
-    stat_type getCost() const         { return cost; }
+    stat_type getTimePenalty() const { return timePenalty; }
+    cost_type getCostPenalty() const { return costPenalty; }
 
 private:
     AnalyzerErrorCode errorCode = ANA_GENERICERROR_ID;
@@ -73,11 +80,28 @@ private:
     unsigned line = 0;
     unsigned column = 0;
     StringAttr scope;
-    stat_type cost = 0;      // number of nanoseconds lost as a result.
+    stat_type timePenalty = 0; // number of nanoseconds lost as a result.
+    cost_type costPenalty = 0;
     StringBuffer comment;
 };
 
-typedef enum { watOptFirst=0, watOptMinInterestingTime=0, watOptMinInterestingCost, watOptSkewThreshold, watOptMinRowsPerNode, watPreFilteredKJThreshold, watOptMax } WutOptionType ;
+enum WutOptionType
+{
+    watOptFirst=0,
+    watOptMinInterestingTime=0,
+    watOptMinInterestingCost,
+    watOptMinInterestingWaste,
+    watOptSkewThreshold,
+    watOptMinRowsPerNode,
+    watPreFilteredKJThreshold,
+    watClusterCostPerHour,
+    watOptMaxExecuteTime,
+    watOptSoapCallTimeAggregateThreshold,
+    watOptSoapCallRowAvgThreshold,
+    watOptSoapCallWarnClusterSize,
+    watOptClusterSize,
+    watOptMax
+};
 
 interface IAnalyserOptions
 {

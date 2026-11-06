@@ -276,6 +276,7 @@ void swapRows(RtlDynamicRowBuilder &row1, RtlDynamicRowBuilder &row2)
     row1.swapWith(row2);
 }
 
+
 class CJoinHelper : implements IJoinHelper, public CSimpleInterface
 {
     CActivityBase &activity;
@@ -314,11 +315,13 @@ class CJoinHelper : implements IJoinHelper, public CSimpleInterface
     OwnedConstThorRow defaultRight;
     Linked<IRowStream> strmL;
     Linked<IRowStream> strmR;
+    JoinMatchStats matchStats;
     bool abort = false;
     bool nextleftgot = false;
     bool nextrightgot = false;
     unsigned atmost = (unsigned)-1;
     rowcount_t lhsProgressCount = 0, rhsProgressCount = 0;
+    rowcount_t startMatchLhsProgressCount = 0;
     unsigned keepmax = (unsigned)-1;
     unsigned abortlimit = (unsigned)-1;
     unsigned keepremaining = (unsigned)-1;
@@ -759,7 +762,8 @@ public:
                             throwUnexpected();
                     }
                 }
-                rightgroupmatched[rightidx] = true;
+                if (rightouter)
+                    rightgroupmatched[rightidx] = true;
             }
             if ((gotsz||denormGot||fret.get())&&(keepremaining!=(unsigned)-1))
                 keepremaining--;
@@ -819,8 +823,16 @@ public:
                         }
                     }
                     while (state == JSonfail);
+                    //We have read a row that does not match, so decrement by 1 to get the count for the row that mismatched
+                    {
+                        //Nested scope to avoid problems with variable leaking into the following case
+                        rowcount_t nextStartMatchLhsProgressCount = lhsProgressCount - 1;
+                        matchStats.noteGroup(nextStartMatchLhsProgressCount - startMatchLhsProgressCount, 0);
+                        startMatchLhsProgressCount = nextStartMatchLhsProgressCount;
+                    }
                     // fall through
                 case JScompare:                         
+                    //Need to create a new match group when the right has been completely processed
                     if (getL()) {
                         rightidx = 0;
                         rightgroupmatched = NULL;
@@ -829,8 +841,10 @@ public:
                             while ((nr<rightgroup.ordinality())&&(btwcompLR.upper->docompare(nextleft,rightgroup.query(nr))>0))
                                 nr++;
                             rightgroup.removeRows(0,nr);
-                            rightgroupmatched = (bool *)rightgroupmatchedbuf.clear().reserve(rightgroup.ordinality());
-                            memset_iflen(rightgroupmatched,rightmatched?1:0,rightgroup.ordinality());
+                            if (rightouter && rightgroup.ordinality()) {
+                                rightgroupmatched = (bool *)rightgroupmatchedbuf.clear().reserve(rightgroup.ordinality());
+                                memset(rightgroupmatched,rightmatched?1:0,rightgroup.ordinality());
+                            }
                         }
                         else
                             rightgroup.kill();
@@ -843,8 +857,10 @@ public:
                             limitedhelper->getGroup(rightgroup,nextleft);
                             if (rightgroup.ordinality()) {
                                 state = JSmatch;
-                                rightgroupmatched = (bool *)rightgroupmatchedbuf.clear().reserve(rightgroup.ordinality());
-                                memset(rightgroupmatched,1,rightgroup.ordinality()); // no outer
+                                if (rightouter && rightgroup.ordinality()) {
+                                    rightgroupmatched = (bool *)rightgroupmatchedbuf.clear().reserve(rightgroup.ordinality());
+                                    memset(rightgroupmatched,1,rightgroup.ordinality()); // no outer
+                                }
                             }
                             else 
                                 ret.setown(outrow(Onext,Oouter)); // out left outer and advance left
@@ -891,19 +907,36 @@ public:
                                 rightgroup.append(nextright.getClear());
                                 nextR();
                             }
-                            rightgroupmatched = (bool *)rightgroupmatchedbuf.clear().reserve(rightgroup.ordinality());
-                            memset_iflen(rightgroupmatched,rightmatched?1:0,rightgroup.ordinality());
+                            if (rightouter && rightgroup.ordinality()) {
+                                rightgroupmatched = (bool *)rightgroupmatchedbuf.clear().reserve(rightgroup.ordinality());
+                                memset(rightgroupmatched,rightmatched?1:0,rightgroup.ordinality());
+                            }
                             if (!hitatmost&&rightgroup.ordinality())
                                 state = JSmatch;
                             else if (cmp<0)
+                            {
+                                //Left row and no match right row
+                                matchStats.noteGroup(1, 0); // This will not spot large left groups
+                                startMatchLhsProgressCount = lhsProgressCount;
                                 ret.setown(outrow(Onext,Oouter));
+                            }
                             else 
+                            {
+                                //Right row with no matching left rows.
+                                //This will not spot large right groups since it processes a row at a time
+                                matchStats.noteGroup(0, 1);
                                 ret.setown(outrow(Oouter,Onext));
+                            }
                         }
 
                     }
-                    else if (getR()) 
+                    else if (getR())
+                    {
+                        //We would miss tracking a very large trailing right group, but it is not worth
+                        //the extra work to spot it
+                        //FUTURE: if (!rightouter) we could return null and stop reading the rhs.
                         ret.setown(outrow(Oouter,Onext));
+                    }
                     else
                         return NULL;
                     break;
@@ -920,20 +953,37 @@ public:
                             nextL();
                         }
                         mcoreintercept->addWork(&leftgroup,&rightgroup);
+                        startMatchLhsProgressCount = (lhsProgressCount - 1); // Never used, but keep consistent with other cases
                         state = JScompare;
                     }
                     else if (rightidx<rightgroup.ordinality()) {
-                        if (helper->match(nextleft,rightgroup.query(rightidx)))
-                            ret.setown(outrow(Onext,Ogroup));
-                        rightidx++;
+                        if (keepremaining == 0)
+                            rightidx = rightgroup.ordinality();
+                        else {
+                            do {
+                                if (helper->match(nextleft,rightgroup.query(rightidx))) {
+                                    ret.setown(outrow(Onext,Ogroup));
+                                    rightidx++;
+                                    break;
+                                }
+                                rightidx++;
+                            } while (rightidx<rightgroup.ordinality());
+                        }
                     }
                     else { // all done
                         ret.setown(outrow(Onext,Oouter));
                         rightidx = 0;
                         if (getL()) {
                             int cmp = compareL->docompare(nextleft,prevleft);
-                            if (cmp>0) 
-                                state = JSrightgrouponly;
+                            if (cmp>0)
+                            {
+                                //Finished processing this group -> gather the stats for the number of join candidates.
+                                //lhsProgressCount is one higher than the the row count that follows the end of group
+                                rowcount_t numLeftRows = (lhsProgressCount - 1) - startMatchLhsProgressCount;
+                                matchStats.noteGroup(numLeftRows, rightgroup.ordinality());
+                                startMatchLhsProgressCount = (lhsProgressCount - 1);
+                                state = rightouter ? JSrightgrouponly : JScompare;
+                            }
                             else if (cmp<0) 
                             {
                                 activity.logRow("prev: ", *allocatorL->queryOutputMeta(), prevleft);
@@ -942,10 +992,16 @@ public:
                             }
                         }
                         else
-                            state = JSrightgrouponly;
+                        {
+                            //Finished processing this group -> gather the stats for the number of join candidates.
+                            rowcount_t numLeftRows = lhsProgressCount - startMatchLhsProgressCount;
+                            matchStats.noteGroup(numLeftRows, rightgroup.ordinality());
+                            startMatchLhsProgressCount = lhsProgressCount;
+                            state = rightouter ? JSrightgrouponly : JScompare;
+                        }
                     }
                     break;
-                case JSrightgrouponly: 
+                case JSrightgrouponly:
                     // right group
                     if (rightidx<rightgroup.ordinality())
                         ret.setown(outrow(Oouter,Ogroup));
@@ -965,6 +1021,12 @@ public:
     virtual void stop() { abort = true; }
     virtual rowcount_t getLhsProgress() const { return lhsProgressCount; }
     virtual rowcount_t getRhsProgress() const { return rhsProgressCount; }
+
+    virtual void gatherStats(CRuntimeStatisticCollection & stats) const override
+    {
+        //Left and right progress could be added here.
+        matchStats.gatherStats(stats);
+    }
 };
 
 class SelfJoinHelper: implements IJoinHelper, public CSimpleInterface
@@ -975,6 +1037,7 @@ class SelfJoinHelper: implements IJoinHelper, public CSimpleInterface
     CThorExpandingRowArray curgroup;
     unsigned leftidx = 0;
     unsigned rightidx = 0;
+    JoinMatchStats matchStats;
     bool leftmatched = false;
     MemoryBuffer rightmatchedbuf;
     bool *rightmatched = nullptr;
@@ -1193,6 +1256,7 @@ retry:
                         eof = 0;
                         return NULL;
                     }
+                    matchStats.noteGroup(curgroup.ordinality(), curgroup.ordinality());
                     if (curgroup.ordinality() > INITIAL_SELFJOIN_MATCH_WARNING_LEVEL) {
                         Owned<IThorException> e = MakeActivityWarning(&activity, TE_SelfJoinMatchWarning, "Exceeded initial match limit");
                         e->queryData().append((unsigned)curgroup.ordinality());
@@ -1203,8 +1267,10 @@ retry:
                     joinCounter = 0;
                     leftmatched = false;
                     if (state==JSload) {     // catch atmost above
-                        rightmatched = (bool *)rightmatchedbuf.clear().reserve(curgroup.ordinality());
-                        memset(rightmatched,rightouter?0:1,curgroup.ordinality());
+                        if (rightouter && curgroup.ordinality()) {
+                            rightmatched = (bool *)rightmatchedbuf.clear().reserve(curgroup.ordinality());
+                            memset(rightmatched,0,curgroup.ordinality());
+                        }
                         state = JSmatch; // ok we have group so match
                     }
                     break;
@@ -1215,26 +1281,34 @@ retry:
                             state = JSload;
                         }
                         else if ((rightidx<curgroup.ordinality())&&(!firstonlyR||(rightidx==0))) {
-                            const void *r = curgroup.query(rightidx);
-                            if (helper->match(l,r)) {
-                                if (keepremaining>0) {
-                                    if (!exclude) {
-                                        RtlDynamicRowBuilder rtmp(allocator);
-                                        size32_t sz = helper->transform(rtmp,l,r,++joinCounter, JTFmatchedleft|JTFmatchedright);
-                                        if (sz)
-                                            ret.setown(rtmp.finalizeRowClear(sz));
+                            if (keepremaining == 0)
+                                rightidx = curgroup.ordinality();
+                            else {
+                                do {
+                                    const void *r = curgroup.query(rightidx);
+                                    if (helper->match(l,r)) {
+                                        if (keepremaining>0) {
+                                            if (!exclude) {
+                                                RtlDynamicRowBuilder rtmp(allocator);
+                                                size32_t sz = helper->transform(rtmp,l,r,++joinCounter, JTFmatchedleft|JTFmatchedright);
+                                                if (sz)
+                                                    ret.setown(rtmp.finalizeRowClear(sz));
+                                            }
+                                            if (ret.get()&&(keepremaining!=(unsigned)-1))
+                                                keepremaining--;
+                                            // treat SKIP and exclude as match success
+                                            if (rightouter)
+                                                rightmatched[rightidx] = true;
+                                            leftmatched = true;
+                                        }
+                                        else
+                                            rightidx = curgroup.ordinality()-1;
+                                        rightidx++;
+                                        break;
                                     }
-                                    if (ret.get()&&(keepremaining!=(unsigned)-1))
-                                        keepremaining--;
-                                    // treat SKIP and exclude as match success
-                                    if (rightouter)
-                                        rightmatched[rightidx] = true;
-                                    leftmatched = true;
-                                }
-                                else
-                                    rightidx = curgroup.ordinality()-1;
+                                    rightidx++;
+                                } while ((rightidx<curgroup.ordinality())&&!firstonlyR);
                             }
-                            rightidx++;
                         }
                         else { // right all done
                             if (leftouter&&!leftmatched) {
@@ -1248,7 +1322,7 @@ retry:
                             joinCounter = 0;
                             leftidx++;
                             if ((leftidx>=curgroup.ordinality())||(firstonlyL&&(leftidx>0)))
-                                state = JSrightonly;
+                                state = rightouter ? JSrightonly : JSload;
                             else
                                 leftmatched = false;
                         }
@@ -1299,6 +1373,12 @@ retry:
     virtual void stop() { abort = true; }
     virtual rowcount_t getLhsProgress() const { return progressCount; }
     virtual rowcount_t getRhsProgress() const { return progressCount; }
+    virtual void gatherStats(CRuntimeStatisticCollection & stats) const override
+    {
+        //Left and right progress could be added here.
+        matchStats.gatherStats(stats);
+    }
+
 };
 
 IJoinHelper *createDenormalizeHelper(CActivityBase &activity, IHThorDenormalizeArg *helper, IThorRowInterfaces *rowIf)
@@ -1462,14 +1542,15 @@ public:
     unsigned numworkers;
     ThorActivityKind kind;
     Owned<IException> exc;
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     bool eos, selfJoin;
-
+    unsigned candidateBatchLimit;
+    JoinMatchStats matchStats;
 
     void setException(IException *e,const char *title)
     {
+        DBGLOG(e,title);
         CriticalBlock b(sect);
-        EXCLOG(e,title);
         if (exc.get())
             e->Release();
         else
@@ -1482,88 +1563,145 @@ public:
     public:
         CThorExpandingRowArray lgroup;
         CThorExpandingRowArray rgroup;
+        UnsignedArray leftOffsets;
+        UnsignedArray rightOffsets;
+        unsigned numCandidates;
         const void *row;
+        MemoryBuffer rmatchedbuf;
         inline cWorkItem(CActivityBase &_activity, CThorExpandingRowArray *_lgroup, CThorExpandingRowArray *_rgroup)
             : lgroup(_activity, &_activity), rgroup(_activity, &_activity)
         {
-            set(_lgroup,_rgroup);
+            numCandidates = 0;
+            append(_lgroup,_rgroup);
         }
         inline cWorkItem(CActivityBase &_activity) : lgroup(_activity, &_activity), rgroup(_activity, &_activity)
         {
             clear();
         }
 
-        inline void set(CThorExpandingRowArray *_lgroup, CThorExpandingRowArray *_rgroup)
+        inline void append(CThorExpandingRowArray *_lgroup, CThorExpandingRowArray *_rgroup)
         {
-            if (_lgroup)
-                lgroup.transfer(*_lgroup);
-            else
-                lgroup.kill();
-            if (_rgroup)
-                rgroup.transfer(*_rgroup);
-            else
-                rgroup.kill();
+            // _rgroup == nullptr signals a self-join: the right side is the same as the left side
+            bool isSelfJoin = (_rgroup == nullptr);
+            unsigned lCount = _lgroup ? _lgroup->ordinality() : 0;
+            unsigned rCount = isSelfJoin ? lCount : _rgroup->ordinality();
+
+            if (lCount)
+                lgroup.appendRows(*_lgroup, true); // moves rows, takes ownership, clears source
+            if (!isSelfJoin && rCount)
+                rgroup.appendRows(*_rgroup, true); // moves rows, takes ownership, clears source
+
+            leftOffsets.append(lgroup.ordinality());
+            // For self-join, doMatch uses lgroup as rgroup, so right offsets must match left offsets
+            rightOffsets.append(isSelfJoin ? lgroup.ordinality() : rgroup.ordinality());
             row = NULL;
+            //Unlikely - but check for overflow in the number of potential candidates
+            __uint64 groupCandidates = (unsigned __int64)lCount * (unsigned __int64)rCount;
+            if (numCandidates + groupCandidates > UINT_MAX)
+                numCandidates = UINT_MAX;
+            else
+                numCandidates += (unsigned)groupCandidates;
         }
+
+        inline void swap(cWorkItem &other)
+        {
+            lgroup.swap(other.lgroup);
+            rgroup.swap(other.rgroup);
+            leftOffsets.swapWith(other.leftOffsets);
+            rightOffsets.swapWith(other.rightOffsets);
+            std::swap(numCandidates, other.numCandidates);
+            std::swap(row, other.row);
+        }
+
         inline void set(const void *_row)
         {
-            lgroup.kill();
-            rgroup.kill();
+            lgroup.clearRows();
+            rgroup.clearRows();
+            leftOffsets.kill();
+            rightOffsets.kill();
+            numCandidates = 0;
             row = _row;
         }
         inline void clear()
         {
-            set(NULL);
+            set(nullptr);
         }
     };
 
     void doMatch(cWorkItem &work, IRowWriter &writer, IEngineRowAllocator *theAllocator)
     {
-        MemoryBuffer rmatchedbuf;  
         CThorExpandingRowArray &rgroup = selfJoin?work.lgroup:work.rgroup;
         bool *rmatched = NULL;
         if (rightouter) {
-            rmatched = (bool *)rmatchedbuf.clear().reserve(rgroup.ordinality());
+            rmatched = (bool *)work.rmatchedbuf.clear().reserve(rgroup.ordinality());
             memset_iflen(rmatched,0,rgroup.ordinality());
         }
-        ForEachItemIn(leftidx,work.lgroup)
-        {
-            bool lmatched = !leftouter;
-            unsigned joinCounter = 0;
-            for (unsigned rightidx=0; rightidx<rgroup.ordinality(); rightidx++) {
-                if (helper->match(work.lgroup.query(leftidx),rgroup.query(rightidx))) {
-                    lmatched = true;
-                    if (rightouter)
-                        rmatched[rightidx] = true;
-                    RtlDynamicRowBuilder ret(theAllocator);
-                    size32_t sz = exclude?0:helper->transform(ret,work.lgroup.query(leftidx),rgroup.query(rightidx),++joinCounter,JTFmatchedleft|JTFmatchedright);
-                    if (sz)
-                        writer.putRow(ret.finalizeRowClear(sz));
 
+        unsigned leftStart = 0;
+        unsigned rightStart = 0;
+        for (unsigned batch = 0; batch < work.leftOffsets.ordinality(); batch++)
+        {
+            unsigned leftEnd = work.leftOffsets.item(batch);
+            unsigned rightEnd = work.rightOffsets.item(batch);
+
+            for (unsigned leftidx = leftStart; leftidx < leftEnd; leftidx++)
+            {
+                bool lmatched = !leftouter;
+                unsigned joinCounter = 0;
+                for (unsigned rightidx = rightStart; rightidx < rightEnd; rightidx++)
+                {
+                    if (helper->match(work.lgroup.query(leftidx),rgroup.query(rightidx)))
+                    {
+                        lmatched = true;
+                        if (rightouter)
+                            rmatched[rightidx] = true;
+                        RtlDynamicRowBuilder ret(theAllocator);
+                        size32_t sz = exclude?0:helper->transform(ret,work.lgroup.query(leftidx),rgroup.query(rightidx),++joinCounter,JTFmatchedleft|JTFmatchedright);
+                        if (sz)
+                            writer.putRow(ret.finalizeRowClear(sz));
+
+                    }
                 }
-            }
-            if (!lmatched) {
-                RtlDynamicRowBuilder ret(theAllocator);
-                size32_t sz =  helper->transform(ret, work.lgroup.query(leftidx), defaultRight, 0, JTFmatchedleft);
-                if (sz)
-                    writer.putRow(ret.finalizeRowClear(sz));
-            }
-        }
-        if (rightouter) {
-            ForEachItemIn(rightidx2,rgroup) {
-                if (!rmatched[rightidx2]) {
+                if (!lmatched) {
                     RtlDynamicRowBuilder ret(theAllocator);
-                    size32_t sz =  helper->transform(ret, defaultLeft, rgroup.query(rightidx2), 0, JTFmatchedright);
+                    size32_t sz =  helper->transform(ret, work.lgroup.query(leftidx), defaultRight, 0, JTFmatchedleft);
                     if (sz)
                         writer.putRow(ret.finalizeRowClear(sz));
                 }
             }
+            if (rightouter) {
+                for (unsigned rightidx2 = rightStart; rightidx2 < rightEnd; rightidx2++)
+                {
+                    if (!rmatched[rightidx2])
+                    {
+                        RtlDynamicRowBuilder ret(theAllocator);
+                        size32_t sz =  helper->transform(ret, defaultLeft, rgroup.query(rightidx2), 0, JTFmatchedright);
+                        if (sz)
+                            writer.putRow(ret.finalizeRowClear(sz));
+                    }
+                }
+            }
+            leftStart = leftEnd;
+            rightStart = rightEnd;
         }
+    }
+
+    void noteGroupSizes(CThorExpandingRowArray *lgroup,CThorExpandingRowArray *rgroup)
+    {
+        rowidx_t numLeft = lgroup ? lgroup->ordinality() : 0;
+        rowidx_t numRight = selfJoin ? numLeft : rgroup ? rgroup->ordinality() : 0;
+        matchStats.noteGroup(numLeft, numRight);
+    }
+
+    virtual void gatherStats(CRuntimeStatisticCollection & stats) const override
+    {
+        matchStats.gatherStats(stats);
     }
 
     CMultiCoreJoinHelperBase(CActivityBase &_activity, unsigned numthreads, bool _selfJoin, IJoinHelper *_jhelper, IHThorJoinArg *_helper, IThorRowInterfaces *_rowIf)
         : activity(_activity), rowIf(_rowIf)
     {
+        candidateBatchLimit = (unsigned)_activity.getOptInt(THOROPT_JOIN_BATCH_LIMIT, 10000);
         allocator.set(rowIf->queryRowAllocator());
         kind = activity.queryContainer().getKind();
         jhelper = _jhelper;
@@ -1626,6 +1764,7 @@ class CMultiCoreJoinHelper: public CMultiCoreJoinHelperBase
     unsigned curin;         // only updated from cReader thread
     unsigned curout;            // only updated from cReader thread
     bool stopped;
+    cWorkItem activeItem;
     
     class cReader: public Thread
     {
@@ -1637,7 +1776,7 @@ class CMultiCoreJoinHelper: public CMultiCoreJoinHelperBase
         }
         int run()
         {
-            LOG(MCthorDetailedDebugInfo, thorJob, "CMultiCoreJoinHelper::cReader started");
+            LOG(MCthorDetailedDebugInfo, "CMultiCoreJoinHelper::cReader started");
             try {
                 const void * row = parent->jhelper->nextRow();
                 assertex(!row);
@@ -1645,9 +1784,8 @@ class CMultiCoreJoinHelper: public CMultiCoreJoinHelperBase
             catch (IException *e) {
                 parent->setException(e,"CMultiCoreJoinHelper::cReader");
             }
-            for (unsigned i=0;i<parent->numworkers;i++) 
-                parent->addWork(NULL,NULL);
-            LOG(MCthorDetailedDebugInfo, thorJob, "CMultiCoreJoinHelper::cReader exit");
+            parent->stopWorkers();
+            LOG(MCthorDetailedDebugInfo, "CMultiCoreJoinHelper::cReader exit");
             return 0;
         }
     } reader;
@@ -1657,8 +1795,8 @@ class CMultiCoreJoinHelper: public CMultiCoreJoinHelperBase
         CMultiCoreJoinHelper *parent;
     public:
         cWorkItem work;
-        Semaphore workready;
-        Semaphore workwait;
+        Semaphore workready{SYNC_LOCATION};
+        Semaphore workwait{SYNC_LOCATION};
         Owned<ISmartRowBuffer> rowStream;
         bool stopped;
 
@@ -1671,7 +1809,7 @@ class CMultiCoreJoinHelper: public CMultiCoreJoinHelperBase
         }
         int run()
         {
-            LOG(MCthorDetailedDebugInfo, thorJob, "CMultiCoreJoinHelper::cWorker started");
+            LOG(MCthorDetailedDebugInfo, "CMultiCoreJoinHelper::cWorker started");
 
             Owned<IThorRowInterfaces> rowIf = parent->activity.getRowInterfaces();
             Owned<IEngineRowAllocator> allocator = parent->activity.getRowAllocator(rowIf->queryRowMetaData(), (roxiemem::RHFpacked|roxiemem::RHFunique));
@@ -1688,7 +1826,7 @@ class CMultiCoreJoinHelper: public CMultiCoreJoinHelperBase
                         rowWriter->putRow(work.row);
                     else
                     {
-                        if (work.lgroup.ordinality()==0)
+                        if (work.leftOffsets.ordinality()==0)
                             break;
                         parent->doMatch(work, *rowWriter, allocator);
                     }
@@ -1704,7 +1842,7 @@ class CMultiCoreJoinHelper: public CMultiCoreJoinHelperBase
             rowWriter->putRow(NULL); // end-of-stream
             rowWriter->flush();
             stopped = true; // NB: will not get past flush(), until all read
-            LOG(MCthorDetailedDebugInfo, thorJob, "CMultiCoreJoinHelper::cWorker exit");
+            LOG(MCthorDetailedDebugInfo, "CMultiCoreJoinHelper::cWorker exit");
             return 0;
         }
         bool isStopped() const { return stopped; }
@@ -1712,7 +1850,7 @@ class CMultiCoreJoinHelper: public CMultiCoreJoinHelperBase
 
 public:
     CMultiCoreJoinHelper(CActivityBase &activity, unsigned numthreads, bool selfJoin, IJoinHelper *_jhelper, IHThorJoinArg *_helper, IThorRowInterfaces *_rowIf)
-        : CMultiCoreJoinHelperBase(activity, numthreads, selfJoin, _jhelper, _helper, _rowIf)
+        : CMultiCoreJoinHelperBase(activity, numthreads, selfJoin, _jhelper, _helper, _rowIf), activeItem(activity)
     {
         reader.parent = this;
         stopped = false;
@@ -1752,8 +1890,8 @@ public:
             return false;
         stopped = false;
         for (unsigned i=0;i<numworkers;i++)
-            workers[i]->start();
-        reader.start();
+            workers[i]->start(true);
+        reader.start(true);
         return true;
     }
     virtual const void *nextRow()
@@ -1797,24 +1935,57 @@ public:
             workers[i]->rowStream->stop();
     }
 
+    void sendWorkItem(cWorkItem * item)
+    {
+        cWorker *worker = workers[curin];
+        worker->workready.wait();
+        if (item)
+            worker->work.swap(*item);
+        else
+            worker->work.clear();
+        worker->workwait.signal();
+        curin = (curin+1)%numworkers;
+    }
+
+    void sendTerminator()
+    {
+        sendWorkItem(nullptr);
+    }
+
 // IMulticoreIntercept impl.
     virtual void addWork(CThorExpandingRowArray *lgroup,CThorExpandingRowArray *rgroup)
     {
         /* NB: This adds a work item to each worker in sequence
          * The pull side, also pulls from the workers in sequence
          * This ensures the output is return in input order.
+         * Multiple blocks of work are accumulated in activeItem and combined into a single work item before being
+         * dispatched to a worker.  The different work blocks are delimited by the leftOffsets and rightOffsets arrays,
+         * which allows the worker to know how many rows in each group, and where each group starts.
          */
-        cWorker *worker = workers[curin];
-        worker->workready.wait();
-        workers[curin]->work.set(lgroup,rgroup);
-        worker->workwait.signal();
-        curin = (curin+1)%numworkers;
+        noteGroupSizes(lgroup, rgroup);
+
+        activeItem.append(lgroup, rgroup);
+        if (activeItem.numCandidates >= candidateBatchLimit)
+            sendWorkItem(&activeItem);
+    }
+    void stopWorkers()
+    {
+        // Flush any remaining active work item
+        if (activeItem.leftOffsets.ordinality())
+            sendWorkItem(&activeItem);
+
+        // Send terminator to each worker
+        for (unsigned i=0;i<numworkers;i++)
+            sendTerminator();
     }
     virtual void addRow(const void *row)
     {
+        if (activeItem.leftOffsets.ordinality())
+            sendWorkItem(&activeItem);
+
         cWorker *worker = workers[curin];
         worker->workready.wait();
-        workers[curin]->work.set(row);
+        worker->work.set(row);
         worker->workwait.signal();
         curin = (curin+1)%numworkers;
     }
@@ -1825,8 +1996,8 @@ class CMultiCoreUnorderedJoinHelper: public CMultiCoreJoinHelperBase
 {
     void setException(IException *e,const char *title)
     {
+        DBGLOG(e,title);
         CriticalBlock b(sect);
-        EXCLOG(e,title);
         if (exc.get())
             e->Release();
         else
@@ -1834,9 +2005,11 @@ class CMultiCoreUnorderedJoinHelper: public CMultiCoreJoinHelperBase
         multiWriter->abort();
     }
 
-    SimpleInterThreadQueueOf<cWorkItem,false> workqueue;
+    ReallySimpleInterThreadQueueOf<cWorkItem,false> workqueue;
+    SafeQueueOf<cWorkItem,false> freequeue;
     Owned<IRowMultiWriterReader> multiWriter;
     Owned<IRowWriter> rowWriter;
+    cWorkItem *activeItem = nullptr;
 
     class cReader: public Thread
     {
@@ -1848,7 +2021,7 @@ class CMultiCoreUnorderedJoinHelper: public CMultiCoreJoinHelperBase
         }
         int run()
         {
-            LOG(MCthorDetailedDebugInfo, thorJob, "CMulticoreUnorderedJoinHelper::cReader started");
+            LOG(MCthorDetailedDebugInfo, "CMulticoreUnorderedJoinHelper::cReader started");
             try {
                 const void * row = parent->jhelper->nextRow();
                 assertex(!row);
@@ -1857,7 +2030,7 @@ class CMultiCoreUnorderedJoinHelper: public CMultiCoreJoinHelperBase
                 parent->setException(e,"CMulticoreUnorderedJoinHelper::cReader");
             }
             parent->stopWorkers();
-            LOG(MCthorDetailedDebugInfo, thorJob, "CMulticoreUnorderedJoinHelper::cReader exit");
+            LOG(MCthorDetailedDebugInfo, "CMulticoreUnorderedJoinHelper::cReader exit");
             return 0;
         }
     } reader;
@@ -1876,11 +2049,11 @@ class CMultiCoreUnorderedJoinHelper: public CMultiCoreJoinHelperBase
             Owned<IEngineRowAllocator> allocator = parent->activity.getRowAllocator(rowIf->queryRowMetaData(), (roxiemem::RHFpacked|roxiemem::RHFunique));
 
             Owned<IRowWriter> rowWriter = parent->multiWriter->getWriter();
-            LOG(MCthorDetailedDebugInfo, thorJob, "CMulticoreUnorderedJoinHelper::cWorker started");
+            LOG(MCthorDetailedDebugInfo, "CMulticoreUnorderedJoinHelper::cWorker started");
             for (;;)
             {
                 cWorkItem *work = parent->workqueue.dequeue();
-                if (!work||((work->lgroup.ordinality()==0)&&(work->rgroup.ordinality()==0)))
+                if (!work||((work->leftOffsets.ordinality()==0)&&(work->row==NULL)))
                 {
                     delete work;
                     break;
@@ -1888,7 +2061,8 @@ class CMultiCoreUnorderedJoinHelper: public CMultiCoreJoinHelperBase
                 try
                 {
                     parent->doMatch(*work, *rowWriter, allocator);
-                    delete work;
+                    work->clear(); // release rows and reset offsets/counts before recycling
+                    parent->freequeue.enqueue(work);
                 }
                 catch (IException *e)
                 {
@@ -1897,7 +2071,7 @@ class CMultiCoreUnorderedJoinHelper: public CMultiCoreJoinHelperBase
                     break;
                 }
             }
-            LOG(MCthorDetailedDebugInfo, thorJob, "CMulticoreUnorderedJoinHelper::cWorker exit");
+            LOG(MCthorDetailedDebugInfo, "CMulticoreUnorderedJoinHelper::cWorker exit");
             return 0;
         }
     } **workers;
@@ -1925,11 +2099,21 @@ public:
             delete workers[i];
         delete [] workers;
         ::Release(jhelper);
+        delete activeItem;
     }
     void stopWorkers()
     {
+        if (activeItem && activeItem->leftOffsets.ordinality())
+        {
+            workqueue.enqueue(activeItem);
+            activeItem = nullptr;
+        }
         for (unsigned i=0;i<numworkers;i++)
-            addWork(NULL, NULL);
+        {
+            cWorkItem *item = freequeue.dequeue();
+            if (!item) item = new cWorkItem(activity);
+            workqueue.enqueue(item);
+        }
         rowWriter.clear();
     }
 
@@ -1948,8 +2132,8 @@ public:
         workqueue.setLimit(numworkers+1);
         rowWriter.setown(multiWriter->getWriter());
         for (unsigned i=0;i<numworkers;i++)
-            workers[i]->start();
-        reader.start();
+            workers[i]->start(true);
+        reader.start(true);
         return true;
     }
     virtual const void *nextRow()
@@ -1971,7 +2155,7 @@ public:
     virtual void stop()
     {
         CMultiCoreJoinHelperBase::stop();
-        workqueue.stop();
+        workqueue.stop(numworkers, 1);
         multiWriter->abort();
         if (!reader.join(1000*60))
             IERRLOG("~CMulticoreUnorderedJoinHelper reader join timed out");
@@ -1982,13 +2166,25 @@ public:
         }
         while (workqueue.ordinality())
             delete workqueue.dequeueNow();
+        while (freequeue.ordinality())
+            delete freequeue.dequeue();
     }
 
 // IMulticoreIntercept impl.
     virtual void addWork(CThorExpandingRowArray *lgroup,CThorExpandingRowArray *rgroup)
     {
-        cWorkItem *item = new cWorkItem(activity, lgroup, rgroup);
-        workqueue.enqueue(item);
+        //NOTE: Unlike the ordered version, this is not called with addWork(nullptr, nullptr) at the end of work
+        //So this logic does not need to check for that case.
+        noteGroupSizes(lgroup, rgroup);
+        if (!activeItem) {
+            activeItem = freequeue.dequeue();
+            if (!activeItem) activeItem = new cWorkItem(activity);
+        }
+        activeItem->append(lgroup, rgroup);
+        if (activeItem->numCandidates >= candidateBatchLimit) {
+            workqueue.enqueue(activeItem);
+            activeItem = nullptr;
+        }
     }
     virtual void addRow(const void *row)
     {

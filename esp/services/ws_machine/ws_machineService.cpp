@@ -26,6 +26,14 @@
 #include "platform.h"
 #include "TpWrapper.hpp"
 
+#include <math.h>
+
+
+using std::string;
+using std::set;
+using std::map;
+using std::pair;
+
 static const int THREAD_POOL_SIZE = 40;
 static const int THREAD_POOL_STACK_SIZE = 64000;
 static const char* FEATURE_URL = "MachineInfoAccess";
@@ -74,7 +82,7 @@ private:
     static Mutex s_mutex;
 };
 
-Mutex CMachineInfoThreadParam::s_mutex;
+Mutex CMachineInfoThreadParam::s_mutex(SYNC_LOCATION);
 
 class CRoxieStateInfoThreadParam : public CWsMachineThreadParam
 {
@@ -191,7 +199,7 @@ void Cws_machineEx::init(IPropertyTree *cfg, const char *process, const char *se
     //Start thread pool
     Owned<IThreadFactory> pThreadFactory = new CWsMachineThreadFactory();
     m_threadPool.setown(createThreadPool("WsMachine Thread Pool", pThreadFactory,
-        NULL, m_threadPoolSize, 10000, m_threadPoolStackSize)); //10 sec timeout for available thread; use stack size of 2MB
+         false, nullptr, m_threadPoolSize, 10000, m_threadPoolStackSize)); //10 sec timeout for available thread; use stack size of 2MB
 
     setupLegacyFilters();
 
@@ -201,6 +209,7 @@ void Cws_machineEx::init(IPropertyTree *cfg, const char *process, const char *se
     unsigned machineUsageCacheForceRebuildMinutes = pServiceNode->getPropInt("MachineUsageCacheMinutes", machineUsageCacheMinutes);
     unsigned machineUsageCacheAutoRebuildMinutes = pServiceNode->getPropInt("MachineUsageCacheAutoRebuildMinutes", defaultMachineUsageCacheAutoBuildMinutes);
     usageCacheReader.setown(new CUsageCacheReader(this, "Usage Reader", machineUsageCacheAutoRebuildMinutes*60, machineUsageCacheForceRebuildMinutes*60));
+    usageCacheReader->init();
 }
 
 StringBuffer& Cws_machineEx::getAcceptLanguage(IEspContext& context, StringBuffer& acceptLanguage)
@@ -296,6 +305,8 @@ bool Cws_machineEx::onGetTargetClusterInfo(IEspContext &context, IEspGetTargetCl
     }
     return true;
 }
+
+
 
 void Cws_machineEx::addChannels(CGetMachineInfoData& machineInfoData, IPropertyTree* envRoot,
     const char* componentType, const char* componentName)
@@ -788,29 +799,26 @@ void Cws_machineEx::getThorProcesses(IConstEnvironment* constEnv, IPropertyTree*
             return;
         }
         nodeGroup.setown(getClusterProcessNodeGroup(processName, eqThorCluster));
+        if (!nodeGroup || (nodeGroup->ordinality() == 0))
+        {
+            OWARNLOG("Cannot find node group for %s", processName);
+            return;
+        }
     }
     else
     {
         getClusterSpareGroupName(*cluster, groupName);
-        if (groupName.length() < 1)
-        {
-            OWARNLOG("Cannot find group name for %s", processName);
-            return;
-        }
         nodeGroup.setown(queryNamedGroupStore().lookup(groupName.str()));
-    }
-    if (!nodeGroup || (nodeGroup->ordinality() == 0))
-    {
-        OWARNLOG("Cannot find node group for %s", processName);
-        return;
+        if (!nodeGroup || (nodeGroup->ordinality() == 0))
+            return; //The thor may not have spare node.
     }
 
-    int slavesPerNode = cluster->getPropInt("@slavesPerNode");
+    unsigned processNumber = 1;
     Owned<INodeIterator> gi = nodeGroup->getIterator();
     ForEach(*gi)
     {
         StringBuffer addressRead;
-        gi->query().endpoint().getIpText(addressRead);
+        gi->query().endpoint().getHostText(addressRead);
         if (addressRead.length() == 0)
         {
             OWARNLOG("Network address not found for a node in node group %s", groupName.str());
@@ -826,7 +834,7 @@ void Cws_machineEx::getThorProcesses(IConstEnvironment* constEnv, IPropertyTree*
         else
         {
             IpAddress ipaddr = queryHostIP();
-            ipaddr.getIpText(netAddress);
+            ipaddr.getHostText(netAddress);
         }
 
         if (netAddress.length() == 0)
@@ -842,10 +850,11 @@ void Cws_machineEx::getThorProcesses(IConstEnvironment* constEnv, IPropertyTree*
             continue;
         }
 
-        //Each thor slave is a process. The i is used to check whether the process is running or not.
-        for (unsigned i = 1; i <= slavesPerNode; i++)
-            setProcessRequest(machineInfoData, uniqueProcesses, netAddress.str(), addressRead.str(),
-                processType, processName, directory, i);
+        //Each thor slave is a process. Each process has a PID file.
+        //The PID file is used to get the information about the process.
+        //PID file name for thor slave: thorslave_{processName}_{processNumber}.pid
+        setProcessRequest(machineInfoData, uniqueProcesses, netAddress.str(), addressRead.str(),
+            processType, processName, directory, processNumber++);
     }
 
     return;
@@ -907,26 +916,12 @@ void Cws_machineEx::getProcesses(IConstEnvironment* constEnv, IPropertyTree* env
             SCMStringBuffer ep;
             pMachineInfo->getNetAddress(ep);
 
-            const char* ip = ep.str();
-            if (!ip)
+            if (ep.length() == 0)
             {
                 OWARNLOG("Network address not found for machine %s", name0);
                 continue;
             }
-
-            StringBuffer netAddress;
-            StringBuffer configNetAddress(ip);
-            if (!streq(ip, "."))
-            {
-                netAddress.set(ip);
-            }
-            else
-            {
-                IpAddress ipaddr = queryHostIP();
-                ipaddr.getIpText(netAddress);
-            }
-
-            setProcessRequest(machineInfoData, uniqueProcesses, netAddress.str(), configNetAddress.str(), processType, processName, directory0);
+            setProcessRequest(machineInfoData, uniqueProcesses, ep.str(), ep.str(), processType, processName, directory0);
         }
     }
 
@@ -1162,6 +1157,8 @@ void Cws_machineEx::doGetMachineInfo(IEspContext& context, CMachineInfoThreadPar
     }
     else
     {
+        ESPLOG(LogMax, "netAddress(%s), command(%s)", pParam->m_machineData.getNetworkAddress(), preflightCommand.str());
+
         error = runCommand(context, pParam->m_machineData.getNetworkAddress(), pParam->m_machineData.getNetworkAddressInEnvSetting(), pParam->m_machineData.getOS(), preflightCommand.str(), pParam->m_options.getUserName(), pParam->m_options.getPassword(), response);
         if ((error == 0) && (response.length() > 0))
             readPreflightResponse(context, pParam, response.str(), error);
@@ -1179,7 +1176,7 @@ void Cws_machineEx::buildPreflightCommand(IEspContext& context, CMachineInfoThre
 {
     preflightCommand.clear().appendf("/%s/sbin/%s -p=%s", environmentConfData.m_executionPath.str(),
         m_machineInfoFile.str(), environmentConfData.m_pidPath.str());
-    if (preflightCommand.charAt(preflightCommand.length() - 1) == pParam->m_machineData.getPathSep())
+    if (preflightCommand.length() && preflightCommand.charAt(preflightCommand.length() - 1) == pParam->m_machineData.getPathSep())
         preflightCommand.remove(preflightCommand.length()-1, 1);
 
     bool checkDependency = false;
@@ -1445,15 +1442,14 @@ void Cws_machineEx::readStorageData(const char* response, CMachineInfoThreadPara
 
         if (buf.length() > 0)
         {
-            StringBuffer diskSpaceTitle;
-            int diskSpacePercentAvail = 0;
-            __int64 diskSpaceAvailable = 0, diskSpaceTotal = 0;
-            if (!readStorageSpace(buf.str(), diskSpaceTitle, diskSpaceAvailable, diskSpaceTotal, diskSpacePercentAvail))
+            Owned<CStorageData> sData = new CStorageData(true, false, true);
+            if (!sData->read(buf))
                 DBGLOG("Invalid storage information on %s: %s", pParam->m_machineData.getNetworkAddress(), buf.str());
-            else if ((diskSpaceTitle.length() > 0) && !excludePartition(diskSpaceTitle.str()))
+            else
             {
-                Owned<CStorageData> diskData = new CStorageData(diskSpaceTitle, diskSpaceAvailable, diskSpaceTotal, diskSpacePercentAvail);
-                storage.append(*diskData.getClear());
+                const char* title = sData->getDiskSpaceTitle();
+                if (!isEmptyString(title) && !excludePartition(title))
+                    storage.append(*sData.getClear());
             }
         }
         if (!pStr || (strnicmp(pStr, "---ProcessList1---", 18)==0))
@@ -1461,53 +1457,46 @@ void Cws_machineEx::readStorageData(const char* response, CMachineInfoThreadPara
     }
 }
 
-bool Cws_machineEx::readStorageSpace(const char *line, StringBuffer& title, __int64& free, __int64& total, int& percentAvail)
+bool CStorageData::read(const char* s)
 {
-    if (!line || !*line)
+    if (isEmptyString(s))
         return false;
 
-    StringBuffer freeStr, usedStr;
-
-    const char* pStr = line;
-    const char* pStr1 = strchr(pStr, ':');
-    if (!pStr1)
-        return false;
-
-    title.clear().append(pStr, 0, pStr1 - pStr);
-    pStr = pStr1 + 2;
-    pStr1 = (char*) strchr(pStr, ' ');
-    if (!pStr1)
-        return false;
-
-    usedStr.append(pStr, 0, pStr1 - pStr);
-    pStr = pStr1 + 1;
-    if (!pStr)
-        return false;
-
-    freeStr.append(pStr);
-
-    __int64 factor1 = 1;
-    if (freeStr.length() > 9)
+    const char* pStr = s;
+    if (m_readTitle)
     {
-        freeStr.setLength(freeStr.length()-6);
-        factor1 = 1000000;
-    }
-    free = atol(freeStr.str())*factor1;
+        const char* finger = strchr(pStr, ':');
+        if (!finger)
+            return false;
 
-    __int64 factor2 = 1;
-    if (usedStr.length() > 9)
+        m_diskSpaceTitle.append(pStr, 0, finger - pStr);
+        pStr = finger + 2;
+    }
+
+    StringArray data;
+    data.appendList(pStr, " ");
+    if (data.length() < 2)
+        return false;
+
+    m_diskSpaceUsed = atol(data.item(0));
+    m_diskSpaceAvailable = atol(data.item(1));
+    if (m_toMByte)
     {
-        usedStr.setLength(usedStr.length()-6);
-        factor2 = 1000000;
+        //Convert from kilobytes to megabytes
+        m_diskSpaceAvailable = llround((double)m_diskSpaceAvailable/1024);
+        m_diskSpaceUsed = llround((double)m_diskSpaceUsed/1024);
     }
-    __int64 used = atol(usedStr.str())*factor2;
 
-    total = free + used;
-    if (total > 0)
-        percentAvail = (int) ((free*100)/total);
+    m_diskSpaceTotal = m_diskSpaceAvailable + m_diskSpaceUsed;
+    if (m_diskSpaceTotal > 0)
+        m_diskSpacePercentAvail = round((float)m_diskSpaceAvailable*100/m_diskSpaceTotal);
 
-    free = (__int64) free /1000; //MByte
-    total = (__int64) total /1000; //MByte
+    //If a given path (ex. /var/lib/HPCCSystems/hpcc-mirror/thor) in the usage request does not exist,
+    //the data.item(2) is the path where the usage script is used to read the DiskSpace
+    //(ex. /var/lib/HPCCSystems/hpcc-mirror/).
+    if (m_readPath && (data.length() > 2))
+        m_path.set(data.item(2));
+
     return true;
 }
 
@@ -2404,7 +2393,7 @@ void Cws_machineEx::readThorUsageReq(const char* name, IConstEnvironment* constE
 
     Owned<IPropertyTree> machineReq = createMachineUsageReq(constEnv, computer);
     xpath.setf("Machine[@netAddress='%s']", machineReq->queryProp("@netAddress"));
-    if (componentReq->queryPropTree(xpath))
+    if (componentReq->hasProp(xpath))
     {   //ThorMasterProcess is running on one of the ThorSlaveProcess machines.
         //So, we do not add this machine again.
         usageReq->addPropTree(componentReq->queryName(), LINK(componentReq));
@@ -2675,32 +2664,6 @@ void Cws_machineEx::getMachineUsages(IEspContext& context, IPropertyTree* unique
         m_threadPool->join(threadHandles.item(i));
 }
 
-bool Cws_machineEx::readDiskSpaceResponse(const char* response, __int64& free, __int64& used, int& percentAvail, StringBuffer& pathUsed)
-{
-    if (isEmptyString(response))
-        return false;
-
-    StringArray data;
-    data.appendList(response, " ");
-    if (data.length() < 2)
-        return false;
-
-    used = atol(data.item(0));
-    free = atol(data.item(1));
-
-    __int64 total = free + used;
-    if (total > 0)
-        percentAvail = (int) ((free*100)/total);
-
-    //The given path (ex. /var/lib/HPCCSystems/hpcc-mirror/thor) in the usage request does not exist.
-    //The data.item(2) is the path (ex. /var/lib/HPCCSystems/hpcc-mirror/) the usage script is used
-    //to read the DiskSpace.
-    if (data.length() > 2)
-        pathUsed.set(data.item(2));
-
-    return true;
-}
-
 void Cws_machineEx::getMachineUsage(IEspContext& context, CGetMachineUsageThreadParam* param)
 {
     VStringBuffer command("/%s/sbin/usage -d=", environmentConfData.m_executionPath.str());
@@ -2715,7 +2678,7 @@ void Cws_machineEx::getMachineUsage(IEspContext& context, CGetMachineUsageThread
         command.appendf("%s", t.queryProp("@path"));
         pathCount++;
     }
-    ESPLOG(LogMax, "command(%s)", command.str());
+    ESPLOG(LogMax, "netAddress(%s), command(%s)", param->request->queryProp("@netAddress"), command.str());
 
     StringBuffer response;
     int error = runCommand(context, param->request->queryProp("@netAddress"), nullptr,
@@ -2734,23 +2697,22 @@ void Cws_machineEx::getMachineUsage(IEspContext& context, CGetMachineUsageThread
     {
         IPropertyTree& diskPathTree = diskPathList->query();
 
-        StringBuffer aDiskPathResp, pathUsed;
+        StringBuffer aDiskPathResp;
         VStringBuffer diskPath("%s:", diskPathTree.queryProp("@path"));
         readALineFromResult(response, diskPath, aDiskPathResp, true);
 
-        int percentAvail = 0;
-        __int64 diskSpaceAvailable = 0, diskSpaceUsed = 0;
-        if (!readDiskSpaceResponse(aDiskPathResp.str(), diskSpaceAvailable, diskSpaceUsed, percentAvail, pathUsed))
+        CStorageData sData(false, true, false);
+        if (!sData.read(aDiskPathResp))
         {
             DBGLOG("Failed to read disc space on %s: %s", param->request->queryProp("@netAddress"), aDiskPathResp.str());
             diskPathTree.addProp("@error", "Failed to read disc space.");
             continue;
         }
-
-        diskPathTree.addPropInt64("@used", diskSpaceUsed);
-        diskPathTree.addPropInt64("@available", diskSpaceAvailable);
-        diskPathTree.addPropInt("@percentAvail", percentAvail);
-        if (!pathUsed.isEmpty())
+        diskPathTree.addPropInt64("@used", sData.getDiskSpaceUsed());
+        diskPathTree.addPropInt64("@available", sData.getDiskSpaceAvailable());
+        diskPathTree.addPropInt("@percentAvail", sData.getDiskSpacePercentAvail());
+        const char* pathUsed = sData.getDiskSpacePath();
+        if (!isEmptyString(pathUsed))
             diskPathTree.addProp("@pathUsed", pathUsed);
     }
 }
@@ -2919,7 +2881,7 @@ bool Cws_machineEx::onGetComponentUsage(IEspContext& context, IEspGetComponentUs
 StringArray& Cws_machineEx::listTargetClusterNames(IConstEnvironment* constEnv, StringArray& targetClusters)
 {
 #ifdef _CONTAINERIZED
-    Owned<IStringIterator> targets = getContainerTargetClusters(nullptr, nullptr);
+    Owned<IStringIterator> targets = config::getContainerTargets(nullptr, nullptr);
 #else
     Owned<IStringIterator> targets = getTargetClusters(nullptr, nullptr);
 #endif

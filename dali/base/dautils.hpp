@@ -24,10 +24,13 @@
 #include "jsocket.hpp"
 #include "jfile.hpp"
 #include "jlog.hpp"
+#include "dafsaudit.hpp"
 #include "mpbase.hpp"
 #include "dasess.hpp"
 
-#ifndef da_decl
+#ifdef DALI_EXPORTS
+#define da_decl DECL_EXPORT
+#else
 #define da_decl DECL_IMPORT
 #endif
 
@@ -54,12 +57,13 @@ class da_decl CDfsLogicalFileName
 {
     StringAttr lfn;
     unsigned tailpos;
-    unsigned localpos; // if 0 not foreign
+    unsigned localpos; // if 0 not foreign or remote
     StringAttr cluster; 
     CMultiDLFN *multi;   // for temp superfile
     bool external;
     bool allowospath;
     bool allowWild;
+    bool allowTrailingEmptyScope;
     SocketEndpoint foreignep;
     bool selfScopeTranslation = true; // default behaviour is to translate self scopes, e.g. .::.::scope::.::name -> scope::name
 
@@ -68,7 +72,7 @@ public:
     ~CDfsLogicalFileName();
 
     CDfsLogicalFileName & operator = (CDfsLogicalFileName const &from);
-    void set(const char *lfn, bool removeForeign=false); // throws an exception on invalid filenames
+    void set(const char *lfn, bool removeForeign=false, bool skipAddRootScopeIfNone=false); // throws an exception on invalid filenames
     bool setValidate(const char *lfn, bool removeForeign=false); // returns false for invalid filenames
     void set(const CDfsLogicalFileName &lfn);
     void set(const char *scopes,const char *tail);
@@ -92,7 +96,15 @@ public:
     void setExternal(const char *location,const char *path);
     void setExternal(const SocketEndpoint &dafsip,const char *path);
     void setExternal(const RemoteFilename &rfn);
+    void setRemote(const char *remoteName, const char *logicalName);
+    void setPlaneExternal(const char *planeName,const char *path);
     bool isExternal() const { return external; }
+    bool isExternalPlane() const;
+    bool isRemote() const;
+    bool getExternalPlane(StringBuffer & plane) const;
+    bool getRemoteSpec(StringBuffer &remoteSvc, StringBuffer &logicalName) const;
+    bool isExternalFile() const;
+    bool getExternalHost(StringBuffer & host) const;
     /*
      * Multi files are temporary SuperFiles only. SuperFiles created
      * by the user do not fit into this category and are created
@@ -109,14 +121,14 @@ public:
     void setCluster(const char *cname); 
     StringBuffer &getCluster(StringBuffer &cname) const { return cname.append(cluster); }
 
-    const char *get(bool removeforeign=false) const;
-    StringBuffer &get(StringBuffer &str,bool removeforeign=false, bool withCluster=false) const;
+    const char *get(bool removeForeignOrRemote=false) const;
+    StringBuffer &get(StringBuffer &str,bool removeForeignOrRemote=false, bool withCluster=false) const;
     const char *queryTail() const;
     StringBuffer &getTail(StringBuffer &buf) const;
 
-    StringBuffer &getScopes(StringBuffer &buf,bool removeforeign=false) const;
-    unsigned numScopes(bool removeforeign=false) const; // not including tail
-    StringBuffer &getScope(StringBuffer &buf,unsigned idx,bool removeforeign=false) const;
+    StringBuffer &getScopes(StringBuffer &buf,bool removeForeignOrRemote=false) const;
+    unsigned numScopes(bool removeForeignOrRemote=false) const; // not including tail
+    StringBuffer &getScope(StringBuffer &buf,unsigned idx,bool removeForeignOrRemote=false) const;
 
     StringBuffer &makeScopeQuery(StringBuffer &query, bool absolute=true) const; // returns xpath for containing scope
     StringBuffer &makeFullnameQuery(StringBuffer &query, DfsXmlBranchKind kind, bool absolute=true) const; // return xpath for branch
@@ -140,11 +152,12 @@ public:
     IPropertyTree *createSuperTree() const;
     void allowOsPath(bool allow=true) { allowospath = allow; } // allow local OS path to be specified
     void setAllowWild(bool b=true) { allowWild = b; } // allow wildcards
+    void setAllowTrailingEmptyScope(bool b=true) { allowTrailingEmptyScope = b; }
     bool isExpanded() const;
     void expand(IUserDescriptor *user);
 
 protected:
-    void normalizeName(const char * name, StringAttr &res, bool strict);
+    void normalizeName(const char * name, StringAttr &res, bool strict, bool nameIsRoot, bool stripLeadingSelfScope);
     bool normalizeExternal(const char * name, StringAttr &res, bool strict);
 };
 
@@ -152,14 +165,14 @@ protected:
 class da_decl CTransactionLogTracker
 {
     unsigned max;
-    atomic_t *counts;
+    std::atomic<unsigned> * counts;
 public:
     CTransactionLogTracker(int _max) : max(_max)
     {
-        counts = new atomic_t[max+1]; // +1 reserve for unknown commands
+        counts = new std::atomic<unsigned>[max+1]; // +1 reserve for unknown commands
         unsigned t=0;
         for (; t<=max; t++)
-            atomic_set(&counts[t],0);
+            counts[t] = 0;
     }
     ~CTransactionLogTracker()
     {
@@ -168,15 +181,15 @@ public:
     inline const unsigned &getMax() const { return max; }
     inline void startTransaction(unsigned cmd)
     {
-        atomic_inc(&counts[cmd]);
+        counts[cmd]++;
     }
     inline void endTransaction(unsigned cmd)
     {
-        atomic_dec(&counts[cmd]);
+        counts[cmd]--;
     }
     unsigned getTransactionCount(unsigned cmd) const
     {
-        return (unsigned)atomic_read(&counts[cmd]);
+        return counts[cmd].load();
     }
     virtual StringBuffer &getCmdText(unsigned cmd, StringBuffer &ret) const = 0;
 };
@@ -199,7 +212,7 @@ struct da_decl TransactionLog
             owner.startTransaction(cmd);
             owner.getCmdText(cmd, msg);
             msg.append(", endpoint=");
-            ep.getUrlStr(msg);
+            ep.getEndpointHostText(msg);
             startCycles = get_cycles_now();
         }
         else
@@ -264,6 +277,7 @@ struct da_decl TransactionLog
 
 
 extern da_decl const char * skipScope(const char *lname,const char *scope); // skips a sspecified scope (returns NULL if scope doesn't match)
+extern da_decl bool isForeignFilename(const char *name); // equivalent to CDfsLogicalFileName::set(name).isForeign()
 extern da_decl const char * querySdsFilesRoot();
 extern da_decl const char * querySdsRelationshipsRoot();
 extern da_decl void ensureSDSPath(const char * sdsPath);
@@ -433,14 +447,14 @@ interface ILocalOrDistributedFile: extends IInterface
     virtual unsigned numParts() = 0;
     virtual unsigned numPartCopies(unsigned partnum) = 0;
     virtual IFile *getPartFile(unsigned partnum,unsigned copy=0) = 0;
+    virtual void getDirAndFilename(StringBuffer &dir, StringBuffer &filename) = 0;
     virtual RemoteFilename &getPartFilename(RemoteFilename &rfn, unsigned partnum,unsigned copy=0) = 0;
     virtual offset_t getPartFileSize(unsigned partnum)=0;   // NB expanded size             
     virtual bool getPartCrc(unsigned partnum, unsigned &crc) = 0;
     virtual bool exists() const = 0;   // if created for writing, this may be false
     virtual bool isExternal() const = 0;
+    virtual bool isExternalFile() const = 0;
 };
-
-extern da_decl ILocalOrDistributedFile* createLocalOrDistributedFile(const char *fname,IUserDescriptor *user,bool onlylocal,bool onlydfs,bool iswrite, bool isPrivilegedUser);
 
 typedef __int64 ConnectionId;
 
@@ -532,7 +546,111 @@ interface ILockInfoCollection : extends IInterface
 extern da_decl ILockInfoCollection *createLockInfoCollection();
 extern da_decl ILockInfoCollection *deserializeLockInfoCollection(MemoryBuffer &mb);
 
+extern da_decl IPropertyTreeIterator * getDropZonePlanesIterator(const char * name=nullptr);
+extern da_decl IPropertyTree * getDropZonePlane(const char * name);
+extern da_decl IPropertyTree * findPlane(const char *category, const char * path, const char * host, bool ipMatch, bool mustMatch);
+extern da_decl IPropertyTree * findDropZonePlane(const char * path, const char * host, bool ipMatch, bool mustMatch);
+extern da_decl bool validateDropZone(IPropertyTree *plane, const char *path, const char *host, bool ipMatch);
+
+extern da_decl bool allowForeign();
 extern da_decl void setPageCacheTimeoutMilliSeconds(unsigned timeoutSeconds);
 extern da_decl void setMaxPageCacheItems(unsigned _maxPageCacheItems);
+extern da_decl IRemoteConnection* connectXPathOrFile(const char* path, bool safe, StringBuffer& xpath);
+extern da_decl bool expandExternalPath(StringBuffer &dir, StringBuffer &tail, const char * filename, const char * s, bool iswin, IException **e);
+extern da_decl bool validFNameChar(char c); 
+extern da_decl void addStripeDirectory(StringBuffer &out, const char *directory, const char *planePrefix, unsigned partNum, unsigned lfnHash, unsigned numStripes);
+
+// [append,get]LfnHashFromPath are a set of functions for getting a logical filename hash
+// from a path. The path should not include the prefix or stripe directory. If the filepath
+// contains a dir-per-part directory, getLfnHashFromPath should be used on the scope directories
+// before the dir-per-part directory, and appendLfnHashFromPath should be used on the tail after
+// the dir-per-part directory
+// e.g. a file path /var/lib/HPCCSystems/hpcc-data/d1/somescope/otherscope/1/afile._1_of_2
+// unsigned lfnHash = getLfnHashFromPath(20, "somescope/otherscope");
+// lfnHash = appendLfnHashFromPath(5, "afile", lfnHash);
+// or e.g. a file path /var/lib/HPCCSystems/hpcc-data/somescope/otherscope/afile._1_of_2
+// unsigned lfnHash = getLfnHashFromPath(26, "somescope/otherscope/afile");
+inline unsigned appendLfnHashFromPath(size32_t len, const char *path, unsigned initval)
+{
+    initval = hashc((const unsigned char *)"::", 2, initval);
+    return hashc((const unsigned char *)path, len, initval);
+}
+inline unsigned getLfnHashFromPath(size32_t len, const char *path, unsigned hashval = 0)
+{
+    while (len>0)
+    {
+        const char *slash = (const char *) memchr(path, PATHSEPCHAR, len);
+        if (!slash)
+        {
+            // Hash the rest of len
+            hashval = hashc((const unsigned char *)path, len, hashval);
+            break;
+        }
+        else
+        {
+            // Hash until path separator and hash logical filename separator separately
+            hashval = hashc((const unsigned char *)path, slash-path, hashval);
+            hashval = hashc((const unsigned char *)"::", 2, hashval);
+            len -= (slash-path)+1;
+            path = slash+1;
+        }
+    }
+    return hashval;
+}
+inline unsigned getFilenameHash(size32_t len, const char *filename)
+{
+    return hashc((const unsigned char *)filename, len, 0);
+}
+inline unsigned getFilenameHash(const char *filename)
+{
+    return getFilenameHash(strlen(filename), filename);
+}
+inline unsigned calcStripeNumber(unsigned partNum, unsigned lfnHash, unsigned numStripes)
+{
+    if (numStripes <= 1)
+        return 0;
+    return ((partNum+lfnHash)%numStripes)+1;
+}
+inline unsigned calcStripeNumber(unsigned partNum, const char *lfnName, unsigned numStripes)
+{
+    if (numStripes <= 1)
+        return 0;
+    unsigned lfnHash = getFilenameHash(lfnName);
+    return ((partNum+lfnHash)%numStripes)+1;
+}
+interface INamedGroupStore;
+extern da_decl void remapGroupsToDafilesrv(IPropertyTree *file, bool foreign, bool secure);
+extern da_decl unsigned getPreferredDaFsServerPort();
+#ifdef NULL_DALIUSER_STACKTRACE
+#define logNullUser(userDesc) doLogNullUser(userDesc, __func__);
+#define logNullUserWithSource(userDesc, source) doLogNullUser(userDesc, source);
+extern da_decl void doLogNullUser(IUserDescriptor * userDesc, const char *location);
+#else
+inline void logNullUser(IUserDescriptor *userDesc) { }
+inline void logNullUserWithSource(IUserDescriptor *userDesc, const char *source) { }
+#endif
+
+interface IDistributedFileTransaction;
+interface IFileReadPropertiesUpdater : extends IInterface
+{
+public:
+    virtual cost_type addCostAndNumReads(IDistributedFile * file, stat_type numDiskReads, cost_type curReadCost) = 0;
+    virtual void publish(IDistributedFileTransaction *transaction = nullptr) = 0;
+};
+
+extern da_decl IFileReadPropertiesUpdater * createFileReadPropertiesUpdater(IUserDescriptor * udesc);
+
+/**
+ * Given a temporary logical filename for hthor, attach scopes to it
+ * so that thor processes can find it (or hthor can find a thor-created
+ * temp filename published to Dali)
+ *
+ * @param   out     Reference to a string buffer that will be destructively
+ *                  modified to contain the result
+ * @param   wuid    The current workunit ID
+ * @param   lfn     The logical filename
+ * @param   user    The current user's username, or NULL
+ */
+extern da_decl StringBuffer & mangleTemporaryFileName(StringBuffer & out, const char * lfn, const char * wuid, const char * user, bool isPaused = false, bool jobUsesCheckpoints = false);
 
 #endif

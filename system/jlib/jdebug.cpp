@@ -25,9 +25,15 @@
 #include "jfile.hpp"
 #include "jmutex.hpp"
 #include "jtime.hpp"
+#include "jutil.hpp"
+#include "jthread.hpp"
+#include "jsem.hpp"
+#include "jlog.hpp"
 #include <stdio.h>
 #include <time.h>
 #include <atomic>
+#include <cmath>
+#include "jerror.hpp"
 
 #ifdef _WIN32
 #define DPSAPI_VERSION 1
@@ -44,6 +50,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/klog.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <dirent.h>
 #endif
 #ifdef __APPLE__
@@ -55,7 +63,6 @@
  #include <mach/mach_host.h>
  #include <mach/vm_statistics.h>
 #endif
-#include "build-config.h"
 
 //===========================================================================
 #ifdef _DEBUG
@@ -82,21 +89,21 @@ PU (%) is the percentage CPU in use (unchanged from previously).
 
 MU (%) is what percentage of total (all processes) memory is in use
 (ram + swap) or in 32 bit is the percentage of 3GB (address space)
-used (whichever larger). 
+used (whichever larger).
 
 MAL is total memory in use (i.e malloced and not freed ) by this
-process  (= MMP+SBK) 
+process  (= MMP+SBK)
 
 MMP is the sum of memory mapped (large) blocks in use by this process
 (which will be  returned to OS when freed).
 
 SBK is the sbrk'ed memory i.e. smaller blocks allocated from the
 arena. (note this memory is unlikely to be returned to OS while the
-process is still running). 
+process is still running).
 
 TOT (K) is an indication of the memory footprint of the process.
 This is the 'arena' size (which is how much reserved by sbrk) plus the
-mmap memory size (MMP). 
+mmap memory size (MMP).
 
 RAM (K) is how much real memory is in use by all processes - it is
 the same as what would be reported by the 'free' command after the
@@ -139,27 +146,27 @@ inline offset_t readHexNum(const char *&s)
     for (;;) {
         switch (*s) {
             case '0':
-            case '1': 
-            case '2': 
-            case '3': 
+            case '1':
+            case '2':
+            case '3':
             case '4':
-            case '5': 
-            case '6': 
-            case '7': 
+            case '5':
+            case '6':
+            case '7':
             case '8':
-            case '9': ret = ret*16+(*s-'0'); 
+            case '9': ret = ret*16+(*s-'0');
                  break;
-            case 'A': 
-            case 'B': 
-            case 'C': 
-            case 'D': 
+            case 'A':
+            case 'B':
+            case 'C':
+            case 'D':
             case 'E':
             case 'F': ret = ret*16+(*s-'A'+10);
                  break;
-            case 'a': 
-            case 'b': 
-            case 'c': 
-            case 'd': 
+            case 'a':
+            case 'b':
+            case 'c':
+            case 'd':
             case 'e':
             case 'f': ret = ret*16+(*s-'a'+10);
                  break;
@@ -177,15 +184,15 @@ inline offset_t readDecNum(const char *&s)
     for (;;) {
         switch (*s) {
             case '0':
-            case '1': 
-            case '2': 
-            case '3': 
+            case '1':
+            case '2':
+            case '3':
             case '4':
-            case '5': 
-            case '6': 
-            case '7': 
+            case '5':
+            case '6':
+            case '7':
             case '8':
-            case '9': ret = ret*10+(*s-'0'); 
+            case '9': ret = ret*10+(*s-'0');
                  break;
         default:
             return ret;
@@ -198,22 +205,22 @@ inline offset_t readDecNum(const char *&s)
 
 #if defined(_WIN32)
 
-static __int64 numCyclesNTicks; 
+static __int64 numCyclesNTicks;
 static __int64 ticksPerSec;
 static __int64 numScaleTicks;
 static bool useRDTSC = _USE_RDTSC;
-static double cycleToNanoScale; 
+static double cycleToNanoScale;
 
-static void calibrate_timing()
+static bool calibrate_timing()
 {
 #ifndef _AMD64_
-    if (useRDTSC) 
+    if (useRDTSC)
     {
         unsigned long r;
-        __asm { 
-             mov eax, 1 ;  
-             cpuid ; 
-             mov r, edx 
+        __asm {
+             mov eax, 1 ;
+             cpuid ;
+             mov r, edx
         }
         if ((r&0x10)==0)
             useRDTSC = false;
@@ -233,7 +240,7 @@ static void calibrate_timing()
             if (numPerUS>0)
             {
                 cycleToNanoScale = 1000.0 / numPerUS;
-                return;
+                return true;
             }
         }
         DBGLOG("calibrate_timing failed using RDTSC");
@@ -256,6 +263,7 @@ static void calibrate_timing()
     cycle_t a2 = getTSC();
     numCyclesNTicks = (a2 - a1);
     cycleToNanoScale = ((double)numScaleTicks * 1000000000.0) / ((double)numCyclesNTicks * ticksPerSec);
+    return true;
 }
 
 __int64 cycle_to_nanosec(cycle_t cycles)
@@ -303,12 +311,12 @@ static double cycleToNanoScale;
 static double cycleToMicroScale;
 static double cycleToMilliScale;
 
-void calibrate_timing()
+static bool calibrate_timing()
 {
 #if defined(_ARCH_X86_) || defined(_ARCH_X86_64_)
     if (useRDTSC) {
         unsigned long eax;
-        unsigned long ebx; 
+        unsigned long ebx;
         unsigned long ecx;
         unsigned long edx;
 #if defined(_ARCH_X86_64_)
@@ -316,10 +324,10 @@ void calibrate_timing()
 
 #else
 // NB PIC code and ebx usage don't mix well
-        asm volatile("pushl %%ebx      \n\t" 
+        asm volatile("pushl %%ebx      \n\t"
                      "cpuid            \n\t"
-                     "movl %%ebx, %1   \n\t" 
-                     "popl %%ebx       \n\t" 
+                     "movl %%ebx, %1   \n\t"
+                     "popl %%ebx       \n\t"
                      : "=a"(eax), "=r"(ebx), "=c"(ecx), "=d"(edx)
                  : "a"(1)
                  : "cc");
@@ -346,16 +354,24 @@ void calibrate_timing()
                 cycleToNanoScale = 1000.0 / numPerUS;
                 cycleToMicroScale = 1.0 / numPerUS;
                 cycleToMilliScale = 0.001 / numPerUS;
-                return;
+                return true;
             }
         }
         IERRLOG("calibrate_timing failed using RDTSC");
         useRDTSC = false;
     }
 #endif
+#if defined (__APPLE__)
+    verifyex(mach_timebase_info(&timebase_info) == KERN_SUCCESS);
+    cycleToNanoScale = static_cast<double>(timebase_info.numer)/timebase_info.denom;
+    cycleToMicroScale = cycleToNanoScale/1000.0;
+    cycleToMilliScale = cycleToNanoScale/1000000.0;
+#else
     cycleToNanoScale = 1.0;
-    cycleToMicroScale = 1.0;
-    cycleToMilliScale = 1.0;
+    cycleToMicroScale = cycleToNanoScale/1000.0;
+    cycleToMilliScale = cycleToNanoScale/1000000.0;
+#endif
+    return true;
 }
 
 
@@ -375,14 +391,14 @@ cycle_t jlib_decl get_cycles_now()
     if (!use_gettimeofday) {
         timespec tm;
         if (clock_gettime(CLOCK_MONOTONIC, &tm)>=0)
-            return ((cycle_t)tm.tv_sec)*1000000000L+(tm.tv_nsec);   
+            return ((cycle_t)tm.tv_sec)*1000000000L+(tm.tv_nsec);
         use_gettimeofday = true;
         fprintf(stderr,"clock_gettime CLOCK_MONOTONIC returns %d",errno);   // don't use PROGLOG
     }
 #endif
     struct timeval tm;
     gettimeofday(&tm,NULL);
-    return ((cycle_t)tm.tv_sec)*1000000000L+(cycle_t)tm.tv_usec*1000L; 
+    return ((cycle_t)tm.tv_sec)*1000000000L+(cycle_t)tm.tv_usec*1000L;
 }
 #endif
 
@@ -404,7 +420,11 @@ __int64 jlib_decl cycle_to_microsec(cycle_t cycles)
     if (useRDTSC)
         return (__int64)((double)cycles * cycleToMicroScale);
 #endif
+#ifdef __APPLE__
+    return cycles * (uint64_t) timebase_info.numer / ((uint64_t)timebase_info.denom*1000);
+#else
     return cycles / 1000;
+#endif
 }
 
 __int64 jlib_decl cycle_to_millisec(cycle_t cycles)
@@ -413,7 +433,11 @@ __int64 jlib_decl cycle_to_millisec(cycle_t cycles)
     if (useRDTSC)
         return (__int64)((double)cycles * cycleToMilliScale);
 #endif
+#ifdef __APPLE__
+    return cycles * (uint64_t) timebase_info.numer / ((uint64_t)timebase_info.denom*1000000);
+#else
     return cycles / 1000000;
+#endif
 }
 
 cycle_t nanosec_to_cycle(__int64 ns)
@@ -422,7 +446,11 @@ cycle_t nanosec_to_cycle(__int64 ns)
     if (useRDTSC)
         return (__int64)((double)ns / cycleToNanoScale);
 #endif
+#ifdef __APPLE__
+    return ns * (uint64_t) timebase_info.denom / ((uint64_t)timebase_info.numer);
+#else
     return ns;
+#endif
 }
 
 double getCycleToNanoScale()
@@ -431,6 +459,11 @@ double getCycleToNanoScale()
 }
 
 #endif
+
+cycle_t millisec_to_cycle(unsigned ms)
+{
+    return nanosec_to_cycle((__int64)ms * 1000000);
+}
 
 
 void display_time(const char *title, cycle_t diff)
@@ -464,7 +497,7 @@ MTimeSection::~MTimeSection()
         display_time(scope, end_time-start_time);
 }
 
-class TimeSectionInfo : public MappingBase 
+class TimeSectionInfo : public MappingBase
 {
 public:
     TimeSectionInfo(const char * _scope, __int64 _cycles) : scope(_scope), totalcycles(_cycles), maxcycles(_cycles), count(1) {};
@@ -477,15 +510,15 @@ public:
     unsigned getCount() const { return count; }
 
     StringAttr  scope;
-    __int64 totalcycles;
-    __int64 maxcycles;
+    cycle_t totalcycles;
+    cycle_t maxcycles;
     unsigned count;
 };
 
 class DefaultTimeReporter : implements ITimeReporter, public CInterface
 {
     StringMapOf<TimeSectionInfo> *sections;
-    CriticalSection c;
+    CriticalSection c{SYNC_LOCATION};
     TimeSectionInfo &findSection(unsigned idx)
     {
         CriticalBlock b(c);
@@ -495,15 +528,15 @@ class DefaultTimeReporter : implements ITimeReporter, public CInterface
              if (!idx--)
                  return (TimeSectionInfo &) iter.query();
         }
-        throw MakeStringException(2, "Invalid index to DefaultTimeReporter");
+        throw MakeStringException(JLIBERR_UtilInvalidIndexToDefaulttimereporter, "Invalid index to DefaultTimeReporter");
     }
 public:
     IMPLEMENT_IINTERFACE
-    DefaultTimeReporter() 
+    DefaultTimeReporter()
     {
         sections = new StringMapOf<TimeSectionInfo>(true);
     }
-    ~DefaultTimeReporter() 
+    ~DefaultTimeReporter()
     {
 //      printTimings();                     // Must explicitly call printTimings - no automatic print (too late here!)
         delete sections;
@@ -622,14 +655,7 @@ ITimeReporter * queryActiveTimer()
 
 ITimeReporter *createStdTimeReporter() { return new DefaultTimeReporter(); }
 
-cycle_t oneSecInCycles;
-MODULE_INIT(INIT_PRIORITY_JDEBUG1)
-{
-    // perform v. early in process startup, ideally this would grab process exclusively for the 2 100ths of a sec it performs calc.
-    calibrate_timing();
-    oneSecInCycles = nanosec_to_cycle(1000000000);
-    return 1;
-}
+cycle_t oneSecInCycles = calibrate_timing() ?  nanosec_to_cycle(1000000000) : 0;
 
 MODULE_INIT(INIT_PRIORITY_JDEBUG2)
 {
@@ -643,6 +669,100 @@ MODULE_EXIT()
     activeTimer = NULL;
 }
 
+
+//===========================================================================
+
+
+//Calculate how much time has elapsed total - with the given number of threads still active
+__uint64 BlockedTimeTracker::calcActiveTime(cycle_t tally, unsigned active) const
+{
+    if (active != 0)
+    {
+        cycle_t now = get_cycles_now();
+        tally += active * now;
+    }
+
+    return cycle_to_nanosec(tally);
+}
+
+cycle_t BlockedTimeTracker::noteWaiting()
+{
+    cycle_t now = get_cycles_now();
+    CriticalBlock block(cs);
+    numStarted++;
+    timeStampTally -= now;
+    return now;
+}
+
+cycle_t BlockedTimeTracker::noteWaiting(unsigned numWaiting)
+{
+    cycle_t now = get_cycles_now();
+    CriticalBlock block(cs);
+    numStarted += numWaiting;
+    timeStampTally -= now * numWaiting;
+    return now;
+}
+
+cycle_t BlockedTimeTracker::noteComplete()
+{
+    cycle_t now = get_cycles_now();
+    CriticalBlock block(cs);
+    numFinished++;
+    timeStampTally += now;
+    return now;
+}
+
+__uint64 BlockedTimeTracker::getWaitingNs() const
+{
+    unsigned active;
+    cycle_t tally;
+    {
+        CriticalBlock block(cs);
+        active = numStarted - numFinished;
+        tally = timeStampTally;
+    }
+
+    return calcActiveTime(tally, active);
+}
+
+
+unsigned BlockedTimeTracker::numInFlight() const
+{
+    CriticalBlock block(cs);
+    return numStarted - numFinished;
+}
+
+void BlockedTimeTracker::extractOverlapInfo(OverlapTimeInfo & info, bool isStart) const
+{
+    unsigned started;
+    unsigned finished;
+    cycle_t tally;
+
+    {
+        CriticalBlock block(cs);
+        started = numStarted;
+        finished = numFinished;
+        tally = timeStampTally;
+    }
+
+    //Record so that when counts are subtracted, the total count will include all jobs that overlapped in any part
+    info.count = isStart ? finished : started;
+    info.elapsedNs = calcActiveTime(tally, started - finished);
+}
+
+
+__uint64 LightweightBlockedTimeTracker::getWaitingNs() const
+{
+    __uint64 tally = timeStampTally.load(std::memory_order_acquire); // read the value once atomically
+    unsigned active = tally % MAX_ACTIVE;
+    if (active != 0)
+    {
+        cycle_t now = get_cycles_now();
+        tally += active * now * MAX_ACTIVE;
+    }
+
+    return cycle_to_nanosec(tally / MAX_ACTIVE);
+}
 
 //===========================================================================
 
@@ -722,7 +842,7 @@ struct KERNEL_USER_TIMES {
     __int64 ExitTime;
     __int64 KernelTime;
     __int64 UserTime;
-    //__int64 EllapsedTime; 
+    //__int64 EllapsedTime;
 };
 
 
@@ -760,6 +880,54 @@ static struct CNtKernelInformation
 } NtKernelFunctions;
 #endif
 
+//===========================================================================
+
+#ifndef _WIN32
+
+static std::atomic<bool> gatheredGroup{false};
+static StringAttr cgroup;
+static CriticalSection csgroupCs(SYNC_LOCATION);
+static const char * queryCGroup()
+{
+    if (!gatheredGroup)
+    {
+        CriticalBlock block(csgroupCs);
+        if (!gatheredGroup)
+        {
+            StringBuffer contents;
+            if (loadBinaryFile(contents, "/proc/self/cgroup", false))
+            {
+                auto processLine = [](size_t len, const char * ln)
+                {
+                    //Note ln points at the start of the line, but the line is not null terminated
+                    switch (*ln)
+                    {
+                    case '0':
+                        if (strncmp(ln, "0::/", 4) == 0)
+                        {
+                            //Format is 0::/<cgroup>
+                            //If not running in a container the "cgroup" may be something like user.slice/user-1000.slice/user@1000.service/....
+                            //If so ignore because it is not a real cgroup
+                            if (!memchr(ln+4, '/', len-4))
+                                cgroup.set(ln+4, len-4);
+                        }
+                        break;
+                    }
+                    //Some systems with version 1 cgroups have <n>:cpu,cpuacct:/<cgroup>
+                    const char  * match = (const char *)jmemmem(len, ln, 14, ":cpu,cpuacct:/");
+                    if (match)
+                        cgroup.set(match+14, (ln + len) - (match + 14));
+                };
+
+                processLines(contents, processLine);
+            }
+            gatheredGroup = true;
+        }
+    }
+    return cgroup.get();
+}
+
+#endif
 
 //===========================================================================
 
@@ -769,80 +937,240 @@ static __uint64 ticksToNs = I64C(100);  // FILETIME is in 100ns increments
 static __uint64 ticksToNs = I64C(1000000000) / sysconf(_SC_CLK_TCK);
 #endif
 
-
 #ifdef _WIN32
 inline unsigned __int64 extractFILETIME(const FILETIME & value)
 {
     return ((__uint64)value.dwHighDateTime << (sizeof(value.dwLowDateTime) * 8) | value.dwLowDateTime);
 }
+#else
+static bool matchExtractValue(const char * text, const char * prefix, __uint64 & value)
+{
+    if (!startsWith(text, prefix))
+        return false;
+
+    char *tail;
+    value = strtoull(text + strlen(prefix), &tail, 10);
+    while (std::isspace(*(byte *)tail))
+        tail++;
+
+    offset_t scale = 1;
+    if (*tail)
+    {
+        switch (*tail)
+        {
+        case 'k': case 'K': scale = 1llu<<10; break;
+        case 'm': case 'M': scale = 1llu<<20; break;
+        case 'g': case 'G': scale = 1llu<<30; break;
+        case 't': case 'T': scale = 1llu<<40; break;
+        case 'p': case 'P': scale = 1llu<<50; break;
+        case 'e': case 'E': scale = 1llu<<60; break;
+        }
+    }
+
+    value *= scale;
+    return true;
+}
 #endif
 
-CpuInfo::CpuInfo(bool processTime, bool systemTime) : CpuInfo()
-{
-    if (processTime)
-        getProcessTimes();
-    else if (systemTime)
-        getSystemTimes();
-}
-
-void CpuInfo::clear()
+void SystemProcessInfo::clear()
 {
     user = 0;
     system = 0;
     idle = 0;
     iowait = 0;
+    contextSwitches = 0;
+    peakVirtualMemory = 0;
+    activeVirtualMemory = 0;
+    peakResidentMemory = 0;
+    activeResidentMemory = 0;
+    activeSwapMemory = 0;
+    activeDataMemory = 0;
+    majorFaults = 0;
+    numThreads = 0;
 }
 
-CpuInfo CpuInfo::operator - (const CpuInfo & rhs) const
+SystemProcessInfo SystemProcessInfo::operator - (const SystemProcessInfo & rhs) const
 {
-    CpuInfo result;
+    SystemProcessInfo result;
     result.user = user - rhs.user;
     result.system = system - rhs.system;
     result.idle = idle - rhs.idle;
     result.iowait = iowait - rhs.iowait;
-    result.ctx = ctx - rhs.ctx;
+    result.contextSwitches = contextSwitches - rhs.contextSwitches;
+    result.peakVirtualMemory = peakVirtualMemory - rhs.peakVirtualMemory;
+    result.activeVirtualMemory = activeVirtualMemory - rhs.activeVirtualMemory;
+    result.peakResidentMemory = peakResidentMemory - rhs.peakResidentMemory;
+    result.activeResidentMemory = activeResidentMemory - rhs.activeResidentMemory;
+    result.activeSwapMemory = activeSwapMemory - rhs.activeSwapMemory;
+    result.activeDataMemory = activeDataMemory - rhs.activeDataMemory;
+    result.majorFaults = majorFaults - rhs.majorFaults;
+    result.numThreads = numThreads - rhs.numThreads;
+    result.numPeriods = numPeriods - rhs.numPeriods;
+    result.numThrottledPeriods = numThrottledPeriods - rhs.numThrottledPeriods;
+    result.timeThrottledNs = timeThrottledNs - rhs.timeThrottledNs;
     return result;
 }
 
-bool CpuInfo::getProcessTimes()
+unsigned SystemProcessInfo::getPercentCpu() const
+{
+    __uint64 total = getTotal();
+    if (total == 0)
+        return 0;
+    unsigned percent = (unsigned)(((total - idle) * 100) / total);
+    if (percent > 100)
+        percent = 100;
+    return percent;
+}
+
+__uint64 SystemProcessInfo::getSystemNs() const
+{
+    return system * ticksToNs;
+}
+
+__uint64 SystemProcessInfo::getUserNs() const
+{
+    return user * ticksToNs;
+}
+
+__uint64 SystemProcessInfo::getTotalNs() const
+{
+    return getTotal() * ticksToNs;
+}
+
+unsigned SystemProcessInfo::getIdlePercent() const
+{
+    __uint64 total = getTotal();
+    if (total == 0)
+        return 0;
+    return (unsigned)((idle * 100) / total);
+}
+
+unsigned SystemProcessInfo::getIoWaitPercent() const
+{
+    __uint64 total = getTotal();
+    if (total == 0)
+        return 0;
+    return (unsigned)((iowait * 100) / total);
+}
+
+unsigned SystemProcessInfo::getSystemPercent() const
+{
+    __uint64 total = getTotal();
+    if (total == 0)
+        return 0;
+    return (unsigned)((system * 100) / total);
+}
+
+unsigned SystemProcessInfo::getUserPercent() const
+{
+    __uint64 total = getTotal();
+    if (total == 0)
+        return 0;
+    return (unsigned)((user * 100) / total);
+}
+
+//===========================================================================
+
+ProcessInfo::ProcessInfo(unsigned flags) : ProcessInfo()
+{
+    update(flags);
+}
+
+bool ProcessInfo::update(unsigned flags)
 {
 #ifdef _WIN32
-    FILETIME creationTime, exitTime;
-    FILETIME kernelTime, userTime;
-    GetProcessTimes(GetCurrentProcess(), &creationTime, &exitTime, &kernelTime, &userTime);
-
-    user = extractFILETIME(userTime);
-    system = extractFILETIME(kernelTime);
-    return true;
-#else
-    VStringBuffer fname("/proc/%u/stat", getpid());
-    //NOTE: This file needs to be reopened each time - seeking to the start and rereading does not refresh it
-    clear();
-    FILE* cpufp = fopen(fname.str(), "r");
-    if (!cpufp) {
-        return false;
-    }
-    char ln[2560];
-    if (fgets(ln, sizeof(ln), cpufp))
+    if (flags & ReadMemoryInfo)
     {
-        long int majorFaults = 0;
-        long unsigned userTime = 0;
-        long unsigned systemTime = 0;
-        long unsigned childUserTime = 0;
-        long unsigned childSystemTime = 0;
-        int matched = sscanf(ln, "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %lu %*u %lu %lu %lu %lu", &majorFaults, &userTime, &systemTime, &childUserTime, &childSystemTime);
-        if (matched >= 3)
+        PROCESS_MEMORY_COUNTERS pmc;
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
         {
-            user = userTime + childUserTime;
-            system = systemTime + childSystemTime;
+            peakVirtualMemory = pmc.PeakWorkingSetSize;
+            peakResidentMemory = pmc.PeakWorkingSetSize;
         }
     }
-    fclose(cpufp);
+
+    if (flags & ReadCpuInfo)
+    {
+        FILETIME creationTime, exitTime;
+        FILETIME kernelTime, userTime;
+        GetProcessTimes(GetCurrentProcess(), &creationTime, &exitTime, &kernelTime, &userTime);
+
+        user = extractFILETIME(userTime);
+        system = extractFILETIME(kernelTime);
+    }
+    return true;
+#else
+    clear();
+
+    StringBuffer contents;
+    if (flags & (ReadMemoryInfo|ReadContextInfo))
+    {
+        //Takes ~7us
+        //NOTE: This file needs to be reopened each time - seeking to the start and rereading does not refresh it
+        if (loadBinaryFile(contents, "/proc/self/status", false))
+        {
+            contextSwitches = 0;
+            auto processLine = [this](size_t len, const char * cur)
+            {
+                __uint64 value;
+                switch (*cur)
+                {
+                case 'V':
+                    matchExtractValue(cur, "VmPeak:", peakVirtualMemory) ||
+                    matchExtractValue(cur, "VmSize:", activeVirtualMemory) ||
+                    matchExtractValue(cur, "VmHWM:", peakResidentMemory) ||
+                    matchExtractValue(cur, "VmRSS:", activeResidentMemory) ||
+                    matchExtractValue(cur, "VmSwap:", activeSwapMemory) ||
+                    matchExtractValue(cur, "VmData:", activeDataMemory);
+                    break;
+                case 'T':
+                    matchExtractValue(cur, "Threads:", numThreads);
+                    break;
+                case 'v':
+                    if (matchExtractValue(cur, "voluntary_ctxt_switches:", value))
+                        contextSwitches += value;
+                    break;
+                case 'n':
+                    if (matchExtractValue(cur, "nonvoluntary_ctxt_switches:", value))
+                        contextSwitches += value;
+                    break;
+                }
+            };
+
+            processLines(contents, processLine);
+        }
+    }
+
+    if (flags & (ReadCpuInfo|ReadFaultInfo))
+    {
+        //Takes ~4-5us
+        if (loadBinaryFile(contents.clear(), "/proc/self/stat", false))
+        {
+            long unsigned userTime = 0;
+            long unsigned systemTime = 0;
+            long unsigned childUserTime = 0;
+            long unsigned childSystemTime = 0;
+            int matched = sscanf(contents.str(), "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %llu %*u %lu %lu %lu %lu", &majorFaults, &userTime, &systemTime, &childUserTime, &childSystemTime);
+            if (matched >= 3)
+            {
+                user = userTime + childUserTime;
+                system = systemTime + childSystemTime;
+            }
+        }
+    }
+
     return true;
 #endif
 }
 
-bool CpuInfo::getSystemTimes()
+//===========================================================================
+
+SystemInfo::SystemInfo(unsigned flags) : SystemInfo()
+{
+    update(flags);
+}
+
+bool SystemInfo::update(unsigned flags)
 {
 #ifdef _WIN32
     FILETIME idleTime, kernelTime, userTime;
@@ -854,100 +1182,92 @@ bool CpuInfo::getSystemTimes()
     system = extractFILETIME(kernelTime) - idle;
     return true;
 #else
-    //NOTE: This file needs to be reopened each time - seeking to the start and rereading does not refresh it
-    FILE* cpufp = fopen("/proc/stat", "r");
-    if (!cpufp) {
-        clear();
-        return false;
-    }
-    char ln[256];
-    while (fgets(ln, sizeof(ln), cpufp))
+    StringBuffer contents;
+    if (loadBinaryFile(contents, "/proc/stat", false))
     {
-        if (strncmp(ln, "cpu ", 4) == 0)
+        auto processLine = [this](size_t len, const char * ln)
         {
-            int items;
-            __uint64 nice, irq, softirq;
+            switch (*ln)
+            {
+            case 'c':
+                if (strncmp(ln, "cpu ", 4) == 0)
+                {
+                    int items;
+                    __uint64 nice, irq, softirq;
 
-            items = sscanf(ln,
-                "cpu %llu %llu %llu %llu %llu %llu %llu",
-                &user, &nice,
-                &system,
-                &idle,
-                &iowait,
-                &irq, &softirq);
+                    items = sscanf(ln,
+                        "cpu %llu %llu %llu %llu %llu %llu %llu",
+                        &user, &nice,
+                        &system,
+                        &idle,
+                        &iowait,
+                        &irq, &softirq);
 
-            user += nice;
-            if (items == 4)
-                iowait = 0;
-            if (items == 7)
-                system += irq + softirq;
+                    user += nice;
+                    if (items == 4)
+                        iowait = 0;
+                    if (items == 7)
+                        system += irq + softirq;
+                }
+                else if (strncmp(ln, "ctxt ", 5) == 0)
+                {
+                    (void)sscanf(ln, "ctxt %llu", &contextSwitches);
+                }
+                break;
+            }
+        };
+
+        processLines(contents, processLine);
+    }
+
+    auto processLine = [this](size_t len, const char * ln)
+    {
+        switch (*ln)
+        {
+        case 'n':
+            if (strncmp(ln, "nr_periods ", 11) == 0)
+                numPeriods = strtod(ln+11, nullptr);
+            else if (strncmp(ln, "nr_throttled ", 13) == 0)
+                numThrottledPeriods = strtod(ln+13, nullptr);
+            break;
+        case 't':
+            if (strncmp(ln, "throttled_usec ", 15) == 0)
+                timeThrottledNs = strtod(ln+15, nullptr) * 1000;
+            else if (strncmp(ln, "throttled_time ", 15) == 0)
+                timeThrottledNs = strtod(ln+15, nullptr);
+            break;
         }
-        else if (strncmp(ln, "ctxt ", 5) == 0)
+    };
+
+    bool done = false;
+    const char * cgroup = queryCGroup();
+    if (cgroup)
+    {
+        //Version 2 of cgroups has the information in cgroup/<cgroup>
+        VStringBuffer filename("/sys/fs/cgroup/%s/cpu.stat", cgroup);
+        if (loadBinaryFile(contents.clear(), filename.str(), false))
         {
-            (void)sscanf(ln, "ctxt %llu", &ctx);
+            processLines(contents, processLine);
+            done = true;
+        }
+        else
+        {
+            //Some systems with version 1 cgroups have the information in /sys/fs/cgroup/cpu/<cgroup>/cpu.stat
+            filename.clear().appendf("/sys/fs/cgroup/cpu/%s/cpu.stat", cgroup);
+            if (loadBinaryFile(contents.clear(), filename.str(), false))
+            {
+                processLines(contents, processLine);
+                done = true;
+            }
         }
     }
-    fclose(cpufp);
+
+    //If the version 2 file was not found look for ther version 1 information in cgroup/cpu
+    if (!done && loadBinaryFile(contents.clear(), "/sys/fs/cgroup/cpu/cpu.stat", false))
+        processLines(contents, processLine);
+
     return true;
 #endif
-}
-
-unsigned CpuInfo::getPercentCpu() const
-{
-    __uint64 total = getTotal();
-    if (total == 0)
-        return 0;
-    unsigned percent = (unsigned)(((total - idle) * 100) / total);
-    if (percent > 100)
-        percent = 100;
-    return percent;
-}
-
-__uint64 CpuInfo::getSystemNs() const
-{
-    return system * ticksToNs;
-}
-
-__uint64 CpuInfo::getUserNs() const
-{
-    return user * ticksToNs;
-}
-
-__uint64 CpuInfo::getTotalNs() const
-{
-    return getTotal() * ticksToNs;
-}
-
-unsigned CpuInfo::getIdlePercent() const
-{
-    __uint64 total = getTotal();
-    if (total == 0)
-        return 0;
-    return (unsigned)((idle * 100) / total);
-}
-
-unsigned CpuInfo::getIoWaitPercent() const
-{
-    __uint64 total = getTotal();
-    if (total == 0)
-        return 0;
-    return (unsigned)((iowait * 100) / total);
-}
-
-unsigned CpuInfo::getSystemPercent() const
-{
-    __uint64 total = getTotal();
-    if (total == 0)
-        return 0;
-    return (unsigned)((system * 100) / total);
-}
-
-unsigned CpuInfo::getUserPercent() const
-{
-    __uint64 total = getTotal();
-    if (total == 0)
-        return 0;
-    return (unsigned)((user * 100) / total);
 }
 
 //===========================================================================
@@ -1009,12 +1329,7 @@ memsize_t getMapInfo(const char *type)
     return 0; // TODO/UNKNOWN
 }
 
-memsize_t getVMInfo(const char *type)
-{
-    return 0; // TODO/UNKNOWN
-}
-
-void getCpuInfo(unsigned &numCPUs, unsigned &CPUSpeed)
+void getSystemProcessInfo(unsigned &numCPUs, unsigned &CPUSpeed)
 {
     // MORE: Might be a better way to get CPU speed (actual) than the one stored in Registry
     LONG  lRet;
@@ -1031,12 +1346,12 @@ void getCpuInfo(unsigned &numCPUs, unsigned &CPUSpeed)
         DBGLOG("RegQueryValueEx() failed to get CPU speed - errorCode=%d", lRet);
         RegCloseKey(hKey);
     }
-    else 
+    else
     {
         CPUSpeed = keyValue;
         RegCloseKey(hKey);
     }
-    
+
 
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
@@ -1047,7 +1362,11 @@ void getCpuInfo(unsigned &numCPUs, unsigned &CPUSpeed)
 static unsigned evalAffinityCpus()
 {
     unsigned numCpus = 0;
+#ifdef __64BIT__
+    DWORD64 ProcessAffinityMask, SystemAffinityMask;
+#else
     DWORD ProcessAffinityMask, SystemAffinityMask;
+#endif
     if (GetProcessAffinityMask(GetCurrentProcess(), (PDWORD_PTR)&ProcessAffinityMask, (PDWORD_PTR)&SystemAffinityMask))
     {
         unsigned i = 0;
@@ -1063,7 +1382,7 @@ static unsigned evalAffinityCpus()
         Owned<IException> e = makeOsException(GetLastError(), "Failed to get affinity");
         EXCLOG(e, NULL);
         unsigned cpuSpeed;
-        getCpuInfo(numCpus, cpuSpeed);
+        getSystemProcessInfo(numCpus, cpuSpeed);
         return numCpus;
     }
     return numCpus;
@@ -1139,45 +1458,7 @@ memsize_t getMapInfo(const char *type)
     return ret;
 }
 
-static bool matchExtract(const char * prefix, const char * line, memsize_t & value)
-{
-    size32_t len = strlen(prefix);
-    if (strncmp(prefix, line, len)==0)
-    {
-        char * tail = NULL;
-        value = strtol(line+len, &tail, 10);
-        while (isspace(*tail))
-            tail++;
-        if (strncmp(tail, "kB", 2) == 0)
-            value *= 0x400;
-        else if (strncmp(tail, "mB", 2) == 0)
-            value *= 0x100000;
-        else if (strncmp(tail, "gB", 2) == 0)
-            value *= 0x40000000;
-        return true;
-    }
-    return false;
-}
-
-memsize_t getVMInfo(const char *type)
-{
-    memsize_t ret = 0;
-    VStringBuffer name("%s:", type);
-    VStringBuffer procMaps("/proc/self/status");
-    FILE *diskfp = fopen(procMaps.str(), "r");
-    if (!diskfp)
-        return 0;
-    char ln[256];
-    while (fgets(ln, sizeof(ln), diskfp))
-    {
-        if (matchExtract(name.str(), ln, ret))
-            break;
-    }
-    fclose(diskfp);
-    return ret;
-}
-
-void getCpuInfo(unsigned &numCPUs, unsigned &CPUSpeed)
+void getSystemProcessInfo(unsigned &numCPUs, unsigned &CPUSpeed)
 {
     numCPUs = 1;
     CPUSpeed = 0;
@@ -1206,9 +1487,9 @@ void getCpuInfo(unsigned &numCPUs, unsigned &CPUSpeed)
     const char *bufptr;
     while ((bufptr = fgets(line, 1000, cpufp)) != NULL)
     {
-        if (strncmp(cpuNumTag, bufptr, strlen(cpuNumTag))==0) 
+        if (strncmp(cpuNumTag, bufptr, strlen(cpuNumTag))==0)
             numCPUs++;
-        else if (strncmp(cpuSpeedTag, bufptr, strlen(cpuSpeedTag))==0) 
+        else if (strncmp(cpuSpeedTag, bufptr, strlen(cpuSpeedTag))==0)
             CPUSpeed = (unsigned)strtol(bufptr+strlen(cpuSpeedTag), &tail, 10);
     }
 
@@ -1237,7 +1518,7 @@ void getCpuInfo(unsigned &numCPUs, unsigned &CPUSpeed)
 
 static unsigned evalAffinityCpus()
 {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__EMSCRIPTEN__)
     // MORE - could do better
 #else
     cpu_set_t cpuset;
@@ -1263,7 +1544,7 @@ static unsigned evalAffinityCpus()
 
 // Note - values are returned in Kb
 
-static void getMemUsage(unsigned &inuse,unsigned &active,unsigned &total,unsigned &swaptotal,unsigned &swapinuse) 
+static void getMemUsage(unsigned &inuse,unsigned &active,unsigned &total,unsigned &swaptotal,unsigned &swapinuse)
 {
 #ifdef __APPLE__
     active = 0;
@@ -1311,33 +1592,69 @@ static void getMemUsage(unsigned &inuse,unsigned &active,unsigned &total,unsigne
     unsigned swapcached = 0;
     unsigned cached = 0;
     while (bufptr&&i) {
-        if (*bufptr =='\n') 
+        if (*bufptr =='\n')
             bufptr++;
         i--;
-        if (strncmp("MemTotal:", bufptr, 9)==0) 
+        if (strncmp("MemTotal:", bufptr, 9)==0)
             total = (unsigned)strtol(bufptr+9, &tail, 10);
-        else if (strncmp("SwapTotal:", bufptr, 10)==0) 
+        else if (strncmp("SwapTotal:", bufptr, 10)==0)
             swaptotal = (unsigned)strtol(bufptr+10, &tail, 10);
-        else if (strncmp("MemFree:", bufptr, 8)==0) 
+        else if (strncmp("MemFree:", bufptr, 8)==0)
             free = (unsigned)strtol(bufptr+8, &tail, 10);
-        else if (strncmp("Active:", bufptr, 7)==0) 
+        else if (strncmp("Active:", bufptr, 7)==0)
             active = (unsigned)strtol(bufptr+7, &tail, 10);
-        else if (strncmp("SwapFree:", bufptr, 9)==0) 
+        else if (strncmp("SwapFree:", bufptr, 9)==0)
             swapfree = (unsigned)strtol(bufptr+9, &tail, 10);
-        else if (strncmp("Cached:", bufptr, 7)==0) 
+        else if (strncmp("Cached:", bufptr, 7)==0)
             cached = (unsigned)strtol(bufptr+7, &tail, 10);
-        else if (strncmp("SwapCached:", bufptr, 11)==0) 
+        else if (strncmp("SwapCached:", bufptr, 11)==0)
             swapcached = (unsigned)strtol(bufptr+11, &tail, 10);
-        else 
+        else
             i++;
         bufptr = strchr(bufptr, '\n');
     }
     inuse = total-free-cached;
-    swapinuse = swaptotal-swapfree-swapcached;
+
+    // swapinuse = swaptotal-swapfree-swapcached;
+
+    // sometimes in containers [under mem pressure ?] we see from /proc/meminfo -
+
+    // SwapCached:            0 kB
+    // SwapTotal:             0 kB
+    // SwapFree:       18446744073709551496 kB
+    // or -
+    // SwapCached:            0 kB
+    // SwapTotal:             0 kB
+    // SwapFree:            120 kB
+
+    // and from free cmd -
+
+    // free -m
+    //               total        used        free      shared  buff/cache   available
+    // Mem:          43008       17616        5375           0       20015       25391
+    // Swap:             0 18014398509481984           0
+
+    // if swapfree > 0 when swaptotal == 0 -
+    // *might* indicate kernel is pushing exe/mmapped pages out of memory to make room
+    // for other things and this can affect performance
+
+    // not sure why SwapFree value is not always valid/accurate
+    // vmstat shows more reasonable swpd value, but walks all /proc/<pid>/stat files
+
+    // SwapCached: Memory that is present within main memory, but also in the swapfile
+
+    if ((swapfree + swapcached) > swaptotal)
+    {
+        swapinuse = swapfree + swapcached;
+        if (swapinuse > total)
+            swapinuse = active; // something more reasonable ...
+    }
+    else
+        swapinuse = swaptotal-swapfree-swapcached;
 #endif
 }
 
-class CInt64fix 
+class CInt64fix
 {
     __int64 val;
 public:
@@ -1345,10 +1662,10 @@ public:
     {
         val = 0;
     }
-    void set(int v) 
+    void set(int v)
     {
         __int64 ret = (unsigned)v;
-        while (val-ret>0x80000000LL) 
+        while (val-ret>0x80000000LL)
             ret += 0x100000000LL;
         val = ret;
     }
@@ -1358,7 +1675,7 @@ public:
         return val;
     }
 };
-    
+
 
 
 void getMemStats(StringBuffer &out, unsigned &memused, unsigned &memtot)
@@ -1367,7 +1684,8 @@ void getMemStats(StringBuffer &out, unsigned &memused, unsigned &memtot)
     __int64 total = getMapInfo("heap");
     __int64 sbrkmem = getMapInfo("sbrk");
     __int64 mmapmem = total - sbrkmem;
-    __int64 virttot = getVMInfo("VmData");
+    ProcessInfo processInfo(ReadMemoryInfo);
+    __int64 virttot = processInfo.getActiveDataMemory();
     unsigned mu;
     unsigned ma;
     unsigned mt;
@@ -1384,10 +1702,10 @@ void getMemStats(StringBuffer &out, unsigned &memused, unsigned &memtot)
         muval = 100; // !
 
 
-    out.appendf("MU=%3u%% MAL=%" I64F "d MMP=%" I64F "d SBK=%" I64F "d TOT=%uK RAM=%uK SWP=%uK", 
-        muval, total, mmapmem, sbrkmem, (unsigned)(virttot/1024), mu, su);
+    out.appendf("MU=%3u%% MAL=%" I64F "d MMP=%" I64F "d SBK=%" I64F "d TOT=%uK RAM=%uK SWP=%uK FLT=%" I64F "u CTX=%" I64F "u",
+        muval, total, mmapmem, sbrkmem, (unsigned)(virttot/1024), mu, su, processInfo.getMajorFaults(), processInfo.getNumContextSwitches());
 #ifdef _USE_MALLOC_HOOK
-    if (totalMem) 
+    if (totalMem)
         out.appendf(" TM=%" I64F "d",totalMem);
 #endif
     memused = mu+su;
@@ -1449,49 +1767,37 @@ unsigned getAffinityCpus()
         cachedNumCpus.store(evalAffinityCpus(), std::memory_order_release);
     return cachedNumCpus.load(std::memory_order_acquire);
 }
+void setAffinityCpus(unsigned cpus)
+{
+    cachedNumCpus.store(cpus, std::memory_order_release);
+}
 void clearAffinityCache()
 {
     cachedNumCpus.store(0, std::memory_order_release);
 }
 
-
-void getPeakMemUsage(memsize_t &peakVm,memsize_t &peakResident)
+bool applyResourcedCPUAffinity(const IPropertyTree *resourceSection)
 {
-    peakVm = 0;
-    peakResident = 0;
-
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS pmc;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+    if (nullptr == resourceSection)
+        return false;
+    const char *cpusText = resourceSection->queryProp("@cpu");
+    if (isEmptyString(cpusText))
+        return false;
+    double cpus = friendlyCPUToDecimal(cpusText);
+    if (0.0 == cpus)
+        throw makeStringExceptionV(JLIBERR_UtilInvalidNumberOfResourcesCpusS, "Invalid number of resources cpus: %s", cpusText);
+    unsigned __int64 cpusI = (unsigned __int64)std::ceil(cpus);
+    if (cpus != (double)cpusI)
+        OWARNLOG("Fractional number of CPUs '%s' specified can cause poor performance, rounding up to: %" I64F "u", cpusText, cpusI);
+    unsigned realAffinityCpus = evalAffinityCpus();
+    if (cpusI > realAffinityCpus)
+        OWARNLOG("Attempting to set resourced cpu limit to %u, exceeds cpu affinity of %u", (unsigned)cpusI, realAffinityCpus);
+    else
     {
-        peakVm = pmc.PeakWorkingSetSize;
-        peakResident = pmc.PeakWorkingSetSize;
-
+        // NB: if something were to clear affinity, then this setting would be lost
+        setAffinityCpus(cpusI);
     }
-#else
-    static int memfd = -1;
-    if (memfd==-1)
-        memfd = open("/proc/self/status",O_RDONLY);
-    if (memfd==-1)
-        return;
-    char buf[2048];
-    size32_t l = pread(memfd, buf, sizeof(buf)-1, 0L);
-    if ((int)l<=0)
-        return;
-    buf[l] = 0;
-
-    const char *bufptr = buf;
-    while (bufptr) {
-        if (*bufptr =='\n')
-            bufptr++;
-        if (!matchExtract("VmPeak:", bufptr, peakVm) &&
-            !matchExtract("VmHWM:", bufptr, peakResident))
-        {
-            //ignore this line
-        }
-        bufptr = strchr(bufptr, '\n');
-    }
-#endif
+    return true; // signifies there was a cpu resource setting of some kind
 }
 
 #define RXMAX 1000000       // can be 10x bigger but this produces reasonable amounts
@@ -1622,7 +1928,7 @@ struct CProcInfo: extends CInterface
             return false;
 
         active = true;
-        if (first) 
+        if (first)
             first = false;
         else {
             delta.system = info.time.system-prev.system;
@@ -1637,7 +1943,7 @@ class CProcessMonitor
     CIArrayOf<CProcInfo> processes;
     unsigned tot_time;
     bool busy;
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
 
     static int compare(CInterface * const *i1, CInterface * const *i2)
     {
@@ -1684,7 +1990,7 @@ public:
         tot_time = 0;
         ForEachItemInRev(i3,processes) {
             CProcInfo &pi = processes.item(i3);
-            if (pi.active) 
+            if (pi.active)
                 tot_time += pi.delta.system+pi.delta.user;
             else
                 processes.remove(i3);
@@ -1700,14 +2006,12 @@ public:
             return;
         assertex(n);
         processes.sort(compare);
-        StringBuffer name;
         ForEachItemIn(i1,processes) {
             CProcInfo &pi = processes.item(i1);
             if ((pi.delta.system==0)&&(pi.delta.user==0))
                 break;
-            getThreadName(pi.pid(),0,name.clear());
-            str.appendf("\n TT: PI=%d PN=%s PC=%d ST=%d UT=%d%s%s",
-                        pi.pid(),pi.info.cmd,(pi.delta.system+pi.delta.user)*100/tot_time,pi.delta.system,pi.delta.user,name.length()?" TN=":"",name.str());
+            str.appendf("\n TT: PI=%d PN=%s PC=%d ST=%d UT=%d",
+                        pi.pid(),pi.info.cmd,(pi.delta.system+pi.delta.user)*100/tot_time,pi.delta.system,pi.delta.user);
             if (--n==0)
                 break;
         }
@@ -1717,7 +2021,7 @@ public:
     {
         if (pc>90) {
             scan();
-            if (busy) 
+            if (busy)
                 print(3,str); // print top 3
             else
                 busy = true;
@@ -1910,7 +2214,7 @@ MODULE_INIT(INIT_PRIORITY_JDEBUG2)
 }
 MODULE_EXIT()
 {
-    delete globalOsDiskInfo.queryExisting();
+    globalOsDiskInfo.destroy();
 }
 
 const OsDiskInfo & queryGlobalOsDiskInfo()
@@ -2116,10 +2420,10 @@ class CExtendedStats  // Disk network and cpu stats
     unsigned nparts;
     OsDiskStats *newDiskStats;
     OsDiskStats *oldDiskStats;
-    CpuInfo newcpu;
+    SystemInfo newcpu;
     unsigned numcpu;
-    CpuInfo oldcpu;
-    CpuInfo cpu;
+    SystemInfo oldcpu;
+    SystemProcessInfo deltacpu;
     OsNetworkStats oldnet;
     OsNetworkStats newnet;
     unsigned ncpu;
@@ -2138,21 +2442,21 @@ class CExtendedStats  // Disk network and cpu stats
     {
         if (!ncpu) {
             unsigned speed;
-            getCpuInfo(ncpu, speed);
+            getSystemProcessInfo(ncpu, speed);
             if (!ncpu)
                 ncpu = 1;
         }
 
         oldcpu = newcpu;
-        if (newcpu.getSystemTimes())
+        if (newcpu.update(ReadCpuInfo))
         {
-            cpu = newcpu - oldcpu;
-            totalcpu = cpu.getTotal();
+            deltacpu = newcpu - oldcpu;
+            totalcpu = deltacpu.getTotal();
             return true;
         }
         else
         {
-            cpu.clear();
+            deltacpu.clear();
             totalcpu = 0;
             return false;
         }
@@ -2253,7 +2557,7 @@ class CExtendedStats  // Disk network and cpu stats
     }
 
 
-    inline double perSec(double v,double deltams) 
+    inline double perSec(double v,double deltams)
     {
         return 1000.0*v/deltams;
     }
@@ -2265,7 +2569,7 @@ public:
     {
         if (!getNextCPU())
             return (unsigned)-1;
-        return cpu.getPercentCpu();
+        return deltacpu.getPercentCpu();
     }
 
 
@@ -2359,9 +2663,16 @@ public:
         }
         if (totalcpu)
         {
-            if (out.length()&&(out.charAt(out.length()-1)!=' '))
-                out.append(' ');
-            out.appendf("CPU: usr=%d sys=%d iow=%d idle=%d", cpu.getUserPercent(), cpu.getSystemPercent(), cpu.getIoWaitPercent(), cpu.getIdlePercent());
+            ensureSeparator(out, ' ');
+            out.appendf("CPU: usr=%d sys=%d iow=%d idle=%d", deltacpu.getUserPercent(), deltacpu.getSystemPercent(), deltacpu.getIoWaitPercent(), deltacpu.getIdlePercent());
+
+            __uint64 periods = deltacpu.getNumPeriods();
+            if (periods)
+            {
+                unsigned throttling = deltacpu.getNumThrottledPeriods() * 100 / periods;
+                __uint64 timeThrottledNs = deltacpu.getTimeThrottledNs();
+                out.appendf(" thr=%u%% thrns=%llu", throttling, timeThrottledNs);
+            }
         }
         return true;
     }
@@ -2535,7 +2846,7 @@ public:
                     if (drops > ret->drops)
                     {
                         if (!firstTime)
-                            LOG(MCoperatorError, unknownJob, "DROPPED UDP PACKETS: port %d rx_queue=%u (peak %u) drops=%u (total %i)", port, queue, ret->rx_queue, drops-ret->drops, drops);
+                            LOG(MCoperatorError, "DROPPED UDP PACKETS: port %d rx_queue=%u (peak %u) drops=%u (total %i)", port, queue, ret->rx_queue, drops-ret->drops, drops);
                         ret->drops = drops;
                     }
                 }
@@ -2602,10 +2913,10 @@ public:
                         {
                             firstCall = false;
                             if (errors)
-                                LOG(MCoperatorWarning, unknownJob, "UDP Initial InError total: %u", errors);
+                                LOG(MCoperatorWarning, "UDP Initial InError total: %u", errors);
                         }
                         else if (errors > prevErrors)
-                            LOG(MCoperatorError, unknownJob, "UDP InErrors: %u (total %u)", errors-prevErrors, errors);
+                            LOG(MCoperatorError, "UDP InErrors: %u (total %u)", errors-prevErrors, errors);
                         prevErrors = errors;
                     }
                 }
@@ -2627,21 +2938,21 @@ static class CMemoryUsageReporter: public Thread
 {
     bool term;
     unsigned  interval;
-    Semaphore sem;
+    Semaphore sem{SYNC_LOCATION};
     PerfMonMode traceMode;
     Linked<IPerfMonHook> hook;
     unsigned latestCPU;
 #ifdef _WIN32
     LONG                           status;
-    CpuInfo                        prevTime;
-    CpuInfo                        deltaTime;
+    SystemProcessInfo              prevTime;
+    SystemProcessInfo              deltaTime;
 #else
     CProcessMonitor                procmon;
     CExtendedStats                 extstats;
 #endif
     StringBuffer                   primaryfs;
     StringBuffer                   secondaryfs;
-    CriticalSection                sect; // for getSystemTraceInfo
+    CriticalSection                sect{SYNC_LOCATION}; // for getSystemTraceInfo
 
     CSnmpStatsReporter             snmpStats;
     CUdpStatsReporter              udpStats;
@@ -2658,8 +2969,14 @@ public:
         hook.set(_hook);
         term = false;
         latestCPU = 0;
+
         // UDP stats reported unless explicitly disabled
-        if (queryEnvironmentConf().getPropBool("udp_stats", true))
+        if (isContainerized())
+        {
+            if (getConfigBool("expert/@udpStats", true))
+                traceMode |= PerfMonUDP;
+        }
+        else if (queryEnvironmentConf().getPropBool("udp_stats", true))
             traceMode |= PerfMonUDP;
 #ifdef _WIN32
         primaryfs.append("C:");
@@ -2688,8 +3005,8 @@ public:
     {
         CriticalBlock block(sect);
 #ifdef _WIN32
-        CpuInfo current;
-        current.getSystemTimes();
+        SystemInfo current;
+        current.update(ReadCpuInfo);
         if (prevTime.getTotal())
         {
             deltaTime = current - prevTime;
@@ -2894,7 +3211,7 @@ public:
                 udpStats.reportUdpInfo(0);
             }
             if(traceMode&&str.length()) {
-                MLOG(MCdebugInfo, unknownJob, "SYS: %s", str.str());
+                MLOG(MCdebugInfo, "SYS: %s", str.str());
 #ifndef _WIN32
                 if (traceMode&PerfMonExtended)
                 {
@@ -2963,7 +3280,7 @@ void getProcessTime(UserSystemTime_t & result)
 
 void getSystemTraceInfo(StringBuffer &str, PerfMonMode mode)
 {
-    if (!MemoryUsageReporter) 
+    if (!MemoryUsageReporter)
         MemoryUsageReporter = new CMemoryUsageReporter(1000, mode, 0, false);
     MemoryUsageReporter->getSystemTraceInfo(str, mode);
 }
@@ -2973,7 +3290,7 @@ void startPerformanceMonitor(unsigned interval, PerfMonMode traceMode, IPerfMonH
     stopPerformanceMonitor();
     if (!MemoryUsageReporter) {
         MemoryUsageReporter = new CMemoryUsageReporter(interval, traceMode, hook, (traceMode&PerfMonExtended)!=0);
-        MemoryUsageReporter->start();
+        MemoryUsageReporter->start(false);
     }
 }
 
@@ -3016,7 +3333,7 @@ unsigned getLatestCPUUsage()
 void getHardwareInfo(HardwareInfo &hdwInfo, const char *primDiskPath, const char *secDiskPath)
 {
     memset(&hdwInfo, 0, sizeof(HardwareInfo));
-    getCpuInfo(hdwInfo.numCPUs, hdwInfo.CPUSpeed);
+    getSystemProcessInfo(hdwInfo.numCPUs, hdwInfo.CPUSpeed);
 
 #ifdef _WIN32
 
@@ -3044,7 +3361,7 @@ void getHardwareInfo(HardwareInfo &hdwInfo, const char *primDiskPath, const char
     // MORE: Find win32 call for NIC speed
 
 #else  // linux
-    unsigned memUsed, memActive, memSwap, memSwapUsed; 
+    unsigned memUsed, memActive, memSwap, memSwapUsed;
     getMemUsage(memUsed, memActive, hdwInfo.totalMemory, memSwap, memSwapUsed);
     hdwInfo.totalMemory /= 1024; // in MB
 
@@ -3072,12 +3389,12 @@ void getHardwareInfo(HardwareInfo &hdwInfo, const char *primDiskPath, const char
 //===========================================================================
 
 
-enum SegTypes { 
+enum SegTypes {
         segtype_free,         //
         segtype_heap,         // rw-p named [heap]
         segtype_data,         // rw-p unnamed
         segtype_guard,        // ---p unnamed/named
-        segtype_stack,        // rwxp 
+        segtype_stack,        // rwxp
         segtype_qlibcode,     // r-xp  named */lib200
         segtype_qlibdata,     // rw-p  named */lib200
         segtype_libcode,      // r-xp  named *
@@ -3096,7 +3413,7 @@ struct SegTypeRec
 
 
 
-const char *PROCMAPHEADER = 
+const char *PROCMAPHEADER =
     "FREE,NFREE,MAXFREE,HEAP,STACK,NSTACKS,DATA,NDATA,MAXDATA,LIBDATA,QUERYDATA,MAXQUERYDATA,LIBCODE,QUERYCODE,MAXQLIBCODE";
 
 
@@ -3179,7 +3496,6 @@ void printProcMap(const char *fn, bool printbody, bool printsummary, StringBuffe
     }
     while (reader.nextln()) {
         const char *ln = reader.ln;
-        unsigned n=0;
         if (*ln) {
             offset_t start = readHexNum(ln);
             if (last&&(last!=start)) {
@@ -3253,7 +3569,6 @@ void printProcMap(const char *fn, bool printbody, bool printsummary, StringBuffe
                 recs[t].total += ssz;
                 if (ssz>recs[t].largest)
                     recs[t].largest = ssz;
-                n++;
                 last = end;
 #ifndef __64BIT__
                 if ((end<0xffffffff)&&(end>=0xc0000000))    // rest is OS (32-bit only)
@@ -3660,7 +3975,7 @@ void printAllocationSummary()
     {
         _CrtMemBlockHeader * display = locations[i2];
         //char tempBuffer[16];
-        //unsigned len = dumpMemory(sizeof(tempBuffer), tempBuffer, display->nDataSize, 
+        //unsigned len = dumpMemory(sizeof(tempBuffer), tempBuffer, display->nDataSize,
 
         PROGLOG("%s(%d) %d:%d {%ld} = %d", display->szFileName ? display->szFileName : "<unknown>", display->nLine, display->nDataSize, counts[i2], display->lRequest, display->nDataSize * counts[i2]);
     }
@@ -3713,7 +4028,7 @@ void printAllocationSummary()
 // Note memory hooks should not be enabled for release (as not re-entrant in linux)
 
 
-static CriticalSection hookSect;
+static CriticalSection hookSect(SYNC_LOCATION);
 
 #ifdef __linux__
 
@@ -3999,7 +4314,7 @@ class UserMetricMsgHandler : public CInterface, implements ILogMsgHandler, imple
     Owned<ILogMsgFilter> regexFilter;
 public:
     virtual void Link(void) const { CInterface::Link(); }
-    virtual bool Release(void) const    
+    virtual bool Release(void) const
     {
         if (CInterface::Release())
             return true;
@@ -4017,24 +4332,23 @@ public:
     }
 
     // interface ILogMsgHandler
-    virtual void handleMessage(const LogMsg & msg __attribute__((unused))) { counter++; }
-    virtual bool needsPrep() const { return false; }
-    virtual void prep() {}
-    virtual unsigned queryMessageFields() const { return MSGFIELD_detail; }
-    virtual void setMessageFields(unsigned _fields __attribute__((unused)) = MSGFIELD_all) {}
-    virtual void addToPTree(IPropertyTree * parent __attribute__((unused))) const {}
-    virtual int flush() { return 0; }
-    virtual char const *disable() { return 0; }
-    virtual void enable() {}
-    virtual bool getLogName(StringBuffer &name __attribute__((unused))) const { return false; }
-    virtual offset_t getLogPosition(StringBuffer &logFileName __attribute__((unused))) const { return 0; };
+    virtual void handleMessage(const LogMsg & msg __attribute__((unused))) override { counter++; }
+    virtual bool needsPrep() const override { return false; }
+    virtual void prep() override {}
+    virtual unsigned queryMessageFields() const override { return MSGFIELD_detail; }
+    virtual void setMessageFields(unsigned _fields __attribute__((unused)) = MSGFIELD_all) override {}
+    virtual void addToPTree(IPropertyTree * parent __attribute__((unused))) const override {}
+    virtual int flush() override { return 0; }
+    virtual bool getLogName(StringBuffer &name __attribute__((unused))) const override { return false; }
+    virtual offset_t getLogPosition(StringBuffer &logFileName __attribute__((unused))) const override { return 0; };
+    virtual LogHandlerFormat queryFormatType() const override { return LOGFORMAT_undefined; };
 
     // interface IUserMetric
-    virtual unsigned __int64 queryCount() const { return counter; }
-    virtual const char *queryName() const { return metricName; }
-    virtual const char *queryMatchString() const { return regex; }
-    virtual void inc() { counter++; }
-    virtual void reset() { counter = 0; }
+    virtual unsigned __int64 queryCount() const override { return counter; }
+    virtual const char *queryName() const override { return metricName; }
+    virtual const char *queryMatchString() const override { return regex; }
+    virtual void inc() override { counter++; }
+    virtual void reset() override { counter = 0; }
 };
 
 jlib_decl IUserMetric *createUserMetric(const char *name, const char *matchString)
@@ -4112,3 +4426,337 @@ jlib_decl bool printLsOf(unsigned pid)
     return true;
 }
 
+
+//---------------------------------------------------------------------------------------------------------------------
+// Memory monitoring and core dump functionality
+//---------------------------------------------------------------------------------------------------------------------
+
+#ifdef __linux__
+static void createCoreDumpProcessAndWait(bool useVforkAndGcore, pid_t pid)
+{
+    char gCoreFname[64];
+    char gCorePPid[32];
+    if (useVforkAndGcore)
+    {
+        // Build a unique relative filename: core.<parentPid>.<timestamp>
+        time_t now = time(NULL);
+        snprintf(gCoreFname, sizeof(gCoreFname), "core.%d.%ld", (int)pid, (long)now);
+
+        // Prepare arguments: gcore -o <fname> <parent-pid>
+        snprintf(gCorePPid, sizeof(gCorePPid), "%d", (int)pid);
+    }
+    pid_t coreDumpPid = useVforkAndGcore ? vfork() : fork();
+    if (0 == coreDumpPid)
+    {
+        if (useVforkAndGcore)
+        {
+            // Execute gcore; on success it will write to gCoreFname in the current directory
+            execlp("gcore", "gcore", "-o", gCoreFname, gCorePPid, (char *)NULL);
+        }
+        else
+            raise(SIGABRT); // will cause core dump (based on core_pattern)
+
+        _exit(1); // shouldn't reach here
+    }
+    else if (coreDumpPid < 0)
+    {
+        WARNLOG("generateCoreDump: Failed to fork core dump process");
+        _exit(1); // shouldn't reach here
+    }
+    int status;
+    waitpid(coreDumpPid, &status, 0);
+    WARNLOG("generateCoreDump: Core dump pid %d exited with status %d", coreDumpPid, status);
+}
+
+// void generateCoreDump(bool useVforkAndGcore, bool suspendParent)
+// bool useVforkAndGcore (default: false)
+// false: uses fork() and abort(). fork() duplicates parent process memory with COW semantics.
+//        abort() causes the kernel to produce a sparse core file efficiently (quick)
+// true: use vfork(), exec and gcore. vfork() runs in same address space as parent process until the exec.
+//       gcore attaches to the process and walks memory and copies it to a core file (slower).
+// bool suspendParent (default: false)
+// if true, creates a reaper process, then suspends self, the reaper process then monitors the core process
+// (either vfork()+exec, or fork()+abort()), and resumes the parent process when done.
+
+void generateCoreDump(bool useVforkAndGcore, bool suspendParent)
+{
+    pid_t parentPid = getpid();
+
+    if (suspendParent)
+    {
+        // Reaper process creation
+        pid_t reaperPid = fork();
+        if (reaperPid == 0)
+        {
+            // Reset signal handlers to defaults
+            signal(SIGABRT, SIG_DFL);
+            signal(SIGSEGV, SIG_DFL);
+            signal(SIGBUS, SIG_DFL);
+            signal(SIGILL, SIG_DFL);
+            // Reaper: set new pgid for self, so when coredump thread suspends parent, we aren't suspended too
+            if (setpgid(0, 0) == -1)
+                WARNLOG("generateCoreDump: Reaper pid %d failed to set PGID", reaperPid);
+
+            createCoreDumpProcessAndWait(useVforkAndGcore, parentPid);
+
+            // Reaper: resume parent pid
+            if (kill(parentPid, SIGCONT) == -1)
+            {
+                int errsv = errno;
+                WARNLOG("generateCoreDump: Failed to send SIGCONT to parent pid %d, errno=%d (%s)", parentPid, errsv, strerror(errsv));
+            }
+
+            _exit(0);
+        }
+        else if (reaperPid < 0)
+        {
+            WARNLOG("generateCoreDump: Failed to fork reaper process");
+            return;
+        }
+
+        // Parent suspends itself, waiting for SIGCONT from reaper
+        WARNLOG("generateCoreDump: suspending self with SIGSTOP");
+        if (kill(parentPid, SIGSTOP) == -1)
+        {
+            int errsv = errno;
+            WARNLOG("generateCoreDump: Failed to send SIGSTOP to parent pid %d, errno=%d (%s)", parentPid, errsv, strerror(errsv));
+        }
+        // Parent waits for reaper to exit
+        int status;
+        waitpid(reaperPid, &status, 0);
+        WARNLOG("generateCoreDump: Reaper pid %d exited with status %d", reaperPid, status);
+    }
+    else
+    {
+        // no reaper, parent process will not be explicitly suspended during core dump generation
+        // however, the core child process's execution of abort() or gcore will suspend the process.
+        createCoreDumpProcessAndWait(useVforkAndGcore, parentPid);
+    }
+}
+#else
+void generateCoreDump(bool useVforkAndGcore, bool suspendParent)
+{
+    WARNLOG("generateCoreDump: Core dump generation not supported\n");
+}
+#endif
+
+class CMemoryMonitor : public CSimpleInterfaceOf<IMemoryMonitor>, public IThreaded
+{
+private:
+    CThreaded threaded;
+    StringAttr dstPath;
+    unsigned totalMB{0};
+    unsigned thresholdMB{0};
+    unsigned intervalSecs{10};
+    unsigned incrementMB{100};
+    bool useVforkAndGcore{false};
+    bool suspendParent{false};
+    unsigned currentThresholdMB{0};
+    Semaphore stopSemaphore{SYNC_LOCATION};
+    std::atomic<bool> stopped{true};
+
+    unsigned checkAndCoreDump()
+    {
+        ProcessInfo memInfo(ReadMemoryInfo);
+        unsigned currentMemMB = (unsigned)(memInfo.getActiveResidentMemory() / (1024 * 1024));
+        if (currentMemMB < currentThresholdMB)
+            return 0;
+        WARNLOG("Memory monitor: memory usage (%u MB) exceeded threshold (%u MB) - generating core dump", currentMemMB, currentThresholdMB);
+        char cwd[_MAX_DIR];
+        if (dstPath)
+        {
+            if (!recursiveCreateDirectory(dstPath))
+            {
+                WARNLOG("Failed to create directory for core dumps: %s", dstPath.get());
+                return 0;
+            }
+            // change cwd to target dir.
+            // NB: copying is an alternative, but would need to cope with large sparse files to be efficient
+            if (nullptr == getcwd(cwd, _MAX_DIR))
+            {
+                WARNLOG("Memory monitor: failed to get current directory");
+                return 0;
+            }
+            if (0 != chdir(dstPath))
+            {
+                WARNLOG("Memory monitor: failed to set current directory to %s", dstPath.get());
+                return 0;
+            }
+        }
+        CCycleTimer timer;
+        generateCoreDump(useVforkAndGcore, suspendParent);
+        WARNLOG("Memory monitor: core dump generated in %u ms", timer.elapsedMs());
+        if (dstPath)
+        {
+            if (0 != chdir(cwd))
+                WARNLOG("Memory monitor: failed to set current directory to %s", cwd);
+        }
+        return currentMemMB;
+    }
+public:
+    CMemoryMonitor(const char *_dstPath, unsigned _totalMB, unsigned _thresholdMB, unsigned _intervalSecs, unsigned _incrementMB, bool _useVforkAndGcore, bool _suspendParent)
+        : threaded("CMemoryMonitor", this), dstPath(_dstPath), totalMB(_totalMB), thresholdMB(_thresholdMB), intervalSecs(_intervalSecs),
+          incrementMB(_incrementMB), useVforkAndGcore(_useVforkAndGcore), suspendParent(_suspendParent)
+    {
+    }
+    ~CMemoryMonitor()
+    {
+        stop();
+    }
+    virtual void start() override
+    {
+        if (stopped)
+        {
+            stopped = false;
+            PROGLOG("Memory monitor: started - threshold=%u MB, interval=%u seconds",
+                    thresholdMB, intervalSecs);
+            currentThresholdMB = thresholdMB;
+            threaded.start(false);
+        }
+    }
+    virtual void stop() override
+    {
+        if (!stopped)
+        {
+            stopped = true;
+            stopSemaphore.signal();
+            threaded.join();
+            stopSemaphore.reinit(0); // in case thread didn't consume signal
+            checkAndCoreDump(); // check one last time
+        }
+    }
+    // IThreaded impl.
+    virtual void threadmain() override
+    {
+        while (!stopped)
+        {
+            try
+            {
+                unsigned currentMemMB = checkAndCoreDump();
+                if (currentMemMB) // if 0, no core dump was generated
+                {
+                    if (!incrementMB) // if unset, stop. No further core dumps will be generated.
+                        break;
+                    currentThresholdMB = currentMemMB + incrementMB;
+                    if (currentThresholdMB > totalMB)
+                    {
+                        // If current usage is <99% set one last threshold
+                        unsigned nineNinePct = totalMB * 99 / 100;
+                        if (currentMemMB >= nineNinePct) // memory was already >= 99% for the core dump just generated. Stop.
+                            break;
+                        currentThresholdMB = nineNinePct;
+                    }
+                }
+            }
+            catch (IException *e)
+            {
+                StringBuffer errMsg;
+                e->errorMessage(errMsg);
+                OERRLOG("Memory monitor: error - %s", errMsg.str());
+                e->Release();
+            }
+
+            // Wait for the monitoring interval or until stop is signaled
+            if (!stopped)
+            {
+                if (stopSemaphore.wait(intervalSecs * 1000))
+                    break; // Stop was signaled
+            }
+        }
+        PROGLOG("Memory monitor: stopped");
+    }
+};
+
+IMemoryMonitor *createMemoryMonitor(const char *dstPath, unsigned totalMB, unsigned thresholdMB, unsigned intervalSecs, unsigned incrementMB, bool useVforkAndGcore, bool suspendParent)
+{
+    try
+    {
+        if ((thresholdMB == 0) || (intervalSecs == 0))
+            return nullptr;
+        if (thresholdMB >= totalMB)
+        {
+            WARNLOG("Memory monitor: threshold (%u MB) >= total memory (%u MB), monitoring disabled", thresholdMB, totalMB);
+            return nullptr;
+        }
+        if (!useVforkAndGcore)
+        {
+            // trace core_pattern to help diagnose reasons for core dumps not being created
+            OwnedIFile corePatternFile = createIFile("/proc/sys/kernel/core_pattern");
+            if (corePatternFile->exists())
+            {
+                StringBuffer corePattern;
+                corePattern.loadFile(corePatternFile);
+                WARNLOG("core_pattern = %s", corePattern.str());
+            }
+        }
+        return new CMemoryMonitor(dstPath, totalMB, thresholdMB, intervalSecs, incrementMB, useVforkAndGcore, suspendParent);
+    }
+    catch (IException *e)
+    {
+        EXCLOG(e, "Failed to create memory monitor");
+        e->Release();
+    }
+    return nullptr;
+}
+
+IMemoryMonitor *createMemoryMonitor(const char *dstPath, unsigned totalMB, const IPropertyTree *mcdSettings)
+{
+    assertex(totalMB);
+    unsigned memoryThresholdMB = 0;
+    unsigned memoryIncrementMB = 0;
+    const char *mode = mcdSettings->queryProp("@mode");
+    if (streq("auto", mode))
+    {
+        constexpr unsigned defaultMemoryThresholdPct = 95; // auto set threshold to 95% of totalMB.
+        constexpr unsigned defaultNextIncrementPct = 4; // i.e next threshold will be at 99% (95% + 4%) of totalMB.
+        memoryThresholdMB = mcdSettings->getPropInt("@thresholdMB", NotFound);
+        if (NotFound != memoryThresholdMB)
+            WARNLOG("mode=auto, but thresholdMB is set. thresholdMB takes precedence");
+        else
+        {
+            // Set threshold based on defaultMemoryThresholdPct. Bear in mind roxiemem is normally ~80% of workerTotalMem
+            // we want this at a fairly high level to avoid false positives, but not so high that we run out of memory
+            memoryThresholdMB = totalMB * defaultMemoryThresholdPct / 100;
+        }
+        memoryIncrementMB = mcdSettings->getPropInt("@incrementMB", NotFound);
+        if (NotFound != memoryIncrementMB)
+        {
+            if (memoryThresholdMB + memoryIncrementMB > totalMB)
+            {
+                WARNLOG("mode=auto, incrementMB is set, but memoryThresholdMB + incrementMB >= workerTotalMemMB. Ignoring incrementMB");
+                memoryIncrementMB = 0;
+            }
+        }
+        else
+        {
+            // With defaults it means there will only be at most one other core dump (when crosses 99% of totalMB)
+            memoryIncrementMB = totalMB * defaultNextIncrementPct / 100;
+        }
+    }
+    else if (streq("on", mode))
+    {
+        memoryThresholdMB = mcdSettings->getPropInt("@thresholdMB");
+        if (memoryThresholdMB) // if not disabled
+        {
+            memoryIncrementMB = mcdSettings->getPropInt("@incrementMB");
+            if (memoryThresholdMB + memoryIncrementMB > totalMB)
+            {
+                WARNLOG("mode=on, incrementMB is set, but memoryThresholdMB + incrementMB >= workerTotalMemMB. Ignoring incrementMB");
+                memoryIncrementMB = 0;
+            }
+        }
+    }
+    else if (!streq("off", mode))
+        WARNLOG("Unrecognized memoryCoreDumpMode: %s, ignoring", mode);
+
+    if (!memoryThresholdMB)
+        return nullptr;
+
+    constexpr unsigned defaultMemoryIntervalSecs = 10;
+    unsigned memoryIntervalSecs = mcdSettings->getPropInt("@intervalSecs", defaultMemoryIntervalSecs);
+    bool useVforkAndGcore = mcdSettings->getPropBool("@useVforkAndGcore", false);
+    bool suspendParent = mcdSettings->getPropBool("@suspendParent", false);
+
+    WARNLOG("Monitoring memory usage (total=%uMB), interval: %u secs, threshold: %uMB, increment: %uMB (path: %s), useVforkAndGcore: %s, suspendParent: %s", totalMB, memoryIntervalSecs, memoryThresholdMB, memoryIncrementMB, dstPath, boolToStr(useVforkAndGcore), boolToStr(suspendParent));
+    return createMemoryMonitor(dstPath, totalMB, memoryThresholdMB, memoryIntervalSecs, memoryIncrementMB, useVforkAndGcore, suspendParent);
+}

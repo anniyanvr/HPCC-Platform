@@ -185,7 +185,7 @@ public:
 
     virtual unsigned getHashFromFindParam(const void *fp) const
     {
-        return hashc((const unsigned char *)fp, strlen((const char *)fp), 0);
+        return hashcz((const unsigned char *)fp, 0);
     }
 
     virtual const void *getFindParam(const void *e) const
@@ -339,7 +339,7 @@ static unsigned short getDafsPort(const SocketEndpoint &ep,unsigned &numfails,Cr
     if (nPort)
         return nPort;
     StringBuffer err("Failed to connect to DaFileSrv on ");
-    ep.getIpText(err);
+    ep.getHostText(err);
 #ifdef _WIN32
     OERRLOG("%s",err.str());
     if (sect) {
@@ -420,7 +420,7 @@ public:
     IArrayOf<IGroup> knowngroups;
     StringAttrArray knowngroupnames;
     Linked<IXRefProgressCallback> msgcallback;
-    CriticalSection logsect;
+    CriticalSection logsect{SYNC_LOCATION};
     unsigned totalCompressed;
     __int64 totalUncompressedSize;
     __int64 totalCompressedSize;
@@ -437,7 +437,7 @@ public:
     CEndpointTable EndpointTable;
     CIArrayOf<cMessage> errors;
     CIArrayOf<cMessage> warnings;
-    CriticalSection inprogresssect;
+    CriticalSection inprogresssect{SYNC_LOCATION};
     SocketEndpointArray inprogress;
 
 
@@ -565,7 +565,7 @@ public:
         ForEachItemIn(i,inprogress) {
             if (i)
                 msg.append(", ");
-            inprogress.item(i).getIpText(msg);
+            inprogress.item(i).getHostText(msg);
         }
         if (msgcallback) 
             msgcallback->progress(msg.str());
@@ -606,7 +606,7 @@ public:
 struct CLogicalNameEntry: public CInterface
 {
     CLogicalNameEntry(CXRefManagerBase &_manager, const char *_lname,IPropertyTree &file) // takes ownership of grp
-        : manager(_manager),lname(_lname) 
+        : lname(_lname) , manager(_manager)
     {
         replicated = false;
         outsidedir = 0;
@@ -709,7 +709,7 @@ struct CLogicalNameEntry: public CInterface
     bool remove(IUserDescriptor *user)
     {
         IDistributedFileDirectory &fdir = queryDistributedFileDirectory();
-        Owned<IDistributedFile> file = fdir.lookup(lname.get(),user, false, false, false, nullptr, defaultPrivilegedUser);
+        Owned<IDistributedFile> file = fdir.lookup(lname.get(),user, AccessMode::erase, false, false, nullptr, defaultPrivilegedUser);
         if (!file)
             return false;
         file->detach();
@@ -957,7 +957,7 @@ static bool parseFileName(const char *name,StringBuffer &mname,unsigned &num,uns
     return false;
 }           
 
-        
+
 
 
 
@@ -978,7 +978,7 @@ public:
     CXRefManagerBase &manager;
     byte incompletestate; // 0 unknown, 1 ignore, 2 incomplete
     COrphanEntry(CXRefManagerBase &_manager, const char *_fname,const char *_basedir,unsigned _max,const char *_modified,CLogicalNameEntry *_misplaced)
-        : manager(_manager),fname(_fname), basedir(_basedir), modified(_modified)
+        : basedir(_basedir), fname(_fname), modified(_modified), manager(_manager)
     {
         dirfailed = false;
         max = _max;
@@ -1061,7 +1061,7 @@ public:
     {
         if (!max)
             return 1;
-        bool *done = (bool *)calloc(sizeof(bool),max);
+        bool *done = (bool *)calloc(max, sizeof(bool));
         ForEachItemIn(i1,primarypna) 
             done[primarypna.item(i1)] = true;
         ForEachItemIn(i2,replicatepna) 
@@ -1096,7 +1096,7 @@ public:
                 out.append(", ");
             const SocketEndpoint &item = epa.item(sorted[i2]);
             StringBuffer cur;
-            item.getUrlStr(cur);
+            item.getEndpointHostText(cur);
             const char *s1 = prefix.str();
             const char *s2 = cur.str();
             if (prefix.length()&&(memcmp(s1,s2,prefix.length())==0))
@@ -1186,11 +1186,11 @@ public:
                                 ForEachItemIn(i3,parts[i]) {
                                     unsigned p = parts[i].item(i3);
                                     if (copy) {
-                                        replicateepa.item(p).getUrlStr(buf.clear());    
+                                        replicateepa.item(p).getEndpointHostText(buf.clear());    
                                         b->addProp("RNode",buf.str());
                                     }
                                     else {
-                                        primaryepa.item(p).getUrlStr(buf.clear());  
+                                        primaryepa.item(p).getEndpointHostText(buf.clear());  
                                         b->addProp("Node",buf.str());
                                     }
                                 }
@@ -1314,7 +1314,7 @@ IPropertyTree *CLogicalNameEntry::addFileBranch(IPropertyTree *dst,unsigned flag
                     continue;
                 IPropertyTree *part = addBranch(out,"Part");
                 if (flags&CFBpartnode) {
-                    grp->queryNode((i+rep)%grp->ordinality()).endpoint().getUrlStr(buf.clear());    // TBD check grp==cluster TBD
+                    grp->queryNode((i+rep)%grp->ordinality()).endpoint().getEndpointHostText(buf.clear());    // TBD check grp==cluster TBD
                     part->setProp("Node",buf.str());
                 }
                 if (flags&CFBpartnum) {
@@ -1528,7 +1528,7 @@ void loadFromDFS(CXRefManagerBase &manager,IGroup *grp,unsigned numdirs,const ch
                         manager.warn(lnentry->lname.get(),"No group found, ignoring logical file");
                         return;
                     }
-                    constructPartFilename(grp,partno,numparts,partname,partmask,partdir,replicate,replicateoffset,rfn);
+                    deprecatedConstructPartFilename(grp,partno,numparts,partname,partmask,partdir,replicate,replicateoffset,rfn);
                     SocketEndpoint rep=rfn.queryEndpoint();
                     if (manager.EndpointTable.find(rep)!=NULL) {
                         rfn.getLocalPath(localname.clear());
@@ -1606,13 +1606,13 @@ void loadFromDFS(CXRefManagerBase &manager,IGroup *grp,unsigned numdirs,const ch
 
 
 
-    
+
 
 class CPhysicalXREF
 {
     unsigned numdirs;
     const char **dirbaselist;
-    CriticalSection xrefsect;
+    CriticalSection xrefsect{SYNC_LOCATION};
     CXRefManagerBase &manager;
 
 public:
@@ -1774,7 +1774,7 @@ class CXRefManager: public CXRefManagerBase
         ForEachItemIn(i,logicalnamelist) {
             CLogicalNameEntry &item = logicalnamelist.item(i);
             if (!item.done&&item.nummismatchedsizes) {
-                Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(item.lname.get(), UNKNOWN_USER, false, false, false, nullptr, defaultPrivilegedUser);
+                Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(item.lname.get(), UNKNOWN_USER, AccessMode::readMeta, false, false, nullptr, defaultPrivilegedUser);
                 if (file) {
                     outf("checking %s\n",item.lname.get());
                     Owned<IDistributedFilePartIterator> partiter = file->getIterator();
@@ -1842,11 +1842,11 @@ class CXRefManager: public CXRefManagerBase
             const char *dirlist;
             bool abort;
             CXRefManagerBase &manager;
-            CriticalSection crit;
+            CriticalSection crit{SYNC_LOCATION};
             unsigned numfails;
         public:
             casyncfor(IGroup *_g, const char *_dirlist, CPhysicalXREF &_cxref, CXRefManagerBase *_manager)
-                : cxref(_cxref), manager(*_manager)
+                : CAsyncFor(SYNC_LOCATION), cxref(_cxref), manager(*_manager)
             {
                 g = _g;
                 dirlist = _dirlist;
@@ -1861,7 +1861,7 @@ class CXRefManager: public CXRefManagerBase
                 try {
                     StringBuffer msg;
                     INode &node = g->queryNode(idx);
-                    node.endpoint().getUrlStr(msg);
+                    node.endpoint().getEndpointHostText(msg);
                     manager.log("Getting directories for %s",msg.str());
                     manager.addNodeInProgress(node);
                     Owned<IPropertyTree> results;
@@ -1991,7 +1991,7 @@ class CXRefManager: public CXRefManagerBase
     }
 
 
-    CriticalSection xrefsect;
+    CriticalSection xrefsect{SYNC_LOCATION};
 
 
     void addn(StringBuffer &b,unsigned p,unsigned &firstp,unsigned &lastp)
@@ -2272,7 +2272,7 @@ class CXRefManager: public CXRefManagerBase
             ForEachItemIn(i,logicalnamelist) {
                 CLogicalNameEntry &item = logicalnamelist.item(i);
                 if (item.unknowngrp||item.mismatchgrp.get()||item.missinggrp) {
-                    Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(item.lname.get(),UNKNOWN_USER, false, false, false, nullptr, defaultPrivilegedUser);
+                    Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(item.lname.get(),UNKNOWN_USER, AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
                     if (file) {
                         if (item.missinggrp)
                             outf("WARNING: Missing group for %s\n",item.lname.get());
@@ -2298,10 +2298,10 @@ class CXRefManager: public CXRefManagerBase
                     item.minsize = 0;
                 StringBuffer s1;
                 if (!item.minip.isNull())
-                    item.minip.getIpText(s1);
+                    item.minip.getHostText(s1);
                 StringBuffer s2;
                 if (!item.maxip.isNull())
-                    item.maxip.getIpText(s2);
+                    item.maxip.getHostText(s2);
                 StringBuffer skew;
                 item.getskew(skew);
                 outf("%s numfiles=%u totalsize=%" CF "d minsize=%" CF "d(%s) maxsize=%" CF "d(%s), skew=%s\n",item.name.get(),item.num,item.size,
@@ -2567,12 +2567,12 @@ class CXRefManager: public CXRefManagerBase
                         t->addPropInt64("MaxSize",item.maxsize);
                         StringBuffer s1;
                         if (!item.maxip.isNull())
-                            item.maxip.getIpText(s1);
+                            item.maxip.getHostText(s1);
                         t->addProp("MaxIP",s1.str());
                         t->addPropInt64("MinSize",item.minsize);
                         s1.clear();
                         if (!item.minip.isNull())
-                            item.minip.getIpText(s1);
+                            item.minip.getHostText(s1);
                         t->addProp("MinIP",s1.str());
                         item.getskew(s1.clear());
                         if (s1.length())
@@ -2596,7 +2596,7 @@ public:
         msgcallback.set(_msgcallback);
 
         IPropertyTree *out=NULL;
-        
+
         Owned<IGroup> g;
         unsigned j;
         if (!nclusters) {
@@ -2625,7 +2625,7 @@ public:
         logicalnamelist.kill();
         dirlist.kill();
         orphanlist.kill();
-        
+
         const char* cluster = clusters[0];
         loadFromDFS(*this,g,numdirs,dirbaselist,cluster);
 
@@ -2678,10 +2678,14 @@ IPropertyTree *  runXRef(unsigned nclusters,const char **clusters,IXRefProgressC
 #endif
     // assume all nodes same OS
     Owned<IGroup> group = queryNamedGroupStore().lookup(clusters[0]);
+#ifdef _CONTAINERIZED
+    WARNLOG("CONTAINERIZED(runXRef calls queryOS())");
+#else
     if (group)
         islinux = queryOS(group->queryNode(0).endpoint())==MachineOsLinux;
-    dirs[0] = queryBaseDirectory(grp_unknown, 0,islinux?DFD_OSunix:DFD_OSwindows);  // MORE - should use the info from the group store
-    dirs[1] = queryBaseDirectory(grp_unknown, 1,islinux?DFD_OSunix:DFD_OSwindows);
+#endif
+    dirs[0] = queryUnknownBaseDirectory(0,islinux?DFD_OSunix:DFD_OSwindows);  // MORE - should use the info from the group store
+    dirs[1] = queryUnknownBaseDirectory(1,islinux?DFD_OSunix:DFD_OSwindows);
     numdirs = 2;
     IPropertyTree *ret=NULL;
     try {

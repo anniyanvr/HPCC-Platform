@@ -104,8 +104,19 @@ define([
                     },
                     Value: {
                         label: this.i18n.Value,
-                        width: 360,
+                        width: 240,
                         sortable: true
+                    },
+                    Skew: {
+                        label: this.i18n.Skew,
+                        width: 120,
+                        sortable: true,
+                        formatter: function (Skew, row) {
+                            if (row.LogicalFile && row.LogicalFile.MaxSkew && row.LogicalFile.MinSkew) {
+                                return row.LogicalFile.MaxSkew + " / " + row.LogicalFile.MinSkew;
+                            }
+                            return "";
+                        }
                     },
                     ResultViews: {
                         label: this.i18n.Views, sortable: true,
@@ -236,8 +247,27 @@ define([
             var context = this;
             this.wu.getInfo({
                 onGetResults: function (results) {
-                    context.store.setData(results);
-                    context.grid.refresh();
+                    if (context.wu.ResultsDesc) {
+                        context.store.setData([]);
+                        context.grid.refresh();
+
+                        dojo.publish("hpcc/brToaster", {
+                            Severity: "Error",
+                            Source: "WsWorkunits.WUInfo",
+                            Exceptions: [{
+                                Source: context.i18n.Error,
+                                Message: context.wu.ResultsDesc,
+                                duration: 1
+                            }]
+                        });
+                    } else {
+                        Promise.all(results.map(function (result) {
+                            return result.fetchLogicalFile();
+                        })).then(function (responses) {
+                            context.store.setData(results);
+                            context.grid.refresh();
+                        });
+                    }
                 }
             });
         },

@@ -30,6 +30,10 @@
 #include "jerror.hpp"
 #include "jencrypt.hpp"
 #include "jerror.hpp"
+#include "jsecrets.hpp"
+#include "jmd5.hpp"
+#include "jplane.hpp"
+
 #ifdef _WIN32
 #include <mmsystem.h> // for timeGetTime
 #include <float.h> //for _isnan and _fpclass
@@ -37,10 +41,6 @@
 #include <unistd.h> // read()
 #include <sys/wait.h>
 #include <pwd.h>
-#ifdef __linux__
-#include <crypt.h>
-#include <shadow.h>
-#endif
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,12 +48,15 @@
 #include <signal.h>
 #include <paths.h>
 #include <cmath>
+#include <string>
 #endif
 
 #include <limits.h>
 #include "build-config.h"
 
 #include "portlist.h"
+
+#include <random>
 
 static NonReentrantSpinLock * cvtLock;
 
@@ -68,17 +71,82 @@ static CriticalSection * protectedGeneratorCs;
 mach_timebase_info_data_t timebase_info  = { 1,1 };
 #endif
 
+bool getEnvVar(const char * varName, StringBuffer & varValue)
+{
+    if (isEmptyString(varName))
+        return false;
+
+    try
+    {
+        varValue.set(std::getenv(varName));
+        if (varValue.isEmpty())
+            return false;
+    }
+    catch(const std::exception& e)
+    {
+        ERRLOG("Encountered error fetching '%s' environment variable: '%s'.", varName, e.what());
+        return false;
+    }
+
+    return true;
+}
+
+HPCCBuildInfo hpccBuildInfo;
+
+#define stringify(x) # x
+#define estringify(x) stringify(x)
+
+static void initBuildVars()
+{
+    /* NB: picking up HPCC_BUILD_TAG from an environment variable is mainly so variants (like internal)
+     * can customize the buildtag, which is shown in Eclwatch and logging.
+     */
+    hpccBuildInfo.buildTag = getenv("HPCC_BUILD_TAG");
+    if (isEmptyString(hpccBuildInfo.buildTag))
+        hpccBuildInfo.buildTag = BUILD_TAG;
+
+    hpccBuildInfo.buildVersionMajor = BUILD_VERSION_MAJOR;
+    hpccBuildInfo.buildVersionMinor = BUILD_VERSION_MINOR;
+    hpccBuildInfo.buildVersionPoint = BUILD_VERSION_POINT;
+    hpccBuildInfo.buildVersion = estringify(BUILD_VERSION_MAJOR) "." estringify(BUILD_VERSION_MINOR) "." estringify(BUILD_VERSION_POINT);
+    hpccBuildInfo.buildMaturity = BUILD_MATURITY;
+    hpccBuildInfo.buildTagTimestamp = BUILD_TAG_TIMESTAMP;
+
+    hpccBuildInfo.dirName = DIR_NAME;
+    hpccBuildInfo.prefix = PREFIX;
+    hpccBuildInfo.execPrefix = EXEC_PREFIX;
+    hpccBuildInfo.configPrefix = CONFIG_PREFIX;
+    hpccBuildInfo.installDir = INSTALL_DIR;
+    hpccBuildInfo.libDir = LIB_DIR;
+    hpccBuildInfo.execDir = EXEC_DIR;
+    hpccBuildInfo.componentDir = COMPONENTFILES_DIR;
+    hpccBuildInfo.configDir = CONFIG_DIR;
+    hpccBuildInfo.configSourceDir = CONFIG_SOURCE_DIR;
+    hpccBuildInfo.adminDir = ADMIN_DIR;
+    hpccBuildInfo.pluginsDir = PLUGINS_DIR;
+    hpccBuildInfo.runtimeDir = RUNTIME_DIR;
+    hpccBuildInfo.lockDir = LOCK_DIR;
+    hpccBuildInfo.pidDir = PID_DIR;
+    hpccBuildInfo.logDir = LOG_DIR;
+
+    hpccBuildInfo.envXmlFile = ENV_XML_FILE;
+    hpccBuildInfo.envConfFile = ENV_CONF_FILE;
+}
+
 MODULE_INIT(INIT_PRIORITY_SYSTEM)
 {
-    cvtLock = new NonReentrantSpinLock;
+    cvtLock = new NonReentrantSpinLock(SYNC_LOCATION);
 #ifdef _WIN32
     protectedGenerator = createRandomNumberGenerator();
-    protectedGeneratorCs = new CriticalSection;
+    protectedGeneratorCs = new CriticalSection(SYNC_LOCATION);
 #endif
 #if defined (__APPLE__)
     if (mach_timebase_info(&timebase_info) != KERN_SUCCESS)
         return false;
 #endif
+
+    initBuildVars();
+
     return true;
 }
 
@@ -149,37 +217,45 @@ void MilliSleep(unsigned milli)
     Sleep(milli);
 }
 
+void NanoSleep(__uint64 nano)
+{
+    Sleep((unsigned)((nano + 999999)/100000));
+}
+
+
 #else
 
-void MilliSleep(unsigned milli)
+void NanoSleep(__uint64 ns)
 {
-    if (milli) {
-        unsigned target = msTick()+milli;
-        for (;;) {
-            timespec sleepTime;
+    if (ns)
+    {
+        __uint64 target = nsTick()+ns;
+        for (;;)
+        {
+            constexpr __uint64 nsPerSec = 1'000'000'000;
 
-            if (milli>=1000)
-            {
-                sleepTime.tv_sec = milli/1000;
-                milli %= 1000;
-            }
-            else
-                sleepTime.tv_sec = 0;
-            sleepTime.tv_nsec = milli * 1000000;
+            timespec sleepTime;
+            sleepTime.tv_sec = ns / nsPerSec;
+            sleepTime.tv_nsec = ns % nsPerSec;
             if (nanosleep(&sleepTime, NULL)==0)
                 break;
             if (errno!=EINTR) {
-                PROGLOG("MilliSleep err %d",errno);
+                PROGLOG("NanoSleep err %d",errno);
                 break;
             }
-            milli = target-msTick();
-            if ((int)milli<=0)
+            ns = target-nsTick();
+            if ((__int64)ns<=0)
                 break;
         }
     }
     else
         ThreadYield();  // 0 means  yield
 
+}
+
+void MilliSleep(unsigned milli)
+{
+    NanoSleep((__uint64)milli*1000000);
 }
 
 #endif
@@ -419,48 +495,72 @@ HINSTANCE LoadSharedObject(const char *name, bool isGlobal, bool raiseOnError)
         rfn.setRemotePath(name);
         if (!rfn.isLocal()) {
             // I guess could copy to a temporary location but currently just fail
-            throw MakeStringException(-1,"LoadSharedObject: %s is not a local file",name);
+            throw MakeStringException(JLIBERR_UtilLoadsharedobjectSIsNotALocalFile,"LoadSharedObject: %s is not a local file",name);
         }
         name = rfn.getLocalPath(tmp).str();
     }
 
+    unsigned __int64 _marginMs = 0;
+    findPlaneAttrFromPath(name, WriteSyncMarginMs, 0, _marginMs); // ok to return false, leaving _marginMs as 0 (unset)
+    unsigned marginMs = (unsigned)_marginMs;
 
+    CCycleTimer loadLibraryTimer;
+    auto checkAndDelayRetry = [&]()
+    {
+        if (!marginMs)
+            return false;
+        unsigned elapsedMs = loadLibraryTimer.elapsedMs();
+        if (elapsedMs < marginMs)
+            MilliSleep(marginMs - elapsedMs);
+        return true; // i.e. if there was a margin, we always signal to caller to retry
+    };
 #if defined(_WIN32)
     HINSTANCE h = LoadLibrary(name);
+
     if (!LoadSucceeded(h))
     {
-        int errcode = GetLastError();
-        StringBuffer errmsg;
-        formatSystemError(errmsg, errcode);
-        //Strip trailing newlines - makes output/errors messages cleaner
-        unsigned len = errmsg.length();
-        while (len)
+        if (checkAndDelayRetry())
+            h = LoadLibrary(name);
+        if (!LoadSucceeded(h))
         {
-            char c = errmsg.charAt(len-1);
-            if ((c != '\r') && (c != '\n'))
-                break;
-            len--;
+            int errcode = GetLastError();
+            StringBuffer errmsg;
+            formatSystemError(errmsg, errcode);
+            //Strip trailing newlines - makes output/errors messages cleaner
+            unsigned len = errmsg.length();
+            while (len)
+            {
+                char c = errmsg.charAt(len-1);
+                if ((c != '\r') && (c != '\n'))
+                    break;
+                len--;
+            }
+            errmsg.setLength(len);
+            DBGLOG("Error loading %s: %d - %s", name, errcode, errmsg.str());
+            if (raiseOnError)
+                throw MakeStringException(JLIBERR_UtilErrorLoadingSDS, "Error loading %s: %d - %s", name, errcode, errmsg.str());
         }
-        errmsg.setLength(len);
-        DBGLOG("Error loading %s: %d - %s", name, errcode, errmsg.str());
-        if (raiseOnError)
-            throw MakeStringException(0, "Error loading %s: %d - %s", name, errcode, errmsg.str());
     }
 #else
     HINSTANCE h = dlopen((char *)name, isGlobal ? RTLD_NOW|RTLD_GLOBAL : RTLD_NOW);
-    if(h == NULL)
+    if (h == NULL)
     {
-        // Try again, with .so extension if necessary
-        StringBuffer path, tail, ext;
-        splitFilename(name, &path, &path, &tail, &ext, false);
-        if (!streq(ext.str(), SharedObjectExtension))
-        {
-            // Assume if there's no .so, there may also be no lib at the beginning
-            if (strncmp(tail.str(), SharedObjectPrefix, strlen(SharedObjectPrefix)) != 0)
-                path.append(SharedObjectPrefix);
-            path.append(tail).append(ext).append(SharedObjectExtension);
-            name = path.str();
+        if (checkAndDelayRetry())
             h = dlopen((char *)name, isGlobal ? RTLD_NOW|RTLD_GLOBAL : RTLD_NOW);
+        StringBuffer path;
+        if (h == NULL)
+        {
+            StringBuffer tail, ext;
+            splitFilename(name, &path, &path, &tail, &ext, false);
+            if (!streq(ext.str(), SharedObjectExtension))
+            {
+                // Assume if there's no .so, there may also be no lib at the beginning
+                if (strncmp(tail.str(), SharedObjectPrefix, strlen(SharedObjectPrefix)) != 0)
+                    path.append(SharedObjectPrefix);
+                path.append(tail).append(ext).append(SharedObjectExtension);
+                name = path.str();
+                h = dlopen((char *)name, isGlobal ? RTLD_NOW|RTLD_GLOBAL : RTLD_NOW);
+            }
         }
         if (h == NULL)
         {
@@ -471,7 +571,7 @@ HINSTANCE LoadSharedObject(const char *name, bool isGlobal, bool raiseOnError)
                 if (isCorruptDll(dlErrorMsg.str()))
                     throw new CorruptDllException(errno, name, dlErrorMsg.str());
                 else
-                    throw MakeStringException(0, "Error loading %s: %s", name, dlErrorMsg.str());
+                    throw MakeStringException(JLIBERR_UtilErrorLoadingSS, "Error loading %s: %s", name, dlErrorMsg.str());
             }
         }
     }
@@ -572,16 +672,16 @@ IPluggableFactory *loadPlugin(const IPropertyTree *pluginInfo)
     const char *pluginName = pluginInfo->queryProp("@pluginName");
     const char *entrypoint = pluginInfo->queryProp("@entrypoint");
     if (!pluginName || !entrypoint)
-        throw makeStringException(0, "Plugin information missing plugin name or entrypoint");
+        throw makeStringException(JLIBERR_UtilPluginInformationMissingPluginNameOrEntrypoint, "Plugin information missing plugin name or entrypoint");
     Owned<SharedObject> pluginDll = new SharedObject;
     if (!pluginDll->load(pluginName, false, true))
-        throw makeStringExceptionV(0, "Failed to load plugin %s", pluginName);
+        throw makeStringExceptionV(JLIBERR_UtilFailedToLoadPluginS, "Failed to load plugin %s", pluginName);
     IPluggableFactoryFactory pf = (IPluggableFactoryFactory) pluginDll->getEntry(entrypoint);
     if (!pf)
-        throw makeStringExceptionV(0, "Function %s not found in plugin %s", entrypoint,  pluginName);
+        throw makeStringExceptionV(JLIBERR_UtilFunctionSNotFoundInPluginS, "Function %s not found in plugin %s", entrypoint,  pluginName);
     IPluggableFactory *factory =  pf(pluginDll, pluginInfo);
     if (!factory)
-        throw makeStringExceptionV(0, "Factory function %s returned NULL in plugin %s", entrypoint, pluginName);
+        throw makeStringExceptionV(JLIBERR_UtilFactoryFunctionSReturnedNullInPlugin, "Factory function %s returned NULL in plugin %s", entrypoint, pluginName);
     return factory;
 }
 
@@ -883,7 +983,7 @@ public:
 
 } RandomMain;
 
-static CriticalSection gobalRandomSect;
+static CriticalSection gobalRandomSect(SYNC_LOCATION);
 
 unsigned getRandom()
 {
@@ -949,30 +1049,20 @@ jlib_decl int rand_r(unsigned int *seed)
 class CShuffledIterator: implements IShuffledIterator, public CInterface
 {
     CRandom rand;
-    unsigned *seq;
-    unsigned idx;
-    unsigned num;
+    unsigned * seq = nullptr;
+    unsigned idx = 0;
+    unsigned num = 0;
 public:
     IMPLEMENT_IINTERFACE;
 
-    CShuffledIterator(unsigned _num)
+    CShuffledIterator(unsigned _num) : num(_num)
     {
-        num = _num;
-        idx = 0;
-        seq = NULL;
-    }
-    ~CShuffledIterator()
-    {
-        delete [] seq;
-    }
-
-    bool first()
-    {
-        if (!seq)
-            seq = new unsigned[num];
-        idx = 0;
         if (!num)
-            return false;
+            return;
+
+        seq = new unsigned[num];
+        idx = 0;
+
         unsigned i;
         for (i=0;i<num;i++)
             seq[i] = i;
@@ -983,10 +1073,19 @@ public:
             seq[j] = seq[i];
             seq[i] = t;
         }
-        return true;
+    }
+    ~CShuffledIterator()
+    {
+        delete [] seq;
     }
 
-    bool isValid()
+    bool first()
+    {
+        idx = 0;
+        return (num != 0);
+    }
+
+    bool isValid() const
     {
         return idx<num;
     }
@@ -998,24 +1097,16 @@ public:
         return isValid();
     }
 
-    unsigned get()
+    unsigned get() const
     {
         return lookup(idx);
     }
 
-    unsigned lookup(unsigned i)
+    unsigned lookup(unsigned i) const
     {
-        if (!seq)
-            first();
-        return seq[i%num];
+        assertex(i<num);
+        return seq[i];
     }
-
-    void seed(unsigned su)
-    {
-        rand.seed(su);
-    }
-
-
 };
 
 extern jlib_decl IShuffledIterator *createShuffledIterator(unsigned n)
@@ -1518,6 +1609,12 @@ static void DelimToStringArray(const char *csl, StringArray &dst, const char *de
     }
 }
 
+void StringArray::appendArray(const StringArray & other)
+{
+    ForEachItemIn(i, other)
+        append(other.item(i));
+}
+
 void StringArray::appendList(const char *list, const char *delim, bool trimSpaces)
 {
     DelimToStringArray(list, *this, delim, false, trimSpaces);
@@ -1528,7 +1625,17 @@ void StringArray::appendListUniq(const char *list, const char *delim, bool trimS
     DelimToStringArray(list, *this, delim, true, trimSpaces);
 }
 
-StringBuffer &StringArray::getString(StringBuffer &ret, const char *delim)
+bool StringArray::contains(const char * search, bool nocase) const
+{
+    ForEachItemIn(i, *this)
+    {
+        if (nocase ? strieq(search, item(i)) : streq(search, item(i)))
+            return true;
+    }
+    return false;
+}
+
+StringBuffer &StringArray::getString(StringBuffer &ret, const char *delim) const
 {
     ForEachItemIn(i, *this)
     {
@@ -1574,6 +1681,20 @@ unsigned usTick()
         return 0;
     return (unsigned) ((v.QuadPart*1000000)/freq); // hope dividend doesn't overflow though it might
 }
+extern jlib_decl unsigned __int64 nsTick()
+{
+    static __int64 freq=0;
+    LARGE_INTEGER v;
+    if (!freq) {
+        if (QueryPerformanceFrequency(&v))
+            freq=v.QuadPart;
+        if (!freq)
+            return 0;
+    }
+    if (!QueryPerformanceCounter(&v))
+        return 0;
+    return (v.QuadPart*U64C(1000000000))/freq; // This is unlikely to cleanly wrap
+}
 
 #else
 #ifdef CLOCK_MONOTONIC
@@ -1604,7 +1725,25 @@ unsigned usTick()
     gettimeofday(&tm,NULL);
     return tm.tv_sec*1000000+tm.tv_usec;
 }
+unsigned __int64 nsTick()
+{
+    if (!use_gettimeofday) {
+        timespec tm;
+        if (clock_gettime(CLOCK_MONOTONIC, &tm)>=0)
+            return ((unsigned __int64)tm.tv_sec)*U64C(1000000000)+tm.tv_nsec;
+        use_gettimeofday = true;
+        fprintf(stderr,"clock_gettime CLOCK_MONOTONIC returns %d",errno);   // don't use PROGLOG
+    }
+    struct timeval tm;
+    gettimeofday(&tm,NULL);
+    return tm.tv_sec*U64C(1000000000)+tm.tv_usec*1000;
+}
 #elif __APPLE__
+
+unsigned __int64 nsTick()
+{
+    return mach_absolute_time() * (uint64_t)timebase_info.numer / (uint64_t)timebase_info.denom;
+}
 
 unsigned usTick()
 {
@@ -1622,15 +1761,21 @@ unsigned msTick()
 #warning "clock_gettime(CLOCK_MONOTONIC) not supported"
 unsigned msTick()
 {
-  struct timeval tm;
-  gettimeofday(&tm,NULL);
-  return tm.tv_sec*1000+(tm.tv_usec/1000);
+    struct timeval tm;
+    gettimeofday(&tm,NULL);
+    return tm.tv_sec*1000+(tm.tv_usec/1000);
 }
 unsigned usTick()
 {
-  struct timeval tm;
-  gettimeofday(&tm,NULL);
-  return tm.tv_sec*1000000+tm.tv_usec;
+    struct timeval tm;
+    gettimeofday(&tm,NULL);
+    return tm.tv_sec*1000000+tm.tv_usec;
+}
+unsigned __int64 nsTick()
+{
+    struct timeval tm;
+    gettimeofday(&tm,NULL);
+    return tm.tv_sec*U64C(1000000000)+tm.tv_usec*1000;
 }
 #endif
 #endif
@@ -1694,106 +1839,6 @@ void doStackProbe()
 #pragma GCC diagnostic pop
 #endif
 
-extern jlib_decl bool isContainerized()
-{
-#ifdef _CONTAINERIZED
-    return true;
-#else
-    return false;
-#endif
-}
-
-#ifdef _WIN32
-
-DWORD dwTlsIndex = -1;
-CriticalSection tlscrit;
-
-void initThreadLocal(int len, void* val)
-{
-    {
-        CriticalBlock b(tlscrit);
-        if(dwTlsIndex == -1)
-        {
-            if ((dwTlsIndex = TlsAlloc()) == TLS_OUT_OF_INDEXES)
-                throw MakeStringException(-1, "TlsAlloc failed");
-        }
-    }
-
-    LPVOID lpvData;
-
-    lpvData = TlsGetValue(dwTlsIndex);
-    if (lpvData != 0)
-        LocalFree((HLOCAL) lpvData);
-
-    // Initialize the TLS index for this thread.
-    lpvData = (LPVOID) LocalAlloc(LPTR, len);
-    memcpy((char*)lpvData, val, len);
-    if (! TlsSetValue(dwTlsIndex, lpvData))
-        throw MakeStringException(-1, "TlsSetValue error");
-}
-
-void* getThreadLocalVal()
-{
-    if(dwTlsIndex == -1)
-        return NULL;
-
-    return TlsGetValue(dwTlsIndex);
-}
-
-void clearThreadLocal()
-{
-    if(dwTlsIndex == -1)
-        return;
-
-    LPVOID lpvData = TlsGetValue(dwTlsIndex);
-    if (lpvData != 0)
-    {
-        LocalFree((HLOCAL) lpvData);
-        if (! TlsSetValue(dwTlsIndex, NULL))
-            throw MakeStringException(-1, "TlsSetValue error");
-    }
-}
-
-#else
-// Key for the thread-specific buffer
-static pthread_key_t buffer_key;
-// Once-only initialisation of the key
-static pthread_once_t buffer_key_once = PTHREAD_ONCE_INIT;
-
-// Free the thread-specific buffer
-static void buffer_destroy(void * buf)
-{
-    if(buf)
-        free(buf);
-}
-
-// Allocate the key
-static void buffer_key_alloc()
-{
-    pthread_key_create(&buffer_key, buffer_destroy);
-}
-
-// Allocate the thread-specific buffer
-void initThreadLocal(int len, void* val)
-{
-    pthread_once(&buffer_key_once, buffer_key_alloc);
-    void* valbuf = malloc(len);
-    memcpy(valbuf, val, len);
-    pthread_setspecific(buffer_key, valbuf);
-}
-
-// Return the thread-specific buffer
-void* getThreadLocalVal()
-{
-    return (char *) pthread_getspecific(buffer_key);
-}
-
-void clearThreadLocal()
-{
-}
-
-#endif
-
 StringBuffer &expandMask(StringBuffer &buf, const char *mask, unsigned p, unsigned n)
 {
     const char *s=mask;
@@ -1840,16 +1885,24 @@ static const char *findExtension(const char *fn)
 
 unsigned runExternalCommand(StringBuffer &output, StringBuffer &error, const char *cmd, const char *input)
 {
-    return runExternalCommand(cmd, output, error, cmd, input);
+    return runExternalCommand(cmd, output, error, cmd, input, ".", nullptr);
 }
 
-unsigned runExternalCommand(const char *title, StringBuffer &output, StringBuffer &error, const char *cmd, const char *input)
+unsigned runExternalCommand(const char *title, StringBuffer &output, StringBuffer &error, const char *cmd, const char *input, const char * cwd, const EnvironmentVector * optEnvironment)
 {
     try
     {
+        if (!cwd)
+            cwd = ".";
+
         Owned<IPipeProcess> pipe = createPipeProcess();
+        if (optEnvironment)
+        {
+            for (const auto & cur : *optEnvironment)
+                pipe->setenv(cur.first.c_str(), cur.second.c_str());
+        }
         int ret = START_FAILURE;
-        if (pipe->run(title, cmd, ".", input != NULL, true, true, 1024*1024))
+        if (pipe->run(title, cmd, cwd, input != NULL, true, true, 1024*1024))
         {
             if (input)
             {
@@ -1904,8 +1957,9 @@ bool constructMask(StringAttr &attr, const char *fn, unsigned p, unsigned n)
     return false;
 }
 
-bool deduceMask(const char *fn, bool expandN, StringAttr &mask, unsigned &pret, unsigned &nret)
+bool deduceMask(const char *fn, bool expandN, StringAttr &mask, unsigned &pret, unsigned &nret, unsigned &filenameLen)
 {
+    filenameLen = 0;
     const char *e = findExtension(fn);
     if (!e)
         return false;
@@ -1931,6 +1985,7 @@ bool deduceMask(const char *fn, bool expandN, StringAttr &mask, unsigned &pret, 
                         buf.append((size32_t)(e-fn),fn).append("_$P$_of_$N$");
                     if (*s=='.')
                         buf.append(s);
+                    filenameLen = (e-1)-fn;
                     mask.set(buf);
                     return true;
                 }
@@ -1949,130 +2004,6 @@ bool deduceMask(const char *fn, bool expandN, StringAttr &mask, unsigned &pret, 
 }
 
 //==============================================================
-#ifdef _WIN32
-
-
-class CWindowsAuthenticatedUser: implements IAuthenticatedUser, public CInterface
-{
-    StringAttr name;
-    HANDLE usertoken;
-public:
-    IMPLEMENT_IINTERFACE;
-    CWindowsAuthenticatedUser()
-    {
-        usertoken = (HANDLE)-1;
-    }
-    ~CWindowsAuthenticatedUser()
-    {
-        if (usertoken != (HANDLE)-1)
-            CloseHandle(usertoken);
-    }
-    bool login(const char *user, const char *passwd)
-    {
-        name.clear();
-        if (usertoken != (HANDLE)-1)
-            CloseHandle(usertoken);
-        StringBuffer domain("");
-        const char *ut = strchr(user,'\\');
-        if (ut) {
-            domain.clear().append((size32_t)(ut-user),user);
-            user = ut+1;
-        }
-        BOOL res = LogonUser((LPTSTR)user,(LPTSTR)(domain.length()==0?NULL:domain.str()),(LPTSTR)passwd,LOGON32_LOGON_NETWORK,LOGON32_PROVIDER_DEFAULT,&usertoken);
-        if (res==0)
-            return false;
-        name.set(user);
-        return true;
-    }
-    void impersonate()
-    {
-        if (!ImpersonateLoggedOnUser(usertoken))
-            throw makeOsException(GetLastError());
-    }
-
-    void revert()
-    {
-        RevertToSelf();
-    }
-
-    const char *username()
-    {
-        return name.get();
-    }
-};
-
-IAuthenticatedUser *createAuthenticatedUser() { return new CWindowsAuthenticatedUser; }
-
-#elif defined(__linux__)
-
-class CLinuxAuthenticatedUser: implements IAuthenticatedUser, public CInterface
-{
-    StringAttr name;
-    uid_t uid;
-    gid_t gid;
-    uid_t saveuid;
-    gid_t savegid;
-
-public:
-    IMPLEMENT_IINTERFACE;
-    bool login(const char *user, const char *passwd)
-    {
-        name.clear();
-        const char *ut = strchr(user,'\\');
-        if (ut)
-            user = ut+1; // remove windows domain
-        struct passwd *pw;
-        char *epasswd;
-        if ((pw = getpwnam(user)) == NULL)
-            return false;
-        struct spwd *spwd = getspnam(user);
-        if (spwd)
-            epasswd = spwd->sp_pwdp;
-        else
-            epasswd = pw->pw_passwd;
-        if (!epasswd||!*epasswd)
-            return false;
-        if (strcmp(crypt(passwd,epasswd),epasswd)!=0)
-            return false;
-        uid = pw->pw_uid;
-        gid = pw->pw_gid;
-        name.set(pw->pw_name);
-        return true;
-    }
-    void impersonate()
-    {
-        saveuid = geteuid();
-        savegid = getegid();
-        if (setegid(gid) == -1)
-            throw makeOsException(errno, "Failed to set effective group id");
-        if (seteuid(uid) == -1)
-            throw makeOsException(errno, "Failed to set effective user id");
-    }
-
-    void revert()
-    {
-        if (seteuid(saveuid) == -1)
-            throw makeOsException(errno, "Failed to restore effective group id");
-        if (setegid(savegid) == -1)
-            throw makeOsException(errno, "Failed to restore effective user id");
-    }
-
-    const char *username()
-    {
-        return name.get();
-    }
-
-};
-
-
-
-IAuthenticatedUser *createAuthenticatedUser() { return new CLinuxAuthenticatedUser; }
-#elif defined(__FreeBSD__) || defined (__APPLE__)
-
-IAuthenticatedUser *createAuthenticatedUser() { UNIMPLEMENTED; }
-
-#endif
-
 
 extern jlib_decl void serializeAtom(MemoryBuffer & target, IAtom * name)
 {
@@ -2109,11 +2040,11 @@ static inline void encode3_64(byte *in,StringBuffer &out)
 
 
 
-static NonReentrantSpinLock lock;
+static NonReentrantSpinLock uuidLock(SYNC_LOCATION);
 static unsigned uuidbin[5] = {0,0,0,0,0};
 StringBuffer &genUUID(StringBuffer &out, bool nocase)
 { // returns a 24 char UUID for nocase=false or 32 char for nocase=true
-    lock.enter();
+    uuidLock.enter();
     // could be quicker using statics
     if (uuidbin[0]==0) {
         queryHostIP().getNetAddress(sizeof(uuidbin[0]),uuidbin);
@@ -2143,7 +2074,7 @@ StringBuffer &genUUID(StringBuffer &out, bool nocase)
         encode3_64(tmp,out);
         encode3_64(in+17,out);
     }
-    lock.leave();
+    uuidLock.leave();
     return out;
 }
 
@@ -2296,6 +2227,22 @@ jlib_decl StringBuffer& decodeUrlUseridPassword(StringBuffer& out, const char* i
     return out;
 }
 
+jlib_decl StringBuffer& encodeURL(StringBuffer& out, const char* in)
+{
+    for (const char *p = in; *p; ++p)
+    {
+        uint8_t c = static_cast<uint8_t>(*p);
+        if (strchr(" !\"#$%&\\()*,-.:;", *p)!=nullptr|| (c<0x20) || (c>=0x80) )
+        {
+            out.append("%");
+            out.appendhex(c, false);
+        }
+        else
+            out.append(*p);
+    }
+
+    return out;
+}
 
 jlib_decl StringBuffer &  passwordInput(const char* prompt, StringBuffer& passwd)
 {
@@ -2385,8 +2332,31 @@ StringBuffer & fillConfigurationDirectoryEntry(const char *dir,const char *name,
     return dirout;
 }
 
+static Owned<IPropertyTree> cachedEnvironment;
+static CriticalSection envCrit(SYNC_LOCATION);
+MODULE_INIT(INIT_PRIORITY_STANDARD)
+{
+    return true;
+}
+MODULE_EXIT()
+{
+    cachedEnvironment.clear(); // Must be destroyed before jptree module destructors are called
+}
+
 IPropertyTree *getHPCCEnvironment()
 {
+#ifdef _CONTAINERIZED
+#ifdef _DEBUG
+    throwUnexpectedX("getHPCCEnvironment() called from container system");
+#else
+    IERRLOG("getHPCCEnvironment() called from container system");
+#endif
+#endif
+
+    CriticalBlock b(envCrit);
+    if (cachedEnvironment)
+        return LINK(cachedEnvironment);
+
     StringBuffer envfile;
     if (queryEnvironmentConf().getProp("environment",envfile) && envfile.length())
     {
@@ -2399,17 +2369,23 @@ IPropertyTree *getHPCCEnvironment()
         {
             Owned<IFileIO> fileio = file->open(IFOread);
             if (fileio)
-                return createPTree(*fileio, ipt_lowmem);
+                cachedEnvironment.setown(createPTree(*fileio, ipt_lowmem));
         }
     }
-    return NULL;
+    return LINK(cachedEnvironment);
 }
 
 static Owned<IProperties> envConfFile;
-static CriticalSection envConfCrit;
+static CriticalSection envConfCrit(SYNC_LOCATION);
 
 jlib_decl const IProperties &queryEnvironmentConf()
 {
+#if defined(_CONTAINERIZED) && defined(_DEBUG)
+    //The following line is currently hit by too many examples.  Re-enable the exception when more
+    //work has been done removing calls to getConfigurationDirectory() and other related functions.
+    //throwUnexpectedX("queryEnvironmentConf() callled from container system");
+    IERRLOG("queryEnvironmentConf() callled from container system");
+#endif
     CriticalBlock b(envConfCrit);
     if (!envConfFile)
         envConfFile.setown(createProperties(CONFIG_DIR PATHSEPSTR ENV_CONF_FILE, true));
@@ -2419,7 +2395,7 @@ jlib_decl const IProperties &queryEnvironmentConf()
 
 
 static StringBuffer DAFSpassPhraseDec;//deprecated
-static CriticalSection DAFSpassPhraseCrit;
+static CriticalSection DAFSpassPhraseCrit(SYNC_LOCATION);
 //Deprecated, please use queryHPCCPKIKeyFiles() instead
 jlib_decl bool querySecuritySettings(DAFSConnectCfg *_connectMethod,
                                      unsigned short *_port,
@@ -2432,6 +2408,18 @@ jlib_decl bool querySecuritySettings(DAFSConnectCfg *_connectMethod,
     if (_port)
         *_port = DAFILESRV_PORT;//default
 
+    // TLS TODO: could share mtls setting and cert/config for secure dafilesrv
+    //           but note remote cluster configs should then match this one
+
+#ifdef _CONTAINERIZED
+    //MORE: If these come from the component configuration they will need to clone the strings
+    if (_certificate)
+        *_certificate = nullptr;
+    if (_privateKey)
+        *_privateKey = nullptr;
+    if (_passPhrase)
+        *_passPhrase = nullptr;
+#else
     const IProperties & conf = queryEnvironmentConf();
     StringAttr sslMethod;
     sslMethod.set(conf.queryProp("dfsUseSSL"));
@@ -2445,6 +2433,8 @@ jlib_decl bool querySecuritySettings(DAFSConnectCfg *_connectMethod,
             tmpMethod = SSLFirst;
         else if ( strieq(sslMethod.str(), "UnsecureFirst") )
             tmpMethod = UnsecureFirst;
+        else if ( strieq(sslMethod.str(), "UnsecureAndSSL") )
+            tmpMethod = UnsecureAndSSL;
         else // SSLNone or false or ...
             tmpMethod = SSLNone;
 
@@ -2508,6 +2498,7 @@ jlib_decl bool querySecuritySettings(DAFSConnectCfg *_connectMethod,
             *_passPhrase = DAFSpassPhraseDec.str();//return decrypted password. Note the preferred queryHPCCPKIKeyFiles() method returns it encrypted
         }
     }
+#endif
 
     return true;
 }
@@ -2548,6 +2539,22 @@ jlib_decl bool queryHPCCPKIKeyFiles(const char * *  _certificate,//HPCCCertifica
     return true;
 }
 
+#ifndef _CONTAINERIZED
+jlib_decl bool queryMtlsBareMetalConfig()
+{
+    const IProperties &conf = queryEnvironmentConf();
+    if (conf.queryProp("mtls"))
+        return conf.getPropBool("mtls", false);
+    // not in conf, check xml, since all other mp settings are checked there
+    Owned<IPropertyTree> env = getHPCCEnvironment();
+    if (env)
+        return env->getPropBool("EnvSettings/mtls", false);
+
+    return false;
+}
+#endif
+
+#ifndef _CONTAINERIZED
 static IPropertyTree *getOSSdirTree()
 {
     Owned<IPropertyTree> envtree = getHPCCEnvironment();
@@ -2558,6 +2565,8 @@ static IPropertyTree *getOSSdirTree()
     }
     return NULL;
 }
+#endif
+
 
 StringBuffer &getFileAccessUrl(StringBuffer &out)
 {
@@ -2583,8 +2592,102 @@ StringBuffer &getFileAccessUrl(StringBuffer &out)
     return out;
 }
 
+bool getDefaultPlane(StringBuffer &ret, const char * componentOption, const char * category)
+{
+    if (!isContainerized())
+        throwUnexpectedX("getDefaultPlane() called from non-container system");
+    // If the plane is specified for the component, then use that
+    if (!isEmptyString(componentOption) && getComponentConfigSP()->getProp(componentOption, ret))
+        return true;
+
+    //Otherwise check what the default plane for data storage is configured to be
+    //Iterator needed because "storage/planes[@category='%s'][1]/@name" generates an ambiguous error
+    VStringBuffer xpath("storage/planes[@category='%s']", category);
+    Owned<IPropertyTreeIterator> iter = getGlobalConfigSP()->getElements(xpath);
+    if (iter->first())
+    {
+        iter->query().getProp("@name", ret);
+        return true;
+    }
+
+    return false;
+}
+
+#ifdef _CONTAINERIZED
+static bool getDefaultPlaneDirectory(StringBuffer &ret, const char * componentOption, const char * category)
+{
+    if (!isContainerized())
+        throwUnexpectedX("getDefaultPlaneDirectory() called from non-container system");
+    StringBuffer planeName;
+    if (!getDefaultPlane(planeName, componentOption, category))
+        return false;
+
+    Owned<const IPropertyTree> storagePlane = getStoragePlaneConfig(planeName, true);
+    return storagePlane->getProp("@prefix", ret);
+}
+#endif
+
 bool getConfigurationDirectory(const IPropertyTree *useTree, const char *category, const char *component, const char *instance, StringBuffer &dirout)
 {
+#ifdef _CONTAINERIZED
+    if (streq(category, "data"))
+    {
+        Owned<const IStoragePlane> storagePlane = getStoragePlaneByName(instance, false);
+        if (!storagePlane)
+            throw makeStringExceptionV(JLIBERR_UtilNoDefaultDirectoryAvailableForPlaneS, "no default directory available for plane '%s'", instance);
+        dirout.append(storagePlane->queryPrefix());
+        return true;
+    }
+    if (streq(category, "data2") || streq(category, "mirror"))
+    {
+        Owned<const IStoragePlane> storagePlane = getStoragePlaneByName(instance, false);
+        if (!storagePlane)
+            throw makeStringExceptionV(JLIBERR_UtilNoDefaultDirectoryAvailableForPlaneS_1, "no default directory available for plane '%s'", instance);
+        dirout.append(storagePlane->queryMirrorPrefix());
+        return true;
+    }
+    if (streq(category, "data3") || streq(category, "data4"))
+        return false;
+    if (streq(category, "spill"))
+    {
+        return getDefaultPlaneDirectory(dirout, "@spillPlane", "spill");
+    }
+    if (streq(category, "debug"))
+    {
+        return getDefaultPlaneDirectory(dirout, "@debugPlane", "debug");
+    }
+    if (streq(category, "temp"))
+    {
+        if (getDefaultPlaneDirectory(dirout, "@tempPlane", "temp"))
+            return true;
+        return getDefaultPlaneDirectory(dirout, "@spillPlane", "spill");
+    }
+    if (streq(category, "log"))
+    {
+        return false;
+    }
+    if (streq(category, "dali"))
+    {
+        //Not used... the dataPath configuration property is used instead
+        return getDefaultPlaneDirectory(dirout, "@daliPlane", "dali");
+    }
+    if (streq(category, "query"))
+    {
+        return getDefaultPlaneDirectory(dirout, "@dllPlane", "dll");
+    }
+    if (streq(category, "lock"))
+    {
+        //Called by NamedMutex.  Currently unused in the containerized system.
+        dirout.append("/var/lib/HPCCSystems/lock");
+        return true;
+    }
+    if (streq(category, "key") || streq(category, "run"))
+    {
+        throw makeStringExceptionV(JLIBERR_UtilUnexpectedCategorySRequestedInContainerizedMode, "Unexpected category '%s' requested in containerized mode", category);
+    }
+
+    throw makeStringExceptionV(JLIBERR_UtilUnrecognisedConfigurationCategoryS, "Unrecognised configuration category %s", category);
+#else
     Linked<const IPropertyTree> dirtree = useTree;
     if (!dirtree)
         dirtree.setown(getOSSdirTree());
@@ -2646,6 +2749,7 @@ bool getConfigurationDirectory(const IPropertyTree *useTree, const char *categor
         }
     }
     return false;
+#endif
 }
 
 
@@ -2715,7 +2819,20 @@ bool replaceConfigurationDirectoryEntry(const char *path,const char *frommask,co
     return true;
 }
 
-static CriticalSection sect;
+bool validateConfigurationDirectory(const IPropertyTree* useTree, const char* category, const char* component, const char* instance, const char* dirToValidate)
+{
+    if (isEmptyString(dirToValidate))
+        return false;
+
+    StringBuffer configDir;
+    if (!getConfigurationDirectory(useTree, category, component, instance, configDir))
+        return false;
+
+    addPathSepChar(configDir);
+    return hasPrefix(dirToValidate, configDir, true);
+}
+
+static CriticalSection sect(SYNC_LOCATION);
 static StringAttr processPath;
 const char * queryCurrentProcessPath()
 {
@@ -2828,7 +2945,7 @@ int parseCommandLine(const char * cmdline, MemoryBuffer &mb, const char** &argvo
                     }
                     if (c) {
                         if (argc==256)
-                            throw makeStringException(-1, "parseCommandLine: too many arguments");
+                            throw makeStringException(JLIBERR_UtilParsecommandlineTooManyArguments, "parseCommandLine: too many arguments");
                         arg[argc] = 0;
                     }
                 }
@@ -2892,11 +3009,15 @@ int parseCommandLine(const char * cmdline, MemoryBuffer &mb, const char** &argvo
     return 0;
 }
 
-jlib_decl StringBuffer &getTempFilePath(StringBuffer & target, const char * component, IPropertyTree * pTree)
+static StringBuffer &doGetTempFilePath(StringBuffer & target, const char *tempCategory, const char * component, IPropertyTree * pTree)
 {
     StringBuffer dir;
     if (pTree)
-        getConfigurationDirectory(pTree->queryPropTree("Directories"),"temp",component,pTree->queryProp("@name"),dir);
+        getConfigurationDirectory(pTree->queryPropTree("Directories"),tempCategory,component,pTree->queryProp("@name"),dir);
+#ifdef _CONTAINERIZED
+    else
+        getConfigurationDirectory(nullptr,tempCategory,component,nullptr,dir);
+#endif
     bool ok = false;
     if (!dir.isEmpty())
     {
@@ -2962,7 +3083,7 @@ jlib_decl StringBuffer &getTempFilePath(StringBuffer & target, const char * comp
     }
 
 #ifdef _WIN32
-    throw MakeStringException(-1, "Unable to create temp directory");
+    throw MakeStringException(JLIBERR_UtilUnableToCreateTempDirectory, "Unable to create temp directory");
 #else
     // uniq tmp - perhaps previous dirs above were owned by others ...
     dir.clear();
@@ -2972,9 +3093,61 @@ jlib_decl StringBuffer &getTempFilePath(StringBuffer & target, const char * comp
     strcpy(templt, dir.str());
     char *td = mkdtemp(templt);
     if (!td)
-        throw MakeStringException(-1, "Unable to create temp directory");
+        throw MakeStringException(JLIBERR_UtilUnableToCreateTempDirectory_1, "Unable to create temp directory");
     return target.set(templt);
 #endif
+}
+
+jlib_decl StringBuffer &getTempFilePath(StringBuffer & target, const char * component, IPropertyTree * pTree)
+{
+    return doGetTempFilePath(target, "temp", component, pTree);
+}
+
+jlib_decl StringBuffer &getSpillFilePath(StringBuffer & target, const char * component, IPropertyTree * pTree)
+{
+    return doGetTempFilePath(target, "spill", component, pTree);
+}
+
+jlib_decl StringBuffer &createUniqueTempDirectoryName(StringBuffer & ret)
+{
+    StringBuffer dir;
+    getConfigurationDirectory(nullptr, "temp", nullptr, nullptr, dir);
+    recursiveCreateDirectory(dir);
+    dir.append(PATHSEPCHAR).append("HPCCSystems-XXXXXX");
+    OwnedMalloc<char> uniqueDir(dir.detach());
+    char *td = mkdtemp(uniqueDir);
+    if (!td)
+        throw makeStringException(JLIBERR_UtilUnableToCreateTempDirectory_1, "Unable to create temp directory");
+    return ret.append(uniqueDir);
+}
+
+jlib_decl IFile *createUniqueTempDirectory()
+{
+    StringBuffer dir;
+    createUniqueTempDirectoryName(dir);
+    return createIFile(dir);
+}
+
+jlib_decl StringBuffer &getSystemTempDir(StringBuffer &dir)
+{
+#ifdef _WIN32
+    char path[_MAX_PATH+1];
+    if(GetTempPath(sizeof(path),path))
+        dir.append(path);
+    else
+    {
+        dir.append(getenv("TEMP"));
+        if (!dir.length())
+            dir.append(getenv("TMP"));
+        if (!dir.length())
+            dir.append(".");
+    }
+#else
+    dir.append(getenv("TMPDIR"));
+    if (!dir.length())
+        dir.append("/tmp");
+#endif
+    return dir;
 }
 
 const char *getEnumText(int value, const EnumMapping *map)
@@ -3030,6 +3203,54 @@ int getEnum(const char *v, const EnumMapping *map, int defval)
 
 //---------------------------------------------------------------------------------------------------------------------
 
+extern jlib_decl offset_t friendlyStringToDuration(const char *in)
+{
+    constexpr offset_t SCALE_NS = 1;
+    constexpr offset_t SCALE_US = SCALE_NS * 1000;
+    constexpr offset_t SCALE_MS = SCALE_US * 1000;
+    constexpr offset_t SCALE_S  = SCALE_MS * 1000;
+    constexpr offset_t SCALE_M  = SCALE_S  * 60;
+    constexpr offset_t SCALE_H  = SCALE_M  * 60;
+    constexpr offset_t SCALE_D  = SCALE_H  * 24;
+
+    const char* start = in;
+    while (isspace((unsigned char)*start))
+        start++;
+    if (*start == '-')
+        throw makeStringExceptionV(-1, "Invalid duration format: negative values not allowed in '%s'", in);
+
+    char *tail = nullptr;
+    offset_t result = strtoull(start, &tail, 10);
+
+    // Catch cases where no digits were parsed at all (e.g., input was just "ms")
+    if (start == tail)
+        throw makeStringExceptionV(-1, "Invalid duration format: no numeric value found in '%s'", in);
+
+    offset_t scale = 1;
+    if (*tail)
+    {
+        if (strieq(tail, "ns"))
+            scale = SCALE_NS;
+        else if (strieq(tail, "us"))
+            scale = SCALE_US;
+        else if (strieq(tail, "ms"))
+            scale = SCALE_MS;
+        else if (strieq(tail, "s"))
+            scale = SCALE_S;
+        else if (strieq(tail, "m"))
+            scale = SCALE_M;
+        else if (strieq(tail, "h"))
+            scale = SCALE_H;
+        else if (strieq(tail, "d"))
+            scale = SCALE_D;
+        else
+            throw makeStringExceptionV(-1, "Invalid duration suffix '%s'", tail);
+    }
+    if (result > ((offset_t)-1) / scale)
+        throw makeStringExceptionV(-1, "Duration overflow for input '%s'", in);
+    return result * scale;
+}
+
 extern jlib_decl offset_t friendlyStringToSize(const char *in)
 {
     char *tail;
@@ -3048,7 +3269,7 @@ extern jlib_decl offset_t friendlyStringToSize(const char *in)
             case 'P': scale = 1000000000000000; break;
             case 'E': scale = 1000000000000000000; break;
             default:
-                throw makeStringExceptionV(0, "Invalid size suffix %s", tail);
+                throw makeStringExceptionV(JLIBERR_UtilInvalidSizeSuffixS, "Invalid size suffix %s", tail);
             }
         }
         else if (streq(tail+1, "i"))
@@ -3062,13 +3283,42 @@ extern jlib_decl offset_t friendlyStringToSize(const char *in)
             case 'P': scale = 1llu<<50; break;
             case 'E': scale = 1llu<<60; break;
             default:
-                throw makeStringExceptionV(0, "Invalid size suffix %s", tail);
+                throw makeStringExceptionV(JLIBERR_UtilInvalidSizeSuffixS_1, "Invalid size suffix %s", tail);
             }
         }
         else
-            throw makeStringExceptionV(0, "Invalid size suffix %s", tail);
+            throw makeStringExceptionV(JLIBERR_UtilInvalidSizeSuffixS_1, "Invalid size suffix %s", tail);
     }
     return result * scale;
+}
+
+extern jlib_decl double friendlyCPUToDecimal(const char *in)
+{
+    if (isEmptyString(in))
+        return 0.0;
+    size_t pos;
+    double num = std::stod(in, &pos);
+    if (num)
+    {
+        if ('\0' == in[pos])
+            return num;
+        else if ('m' == in[pos])
+        {
+            // invalid if fraction, check if same as truncated value
+            unsigned __int64 numI = (unsigned __int64)num;
+            if (num == (double)numI)
+                return num/1000.0;
+        }
+    }
+    throw makeStringExceptionV(JLIBERR_UtilInvalidCpuStringS, "Invalid cpu string: '%s'", in);
+}
+
+extern jlib_decl double getResourcedCpus(const char *resourceName)
+{
+    Owned<IPropertyTree> resourceTree = getComponentConfigSP()->getPropTree(resourceName);
+    if (nullptr == resourceTree)
+        return 0.0;
+    return friendlyCPUToDecimal(resourceTree->queryProp("@cpu"));
 }
 
 void jlib_decl atomicWriteFile(const char *fileName, const char *output)
@@ -3082,21 +3332,23 @@ void jlib_decl atomicWriteFile(const char *fileName, const char *output)
     {
         OwnedIFileIO ifileio = newFile->open(IFOcreate);
         if (!ifileio)
-            throw MakeStringException(0, "atomicWriteFile: could not create output file %s", newFileName.str());
+            throw MakeStringException(JLIBERR_UtilAtomicwritefileCouldNotCreateOutputFileS, "atomicWriteFile: could not create output file %s", newFileName.str());
         ifileio->write(0, strlen(output), output);
+        ifileio->close();
     }
 #else
     VStringBuffer newFileName("%s.XXXXXX", fileName);
     int fh = mkstemp(const_cast<char *>(newFileName.str()));
     if (fh==-1)
-        throw MakeStringException(0, "atomicWriteFile: could not create output file for %s", fileName);
+        throw MakeStringException(JLIBERR_UtilAtomicwritefileCouldNotCreateOutputFileFor, "atomicWriteFile: could not create output file for %s", fileName);
     Owned<IFile> newFile = createIFile(newFileName);
     Owned<IFile> file = createIFile(fileName);
     {
-        OwnedIFileIO ifileio = createIFileIO(fh, IFOwrite);
+        OwnedIFileIO ifileio = createIFileIO(file, fh, IFOwrite);
         if (!ifileio)
-            throw MakeStringException(0, "atomicWriteFile: could not create output file %s", newFileName.str());
+            throw MakeStringException(JLIBERR_UtilAtomicwritefileCouldNotCreateOutputFileS_1, "atomicWriteFile: could not create output file %s", newFileName.str());
         ifileio->write(0, strlen(output), output);
+        ifileio->close();
     }
 #endif
     if (file->exists())
@@ -3106,6 +3358,65 @@ void jlib_decl atomicWriteFile(const char *fileName, const char *output)
 
 //---------------------------------------------------------------------------------------------------------------------
 
+const char * generatePassword(StringBuffer &pwd, int pwdLen)
+{
+    if (pwdLen < 8)
+        throw makeStringException(JLIBERR_UtilGeneratedPasswordsMustBeAtLeast8, "Generated Passwords must be at least 8 characters in length");
+
+    #define NUM_GROUPS 4    //4 character groups follow
+    const char alphaUC[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const char alphaLC[] = "abcdefghijklmnopqrstuvwxyz";
+    const char numeric[] = "0123456789";
+    const char symbol[] = "~@#%^*_-+{[}]:,.?";
+
+    std::random_device seedGen;//uniformly-distributed integer random number generator that produces non-deterministic random numbers
+    std::mt19937 mtEngine(seedGen());//generates 32-bit pseudo-random numbers using Mersenne twister algorithm
+
+    //Ensures each character group used at least once
+    pwd.append(alphaUC[mtEngine() % (sizeof(alphaUC) - 1)]);
+    pwd.append(alphaLC[mtEngine() % (sizeof(alphaLC) - 1)]);
+    pwd.append(numeric[mtEngine() % (sizeof(numeric) - 1)]);
+    pwd.append(symbol[mtEngine() % (sizeof(symbol) - 1)]);
+
+    for (int i = 4; i < pwdLen; i++)
+    {
+        switch(mtEngine() % NUM_GROUPS)//select a random character group
+        {
+        case 0:
+            pwd.append(alphaUC[mtEngine() % (sizeof(alphaUC) - 1)]);
+            break;
+        case 1:
+            pwd.append(alphaLC[mtEngine() % (sizeof(alphaLC) - 1)]);
+            break;
+        case 2:
+            pwd.append(numeric[mtEngine() % (sizeof(numeric) - 1)]);
+            break;
+        case 3:
+            pwd.append(symbol[mtEngine() % (sizeof(symbol) - 1)]);
+            break;
+        }
+    }
+
+    return pwd.str();
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+bool checkCreateDaemon(unsigned argc, const char * * argv)
+{
+#ifndef _CONTAINERIZED
+    for (unsigned i=0;i<(unsigned)argc;i++) {
+        if (streq(argv[i],"--daemon") || streq(argv[i],"-d")) {
+            if (daemon(1,0) || write_pidfile(argv[++i])) {
+                perror("Failed to daemonize");
+                return false;
+            }
+            break;
+        }
+    }
+#endif
+    return true;
+}
 
 //#define TESTURL
 #ifdef TESTURL
@@ -3132,3 +3443,115 @@ static int doTests()
 
 int gDummy = doTests();
 #endif
+
+
+void addSecretToJfrog(StringBuffer &configPath, IPropertyTree &item)
+{
+    StringBuffer password;
+    const char *user = item.queryProp("@jfrogUser");
+    getSecretValue(password, "jfrog", user, "password", true);
+    password.stripChar('\n').stripChar(' ').str(); // Strip newlines/whitespaces in case the secret has been entered by hand.
+
+    StringBuffer fileContents;
+    const char *server = item.queryProp("@jfrogServer");
+    fileContents.setf("{\n\
+    \"servers\": [\n\
+        {\n\
+        \"url\": \"%s/\",\n\
+        \"artifactoryUrl\": \"%s/artifactory/\",\n\
+        \"distributionUrl\": \"%s/distribution/\",\n\
+        \"xrayUrl\": \"%s/xray/\",\n\
+        \"missionControlUrl\": \"%s/mc/\",\n\
+        \"pipelinesUrl\": \"%s/pipelines/\",\n\
+        \"user\": \"%s\",\n\
+        \"password\": \"%s\",\n\
+        \"serverId\": \"HPCC\",\n\
+        \"isDefault\": true\n\
+        }\n\
+    ],\n\
+    \"version\": \"6\"\n}\n", server, server, server, server, server, server, user, password.str());
+
+    getHomeDir(configPath);
+    atomicWriteFile(configPath.append(PATHSEPCHAR).append(".jfrog").append(PATHSEPCHAR).append("jfrog-cli.conf.v6"), fileContents);
+}
+
+extern jlib_decl void getResourceFromJfrog(StringBuffer &localPath, IPropertyTree &item)
+{
+    StringBuffer configPath;
+    addSecretToJfrog(configPath, item);
+
+    StringBuffer filename(localPath);
+    getFileNameOnly(filename, false);
+    recursiveCreateDirectoryForFile(localPath);
+
+    StringBuffer jfrogCmd("jf rt dl --flat --quiet ");
+    jfrogCmd.appendf("\"%s%s\" %s", item.queryProp("@repositoryPath"), filename.str(), localPath.str());
+
+    StringBuffer errOut;
+    StringBuffer jfrogOut;
+    EnvironmentVector env{std::pair<std::string, std::string>("CI", "true")};
+    int result = runExternalCommand("jfrog", jfrogOut, errOut, jfrogCmd.str(), nullptr, nullptr, &env);
+
+    OwnedIFile configFile = createIFile(configPath);
+    configFile->remove(); // Remove file with Jfrog credentials after call is made
+
+    if (result != 0)
+        throw makeStringExceptionV(JLIBERR_UtilErrorLoadingResourceFromJfrogSNS, "Error loading resource from jfrog: %s\n%s", errOut.str(), jfrogOut.str());
+
+    item.setProp("@resourcePath", localPath);
+
+    const char *md5 = item.queryProp("@md5");
+    if (md5)
+    {
+        StringBuffer calculated;
+        md5_filesum(localPath, calculated);
+        if (!strieq(calculated, md5))
+            throw makeStringExceptionV(JLIBERR_UtilMd5MismatchOnFileSInManifest, "MD5 mismatch on file %s in manifest", filename.str());
+    }
+}
+
+void hold(const char *msg)
+{
+    WARNLOG("Holding: %s", msg);
+    bool held = true;
+    while (held)
+    {
+        MilliSleep(5000);
+    }
+    WARNLOG("Released: %s", msg);
+}
+
+
+// Reads digits from a null-terminated string
+// Returns the number if possible, zero if the string is not a number
+unsigned readDigits(const char *name)
+{
+    unsigned num = 0;
+    while (*name)
+    {
+        if (isdigit(*name))
+            num = num * 10 + (*name - '0');
+        else
+            return 0;
+        name++;
+    }
+    return num;
+}
+
+
+unsigned readDigits(char const * & str, unsigned numDigits, bool throwOnFailure)
+{
+    unsigned ret = 0;
+    while (numDigits--)
+    {
+        char c = *str++;
+        if (!isdigit(c))
+        {
+            if (throwOnFailure)
+                throw makeStringExceptionV(JLIBERR_UtilInvalidFormatReaddigitsS, "Invalid format (readDigits): %s", str);
+            return 0;
+        }
+        ret  = ret * 10 + (c - '0');
+    }
+    return ret;
+}

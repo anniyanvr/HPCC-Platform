@@ -19,10 +19,11 @@
 
 import os
 import logging
+import shutil
 
 from ...common.error import Error
 from ...common.shell import Shell
-from ...util.util import PrintException
+from ...util.util import printException
 
 logger = logging.getLogger('RegressionTestEngine')
 
@@ -57,6 +58,11 @@ class ECLCC(Shell):
                 os.mkdir(dirname)
             if os.path.isfile(filename):
                 os.unlink(filename)
+            if ecl.isEclXml:
+                logger.debug("%3d. makeArchive - copying .eclxml file directly (no compilation needed)", ecl.getTaskId())
+                shutil.copy2(ecl.getEcl(), filename)
+                retVal = True
+                return retVal
             result, stderr = self.getArchive(ecl)
 
             if result.startswith( 'Error('):
@@ -92,7 +98,7 @@ class ECLCC(Shell):
                 FILE.close()
                 retVal = True
         except Exception as e:
-            PrintException(repr(e) + "ECLCC.makeArchive()")
+            printException(repr(e) + "ECLCC.makeArchive()")
             
         return retVal
 

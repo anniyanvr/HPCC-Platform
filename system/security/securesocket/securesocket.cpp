@@ -23,12 +23,14 @@
 //jlib
 #include "jliball.hpp"
 #include "string.h"
+#include <atomic>
+#include <limits>
+#include <mutex>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <signal.h>  
 #else
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -38,8 +40,10 @@
 #include <stddef.h>
 #include <errno.h>
 #endif
+#include <signal.h>
 
 //openssl
+#include <opensslcommon.hpp>
 #include <openssl/rsa.h>
 #include <openssl/crypto.h>
 #ifndef _WIN32
@@ -57,20 +61,21 @@
 #include <openssl/err.h>
 #include <openssl/conf.h>
 #include <openssl/x509v3.h>
+#include <openssl/bn.h>
+#include <openssl/x509.h>
 
 #include "jsmartsock.ipp"
+#include "cryptocommon.hpp"
 #include "securesocket.hpp"
+#include "jiouring.hpp"
 
-Owned<ISecureSocketContext> server_securesocket_context;
-bool accept_selfsigned = false;
+using namespace cryptohelper;
+
+static JSocketStatistics *SSTATS;
 
 #define CHK_NULL(x) if((x)==NULL) exit(1)
 #define CHK_ERR(err, s) if((err)==-1){perror(s);exit(1);}
 #define CHK_SSL(err) if((err) ==-1){ERR_print_errors_fp(stderr); exit(2);}
-
-#define THROWSECURESOCKETEXCEPTION(err) \
-    throw MakeStringException(-1, "SecureSocket Exception Raised in: %s, line %d - %s", sanitizeSourceFile(__FILE__), __LINE__, err);
-
 
 static int pem_passwd_cb(char* buf, int size, int rwflag, void* password)
 {
@@ -90,9 +95,51 @@ static void readBio(BIO* bio, StringBuffer& buf)
     }
 }
 
+
 //Use a namespace to prevent clashes with a class of the same name in jhtree
 namespace securesocket
 {
+
+
+// Helper function to check if TLS io_uring is enabled via configuration
+// Cached on first call for performance (config is read-only after startup)
+// Unit tests can reset cache to force re-read
+static std::atomic<bool> tlsIOUringCached{false};
+static std::atomic<bool> tlsIOUringCacheSet{false};
+
+bool isTLSIOUringEnabled()
+{
+    if (!tlsIOUringCacheSet.load(std::memory_order_acquire))
+    {
+        bool enabled = false;
+        try
+        {
+            Owned<IPropertyTree> config = getComponentConfigSP();
+            if (config)
+                enabled = config->getPropBool("expert/@useTLSIOUring", false);
+        }
+        catch (...)
+        {
+            enabled = false;
+        }
+        tlsIOUringCached.store(enabled, std::memory_order_relaxed);
+        tlsIOUringCacheSet.store(true, std::memory_order_release);
+    }
+    return tlsIOUringCached.load(std::memory_order_relaxed);
+}
+
+// Function to reset the cache for unit testing
+void resetTLSIOUringEnabledCache()
+{
+    tlsIOUringCached.store(false, std::memory_order_relaxed);
+    tlsIOUringCacheSet.store(false, std::memory_order_release);
+}
+
+static void completeAsyncCallback(IAsyncCallback & callback, int result)
+{
+    if (callback.onAsyncComplete(result))
+        callback.afterCompletion();
+}
 
 class CStringSet : public CInterface
 {
@@ -126,50 +173,471 @@ public:
     }
 };
 
+// TLS handshake state machine states
+enum class TLSAcceptState
+{
+    Initial,        // Not started
+    Accepting,      // SSL_accept() in progress
+    WantRead,       // Need to read more data
+    WantWrite,      // Need to write data
+    FinalFlush,     // Sending final handshake data before completing
+    Completed,      // Handshake complete
+    Error           // Handshake failed
+};
+
+// Forward declaration
+class CSecureSocket;
+
+// Base class for async TLS handlers - captures common lifecycle and structure
+//
+// All TLS async handlers (accept, connect, read, write) share:
+// - Self-ownership lifecycle pattern (Link/Release in start/complete)
+// - Common members (ssl, processor, socket, finalCallback, BIOs)
+// - Similar async completion handling
+//
+// Derived classes must implement:
+// - tryOperation() - Attempt the specific SSL operation
+// - Specific state machine logic
+class CAsyncTLSHandlerBase : public CSimpleInterfaceOf<IAsyncCallback>
+{
+protected:
+    SSL * ssl;
+    Linked<IAsyncProcessor> processor;
+    Linked<ISocket> socket;
+    IAsyncCallback & finalCallback;
+    BIO * internal_bio = nullptr;
+    BIO * network_bio = nullptr;
+
+public:
+    CAsyncTLSHandlerBase(SSL * _ssl, IAsyncProcessor * _processor, ISocket * _socket, IAsyncCallback & _finalCallback)
+        : ssl(_ssl), processor(_processor), socket(_socket), finalCallback(_finalCallback)
+    {
+    }
+
+    virtual ~CAsyncTLSHandlerBase()
+    {
+        // Do NOT free BIOs - they're owned by SSL context and needed for subsequent I/O
+    }
+
+protected:
+    // Common start pattern: try immediately and Release() on synchronous completion.
+    // CSimpleInterfaceOf starts with refcount=1, so no extra Link() is needed.
+    void startWithInitialTry()
+    {
+        if (safeTryOperation())
+            Release();
+    }
+
+    bool safeTryOperation()
+    {
+        try
+        {
+            return tryOperation();
+        }
+        catch (IException *e)
+        {
+            e->Release();
+            return handleError(-1);
+        }
+        catch (...)
+        {
+            return handleError(-1);
+        }
+    }
+
+    // Derived classes implement the specific operation (accept, connect, read, write)
+    // Returns true if complete (success or error), false if async operation pending
+    virtual bool tryOperation() = 0;
+
+    // Common error handling pattern
+    virtual bool handleError(int error)
+    {
+        completeAsyncCallback(finalCallback, error);
+        return true;  // Always complete on error
+    }
+    
+    virtual void afterCompletion() override
+    {
+        Release();
+    }
+};
+
+// Async TLS Accept Handler - manages the async TLS accept state machine
+// 
+// Lifecycle: Uses self-ownership pattern. Created with refcount=1 by CSimpleInterfaceOf.
+// Survives until completion (success or error)
+// when processor calls Release() after onAsyncComplete()/try methods return true.
+// The try methods return bool: true if complete (success/error), false if async op pending.
+class CAsyncTLSAcceptHandler : public CAsyncTLSHandlerBase
+{
+private:
+    Linked<CSecureSocket> secureSocket;
+    TLSAcceptState state = TLSAcceptState::Initial;
+    MemoryAttr readBuffer;
+    MemoryAttr writeBuffer;
+    size32_t pendingWriteSize = 0;
+    size32_t pendingWriteOffset = 0;
+    int logLevel;
+    
+public:
+    CAsyncTLSAcceptHandler(CSecureSocket * _secureSocket, SSL * _ssl, IAsyncProcessor * _processor, 
+                           ISocket * _socket, IAsyncCallback & _finalCallback, int _logLevel);
+    
+    void start();
+    virtual bool onAsyncComplete(int result) override;
+    
+protected:
+    virtual bool tryOperation() override { return tryAccept(); }
+    
+private:
+    bool tryAccept();  // Returns true if complete (success or error), false if async operation pending
+    bool continuePendingWrite(int result);
+    virtual bool handleError(int error) override;  // Returns true (always complete)
+};
+
+// TLS read state machine states
+enum class TLSReadState
+{
+    Initial,        // Not started
+    Reading,        // SSL_read() in progress
+    WantRead,       // Need more encrypted data from socket
+    WantWrite,      // Need to send data (renegotiation)
+    Completed,      // Decrypted data available
+    Error           // Read failed
+};
+
+// TLS write state machine states
+enum class TLSWriteState
+{
+    Initial,        // Not started
+    Writing,        // SSL_write() in progress
+    WantRead,       // Need to read (renegotiation)
+    WantWrite,      // Need to flush encrypted data
+    Flushing,       // Writing encrypted data to socket
+    Completed,      // Write complete
+    Error           // Write failed
+};
+
+// Async TLS Write Handler - manages the async TLS write state machine
+//
+// Lifecycle: Uses self-ownership pattern. Created with refcount=1 by CSimpleInterfaceOf.
+// Survives until completion (success or error)
+// when start()/onAsyncComplete() calls Release() after try methods return true.
+// The try methods return bool: true if complete (success/error), false if async op pending.
+//
+// IMPORTANT: This handler does NOT create its own BIO pair. It uses the existing BIOs
+// that are already configured on the SSL context. Creating a new BIO pair would break
+// the SSL connection for reading.
+//
+// Write Flow: SSL_write() uses memory BIOs already set up in the SSL context.
+// We use BIO_pending() to check for encrypted data and BIO_read() to extract it.
+class CAsyncTLSWriteHandler : public CAsyncTLSHandlerBase
+{
+public:
+    CAsyncTLSWriteHandler(CSecureSocket * _secureSocket, SSL * _ssl, IAsyncProcessor * _processor, ISocket * _socket,
+                         const void * _buf, size32_t _size, IAsyncCallback & _finalCallback);
+    
+    void start()
+    {
+        state = TLSWriteState::Writing;
+        if (safeTryOperation())
+            Release();
+    }
+
+    virtual bool onAsyncComplete(int result) override
+    {
+        
+        if (result < 0)
+        {
+            return handleError(result);
+        }
+        if (result == 0)
+            return handleError(-1);
+        
+        bool complete = false;
+        switch (state)
+        {
+        case TLSWriteState::WantRead:
+            // Renegotiation data arrived, feed to BIO and retry write
+            if (BIO_write(network_bio, encryptedBuffer.bytes(), result) != result)
+                return handleError(-1);
+            complete = safeTryOperation();
+            break;
+            
+        case TLSWriteState::Flushing:
+            // Handle partial writes by replaying the remainder before resuming SSL_write().
+            if ((size32_t)result > (pendingEncryptedWriteSize - pendingEncryptedWriteOffset))
+                return handleError(-1);
+            pendingEncryptedWriteOffset += result;
+            if (pendingEncryptedWriteOffset < pendingEncryptedWriteSize)
+            {
+                processor->enqueueSocketWrite(socket, encryptedBuffer.bytes() + pendingEncryptedWriteOffset, pendingEncryptedWriteSize - pendingEncryptedWriteOffset, *this);
+                return false;
+            }
+            pendingEncryptedWriteOffset = 0;
+            pendingEncryptedWriteSize = 0;
+            state = TLSWriteState::Writing;
+            complete = safeTryOperation();
+            break;
+            
+        default:
+            complete = handleError(-1);
+        }
+        
+        return complete;
+    }
+
+protected:
+    virtual bool tryOperation() override { return tryWrite(); }
+
+private:
+    // Helper to flush any pending encrypted data from BIO to socket
+    // Returns true if data was queued for async write, false if nothing to flush
+    bool flushEncryptedDataToSocket()
+    {
+        int pending = BIO_pending(network_bio);
+        if (pending > 0)
+        {
+            if (pending > (int)encryptedBuffer.length())
+                encryptedBuffer.allocate(pending);
+                
+            int bytesRead = BIO_read(network_bio, encryptedBuffer.bytes(), pending);
+            if (bytesRead > 0)
+            {
+                pendingEncryptedWriteOffset = 0;
+                pendingEncryptedWriteSize = bytesRead;
+                state = TLSWriteState::Flushing;
+                processor->enqueueSocketWrite(socket, encryptedBuffer.bytes(), bytesRead, *this);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool tryWrite()
+    {
+        
+        // Check if we've already written all plaintext data
+        if (totalWritten >= plainSize)
+        {
+            // Check if there's any pending encrypted data to flush
+            if (flushEncryptedDataToSocket())
+                return false;
+            
+            // All done
+            state = TLSWriteState::Completed;
+            completeAsyncCallback(finalCallback, plainSize);
+            return true;
+        }
+        
+        // Try to write remaining plaintext data through SSL
+        // Limit each write to 16KB to avoid exceeding BIO buffer capacity
+        size32_t remaining = plainSize - totalWritten;
+        size32_t chunkSize = std::min(remaining, (size32_t)16384);
+        int ret = SSL_write(ssl, plainBuf + totalWritten, chunkSize);
+        
+        if (ret > 0)
+        {
+            // SSL_write succeeded
+            totalWritten += ret;
+            
+            // Get encrypted data from BIO and send to socket
+            if (flushEncryptedDataToSocket())
+                return false;
+            
+            // No encrypted data yet, retry SSL_write
+            return tryWrite();
+        }
+        
+        // SSL_write didn't complete, check what it needs
+        int ssl_error = SSL_get_error(ssl, ret);
+        
+        switch (ssl_error)
+        {
+        case SSL_ERROR_WANT_READ:
+            // Renegotiation - need to read from socket
+            state = TLSWriteState::WantRead;
+            processor->enqueueSocketRead(socket, encryptedBuffer.bytes(), encryptedBuffer.length(), *this);
+            return false;
+            
+        case SSL_ERROR_WANT_WRITE:
+        {
+            // Need to flush data, read from BIO and send
+            if (flushEncryptedDataToSocket())
+                return false;
+            // If no data to flush, this is an error
+            return handleError(-1);
+        }
+            
+        case SSL_ERROR_ZERO_RETURN:
+            return handleError(-1);
+            
+        default:
+            return handleError(ssl_error);
+        }
+    }
+    
+    virtual bool handleError(int error) override
+    {
+        state = TLSWriteState::Error;
+        int normalizedError = error;
+        if (normalizedError > 0)
+            normalizedError = -normalizedError;
+        else if (normalizedError == 0)
+            normalizedError = -1;
+        completeAsyncCallback(finalCallback, normalizedError);
+        return true;
+    }
+
+    TLSWriteState state = TLSWriteState::Initial;
+    const byte * plainBuf = nullptr;
+    size32_t plainSize = 0;
+    size32_t totalWritten = 0;
+    MemoryAttr encryptedBuffer;
+    size32_t pendingEncryptedWriteSize = 0;
+    size32_t pendingEncryptedWriteOffset = 0;
+};
+
+// Async TLS Connect Handler - manages the async TLS client connect state machine
+//
+// Lifecycle: Uses self-ownership pattern. Created with refcount=1 by CSimpleInterfaceOf.
+// Survives until completion (success or error)
+// when start()/onAsyncComplete() calls Release() after try methods return true.
+// The try methods return bool: true if complete (success/error), false if async op pending.
+class CAsyncTLSConnectHandler : public CAsyncTLSHandlerBase
+{
+private:
+    Linked<CSecureSocket> secureSocket;
+    TLSAcceptState state = TLSAcceptState::Initial; // Reuse same enum for connect
+    MemoryAttr readBuffer;
+    MemoryAttr writeBuffer;
+    size32_t pendingWriteSize = 0;
+    size32_t pendingWriteOffset = 0;
+    int logLevel;
+    
+public:
+    CAsyncTLSConnectHandler(CSecureSocket * _secureSocket, SSL * _ssl, IAsyncProcessor * _processor,
+                            ISocket * _socket, IAsyncCallback & _finalCallback, int _logLevel);
+    
+    void start();
+    virtual bool onAsyncComplete(int result) override;
+
+protected:
+    virtual bool tryOperation() override { return tryConnect(); }
+    
+private:
+    bool tryConnect();  // Returns true if complete (success or error), false if async operation pending
+    bool continuePendingWrite(int result);
+    virtual bool handleError(int error) override;  // Returns true (always complete)
+};
+
+// Async TLS Read Handler - manages async TLS read with decryption
+//
+// Lifecycle: Uses self-ownership pattern. Created with refcount=1 by CSimpleInterfaceOf.
+// Survives until completion (success or error)
+// when start()/onAsyncComplete() calls Release() after try methods return true.
+// The try methods return bool: true if complete (success/error), false if async op pending.
+class CAsyncTLSReadHandler : public CAsyncTLSHandlerBase
+{
+private:
+    TLSReadState state = TLSReadState::Initial;
+    MemoryAttr encryptedBuffer;  // Holds encrypted data read from socket
+    MemoryAttr writeBuffer;      // Buffer for data that needs to be written (e.g., renegotiation)
+    size32_t pendingWriteSize = 0;
+    size32_t pendingWriteOffset = 0;
+    void * appBuffer;            // Application buffer to fill with decrypted data
+    size32_t minSize;
+    size32_t maxSize;
+    size32_t totalRead = 0;      // Total decrypted bytes read so far
+    
+public:
+    CAsyncTLSReadHandler(CSecureSocket * _secureSocket, SSL * _ssl, IAsyncProcessor * _processor,
+                         ISocket * _socket, void * _buf, size32_t _minSize, size32_t _maxSize,
+                         IAsyncCallback & _finalCallback);
+    
+    void start();
+    virtual bool onAsyncComplete(int result) override;
+
+protected:
+    virtual bool tryOperation() override { return tryRead(); }
+    
+private:
+    bool tryRead();  // Returns true if complete (success or error), false if async operation pending
+    bool continuePendingWrite(int result);
+    virtual bool handleError(int error) override;  // Returns true (always complete)
+};
+
 class CSecureSocket : implements ISecureSocket, public CInterface
 {
 private:
     SSL*        m_ssl;
+    BIO*        network_bio = nullptr;  // Network BIO for async I/O (other end of BIO pair)
     Owned<ISocket> m_socket;
+    bool        nonBlocking;
     bool        m_verify;
     bool        m_address_match;
-    CStringSet* m_peers;
+    Linked<CStringSet> m_peers;
     int         m_loglevel;
     bool        m_isSecure;
+    StringBuffer m_fqdn;
+    size32_t    nextblocksize = 0;
+    unsigned    blockflags = BF_ASYNC_TRANSFER;
+    unsigned    blocktimeoutms = WAIT_FOREVER;
+#ifdef USERECVSEM
+    static Semaphore receiveblocksem;
+    bool             receiveblocksemowned; // owned by this socket
+#endif
+    SocketStats     stats;
 private:
     StringBuffer& get_cn(X509* cert, StringBuffer& cn);
+    void handleError(int ssl_err, bool writing, bool wait, unsigned timeoutMs, const char *opStr, unsigned long errnum=0);
+    bool flushPendingEncryptedOutput(CCycleTimer &timer, unsigned timeoutMs, const char *opStr);
+    size32_t readAndQueueEncryptedSocketInput(CCycleTimer &timer, unsigned timeoutMs, const char *opStr);
+    
+    // Make verify_cert and network_bio accessible to async handlers
+    friend class CAsyncTLSAcceptHandler;
+    friend class CAsyncTLSConnectHandler;
+    friend class CAsyncTLSReadHandler;
+    friend class CAsyncTLSWriteHandler;
     bool verify_cert(X509* cert);
 
 public:
     IMPLEMENT_IINTERFACE;
 
-    CSecureSocket(ISocket* sock, SSL_CTX* ctx, bool verify = false, bool addres_match = false, CStringSet* m_peers = NULL, int loglevel=SSLogNormal);
-    CSecureSocket(int sockfd, SSL_CTX* ctx, bool verify = false, bool addres_match = false, CStringSet* m_peers = NULL, int loglevel=SSLogNormal);
+    CSecureSocket(ISocket* sock, SSL* ssl, bool verify = false, bool address_match = false, CStringSet* m_peers = NULL, int loglevel=SSLogNormal, const char *fqdn = nullptr);
     ~CSecureSocket();
 
     virtual int secure_accept(int logLevel);
     virtual int secure_connect(int logLevel);
+    virtual void startAsyncAccept(IAsyncProcessor * processor, IAsyncCallback & callback, int logLevel);
+    virtual void startAsyncConnect(IAsyncProcessor * processor, IAsyncCallback & callback, int logLevel);
+    virtual void startAsyncRead(IAsyncProcessor * processor, void * buf, size32_t minSize, size32_t maxSize, IAsyncCallback & callback);
+    virtual void startAsyncWrite(IAsyncProcessor * processor, const void * buf, size32_t size, IAsyncCallback & callback);
 
     virtual int logPollError(unsigned revents, const char *rwstr);
     virtual int wait_read(unsigned timeoutms);
-    virtual void read(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read,unsigned timeoutsecs);
-    virtual void readtms(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timeoutms);
+    virtual void read(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read,unsigned timeoutsecs, bool suppresGCIfMinSize=true);
+    virtual void readtms(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timeoutms, bool suppresGCIfMinSize=true);
     virtual size32_t write(void const* buf, size32_t size);
-    virtual size32_t writetms(void const* buf, size32_t size, unsigned timeoutms=WAIT_FOREVER);
+    virtual size32_t writetms(void const* buf, size32_t minSize, size32_t size, unsigned timeoutms=WAIT_FOREVER);
 
-    void readTimeout(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timeout, bool useSeconds);
+    virtual StringBuffer& get_ssl_version(StringBuffer& ver)
+    {
+        ver.set(SSL_get_version(m_ssl));
+        return ver;
+    }
 
     //The following are the functions from ISocket that haven't been implemented.
 
 
-    virtual void   read(void* buf, size32_t size)
+    virtual void read(void* buf, size32_t size)
     {
         size32_t size_read;
         // MCK - this was:
         // readTimeout(buf, size, size, size_read, 0, false);
         // but that is essentially a non-blocking read() and we want a blocking read() ...
         // read() is always expecting size bytes so min_size should be size
-        readTimeout(buf, size, size, size_read, WAIT_FOREVER, false);
+        readtms(buf, size, size, size_read, WAIT_FOREVER);
     }
 
     virtual size32_t get_max_send_size()
@@ -180,7 +648,7 @@ public:
     //
     // This method is called by server to accept client connection
     //
-    virtual ISocket* accept(bool allowcancel=false, SocketEndpoint *peerEp=nullptr) // not needed for UDP
+    virtual ISocket* accept(bool allowcancel=false) // not needed for UDP
     {
         throw MakeStringException(-1, "CSecureSocket::accept: not implemented");
     }
@@ -190,7 +658,7 @@ public:
     // 
     virtual int wait_write(unsigned timeout)
     {
-        throw MakeStringException(-1, "CSecureSocket::wait_write: not implemented");
+        return m_socket->wait_write(timeout);
     }
 
     //
@@ -199,16 +667,21 @@ public:
     //
     virtual bool set_nonblock(bool on) // returns old state
     {
-        throw MakeStringException(-1, "CSecureSocket::set_nonblock: not implemented");
+        if (on == nonBlocking)
+            return nonBlocking;
+        if (on == m_socket->set_nonblock(on)) // this call should return opposite state, if it doesn't it failed
+            return nonBlocking;
+
+        nonBlocking = on;
+        return !nonBlocking; // previous state
     }
 
     // enable 'nagling' - small packet coalescing (implies delayed transmission)
     //
     virtual bool set_nagle(bool on) // returns old state
     {
-        throw MakeStringException(-1, "CSecureSocket::set_nagle: not implemented");
+        return m_socket->set_nagle(on);
     }
-
 
     // set 'linger' time - time close will linger so that outstanding unsent data will be transmited
     //
@@ -217,13 +690,17 @@ public:
         m_socket->set_linger(lingersecs);
     }
 
+    virtual void set_quick_ack(bool on)
+    {
+        m_socket->set_quick_ack(on);
+    }
 
     //
     // Cancel accept operation and close socket
     //
     virtual void  cancel_accept() // not needed for UDP
     {
-        throw MakeStringException(-1, "CSecureSocket::cancel_accept: not implemented");
+        m_socket->cancel_accept();
     }
 
     //
@@ -232,6 +709,12 @@ public:
     virtual void  shutdown(unsigned mode) // not needed for UDP
     {
         m_socket->shutdown(mode);
+    }
+
+    // Same as shutdown, but never throws an exception (to call from closedown destructors)
+    virtual void  shutdownNoThrow(unsigned mode)
+    {
+        m_socket->shutdownNoThrow(mode);
     }
 
     // Get local name of accepted (or connected) socket and returns port
@@ -264,6 +747,11 @@ public:
         return m_socket->getEndpoint(ep);
     }
 
+    virtual unsigned __int64 getStatistic(StatisticKind kind) const override
+    {
+        return stats.getStatistic(kind);
+    }
+
     //
     // Close socket
     //
@@ -278,39 +766,25 @@ public:
     }
 
     // Block functions 
+    // TLS TODO: can we move these block* into a base class for both CSocket and CSecureSocket ?
 
-    virtual void  set_block_mode (             // must be called before block operations
-                            unsigned flags,    // BF_* flags (must match receive_block)
-                          size32_t recsize=0,  // record size (required for rec compression)
-                            unsigned timeout=0 // timeout in msecs (0 for no timeout)
-                  ) 
-    {
-        throw MakeStringException(-1, "CSecureSocket::set_block_mode: not implemented");
-    }
-
-
+    virtual void  set_block_mode(                // must be called before block operations
+                            unsigned flags,      // BF_* flags (must match receive_block)
+                            size32_t recsize=0,  // record size (required for rec compression)
+                            unsigned timeout=0   // timeout in msecs (0 for no timeout)
+                  );
 
     virtual bool  send_block( 
-                            const void *blk,   // data to send 
+                            const void *blk,     // data to send
                             size32_t sz          // size to send (0 for eof)
-                  )
-    {
-        throw MakeStringException(-1, "CSecureSocket::send_block: not implemented");
-    }
+                  );
 
-    virtual size32_t receive_block_size ()     // get size of next block (always must call receive_block after) 
-    {
-        throw MakeStringException(-1, "CSecureSocket::receive_block_size: not implemented");
-    }
+    virtual size32_t receive_block_size();       // get size of next block (always must call receive_block after)
 
     virtual size32_t receive_block(
-                            void *blk,         // receive pointer 
+                            void *blk,           // receive pointer
                             size32_t sz          // max size to read (0 for sync eof) 
-                                               // if less than block size truncates block
-                  )
-    {
-        throw MakeStringException(-1, "CSecureSocket::receive_block: not implemented");
-    }
+                     );                          // if less than block size truncates block
 
     virtual void  close()
     {
@@ -337,6 +811,17 @@ public:
         size32_t avr = m_socket->avail_read();
         if (avr > 0)
         {
+            // TLS TODO: MCK - needs to be thought out and refactored
+            // Bytes here may be part of encrypted SSL record.
+            // If SSL_MODE_AUTO_RETRY set (and it is) then bytes
+            // here may also be from auto-renegotiation.
+            // If return 0 here, caller may think socket was closed
+            // If return >0 here, caller may block on next SSL_read()
+            // Only two locations where this value other than !=0 is used:
+            //     CRemoteFileServer->notifySelected() (dafsserver)
+            //     CMPPacketReader->notifySelected() (mpcomm)
+            return 1;
+            /* --------------------------------
             // bytes may be SSL/TLS protocol and not part of msg
             byte c[2];
             // TODO this may block ...
@@ -355,13 +840,24 @@ public:
                 errbuf[511] = '\0';
                 DBGLOG("SSL_peek (avail_read) returns error %d - %s", ret, errbuf);
             }
+            -------------------------------- */
         }
         return 0;
     }
 
-    virtual size32_t write_multiple(unsigned num,const void **buf, size32_t *size)
+    virtual size32_t write_multiple(unsigned num, const void **buf, size32_t *size)
     {
-        throw MakeStringException(-1, "CSecureSocket::write_multiple: not implemented");
+        size32_t res = 0;
+        for (int i=0; i<num; i++)
+        {
+            if (size[i] > 0)
+            {
+                // non-tls version tries to write equal 64k chunks, but unless we set
+                // SSL_MODE_ENABLE_PARTIAL_WRITE, we should write each buf[i] entirely ...
+                res += write(buf[i], size[i]);
+            }
+        }
+        return res;
     }
 
     virtual size32_t get_send_buffer_size() // get OS send buffer
@@ -403,7 +899,7 @@ public:
 
     virtual void set_keep_alive(bool set) // set option SO_KEEPALIVE
     {
-        throw MakeStringException(-1, "CSecureSocket::set_keep_alive: not implemented");
+        m_socket->set_keep_alive(set);
     }
 
     virtual size32_t udp_write_to(const SocketEndpoint &ep, void const* buf, size32_t size)
@@ -422,49 +918,160 @@ public:
     }
 };
 
+// CAsyncTLSAcceptHandler constructor implementation
+CAsyncTLSAcceptHandler::CAsyncTLSAcceptHandler(CSecureSocket * _secureSocket, SSL * _ssl, IAsyncProcessor * _processor,
+                                               ISocket * _socket, IAsyncCallback & _finalCallback, int _logLevel)
+    : CAsyncTLSHandlerBase(_ssl, _processor, _socket, _finalCallback),
+      secureSocket(_secureSocket), logLevel(_logLevel)
+{
+    // Create memory BIO pair for async I/O with io_uring if not already set up
+    // This allows us to manually control socket I/O via io_uring while SSL handles TLS protocol
+    if (!secureSocket->network_bio)
+    {
+        if (BIO_new_bio_pair(&internal_bio, 0, &network_bio, 0) != 1)
+            throw MakeStringException(-1, "CAsyncTLSAcceptHandler: failed to create BIO pair");
+        SSL_set_bio(ssl, internal_bio, internal_bio);
+        secureSocket->network_bio = network_bio;  // Store for later use
+    }
+    else
+    {
+        network_bio = secureSocket->network_bio;
+        internal_bio = SSL_get_rbio(ssl);
+    }
+    
+    // Set socket to non-blocking mode for async I/O operations.
+    // This is a permanent one-way transition - the socket will remain in non-blocking mode
+    // for its lifetime. All subsequent I/O on this socket must use async operations.
+    // Note: Sync fallback (when !processor || !isTLSIOUringEnabled() || !network_bio) 
+    // occurs before this handler is created, so sync operations never execute on a 
+    // non-blocking socket.
+    socket->set_nonblock(true);
+}
+
+// CAsyncTLSConnectHandler constructor implementation
+CAsyncTLSConnectHandler::CAsyncTLSConnectHandler(CSecureSocket * _secureSocket, SSL * _ssl, IAsyncProcessor * _processor,
+                                                 ISocket * _socket, IAsyncCallback & _finalCallback, int _logLevel)
+    : CAsyncTLSHandlerBase(_ssl, _processor, _socket, _finalCallback),
+      secureSocket(_secureSocket), logLevel(_logLevel)
+{
+    // Create memory BIO pair for async I/O with io_uring if not already set up
+    // This allows us to manually control socket I/O via io_uring while SSL handles TLS protocol
+    if (!secureSocket->network_bio)
+    {
+        if (BIO_new_bio_pair(&internal_bio, 0, &network_bio, 0) != 1)
+            throw MakeStringException(-1, "CAsyncTLSConnectHandler: failed to create BIO pair");
+        SSL_set_bio(ssl, internal_bio, internal_bio);
+        secureSocket->network_bio = network_bio;  // Store for later use
+    }
+    else
+    {
+        network_bio = secureSocket->network_bio;
+        internal_bio = SSL_get_rbio(ssl);
+    }
+    
+    // Set socket to non-blocking mode for async I/O operations.
+    // This is a permanent one-way transition - the socket will remain in non-blocking mode
+    // for its lifetime. All subsequent I/O on this socket must use async operations.
+    // Note: Sync fallback (when !processor || !isTLSIOUringEnabled() || !network_bio) 
+    // occurs before this handler is created, so sync operations never execute on a 
+    // non-blocking socket.
+    socket->set_nonblock(true);
+}
+
+// CAsyncTLSReadHandler constructor implementation
+CAsyncTLSReadHandler::CAsyncTLSReadHandler(CSecureSocket * _secureSocket, SSL * _ssl, IAsyncProcessor * _processor,
+                                           ISocket * _socket, void * _buf, size32_t _minSize, size32_t _maxSize,
+                                           IAsyncCallback & _finalCallback)
+    : CAsyncTLSHandlerBase(_ssl, _processor, _socket, _finalCallback),
+      appBuffer(_buf), minSize(_minSize), maxSize(_maxSize)
+{
+    // Use existing BIOs from SSL context (must be set up during async handshake).
+    // PRECONDITION: network_bio must be non-null - verified by startAsyncRead() before
+    // creating this handler. If network_bio is null, code falls back to sync read.
+    internal_bio = SSL_get_rbio(ssl);
+    network_bio = _secureSocket->network_bio;
+    assertex(network_bio != nullptr);  // Should never be null - checked before handler creation
+    
+    // Set socket to non-blocking mode for async I/O operations.
+    // This is a permanent one-way transition - the socket will remain in non-blocking mode
+    // for its lifetime. All subsequent I/O on this socket must use async operations.
+    // Note: Sync fallback (when !processor || !isTLSIOUringEnabled() || !network_bio) 
+    // occurs before this handler is created, so sync operations never execute on a 
+    // non-blocking socket.
+    socket->set_nonblock(true);
+    encryptedBuffer.ensure(16384);  // Pre-allocate buffer for encrypted data
+}
+
+// CAsyncTLSWriteHandler constructor implementation
+CAsyncTLSWriteHandler::CAsyncTLSWriteHandler(CSecureSocket * _secureSocket, SSL * _ssl, IAsyncProcessor * _processor,
+                                             ISocket * _socket, const void * _buf, size32_t _size, IAsyncCallback & _finalCallback)
+    : CAsyncTLSHandlerBase(_ssl, _processor, _socket, _finalCallback),
+      plainBuf((const byte *)_buf), plainSize(_size), totalWritten(0)
+{
+    // Use existing network BIO from CSecureSocket (must be set up during async handshake).
+    // PRECONDITION: network_bio must be non-null - verified by startAsyncWrite() before
+    // creating this handler. If network_bio is null, code falls back to sync write.
+    network_bio = _secureSocket->network_bio;
+    assertex(network_bio != nullptr);  // Should never be null - checked before handler creation
+    
+    // Allocate buffer for encrypted data (max TLS record is 16KB + overhead)
+    encryptedBuffer.allocate(17000);
+}
+
+#ifdef USERECVSEM
+Semaphore CSecureSocket::receiveblocksem({SYNC_LOCATION}, 2);
+#endif
 
 /**************************************************************************
  *  CSecureSocket -- secure socket layer implementation using openssl     *
  **************************************************************************/
-CSecureSocket::CSecureSocket(ISocket* sock, SSL_CTX* ctx, bool verify, bool address_match, CStringSet* peers, int loglevel)
+CSecureSocket::CSecureSocket(ISocket* sock, SSL* ssl, bool verify, bool address_match, CStringSet* peers, int loglevel, const char *fqdn)
 {
+    m_ssl = ssl;
     m_socket.setown(sock);
-    m_ssl = SSL_new(ctx);
+    int sockfd = sock->OShandle();
 
     m_verify = verify;
     m_address_match = address_match;
-    m_peers = peers;;
+    m_peers.setown(peers);
     m_loglevel = loglevel;
     m_isSecure = false;
 
-    if(m_ssl == NULL)
+    nonBlocking = false;
+#if defined(O_NONBLOCK) 
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (-1 != flags)
+        nonBlocking = 0 != (flags & O_NONBLOCK);
+#elif defined(_WIN32)
+    u_long flags;
+    if (ioctlsocket(sockfd, FIONBIO, &flags)==0)
     {
-        throw MakeStringException(-1, "Can't create ssl");
+        if (flags)
+            nonBlocking = true;
     }
-    SSL_set_fd(m_ssl, sock->OShandle());
-}
-
-CSecureSocket::CSecureSocket(int sockfd, SSL_CTX* ctx, bool verify, bool address_match, CStringSet* peers, int loglevel)
-{
-    //m_socket.setown(sock);
-    //m_socket.setown(ISocket::attach(sockfd));
-    m_ssl = SSL_new(ctx);
-
-    m_verify = verify;
-    m_address_match = address_match;
-    m_peers = peers;;
-    m_loglevel = loglevel;
-    m_isSecure = false;
-
-    if(m_ssl == NULL)
+#else
+    int flags;
+    if (ioctl(sock, FIONBIO, &flags)==0)
     {
-        throw MakeStringException(-1, "Can't create ssl");
+        if (flags)
+            nonBlocking = true;
     }
+#endif
+    // there is no MSG_NOSIGNAL or SO_NOSIGPIPE for SSL_write() ...
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
     SSL_set_fd(m_ssl, sockfd);
+
+    if (fqdn)
+        m_fqdn.set(fqdn);
 }
 
 CSecureSocket::~CSecureSocket()
 {
+    if (network_bio)
+        BIO_free(network_bio);
     SSL_free(m_ssl);
 }
 
@@ -553,21 +1160,11 @@ StringBuffer& CSecureSocket::get_cn(X509* cert, StringBuffer& cn)
 
 bool CSecureSocket::verify_cert(X509* cert)
 {
-    DBGLOG ("peer's certificate:\n");
-
     char *s, oneline[1024];
 
     s = X509_NAME_oneline (X509_get_subject_name (cert), oneline, 1024);
-    if(s != NULL)
-    {
-        DBGLOG ("\t subject: %s", oneline);
-    }
 
     s = X509_NAME_oneline (X509_get_issuer_name  (cert), oneline, 1024);
-    if(s != NULL)
-    {
-        DBGLOG ("\t issuer: %s", oneline);
-    }
 
     StringBuffer cn;
     get_cn(cert, cn);
@@ -580,10 +1177,10 @@ bool CSecureSocket::verify_cert(X509* cert)
         SocketEndpoint ep;
         m_socket->getPeerEndpoint(ep);
         StringBuffer iptxt;
-        ep.getIpText(iptxt);
+        ep.getHostText(iptxt);
         SocketEndpoint cnep(cn.str());
         StringBuffer cniptxt;
-        cnep.getIpText(cniptxt);
+        cnep.getHostText(cniptxt);
         DBGLOG("peer ip=%s, certificate ip=%s", iptxt.str(), cniptxt.str());
         if(!(cniptxt.length() > 0 && stricmp(iptxt.str(), cniptxt.str()) == 0))
         {
@@ -593,10 +1190,7 @@ bool CSecureSocket::verify_cert(X509* cert)
     }
     
     if (m_peers->contains("anyone") || m_peers->contains(cn.str()))
-    {
-        DBGLOG("%s among trusted peers", cn.str());
         return true;
-    }
     else
     {
         DBGLOG("%s not among trusted peers, verification failed", cn.str());
@@ -607,75 +1201,800 @@ bool CSecureSocket::verify_cert(X509* cert)
 int CSecureSocket::secure_accept(int logLevel)
 {
     int err;
-    err = SSL_accept(m_ssl);
-    if(err == 0)
+    while (true)
     {
-        int ret = SSL_get_error(m_ssl, err);
-        // if err == 0 && ret == SSL_ERROR_SYSCALL
-        // then client closed connection gracefully before ssl neg
-        // which can happen with port scan / VIP ...
-        // NOTE: ret could also be SSL_ERROR_ZERO_RETURN if client closed
-        // gracefully after ssl neg initiated ...
-        if ( (logLevel >= 5) || (ret != SSL_ERROR_SYSCALL) )
+        err = SSL_accept(m_ssl);
+        if (err > 0)
+        {
+            if (logLevel > SSLogNormal)
+                DBGLOG("SSL accept ok, using %s", SSL_get_cipher(m_ssl));
+
+            if (m_verify)
+            {
+                bool verified = false;
+                // Get client's certificate (note: beware of dynamic allocation) - opt 
+                X509* client_cert = SSL_get_peer_certificate (m_ssl);
+                if (client_cert != NULL) 
+                {
+                    // We could do all sorts of certificate verification stuff here before
+                    // deallocating the certificate.
+                    verified = verify_cert(client_cert);
+                    X509_free (client_cert);
+                }
+
+                if (!verified)
+                    throw MakeStringException(-1, "certificate verification failed");
+            }
+
+            m_isSecure = true;
+            return 0;
+        }
+        else
+        {
+            int ret = SSL_get_error(m_ssl, err);
+            if (err == 0)
+            {
+                // if err == 0 && ret == SSL_ERROR_SYSCALL
+                // then client closed connection gracefully before ssl neg
+                // which can happen with port scan / VIP ...
+                // NOTE: ret could also be SSL_ERROR_ZERO_RETURN if client closed
+                // gracefully after ssl neg initiated ...
+                if ( (logLevel > SSLogNormal) || (ret != SSL_ERROR_SYSCALL) )
+                {
+                    char errbuf[512];
+                    ERR_error_string_n(ERR_get_error(), errbuf, 512);
+                    DBGLOG("SSL_accept returned 0, error - %s", errbuf);
+                }
+                if (ret == SSL_ERROR_SYSCALL)
+                    return PORT_CHECK_SSL_ACCEPT_ERROR;
+                return -1;
+            }
+
+            unsigned long errnum = ERR_get_error();
+            // Since err < 0 we call ERR_get_error() for additional info
+            // if ret == SSL_ERROR_SYSCALL and ERR_get_error() == 0 then
+            // its most likely a port scan / load balancer check so do not log
+            // with SSL 1.1.1e and 3.0 if ret == SSL_ERROR_SSL and ERR_get_error reason is EOF
+            // its also most likely a port scan / load balancer check so do not log
+            int srtn = err;
+            if ( (ret == SSL_ERROR_SYSCALL) && (errnum == 0) )
+                srtn = PORT_CHECK_SSL_ACCEPT_ERROR;
+            // if ctx option SSL_OP_IGNORE_UNEXPECTED_EOF is set then will get SSL_ERROR_ZERO_RETURN ...
+            if ( (ret == SSL_ERROR_ZERO_RETURN) && (errnum == 0) )
+                srtn = PORT_CHECK_SSL_ACCEPT_ERROR;
+            // otherwise will get SSL_ERROR_SSL and unexpected eof ...
+#if defined(SSL_R_UNEXPECTED_EOF_WHILE_READING)
+            if ( (ret == SSL_ERROR_SSL) && (ERR_GET_REASON(errnum) == SSL_R_UNEXPECTED_EOF_WHILE_READING) )
+                srtn = PORT_CHECK_SSL_ACCEPT_ERROR;
+#endif
+            // JCSMORE this should really handle accept_cancel_pending
+            if (PORT_CHECK_SSL_ACCEPT_ERROR != srtn)
+                handleError(ret, false, true, WAIT_FOREVER, "SSL_accept", errnum);
+            else
+            {
+                if ((logLevel <= SSLogNormal) && (srtn == PORT_CHECK_SSL_ACCEPT_ERROR))
+                    return srtn;
+                char errbuf[512];
+                ERR_error_string_n(errnum, errbuf, 512);
+                errbuf[511] = '\0';
+                DBGLOG("SSL_accept returned %d, SSL_get_error=%d, error - %s", err, ret, errbuf);
+                if(strstr(errbuf, "error:1408F455:") != NULL)
+                {
+                    DBGLOG("Unrecoverable SSL library error.");
+                    _exit(0);
+                }
+                return srtn;
+            }
+        }
+    }
+}
+
+// Async TLS accept implementation
+void CSecureSocket::startAsyncAccept(IAsyncProcessor * processor, IAsyncCallback & callback, int logLevel)
+{
+    // Check if TLS io_uring is enabled via configuration
+    if (!processor || !isTLSIOUringEnabled())
+    {
+        // Fallback to synchronous accept
+        try
+        {
+            int result = secure_accept(logLevel);
+            completeAsyncCallback(callback, result);
+        }
+        catch (IException *e)
+        {
+            e->Release();
+            completeAsyncCallback(callback, -1);
+        }
+        return;
+    }
+    
+    try
+    {
+        // Create and start the async accept handler.
+        // Handler starts with refcount=1 and will Release() after completion.
+        CAsyncTLSAcceptHandler *handler = new CAsyncTLSAcceptHandler(this, m_ssl, processor, m_socket, callback, logLevel);
+        handler->start();
+    }
+    catch (IException *e)
+    {
+        e->Release();
+        completeAsyncCallback(callback, -1);
+    }
+    catch (...)
+    {
+        completeAsyncCallback(callback, -1);
+    }
+}
+
+// Async TLS connect implementation
+void CSecureSocket::startAsyncConnect(IAsyncProcessor * processor, IAsyncCallback & callback, int logLevel)
+{
+    // Check if TLS io_uring is enabled via configuration
+    if (!processor || !isTLSIOUringEnabled())
+    {
+        // Fallback to synchronous connect
+        try
+        {
+            int result = secure_connect(logLevel);
+            completeAsyncCallback(callback, result);
+        }
+        catch (IException *e)
+        {
+            e->Release();
+            completeAsyncCallback(callback, -1);
+        }
+        return;
+    }
+    
+    try
+    {
+        // Create and start the async connect handler.
+        // Handler starts with refcount=1 and will Release() after completion.
+        CAsyncTLSConnectHandler *handler = new CAsyncTLSConnectHandler(this, m_ssl, processor, m_socket, callback, logLevel);
+        handler->start();
+    }
+    catch (IException *e)
+    {
+        e->Release();
+        completeAsyncCallback(callback, -1);
+    }
+    catch (...)
+    {
+        completeAsyncCallback(callback, -1);
+    }
+}
+
+// CAsyncTLSAcceptHandler implementation
+void CAsyncTLSAcceptHandler::start()
+{
+    state = TLSAcceptState::Accepting;
+    if (safeTryOperation())
+        Release();
+}
+
+bool CAsyncTLSAcceptHandler::onAsyncComplete(int result)
+{
+    if (result < 0)
+        return handleError(result);
+    
+    // Handle completion of underlying I/O based on current TLS accept state
+    if (state == TLSAcceptState::WantRead)
+    {
+        if (result == 0)
+            return handleError(-1);
+        // Feed received bytes to SSL's network BIO
+        if (BIO_write(network_bio, readBuffer.bytes(), result) != result)
+            return handleError(-1);
+        state = TLSAcceptState::Accepting;
+    }
+    else if (state == TLSAcceptState::WantWrite)
+    {
+        return continuePendingWrite(result);
+    }
+    
+    // Retry SSL_accept now that I/O completed, but only if we're in an accepting state
+    if (state == TLSAcceptState::Accepting)
+        return safeTryOperation();
+    
+    return false;
+}
+
+bool CAsyncTLSAcceptHandler::continuePendingWrite(int result)
+{
+    if (result <= 0)
+        return handleError(-1);
+
+    if ((size32_t)result > (pendingWriteSize - pendingWriteOffset))
+        return handleError(-1);
+
+    pendingWriteOffset += result;
+    if (pendingWriteOffset < pendingWriteSize)
+    {
+        processor->enqueueSocketWrite(socket, writeBuffer.bytes() + pendingWriteOffset, pendingWriteSize - pendingWriteOffset, *this);
+        return false;
+    }
+
+    pendingWriteOffset = 0;
+    pendingWriteSize = 0;
+    state = TLSAcceptState::Accepting;
+    return safeTryOperation();
+}
+
+bool CAsyncTLSAcceptHandler::tryAccept()
+{
+    int ret = SSL_accept(ssl);
+    
+    if (ret == 1)
+    {
+        // Handshake complete - verify certificate if needed
+        if (secureSocket->m_verify)
+        {
+            bool verified = false;
+            X509* client_cert = SSL_get_peer_certificate(ssl);
+            if (client_cert != NULL)
+            {
+                verified = secureSocket->verify_cert(client_cert);
+                X509_free(client_cert);
+            }
+            
+            if (!verified)
+            {
+                if (logLevel > SSLogNormal)
+                    DBGLOG("Async TLS accept: certificate verification failed");
+                return handleError(-1);
+            }
+        }
+        
+        secureSocket->m_isSecure = true;
+        
+        if (logLevel > SSLogNormal)
+            DBGLOG("Async SSL accept ok, using %s", SSL_get_cipher(ssl));
+        
+        state = TLSAcceptState::Completed;
+        completeAsyncCallback(finalCallback, 0);
+        return true;
+    }
+    
+    // Check if SSL generated output to send
+    int pending = BIO_pending(network_bio);
+    if (pending > 0)
+    {
+        state = TLSAcceptState::WantWrite;
+        writeBuffer.ensure(pending);
+        int bytesRead = BIO_read(network_bio, writeBuffer.bytes(), pending);
+        if (bytesRead <= 0)
+            return handleError(-1);
+        pendingWriteOffset = 0;
+        pendingWriteSize = bytesRead;
+        processor->enqueueSocketWrite(socket, writeBuffer.bytes(), bytesRead, *this);
+        return false;
+    }
+    
+    // Check what SSL needs
+    int ssl_error = SSL_get_error(ssl, ret);
+    if (ssl_error == SSL_ERROR_WANT_READ)
+    {
+        state = TLSAcceptState::WantRead;
+        readBuffer.ensure(16384);
+        processor->enqueueSocketRead(socket, readBuffer.bytes(), 16384, *this);
+        return false;
+    }
+    else
+    {
+        return handleError(-1);
+    }
+}
+
+bool CAsyncTLSAcceptHandler::handleError(int error)
+{
+    state = TLSAcceptState::Error;
+    completeAsyncCallback(finalCallback, error);
+    return true;
+}
+
+// CAsyncTLSConnectHandler implementation
+void CAsyncTLSConnectHandler::start()
+{
+    state = TLSAcceptState::Accepting;
+    if (safeTryOperation())
+        Release();
+}
+
+bool CAsyncTLSConnectHandler::onAsyncComplete(int result)
+{
+    if (result < 0)
+        return handleError(result);
+    
+    // Handle completion of underlying I/O based on current TLS connect state
+    if (state == TLSAcceptState::WantRead)
+    {
+        if (result == 0)
+            return handleError(-1);
+        // Feed received bytes to SSL's network BIO
+        if (BIO_write(network_bio, readBuffer.bytes(), result) != result)
+            return handleError(-1);
+        state = TLSAcceptState::Accepting;
+    }
+    else if (state == TLSAcceptState::WantWrite)
+    {
+        return continuePendingWrite(result);
+    }
+    
+    // Retry SSL_connect now that I/O completed, but only if we're in an accepting state
+    if (state == TLSAcceptState::Accepting)
+        return safeTryOperation();
+    
+    return false;
+}
+
+bool CAsyncTLSConnectHandler::continuePendingWrite(int result)
+{
+    if (result <= 0)
+        return handleError(-1);
+
+    if ((size32_t)result > (pendingWriteSize - pendingWriteOffset))
+        return handleError(-1);
+
+    pendingWriteOffset += result;
+    if (pendingWriteOffset < pendingWriteSize)
+    {
+        processor->enqueueSocketWrite(socket, writeBuffer.bytes() + pendingWriteOffset, pendingWriteSize - pendingWriteOffset, *this);
+        return false;
+    }
+
+    pendingWriteOffset = 0;
+    pendingWriteSize = 0;
+    state = TLSAcceptState::Accepting;
+    return safeTryOperation();
+}
+
+bool CAsyncTLSConnectHandler::tryConnect()
+{
+    int ret = SSL_connect(ssl);
+    
+    if (ret == 1)
+    {
+        // Handshake complete - verify certificate if needed
+        if (secureSocket->m_verify)
+        {
+            bool verified = false;
+            X509* server_cert = SSL_get_peer_certificate(ssl);
+            if (server_cert != NULL)
+            {
+                verified = secureSocket->verify_cert(server_cert);
+                X509_free(server_cert);
+            }
+            
+            if (!verified)
+            {
+                if (logLevel > SSLogNormal)
+                    DBGLOG("Async TLS connect: certificate verification failed");
+                return handleError(-1);
+            }
+        }
+        
+        secureSocket->m_isSecure = true;
+        
+        if (logLevel > SSLogNormal)
+            DBGLOG("Async SSL connect ok, using %s", SSL_get_cipher(ssl));
+        
+        state = TLSAcceptState::Completed;
+        completeAsyncCallback(finalCallback, 0);
+        return true;
+    }
+    
+    // Check if SSL generated output to send
+    int pending = BIO_pending(network_bio);
+    if (pending > 0)
+    {
+        state = TLSAcceptState::WantWrite;
+        writeBuffer.ensure(pending);
+        int bytesRead = BIO_read(network_bio, writeBuffer.bytes(), pending);
+        if (bytesRead <= 0)
+            return handleError(-1);
+        pendingWriteOffset = 0;
+        pendingWriteSize = bytesRead;
+        processor->enqueueSocketWrite(socket, writeBuffer.bytes(), bytesRead, *this);
+        return false;
+    }
+    
+    // Check what SSL needs
+    int ssl_error = SSL_get_error(ssl, ret);
+    if (ssl_error == SSL_ERROR_WANT_READ)
+    {
+        state = TLSAcceptState::WantRead;
+        readBuffer.ensure(16384);
+        processor->enqueueSocketRead(socket, readBuffer.bytes(), 16384, *this);
+        return false;
+    }
+    else
+    {
+        return handleError(-1);
+    }
+}
+
+bool CAsyncTLSConnectHandler::handleError(int error)
+{
+    state = TLSAcceptState::Error;
+    completeAsyncCallback(finalCallback, error);
+    return true;
+}
+
+// CAsyncTLSReadHandler implementation
+void CAsyncTLSReadHandler::start()
+{
+    state = TLSReadState::Reading;
+    if (safeTryOperation())
+        Release();
+}
+
+bool CAsyncTLSReadHandler::onAsyncComplete(int result)
+{
+    if (result < 0)
+        return handleError(result);
+    
+    // If we read 0 bytes from socket, the connection was closed
+    if (result == 0)
+    {
+        if (state == TLSReadState::WantWrite)
+            return handleError(-1);
+        // If we haven't satisfied minSize yet, this is an error (premature close)
+        if (totalRead < minSize)
+        {
+            state = TLSReadState::Error;
+            completeAsyncCallback(finalCallback, -1);
+            return true;
+        }
+        // Otherwise complete with whatever we've read
+        state = TLSReadState::Completed;
+        completeAsyncCallback(finalCallback, totalRead);
+        return true;
+    }
+    
+    // Handle completion of underlying I/O based on current TLS read state
+    if (state == TLSReadState::WantRead && result > 0)
+    {
+        // Feed received encrypted bytes to SSL's network BIO
+        if (BIO_write(network_bio, encryptedBuffer.bytes(), result) != result)
+            return handleError(-1);
+        state = TLSReadState::Reading;
+    }
+    else if (state == TLSReadState::WantWrite)
+    {
+        return continuePendingWrite(result);
+    }
+    
+    // Retry SSL_read now that I/O completed, but only if we're in a reading state
+    if (state == TLSReadState::Reading)
+        return safeTryOperation();
+    
+    return false;
+}
+
+bool CAsyncTLSReadHandler::continuePendingWrite(int result)
+{
+    if (result <= 0)
+        return handleError(-1);
+
+    if ((size32_t)result > (pendingWriteSize - pendingWriteOffset))
+        return handleError(-1);
+
+    pendingWriteOffset += result;
+    if (pendingWriteOffset < pendingWriteSize)
+    {
+        processor->enqueueSocketWrite(socket, writeBuffer.bytes() + pendingWriteOffset, pendingWriteSize - pendingWriteOffset, *this);
+        return false;
+    }
+
+    pendingWriteOffset = 0;
+    pendingWriteSize = 0;
+    state = TLSReadState::Reading;
+    return safeTryOperation();
+}
+
+bool CAsyncTLSReadHandler::tryRead()
+{
+    // Keep reading until we have at least minSize bytes
+    while (totalRead < minSize && totalRead < maxSize)
+    {
+        size32_t bytesToRead = maxSize - totalRead;
+        size32_t readChunk = std::min(bytesToRead, (size32_t)std::numeric_limits<int>::max());
+
+        int ret = SSL_read(ssl, (char*)appBuffer + totalRead, (int)readChunk);
+        
+        if (ret > 0)
+        {
+            // Successfully read some decrypted data
+            totalRead += ret;
+            
+            // If we've satisfied minSize, we're done
+            if (totalRead >= minSize)
+            {
+                state = TLSReadState::Completed;
+                completeAsyncCallback(finalCallback, totalRead);
+                return true;
+            }
+            // Otherwise continue reading to satisfy minSize
+            continue;
+        }
+        
+        // SSL_read didn't return data - check what it needs
+        int ssl_error = SSL_get_error(ssl, ret);
+        
+        if (ssl_error == SSL_ERROR_WANT_READ)
+        {
+            // Need more encrypted data from socket
+            // First check if SSL has generated any data to send (e.g., renegotiation)
+            int pending = BIO_pending(network_bio);
+            if (pending > 0)
+            {
+                // Send data SSL generated before reading more
+                state = TLSReadState::WantWrite;
+                writeBuffer.ensure(pending);
+                int bytesRead = BIO_read(network_bio, writeBuffer.bytes(), pending);
+                if (bytesRead <= 0)
+                    return handleError(-1);
+                pendingWriteOffset = 0;
+                pendingWriteSize = bytesRead;
+                processor->enqueueSocketWrite(socket, writeBuffer.bytes(), bytesRead, *this);
+                return false;
+            }
+            
+            // Read encrypted data from socket
+            state = TLSReadState::WantRead;
+            encryptedBuffer.ensure(16384);
+            processor->enqueueSocketRead(socket, encryptedBuffer.bytes(), 16384, *this);
+            return false;
+        }
+        else if (ssl_error == SSL_ERROR_WANT_WRITE)
+        {
+            // Need to send data (renegotiation)
+            int pending = BIO_pending(network_bio);
+            if (pending > 0)
+            {
+                state = TLSReadState::WantWrite;
+                writeBuffer.ensure(pending);
+                int bytesRead = BIO_read(network_bio, writeBuffer.bytes(), pending);
+                if (bytesRead <= 0)
+                    return handleError(-1);
+                pendingWriteOffset = 0;
+                pendingWriteSize = bytesRead;
+                processor->enqueueSocketWrite(socket, writeBuffer.bytes(), bytesRead, *this);
+                return false;
+            }
+            // No data to write, this is an error
+            return handleError(-1);
+        }
+        else if (ssl_error == SSL_ERROR_ZERO_RETURN)
+        {
+            // Clean TLS shutdown
+            state = TLSReadState::Completed;
+            completeAsyncCallback(finalCallback, totalRead);
+            return true;
+        }
+        else
+        {
+            return handleError(-1);
+        }
+    }
+    
+    // Should not reach here, but if we do, we've read enough
+    state = TLSReadState::Completed;
+    completeAsyncCallback(finalCallback, totalRead);
+    return true;
+}
+
+bool CAsyncTLSReadHandler::handleError(int error)
+{
+    state = TLSReadState::Error;
+    completeAsyncCallback(finalCallback, error);
+    return true;
+}
+
+// CSecureSocket async read implementation
+void CSecureSocket::startAsyncRead(IAsyncProcessor * processor, void * buf, size32_t minSize, size32_t maxSize, IAsyncCallback & callback)
+{
+    // Fall back to sync if io_uring is disabled, processor is null, or BIOs aren't set up for async
+    if (!processor || !isTLSIOUringEnabled() || !network_bio)
+    {
+        // Fallback to synchronous read
+        try
+        {
+            size32_t sizeRead;
+            readtms(buf, minSize, maxSize, sizeRead, WAIT_FOREVER);
+            completeAsyncCallback(callback, sizeRead);
+        }
+        catch (IException *e)
+        {
+            e->Release();
+            completeAsyncCallback(callback, -1);
+        }
+        return;
+    }
+    
+    try
+    {
+        // Create and start the async read handler.
+        // Handler starts with refcount=1 and will Release() after completion.
+        CAsyncTLSReadHandler *handler = new CAsyncTLSReadHandler(this, m_ssl, processor, m_socket, buf, minSize, maxSize, callback);
+        handler->start();
+    }
+    catch (IException *e)
+    {
+        e->Release();
+        completeAsyncCallback(callback, -1);
+    }
+    catch (...)
+    {
+        completeAsyncCallback(callback, -1);
+    }
+}
+
+// CSecureSocket async write implementation
+void CSecureSocket::startAsyncWrite(IAsyncProcessor * processor, const void * buf, size32_t size, IAsyncCallback & callback)
+{
+    // Fall back to sync if io_uring is disabled, processor is null, or BIOs aren't set up for async
+    if (!processor || !isTLSIOUringEnabled() || !network_bio)
+    {
+        // Fallback to synchronous write
+        try
+        {
+            size32_t written = write(buf, size);
+            completeAsyncCallback(callback, written);
+        }
+        catch (IException *e)
+        {
+            e->Release();
+            completeAsyncCallback(callback, -1);
+        }
+        return;
+    }
+    
+    try
+    {
+        // Create and start the async write handler.
+        // Handler starts with refcount=1 and will Release() after completion.
+        CAsyncTLSWriteHandler *handler = new CAsyncTLSWriteHandler(this, m_ssl, processor, m_socket, buf, size, callback);
+        handler->start();
+    }
+    catch (IException *e)
+    {
+        e->Release();
+        completeAsyncCallback(callback, -1);
+    }
+    catch (...)
+    {
+        completeAsyncCallback(callback, -1);
+    }
+}
+
+void CSecureSocket::handleError(int ssl_err, bool writing, bool wait, unsigned timeoutMs, const char *opStr, unsigned long errnum)
+{
+    // if !wait, then we only perform ssl_err checking, we do not wait_read/wait_write or timeout
+    int rc = 0;
+    int sockErr = 0;
+    switch (ssl_err)
+    {
+        case SSL_ERROR_ZERO_RETURN:
+        {
+            m_socket->shutdownNoThrow();
+            THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
+        }
+        case SSL_ERROR_WANT_READ: // NB: SSL_write can provoke SSL_ERROR_WANT_READ
+        {
+            if (wait)
+                rc = wait_read(timeoutMs);
+            break;
+        }
+        case SSL_ERROR_WANT_WRITE: // NB: SSL_read can provoke SSL_ERROR_WANT_WRITE
+        {
+            if (wait)
+                rc = wait_write(timeoutMs);
+            break;
+        }
+        case SSL_ERROR_SYSCALL:
+        {
+            sockErr = SOCKETERRNO();
+            if (sockErr == EAGAIN || sockErr == EWOULDBLOCK)
+            {
+                if (wait)
+                {
+                    if (writing)
+                        rc = wait_write(timeoutMs);
+                    else
+                        rc = wait_read(timeoutMs);
+                }
+                break;
+            }
+            // fall through to default error handling below
+        }
+        default:
         {
             char errbuf[512];
-            ERR_error_string_n(ERR_get_error(), errbuf, 512);
-            DBGLOG("SSL_accept returned 0, error - %s", errbuf);
+            if (!errnum)
+                errnum = ERR_get_error();
+            if (errnum)
+                ERR_error_string_n(errnum, errbuf, 512);
+            else
+                strcpy(errbuf, "no OpenSSL error queued");
+            ERR_clear_error();
+            VStringBuffer errmsg("%s error %d (%d) - %s", opStr, ssl_err, sockErr, errbuf);
+            if (m_loglevel >= SSLogMax)
+                DBGLOG("Warning: %s", errmsg.str());
+            THROWJSOCKEXCEPTION_MSG(sockErr ? sockErr : JSOCKERR_connection_failed, errmsg);
         }
-        return -1;
     }
-    else if(err < 0)
+    if (wait && rc <= 0)
     {
-        int ret = SSL_get_error(m_ssl, err);
-        char errbuf[512];
-        ERR_error_string_n(ERR_get_error(), errbuf, 512);
-        errbuf[511] = '\0';
-        DBGLOG("SSL_accept returned %d, SSL_get_error=%d, error - %s", err, ret, errbuf);
-        if(strstr(errbuf, "error:1408F455:") != NULL)
+        int code = SOCKETERRNO();
+        VStringBuffer errorMsg("%s: %s ", opStr, (SSL_ERROR_WANT_WRITE == ssl_err) ? "wait_write" : "wait_read");
+        if (rc == 0)
         {
-            DBGLOG("Unrecoverable SSL library error.");
-            _exit(0);
+            code = JSOCKERR_timeout_expired;
+            errorMsg.append("timeout expired");
         }
-        return err;
+        else
+            errorMsg.append("error");
+        THROWJSOCKEXCEPTION_MSG(code, errorMsg.str());
     }
+}
 
-    if (logLevel)
-        DBGLOG("SSL connection using %s", SSL_get_cipher(m_ssl));
+bool CSecureSocket::flushPendingEncryptedOutput(CCycleTimer &timer, unsigned timeoutMs, const char *opStr)
+{
+    byte encryptedWriteBuffer[16384];
 
-    if(m_verify)
+    bool flushed = false;
+    while (true)
     {
-        bool verified = false;
-        // Get client's certificate (note: beware of dynamic allocation) - opt 
-        X509* client_cert = SSL_get_peer_certificate (m_ssl);
-        if (client_cert != NULL) 
-        {
-            // We could do all sorts of certificate verification stuff here before
-            // deallocating the certificate.
-            verified = verify_cert(client_cert);
-            X509_free (client_cert);
-        }
+        int pending = BIO_pending(network_bio);
+        if (pending <= 0)
+            return flushed;
 
-        if(!verified)
-            throw MakeStringException(-1, "certificate verification failed");
+        size32_t chunk = std::min((size32_t)pending, (size32_t)sizeof(encryptedWriteBuffer));
+        int bytesRead = BIO_read(network_bio, encryptedWriteBuffer, chunk);
+        if (bytesRead <= 0)
+            THROWJSOCKEXCEPTION_MSG(-1, VStringBuffer("%s: failed to drain encrypted TLS output", opStr).str());
 
+        unsigned remainingMs = timer.remainingMs(timeoutMs);
+        m_socket->writetms(encryptedWriteBuffer, bytesRead, bytesRead, remainingMs);
+        flushed = true;
     }
+}
 
-    m_isSecure = true;
-    return 0;
+size32_t CSecureSocket::readAndQueueEncryptedSocketInput(CCycleTimer &timer, unsigned timeoutMs, const char *opStr)
+{
+    byte encryptedReadBuffer[16384];
+    size32_t encryptedRead = 0;
+    unsigned remainingMs = timer.remainingMs(timeoutMs);
+    m_socket->readtms(encryptedReadBuffer, 1, sizeof(encryptedReadBuffer), encryptedRead, remainingMs);
+    if (encryptedRead > 0 && BIO_write(network_bio, encryptedReadBuffer, encryptedRead) != encryptedRead)
+        THROWJSOCKEXCEPTION_MSG(-1, VStringBuffer("%s: failed to queue encrypted socket input", opStr).str());
+    return encryptedRead;
 }
 
 int CSecureSocket::secure_connect(int logLevel)
 {
-    int err = SSL_connect (m_ssl);                     
-    if(err <= 0)
+    if (m_fqdn.length() > 0)
     {
-        int ret = SSL_get_error(m_ssl, err);
-        char errbuf[512];
-        ERR_error_string_n(ERR_get_error(), errbuf, 512);
-        DBGLOG("SSL_connect error - %s, SSL_get_error=%d, error - %d", errbuf,ret, err);
-        throw MakeStringException(-1, "SSL_connect failed: %s", errbuf);
+        if (!streq(m_fqdn.str(), "."))
+            SSL_set_tlsext_host_name(m_ssl, m_fqdn.str());
+    }
+
+    unsigned timeoutMs = 60*1000; // more than enough, used to be infinite
+    CCycleTimer timer;
+    while (true)
+    {
+        int rc = SSL_connect(m_ssl);
+        if (rc > 0)
+            break;
+        int ssl_err = SSL_get_error(m_ssl, rc);
+        unsigned remainingMs = timer.remainingMs(timeoutMs);
+        handleError(ssl_err, true, true, remainingMs, "SSL_connect");
     }
     
+    if (logLevel > SSLogNormal)
+        DBGLOG("SSL connect ok, using %s", SSL_get_cipher (m_ssl));
 
     // Currently only do fake verify - simply logging the subject and issuer
     // The verify parameter makes it possible for the application to verify only
@@ -685,10 +2004,6 @@ int CSecureSocket::secure_connect(int logLevel)
         // Following two steps are optional and not required for
         // data exchange to be successful.
         
-        // Get the cipher - opt
-        if (logLevel)
-            DBGLOG("SSL connection using %s\n", SSL_get_cipher (m_ssl));
-
         // Get server's certificate (note: beware of dynamic allocation) - opt
         X509* server_cert = SSL_get_peer_certificate (m_ssl);
         bool verified = false;
@@ -729,101 +2044,421 @@ int CSecureSocket::wait_read(unsigned timeoutms)
     return m_socket->wait_read(timeoutms);
 }
 
-inline unsigned socketTime(bool useSeconds)
+void CSecureSocket::readtms(void* buf, size32_t min_size, size32_t max_size, size32_t &sizeRead, unsigned timeoutMs, bool suppresGCIfMinSize)
 {
-    if (useSeconds)
+    // Adheres to same semantics as CSocket::readtms
+    // NB: when handling poll notifications, we must read until SSL_read indicates would block
+    // because we may not get another poll notification because SSL internally has read everything.
+    sizeRead = 0;
+    CCycleTimer timer;
+
+    if (network_bio)
     {
-        time_t timenow;
-        return (unsigned) time(&timenow);
-    }
-    return msTick();
-}
 
-inline unsigned socketTimeRemaining(bool useSeconds, unsigned start, unsigned timeout)
-{
-    unsigned elapsed = socketTime(useSeconds) - start;
-    if (elapsed < timeout)
-    {
-        unsigned timeleft = timeout - elapsed;
-        if (useSeconds)
-            timeleft *= 1000;
-        return timeleft;
-    }
-    return 0;
-}
-
-void CSecureSocket::readTimeout(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timeout, bool useSeconds)
-{
-    size_read = 0;
-    unsigned start;
-    unsigned timeleft;
-
-    if (timeout != WAIT_FOREVER) {
-        start = socketTime(useSeconds);
-        timeleft = timeout;
-        if (useSeconds)
-            timeleft *= 1000;
-    }
-
-    do {
-        int rc;
-        if (timeout != WAIT_FOREVER) {
-            rc = wait_read(timeleft);
-            if (rc < 0) {
-                THROWSECURESOCKETEXCEPTION("wait_read error"); 
+        while (true)
+        {
+            ERR_clear_error();
+            size32_t bytesToRead = max_size - sizeRead;
+            size32_t readChunk = std::min(bytesToRead, (size32_t)std::numeric_limits<int>::max());
+            int rc = SSL_read(m_ssl, (char *)buf + sizeRead, (int)readChunk);
+            unsigned remainingMs = timer.remainingMs(timeoutMs);
+            if (rc > 0)
+            {
+                sizeRead += rc;
+                if (sizeRead == max_size)
+                    break;
+                if (0 == remainingMs)
+                {
+                    if (sizeRead >= min_size)
+                        break;
+                    THROWJSOCKEXCEPTION_MSG(JSOCKERR_timeout_expired, "timeout expired");
+                }
+                continue;
             }
-            if (rc == 0) {
-                THROWSECURESOCKETEXCEPTION("timeout expired"); 
+
+            if (0 == rc)
+            {
+                m_socket->shutdownNoThrow();
+                if (suppresGCIfMinSize && (sizeRead >= min_size))
+                    break;
+                THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
             }
-            timeleft = socketTimeRemaining(useSeconds, start, timeout);
+
+            int ssl_err = SSL_get_error(m_ssl, rc);
+            if (ssl_err == SSL_ERROR_WANT_READ)
+            {
+                if (sizeRead >= min_size)
+                    break;
+
+                flushPendingEncryptedOutput(timer, timeoutMs, "SSL_read");
+
+                size32_t encryptedRead = readAndQueueEncryptedSocketInput(timer, timeoutMs, "SSL_read");
+                if (encryptedRead == 0)
+                {
+                    m_socket->shutdownNoThrow();
+                    if (suppresGCIfMinSize && (sizeRead >= min_size))
+                        break;
+                    THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
+                }
+                continue;
+            }
+
+            if (ssl_err == SSL_ERROR_WANT_WRITE)
+            {
+                if (sizeRead >= min_size)
+                    break;
+
+                if (flushPendingEncryptedOutput(timer, timeoutMs, "SSL_read"))
+                    continue;
+
+                // No TLS output to flush; use wait/write-error handling instead of spinning.
+                handleError(ssl_err, false, true, remainingMs, "SSL_read");
+                continue;
+            }
+
+            bool wait = sizeRead < min_size; // if >= min_size, then handleError will validate errors only
+            handleError(ssl_err, false, wait, remainingMs, "SSL_read");
+            if (sizeRead >= min_size)
+                break;
         }
-
+    }
+    else
+    {
+    while (true)
+    {
         ERR_clear_error();
-        rc = SSL_read(m_ssl, (char*)buf + size_read, max_size - size_read);
+        size32_t bytesToRead = max_size - sizeRead;
+        size32_t readChunk = std::min(bytesToRead, (size32_t)std::numeric_limits<int>::max());
+        int rc = SSL_read(m_ssl, (char*)buf + sizeRead, (int)readChunk);
+        unsigned remainingMs = timer.remainingMs(timeoutMs);
         if (rc > 0)
         {
-            size_read += rc;
+            sizeRead += rc;
+            if (sizeRead == max_size)
+                break;
+            if (0 == remainingMs)
+            {
+                if (sizeRead >= min_size)
+                    break;
+                THROWJSOCKEXCEPTION_MSG(JSOCKERR_timeout_expired, "timeout expired");
+            }
+            // loop around to read more, or detect blocked (and exit if sizeRead >= min_size)
+        }
+        else if (0 == rc)
+        {
+            m_socket->shutdownNoThrow();
+            if (suppresGCIfMinSize && (sizeRead >= min_size))
+                break;
+            THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
         }
         else
         {
-            int err = SSL_get_error(m_ssl, rc);
-            char errbuf[512];
-            ERR_error_string_n(err, errbuf, 512);
-            ERR_clear_error();
-            VStringBuffer errmsg("SSL_read error %d - %s", err, errbuf);
-            if (m_loglevel >= SSLogMax)
-                DBGLOG("Warning: %s", errmsg.str());
-            if (min_size > 0)
-                throw createJSocketException(JSOCKERR_graceful_close, errmsg);
+            // NB: if blocked, return if sizeRead >= min_size
+            int ssl_err = SSL_get_error(m_ssl, rc);
+            bool wait = sizeRead < min_size; // if >= min_size, then handleError will validate errors only
+            handleError(ssl_err, false, wait, remainingMs, "SSL_read");
+            if (sizeRead >= min_size)
+                break;
         }
-    } while (size_read < min_size);
+    }
+    }
+
+    cycle_t elapsedCycles = timer.elapsedCycles();
+    if (!SSTATS)
+        SSTATS = getSocketStatPtr();
+    SSTATS->reads++;
+    SSTATS->readsize += sizeRead;
+    SSTATS->readtimecycles += elapsedCycles;
+    stats.ioReads++;
+    stats.ioReadBytes += sizeRead;
+    stats.ioReadCycles += elapsedCycles;
+
 }
 
-
-void CSecureSocket::readtms(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timeoutms)
+void CSecureSocket::read(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timeoutsecs, bool suppresGCIfMinSize)
 {
-    readTimeout(buf, min_size, max_size, size_read, timeoutms, false);
+    unsigned timeoutMs = (timeoutsecs==WAIT_FOREVER) ? WAIT_FOREVER : (timeoutsecs * 1000);
+    readtms(buf, min_size, max_size, size_read, timeoutMs, suppresGCIfMinSize);
 }
 
-void CSecureSocket::read(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read,unsigned timeoutsecs)
+size32_t CSecureSocket::writetms(void const* buf, size32_t minSize, size32_t size, unsigned timeoutMs)
 {
-    readTimeout(buf, min_size, max_size, size_read, timeoutsecs, true);
+    if (size == 0)
+        return 0;
+
+    CCycleTimer timer;
+
+    size32_t bytesWritten = 0;
+    size32_t bytesRemaining = size;
+    char *cbuf = (char *)buf;
+
+    if (network_bio)
+    {
+
+        ERR_clear_error();
+        while (bytesRemaining)
+        {
+            size32_t bytesChunk = MIN(bytesRemaining, 0x4000);
+            int rc = SSL_write(m_ssl, &cbuf[bytesWritten], bytesChunk);
+            if (rc > 0)
+            {
+                dbgassertex(bytesChunk == rc);
+                bytesRemaining -= rc;
+                bytesWritten += rc;
+                flushPendingEncryptedOutput(timer, timeoutMs, "SSL_write");
+                continue;
+            }
+
+            int ssl_err = SSL_get_error(m_ssl, rc);
+            unsigned remainingMs = timer.remainingMs(timeoutMs);
+            if (ssl_err == SSL_ERROR_WANT_READ)
+            {
+                flushPendingEncryptedOutput(timer, timeoutMs, "SSL_write");
+
+                size32_t encryptedRead = readAndQueueEncryptedSocketInput(timer, timeoutMs, "SSL_write");
+                if (encryptedRead == 0)
+                {
+                    m_socket->shutdownNoThrow();
+                    THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
+                }
+                continue;
+            }
+
+            if (ssl_err == SSL_ERROR_WANT_WRITE)
+            {
+                if (flushPendingEncryptedOutput(timer, timeoutMs, "SSL_write"))
+                    continue;
+            }
+
+            handleError(ssl_err, true, true, remainingMs, "SSL_write");
+        }
+
+        flushPendingEncryptedOutput(timer, timeoutMs, "SSL_write");
+    }
+    else
+    {
+    ERR_clear_error();
+    while (bytesRemaining)
+    {
+        size32_t bytesChunk = MIN(bytesRemaining, 0x4000);
+        int rc = SSL_write(m_ssl, &cbuf[bytesWritten], bytesChunk);
+        if (rc > 0)
+        {
+            // NB: minSize not used here, because not using SSL_MODE_ENABLE_PARTIAL_WRITE
+            dbgassertex(bytesChunk == rc);
+            bytesRemaining -= rc;
+            bytesWritten += rc;
+        }
+        else
+        {
+            int ssl_err = SSL_get_error(m_ssl, rc);
+            unsigned remainingMs = timer.remainingMs(timeoutMs);
+            handleError(ssl_err, true, true, remainingMs, "SSL_write");
+        }
+    }
+    }
+
+    cycle_t elapsedCycles = timer.elapsedCycles();
+    if (!SSTATS)
+        SSTATS = getSocketStatPtr();
+    SSTATS->writes++;
+    SSTATS->writesize += bytesWritten;
+    SSTATS->writetimecycles += elapsedCycles;
+    stats.ioWrites++;
+    stats.ioWriteBytes += bytesWritten;
+    stats.ioWriteCycles += elapsedCycles;
+
+    return bytesWritten;
 }
 
 size32_t CSecureSocket::write(void const* buf, size32_t size)
 {
-    int numwritten = SSL_write(m_ssl, buf, size);
-    return numwritten;
+    return writetms(buf, size, size, WAIT_FOREVER);
 }
 
-size32_t CSecureSocket::writetms(void const* buf, size32_t size, unsigned timeoutms)
+// ----------------------------
+
+void CSecureSocket::set_block_mode(unsigned flags, size32_t recsize, unsigned _timeoutms)
 {
-    // timeoutms not implemented yet ...
-    int numwritten = SSL_write(m_ssl, buf, size);
-    return numwritten;
+    blockflags = flags;
+    nextblocksize = UINT_MAX;
+    blocktimeoutms = _timeoutms?_timeoutms:WAIT_FOREVER;
 }
 
-int verify_callback(int ok, X509_STORE_CTX *store)
+size32_t CSecureSocket::receive_block_size()
+{
+    // assumed always paired with receive_block
+    if (nextblocksize) {
+        if (blockflags&BF_SYNC_TRANSFER_PULL) {
+            bool eof=false;
+            write(&eof,sizeof(eof));
+        }
+        size32_t rd;
+        readtms(&nextblocksize,sizeof(nextblocksize),sizeof(nextblocksize),rd,blocktimeoutms);
+        _WINREV(nextblocksize);
+        if (nextblocksize==0) { // confirm eof
+            try {
+                bool confirm=true;
+                write(&confirm,sizeof(confirm));
+            }
+            catch (IJSOCK_Exception *e) {
+                if ((e->errorCode()!=JSOCKERR_broken_pipe)&&(e->errorCode()!=JSOCKERR_graceful_close))
+                    EXCLOG(e,"receive_block_size");
+                e->Release();
+            }
+        }
+        else if (blockflags&BF_SYNC_TRANSFER_PUSH) {  // leaves receiveblocksem clear
+#ifdef USERECVSEM
+            CSemProtect semprot; // this will catch exception in write
+            while (!semprot.wait(&receiveblocksem,&receiveblocksemowned,60*1000*5))
+                IWARNLOG("Receive block stalled");
+#endif
+            bool eof=false;
+            write(&eof,sizeof(eof));
+#ifdef USERECVSEM
+            semprot.clear();
+#endif
+        }
+    }
+    return nextblocksize;
+}
+
+size32_t CSecureSocket::receive_block(void *blk, size32_t maxsize)
+{
+#ifdef USERECVSEM
+    CSemProtect semprot; // this will catch exceptions
+#endif
+    size32_t sz = nextblocksize;
+    if (sz) {
+        if (sz==UINT_MAX) { // need to get size
+            if (!blk||!maxsize) {
+                if (blockflags&BF_SYNC_TRANSFER_PUSH) { // ignore block size
+                    size32_t rd;
+                    readtms(&nextblocksize,sizeof(nextblocksize),sizeof(nextblocksize),rd,blocktimeoutms);
+                }
+                if (blockflags&(BF_SYNC_TRANSFER_PULL|BF_SYNC_TRANSFER_PUSH)) { // signal eof
+                    bool eof=true;
+                    write(&eof,sizeof(eof));
+                    nextblocksize = 0;
+                    return 0;
+                }
+            }
+            sz = receive_block_size();
+            if (!sz)
+                return 0;
+        }
+        unsigned startt=usTick();   // include sem block but not initial handshake
+#ifdef USERECVSEM
+        if (blockflags&BF_SYNC_TRANSFER_PUSH)  // read_block_size sets semaphore
+            semprot.set(&receiveblocksem,&receiveblocksemowned);  // this will reset semaphore on exit
+#endif
+        nextblocksize = UINT_MAX;
+        size32_t rd;
+        if (sz<=maxsize) {
+            readtms(blk,sz,sz,rd,blocktimeoutms);
+        }
+        else { // truncate
+            readtms(blk,maxsize,maxsize,rd,blocktimeoutms);
+            sz -= maxsize;
+            OwnedMalloc<void> tmp = malloc(sz);
+            readtms(tmp,sz,sz,rd,blocktimeoutms);
+            sz = maxsize;
+        }
+        if (blockflags&BF_RELIABLE_TRANSFER) {
+            bool isok=true;
+            write(&isok,sizeof(isok));
+        }
+        unsigned elapsed = usTick()-startt;
+        SSTATS = getSocketStatPtr();
+        if (SSTATS)
+        {
+            SSTATS->blockrecvtime+=elapsed;
+            SSTATS->numblockrecvs++;
+            SSTATS->blockrecvsize+=sz;
+        }
+    }
+    return sz;
+}
+
+bool CSecureSocket::send_block(const void *blk, size32_t sz)
+{
+    unsigned startt=usTick();
+#ifdef TRACE_SLOW_BLOCK_TRANSFER
+    unsigned startt2 = startt;
+    unsigned startt3 = startt;
+#endif
+    if (blockflags&BF_SYNC_TRANSFER_PULL) {
+        size32_t rd;
+        bool eof = true;
+        readtms(&eof,sizeof(eof),sizeof(eof),rd,blocktimeoutms);
+        if (eof)
+            return false;
+#ifdef TRACE_SLOW_BLOCK_TRANSFER
+        startt2=usTick();
+#endif
+    }
+    if (!blk||!sz) {
+        sz = 0;
+        write(&sz,sizeof(sz));
+        try {
+            bool reply;
+            size32_t rd;
+            readtms(&reply,sizeof(reply),sizeof(reply),rd,blocktimeoutms);
+        }
+        catch (IJSOCK_Exception *e) {
+            if ((e->errorCode()!=JSOCKERR_broken_pipe)&&(e->errorCode()!=JSOCKERR_graceful_close))
+                EXCLOG(e,"CSocket::send_block");
+            e->Release();
+        }
+        return false;
+    }
+    size32_t rsz=sz;
+    _WINREV(rsz);
+    write(&rsz,sizeof(rsz));
+    if (blockflags&BF_SYNC_TRANSFER_PUSH) {
+#ifdef TRACE_SLOW_BLOCK_TRANSFER
+        startt2=usTick();
+#endif
+        size32_t rd;
+        bool eof = true;
+        readtms(&eof,sizeof(eof),sizeof(eof),rd,blocktimeoutms);
+        if (eof)
+            return false;
+#ifdef TRACE_SLOW_BLOCK_TRANSFER
+        startt3=usTick();
+#endif
+    }
+    write(blk,sz);
+    if (blockflags&BF_RELIABLE_TRANSFER) {
+        bool isok=false;
+        size32_t rd;
+        readtms(&isok,sizeof(isok),sizeof(isok),rd,blocktimeoutms);
+        if (!isok)
+            return false;
+    }
+    unsigned nowt = usTick();
+    unsigned elapsed = nowt-startt;
+    SSTATS = getSocketStatPtr();
+    if (SSTATS)
+    {
+        SSTATS->blocksendtime+=elapsed;
+        SSTATS->numblocksends++;
+        SSTATS->blocksendsize+=sz;
+        if (elapsed>SSTATS->longestblocksend) {
+            SSTATS->longestblocksend = elapsed;
+            SSTATS->longestblocksize = sz;
+        }
+    }
+#ifdef TRACE_SLOW_BLOCK_TRANSFER
+    if (elapsed>1000000*60)  // over 1min
+        IWARNLOG("send_block took %ds to %s  (%d,%d,%d)",elapsed/1000000,tracename,startt2-startt,startt3-startt2,nowt-startt3);
+#endif
+    return true;
+}
+
+// ----------------------------
+
+int verify_callback(int ok, X509_STORE_CTX *store, bool accept_selfsigned)
 {
     if(!ok)
     {
@@ -845,6 +2480,16 @@ int verify_callback(int ok, X509_STORE_CTX *store)
     return ok;
 }
 
+int verify_callback_allow_selfSigned(int ok, X509_STORE_CTX *store)
+{
+    return verify_callback(ok, store, true);
+}
+
+int verify_callback_reject_selfSigned(int ok, X509_STORE_CTX *store)
+{
+    return verify_callback(ok, store, false);
+}
+
 const char* strtok__(const char* s, const char* d, StringBuffer& tok)
 {
     if(!s || !*s || !d || !*d)
@@ -862,232 +2507,355 @@ const char* strtok__(const char* s, const char* d, StringBuffer& tok)
     return s;
 }
 
-class CSecureSocketContext : implements ISecureSocketContext, public CInterface
+static bool usePrivateKeyPEMBuffer(SSL_CTX *ctx, const char *privKeyBuf, int privKeyLen=-1)
+{
+    // single RSA key in buffer
+
+    OwnedEVPBio cbio(BIO_new_mem_buf(privKeyBuf, privKeyLen));
+    if (!cbio)
+        return false;
+
+    OwnedEVPRSA rsa(PEM_read_bio_RSAPrivateKey(cbio, NULL, 0, NULL));
+    if (!rsa)
+        return false;
+
+    if (!SSL_CTX_use_RSAPrivateKey(ctx, rsa))
+        return false;
+
+    return true;
+}
+
+static bool useCertificateChainPEMBuffer(SSL_CTX *ctx, const char *certBuf, int certLen=-1)
+{
+    // this routine based on code originally from:
+    // https://stackoverflow.com/questions/3810058/read-certificate-files-from-memory-instead-of-a-file-using-openssl
+
+    // can have multiple certs in buffer
+
+    OwnedEVPBio cbio(BIO_new_mem_buf(certBuf, certLen));
+    if (!cbio)
+        return false;
+
+    OwnedX509StkPtr infoStk(PEM_X509_INFO_read_bio(cbio, NULL, NULL, NULL));
+    if (!infoStk)
+        return false;
+
+    bool first = true;
+    X509_INFO *infoVal;
+    for (int i=0; i<sk_X509_INFO_num(infoStk); i++)
+    {
+        infoVal = sk_X509_INFO_value(infoStk, i);
+        if (infoVal->x509)
+        {
+            // First cert is server/main cert. Remaining, if any, are intermediate certs.
+            if (first)
+            {
+                first = false;
+
+                // Set server certificate. Note that this operation increments the
+                // reference count, which means that it is okay for cleanup to free it.
+                if (!SSL_CTX_use_certificate(ctx, infoVal->x509))
+                    return false;
+
+                // Get ready to store intermediate certs, if any.
+                SSL_CTX_clear_chain_certs(ctx);
+            }
+            else
+            {
+                // Add intermediate cert to chain.
+                if (!SSL_CTX_add0_chain_cert(ctx, infoVal->x509))
+                    return false;
+
+                // Above function doesn't increment cert reference count. NULL the
+                // reference to it in order to prevent it from being freed during cleanup.
+                infoVal->x509 = NULL;
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool setVerifyCertsPEMBuffer(SSL_CTX *ctx, const char *caCertBuf, int caCertLen=-1)
+{
+    // this routine based on code originally from:
+    // https://stackoverflow.com/questions/5052563/c-openssl-use-root-ca-from-buffer-rather-than-file-ssl-ctx-load-verify-locat
+
+    // can have multiple certs in buffer
+
+    OwnedEVPBio cbio(BIO_new_mem_buf(caCertBuf, caCertLen));
+    if (!cbio)
+        return false;
+
+    OwnedX509Store store(X509_STORE_new());
+    if (!store)
+        return false;
+
+    OwnedX509StkPtr infoStk(PEM_X509_INFO_read_bio(cbio, NULL, NULL, NULL));
+    if (!infoStk)
+        return false;
+
+    X509_INFO *infoVal;
+    for (int i = 0; i < sk_X509_INFO_num(infoStk); i++)
+    {
+        infoVal = sk_X509_INFO_value(infoStk, i);
+        if (infoVal->x509)
+        {
+            if (!X509_STORE_add_cert(store, infoVal->x509))
+                return false;
+
+            infoVal->x509 = NULL;
+        }
+    }
+
+    SSL_CTX_set_cert_store(ctx, store.getClear());
+
+    return true;
+}
+
+class CSecureSocketContext : public CInterfaceOf<ISecureSocketContext>
 {
 private:
-    SSL_CTX*    m_ctx;
+    SecureSocketType sockettype;
+    OwnedSSLCTX m_ctx;
 #if (OPENSSL_VERSION_NUMBER > 0x00909000L) 
-    const SSL_METHOD* m_meth;
+    const SSL_METHOD* m_meth = nullptr;
 #else
     SSL_METHOD* m_meth;
 #endif 
 
-    bool m_verify;
-    bool m_address_match;
+    bool m_verify = false;
+    bool m_address_match = false;
     Owned<CStringSet> m_peers;
     StringAttr password;
+    CriticalSection cs{SYNC_LOCATION}; // NB: only used if context is from a syncedConfig
+    Linked<const ISyncedPropertyTree> syncedConfig;
+    unsigned configVersion = 0;
 
     void setSessionIdContext()
     {
         SSL_CTX_set_session_id_context(m_ctx, (const unsigned char*)"hpccsystems", 11);
     }
 
-public:
-    IMPLEMENT_IINTERFACE;
-    CSecureSocketContext(SecureSocketType sockettype)
+    void initContext(SecureSocketType sockettype)
     {
-        m_verify = false;
-        m_address_match = false;
-
         if(sockettype == ClientSocket)
             m_meth = SSLv23_client_method();
         else
             m_meth = SSLv23_server_method();
 
-        m_ctx = SSL_CTX_new(m_meth);
+        m_ctx.setown(SSL_CTX_new(m_meth));
 
         if(!m_ctx)
-        {
-            throw MakeStringException(-1, "ctx can't be created");
-        }
+            throw makeStringException(-1, "ctx can't be created");
 
         if (sockettype == ServerSocket)
             setSessionIdContext();
-
-        SSL_CTX_set_mode(m_ctx, SSL_CTX_get_mode(m_ctx) | SSL_MODE_AUTO_RETRY);
     }
 
-    CSecureSocketContext(const char* certfile, const char* privkeyfile, const char* passphrase, SecureSocketType sockettype)
+    void setCertificate(const char *certFileOrBuf)
     {
-        m_verify = false;
-        m_address_match = false;
+        if (isEmptyString(certFileOrBuf))
+            return;
 
-        if(sockettype == ClientSocket)
-            m_meth = SSLv23_client_method();
-        else
-            m_meth = SSLv23_server_method();
-
-        m_ctx = SSL_CTX_new(m_meth);
-
-        if(!m_ctx)
+        if (containsEmbeddedKey(certFileOrBuf))
         {
-            throw MakeStringException(-1, "ctx can't be created");
+            // can have multiple certs in buffer
+            if (!useCertificateChainPEMBuffer(m_ctx, certFileOrBuf))
+                throw makeEVPException(-1, "error loading certificate chain");
         }
-
-        if (sockettype == ServerSocket)
-            setSessionIdContext();
-
-        password.set(passphrase);
-        SSL_CTX_set_default_passwd_cb_userdata(m_ctx, (void*)password.str());
-        SSL_CTX_set_default_passwd_cb(m_ctx, pem_passwd_cb);
-
-        if (SSL_CTX_use_certificate_chain_file(m_ctx, certfile)<=0)
-        {
-            char errbuf[512];
-            ERR_error_string_n(ERR_get_error(), errbuf, 512);
-            throw MakeStringException(-1, "error loading certificate chain file %s - %s", certfile, errbuf);
-        }
-
-        if(SSL_CTX_use_PrivateKey_file(m_ctx, privkeyfile, SSL_FILETYPE_PEM) <= 0)
-        {
-            char errbuf[512];
-            ERR_error_string_n(ERR_get_error(), errbuf, 512);
-            throw MakeStringException(-1, "error loading private key file %s - %s", privkeyfile, errbuf);
-        }
-
-        if(!SSL_CTX_check_private_key(m_ctx))
-        {
-            throw MakeStringException(-1, "Private key does not match the certificate public key");
-        }
-        
-        SSL_CTX_set_mode(m_ctx, SSL_CTX_get_mode(m_ctx) | SSL_MODE_AUTO_RETRY);
+        else if (SSL_CTX_use_certificate_chain_file(m_ctx, certFileOrBuf) <= 0)
+            throw makeEVPExceptionV(-1, "error loading certificate chain file %s", certFileOrBuf);
     }
 
-    CSecureSocketContext(IPropertyTree* config, SecureSocketType sockettype)
+    void setPrivateKey(const char *privKeyFileOrBuf)
     {
-        assertex(config);
-        m_verify = false;
-        m_address_match = false;
+        if (isEmptyString(privKeyFileOrBuf))
+            return;
 
-        if(sockettype == ClientSocket)
-            m_meth = SSLv23_client_method();
-        else
-            m_meth = SSLv23_server_method();
-
-        m_ctx = SSL_CTX_new(m_meth);
-
-        if(!m_ctx)
+        if (containsEmbeddedKey(privKeyFileOrBuf))
         {
-            throw MakeStringException(-1, "ctx can't be created");
+            // single RSA key in buffer
+            if (!usePrivateKeyPEMBuffer(m_ctx, privKeyFileOrBuf))
+                throw makeEVPException(-1, "error loading private key");
         }
+        else if (SSL_CTX_use_PrivateKey_file(m_ctx, privKeyFileOrBuf, SSL_FILETYPE_PEM) <= 0)
+            throw makeEVPExceptionV(-1, "error loading private key file %s", privKeyFileOrBuf);
 
-        if (sockettype == ServerSocket)
-            setSessionIdContext();
+        if (!SSL_CTX_check_private_key(m_ctx))
+            throw makeStringException(-1, "Private key does not match the certificate public key");
+    }
 
-        const char *cipherList = config->queryProp("cipherList");
-        if (!cipherList || !*cipherList)
-            cipherList = "ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:ECDH+3DES:DH+3DES:RSA+AESGCM:RSA+AES:RSA+3DES:!aNULL:!MD5";
-        SSL_CTX_set_cipher_list(m_ctx, cipherList);
+    void setVerifyCerts(const char *caCertsPathOrBuf)
+    {
+        if (isEmptyString(caCertsPathOrBuf))
+            return;
 
-        const char* passphrase = config->queryProp("passphrase");
-        if(passphrase && *passphrase)
+        if (containsEmbeddedKey(caCertsPathOrBuf))
         {
-            StringBuffer pwd;
-            decrypt(pwd, passphrase);
-            password.set(pwd);
-            SSL_CTX_set_default_passwd_cb_userdata(m_ctx, (void*)password.str());
-            SSL_CTX_set_default_passwd_cb(m_ctx, pem_passwd_cb);
+            // can have multiple certs in buffer
+            if (!setVerifyCertsPEMBuffer(m_ctx, caCertsPathOrBuf))
+                throw makeStringException(-1, "Error loading CA certificates");
         }
+        else if (SSL_CTX_load_verify_locations(m_ctx, caCertsPathOrBuf, NULL) != 1)
+            throw makeStringExceptionV(-1, "Error loading CA certificates from %s", caCertsPathOrBuf);
+    }
 
-        const char* certfile = config->queryProp("certificate");
-        if(certfile && *certfile)
+    void createNewContext(const IPropertyTree* config)
+    {
+        initContext(sockettype);
+
+        if (config)
         {
-            if (SSL_CTX_use_certificate_chain_file(m_ctx, certfile) <= 0)
+            const char *cipherList = config->queryProp("cipherList");
+            if (!cipherList || !*cipherList)
+                cipherList = "ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:ECDH+3DES:DH+3DES:RSA+AESGCM:RSA+AES:RSA+3DES:!aNULL:!MD5";
+            SSL_CTX_set_cipher_list(m_ctx, cipherList);
+
+            const char* passphrase = config->queryProp("passphrase");
+            if (passphrase && *passphrase)
             {
-                char errbuf[512];
-                ERR_error_string_n(ERR_get_error(), errbuf, 512);
-                throw MakeStringException(-1, "error loading certificate chain file %s - %s", certfile, errbuf);
+                StringBuffer pwd;
+                decrypt(pwd, passphrase);
+                password.set(pwd);
+                SSL_CTX_set_default_passwd_cb_userdata(m_ctx, (void*)password.str());
+                SSL_CTX_set_default_passwd_cb(m_ctx, pem_passwd_cb);
             }
-        }
 
-        const char* privkeyfile = config->queryProp("privatekey");
-        if(privkeyfile && *privkeyfile)
-        {
-            if(SSL_CTX_use_PrivateKey_file(m_ctx, privkeyfile, SSL_FILETYPE_PEM) <= 0)
-            {
-                char errbuf[512];
-                ERR_error_string_n(ERR_get_error(), errbuf, 512);
-                throw MakeStringException(-1, "error loading private key file %s - %s", privkeyfile, errbuf);
-            }
-            if(!SSL_CTX_check_private_key(m_ctx))
-            {
-                throw MakeStringException(-1, "Private key does not match the certificate public key");
-            }
-        }
-    
-        SSL_CTX_set_mode(m_ctx, SSL_CTX_get_mode(m_ctx) | SSL_MODE_AUTO_RETRY);
+            const char *certFileOrBuf = config->queryProp("certificate_pem");
+            if (!certFileOrBuf)
+                certFileOrBuf = config->queryProp("certificate");
+            if (certFileOrBuf && *certFileOrBuf)
+                setCertificate(certFileOrBuf);
 
-        m_verify = config->getPropBool("verify/@enable");
-        m_address_match = config->getPropBool("verify/@address_match");
-        accept_selfsigned = config->getPropBool("verify/@accept_selfsigned");
+            const char *privKeyFileOrBuf = config->queryProp("privatekey_pem");
+            if (!privKeyFileOrBuf)
+                privKeyFileOrBuf = config->queryProp("privatekey");
+            if (privKeyFileOrBuf && *privKeyFileOrBuf)
+                setPrivateKey(privKeyFileOrBuf);
 
-        if(m_verify)
-        {
-            const char* capath = config->queryProp("verify/ca_certificates/@path");
-            if(capath && *capath)
+            m_verify = config->getPropBool("verify/@enable");
+            m_address_match = config->getPropBool("verify/@address_match");
+
+            if(m_verify)
             {
-                if(SSL_CTX_load_verify_locations(m_ctx, capath, NULL) != 1)
+                const char *caCertPathOrBuf = config->queryProp("verify/ca_certificates/pem");
+                if (!caCertPathOrBuf)
+                    caCertPathOrBuf = config->queryProp("verify/ca_certificates/@path");
+                if (caCertPathOrBuf && *caCertPathOrBuf)
+                    setVerifyCerts(caCertPathOrBuf);
+
+                bool acceptSelfSigned = config->getPropBool("verify/@accept_selfsigned");
+                SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT | SSL_VERIFY_CLIENT_ONCE, (acceptSelfSigned) ? verify_callback_allow_selfSigned : verify_callback_reject_selfSigned);
+
+                m_peers.setown(new CStringSet());
+                const char* peersstr = config->queryProp("verify/trusted_peers");
+                while(peersstr && *peersstr)
                 {
-                    throw MakeStringException(-1, "Error loading CA certificates from %s", capath);
-                }
-            }
+                    StringBuffer onepeerbuf;
+                    peersstr = strtok__(peersstr, "|", onepeerbuf);
+                    if(onepeerbuf.length() == 0)
+                        break;
 
-            SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT | SSL_VERIFY_CLIENT_ONCE, verify_callback);
-
-            m_peers.setown(new CStringSet());
-            const char* peersstr = config->queryProp("verify/trusted_peers");
-            while(peersstr && *peersstr)
-            {
-                StringBuffer onepeerbuf;
-                peersstr = strtok__(peersstr, "|", onepeerbuf);
-                if(onepeerbuf.length() == 0)
-                    break;
-
-                char*  onepeer = onepeerbuf.detach();
-                if (isdigit(*onepeer))
-                {
-                    char *dash = strrchr(onepeer, '-');
-                    if (dash)
+                    const char * onepeer = onepeerbuf.str();
+                    if (isdigit(*onepeer))
                     {
-                        *dash = 0;
-                        int last = atoi(dash+1);
-                        char *dot = strrchr(onepeer, '.');
-                        *dot = 0;
-                        int first = atoi(dot+1);
-                        for (int i = first; i <= last; i++)
+                        const char *dash = strrchr(onepeer, '-');
+                        const char *dot = strrchr(onepeer, '.');
+                        //Allow a range in the form a.b.c.d-e
+                        if (dash && dot && dot < dash)
                         {
-                            StringBuffer t;
-                            t.append(onepeer).append('.').append(i);
-                            m_peers->add(t.str());
+                            int first = atoi(dot+1);
+                            int last = atoi(dash+1);
+                            for (int i = first; i <= last; i++)
+                            {
+                                StringBuffer t;
+                                t.append(dot-onepeer, onepeer).append('.').append(i);
+                                m_peers->add(t.str());
+                            }
                         }
+                        else
+                            m_peers->add(onepeer);
                     }
                     else
-                    {
                         m_peers->add(onepeer);
-                    }
                 }
-                else
-                {
-                    m_peers->add(onepeer);
-                }
-                free(onepeer);
             }
+        }
+
+        SSL_CTX_set_mode(m_ctx, SSL_CTX_get_mode(m_ctx) | SSL_MODE_AUTO_RETRY);
+    }
+
+    ISecureSocket* createSecureSocketImpl(ISocket* sock, int loglevel, const char *fqdn)
+    {
+        if (syncedConfig)
+        {
+            //Check if a new context should be created - it must be called within a critical section
+            //NOTE: The openssl ctx is reference counted internally, so any existing sockets will still be valid.
+            //
+            //Once a CSecureSocket is created, it will be bound to the SSL_CTX that was used to create it.
+            //If the SSL_CTX is updated, existing CSecureSockets will continue to use the old SSL_CTX, and new CSecureSockets will use the new SSL_CTX.
+
+            SSL* ssl;
+            bool verify;
+            bool address_match;
+            Linked<CStringSet> peers;
+            {
+                CriticalBlock block(cs);
+                unsigned activeVersion = syncedConfig->getVersion();
+                if (activeVersion != configVersion)
+                {
+                    DBGLOG("CSecureSocketContext: Updating secure socket context from version %u to %u", configVersion, activeVersion);
+                    configVersion = activeVersion;
+                    Owned<const IPropertyTree> config = syncedConfig->getTree();
+                    createNewContext(config);
+                }
+                ssl = SSL_new(m_ctx);
+                if (ssl == nullptr)
+                    throw makeStringException(-1, "Can't create ssl");
+
+                verify = m_verify;
+                address_match = m_address_match;
+                peers.set(m_peers);
+            }
+            return new CSecureSocket(sock, ssl, verify, address_match, peers.getClear(), loglevel, fqdn);
+        }
+        else
+        {
+            SSL *ssl = SSL_new(m_ctx);
+            if (ssl == nullptr)
+                throw makeStringException(-1, "Can't create ssl");
+            return new CSecureSocket(sock, ssl, m_verify, m_address_match, m_peers.getLink(), loglevel, fqdn);
         }
     }
 
-    ~CSecureSocketContext()
+public:
+    CSecureSocketContext(const IPropertyTree* config, SecureSocketType _sockettype) : sockettype(_sockettype)
     {
-        SSL_CTX_free(m_ctx);
+        createNewContext(config);
     }
 
-    ISecureSocket* createSecureSocket(ISocket* sock, int loglevel)
+    CSecureSocketContext(const ISyncedPropertyTree* _syncedConfig, SecureSocketType _sockettype) : sockettype(_sockettype), syncedConfig(_syncedConfig)
     {
-        return new CSecureSocket(sock, m_ctx, m_verify, m_address_match, m_peers, loglevel);
+        Owned<const IPropertyTree> config;
+        if (syncedConfig)
+        {
+            configVersion = syncedConfig->getVersion();
+            config.setown(syncedConfig->getTree());
+        }
+        createNewContext(config);
     }
 
-    ISecureSocket* createSecureSocket(int sockfd, int loglevel)
+//interface ISecureSocketContext
+    ISecureSocket* createSecureSocket(ISocket* sock, int loglevel, const char *fqdn)
     {
-        return new CSecureSocket(sockfd, m_ctx, m_verify, m_address_match, m_peers, loglevel);
+        return createSecureSocketImpl(sock, loglevel, fqdn);
+    }
+
+    ISecureSocket* createSecureSocket(int sockfd, int loglevel, const char *fqdn)
+    {
+        Owned<ISocket> sock = ISocket::attach(sockfd);
+        return createSecureSocketImpl(sock.getClear(), loglevel, fqdn);
     }
 };
 
@@ -1198,8 +2966,6 @@ public:
         X509 *x509=NULL;
         EVP_PKEY *pkey=NULL;
 
-        CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
-
         bio_err=BIO_new_fp(stderr, BIO_NOCLOSE);
 
         if ((pkey=EVP_PKEY_new()) == NULL)
@@ -1234,8 +3000,13 @@ public:
         X509_NAME *name=NULL;
         X509_set_version(x509,3);
         ASN1_INTEGER_set(X509_get_serialNumber(x509), 0); // serial number set to 0
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         X509_gmtime_adj(X509_get_notBefore(x509),0);
         X509_gmtime_adj(X509_get_notAfter(x509),(long)60*60*24*m_days);
+#else
+        X509_gmtime_adj(X509_getm_notBefore(x509),0);
+        X509_gmtime_adj(X509_getm_notAfter(x509),(long)60*60*24*m_days);
+#endif
         X509_set_pubkey(x509, pkey);
 
         name=X509_get_subject_name(x509);
@@ -1347,12 +3118,12 @@ public:
         X509 *x509=NULL;
         EVP_PKEY *pkey=NULL;
 
-        CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
         bio_err=BIO_new_fp(stderr, BIO_NOCLOSE);
 
+# if OPENSSL_API_COMPAT < 0x10100000L
         OpenSSL_add_all_algorithms ();
         ERR_load_crypto_strings ();
-
+#endif
         pmem = BIO_new(BIO_s_mem());
         BIO_puts(pmem, privkey);
         if (!(pkey = PEM_read_bio_PrivateKey (pmem, NULL, NULL, (void*)m_passphrase.get())))
@@ -1364,8 +3135,13 @@ public:
         X509_NAME *name=NULL;
         X509_set_version(x509,3);
         ASN1_INTEGER_set(X509_get_serialNumber(x509), 0); // serial number set to 0
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         X509_gmtime_adj(X509_get_notBefore(x509),0);
         X509_gmtime_adj(X509_get_notAfter(x509),(long)60*60*24*m_days);
+#else
+        X509_gmtime_adj(X509_getm_notBefore(x509),0);
+        X509_gmtime_adj(X509_getm_notAfter(x509),(long)60*60*24*m_days);
+#endif
         X509_set_pubkey(x509, pkey);
 
         name=X509_get_subject_name(x509);
@@ -1478,11 +3254,12 @@ public:
         const EVP_MD *digest;
         BIO *pmem;
 
-        CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
         bio_err=BIO_new_fp(stderr, BIO_NOCLOSE);
 
+# if OPENSSL_API_COMPAT < 0x10100000L
         OpenSSL_add_all_algorithms ();
         ERR_load_crypto_strings ();
+#endif
 
         pmem = BIO_new(BIO_s_mem());
         BIO_puts(pmem, privkey);
@@ -1552,6 +3329,7 @@ public:
 #ifndef OPENSSL_NO_CRYPTO_MDEBUG
         CRYPTO_mem_leaks(bio_err);
 #endif
+        BIO_free(bio_err);
         BIO_free(pmem);
         BIO_free(reqmem);
         EVP_PKEY_free (pkey);
@@ -1560,58 +3338,72 @@ public:
     }
 };
 
-}
+} // namespace securesocket
 
 extern "C" {
-CriticalSection factoryCrit;
 
 SECURESOCKET_API ISecureSocketContext* createSecureSocketContext(SecureSocketType sockettype)
 {
-    CriticalBlock b(factoryCrit);
-    if(sockettype == ClientSocket)
-    {
-        return new securesocket::CSecureSocketContext(sockettype);
-    }
-    else
-    {
-        if(server_securesocket_context.get() == NULL)
-            server_securesocket_context.setown(new securesocket::CSecureSocketContext(sockettype));
-        return server_securesocket_context.getLink();
-    }
+    return new securesocket::CSecureSocketContext((ISyncedPropertyTree *)nullptr, sockettype);
 }
 
-SECURESOCKET_API ISecureSocketContext* createSecureSocketContextEx(const char* certfile, const char* privkeyfile, const char* passphrase, SecureSocketType sockettype)
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextSynced(const ISyncedPropertyTree * config, SecureSocketType sockettype)
 {
-    CriticalBlock b(factoryCrit);
-    if(sockettype == ClientSocket)
-    {
-        return new securesocket::CSecureSocketContext(certfile, privkeyfile, passphrase, sockettype);
-    }
-    else
-    {
-        if(server_securesocket_context.get() == NULL)
-            server_securesocket_context.setown(new securesocket::CSecureSocketContext(certfile, privkeyfile, passphrase, sockettype));
-        return server_securesocket_context.getLink();
-    }
+    return new securesocket::CSecureSocketContext(config, sockettype);
 }
 
-SECURESOCKET_API ISecureSocketContext* createSecureSocketContextEx2(IPropertyTree* config, SecureSocketType sockettype)
-{
-    if(config == NULL)
-        return createSecureSocketContext(sockettype);
 
-    CriticalBlock b(factoryCrit);
-    if(sockettype == ClientSocket)
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextSecret(const char *issuer, SecureSocketType sockettype)
+{
+    Owned<const ISyncedPropertyTree> info = getIssuerTlsSyncedConfig(issuer);
+    return createSecureSocketContextSynced(info, sockettype);
+}
+
+
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextSecretSrv(const char *issuer, const char *optTrustedPeers, bool requireMtlsFlag)
+{
+    if (requireMtlsFlag && !queryMtls())
+        throw makeStringException(-100, "MTLS secure context required but not configured");
+
+    Owned<const ISyncedPropertyTree> info = getIssuerTlsSyncedConfig(issuer, optTrustedPeers, false);
+
+    if (!info->isValid())
+        throw makeStringExceptionV(-101, "TLS issuer %s secure context requested but not configured (2)", issuer);
+
+    return createSecureSocketContextSynced(info, ServerSocket);
+}
+
+IPropertyTree * createSecureSocketConfig(const char* certFileOrBuf, const char* privKeyFileOrBuf, const char* passphrase, bool createIfAllNull)
+{
+    if (!createIfAllNull)
     {
-        return new securesocket::CSecureSocketContext(config, sockettype);
+        if (!certFileOrBuf && !privKeyFileOrBuf && !passphrase)
+            return nullptr;
     }
-    else
-    {
-        if(server_securesocket_context.get() == NULL)
-            server_securesocket_context.setown(new securesocket::CSecureSocketContext(config, sockettype));
-        return server_securesocket_context.getLink();
-    }
-}       
+
+    Owned<IPropertyTree> config = createPTree("ssl");
+    if (certFileOrBuf)
+        config->setProp("certificate", certFileOrBuf);
+    if (privKeyFileOrBuf)
+        config->setProp("privatekey", privKeyFileOrBuf);
+    if (passphrase)
+        config->setProp("passphrase", passphrase);
+    return config.getClear();
+}
+
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextSSF(ISmartSocketFactory* ssf)
+{
+    if (ssf == nullptr)
+        return createSecureSocketContext(ClientSocket);
+
+    return createSecureSocketContextSynced(ssf->queryTlsConfig(), ClientSocket);
+}
+
+//Legacy factory interfaces
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextEx2(const IPropertyTree* config, SecureSocketType sockettype)
+{
+    return new securesocket::CSecureSocketContext(config, sockettype);
+}
 
 SECURESOCKET_API ICertificate *createCertificate()
 {
@@ -1629,8 +3421,10 @@ SECURESOCKET_API int signCertificate(const char* csr, const char* ca_certificate
     if(days <= 0)
         days = 365;
 
+# if OPENSSL_API_COMPAT < 0x10100000L
     OpenSSL_add_all_algorithms ();
     ERR_load_crypto_strings ();
+#endif
     
     BIO *bio_err;
     bio_err=BIO_new_fp(stderr, BIO_NOCLOSE);
@@ -1667,10 +3461,14 @@ SECURESOCKET_API int signCertificate(const char* csr, const char* ca_certificate
 
     //set public key in the certificate
     X509_set_pubkey (cert, pkey);
-
     // set duration for the certificate
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     X509_gmtime_adj (X509_get_notBefore (cert), 0);
     X509_gmtime_adj (X509_get_notAfter (cert), days*24*60*60);
+#else
+    X509_gmtime_adj (X509_getm_notBefore (cert), 0);
+    X509_gmtime_adj (X509_getm_notAfter (cert), days*24*60*60);
+#endif
 
     // sign the certificate with the CA private key
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
@@ -1700,6 +3498,7 @@ SECURESOCKET_API int signCertificate(const char* csr, const char* ca_certificate
 #ifndef OPENSSL_NO_CRYPTO_MDEBUG
     CRYPTO_mem_leaks(bio_err);
 #endif
+    BIO_free(bio_err);
     BIO_free(csrmem);
     BIO_free(cacertmem);
     BIO_free(cmem);
@@ -1708,16 +3507,21 @@ SECURESOCKET_API int signCertificate(const char* csr, const char* ca_certificate
     return 0;
 }
 
-}
+} // extern C
 
 class CSecureSmartSocketFactory : public CSmartSocketFactory
 {
 public:
     Owned<ISecureSocketContext> secureContext;
 
-    CSecureSmartSocketFactory(const char *_socklist, bool _retry, unsigned _retryInterval, unsigned _dnsInterval) : CSmartSocketFactory(_socklist, _retry, _retryInterval, _dnsInterval)
+    CSecureSmartSocketFactory(const char *_socklist, IPropertyTree *_tlsConfig, bool _retry, unsigned _retryInterval, unsigned _dnsInterval) : CSmartSocketFactory(_socklist, _tlsConfig, _retry, _retryInterval, _dnsInterval)
     {
         secureContext.setown(createSecureSocketContext(ClientSocket));
+    }
+
+    CSecureSmartSocketFactory(IPropertyTree &service, bool _retry, unsigned _retryInterval, unsigned _dnsInterval) : CSmartSocketFactory(service, _retry, _retryInterval, _dnsInterval)
+    {
+        secureContext.setown(createSecureSocketContextSynced(queryTlsConfig(), ClientSocket));
     }
 
     virtual ISmartSocket *connect_timeout(unsigned timeoutms) override
@@ -1743,7 +3547,94 @@ public:
     }
 };
 
-ISmartSocketFactory *createSecureSmartSocketFactory(const char *_socklist, bool _retry, unsigned _retryInterval, unsigned _dnsInterval)
+ISmartSocketFactory *createSecureSmartSocketFactory(const char *_socklist, IPropertyTree* _tlsConfig, bool _retry, unsigned _retryInterval, unsigned _dnsInterval)
 {
-    return new CSecureSmartSocketFactory(_socklist, _retry, _retryInterval, _dnsInterval);
+    return new CSecureSmartSocketFactory(_socklist, _tlsConfig, _retry, _retryInterval, _dnsInterval);
+}
+
+ISmartSocketFactory *createSecureSmartSocketFactory(IPropertyTree &service, bool _retry, unsigned _retryInterval, unsigned _dnsInterval)
+{
+    return new CSecureSmartSocketFactory(service, _retry, _retryInterval, _dnsInterval);
+}
+
+class CSingletonSecureSocketConnection: public CSingletonSocketConnection
+{
+public:
+    Owned<ISecureSocketContext> secureContextClient;
+    Owned<ISecureSocketContext> secureContextServer;
+    int tlsLogLevel;
+
+    CSingletonSecureSocketConnection(SocketEndpoint &_ep)
+    {
+        ep = _ep;
+        state = Snone;
+        cancelling = false;
+        secureContextClient.setown(createSecureSocketContextSecret("local", ClientSocket));
+        secureContextServer.setown(createSecureSocketContextSecretSrv("local", nullptr, true));
+#ifdef _CONTAINERIZED
+        tlsLogLevel = getComponentConfigSP()->getPropInt("logging/@detail", SSLogMin);
+        if (tlsLogLevel >= ExtraneousMsgThreshold) // or InfoMsgThreshold ?
+            tlsLogLevel = SSLogMax;
+#else
+        tlsLogLevel = SSLogMin;
+#endif
+    }
+
+    virtual ~CSingletonSecureSocketConnection()
+    {
+        shutdownAndCloseNoThrow(sock);
+    }
+
+    bool connect(unsigned timeoutms) override
+    {
+        bool srtn = CSingletonSocketConnection::connect(timeoutms);
+        if (srtn)
+        {
+            Owned<ISecureSocket> ssock = secureContextClient->createSecureSocket(sock.getClear(), tlsLogLevel);
+            int status = ssock->secure_connect(tlsLogLevel);
+            if (status < 0)
+            {
+                ssock->close();
+                return false;
+            }
+            else
+            {
+                sock.setown(ssock.getClear());
+                return true;
+            }
+        }
+        return srtn;
+    }
+
+    bool accept(unsigned timeoutms) override
+    {
+        bool srtn = CSingletonSocketConnection::accept(timeoutms);
+        if (srtn)
+        {
+            Owned<ISecureSocket> ssock = secureContextServer->createSecureSocket(sock.getClear(), tlsLogLevel);
+            int status = ssock->secure_accept(tlsLogLevel);
+            if (status < 0)
+            {
+                ssock->close();
+                return false;
+            }
+            else
+            {
+                sock.setown(ssock.getClear());
+                return true;
+            }
+        }
+        return srtn;
+    }
+
+};
+
+IConversation *createSingletonSecureSocketConnection(unsigned short port,SocketEndpoint *_ep)
+{
+    SocketEndpoint ep;
+    if (_ep)
+        ep = *_ep;
+    if (port)
+        ep.port = port;
+    return new CSingletonSecureSocketConnection(ep);
 }

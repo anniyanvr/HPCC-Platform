@@ -17,6 +17,7 @@
 
 #include "jio.hpp"
 #include "jfile.hpp"
+#include "jplane.hpp"
 #include "jtime.hpp"
 #include "jsort.hpp"
 
@@ -44,6 +45,7 @@ class CIndexReadSlaveBase : public CSlaveActivity
 protected:
     StringAttr logicalFilename;
     IArrayOf<IPartDescriptor> partDescs;
+    bool isSuperFile = false;
     IHThorIndexReadBaseArg *helper;
     IHThorSourceLimitTransformExtra * limitTransformExtra;
     Owned<IEngineRowAllocator> allocator;
@@ -75,44 +77,31 @@ protected:
     rowcount_t keyedProcessed = 0;
     rowcount_t rowLimit = RCMAX;
     bool useRemoteStreaming = false;
+    Owned<IFileIO> lazyIFileIO;
+    mutable CriticalSection keyManagersCS{SYNC_LOCATION};  // CS for any updates to keyManagers
+    unsigned fileTableStart = NotFound;
+    std::vector<Owned<CStatsContextLogger>> contextLoggers;
+    IndexReadOptions foreignReadOptions{ (size32_t)-1, (size32_t)-1 };
 
-    template<class StatProvider>
-    class CCaptureIndexStats
-    {
-        CRuntimeStatisticCollection &stats;
-        StatProvider &statProvider;
-        unsigned __int64 startSeeks = 0, startScans = 0, startWildSeeks = 0;
-    public:
-        inline CCaptureIndexStats(CRuntimeStatisticCollection &_stats, StatProvider &_statProvider) : stats(_stats), statProvider(_statProvider)
-        {
-            startSeeks = statProvider.querySeeks();
-            startScans = statProvider.queryScans();
-            startWildSeeks = statProvider.queryWildSeeks();
-        }
-        inline ~CCaptureIndexStats()
-        {
-            stats.mergeStatistic(StNumIndexSeeks, statProvider.querySeeks() - startSeeks);
-            stats.mergeStatistic(StNumIndexScans, statProvider.queryScans() - startScans);
-            stats.mergeStatistic(StNumIndexWildSeeks, statProvider.queryWildSeeks() - startWildSeeks);
-        }
-    };
 
     class TransformCallback : implements IThorIndexCallback , public CSimpleInterface
     {
     protected:
         CIndexReadSlaveBase &activity;
         IKeyManager *keyManager = nullptr;
+        bool needsBlobCleaning = false;
     public:
         TransformCallback(CIndexReadSlaveBase &_activity) : activity(_activity) { };
         IMPLEMENT_IINTERFACE_O_USING(CSimpleInterface)
 
     //IThorIndexCallback
         virtual const byte *lookupBlob(unsigned __int64 id) override
-        { 
+        {
             size32_t dummy;
             if (!keyManager)
                 throw MakeActivityException(&activity, 0, "Callback attempting to read blob with no key manager - index being read remotely?");
-            return (byte *) keyManager->loadBlob(id, dummy); 
+            needsBlobCleaning = true;
+            return (byte *) keyManager->loadBlob(id, dummy, nullptr);
         }
         void prepareManager(IKeyManager *_keyManager)
         {
@@ -121,8 +110,11 @@ protected:
         }
         void finishedRow()
         {
-            if (keyManager)
-                keyManager->releaseBlobs(); 
+            if (needsBlobCleaning)
+            {
+                needsBlobCleaning = false;
+                keyManager->releaseBlobs();
+            }
         }
         void resetManager()
         {
@@ -142,7 +134,7 @@ protected:
         unsigned expectedFormatCrc = helper->getDiskFormatCrc();
         IOutputMetaData *expectedFormat = helper->queryDiskRecordSize();
 
-        Owned<ITranslator> ret = ::getTranslators("rowstream", expectedFormatCrc, expectedFormat, publishedFormatCrc, publishedFormat, projectedFormatCrc, projectedFormat, translationMode);
+        Owned<ITranslator> ret = ::getTranslators(logicalFilename, expectedFormatCrc, expectedFormat, publishedFormatCrc, publishedFormat, projectedFormatCrc, projectedFormat, translationMode);
         if (!ret)
             return nullptr;
         if (!ret->queryTranslator().canTranslate())
@@ -177,10 +169,9 @@ public:
             unsigned projectedFormatCrc = helper->getProjectedFormatCrc();
             IOutputMetaData *projectedFormat = helper->queryProjectedDiskRecordSize();
 
-            unsigned p = partNum;
-            while (p<partDescs.ordinality()) // will process all parts if localMerge
+            for (unsigned p = partNum; p<partDescs.ordinality(); p++) // will process all parts if localMerge
             {
-                IPartDescriptor &part = partDescs.item(p++);
+                IPartDescriptor &part = partDescs.item(p);
                 unsigned crc=0;
                 part.getCrc(crc);
 
@@ -261,6 +252,7 @@ public:
 
                             StringBuffer lPath;
                             rfn.getLocalPath(lPath);
+                            // todo: track stats when using remote handler
                             Owned<IIndexLookup> indexLookup = createRemoteFilteredKey(ep, lPath, crc, actualFormat, projectedFormat, actualFilter, remoteLimit);
                             if (indexLookup)
                             {
@@ -271,7 +263,7 @@ public:
                                 catch (IException *e)
                                 {
     #ifdef _DEBUG
-                                    EXCLOG(e, nullptr);
+                                    DBGLOG(e);
     #endif
                                     if (remoteReadException)
                                         e->Release(); // only record 1st
@@ -283,7 +275,7 @@ public:
                                     continue; // try next copy and ultimately failover to local when no more copies
                                 }
                                 ActPrintLog("[part=%d]: reading remote dafilesrv index '%s' (logical file = %s)", partNum, path.str(), logicalFilename.get());
-                                partNum = p;
+                                partNum = (p+1); // NB: returning next part number to process.
                                 return indexLookup.getClear();
                             }
                         }
@@ -298,16 +290,26 @@ public:
                 }
 
                 // local key handling
-
-                Owned<IFileIO> lazyIFileIO = queryThor().queryFileCache().lookupIFileIO(*this, logicalFilename, part);
+                lazyIFileIO.setown(queryThor().queryFileCache().lookupIFileIO(*this, logicalFilename, part, nullptr, indexReadFileStatistics));
 
                 RemoteFilename rfn;
                 part.getFilename(0, rfn);
                 StringBuffer path;
                 rfn.getPath(path); // NB: use for tracing only, IDelayedFile uses IPartDescriptor and any copy
 
-                Owned<IKeyIndex> keyIndex = createKeyIndex(path, crc, *lazyIFileIO, (unsigned) -1, false, false);
-                Owned<IKeyManager> klManager = createLocalKeyManager(helper->queryDiskRecordSize()->queryRecordAccessor(true), keyIndex, nullptr, helper->hasNewSegmentMonitors(), false);
+                IndexReadOptions readOptions;
+                if (foreignReadOptions.randomReadSize != (size32_t)-1) // set in init if foreign
+                    readOptions = foreignReadOptions;
+                else
+                {
+                    StringBuffer planeName;
+                    part.queryOwner().getClusterLabel(0, planeName);
+                    readOptions = getIndexReadOptions(planeName);
+                }
+
+                Owned<IKeyIndex> keyIndex = createKeyIndex(path, crc, *lazyIFileIO, (unsigned) -1, false, readOptions);
+                IContextLogger * contextLogger = isSuperFile?contextLoggers[p]:contextLoggers[0];
+                Owned<IKeyManager> klManager = createLocalKeyManager(helper->queryDiskRecordSize()->queryRecordAccessor(true), keyIndex, contextLogger, helper->hasNewSegmentMonitors(), false);
                 if (localMerge)
                 {
                     if (!keyIndexSet)
@@ -318,7 +320,10 @@ public:
                         translators.append(translator.getClear());
                     }
                     keyIndexSet->addIndex(keyIndex.getClear());
-                    keyManagers.append(*klManager.getLink());
+                    {
+                        CriticalBlock b(keyManagersCS);
+                        keyManagers.append(*klManager.getLink());
+                    }
                     keyManager = klManager;
                 }
                 else
@@ -328,12 +333,16 @@ public:
                     if (translator)
                         klManager->setLayoutTranslator(&translator->queryTranslator());
                     translators.append(translator.getClear());
-                    keyManagers.append(*klManager.getLink());
+                    {
+                        CriticalBlock b(keyManagersCS);
+                        keyManagers.append(*klManager.getLink());
+                    }
                     keyManager = klManager;
-                    partNum = p;
+                    partNum = (p+1); // NB: returning next part number to process.
                     return createIndexLookup(keyManager);
                 }
             }
+            //Not tracking jhtree cache stats in KeyMerger at the moment.  Future: something to consider
             keyMergerManager.setown(createKeyMerger(helper->queryDiskRecordSize()->queryRecordAccessor(true), keyIndexSet, seekGEOffset, nullptr, helper->hasNewSegmentMonitors(), false));
             const ITranslator *translator = translators.item(0);
             if (translator)
@@ -357,6 +366,7 @@ public:
         {
             resetManager(currentManager);
             currentManager = nullptr;
+            lazyIFileIO.clear();
         }
         IKeyManager *keyManager = nullptr;
         currentInput.setown(getNextInput(keyManager, currentPart, true));
@@ -410,12 +420,9 @@ public:
         const void *ret = nullptr;
         while (true)
         {
-            {
-                CCaptureIndexStats<IIndexLookup> scoped(stats, *currentInput);
-                ret = currentInput->nextKey();
-                if (ret)
-                    break;
-            }
+            ret = currentInput->nextKey();
+            if (ret)
+                break;
             configureNextInput();
             if (!currentInput)
                 break;
@@ -491,8 +498,11 @@ public:
 
         if ((RCMAX != keyedLimit) && (keyedLimit+1 < remoteLimit))
             remoteLimit = keyedLimit+1; // 1 more to ensure triggered when received back.
-        if ((RCMAX != rowLimit) && (rowLimit+1 < remoteLimit))
-            remoteLimit = rowLimit+1; // 1 more to ensure triggered when received back.
+        if (!mayFilter)
+        {
+            if ((RCMAX != rowLimit) && (rowLimit+1 < remoteLimit))
+                remoteLimit = rowLimit+1; // 1 more to ensure triggered when received back.
+        }
     }
     void calcKeyedLimitCount()
     {
@@ -510,7 +520,8 @@ public:
         deserializer.set(queryRowDeserializer());
         serializer.set(queryRowSerializer());
         helper->setCallback(&callback);
-        reInit = 0 != (helper->getFlags() & (TIRvarfilename|TIRdynamicfilename));
+        unsigned flags = helper->getFlags();
+        reInit = (0 != (flags & (TIRvarfilename|TIRdynamicfilename))) && (0 == (flags & TIRinvariantfilename));
     }
     rowcount_t getLocalCount(const rowcount_t keyedLimit, bool hard)
     {
@@ -528,7 +539,6 @@ public:
                 break;
             if (keyManager)
                 prepareManager(keyManager);
-            CCaptureIndexStats<IIndexLookup> scoped(stats, *indexInput);
             if (hard) // checkCount checks hard key count only.
                 count += indexInput->checkCount(keyedLimit-count); // part max, is total limit [keyedLimit] minus total so far [count]
             else
@@ -555,6 +565,17 @@ public:
     virtual void init(MemoryBuffer &data, MemoryBuffer &slaveData)
     {
         data.read(logicalFilename);
+
+        CDfsLogicalFileName dlfn;
+        dlfn.set(logicalFilename);
+
+        foreignReadOptions = { (size32_t)-1, (size32_t)-1 };
+        if (dlfn.isForeign())
+        {
+            // all other logical files will map to a plane (inc. ~remote files), for foreign files we look for an expert setting which defines sequential and random block size
+            foreignReadOptions = getForeignIndexReadOptions(); // defaults to sensible sizes in containerized
+        }
+
         if (!container.queryLocalOrGrouped())
             mpTag = container.queryJobChannel().deserializeMPTag(data); // channel to pass back partial counts for aggregation
         if (initialized)
@@ -562,12 +583,15 @@ public:
             partDescs.kill();
             keyIndexSet.clear();
             translators.kill();
-            keyManagers.kill();
+            {
+                CriticalBlock b(keyManagersCS);
+                keyManagers.kill();
+            }
             keyMergerManager.clear();
         }
         else
             initialized = true;
-        
+
         unsigned parts;
         data.read(parts);
         if (parts)
@@ -579,6 +603,8 @@ public:
         {
             IPartDescriptor &part0 = partDescs.item(0);
             IFileDescriptor &fileDesc = part0.queryOwner();
+            ISuperFileDescriptor *super = fileDesc.querySuperFileDescriptor();
+            isSuperFile = super != nullptr;
 
             if ((0 == (helper->getFlags() & TIRusesblob)) && !localMerge)
             {
@@ -655,12 +681,23 @@ public:
                     }
                 }
             }
+            data.read(fileTableStart);
+            setupSpace4FileStats(fileTableStart, reInit, isSuperFile, isSuperFile?super->querySubFiles():0, indexReadFileStatistics);
+            if (isSuperFile)
+            {
+                // Only superfiles required multiple context loggers to track sublevel stats
+                for(unsigned i = 0; i < parts; ++i)
+                    contextLoggers.push_back(new CStatsContextLogger(jhtreeCacheStatistics));
+            }
+            else
+            {
+                contextLoggers.push_back(new CStatsContextLogger(jhtreeCacheStatistics));
+            }
         }
     }
     // IThorDataLink
     virtual void start() override
     {
-        ActivityTimer s(slaveTimerStats, timeActivities);
         PARENT::start();
         keyedProcessed = 0;
         if (!eoi)
@@ -686,10 +723,87 @@ public:
             currentManager = nullptr;
         }
     }
+    virtual void gatherActiveStats(CRuntimeStatisticCollection &activeStats) const
+    {
+        PARENT::gatherActiveStats(activeStats);
+        // *) jhtree stats will have been tracked as follows
+        //    - For superfiles, there will be 1 IContextLogger in contextLoggers[] for each part
+        //    - In all other cases, use 1st IContextLogger in contextLoggers[] for all parts
+        // *) File IO stats will have been tracked as follows
+        //    - the io stats will be tracked in keyManagers[]
+        //    - (There will be exactly 1 keyManager per part)
+        // Note: the KeyManagers[], contextLoggers[] and fileStats[] are not necessarilly the same size
+        // - KeyManagers[] will always be the same size as partDescs[]
+        // - contextLoggers[] will be the size of the number of subfiles for superfiles, otherwise 1
+        // - fileStats[] may be size of #subfiles for superfiles, size 1 for dynamic/variable files, or
+        //   zero for everything else
+        // This function will:
+        // 1) In all cases, activeStats will have activity level jhtree & io stats
+        // 2) For superfiles and variable/dynamic files, fileStats[] will have jhtree & io stats
+        //    (If there are no fileStats, the file level stats can be extracted from activeStats)
+        // TODO:
+        // * When localMerge==true or when useMerger==true, stats may not correct.  Revisit
+        //   this section to ensure that the code handles these correctly.
+        if (partDescs.ordinality())
+        {
+            // reset required because within loop below, mergeStats() is used to build up stats for each file
+            for (auto & fileStatItem: fileStats)
+                fileStatItem->reset();
+            ISuperFileDescriptor *superFDesc = partDescs.item(0).queryOwner().querySuperFileDescriptor();
+            for (unsigned partNum=0; partNum<partDescs.ordinality(); partNum++)
+            {
+                IKeyManager * keyManager;
+                {
+                    CriticalBlock b(keyManagersCS);
+                    if (!keyManagers.isItem(partNum))
+                        continue;
+                    keyManager = &keyManagers.item(partNum);
+                }
+                if (fileStats.size()>0)
+                {
+                    unsigned subfile = 0;
+                    // For super file workout entry number in filestats for subfile
+                    // (For non-superfiles, subfile will be zero, so first entry from fileStats will be used)
+                    if (isSuperFile)
+                    {
+                        unsigned lnum;
+                        if(!superFDesc->mapSubPart(partDescs.item(partNum).queryPartIndex(), subfile, lnum))
+                            continue; // should not happen
+                    }
+                    CRuntimeStatisticCollection * fileStatItem = fileStats[fileTableStart+subfile];
+                    keyManager->mergeStats(*fileStatItem); // file level IO stats
+                    // Merge subfile jhtree stats into fileStats and activeStats
+                    if (isSuperFile)
+                    {
+                        fileStatItem->merge(contextLoggers[partNum]->queryStats());
+                        activeStats.merge(contextLoggers[partNum]->queryStats());
+                    }
+                }
+                // IO stats always needed in activeStats for activity level stats
+                keyManager->mergeStats(activeStats);
+            }
+            // ContextLoggers for non-superfile, not merged to activeStats or fileStats
+            // (Avoid doing in loop above, to avoid merging same jhtree stats multiple times)
+            if (!isSuperFile)
+            {
+                activeStats.merge(contextLoggers[0]->queryStats());
+                if (fileStats.size()>0)
+                    fileStats[fileTableStart]->merge(contextLoggers[0]->queryStats());
+            }
+        }
+        activeStats.setStatistic(StNumRowsProcessed, progress);
+    }
     virtual void serializeStats(MemoryBuffer &mb) override
     {
-        stats.setStatistic(StNumRowsProcessed, progress);
         PARENT::serializeStats(mb);
+        mb.append((unsigned)fileStats.size());
+        for (auto &stats: fileStats)
+            stats->serialize(mb);
+    }
+    virtual void done() override
+    {
+        lazyIFileIO.clear();
+        PARENT::done();
     }
 };
 
@@ -713,7 +827,7 @@ class CIndexReadSlaveActivity : public CIndexReadSlaveBase
         auto onScopeExitFunc = [&]()
         {
             if (postFiltered > 0)
-                stats.mergeStatistic(StNumPostFiltered, postFiltered);
+                inactiveStats.mergeStatistic(StNumPostFiltered, postFiltered);
         };
         COnScopeExit scoped(onScopeExitFunc);
         RtlDynamicRowBuilder ret(allocator);
@@ -727,11 +841,9 @@ class CIndexReadSlaveActivity : public CIndexReadSlaveBase
                 if (needTransform)
                 {
                     size32_t sz = helper->transform(ret, r);
+                    callback.finishedRow();
                     if (sz)
-                    {
-                        callback.finishedRow();
                         return ret.finalizeRowClear(sz);
-                    }
                     else
                         ++postFiltered;
                 }
@@ -770,7 +882,6 @@ class CIndexReadSlaveActivity : public CIndexReadSlaveBase
             helper->mapOutputToInput(tempBuilder, seek, numFields); // NOTE - weird interface to mapOutputToInput means that it STARTS writing at seekGEOffset...
             rawSeek = (byte *)temp;
         }
-        CCaptureIndexStats<IKeyManager> scoped(stats, *currentManager);
         if (!currentManager->lookupSkip(rawSeek, seekGEOffset, seekSize))
             return NULL;
         const byte *row = currentManager->queryKeyBuffer();
@@ -791,7 +902,7 @@ class CIndexReadSlaveActivity : public CIndexReadSlaveBase
         auto onScopeExitFunc = [&]()
         {
             if (postFiltered > 0)
-                stats.mergeStatistic(StNumPostFiltered, postFiltered);
+                inactiveStats.mergeStatistic(StNumPostFiltered, postFiltered);
         };
         COnScopeExit scoped(onScopeExitFunc);
         RtlDynamicRowBuilder ret(allocator);
@@ -810,11 +921,9 @@ class CIndexReadSlaveActivity : public CIndexReadSlaveBase
                 if (needTransform)
                 {
                     size32_t sz = helper->transform(ret, r);
+                    callback.finishedRow();
                     if (sz)
-                    {
-                        callback.finishedRow();
                         return ret.finalizeRowClear(sz);
-                    }
                     else
                     {
                         if (optimizeSteppedPostFilter && stepExtra.returnMismatches())
@@ -822,10 +931,10 @@ class CIndexReadSlaveActivity : public CIndexReadSlaveBase
                             if (memcmp(ret.getSelf() + seekGEOffset, seek, seekSize) != 0)
                             {
                                 size32_t sz = helper->unfilteredTransform(ret, r);
+                                callback.finishedRow();
                                 if (sz)
                                 {
                                     wasCompleteMatch = false;
-                                    callback.finishedRow();
                                     return ret.finalizeRowClear(sz);
                                 }
                                 else
@@ -868,7 +977,7 @@ public:
             const CFieldOffsetSize * fields = rawMeta->queryFields();
             unsigned maxFields = rawMeta->getNumFields();
             seekGEOffset = fields[0].offset;
-            seekSizes.ensure(maxFields);
+            seekSizes.ensureCapacity(maxFields);
             seekSizes.append(fields[0].size);
             for (unsigned i=1; i < maxFields; i++)
                 seekSizes.append(seekSizes.item(i-1) + fields[i].size);
@@ -1050,6 +1159,13 @@ public:
         merging = false;
         appendOutputLinked(this);
     }
+    virtual unsigned __int64 queryLookAheadCycles() const
+    {
+        cycle_t lookAheadCycles = PARENT::queryLookAheadCycles();
+        if (distributor)
+            lookAheadCycles += distributor->queryLookAheadCycles();
+        return lookAheadCycles;
+    }
 // IHThorGroupAggregateCallback
     virtual void processRow(const void *next)
     {
@@ -1094,7 +1210,6 @@ public:
                     if (keyManager)
                         prepareManager(keyManager);
 
-                    CCaptureIndexStats<IIndexLookup> scoped(stats, *indexInput);
                     while (true)
                     {
                         const void *key = indexInput->nextKey();
@@ -1208,7 +1323,8 @@ public:
         ActivityTimer s(slaveTimerStats, timeActivities);
 
         // NB: initLimits sets up remoteLimit before base start() call, because if parts are remote PARENT::start() will use remoteLimit
-        initLimits(helper->getChooseNLimit(), helper->getKeyedLimit(), helper->getRowLimit(), helper->hasMatchFilter());
+        // NB2: I'm not sure if hasMatchFilter() can ever actually be generated.
+        initLimits(helper->getChooseNLimit(), helper->getKeyedLimit(), helper->getRowLimit(), helper->hasFilter() || helper->hasMatchFilter());
         calcKeyedLimitCount();
 
         PARENT::start();
@@ -1252,7 +1368,6 @@ public:
                         if (keyManager)
                             prepareManager(keyManager);
 
-                        CCaptureIndexStats<IIndexLookup> scoped(stats, *indexInput);
                         while (true)
                         {
                             const void *key = indexInput->nextKey();
@@ -1384,7 +1499,8 @@ public:
         ActivityTimer s(slaveTimerStats, timeActivities);
 
         // NB: initLimits sets up remoteLimit before base start() call, because if parts are remote PARENT::start() will use remoteLimit
-        initLimits(helper->getChooseNLimit(), helper->getKeyedLimit(), helper->getRowLimit(), helper->hasMatchFilter());
+        // NB2: mayFilter=true assumed, because there is no flag to indicate post-filtering
+        initLimits(helper->getChooseNLimit(), helper->getKeyedLimit(), helper->getRowLimit(), true);
         calcKeyedLimitCount();
 
         PARENT::start();
@@ -1445,12 +1561,12 @@ public:
 
             for (;;)
             {
-                callback.finishedRow();
                 const void *rec = nextKey();
                 if (rec)
                 {
                     ++progress;
                     expanding = helper->first(rec);
+                    callback.finishedRow(); // first() can lookup blobs
                     if (expanding)
                     {
                         OwnedConstThorRow row = createNextRow();

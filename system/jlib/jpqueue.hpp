@@ -30,17 +30,17 @@
 #include <list>
 #include <vector>
 
-template<typename T> class WaitQueue: public CInterface, protected Mutex
+template<typename T> class WaitQueue: public CInterface
 {
 public:
-    WaitQueue(): counter(), stopped(false), waiting(0)
+    WaitQueue(): waiting(0), stopped(false)
     {
     }
 
     ~WaitQueue()
     {
         stop();
-        synchronized block(*this); 
+        synchronized block(mutex); 
         while(waiting)
         {
             counter.signal(waiting); // actually need only one and only once
@@ -50,13 +50,13 @@ public:
 
     unsigned size()
     {
-        synchronized block(*this);
+        synchronized block(mutex);
         return queue.size();
     }
 
     T get(unsigned timeout=INFINITE)
     {
-        synchronized block(*this);
+        synchronized block(mutex);
         for(;;)
         {
             if(stopped)
@@ -73,7 +73,7 @@ public:
 
     bool put(const T& item)
     {
-        synchronized block(*this);
+        synchronized block(mutex);
         if(stopped)
             return true;
         queue.push_back(item);
@@ -83,7 +83,7 @@ public:
 
     void stop()
     {
-        synchronized block(*this);
+        synchronized block(mutex);
         stopped=true;
         queue.clear();
         counter.signal(waiting);
@@ -91,29 +91,31 @@ public:
 
     bool isStopped()
     {
-        synchronized block(*this);
+        synchronized block(mutex);
         return stopped;
     }
     
 private:
 
+    //Always called within a critical section
     bool wait(unsigned timeout)
     {
         bool ret=false;
-        waiting++;
+        waiting = waiting + 1; // no need for atomic increment as always called within critical section
 
-        int locked = unlockAll();
+        mutex.unlock();
         ret=counter.wait(timeout);
-        lockAll(locked);
+        mutex.lock();
 
-        waiting--;
+        waiting = waiting - 1; // no need for atomic decrement as always called within critical section
         return ret;
     }
 
-    Semaphore counter;
+    Mutex mutex{SYNC_LOCATION};
+    Semaphore counter{SYNC_LOCATION};
     std::list<T> queue;
-    volatile unsigned waiting;
-    volatile bool stopped; //need event
+    unsigned waiting;   // Not atomic because it is only accessed within a critical section
+    std::atomic<bool> stopped; //need event
 };
 
 interface ITask: extends IInterface
@@ -127,6 +129,7 @@ interface IErrorListener: extends IInterface
     virtual void reportError(const char* err,...)=0;
 };
 
+//MORE: This class is barely used - I think it is only used by some ancient windows specific code.
 class TaskQueue
 {
 public:
@@ -145,11 +148,11 @@ public:
         bool needthread=!queue.put(task);
         if(needthread)
         {
-            synchronized block(mworkers);
+            MonitorBlock block(mworkers);
             if(workers.size()<maxsize)
             {
                 workers.push_back(new WorkerThread(*this));
-                workers.back()->start();
+                workers.back()->start(false);
             }
 //            DBGLOG("%d threads",workers.size());
         }
@@ -159,14 +162,14 @@ public:
     {
         queue.stop();
 
-        synchronized block(mworkers); 
+        MonitorBlock block(mworkers); 
         for(Workers::iterator it=workers.begin();it!=workers.end();it++)
             (*it)->stop(); // no good if threads did not clean up
     }
 
     void join()
     {
-        synchronized block(mworkers);
+        MonitorBlock block(mworkers);
         while(!workers.empty())
         {
             mworkers.wait();
@@ -193,7 +196,7 @@ private:
     class WorkerThread: public Thread
     {
     public:
-        WorkerThread(TaskQueue& _tq): tq(_tq), stopped(false) 
+        WorkerThread(TaskQueue& _tq) : Thread("WorkerThread"), tq(_tq), stopped(false)
         {
         }
 
@@ -241,13 +244,13 @@ private:
 
     private:
         TaskQueue& tq;
-        volatile bool stopped;
+        std::atomic<bool> stopped;
         Owned<ITask> task;
     };
 
     void remove(WorkerThread* th)
     {
-        synchronized block(mworkers);
+        MonitorBlock block(mworkers);
         workers.remove(th);
         if(workers.empty())
             mworkers.notifyAll();
@@ -262,7 +265,7 @@ private:
     Workers workers;
     Monitor mworkers;
     Linked<IErrorListener> err;
-    Mutex merr;
+    Mutex merr{SYNC_LOCATION};
 };
 
 #ifdef _MSC_VER

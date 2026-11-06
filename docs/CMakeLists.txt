@@ -14,8 +14,9 @@
 #    limitations under the License.
 ################################################################################
 
-cmake_minimum_required(VERSION 2.8)
-PROJECT(docs)
+PROJECT(docs 
+  VERSION ${HPCC_MAJOR}.${HPCC_MINOR}.${HPCC_POINT}.${HPCC_SEQUENCE}
+)
 
 define_property(GLOBAL PROPERTY DOC_TARGETS BRIEF_DOCS "docs" FULL_DOCS "docs")
 mark_as_advanced(DOC_TARGETS)
@@ -28,7 +29,7 @@ set (DOCBOOK_XSL ${CMAKE_CURRENT_BINARY_DIR}/resources/docbook-xsl)
 set (XML_CATALOG ${CMAKE_CURRENT_BINARY_DIR}/BuildTools/catalog.xml)
 set (DOC_VERSION "${HPCC_MAJOR}.${HPCC_MINOR}.${HPCC_POINT}")
 set (FO_XSL ${CMAKE_CURRENT_BINARY_DIR}/BuildTools/fo.xsl)
-set (VERSION_DIR ${CMAKE_CURRENT_BINARY_DIR}/)
+set (VERSION_DIR ${CMAKE_CURRENT_BINARY_DIR})
 set (ECLIPSE_HTML_XSL ${CMAKE_CURRENT_BINARY_DIR}/BuildTools/EclipseHelp.xsl)
 #set (ECL_REFERENCE_XML ${CMAKE_CURRENT_BINARY_DIR}/ECLReference/ECLReference.xml)
 set (HTML_HELP_XSL ${CMAKE_CURRENT_BINARY_DIR}/resources/docbook-xsl/htmlhelp/htmlhelp.xsl)
@@ -54,6 +55,7 @@ endif()
 
 
 # Required directories to add.
+add_subdirectory(portal-js)
 add_subdirectory(common)
 add_subdirectory(BuildTools)
 add_subdirectory(resources)

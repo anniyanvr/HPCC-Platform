@@ -4,16 +4,16 @@
 <sect1 id="TOJSON">
   <title>TOJSON</title>
 
-  <para><emphasis role="bold">TOJSON<indexterm>
+  <para><emphasis role="bold">TOJSON(</emphasis><emphasis> record
+  </emphasis><emphasis role="bold">[,ALL])</emphasis><indexterm>
       <primary>TOJSON</primary>
     </indexterm><indexterm>
       <primary>TOJSON function</primary>
-    </indexterm>(</emphasis><emphasis> record </emphasis><emphasis
-  role="bold">)</emphasis></para>
+    </indexterm></para>
 
   <para><informaltable colsep="1" frame="all" rowsep="1">
       <tgroup cols="2">
-        <colspec colwidth="77.95pt" />
+        <colspec colwidth="77.95pt"/>
 
         <tbody>
           <row>
@@ -23,23 +23,32 @@
           </row>
 
           <row>
+            <entry><emphasis role="bold">ALL</emphasis></entry>
+
+            <entry>Specifies fields with empty strings are included in the
+            output. Without the ALL flag, <emphasis
+            role="bold">TOJSON</emphasis> omits fields that contain only
+            whitespace or are empty after trimming.</entry>
+          </row>
+
+          <row>
             <entry>Return:</entry>
 
-            <entry>TOJSON returns a STRING.</entry>
+            <entry>TOJSON returns a UTF8.</entry>
           </row>
         </tbody>
       </tgroup>
     </informaltable></para>
 
   <para>The <emphasis role="bold">TOJSON </emphasis>function returns a single
-  string with the data in the <emphasis>record</emphasis> re-formatted as
-  JSON. If the RECORD structure of the <emphasis>record</emphasis> has XPATHs
-  defined, then they will be used, otherwise the lower-cased field names are
-  used as the JSON tag names.</para>
+  UTF-8 string with the data in the <emphasis>record</emphasis> re-formatted
+  as JSON. If the RECORD structure of the <emphasis>record</emphasis> has
+  XPATHs defined, then they will be used, otherwise the lower-cased field
+  names are used as the JSON tag names.</para>
 
   <para>Example:</para>
 
-  <programlisting>namesRec1 := RECORD  
+  <programlisting lang="ECL_Runnable">namesRec1 := RECORD  
  UNSIGNED2 EmployeeID{xpath('EmpID')};  
  STRING10 Firstname{xpath('FName')};  
  STRING10 Lastname{xpath('LName')}; 

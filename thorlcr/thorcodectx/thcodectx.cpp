@@ -84,7 +84,7 @@ char *CThorCodeContextBase::getDaliServers()
             first = false;
         else
             dali.append(',');
-        coven->query().endpoint().getUrlStr(dali);
+        coven->query().endpoint().getEndpointHostText(dali);
     }
     return dali.detach();
 }
@@ -162,6 +162,11 @@ const void * CThorCodeContextBase::fromJson(IEngineRowAllocator * rowAllocator, 
 }
 
 ISectionTimer * CThorCodeContextBase::registerTimer(unsigned activityId, const char * name)
+{
+    return queryNullSectionTimer();
+}
+
+ISectionTimer * CThorCodeContextBase::registerStatsTimer(unsigned activityId, const char * name, unsigned int statsOption)
 {
     return queryNullSectionTimer();
 }

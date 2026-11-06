@@ -87,17 +87,6 @@ typedef enum wsEclTypes_
 
 } wsEclType;
 
-class RoxieSocketFactory : public CSmartSocketFactory
-{
-public:
-    bool includeTargetInURL;
-    StringAttr alias;
-
-    RoxieSocketFactory(const char *_socklist, bool _retry, bool includeTarget, const char *_alias, unsigned _dnsInterval) : CSmartSocketFactory(_socklist, _retry, 60, _dnsInterval), includeTargetInURL(includeTarget), alias(_alias)
-    {
-    }
-};
-
 class CWsEclService : public CInterface,
     implements IEspService
 {
@@ -107,8 +96,6 @@ public:
     StringArray targets;
     StringAttr auth_method;
     StringAttr portal_URL;
-    StringAttr globalIdHttpHeader;
-    StringAttr callerIdHttpHeader;
     unsigned roxieTimeout;
     unsigned workunitTimeout;
 
@@ -122,49 +109,15 @@ public:
     virtual bool init(const char * name, const char * type, IPropertyTree * cfg, const char * process);
     virtual void setContainer(IEspContainer * container){}
 
-    inline bool getHttpIdHeader(CHttpRequest *request, const char *header, StringBuffer &value, StringAttr &nameused)
+    inline bool getHttpIdHeader(CHttpRequest *request, const char *header, StringBuffer &value)
     {
         if (!header || !*header)
             return false;
 
         request->getHeader(header, value.clear());
         if (value.length())
-        {
-            nameused.set(header);
             return true;
-        }
         return false;
-    }
-
-    StringBuffer &getHttpGlobalIdHeader(CHttpRequest *request, StringBuffer &value, StringAttr &nameused)
-    {
-        if (!getHttpIdHeader(request, globalIdHttpHeader, value, nameused))
-        {
-            if (!getHttpIdHeader(request, "Global-Id", value, nameused))
-                getHttpIdHeader(request, "HPCC-Global-Id", value, nameused);
-        }
-        return value;
-    }
-    StringBuffer &getHttpCallerIdHeader(CHttpRequest *request, StringBuffer &value, StringAttr &nameused)
-    {
-        if (!getHttpIdHeader(request, callerIdHttpHeader, value, nameused))
-        {
-            if (!getHttpIdHeader(request, "Caller-Id", value, nameused))
-                getHttpIdHeader(request, "HPCC-Caller-Id", value, nameused);
-        }
-        return value;
-    }
-    const char *queryGlobalIdHeaderName()
-    {
-        if (!globalIdHttpHeader.isEmpty())
-            return globalIdHttpHeader;
-        return "HPCC-Global-Id"; //HPCC default
-    }
-    const char *queryCallerIdHeaderName()
-    {
-        if (!callerIdHttpHeader.isEmpty())
-            return callerIdHttpHeader;
-        return "HPCC-Caller-Id"; //HPCC default
     }
 
     bool unsubscribeServiceFromDali() override {return true;}
@@ -186,6 +139,12 @@ class CWsEclBinding : public CHttpSoapBinding
 {
 private:
     CWsEclService *wsecl;
+
+protected:
+    bool getSchema(StringBuffer& schema, IEspContext &ctx, CHttpRequest* req, const char *service, const char *method,bool standalone) override;
+    int getWsdlOrXsd(IEspContext &context, CHttpRequest* request, CHttpResponse* response, const char *service, const char *method, bool isWsdl);
+    // Does not provide all the flexibility of the getSchema override. Consider refactoring out to use getSchema in its place.
+    bool getSimpleSchema(StringBuffer& schema, IEspContext &ctx, CHttpRequest* req, WsEclWuInfo &wsinfo) ;
 
 public:
     CWsEclBinding(IPropertyTree *cfg, const char *bindname, const char *procname) : 
@@ -246,7 +205,7 @@ public:
     bool qualifyServiceName(IEspContext &context, const char *servname, const char *methname, StringBuffer &servQName, StringBuffer *methQName){servQName.clear().append(servname); if (methQName) methQName->clear().append(methname); return true;}
 
     int getXsdDefinition(IEspContext &context, CHttpRequest *request, StringBuffer &content, WsEclWuInfo &wsinfo);
-    bool getSchema(StringBuffer& schema, IEspContext &ctx, CHttpRequest* req, WsEclWuInfo &wsinfo) ;
+    
     void appendSchemaNamespaces(IPropertyTree *namespaces, IEspContext &ctx, CHttpRequest* req, WsEclWuInfo &wsinfo);
     void appendSchemaNamespaces(IPropertyTree *namespaces, IEspContext &ctx, CHttpRequest* req, const char *service, const char *method);
 

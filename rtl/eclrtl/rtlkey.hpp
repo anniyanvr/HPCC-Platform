@@ -71,6 +71,7 @@ interface IIndexFilter : public IInterface
 
     virtual bool isWild() const = 0;
     virtual bool isEmpty() const = 0;
+    virtual bool isSingleValue() const = 0;    // Does this filter match exactly one value for the field?
 };
 
 interface IKeySegmentMonitor : public IIndexFilter
@@ -113,7 +114,7 @@ interface IBlobCreator
 
 enum FFoption : byte
 {
-    FFkeyed = 1,
+    FFkeyed = 0,
     FFopt = 1,
     FFpost = 2,
 };

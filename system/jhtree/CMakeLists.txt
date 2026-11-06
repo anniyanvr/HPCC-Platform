@@ -28,6 +28,9 @@ project( jhtree )
 set (    SRCS 
          hlzw.cpp 
          ctfile.cpp 
+         jhcache.cpp
+         jhinplace.cpp
+         jhblockcompressed.cpp
          jhtree.cpp 
          jhutil.cpp 
          bloom.cpp
@@ -39,6 +42,8 @@ set (    SRCS
 set (    INCLUDES
          ctfile.hpp
          hlzw.h
+         jhcache.hpp
+         jhinplace.hpp
          jhtree.hpp
          jhutil.hpp
          bloom.hpp
@@ -54,17 +59,21 @@ include_directories (
          ./../../rtl/include
          ./../../system/include 
          ./../../system/jlib 
+         ./../../system/security/zcrypt
          ./../../testing/unittests
     )
 
 ADD_DEFINITIONS( -D_USRDLL -DJHTREE_EXPORTS -DECLRTL_LOCAL )
 
+SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STRICT_CXX_FLAGS}")
+
 HPCC_ADD_LIBRARY( jhtree SHARED ${SRCS} ${INCLUDES} )
 install ( TARGETS jhtree RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( jhtree 
+target_link_libraries ( jhtree PRIVATE
          eclrtl
+         zcrypt
          jlib
-         ${CPPUNIT_LIBRARIES}
+         ${CppUnit_LIBRARIES}
     )
 
 

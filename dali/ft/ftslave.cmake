@@ -29,24 +29,27 @@ set (    SRCS
     )
 
 include_directories ( 
-         ./../../common/remote 
-         ./../../system/mp 
-         ./../base 
-         ./../../system/include 
-         ./../../system/jlib
-         ./../../system/security/shared
+         ${HPCC_SOURCE_DIR}/include 
+         ${HPCC_SOURCE_DIR}/jlib
+         ${HPCC_SOURCE_DIR}/dali/base 
+         ${HPCC_SOURCE_DIR}/mp 
+         ${HPCC_SOURCE_DIR}/remote 
+         ${HPCC_SOURCE_DIR}/security/shared
     )
 
 HPCC_ADD_EXECUTABLE ( ftslave ${SRCS} )
 set_target_properties (ftslave PROPERTIES COMPILE_FLAGS -D_CONSOLE)
 install ( TARGETS ftslave RUNTIME DESTINATION ${EXEC_DIR} )
-target_link_libraries ( ftslave
+target_link_libraries ( ftslave PRIVATE
+         dafsclient
+         dalibase 
+         dalift 
+         ftslavelib
          jlib
          mp 
-         hrpc 
          remote 
-         dalibase 
-         environment 
-         dalift 
     )
 
+if (NOT CONTAINERIZED)
+    target_link_libraries ( ftslave PRIVATE environment )
+endif()

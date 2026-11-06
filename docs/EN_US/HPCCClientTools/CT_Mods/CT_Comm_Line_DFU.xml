@@ -32,13 +32,13 @@
         role="bold">|</emphasis><emphasis>options</emphasis><emphasis
         role="bold">]</emphasis></title>
 
-        <para></para>
+        <para/>
 
         <informaltable colsep="1" frame="all" rowsep="1">
           <tgroup cols="2">
-            <colspec align="left" colwidth="85.40pt" />
+            <colspec align="left" colwidth="85.40pt"/>
 
-            <colspec />
+            <colspec/>
 
             <tbody>
               <row>
@@ -110,14 +110,14 @@
 
         <para><informaltable colsep="1" frame="all" rowsep="0">
             <tgroup cols="2">
-              <colspec colwidth="49.50pt" />
+              <colspec colwidth="49.50pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
                   <entry><graphic fileref="../../images/caution.png"
-                  scale="noin" /></entry>
+                  scale="noin"/></entry>
 
                   <entry>The dfuplus utility does not upload files to a
                   landing zone. You must first upload any file(s) to your
@@ -136,9 +136,9 @@
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec align="left" colwidth="125.40pt" />
+              <colspec align="left" colwidth="125.40pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
@@ -203,6 +203,14 @@
                   <entry>Optional. The number of simultaneous connections to
                   limit the <emphasis>operation </emphasis>to. If omitted, the
                   default is 25.</entry>
+                </row>
+
+                <row>
+                  <entry><emphasis><emphasis>nocommon</emphasis></emphasis></entry>
+
+                  <entry>Optional. A boolean flag (0 | 1, default=1). Set to 0
+                  to enable "commoning up" of pull or push processes on same
+                  host.</entry>
                 </row>
 
                 <row>
@@ -293,6 +301,7 @@
           <programlisting>;The values below are examples, you should change them to match your platform deployment
 server=http://10.150.50.12:8010
 username=rlor
+<!--#synthpii-->
 password=password
 overwrite=1
 replicate=1</programlisting>
@@ -302,14 +311,14 @@ replicate=1</programlisting>
 
           <para><informaltable colsep="1" frame="all" rowsep="0">
               <tgroup cols="2">
-                <colspec colwidth="49.50pt" />
+                <colspec colwidth="49.50pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
                     <entry><graphic fileref="../../images/caution.png"
-                    scale="noin" /></entry>
+                    scale="noin"/></entry>
 
                     <entry>We do not recommend storing your password in the
                     ini file (which is clear text). The password is included
@@ -334,9 +343,9 @@ replicate=1</programlisting>
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec align="left" colwidth="122.50pt" />
+                <colspec align="left" colwidth="122.50pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -344,7 +353,17 @@ replicate=1</programlisting>
 
                     <entry>Optional. The IP address of the source machine. If
                     omitted, the information must be supplied by the
-                    <emphasis>srcxml</emphasis> parameter.</entry>
+                    <emphasis>srcxml</emphasis> or
+                    <emphasis>srcplane</emphasis> parameter.</entry>
+                  </row>
+
+                  <row>
+                    <entry>srcplane</entry>
+
+                    <entry>Optional. The source storage plane containing the
+                    source file. Note: <emphasis>srcplane</emphasis> should
+                    not be used at the same time as
+                    <emphasis>srcip</emphasis>.</entry>
                   </row>
 
                   <row>
@@ -380,7 +399,9 @@ replicate=1</programlisting>
                   <row>
                     <entry>dstcluster</entry>
 
-                    <entry>The name of the destination cluster.</entry>
+                    <entry>The name of the destination cluster. For a
+                    containerized deployment, set this to the target data
+                    plane (For example, dstcluster=data)</entry>
                   </row>
 
                   <row>
@@ -440,6 +461,15 @@ replicate=1</programlisting>
                     role="bold">fixed csv delimited xml recfmv
                     recfmb</emphasis> If omitted, the default is
                     fixed.</entry>
+                  </row>
+
+                  <row>
+                    <entry><emphasis>dstNumParts</emphasis></entry>
+
+                    <entry>Optional. Optional. Set to a positive integer to
+                    override the number of parts created when spraying. If
+                    omitted (or set to 0), the spray uses the target cluster's
+                    default part count.</entry>
                   </row>
 
                   <row>
@@ -584,7 +614,14 @@ dfuplus action=spray srcip=10.150.51.26
 imageRecord := RECORD
 STRING filename;
 DATA image; //first 4 bytes contain the length of the image data
-END;</programlisting>
+END;
+// using srcplane
+dfuplus action=spray srcplane=lzstorageplane 
+        srcfile=/var/lib/HPCCSystems/dropzone/largedata1 
+        dstname=mytest::test:spraytest 
+        dstcluster=mydatastorageplane recordsize=58 overwrite=1 server=127.0.0.1:8010
+
+</programlisting>
         </sect3>
 
         <sect3 id="CLI_DFU_DeSprayOperations">
@@ -599,9 +636,9 @@ END;</programlisting>
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec align="left" colwidth="122.50pt" />
+              <colspec align="left" colwidth="122.50pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
@@ -618,7 +655,19 @@ END;</programlisting>
 
                   <entry>Optional. The IP address of the destination machine.
                   If omitted, the information must be supplied by the
-                  <emphasis>dstxml</emphasis> parameter.</entry>
+                  <emphasis>dstxml</emphasis> or <emphasis>dstplane</emphasis>
+                  parameter. Deprecated, you should use
+                  <emphasis>dstplane</emphasis> instead.</entry>
+                </row>
+
+                <row>
+                  <entry><emphasis>dstplane</emphasis></entry>
+
+                  <entry>Optional. The destination storage plane. Note:
+                  <emphasis>dstplane</emphasis> should not be used at the same
+                  time as <emphasis>dstip</emphasis>. In a containerized
+                  deployment, <emphasis>dstplane</emphasis> is required if you
+                  have more than one Landing Zone.</entry>
                 </row>
 
                 <row>
@@ -677,6 +726,20 @@ END;</programlisting>
                   originally came from. If you never need to do that, then the
                   filesize option may be omitted. </para></entry>
                 </row>
+
+                <row>
+                  <entry><emphasis>wrap= 0 | 1</emphasis></entry>
+
+                  <entry>Optional. If set to 1, desprays as multiple files on
+                  the landing zone. Default is 0.</entry>
+                </row>
+
+                <row>
+                  <entry><emphasis>multicopy= 0 | 1</emphasis></entry>
+
+                  <entry>Optional. If set to 1, each destination part gets the
+                  whole file. Default is 0.</entry>
+                </row>
               </tbody>
             </tgroup>
           </informaltable>
@@ -723,6 +786,12 @@ DATA image; //first 4 bytes contain the length of the image data
 dfuplus action=dspray srcname=le::imagedb
           dstip=10.150.51.26 dstfile=/var/lib/HPCCSystems/mydropzone/
           splitprefix=FILENAME,FILESIZE
+
+// using dstplane
+dfuplus action=despray srcname=mytest::test:spraytest 
+        dstplane=lzstorageplane 
+        dstfile=mydespraytest server=127.0.0.1:8010
+
 </programlisting>
         </sect3>
 
@@ -754,9 +823,9 @@ dfuplus action=dspray srcname=le::imagedb
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec align="left" colwidth="122.40pt" />
+              <colspec align="left" colwidth="122.40pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
@@ -775,7 +844,9 @@ dfuplus action=dspray srcname=le::imagedb
                   <entry><emphasis><emphasis>dstcluster</emphasis>
                   </emphasis></entry>
 
-                  <entry>The name of the destination cluster.</entry>
+                  <entry>The name of the destination cluster. For a
+                  containerized deployment, set this to the target data plane
+                  (For example, dstcluster=data)</entry>
                 </row>
 
                 <row>
@@ -811,6 +882,13 @@ dfuplus action=dspray srcname=le::imagedb
                   to preserve the compression of the source file. If omitted,
                   the default is 1.</entry>
                 </row>
+
+                <row>
+                  <entry><emphasis>ensure</emphasis></entry>
+
+                  <entry>Optional. Copies logical file, but does not copy file
+                  parts if they already exist. Default is FALSE.</entry>
+                </row>
               </tbody>
             </tgroup>
           </informaltable>
@@ -834,9 +912,9 @@ dfuplus action=dspray srcname=le::imagedb
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec align="left" colwidth="122.40pt" />
+                <colspec align="left" colwidth="122.40pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -850,7 +928,7 @@ dfuplus action=dspray srcname=le::imagedb
 
           <programlisting>dfuplus action=remove name=RTTEMP::timezones.txt</programlisting>
 
-          <para></para>
+          <para/>
         </sect3>
 
         <sect3 id="CLI_DFU_renameOps">
@@ -864,9 +942,9 @@ dfuplus action=dspray srcname=le::imagedb
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec align="left" colwidth="122.40pt" />
+              <colspec align="left" colwidth="122.40pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
@@ -900,9 +978,9 @@ dfuplus action=dspray srcname=le::imagedb
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec align="left" colwidth="122.40pt" />
+                <colspec align="left" colwidth="122.40pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -938,9 +1016,9 @@ dfuplus action=dspray srcname=le::imagedb
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec colwidth="122.40pt" />
+                <colspec colwidth="122.40pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -967,9 +1045,9 @@ dfuplus action=dspray srcname=le::imagedb
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec align="left" colwidth="122.40pt" />
+              <colspec align="left" colwidth="122.40pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
@@ -1017,7 +1095,7 @@ dfuplus action=dspray srcname=le::imagedb
 dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 </programlisting>
 
-          <para></para>
+          <para/>
         </sect3>
 
         <sect3 id="CLI_DFU_AddSuperOperations">
@@ -1034,9 +1112,9 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec align="left" colwidth="122.40pt" />
+              <colspec align="left" colwidth="122.40pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
@@ -1084,9 +1162,9 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec align="left" colwidth="122.40pt" />
+              <colspec align="left" colwidth="122.40pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
@@ -1134,9 +1212,9 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec colwidth="142.40pt" />
+                <colspec colwidth="142.40pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -1156,7 +1234,9 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
                   <row>
                     <entry>dstcluster=&lt;cluster-name&gt;</entry>
 
-                    <entry>The name of the destination cluster.</entry>
+                    <entry>The name of the destination cluster. For a
+                    containerized deployment, set this to the target data
+                    plane (For example, dstcluster=data)</entry>
                   </row>
 
                   <row>
@@ -1205,9 +1285,9 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec colwidth="122.40pt" />
+                <colspec colwidth="122.40pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -1236,9 +1316,9 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec colwidth="122.40pt" />
+                <colspec colwidth="122.40pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -1247,13 +1327,23 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
                     <entry>The workunit identifier of the workunit.</entry>
                   </row>
+
+                  <row>
+                    <entry><emphasis><emphasis><emphasis>limit</emphasis></emphasis></emphasis></entry>
+
+                    <entry>For publisher workunits, this limits the number of
+                    child workunits to list. If set to 0, then only the parent
+                    status is returned. Default is 1000.</entry>
+                  </row>
                 </tbody>
               </tgroup>
-            </informaltable>Example:</para>
+            </informaltable>Examples:</para>
 
-          <programlisting>dfuplus action=status wuid=W20050309-093020</programlisting>
+          <programlisting>dfuplus action=status wuid=D20220816-135243
+dfuplus action=status limit=300 wuid=P20230301-123456
+dfuplus action=status limit=0 wuid=P20230301-987654</programlisting>
 
-          <para></para>
+          <para/>
         </sect3>
 
         <sect3 id="CLI_DFU_AbortOperations">
@@ -1267,9 +1357,9 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec colwidth="122.40pt" />
+                <colspec colwidth="122.40pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -1286,7 +1376,7 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <programlisting>dfuplus action=abort wuid=W20050309-093020</programlisting>
 
-          <para></para>
+          <para/>
         </sect3>
 
         <sect3 id="CLI_DFU_ResubmitOperations">
@@ -1301,9 +1391,9 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec colwidth="122.40pt" />
+                <colspec colwidth="122.40pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -1320,7 +1410,7 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <programlisting>dfuplus action=resubmit wuid=W20050309-093020</programlisting>
 
-          <para></para>
+          <para/>
         </sect3>
 
         <sect3 id="CLI_DFU_SaveXMLOperations">
@@ -1341,13 +1431,13 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
           <para><emphasis>srcname</emphasis> The logical name of the source
           file.</para>
 
-          <para></para>
+          <para/>
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec colwidth="122.40pt" />
+              <colspec colwidth="122.40pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
@@ -1414,9 +1504,9 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <para><informaltable colsep="1" frame="all" rowsep="1">
               <tgroup cols="2">
-                <colspec colwidth="85.55pt" />
+                <colspec colwidth="85.55pt"/>
 
-                <colspec />
+                <colspec/>
 
                 <tbody>
                   <row>
@@ -1524,9 +1614,9 @@ dfuplus action=monitor event=MyEvent lfn=RTTEMP::OUT::MyFile</programlisting>
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec colwidth="122.40pt" />
+              <colspec colwidth="122.40pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>
@@ -1585,9 +1675,9 @@ dfuplus action=monitor event=MyEvent lfn=RTTEMP::OUT::MyFile</programlisting>
 
           <informaltable colsep="1" frame="all" rowsep="1">
             <tgroup cols="2">
-              <colspec colwidth="122.40pt" />
+              <colspec colwidth="122.40pt"/>
 
-              <colspec />
+              <colspec/>
 
               <tbody>
                 <row>

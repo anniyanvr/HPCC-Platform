@@ -1,0 +1,288 @@
+name: Tagged Build (build-assets.yml)
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,read"
+  VCPKG_NUGET_REPOSITORY: "https://github.com/hpcc-systems/vcpkg"
+
+on:
+  push:
+    tags:
+      - "*"
+      - "community_*"
+      - "!community_8.10.*"
+      - "!community_8.8.*"
+      - "!community_8.6.*"
+      - "!community_8.4.*"
+      - "!community_8.2.*"
+      - "!community_8.0.*"
+      - "!community_7.*"
+
+permissions:
+  contents: read
+
+jobs:
+  preamble:
+    name: Publish Release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      folder_platform: ${{ steps.vars.outputs.folder_platform }}
+      mount_platform: ${{ steps.vars.outputs.mount_platform }}
+      folder_ln: ${{ steps.vars.outputs.folder_ln }}
+      mount_ln: ${{ steps.vars.outputs.mount_ln }}
+      folder_build: ${{ steps.vars.outputs.folder_build }}
+      mount_build: ${{ steps.vars.outputs.mount_build }}
+      community_ref: ${{ steps.vars.outputs.community_ref }}
+      eclide_ref: ${{ steps.vars.outputs.eclide_ref }}
+      community_tag: ${{ steps.vars.outputs.community_tag }}
+      hpcc_version: ${{ steps.vars.outputs.hpcc_version }}
+      hpcc_version_full: ${{ steps.vars.outputs.hpcc_version_full }}
+      candidate_base_branch: ${{ steps.vars.outputs.candidate_base_branch }}
+      candidate_branch: ${{ steps.vars.outputs.candidate_branch }}
+      cmake_docker_config: ${{ steps.vars.outputs.cmake_docker_config }}
+      gpg_import: ${{ steps.vars.outputs.gpg_import }}
+      folder_prettygitlogs: ${{ steps.vars.outputs.folder_prettygitlogs }}
+      folder_eclide: ${{ steps.vars.outputs.folder_eclide }}
+      latest_version: ${{ steps.vars.outputs.latest_tag }}
+      is_latest: ${{ steps.vars.outputs.is_latest }}
+    steps:
+      - name: Checkout HPCC-Platform
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/HPCC-Platform
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+          
+      - name: Calculate vars
+        id: vars
+        run: |
+          echo "folder_platform=${{ github.workspace }}/HPCC-Platform" >> $GITHUB_OUTPUT
+          echo "folder_eclide"=${{ github.workspace }}/ECLIDE >> $GITHUB_OUTPUT
+          echo "folder_prettygitlogs"=${{ github.workspace }}/PrettyGitLogs >> $GITHUB_OUTPUT
+          echo 'mount_platform=source="${{ github.workspace }}/HPCC-Platform",target=/hpcc-dev/HPCC-Platform,type=bind,consistency=cached' >> $GITHUB_OUTPUT
+          echo "folder_ln=${{ github.workspace }}/LN" >> $GITHUB_OUTPUT
+          echo 'mount_ln=source="${{ github.workspace }}/LN",target=/hpcc-dev/LN,type=bind,consistency=cached' >> $GITHUB_OUTPUT
+          echo "folder_build=${{ github.workspace }}/build" >> $GITHUB_OUTPUT
+          echo 'mount_build=source="${{ github.workspace }}/build",target=/hpcc-dev/build,type=bind,consistency=cached' >> $GITHUB_OUTPUT
+          community_ref=${{ github.ref }}
+          echo "community_ref=$community_ref" >> $GITHUB_OUTPUT
+          echo "eclide_ref=$(echo $community_ref | sed 's/community/eclide/')" >> $GITHUB_OUTPUT
+          community_tag=$(echo $community_ref | cut -d'/' -f3)
+          echo "community_tag=$community_tag" >> $GITHUB_OUTPUT
+          echo "hpcc_version=$(echo $community_tag | sed 's/community_//' | sed 's/-[0-9]$//')" >> $GITHUB_OUTPUT
+          echo "hpcc_version_full=$(echo $community_tag | sed 's/community_//')" >> $GITHUB_OUTPUT
+          community_base_ref=${{ github.event.base_ref || github.ref }}
+          candidate_branch=$(echo $community_base_ref | cut -d'/' -f3)
+          echo "candidate_branch=$candidate_branch" >> $GITHUB_OUTPUT
+          echo "candidate_base_branch=$(echo $candidate_branch | awk -F'.' -v OFS='.' '{ $3="x"; print }')" >> $GITHUB_OUTPUT
+          echo "cmake_docker_config=-DCMAKE_BUILD_TYPE=RelWithDebInfo -DVCPKG_FILES_DIR=/hpcc-dev -DCPACK_THREADS=0 -DUSE_OPTIONAL=OFF -DSIGN_MODULES=${{ github.repository_owner == 'hpcc-systems' && 'ON' || 'OFF' }}" >> $GITHUB_OUTPUT
+          echo 'gpg_import=gpg --batch --import /hpcc-dev/build/private.key' >> $GITHUB_OUTPUT
+          latest_tag=$(git tag -l | grep -E "^community_[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,3}-[0-9]{1,2}" | sort -V | tail -n 1)
+          echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
+          echo "is_latest=$(echo $latest_tag | grep -q $community_tag && echo true || echo false)" >> $GITHUB_OUTPUT
+      
+      - name: Print vars
+        run: |
+          echo "${{ toJSON(steps.vars.outputs) }})"
+
+      - name: Release HPCC-Platform
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          generateReleaseNotes: false
+          prerelease: ${{ contains(github.ref, '-rc') }}
+          makeLatest: ${{ steps.vars.outputs.is_latest }}
+
+  build-docker-community:
+    name: Build Docker Community
+    needs: preamble
+    permissions:
+      contents: write
+      actions: write
+    strategy:
+      matrix:
+        os: [ ubuntu-24.04, ubuntu-22.04, rockylinux-8 ]
+        container: [ true, false ]
+        build-docker-image: [ false ]
+        architecture: [ "", "-arm64" ]
+        include:
+          - os: ubuntu-22.04
+            container: true
+            build-docker-image: true
+            architecture: ""
+          - os: ubuntu-22.04
+            container: true
+            build-docker-image: true
+            architecture: "-arm64"
+        exclude:
+          - os: rockylinux-8
+            container: true
+          - os: rockylinux-8
+            architecture: "-arm64"
+      fail-fast: false
+    
+    uses: ./.github/workflows/build-docker-community.yml
+    with:
+      os: ${{ matrix.os }}
+      container: ${{ matrix.container }}
+      architecture: ${{ matrix.architecture }}
+      build-docker-image: ${{ matrix.build-docker-image }}
+      community_ref: ${{ needs.preamble.outputs.community_ref }}
+    secrets: inherit
+
+  publish-community-multiarch-tags:
+    name: Publish Community Multi-Arch Tags
+    needs: [ preamble, build-docker-community ]
+    if: ${{ github.repository_owner == 'hpcc-systems' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Publish multi-arch manifests
+        run: |
+          docker buildx imagetools create \
+            -t hpccsystems/platform-core:${{ needs.preamble.outputs.hpcc_version }} \
+            hpccsystems/platform-core:${{ needs.preamble.outputs.hpcc_version }} \
+            hpccsystems/platform-core:${{ needs.preamble.outputs.hpcc_version }}-arm64
+
+          docker buildx imagetools create \
+            -t hpccsystems/platform-core-ubuntu-22.04:${{ needs.preamble.outputs.community_tag }} \
+            hpccsystems/platform-core-ubuntu-22.04:${{ needs.preamble.outputs.community_tag }} \
+            hpccsystems/platform-core-ubuntu-22.04:${{ needs.preamble.outputs.community_tag }}-arm64
+
+          docker buildx imagetools create \
+            -t hpccsystems/platform-core-ubuntu-22.04:${{ needs.preamble.outputs.candidate_base_branch }} \
+            hpccsystems/platform-core-ubuntu-22.04:${{ needs.preamble.outputs.candidate_base_branch }} \
+            hpccsystems/platform-core-ubuntu-22.04:${{ needs.preamble.outputs.candidate_base_branch }}-arm64
+
+  build-documentation:
+    needs: preamble
+    permissions:
+      contents: write
+      actions: write
+    uses: ./.github/workflows/build-documentation.yml
+    with:
+      community-ref: ${{ needs.preamble.outputs.community_ref }}
+      folder-platform: ${{ needs.preamble.outputs.folder_platform }}
+      folder-build: ${{ needs.preamble.outputs.folder_build }}
+      candidate-base-branch: ${{ needs.preamble.outputs.candidate_base_branch }}
+      community-tag: ${{ needs.preamble.outputs.community_tag }}
+      mount-platform: ${{ needs.preamble.outputs.mount_platform }}
+      mount-build: ${{ needs.preamble.outputs.mount_build }}
+      make-latest: ${{ needs.preamble.outputs.is_latest != 'false' }}
+    secrets: inherit
+
+  build-clienttools-community-macos:
+    needs: preamble
+    permissions:
+      contents: write
+      actions: write
+      packages: read
+    strategy:
+      matrix:
+        cmake-config-options: [ "-DCMAKE_OSX_ARCHITECTURES=x86_64 -DCPACK_SYSTEM_NAME=Darwin-x86_64 -DUSE_PYTHON3=OFF", "" ]
+      fail-fast: false
+    uses: ./.github/workflows/build-clienttools-macos-15.yml
+    with:
+      community-ref: ${{ needs.preamble.outputs.community_ref }}
+      make-latest: ${{ needs.preamble.outputs.is_latest != 'false' }}
+      cmake-config-options: ${{ matrix.cmake-config-options }}
+    secrets: inherit
+
+  build-clienttools-community-windows:
+    needs: preamble
+    permissions:
+      contents: write
+      actions: write
+      packages: read
+    uses: ./.github/workflows/build-clienttools-windows-2022.yml
+    with:
+      community-ref: ${{ needs.preamble.outputs.community_ref }}
+      upload-package: true
+      asset-name: 'clienttools-community-for-eclide'
+      make-latest: ${{ needs.preamble.outputs.is_latest != 'false' }}
+    secrets: inherit
+
+  build-bare-metal-eclide:
+    needs: [ preamble, build-clienttools-community-windows, build-documentation ]
+    permissions:
+      contents: write
+      actions: write
+      packages: read
+    uses: ./.github/workflows/build-eclide.yml
+    with:
+      community-ref: ${{ needs.preamble.outputs.community_ref }}
+      eclide-ref: ${{ needs.preamble.outputs.eclide_ref }}
+      configure-preset: 'vcpkg-VS-17'
+      build-preset: 'VS-17-RelWithDebInfo'
+      build-dir: 'build'
+      clienttools-community-asset-name: 'clienttools-community-for-eclide'
+      documentation-asset-name: 'html-help-documents'
+      make-latest: ${{ needs.preamble.outputs.is_latest != 'false' }}
+    secrets: inherit
+
+  build-bare-metal-eclide-x64:
+    needs: [ preamble, build-clienttools-community-windows, build-documentation ]
+    permissions:
+      contents: write
+      actions: write
+      packages: read
+    uses: ./.github/workflows/build-eclide.yml
+    with:
+      community-ref: ${{ needs.preamble.outputs.community_ref }}
+      eclide-ref: ${{ needs.preamble.outputs.eclide_ref }}
+      configure-preset: 'vcpkg-VS-17-x64'
+      build-preset: 'VS-17-x64-RelWithDebInfo'
+      build-dir: 'build-x64'
+      clienttools-community-asset-name: 'clienttools-community-for-eclide'
+      documentation-asset-name: 'html-help-documents'
+      make-latest: ${{ needs.preamble.outputs.is_latest != 'false' }}
+    secrets: inherit
+
+  changelogs:
+    needs: preamble
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-changelogs.yml
+    with:
+      current-version: ${{ needs.preamble.outputs.hpcc_version_full }}
+      make-latest: ${{ needs.preamble.outputs.is_latest != 'false' }}
+    secrets: inherit
+
+  deploy-wordpress:
+    needs: [preamble, build-docker-community]
+    if: ${{ github.repository_owner == 'hpcc-systems' && needs.preamble.outputs.is_latest == 'true' }}
+    uses: ./.github/workflows/wordpress_automation.yml
+    with:
+      tag: ${{ needs.preamble.outputs.community_tag }}
+    secrets: inherit
+
+  test-build-validation:
+    name: "Test published image"
+    needs: [ preamble, build-docker-community ]
+    runs-on: ubuntu-22.04
+    if: ${{ github.repository_owner == 'hpcc-systems' && needs.preamble.outputs.is_latest == 'true' }}
+    env:
+      WF_YAML_FILE: az-bvt.yml
+    steps:
+      - name: "Trigger external azure test code"
+        run: |
+          data="{\"ref\":\"main\", \"inputs\":{ \"hpccVersion\":\"${{ needs.preamble.outputs.hpcc_version }}\",\"hpccSrcBranch\":\"${{ needs.preamble.outputs.community_tag }}\" }}"
+          curl -L \
+          -X POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer ${{ secrets.GAHT_TOKEN }}" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          https://api.github.com/repos/LexisNexis-RBA/hpccplat-build-verification-tests/actions/workflows/$WF_YAML_FILE/dispatches \
+          -d "${data}"

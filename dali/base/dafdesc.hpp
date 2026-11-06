@@ -18,11 +18,17 @@
 #ifndef DAFDESC_HPP
 #define DAFDESC_HPP
 
-#ifndef da_decl
+#ifdef DALI_EXPORTS
+#define da_decl DECL_EXPORT
+#else
 #define da_decl DECL_IMPORT
 #endif
 
+#include <vector>
+#include <string>
+
 #include "jiface.hpp"
+#include "jplane.hpp"
 #include "mpbase.hpp"
 class RemoteFilename;
 class RemoteFilenameArray;
@@ -51,11 +57,15 @@ enum DFD_OS
 enum DFD_Replicate
 {
     DFD_NoCopies      = 1,
+#ifdef _CONTAINERIZED
+    // NB: in containerized mode, each plane has only 1 copy.
+    DFD_DefaultCopies = 1
+#else
     DFD_DefaultCopies = 2
+#endif
 };
 
-enum GroupType { grp_thor, grp_thorspares, grp_roxie, grp_hthor, grp_unknown, __grp_size };
-
+enum GroupType { grp_thor, grp_thorspares, grp_roxie, grp_hthor, grp_dropzone, grp_unknown, __grp_size };
 
 // ==CLUSTER PART MAPPING ==============================================================================================
 
@@ -80,6 +90,7 @@ public:
                             // ( | CPDMSRP_onlyRepeated for *only* repeats )
     StringAttr defaultBaseDir; // if set overrides *base* directory (i.e. /c$/dir/x/y becomes odir/x/y)
     StringAttr defaultReplicateDir;
+    unsigned numStripedDevices = 1;
 
     void setRoxie (unsigned redundancy, unsigned channelsPerNode, int replicateOffset=1);
     void setRepeatedCopies(unsigned partnum,bool onlyrepeats);
@@ -98,13 +109,14 @@ public:
     bool isReplicated() const;
 };
 
-#define CPDMSF_wrapToNextDrv    (0x01)      // whether should wrap to next drv
-#define CPDMSF_fillWidth        (0x02)      // replicate copies fill cluster serially (when num parts < clusterwidth/2)
-#define CPDMSF_packParts        (0x04)      // whether to save parts as binary
-#define CPDMSF_repeatedPart     (0x08)      // if repeated parts included
-#define CPDMSF_defaultBaseDir   (0x10)      // set if defaultBaseDir present
-#define CPDMSF_defaultReplicateDir  (0x20)      // set if defaultBaseDir present
-#define CPDMSF_overloadedConfig  (0x40)      // set if overloaded mode
+#define CPDMSF_wrapToNextDrv       (0x01) // whether should wrap to next drv
+#define CPDMSF_fillWidth           (0x02) // replicate copies fill cluster serially (when num parts < clusterwidth/2)
+#define CPDMSF_packParts           (0x04) // whether to save parts as binary
+#define CPDMSF_repeatedPart        (0x08) // if repeated parts included
+#define CPDMSF_defaultBaseDir      (0x10) // set if defaultBaseDir present
+#define CPDMSF_defaultReplicateDir (0x20) // set if defaultBaseDir present
+#define CPDMSF_overloadedConfig    (0x40) // set if overloaded mode
+#define CPDMSF_striped             (0x80) // set if parts striped over multiple devices
 
 
 // ==PART DESCRIPTOR ==============================================================================================
@@ -136,6 +148,9 @@ interface IPartDescriptor: extends IInterface
     virtual const char *queryOverrideName() = 0;                                        // for non-standard files
     virtual unsigned copyClusterNum(unsigned copy,unsigned *replicate=NULL)=0;      // map copy number to cluster (and optionally replicate number)
     virtual IReplicatedFile *getReplicatedFile()=0;
+
+    virtual offset_t getFileSize(bool allowphysical,bool forcephysical)=0; // gets the part filesize (NB this will be the *expanded* size)
+    virtual offset_t getDiskSize(bool allowphysical,bool forcephysical)=0; // gets the part size on disk (NB this will be the compressed size)
 };
 typedef IArrayOf<IPartDescriptor> CPartDescriptorArray;
 typedef IIteratorOf<IPartDescriptor> IPartDescriptorIterator;
@@ -145,6 +160,15 @@ typedef IIteratorOf<IPartDescriptor> IPartDescriptorIterator;
 #define IFDSF_ATTR_ONLY       0x04
 #define IFDSF_EXCLUDE_CLUSTERNAMES  0x08
 #define IFDSF_FOREIGN_GROUP   0x10
+
+enum class FileDescriptorFlags
+{
+    none          = 0x00,
+    dirperpart    = 0x01, // each part is in a separate directory (named by part number)
+    foreign       = 0x02, // the file descriptor is for a foreign file
+    absoluteparts = 0x04  // the file descriptor has been constructed with parts with absolute filenames (see doSetPart)
+};
+BITMASK_ENUM(FileDescriptorFlags);
 
 // ==FILE DESCRIPTOR ==============================================================================================
 interface ISuperFileDescriptor;
@@ -189,7 +213,7 @@ if endCluster is not called it will assume only one cluster and not replicated
     virtual void setPart(unsigned idx, INode *node, const char *filename, IPropertyTree *pt=NULL) = 0;
     virtual void endCluster(ClusterPartDiskMapSpec &map)=0;
 
-    virtual void setTraceName(const char *trc) = 0;                             // name used for progress reports, errors etc
+    virtual void setTraceName(const char *trc, bool normalize=true) = 0;        // name used for progress reports, errors etc
 
     virtual unsigned numParts() = 0;                                            // number of separate parts
     virtual unsigned numCopies(unsigned partidx) = 0;                           // number of copies
@@ -224,6 +248,7 @@ if endCluster is not called it will assume only one cluster and not replicated
 
     virtual unsigned numClusters() = 0;
     virtual IClusterInfo *queryCluster(const char *clusterName) = 0;
+    virtual IClusterInfo *queryClusterNum(unsigned idx) = 0;
     virtual ClusterPartDiskMapSpec &queryPartDiskMapping(unsigned clusternum) = 0;
     virtual IGroup *queryClusterGroup(unsigned clusternum) = 0;                     // returns group for cluster if known
     virtual void setClusterGroup(unsigned clusternum,IGroup *grp) = 0;              // sets group for cluster
@@ -243,6 +268,8 @@ if endCluster is not called it will assume only one cluster and not replicated
     virtual void ensureReplicate() = 0;                                             // make sure a file can be replicated
 
     virtual IPropertyTree *queryHistory() = 0;                                       // query file history records
+    virtual void setFlags(FileDescriptorFlags flags) = 0;
+    virtual FileDescriptorFlags getFlags() = 0;
 };
 
 interface ISuperFileDescriptor: extends IFileDescriptor
@@ -256,10 +283,9 @@ interface ISuperFileDescriptor: extends IFileDescriptor
 
 // == CLUSTER INFO (currently not exposed outside dali base) =================================================================================
 
-
 interface IClusterInfo: extends IInterface  // used by IFileDescriptor and IDistributedFile
 {
-    virtual StringBuffer &getGroupName(StringBuffer &name,IGroupResolver *resolver=NULL)=0;
+    virtual StringBuffer &getGroupName(StringBuffer &name,IGroupResolver *resolver=NULL) const = 0;
     virtual const char *queryGroupName()=0;     // may be NULL
     virtual IGroup *queryGroup()=0;           // may be NULL
     virtual ClusterPartDiskMapSpec  &queryPartDiskMapping()=0;
@@ -272,23 +298,15 @@ interface IClusterInfo: extends IInterface  // used by IFileDescriptor and IDist
     virtual void setGroupName(const char *name)=0;
     virtual void getBaseDir(StringBuffer &basedir, DFD_OS os)=0;
     virtual void getReplicateDir(StringBuffer &basedir, DFD_OS os)=0;
-    virtual StringBuffer &getClusterLabel(StringBuffer &name)=0; // node group name
-
-};
-
-//I'm not sure if this should be used in place of an IGroup, probably as system gradually changes
-interface IStoragePlane: extends IInterface
-{
-    virtual const char * queryPrefix() const = 0;
-    virtual unsigned numDevices() const = 0;
-    virtual const char * queryHosts() const = 0;
-    virtual const char * querySingleHost() const = 0;
+    virtual StringBuffer &getClusterLabel(StringBuffer &name) const = 0; // node group name
+    virtual void applyPlane(IStoragePlane *plane) = 0;
 };
 
 IClusterInfo *createClusterInfo(const char *grpname,                  // NULL if roxie label set
                                 IGroup *grp,
                                 const ClusterPartDiskMapSpec &mspec,
-                                INamedGroupStore *resolver=NULL
+                                INamedGroupStore *resolver=NULL,
+                                unsigned flags=0
                                 );
 IClusterInfo *createRoxieClusterInfo(const char *label,
                                 const ClusterPartDiskMapSpec &mspec
@@ -313,39 +331,46 @@ extern da_decl StringBuffer &makePhysicalPartName(
                                 unsigned partno,                    // part number (1..)
                                 unsigned partmax,                   // number of parts (1..)
                                 StringBuffer &result,               // result filename (or directory name if part 0)
-                                unsigned replicateLevel = 0,       // uses replication directory
-                                DFD_OS os=DFD_OSdefault,            // os must be specified if no dir specified
-                                const char *diroverride=NULL);      // override default directory
+                                unsigned replicateLevel,            // uses replication directory
+                                DFD_OS os,                          // os must be specified if no dir specified
+                                const char *diroverride,            // override default directory
+                                unsigned dirPerPartNum,             // explicit dir-per-part directory number (0 for none)
+                                unsigned stripeNum);                // stripe number
 extern da_decl StringBuffer &makeSinglePhysicalPartName(const char *lname, // single part file
                                                         StringBuffer &result,
                                                         bool allowospath,   // allow an OS (absolute) file path
                                                         bool &wasdfs,       // not OS path
                                                         const char *diroverride=NULL
                                                         );
+extern da_decl StringBuffer &makePhysicalDirectory(StringBuffer &result, const char *lname, unsigned replicateLevel, DFD_OS os,const char *diroverride);
+
+// 
+extern da_decl StringBuffer &getLFNDirectoryUsingBaseDir(StringBuffer &result, const char *lname, const char *baseDir);
+extern da_decl StringBuffer &getLFNDirectoryUsingDefaultBaseDir(StringBuffer &result, const char *lname, DFD_OS os);
 
 // set/get defaults
-extern da_decl const char *queryBaseDirectory(GroupType groupType, unsigned replicateLevel=0, DFD_OS os=DFD_OSdefault);
+extern da_decl const char * queryUnknownBaseDirectory(unsigned replicateLevel=0, DFD_OS os=DFD_OSdefault);
+extern da_decl bool getConfigurationDirectory(StringBuffer & result, GroupType groupType, unsigned replicateLevel, const char *instance);
 extern da_decl void setBaseDirectory(const char * dir, unsigned replicateLevel=0, DFD_OS os=DFD_OSdefault);
 extern da_decl const char *queryPartMask();
 extern da_decl StringBuffer &getPartMask(StringBuffer &ret,const char *lname=NULL,unsigned partmax=0);
 extern da_decl void setPartMask(const char * mask);
 extern da_decl bool setReplicateDir(const char *name,StringBuffer &out, bool isrep=true,const char *baseDir=NULL,const char *repDir=NULL); // changes directory of name passed to backup directory
 
-extern da_decl void initializeStorageGroups(bool createPlanesFromGroups);
-extern da_decl const char * queryDefaultStoragePlane();
-extern da_decl IStoragePlane * getStoragePlane(const char * name, bool required);
+extern da_decl void initializeStoragePlanes(bool createPlanesFromGroups, bool threadSafe);  // threadSafe should be true if no other threads will be accessing the global config
+extern da_decl void disableStoragePlanesDaliUpdates();
 
 extern da_decl IFileDescriptor *createFileDescriptor();
 extern da_decl IFileDescriptor *createFileDescriptor(IPropertyTree *attr);      // ownership of attr tree is taken
 extern da_decl IFileDescriptor *createFileDescriptor(const char *lname, const char *clusterType, const char *groupName, IGroup *grp);
 extern da_decl IFileDescriptor *createExternalFileDescriptor(const char *logicalname);
 extern da_decl IFileDescriptor *getExternalFileDescriptor(const char *logicalname);
-extern da_decl ISuperFileDescriptor *createSuperFileDescriptor(IPropertyTree *attr);        // ownership of attr tree is taken
+extern da_decl ISuperFileDescriptor *createSuperFileDescriptor(IPropertyTree *attr, FileDescriptorFlags fileFlags);        // ownership of attr tree is taken
 extern da_decl IFileDescriptor *deserializeFileDescriptor(MemoryBuffer &mb);
 extern da_decl IFileDescriptor *deserializeFileDescriptorTree(IPropertyTree *tree, INamedGroupStore *resolver=NULL, unsigned flags=0);  // flags IFDSF_*
-extern da_decl IFileDescriptor *createFileDescriptor(const char *lname,IGroup *grp,IPropertyTree *tree,DFD_OS os=DFD_OSdefault,unsigned width=0);  // creates default
 extern da_decl IPartDescriptor *deserializePartFileDescriptor(MemoryBuffer &mb);
 extern da_decl void deserializePartFileDescriptors(MemoryBuffer &mb,IArrayOf<IPartDescriptor> &parts);
+extern da_decl IFileDescriptor *createFileDescriptor(const char *lname, const char *planeName, unsigned numParts);
 
 extern da_decl IFileDescriptor *createMultiCopyFileDescriptor(IFileDescriptor *in,unsigned num);
 
@@ -384,5 +409,6 @@ inline DFD_OS SepCharBaseOs(char c)
 
 extern da_decl void extractFilePartInfo(IPropertyTree &info, IFileDescriptor &file);
 
+extern da_decl IndexReadOptions getPartPlaneReadOptions(IPartDescriptor &part, unsigned copy);
 
 #endif

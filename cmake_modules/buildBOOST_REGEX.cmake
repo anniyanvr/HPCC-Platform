@@ -2,9 +2,9 @@
 include(ExternalProject)
 ExternalProject_Add(
   generate-boost-regex
-  URL https://dl.bintray.com/boostorg/release/1.71.0/source/boost_1_71_0.tar.gz
+  URL https://boostorg.jfrog.io/artifactory/main/release/1.71.0/source/boost_1_71_0.tar.gz
   URL_HASH SHA256=96b34f7468f26a141f6020efb813f1a2f3dfb9797ecf76a7d7cbd843cc95f5bd
-  TIMEOUT 15
+  TIMEOUT 60
   DOWNLOAD_DIR ${CMAKE_BINARY_DIR}/downloads
   SOURCE_DIR ${CMAKE_BINARY_DIR}/downloads/boost_1_71_0
   CONFIGURE_COMMAND ${CMAKE_BINARY_DIR}/downloads/boost_1_71_0/bootstrap.sh
@@ -26,7 +26,7 @@ if(PLATFORM OR CLIENTTOOLS_ONLY)
     DESTINATION ${LIB_DIR})
 endif()
 
-set(BOOST_REGEX_INCLUDE_DIR ${CMAKE_BINARY_DIR}/downloads/boost_1_71_0)
-set(BOOST_REGEX_LIBRARIES ${CMAKE_BINARY_DIR}/downloads/boost_1_71_0/stage/lib/libboost_regex.so.1.17.0)
+set(Boost_INCLUDE_DIRS ${CMAKE_BINARY_DIR}/downloads/boost_1_71_0)
+set(Boost_REGEX_LIBRARY ${CMAKE_BINARY_DIR}/downloads/boost_1_71_0/stage/lib/libboost_regex.so.1.17.0)
 message(STATUS "----------------------- ${BOOST_REGEX_LIBRARIES}")
 mark_as_advanced(BOOST_REGEX_LIBRARIES BOOST_REGEX_INCLUDE_DIR)

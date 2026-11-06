@@ -1,19 +1,12 @@
-﻿import * as arrayUtil from "dojo/_base/array";
-import * as declare from "dojo/_base/declare";
-import * as Deferred from "dojo/_base/Deferred";
-import * as lang from "dojo/_base/lang";
-import * as domConstruct from "dojo/dom-construct";
+﻿import { arrayUtil, declare, Deferred, domConstruct, lang, dojoxHtmlEntities as entities, dojoxXmlParser as parser } from "src-dojo/index";
 
-import * as entities from "dojox/html/entities";
-import * as parser from "dojox/xml/parser";
-
-import { ESPBase } from "./ESPBase";
 import * as ESPRequest from "./ESPRequest";
+import { Get as LFGet } from "./ESPLogicalFile";
 import nlsHPCC from "./nlsHPCC";
 import * as Utility from "./Utility";
 import * as WsWorkunits from "./WsWorkunits";
 
-const safeEncode = function (item) {
+function safeEncode(item) {
     switch (Object.prototype.toString.call(item)) {
         case "[object Boolean]":
         case "[object Number]":
@@ -26,158 +19,195 @@ const safeEncode = function (item) {
             console.log("Unknown cell type:  " + Object.prototype.toString.call(item));
     }
     return item;
-};
-
-function RowFormatter(columns, row) {
-    this._columns = [];
-    this._columnIdx = {};
-    this._formattedRow = {};
-    this.flattenColumns(columns, row);
-
-    this._grid = {};
-    this.formatRow(columns, row);
 }
-
-RowFormatter.prototype.flattenColumns = function (columns) {
-    const context = this;
-    arrayUtil.forEach(columns, function (column) {
-        context.flattenColumn(column);
-    });
-};
-
-RowFormatter.prototype.flattenColumn = function (column) {
-    if (column.children) {
-        const context = this;
-        arrayUtil.forEach(column.children, function (column) {
-            context.flattenColumn(column);
-        });
-    } else {
-        this._columnIdx[column.field] = this._columns.length;
-        this._columns.push(column.field);
-    }
-};
 
 const LINE_SPLITTER = "<br><hr style='border: 0px; border-bottom: 1px solid rgb(238, 221, 204);'>";
 const LINE_SPLITTER2 = "<br><hr style='visibility: hidden; border: 0px; border-bottom: 1px solid rgb(238, 221, 204);'>";
-RowFormatter.prototype.formatRow = function (columns, row, rowIdx) {
-    rowIdx = rowIdx || 0;
-    row = row || {};
-    const context = this;
-    let maxChildLen = 0;
-    const colLenBefore = {};
-    arrayUtil.forEach(columns, function (column) {
-        if (!column.children && context._formattedRow[column.field] !== undefined) {
-            colLenBefore[column.field] = ("" + context._formattedRow[column.field]).split(LINE_SPLITTER).length;
-        }
-        const rowArr = row instanceof Array ? row : [row];
-        for (let colIdx = 0; colIdx < rowArr.length; ++colIdx) {
-            const r = rowArr[colIdx];
-            maxChildLen = Math.max(maxChildLen, context.formatCell(column, column.isRawHTML ? r[column.leafID] : safeEncode(r[column.leafID]), rowIdx));
-        }
-    });
-    arrayUtil.forEach(columns, function (column) {
-        if (!column.children) {
-            const cellLength = ("" + context._formattedRow[column.field]).split(LINE_SPLITTER).length - (colLenBefore[column.field] || 0);
-            const delta = maxChildLen - cellLength;
-            if (delta > 0) {
-                const paddingArr = [];
-                paddingArr.length = delta + 1;
-                const padding = paddingArr.join(LINE_SPLITTER2);
-                context._formattedRow[column.field] += padding;
-            }
-        }
-    });
-    return maxChildLen;
-};
+class RowFormatter {
 
-RowFormatter.prototype.formatCell = function (column, cell, rowIdx) {
-    let internalRows = 0;
-    if (column.children) {
-        const children = cell && cell.Row ? cell.Row : [cell];
-        if (children.length === 0) {
-            children.push({});
-        }
+    _columns: any[];
+    _columnIdx: any;
+    _formattedRow: any;
+    _grid: any;
+
+    constructor(columns, row) {
+        this._columns = [];
+        this._columnIdx = {};
+        this._formattedRow = {};
+        this.flattenColumns(columns);
+
+        this._grid = {};
+        this.formatRow(columns, row);
+    }
+
+    flattenColumns(columns) {
         const context = this;
-        arrayUtil.forEach(children, function (row, idx) {
-            internalRows += context.formatRow(column.children, row, rowIdx + idx) + 1;
+        arrayUtil.forEach(columns, function (column) {
+            context.flattenColumn(column);
         });
-        return children.length;
     }
-    if (this._formattedRow[column.field] === undefined) {
-        this._formattedRow[column.field] = cell === undefined ? "" : cell;
-        ++internalRows;
-    } else {
-        this._formattedRow[column.field] += LINE_SPLITTER + (cell === undefined ? "" : cell);
-        ++internalRows;
-    }
-    if (!this._grid[rowIdx]) {
-        this._grid[rowIdx] = {};
-    }
-    this._grid[rowIdx][column.field] = cell;
-    return internalRows;
-};
 
-RowFormatter.prototype.row = function (column) {
-    const retVal = {};
-    const context = this;
-    arrayUtil.forEach(this._columns, function (column) {
-        retVal[column] = context._formattedRow[column];
-    });
-    return retVal;
-};
-
-const Store = declare([ESPRequest.Store, ESPBase], {
-    service: "WsWorkunits",
-    action: "WUResult",
-    responseQualifier: "WUResultResponse.Result",
-    responseTotalQualifier: "WUResultResponse.Total",
-    idProperty: "__hpcc_id",
-    startProperty: "Start",
-    countProperty: "Count",
-    useSingletons: false,
-    preRequest(request) {
-        if (request.FilterBy) {
-            ESPRequest.flattenMap(request, "FilterBy", "NamedValue", true, true);
-        }
-        if (this.name && this.cluster) {
-            this.idPrefix = this.name + "_" + this.cluster;
-            request["LogicalName"] = this.name;
-            request["Cluster"] = this.cluster;
-        } else if (this.name) {
-            this.idPrefix = this.name;
-            request["LogicalName"] = this.name;
-        } else {
-            this.idPrefix = this.wuid + "_" + this.sequence;
-            request["Wuid"] = this.wuid;
-            request["Sequence"] = this.sequence;
-        }
-        if (request.includeXmlSchema) {
-            request["SuppressXmlSchema"] = false;
-        } else {
-            request["SuppressXmlSchema"] = true;
-        }
-    },
-    preProcessResponse(response, request) {
-        if (response.Total === -1 || response.Total === 9223372036854776000 || response.Total === Number.MAX_VALUE) {
-            response.Total = response.Start + response.Count + 1000;
-        }
-        if (lang.exists("Result.Row", response)) {
+    flattenColumn(column) {
+        if (column.children) {
             const context = this;
-            const retVal = context._structure ? this.formatRows(context._structure, response.Result.Row) : response.Result.Row;
-            arrayUtil.forEach(retVal, function (item, index) {
-                item.__hpcc_rowNum = request.Start + index + 1;
-                item.__hpcc_id = context.idPrefix + "_" + item.__hpcc_rowNum;
+            arrayUtil.forEach(column.children, function (column) {
+                context.flattenColumn(column);
             });
-            response.Result = retVal;
+        } else {
+            this._columnIdx[column.field] = this._columns.length;
+            this._columns.push(column.field);
         }
-    },
+    }
+
+    formatRow(columns, row, rowIdx?) {
+        rowIdx = rowIdx || 0;
+        row = row || {};
+        const context = this;
+        let maxChildLen = 0;
+        const colLenBefore = {};
+        arrayUtil.forEach(columns, function (column) {
+            if (!column.children && context._formattedRow[column.field] !== undefined) {
+                colLenBefore[column.field] = ("" + context._formattedRow[column.field]).split(LINE_SPLITTER).length;
+            }
+            const rowArr = row instanceof Array ? row : [row];
+            for (let colIdx = 0; colIdx < rowArr.length; ++colIdx) {
+                const r = rowArr[colIdx];
+                maxChildLen = Math.max(maxChildLen, context.formatCell(column, safeEncode(r[column.leafID]), rowIdx));
+            }
+        });
+        arrayUtil.forEach(columns, function (column) {
+            if (!column.children) {
+                const cellLength = ("" + context._formattedRow[column.field]).split(LINE_SPLITTER).length - (colLenBefore[column.field] || 0);
+                const delta = maxChildLen - cellLength;
+                if (delta > 0) {
+                    const paddingArr = [];
+                    paddingArr.length = delta + 1;
+                    const padding = paddingArr.join(LINE_SPLITTER2);
+                    context._formattedRow[column.field] += padding;
+                }
+            }
+        });
+        return maxChildLen;
+    }
+
+    formatCell(column, cell, rowIdx) {
+        let internalRows = 0;
+        if (column.children) {
+            const children = cell && cell.Row ? cell.Row : [cell];
+            if (children.length === 0) {
+                children.push({});
+            }
+            const context = this;
+            arrayUtil.forEach(children, function (row, idx) {
+                internalRows += context.formatRow(column.children, row, rowIdx + idx) + 1;
+            });
+            return children.length;
+        }
+        if (this._formattedRow[column.field] === undefined) {
+            this._formattedRow[column.field] = cell === undefined ? "" : cell;
+            ++internalRows;
+        } else {
+            this._formattedRow[column.field] += LINE_SPLITTER + (cell === undefined ? "" : cell);
+            ++internalRows;
+        }
+        if (!this._grid[rowIdx]) {
+            this._grid[rowIdx] = {};
+        }
+        this._grid[rowIdx][column.field] = cell;
+        return internalRows;
+    }
+
+    row() {
+        const retVal = {};
+        const context = this;
+        arrayUtil.forEach(this._columns, function (column) {
+            retVal[column] = context._formattedRow[column];
+        });
+        return retVal;
+    }
+}
+
+interface StoreOptions {
+    wuid: string;
+    cluster?: string;
+    name?: string;
+    sequence?: number;
+    isComplete: boolean;
+}
+
+class Store extends ESPRequest.Store {
+    service = "WsWorkunits";
+    action = "WUResult";
+    responseQualifier = "WUResultResponse.Result";
+    responseTotalQualifier = "WUResultResponse.Total";
+    idProperty = "__hpcc_id";
+
+    startProperty = "Start";
+    countProperty = "Count";
+
+    useSingletons = false;
+    name: any;
+    cluster: any;
+    idPrefix: string;
+    wuid: string;
+    sequence: number;
+    isComplete: boolean;
+    _structure: any;
+
+    constructor(options: StoreOptions) {
+        super();
+        this.wuid = options.wuid;
+        this.cluster = options.cluster;
+        this.name = options.name;
+        this.sequence = options.sequence;
+        this.isComplete = options.isComplete;
+
+        this.preRequest = (request) => {
+            if (request.FilterBy) {
+                ESPRequest.flattenMap(request, "FilterBy", "NamedValue", true, true);
+            }
+            if (this.name && this.cluster) {
+                this.idPrefix = this.name + "_" + this.cluster;
+                request["LogicalName"] = this.name;
+                request["Cluster"] = this.cluster;
+            } else if (this.name) {
+                this.idPrefix = this.name;
+                request["LogicalName"] = this.name;
+            } else {
+                this.idPrefix = this.wuid + "_" + this.sequence;
+                request["Wuid"] = this.wuid;
+                request["Sequence"] = this.sequence;
+            }
+            if (request.includeXmlSchema) {
+                request["SuppressXmlSchema"] = false;
+            } else {
+                request["SuppressXmlSchema"] = true;
+            }
+        };
+
+        this.preProcessResponse = (response, request) => {
+            if (response.Total === -1 || response.Total === 9223372036854776000 || response.Total === Number.MAX_VALUE) {
+                response.Total = response.Start + response.Count + 1000;
+            }
+            if (lang.exists("Result.Row", response)) {
+                const context = this;
+                const retVal = context._structure ? this.formatRows(context._structure, response.Result.Row) : response.Result.Row;
+                arrayUtil.forEach(retVal, function (item, index) {
+                    item.__hpcc_rowNum = request.Start + index + 1;
+                    item.__hpcc_id = context.idPrefix + "_" + item.__hpcc_rowNum;
+                });
+                response.Result = retVal;
+            }
+        };
+    }
+
     formatRows(columns, rows) {
         return arrayUtil.map(rows, function (row) {
             const rowFormatter = new RowFormatter(columns, row);
             return rowFormatter.row();
         });
     }
-});
+}
 
 class Result {
     i18n = nlsHPCC;
@@ -197,6 +227,9 @@ class Result {
     XmlSchema: string;
     ECLSchemas: any;
     wu: any;
+
+    FileName: string;
+    LogicalFile: any;
 
     constructor(args) {
         if (args) {
@@ -342,7 +375,7 @@ class Result {
                                         const td = domConstruct.create("td", null, tr);
                                         this.rowToTable(cell[i][key], cell[i], td);
                                     } else if (key.indexOf("__html", key.length - "__html".length) !== -1) {
-                                        domConstruct.create("td", { innerHTML: cell[i][key] }, tr);
+                                        domConstruct.create("td", { innerHTML: safeEncode(cell[i][key]) }, tr);
                                     } else if (key.indexOf("__javascript", key.length - "__javascript".length) !== -1) {
                                         const td = domConstruct.create("td", null, tr);
                                         this.injectJavascript(cell[i][key], cell[i], td);
@@ -361,19 +394,10 @@ class Result {
     }
 
     injectJavascript(__cellContent, __row, __cell) {
-        //  Add paragraph so cells can valign  ---
-        domConstruct.create("p", {
-            style: {
-                height: "1px"
-            },
-            innerHTML: "&nbsp;"
+        // Never execute script content from result payloads; render as inert text.
+        domConstruct.create("pre", {
+            textContent: __cellContent == null ? "" : String(__cellContent)
         }, __cell);
-        try {
-            // tslint:disable-next-line: no-eval
-            eval(__cellContent);
-        } catch (e) {
-            __cell.innerHTML = "<b>Error:</b>&nbsp;&nbsp;" + safeEncode(e.message) + "<br>" + safeEncode(__cellContent);
-        }
     }
 
     parseName(nameObj) {
@@ -450,7 +474,7 @@ class Result {
                             formatter(cell, row) {
                                 switch (typeof cell) {
                                     case "string":
-                                        return cell.replace("\t", "&nbsp;&nbsp;&nbsp;&nbsp;");
+                                        return cell.replace(/\t/g, "&nbsp;&nbsp;&nbsp;&nbsp;");
                                 }
                                 return cell;
                             }
@@ -477,7 +501,7 @@ class Result {
                     column.sortable = false;
                     column.width += keyed ? 16 : 0;
                     column.renderHeaderCell = function (node) {
-                        node.innerHTML = this.label + (this.__hpcc_keyed ? Utility.getImageHTML("index.png", context.i18n.Index) : "");
+                        node.innerHTML = safeEncode(this.label) + (this.__hpcc_keyed ? Utility.getImageHTML("index.png", context.i18n.Index) : "");
                     };
                     if (children) {
                         column.children = children;
@@ -668,7 +692,7 @@ class Result {
 
     getLoadingMessage() {
         if (lang.exists("wu.state", this)) {
-            return "<span class='dojoxGridWating'>[" + this.wu.state + "]</span>";
+            return "<span class='dojoxGridWating'>[" + safeEncode(this.wu.state) + "]</span>";
         }
         return "<span class='dojoxGridWating'>[unknown]</span>";
     }
@@ -680,6 +704,14 @@ class Result {
         }
         retVal += "END;\n";
         return retVal;
+    }
+
+    fetchLogicalFile(): Promise<any> {
+        if (this.FileName) {
+            this.LogicalFile = LFGet(this.Cluster, this.FileName);
+            return this.LogicalFile.refresh().then(() => this.LogicalFile);
+        }
+        return Promise.resolve(undefined);
     }
 }
 

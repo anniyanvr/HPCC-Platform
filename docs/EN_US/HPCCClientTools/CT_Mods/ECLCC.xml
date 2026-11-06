@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE chapter PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+<!DOCTYPE book PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
 "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <book>
   <bookinfo>
@@ -7,7 +7,7 @@
 
     <mediaobject>
       <imageobject>
-        <imagedata fileref="../../images/redswooshWithLogo3.jpg" />
+        <imagedata fileref="../../images/redswooshWithLogo3.jpg"/>
       </imageobject>
     </mediaobject>
 
@@ -29,13 +29,13 @@
       fictitious. Any similarity to actual persons, living or dead, is purely
       coincidental.</para>
 
-      <para></para>
+      <para/>
     </legalnotice>
 
     <releaseinfo>© 2015 HPCC Systems<superscript>®</superscript>. All rights
     reserved</releaseinfo>
 
-    <date><emphasis role="bold"></emphasis></date>
+    <date><emphasis role="bold"/></date>
 
     <corpname>HPCC Systems<superscript>®</superscript></corpname>
 
@@ -46,7 +46,7 @@
 
     <mediaobject role="logo">
       <imageobject>
-        <imagedata fileref="../../images/LN_Rightjustified.jpg" />
+        <imagedata fileref="../../images/LN_Rightjustified.jpg"/>
       </imageobject>
     </mediaobject>
   </bookinfo>
@@ -55,9 +55,9 @@
     <title>ECL Compiler</title>
 
     <para>The ECL Compiler is the compiler component of the High Performance
-    Computing Cluster (HPCC) Systems platform. It is embedded and included when you install the
-    HPCC Systems platform. The compiler is the component that actually compiles the ECL
-    code.</para>
+    Computing Cluster (HPCC) Systems platform. It is embedded and included
+    when you install the HPCC Systems platform. The compiler is the component
+    that actually compiles the ECL code.</para>
 
     <para>The syntax and many of the compiler options implemented are similar
     to the gcc compiler. You can execute either the Linux or Windows version
@@ -70,14 +70,14 @@
         <?dbfo keep-together="always"?>
 
         <tgroup cols="2">
-          <colspec colwidth="49.50pt" />
+          <colspec colwidth="49.50pt"/>
 
-          <colspec />
+          <colspec/>
 
           <tbody>
             <row>
               <entry><inlinegraphic
-              fileref="../../images/OSSgr3.png" /></entry>
+              fileref="../../images/OSSgr3.png"/></entry>
 
               <entry>To compile and run ECL code locally on your Windows
               machine, you will need the Microsoft Visual Studio 2008 C++
@@ -87,7 +87,9 @@
             </row>
           </tbody>
         </tgroup>
-      </informaltable><!--  ***this whole thing should be a comment!
+      </informaltable></para>
+
+      <!--
       /sect2 id="configuration-manager"/
         <title>Dependencies and packages</title>
 
@@ -114,20 +116,20 @@
               </listitem>
             </itemizedlist>
       //sect2/
-         ***END OF COMMENT***   --></para>
+        ***END OF COMMENT***   -->
 
     <sect1 id="Stand-Alone-ECL-Compiler">
       <title>Using the ECL Compiler as a Stand Alone option</title>
 
-      <para>The ECL Compiler is normally used through the ECL IDE, however, you can use the ECL Compiler
-      in a stand alone manner, to create stand alone programs, or workunits.
-      The ECL Compiler can read ECL code from standard input, or can read it
-      from a specified input file. It compiles the code into an executable
-      program (Such as an 'EXE' file in Windows). The resulting program, when
-      executed, runs the job, writing any output to standard output.
-      Alternatively, you could redirect the output to a file or pipe into
-      another process. With the ECL Compiler, you do not need a supercomputer
-      cluster to develop and run ECL code.</para>
+      <para>The ECL Compiler is normally used through the ECL IDE, however,
+      you can use the ECL Compiler in a stand alone manner, to create stand
+      alone programs, or workunits. The ECL Compiler can read ECL code from
+      standard input, or can read it from a specified input file. It compiles
+      the code into an executable program (Such as an 'EXE' file in Windows).
+      The resulting program, when executed, runs the job, writing any output
+      to standard output. Alternatively, you could redirect the output to a
+      file or pipe into another process. With the ECL Compiler, you do not
+      need a supercomputer cluster to develop and run ECL code.</para>
 
       <para>Running the ECL Compiler without any options (or specifying
       --help) will display the syntax.</para>
@@ -143,9 +145,9 @@
           <?dbfo keep-together="always"?>
 
           <tgroup cols="2">
-            <colspec align="left" colwidth="125.55pt" />
+            <colspec align="left" colwidth="125.55pt"/>
 
-            <colspec />
+            <colspec/>
 
             <tbody>
               <row>
@@ -185,8 +187,10 @@
               <row>
                 <entry>-main <emphasis>&lt;ref&gt;</emphasis></entry>
 
-                <entry>Compile definition &lt;ref&gt; from the source
-                collection</entry>
+                <entry>Compile definition &lt;ref&gt; from the specified
+                source - note extended Git repository support (see "<link
+                linkend="CT-CLI-GIT-Support">Git Support</link>" in the
+                previous section)</entry>
               </row>
 
               <row>
@@ -220,14 +224,13 @@
           <?dbfo keep-together="always"?>
 
           <tgroup cols="2">
-            <colspec colwidth="49.50pt" />
+            <colspec colwidth="49.50pt"/>
 
-            <colspec />
+            <colspec/>
 
             <tbody>
               <row>
-                <entry><inlinegraphic
-                fileref="../../images/tip.jpg" /></entry>
+                <entry><inlinegraphic fileref="../../images/tip.jpg"/></entry>
 
                 <entry><emphasis role="bold">NOTE: </emphasis>If there are
                 spaces in the path you specify, put it in quotes. For example:
@@ -243,9 +246,9 @@
           <?dbfo keep-together="always"?>
 
           <tgroup cols="2">
-            <colspec align="left" colwidth="125.55pt" />
+            <colspec align="left" colwidth="125.55pt"/>
 
-            <colspec />
+            <colspec/>
 
             <tbody>
               <row>
@@ -282,7 +285,8 @@
               <row>
                 <entry>-qa</entry>
 
-                <entry>Save ECL query archive as part of workunit</entry>
+                <entry>Save ECL query archive as part of workunit
+                (default). Use -qa=0 to disable.</entry>
               </row>
 
               <row>
@@ -296,7 +300,7 @@
 
       <?hard-pagebreak ?>
 
-      <para></para>
+      <para/>
 
       <para>C++ options:</para>
 
@@ -304,15 +308,15 @@
           <?dbfo keep-together="always"?>
 
           <tgroup cols="2">
-            <colspec align="left" colwidth="125.55pt" />
+            <colspec align="left" colwidth="125.55pt"/>
 
-            <colspec />
+            <colspec/>
 
             <tbody>
               <row>
                 <entry>-S</entry>
 
-                <entry>Generate c++ output, but don't compile</entry>
+                <entry>Generate C++ output, but don't compile</entry>
               </row>
 
               <row>
@@ -330,7 +334,7 @@
               <row>
                 <entry>-Wc,xx</entry>
 
-                <entry>Pass option xx to the c++ compiler</entry>
+                <entry>Pass option xx to the C++ compiler</entry>
               </row>
 
               <row>
@@ -342,19 +346,19 @@
               <row>
                 <entry>-Wa,xx</entry>
 
-                <entry>Pass straight through to c++ compiler</entry>
+                <entry>Pass straight through to C++ compiler</entry>
               </row>
 
               <row>
                 <entry>-Wp,xx</entry>
 
-                <entry>Pass straight through to c++ compiler</entry>
+                <entry>Pass straight through to C++ compiler</entry>
               </row>
 
               <row>
                 <entry>-save-cpps</entry>
 
-                <entry>Do not delete generated c++ files (implied if
+                <entry>Do not delete generated C++ files (implied if
                 -g)</entry>
               </row>
 
@@ -382,9 +386,9 @@
           <?dbfo keep-together="always"?>
 
           <tgroup cols="2">
-            <colspec align="left" colwidth="125.55pt" />
+            <colspec align="left" colwidth="125.55pt"/>
 
-            <colspec />
+            <colspec/>
 
             <tbody>
               <row>
@@ -425,9 +429,9 @@
           <?dbfo keep-together="always"?>
 
           <tgroup cols="2">
-            <colspec align="left" colwidth="125.55pt" />
+            <colspec align="left" colwidth="125.55pt"/>
 
-            <colspec />
+            <colspec/>
 
             <tbody>
               <row>
@@ -441,11 +445,11 @@
 
                 <entry>Allow use of named feature. (e.g., cpp, pipe,
                 all)<para><emphasis role="bold">cpp</emphasis>: Allow embedded
-                code within ECL (e.g., c++, JAVA, Javascript, Python, R,
+                code within ECL (e.g., C++, JAVA, Python,
                 etc.)</para><para><emphasis role="bold">pipe</emphasis>: Allow
                 the PIPE command to send data to an external
                 program.</para><para><emphasis role="bold">userECL</emphasis>:
-                Allow code that is not found via the ecl include
+                Allow code that is not found via the ECL include
                 paths</para><para><emphasis role="bold">datafile</emphasis>:
                 Allow access to datafiles from ECL. </para><para><emphasis
                 role="bold">extern</emphasis>: Allow access to an external
@@ -458,6 +462,13 @@
 
                 <entry>Only allows access to a feature from signed
                 code</entry>
+              </row>
+
+              <row>
+                <entry>-fisComplexCompile</entry>
+
+                <entry>Prevents attempts to compile as a child process when a
+                query is complex.</entry>
               </row>
 
               <row>
@@ -509,10 +520,9 @@
 
                 <entry>Disallow use of named feature<para><emphasis
                 role="bold">cpp</emphasis>: Disallow embedded code within ECL
-                (e.g., c++, JAVA, Javascript, Python, R,
-                etc.)</para><para><emphasis role="bold">pipe</emphasis>:
-                Disallow the PIPE command to send data to an external
-                program.</para></entry>
+                (e.g., C++, JAVA, Python, etc.)</para><para><emphasis
+                role="bold">pipe</emphasis>: Disallow the PIPE command to send
+                data to an external program.</para></entry>
               </row>
 
               <row>
@@ -565,9 +575,9 @@
           <?dbfo keep-together="always"?>
 
           <tgroup cols="2">
-            <colspec align="left" colwidth="125.55pt" />
+            <colspec align="left" colwidth="125.55pt"/>
 
-            <colspec />
+            <colspec/>
 
             <tbody>
               <row>
@@ -714,7 +724,7 @@
           </tgroup>
         </informaltable></para>
 
-      <para></para>
+      <para/>
     </sect1>
 
     <sect1 id="compiled_options">
@@ -730,9 +740,9 @@
           <?dbfo keep-together="always"?>
 
           <tgroup cols="2">
-            <colspec align="left" colwidth="125.55pt" />
+            <colspec align="left" colwidth="125.55pt"/>
 
-            <colspec />
+            <colspec/>
 
             <tbody>
               <row>
@@ -888,7 +898,7 @@ OUTPUT(repo.optionXX);</programlisting>
 
         <programlisting>&lt;Dataset name="Result 1"&gt;&lt;Row&gt;&lt;Result_1&gt;HELLO&lt;/Result_1&gt;&lt;/Row&gt;&lt;/Dataset&gt;</programlisting>
 
-        <para></para>
+        <para/>
       </sect2>
     </sect1>
   </chapter>

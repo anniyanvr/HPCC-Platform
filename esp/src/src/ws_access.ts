@@ -1,37 +1,46 @@
-import * as arrayUtil from "dojo/_base/array";
-import * as declare from "dojo/_base/declare";
-import * as Deferred from "dojo/_base/Deferred";
-import * as lang from "dojo/_base/lang";
-import * as all from "dojo/promise/all";
-import * as Memory from "dojo/store/Memory";
-import * as Observable from "dojo/store/Observable";
-import * as QueryResults from "dojo/store/util/QueryResults";
-import * as SimpleQueryEngine from "dojo/store/util/SimpleQueryEngine";
-import * as topic from "dojo/topic";
+import { arrayUtil, Deferred, lang, all, Observable, QueryResults, SimpleQueryEngine, topic } from "src-dojo/index";
+
+import { AccessService, WsAccess } from "@hpcc-js/comms";
+import { scopedLogger } from "@hpcc-js/util";
 
 import * as ESPRequest from "./ESPRequest";
-import * as ESPUtil from "./ESPUtil";
+import { Memory } from "./store/Memory";
+import { Paged } from "./store/Paged";
+import { BaseStore } from "./store/Store";
 
-const UsersStore = declare([ESPRequest.Store], {
-    service: "ws_access",
-    action: "UserQuery",
-    responseQualifier: "UserQueryResponse.Users.User",
-    responseTotalQualifier: "UserQueryResponse.TotalUsers",
-    idProperty: "username",
-    startProperty: "PageStartFrom",
-    countProperty: "PageSize",
-    SortbyProperty: "SortBy"
-});
+const logger = scopedLogger("src/ws_access.ts");
 
-const GroupsStore = declare([ESPRequest.Store], {
-    service: "ws_access",
-    action: "GroupQuery",
-    responseQualifier: "GroupQueryResponse.Groups.Group",
-    responseTotalQualifier: "GroupQueryResponse.TotalGroups",
-    idProperty: "name",
-    startProperty: "PageStartFrom",
-    countProperty: "PageSize",
-    SortbyProperty: "SortBy",
+class UsersStore extends ESPRequest.Store {
+
+    service = "ws_access";
+    action = "UserQuery";
+    responseQualifier = "UserQueryResponse.Users.User";
+    responseTotalQualifier = "UserQueryResponse.TotalUsers";
+    idProperty = "username";
+
+    startProperty = "PageStartFrom";
+    countProperty = "PageSize";
+
+    SortbyProperty = "SortBy";
+
+    groupname: string;
+
+}
+
+class GroupsStore extends ESPRequest.Store {
+
+    service = "ws_access";
+    action = "GroupQuery";
+    responseQualifier = "GroupQueryResponse.Groups.Group";
+    responseTotalQualifier = "GroupQueryResponse.TotalGroups";
+    idProperty = "name";
+
+    startProperty = "PageStartFrom";
+    countProperty = "PageSize";
+
+    SortbyProperty = "SortBy";
+
+    username: string;
 
     preRequest(request) {
         switch (request.SortBy) {
@@ -43,18 +52,60 @@ const GroupsStore = declare([ESPRequest.Store], {
                 break;
         }
     }
-});
+}
 
 const CONCAT_SYMBOL = ":";
-const ResourcesStore = declare([Memory], {
+
+/**
+ * Returns the grouping prefix for a scope/resource name by finding the first
+ * meaningful separator ("::", ".", "_") after skipping any leading occurrences
+ * of that separator. Returns null if no grouping separator is found.
+ *
+ * Examples:
+ *   "hpccinternal::thor"  → "hpccinternal"
+ *   "_hello_world"        → "_hello"
+ *   "mymodule.sub"        → "mymodule"
+ *   "noseparator"        → null
+ */
+function getScopePrefix(name: string): string | null {
+    // Check "::" first (highest precedence)
+    let start = 0;
+    while (name.startsWith("::", start)) start += 2;
+    const dblColonIdx = name.indexOf("::", start);
+    if (dblColonIdx > start) return name.substring(0, dblColonIdx);
+
+    // Check "."
+    start = 0;
+    while (name.charAt(start) === ".") start++;
+    const dotIdx = name.indexOf(".", start);
+    if (dotIdx > start) return name.substring(0, dotIdx);
+
+    // Check "_"
+    start = 0;
+    while (name.charAt(start) === "_") start++;
+    const underIdx = name.indexOf("_", start);
+    if (underIdx > start) return name.substring(0, underIdx);
+
+    return null;
+}
+
+class ResourcesStore extends Memory {
+
+    groupname: string;
+    username: string;
+    parentRow: any;
+    basedn: string;
+    name: string;
+    scopeScansEnabled: boolean;
 
     constructor() {
-        this.idProperty = "__hpcc_id";
-    },
+        super("__hpcc_id");
+    }
 
-    put: ESPUtil.override(function (inherited, row) {
+    put(row, options) {
+        if (row.__hpcc_type === "ScopeFolder") return row;
         this.get(row.__hpcc_id);
-        const retVal = inherited(arguments);
+        const retVal = super.put(row, options);
         const request = {
             account_name: this.groupname ? this.groupname : this.username,
             account_type: this.groupname ? 1 : 0,
@@ -68,27 +119,30 @@ const ResourcesStore = declare([Memory], {
             request
         });
         return retVal;
-    }),
+    }
 
     query(query, options) {
+        const store = this;
         const results = all([
             this.refreshResources(query),
-            this.refreshAccountPermissions(query)
+            this.refreshAccountPermissions()
         ]).then(lang.hitch(this, function (response) {
-            const accountPermissions = {};
+            // Use Map to avoid prototype-pollution from resource names like "__proto__".
+            const accountPermissions = new Map<string, any>();
             arrayUtil.forEach(response[1], function (item, idx) {
-                accountPermissions[item.ResourceName] = item;
-            }, this);
+                accountPermissions.set(item.ResourceName, item);
+            }, store);
 
-            const data = [];
+            // Build all resource rows first
+            const allItems = [];
             arrayUtil.forEach(response[0], function (item, idx) {
-                const accountPermission = accountPermissions[item.name];
-                data.push(lang.mixin(item, {
+                const accountPermission = accountPermissions.get(item.name);
+                allItems.push(lang.mixin(item, {
                     __hpcc_type: "Resources",
-                    __hpcc_id: this.parentRow.__hpcc_id + CONCAT_SYMBOL + item.name,
-                    __hpcc_parent: this.parentRow,
+                    __hpcc_id: store.parentRow.__hpcc_id + CONCAT_SYMBOL + item.name,
+                    __hpcc_parent: store.parentRow,
                     DisplayName: item.description ? item.description : item.name,
-                    AccountName: this.groupname,
+                    AccountName: store.groupname,
                     allow_access: accountPermission ? accountPermission.allow_access : false,
                     allow_read: accountPermission ? accountPermission.allow_read : false,
                     allow_write: accountPermission ? accountPermission.allow_write : false,
@@ -98,13 +152,64 @@ const ResourcesStore = declare([Memory], {
                     deny_write: accountPermission ? accountPermission.deny_write : false,
                     deny_full: accountPermission ? accountPermission.deny_full : false
                 }));
-            }, this);
+            }, store);
+
+            // Group items by prefix (:: > . > _), skipping leading separator chars.
+            // Only group when 2+ items share the same prefix.
+            // Use Map to avoid prototype-pollution from resource names like "__proto__".
+            const byName = new Map<string, any>();
+            allItems.forEach(function (item) {
+                byName.set(item.name, item);
+            });
+            const prefixGroups = new Map<string, any[]>();
+            allItems.forEach(function (item) {
+                const prefix = getScopePrefix(item.name);
+                if (prefix) {
+                    if (!prefixGroups.has(prefix)) prefixGroups.set(prefix, []);
+                    prefixGroups.get(prefix)!.push(item);
+                }
+            });
+
+            const data: any[] = [];
+            // Items rendered as nested children are omitted from the top-level list below.
+            const nested = new Set<any>();
+            prefixGroups.forEach(function (items, prefix) {
+                if (items.length < 2) return;
+                // If a resource exactly matching the prefix exists, it becomes the
+                // (clickable) expandable parent instead of a separate virtual folder.
+                const parentItem = byName.get(prefix);
+                const childItems = parentItem ? items.filter(function (item) { return item !== parentItem; }) : items;
+                if (parentItem) {
+                    parentItem.children = { query: function () { return QueryResults(childItems); } };
+                } else {
+                    data.push({
+                        __hpcc_type: "ScopeFolder",
+                        __hpcc_id: store.parentRow.__hpcc_id + CONCAT_SYMBOL + "folder:" + prefix,
+                        __hpcc_parent: store.parentRow,
+                        name: prefix,
+                        DisplayName: prefix,
+                        children: { query: function () { return QueryResults(childItems); } }
+                    });
+                }
+                childItems.forEach(function (item) { nested.add(item); });
+            });
+            // Add top-level items (ungrouped, unique prefix, or merged parents)
+            allItems.forEach(function (item) {
+                if (!nested.has(item)) {
+                    data.push(item);
+                }
+            });
+
             options = options || {};
-            this.setData(SimpleQueryEngine({}, { sort: options.sort })(data));
-            return this.data;
+            // Include all resource items in the backing store so that get/put work
+            // correctly for grouped children (prevents duplicate top-level rows on edit).
+            // The returned query result stays top-level only (folders/parents + ungrouped).
+            const allStoreItems: any[] = [...data, ...nested];
+            store.setData(SimpleQueryEngine({}, { sort: options.sort })(allStoreItems));
+            return SimpleQueryEngine({}, { sort: options.sort })(data);
         }));
         return QueryResults(results);
-    },
+    }
 
     refreshResources(query) {
         return Resources({
@@ -112,41 +217,51 @@ const ResourcesStore = declare([Memory], {
                 name: this.parentRow.name
             }
         }).then(lang.hitch(this, function (response) {
+            this.checkScopesEnabled(response);
             if (lang.exists("ResourcesResponse.Resources.Resource", response)) {
                 return response.ResourcesResponse.Resources.Resource;
             }
             return [];
         }));
-    },
+    }
+
+    checkScopesEnabled(response) {
+        this.scopeScansEnabled = response.ResourcesResponse?.scopeScansStatus?.isEnabled ?? false;
+    }
 
     refreshAccountPermissions() {
         if (!this.groupname && !this.username) {
             return [];
         }
-        return AccountPermissions({
+        return AccountPermissionsV2({
             request: {
                 AccountName: this.groupname ? this.groupname : this.username,
                 IsGroup: this.groupname ? true : false,
                 IncludeGroup: false
             }
         }).then(lang.hitch(this, function (response) {
-            if (lang.exists("AccountPermissionsResponse.Permissions.Permission", response)) {
-                return response.AccountPermissionsResponse.Permissions.Permission;
+            if (lang.exists("AccountPermissionsV2Response.Permissions.Permission", response)) {
+                return response.AccountPermissionsV2Response.Permissions.Permission;
             }
             return [];
         }));
     }
-});
+}
 
-const InheritedPermissionStore = declare([Memory], {
+class InheritedPermissionStore extends Memory {
+
+    AccountName: string;
+    TabName: string;
+    IsGroup: boolean;
+    IncludeGroup: boolean;
 
     constructor() {
-        this.idProperty = "__hpcc_id";
-    },
+        super("__hpcc_id");
+    }
 
-    put: ESPUtil.override(function (inherited, row) {
+    put(row, options) {
         this.get(row.__hpcc_id);
-        const retVal = inherited(arguments);
+        const retVal = super.put(row, options);
         const request = {
             BasednName: row.BasednName,
             rname: row.ResourceName,
@@ -159,12 +274,12 @@ const InheritedPermissionStore = declare([Memory], {
             request
         });
         return retVal;
-    }),
+    }
 
     query(query, options) {
         const data = [];
         const results = all([
-            this.refreshAccountPermissions(query)
+            this.refreshAccountPermissions()
         ]).then(lang.hitch(this, function (response) {
             const accountPermissions = {};
             arrayUtil.forEach(response[0], function (item, idx) {
@@ -189,13 +304,13 @@ const InheritedPermissionStore = declare([Memory], {
             return this.data;
         }));
         return QueryResults(results);
-    },
+    }
 
     refreshAccountPermissions() {
         if (!this.AccountName) {
             return [];
         }
-        return AccountPermissions({
+        return AccountPermissionsV2({
             request: {
                 AccountName: this.AccountName,
                 IsGroup: false,
@@ -203,32 +318,37 @@ const InheritedPermissionStore = declare([Memory], {
                 TabName: this.TabName
             }
         }).then(lang.hitch(this, function (response) {
-            if (lang.exists("AccountPermissionsResponse.GroupPermissions.GroupPermission", response)) {
-                const arr = response.AccountPermissionsResponse.GroupPermissions.GroupPermission;
+            if (lang.exists("AccountPermissionsV2Response.GroupPermissions.GroupPermission", response)) {
+                const arr = response.AccountPermissionsV2Response.GroupPermissions.GroupPermission;
                 for (const index in arr) {
                     if (arr[index].GroupName === this.TabName) {
-                        return response.AccountPermissionsResponse.GroupPermissions.GroupPermission[index].Permissions.Permission;
+                        return response.AccountPermissionsV2Response.GroupPermissions.GroupPermission[index].Permissions.Permission;
                     }
                 }
             }
             return [];
         }));
     }
-});
+}
 
-const AccountResourcesStore = declare([Memory], {
+class AccountResourcesStore extends Memory {
+
+    AccountName: string;
+    IsGroup: boolean;
+    IncludeGroup: boolean;
 
     constructor() {
-        this.idProperty = "__hpcc_id";
-    },
+        super("__hpcc_id");
+    }
 
-    put: ESPUtil.override(function (inherited, row) {
+    put(row, options) {
         this.get(row.__hpcc_id);
-        const retVal = inherited(arguments);
+        const retVal = super.put(row, options);
         const request = {
             BasednName: row.BasednName,
             rname: row.ResourceName,
             account_name: row.account_name,
+            account_type: this.IsGroup ? 1 : 0,
             action: "update"
         };
         lang.mixin(request, row);
@@ -236,12 +356,12 @@ const AccountResourcesStore = declare([Memory], {
             request
         });
         return retVal;
-    }),
+    }
 
     query(query, options) {
         const data = [];
         const results = all([
-            this.refreshAccountPermissions(query)
+            this.refreshAccountPermissions()
         ]).then(lang.hitch(this, function (response) {
             const accountPermissions = {};
             arrayUtil.forEach(response[0], function (item, idx) {
@@ -266,7 +386,7 @@ const AccountResourcesStore = declare([Memory], {
             return this.data;
         }));
         return QueryResults(results);
-    },
+    }
 
     refreshAccountPermissions() {
         if (!this.AccountName) {
@@ -285,17 +405,20 @@ const AccountResourcesStore = declare([Memory], {
             return [];
         }));
     }
-});
+}
 
-const IndividualPermissionsStore = declare([Memory], {
+class IndividualPermissionsStore extends Memory {
+
+    name: string;
+    basedn: string;
 
     constructor() {
-        this.idProperty = "__hpcc_id";
-    },
+        super("__hpcc_id");
+    }
 
-    put: ESPUtil.override(function (inherited, row) {
+    put(row, options) {
         this.get(row.__hpcc_id);
-        const retVal = inherited(arguments);
+        const retVal = super.put(row, options);
         const request = {
             BasednName: row.BasednName,
             rname: row.rname,
@@ -307,12 +430,12 @@ const IndividualPermissionsStore = declare([Memory], {
             request
         });
         return retVal;
-    }),
+    }
 
     query(query, options) {
         const data = [];
         const results = all([
-            this.refreshAccountPermissions(query)
+            this.refreshAccountPermissions()
         ]).then(lang.hitch(this, function (response) {
             const accountPermissions = {};
             arrayUtil.forEach(response[0], function (item, idx) {
@@ -338,7 +461,7 @@ const IndividualPermissionsStore = declare([Memory], {
             return this.data;
         }));
         return QueryResults(results);
-    },
+    }
 
     refreshAccountPermissions() {
         return ResourcePermissions({
@@ -353,23 +476,25 @@ const IndividualPermissionsStore = declare([Memory], {
             return [];
         }));
     }
-});
+}
 
-const PermissionsStore = declare([Memory], {
-    service: "ws_access",
-    action: "Permissions",
-    responseQualifier: "BasednsResponse.Basedns.Basedn",
-    idProperty: "__hpcc_id",
+class PermissionsStore extends Memory {
+
+    service = "ws_access";
+    action = "Permissions";
+    responseQualifier = "BasednsResponse.Basedns.Basedn";
+    groupname: string;
+    username: string;
 
     constructor() {
-        this.idProperty = "__hpcc_id";
-    },
+        super("__hpcc_id");
+    }
 
-    get: ESPUtil.override(function (inherited, id) {
+    get(id) {
         const tmp = id.split(CONCAT_SYMBOL);
         if (tmp.length > 0) {
             const parentID = tmp[0];
-            const parent = inherited([parentID]);
+            const parent = super.get(parentID);
             if (tmp.length === 1) {
                 return parent;
             }
@@ -380,20 +505,20 @@ const PermissionsStore = declare([Memory], {
             return parent;
         }
         return null;
-    }),
+    }
 
     putChild(row) {
         const parent = row.__hpcc_parent;
         return parent.children.put(row);
-    },
+    }
 
     getChildren(parent, options) {
         return parent.children.query();
-    },
+    }
 
     mayHaveChildren(object) {
-        return object.__hpcc_type === "Permission";
-    },
+        return object.__hpcc_type === "Permission" || object.__hpcc_type === "ScopeFolder" || !!object.children;
+    }
 
     query(query, options) {
         const deferredResults = new Deferred();
@@ -422,7 +547,7 @@ const PermissionsStore = declare([Memory], {
         }));
         return QueryResults(deferredResults);
     }
-});
+}
 
 export function checkError(response, sourceMethod, showOkMsg) {
     const retCode = lang.getObject(sourceMethod + "Response.retcode", false, response);
@@ -433,13 +558,14 @@ export function checkError(response, sourceMethod, showOkMsg) {
             Source: "WsAccess." + sourceMethod,
             Exceptions: [{ Message: retMsg }]
         });
+        logger.error(retMsg);
     } else if (showOkMsg && retMsg) {
         topic.publish("hpcc/brToaster", {
             Severity: "Message",
             Source: "WsAccess." + sourceMethod,
             Exceptions: [{ Message: retMsg }]
         });
-
+        logger.info(retMsg);
     }
 }
 
@@ -526,6 +652,10 @@ export function AccountPermissions(params) {
     return _doCall("AccountPermissions", params);
 }
 
+export function AccountPermissionsV2(params) {
+    return _doCall("AccountPermissionsV2", params);
+}
+
 export function ResourcePermissions(params) {
     return _doCall("ResourcePermissions", params);
 }
@@ -590,7 +720,7 @@ export function CreateUsersStore(groupname, observable) {
     const store = new UsersStore();
     store.groupname = groupname;
     if (observable) {
-        return Observable(store);
+        return new Observable(store);
     }
     return store;
 }
@@ -599,7 +729,7 @@ export function CreateGroupsStore(username, observable) {
     const store = new GroupsStore();
     store.username = username;
     if (observable) {
-        return Observable(store);
+        return new Observable(store);
     }
     return store;
 }
@@ -608,7 +738,7 @@ export function CreatePermissionsStore(groupname, username) {
     const store = new PermissionsStore();
     store.groupname = groupname;
     store.username = username;
-    return Observable(store);
+    return new Observable(store);
 }
 
 export function CreateAccountPermissionsStore(IsGroup, IncludeGroup, AccountName) {
@@ -616,7 +746,7 @@ export function CreateAccountPermissionsStore(IsGroup, IncludeGroup, AccountName
     store.IsGroup = IsGroup;
     store.IncludeGroup = IncludeGroup;
     store.AccountName = AccountName;
-    return Observable(store);
+    return new Observable(store);
 }
 
 export function CreateInheritedPermissionsStore(IsGroup, IncludeGroup, AccountName, TabName) {
@@ -625,14 +755,14 @@ export function CreateInheritedPermissionsStore(IsGroup, IncludeGroup, AccountNa
     store.IncludeGroup = IncludeGroup;
     store.AccountName = AccountName;
     store.TabName = TabName;
-    return Observable(store);
+    return new Observable(store);
 }
 
 export function CreateIndividualPermissionsStore(basedn, name) {
     const store = new IndividualPermissionsStore();
     store.basedn = basedn;
     store.name = name;
-    return Observable(store);
+    return new Observable(store);
 }
 
 export function CreateResourcesStore(groupname, username, basedn, name) {
@@ -641,5 +771,80 @@ export function CreateResourcesStore(groupname, username, basedn, name) {
     store.username = username;
     store.basedn = basedn;
     store.name = name;
-    return Observable(store);
+    return new Observable(store);
+}
+
+const service = new AccessService({ baseUrl: "" });
+const emptyStore = { data: [], total: 0 };
+
+export type GroupStore = BaseStore<WsAccess.GroupQueryRequest, WsAccess.Group>;
+
+export function CreateGroupStore(): BaseStore<WsAccess.GroupQueryRequest, WsAccess.Group> {
+    const store = new Paged<WsAccess.GroupQueryRequest, WsAccess.Group>({
+        start: "PageStartFrom",
+        count: "PageSize",
+        sortBy: "SortBy",
+        descending: "Descending"
+    }, "Name", request => {
+        try {
+            return service.GroupQuery(request).then(response => {
+                return {
+                    data: response?.Groups?.Group ?? [],
+                    total: response?.TotalGroups ?? 0
+                };
+            });
+        } catch (err) {
+            logger.error(err);
+            return Promise.resolve(emptyStore);
+        }
+    });
+    return store;
+}
+
+export type UserStore = BaseStore<WsAccess.GroupRequest, WsAccess.User>;
+
+export function CreateUserStore(): BaseStore<WsAccess.UserQueryRequest, WsAccess.User> {
+    const store = new Paged<WsAccess.UserQueryRequest, WsAccess.User>({
+        start: "PageStartFrom",
+        count: "PageSize",
+        sortBy: "SortBy",
+        descending: "Descending"
+    }, "username", request => {
+        try {
+            return service.UserQuery(request).then(response => {
+                return {
+                    data: response?.Users?.User ?? [],
+                    total: response?.TotalUsers ?? 0
+                };
+            });
+        } catch (err) {
+            logger.error(err);
+            return Promise.resolve(emptyStore);
+        }
+    });
+    return store;
+}
+
+export type GroupMemberStore = BaseStore<WsAccess.GroupRequest, WsAccess.User>;
+
+export function CreateGroupMemberStore(): BaseStore<WsAccess.GroupMemberQueryRequest, WsAccess.User> {
+    const store = new Paged<WsAccess.GroupMemberQueryRequest, WsAccess.User>({
+        start: "PageStartFrom",
+        count: "PageSize",
+        sortBy: "SortBy",
+        descending: "Descending"
+    }, "username", request => {
+        try {
+            return service.GroupMemberQuery(request).then(response => {
+                return {
+                    data: response?.Users?.User ?? [],
+                    total: response?.TotalUsers ?? 0
+                };
+            });
+        } catch (err) {
+            logger.error(err);
+            return Promise.resolve(emptyStore);
+        }
+    });
+    return store;
 }

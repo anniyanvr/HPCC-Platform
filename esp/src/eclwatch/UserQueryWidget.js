@@ -10,7 +10,6 @@ define([
     "dijit/Menu",
     "dijit/MenuItem",
     "dijit/MenuSeparator",
-    "dijit/form/Select",
 
     "dgrid/tree",
     "dgrid/selector",
@@ -20,6 +19,7 @@ define([
     "src/ws_account",
     "src/ESPBase",
     "src/ESPUtil",
+    "src/Utility",
     "hpcc/UserDetailsWidget",
     "hpcc/GroupDetailsWidget",
     "hpcc/ShowIndividualPermissionsWidget",
@@ -46,9 +46,9 @@ define([
     "hpcc/TableContainer"
 
 ], function (declare, lang, nlsHPCCMod, arrayUtil, domForm, all,
-    registry, Menu, MenuItem, MenuSeparator, Select,
+    registry, Menu, MenuItem, MenuSeparator,
     tree, selector,
-    _TabContainerWidget, WsAccess, WsAccount, ESPBaseMod, ESPUtil, UserDetailsWidget, GroupDetailsWidget, ShowIndividualPermissionsWidget,
+    _TabContainerWidget, WsAccess, WsAccount, ESPBaseMod, ESPUtil, Utility, UserDetailsWidget, GroupDetailsWidget, ShowIndividualPermissionsWidget,
     template) {
 
     var nlsHPCC = nlsHPCCMod.default;
@@ -59,6 +59,8 @@ define([
 
         usersTab: null,
         usersGrid: null,
+
+        scopesTabIdSuffix: 0,
 
         postCreate: function (args) {
             this.inherited(arguments);
@@ -106,7 +108,7 @@ define([
         _onFileScopeDefaultPermissions: function () {
             var row = this.getRow("FileScope");
             if (row) {
-                var fileScopeDefaultPermissionsTab = this.ensurePermissionsPane(row.Basedn + "FileScope", {
+                var fileScopeDefaultPermissionsTab = this.ensurePermissionsPane(`${row.Basedn}_FileScope_${++this.scopesTabIdSuffix}`, {
                     Basedn: row.Basedn,
                     TabName: this.i18n.title_FileScopeDefaultPermissions,
                     DefaultPermissions: true
@@ -118,7 +120,7 @@ define([
         _onWorkunitScopeDefaultPermissions: function () {
             var row = this.getRow("WorkunitScope");
             if (row) {
-                var workunitScopeDefaultPermissionsTab = this.ensurePermissionsPane(row.Basedn + "WUScope", {
+                var workunitScopeDefaultPermissionsTab = this.ensurePermissionsPane(`${row.Basedn}_WUScope_${++this.scopesTabIdSuffix}`, {
                     Basedn: row.Basedn,
                     TabName: this.i18n.title_WorkunitScopeDefaultPermissions,
                     DefaultPermissions: true
@@ -404,7 +406,7 @@ define([
                     if (!deleteRequests[item.__hpcc_id]) {
                         deleteRequests[item.__hpcc_id] = {
                             action: "Delete",
-                            basedn: item.__hpcc_parent.basedn,
+                            BasednName: item.__hpcc_parent.name,
                             rtype: item.__hpcc_parent.rtype,
                             rtitle: item.__hpcc_parent.rtitle
                         };
@@ -503,6 +505,7 @@ define([
         //  Groups  ---
         initGroupsGrid: function () {
             this.initGroupsContextMenu();
+            var context = this;
             var store = WsAccess.CreateGroupsStore(null, true);
             this.groupsGrid = declare([ESPUtil.Grid(true, true)])({
                 sort: [{ attribute: "name" }],
@@ -515,7 +518,7 @@ define([
                     name: {
                         label: this.i18n.GroupName,
                         formatter: function (_name, idx) {
-                            return "<a href='#' onClick='return false;' class='dgrid-row-url'>" + _name + "</a>";
+                            return "<a href='#' onClick='return false;' class='dgrid-row-url'>" + Utility.encodeHTML(_name) + "</a>";
                         }
                     },
                     groupOwner: {
@@ -526,7 +529,11 @@ define([
                     }
                 }
             }, this.id + "GroupsGrid");
-            var context = this;
+
+            ESPUtil.goToPageUserPreference(this.groupsGrid, "UsersQueryWidget_GroupsGrid_GridRowsPerPage").then(function () {
+                context.refreshGroupsGrid();
+            });
+
             this.groupsGrid.on(".dgrid-row:dblclick", function (evt) {
                 if (context._onGroupsRowDblClick) {
                     var item = context.groupsGrid.row(evt).data;
@@ -541,9 +548,6 @@ define([
             });
             this.groupsGrid.onSelectionChanged(function (event) {
                 context.refreshActionState();
-            });
-            ESPUtil.goToPageUserPreference(this.groupsGrid, "UsersQueryWidget_GroupsGrid_GridRowsPerPage").then(function () {
-                context.groupsGrid.startup();
             });
         },
 
@@ -600,6 +604,7 @@ define([
 
         //  Users  ---
         initUsersGrid: function () {
+            var context = this;
             this.initUsersContextMenu();
             this.usersStore = WsAccess.CreateUsersStore(null, true);
             this.usersGrid = declare([ESPUtil.Grid(true, true)])({
@@ -616,7 +621,7 @@ define([
                         label: this.i18n.Username,
                         sortable: true,
                         formatter: function (_name, idx) {
-                            return "<a href='#' onClick='return false;' class='dgrid-row-url'>" + _name + "</a>";
+                            return "<a href='#' onClick='return false;' class='dgrid-row-url'>" + Utility.encodeHTML(_name) + "</a>";
                         }
                     },
                     employeeID: {
@@ -640,7 +645,10 @@ define([
                     }
                 }
             }, this.id + "UsersGrid");
-            var context = this;
+
+            ESPUtil.goToPageUserPreference(this.usersGrid, "UsersQueryWidget_UsersGrid_GridRowsPerPage").then(function () {
+                context.refreshUsersGrid();
+            });
 
             this.usersGrid.on(".dgrid-row-url:click", function (evt) {
                 if (context._onUsersRowDblClick) {
@@ -656,9 +664,6 @@ define([
             });
             this.usersGrid.onSelectionChanged(function (event) {
                 context.refreshActionState();
-            });
-            ESPUtil.goToPageUserPreference(this.usersGrid, "UsersQueryWidget_UsersGrid_GridRowsPerPage").then(function () {
-                context.usersGrid.startup();
             });
         },
 
@@ -738,6 +743,7 @@ define([
             this.permissionsGrid = declare([ESPUtil.Grid(false, true)])({
                 allowSelectAll: true,
                 deselectOnRefresh: true,
+                selectionMode: "none",
                 sort: [{ attribute: "DisplayName" }],
                 store: this.permissionsStore,
                 columns: {
@@ -747,7 +753,9 @@ define([
                             if (row.name === "File Scopes" || row.name === "Workunit Scopes" || row.name === "Repository Modules") {
                                 return false;
                             }
-                            return row.children ? true : false;
+                            // Real resources stay selectable even when they are an expandable prefix-parent;
+                            // only virtual grouping folders and categories (children but no resource) are blocked.
+                            return row.children && row.__hpcc_type !== "Resources" ? true : false;
                         }
                     }, "checkbox"),
                     name: tree({
@@ -755,10 +763,10 @@ define([
                         sortable: false,
                         label: this.i18n.Name,
                         formatter: function (_name, idx) {
-                            if (idx.__hpcc_parent) {
-                                return "<a href='#' onClick='return false;' class='dgrid-row-url'>" + _name + "</a>";
+                            if (idx.__hpcc_parent && idx.__hpcc_type !== "ScopeFolder") {
+                                return "<a href='#' onClick='return false;' class='dgrid-row-url'>" + Utility.encodeHTML(_name) + "</a>";
                             } else {
-                                return _name;
+                                return Utility.encodeHTML(_name);
                             }
                         }
                     }),
@@ -774,15 +782,31 @@ define([
                 }
             }, this.id + "PermissionsGrid");
             var context = this;
+            this.permissionsGrid.on("click", function (evt) {
+                var t = window.setTimeout(function () {
+                    var permissionSelection = context.permissionsGrid.getSelected();
+                    if (permissionSelection.length > 1 || permissionSelection[0].Basedn !== "File Scopes") {
+                        registry.byId(context.id + "EnableScopeScans").set("disabled", true);
+                        registry.byId(context.id + "DisableScopeScans").set("disabled", true);
+                    } else {
+                        var scopeScansEnabled = permissionSelection[0]?.children.scopeScansEnabled ?? false;
+                        registry.byId(context.id + "EnableScopeScans").set("disabled", scopeScansEnabled);
+                        registry.byId(context.id + "DisableScopeScans").set("disabled", !scopeScansEnabled);
+                    }
+                    window.clearTimeout(t);
+                }, 100);
+            });
             this.permissionsGrid.on(".dgrid-row-url:click", function (evt) {
                 if (context._onPermissionsRowDblClick) {
                     var item = context.permissionsGrid.row(evt).data;
+                    if (item.__hpcc_type === "ScopeFolder") return;
                     context._onPermissionsRowDblClick(item.__hpcc_parent.name, item.name, item.DisplayName);
                 }
             });
             this.permissionsGrid.on(".dgrid-row:dblclick", function (evt) {
                 if (context._onPermissionsRowDblClick) {
                     var item = context.permissionsGrid.row(evt).data;
+                    if (item.__hpcc_type === "ScopeFolder") return;
                     context._onPermissionsRowDblClick(item.__hpcc_parent.name, item.name, item.DisplayName);
                 }
             });
@@ -834,7 +858,6 @@ define([
                 retVal = new ShowIndividualPermissionsWidget({
                     id: id,
                     title: params.TabName ? params.TabName : params.Name,
-                    iconClass: "iconPeople",
                     closable: true,
                     params: params
                 });
@@ -875,22 +898,6 @@ define([
             var permissionSelection = this.permissionsGrid.getSelected();
             var hasPermissionSelection = permissionSelection.length;
 
-            if (hasPermissionSelection && permissionSelection[0].name === "File Scopes") {
-                var context = this;
-                WsAccess.Resources({
-                    request: {
-                        name: event.rows[0].data.Basedn
-                    }
-                }).then(function (response) {
-                    if (lang.exists("ResourcesResponse.scopeScansStatus", response)) {
-                        var scopeScansEnabled;
-                        scopeScansEnabled = response.ResourcesResponse.scopeScansStatus.isEnabled;
-                        registry.byId(context.id + "EnableScopeScans").set("disabled", scopeScansEnabled);
-                        registry.byId(context.id + "DisableScopeScans").set("disabled", !scopeScansEnabled);
-                    }
-                });
-            }
-
             registry.byId(this.id + "FileScopeDefaultPermissions").set("disabled", true);
             registry.byId(this.id + "WorkUnitScopeDefaultPermissions").set("disabled", true);
             registry.byId(this.id + "PhysicalFiles").set("disabled", true);
@@ -900,7 +907,7 @@ define([
             registry.byId(this.id + "DeletePermissions").set("disabled", !hasPermissionSelection);
 
             for (var i = 0; i < permissionSelection.length; ++i) {
-                if (permissionSelection[i].children) {
+                if (permissionSelection[i].children && permissionSelection[i].__hpcc_type !== "Resources") {
                     registry.byId(this.id + "DeletePermissions").set("disabled", true);
                 }
                 switch (permissionSelection[i].name) {

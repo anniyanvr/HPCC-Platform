@@ -5,6 +5,7 @@ define([
     "dojo/dom",
     "dojo/dom-attr",
     "dojo/dom-class",
+    "dojo/topic",
 
     "dijit/registry",
 
@@ -16,6 +17,7 @@ define([
     "src/ESPActivity",
     "src/ESPRequest",
     "src/WsWorkunits",
+    "src/Session",
 
     "dojo/text!../templates/WUDetailsWidget.html",
 
@@ -39,13 +41,15 @@ define([
     "dijit/form/TextBox",
     "dijit/Dialog",
     "dijit/form/SimpleTextarea",
+    "dijit/form/DateTextBox",
+    "dijit/form/TimeTextBox",
 
     "hpcc/TableContainer"
-], function (declare, lang, nlsHPCCMod, dom, domAttr, domClass,
+], function (declare, lang, nlsHPCCMod, dom, domAttr, domClass, topic,
     registry,
     Clippy,
     srcReact,
-    _TabContainerWidget, ESPWorkunit, ESPActivity, ESPRequest, WsWorkunits,
+    _TabContainerWidget, ESPWorkunit, ESPActivity, ESPRequest, WsWorkunits, Session,
     template) {
 
     var nlsHPCC = nlsHPCCMod.default;
@@ -82,6 +86,8 @@ define([
         clusterGroup: null,
         maxSlaves: null,
 
+        logAccessorMessage: "",
+
         prevState: "",
 
         postCreate: function (args) {
@@ -113,6 +119,16 @@ define([
             this.emailFrom = registry.byId(this.id + "EmailFrom");
             this.emailSubject = registry.byId(this.id + "EmailSubject");
             this.emailBody = registry.byId(this.id + "EmailBody");
+
+            //Zap LogFilters
+            this.logFilterStartDateTime = dom.byId(this.id + "StartDateTime");
+            this.logFilterStartDate = registry.byId(this.id + "StartDate");
+            this.logFilterStartTime = registry.byId(this.id + "StartTime");
+            this.logFilterEndDateTime = dom.byId(this.id + "EndDateTime");
+            this.logFilterEndDate = registry.byId(this.id + "EndDate");
+            this.logFilterEndTime = registry.byId(this.id + "EndTime");
+            this.logFilterRelativeTimeRangeBuffer = registry.byId(this.id + "RelativeTimeRangeBuffer");
+
             this.protected = registry.byId(this.id + "Protected");
             this.infoGridWidget = registry.byId(this.id + "InfoContainer");
             this.zapDialog = registry.byId(this.id + "ZapDialog");
@@ -128,7 +144,7 @@ define([
         },
 
         destroy: function (args) {
-            srcReact.unrender(this.statusNode);
+            this.statusNodeRoot?.dispose();
             this.zapDialog.destroyRecursive();
             this.inherited(arguments);
         },
@@ -142,15 +158,46 @@ define([
             this.checkThorLogStatus();
         },
 
+        formatLogFilterDateTime: function (dateField, timeField, dateTimeField) {
+            if (dateField.value.toString() !== "Invalid Date") {
+                const d = new Date(dateField.value);
+                const month = d.getMonth() + 1;
+                const day = d.getDate();
+                const date = `${d.getFullYear()}-${(month < 9 ? "0" : "") + month}-${(day < 9 ? "0" : "") + day}`;
+                const time = timeField.value.toString().replace(/.*1970\s(\S+).*/, "$1");
+                dateTimeField.value = `${date}T${time}.000Z`;
+            }
+        },
+
         _onSubmitDialog: function () {
+            var context = this;
             var includeSlaveLogsCheckbox = this.includeSlaveLogsCheckbox.get("checked");
+            if (this.logFilterRelativeTimeRangeBuffer.value !== "") {
+                this.logFilterEndDate.required = "";
+                this.logFilterStartDate.required = "";
+            }
             if (this.zapForm.validate()) {
                 //WUCreateAndDownloadZAPInfo is not a webservice so relying on form to submit.
                 //Server treats "on" and '' as the same thing.
                 this.includeSlaveLogsCheckbox.set("value", includeSlaveLogsCheckbox ? "on" : "off");
+
+                // Log Filters
+                this.formatLogFilterDateTime(this.logFilterStartDate, this.logFilterStartTime, this.logFilterStartDateTime);
+                this.formatLogFilterDateTime(this.logFilterEndDate, this.logFilterEndTime, this.logFilterEndDateTime);
+
                 this.zapForm.set("action", "/WsWorkunits/WUCreateAndDownloadZAPInfo");
+
                 this.zapDialog.hide();
                 this.checkThorLogStatus();
+                if (this.logAccessorMessage !== "") {
+                    topic.publish("hpcc/brToaster", {
+                        Severity: "Warning",
+                        Source: "WsWorkunits/WUCreateAndDownloadZAPInfo",
+                        Exceptions: [{
+                            Message: context.logAccessorMessage,
+                        }]
+                    });
+                }
             }
         },
 
@@ -177,6 +224,7 @@ define([
         },
         _onRefresh: function (event) {
             this.wu.refresh(true);
+            this.wu.fetchServiceNames();
         },
         _onClone: function (event) {
             this.wu.clone();
@@ -222,6 +270,7 @@ define([
                 this.wu.publish(
                     dom.byId(this.id + "Jobname2").value,
                     dom.byId(this.id + "RemoteDali").value,
+                    dom.byId(this.id + "RemoteStorage").value,
                     dom.byId(this.id + "SourceProcess").value,
                     registry.byId(this.id + "Priority").value,
                     dom.byId(this.id + "Comment").value,
@@ -265,10 +314,10 @@ define([
                         context.emailBody.set("disabled", false);
                     } else {
                         context.emailCheckbox.set("disabled", true);
-                        context.emailTo.set("disabled", true);
-                        context.emailFrom.set("disabled", true);
-                        context.emailSubject.set("disabled", true);
-                        context.emailBody.set("disabled", true);
+                        context.emailTo && context.emailTo.set("disabled", true);
+                        context.emailFrom && context.emailFrom.set("disabled", true);
+                        context.emailSubject && context.emailSubject.set("disabled", true);
+                        context.emailBody && context.emailBody.set("disabled", true);
                     }
                     context.updateInput("ZapWUID", null, response.WUGetZAPInfoResponse.WUID);
                     context.updateInput("BuildVersion", null, response.WUGetZAPInfoResponse.BuildVersion);
@@ -282,6 +331,8 @@ define([
                     context.thorIPAddress = response.WUGetZAPInfoResponse.ThorIPAddress;
                     context.emailTo = response.WUGetZAPInfoResponse.EmailTo;
                     context.emailFrom = response.WUGetZAPInfoResponse.EmailFrom;
+
+                    context.logAccessorMessage = response.WUGetZAPInfoResponse?.Message ?? "";
                 }
             });
         },
@@ -309,15 +360,17 @@ define([
                     context.updateInput(name, oldValue, newValue);
                 });
                 this.wu.refresh();
+                this.wu.fetchServiceNames();
             }
 
             this.infoGridWidget.init(params);
             this.checkIfClustersAllowed();
             this.checkThorLogStatus();
             this.statusNode = dom.byId(this.id + "WUStatus");
-            srcReact.render(srcReact.WUStatus, { wuid: params.Wuid }, this.statusNode);
+            this.statusNodeRoot = srcReact.ReactRoot.create(this.statusNode);
+            this.statusNodeRoot.lightThemedRender(srcReact.WUStatus, { wuid: params.Wuid });
 
-            this.protected.on("change", function (evt) {
+            this.protected.on("click", function (evt) {
                 context._onSave();
             });
 
@@ -335,6 +388,10 @@ define([
                 });
             } else if (currSel.id === this.widget._Workflows.id && !this.widget._Workflows.__hpcc_initalized) {
                 this.widget._Workflows.init({
+                    Wuid: this.wu.Wuid
+                });
+            } else if (currSel.id === this.widget._Processes.id && !this.widget._Processes.__hpcc_initalized) {
+                this.widget._Processes.init({
                     Wuid: this.wu.Wuid
                 });
             } else if (currSel.id === this.resultsWidget.id && !this.resultsWidgetLoaded) {
@@ -602,6 +659,15 @@ define([
             } else if (name === "Scope" && newValue) {
                 domClass.remove("scopeOptional", "hidden");
                 domClass.add("scopeOptional", "show");
+            } else if (name === "ServiceNames" && newValue && newValue.Item) {
+                var domElem = registry.byId(this.id + "ServiceNamesCustom");
+                domElem.set("value", newValue.Item.join("\n"));
+            } else if (name === "CompileCost") {
+                this.updateInput("FormattedCompileCost", oldValue, Session.formatCost(newValue));
+            } else if (name === "ExecuteCost") {
+                this.updateInput("FormattedExecuteCost", oldValue, Session.formatCost(newValue));
+            } else if (name === "FileAccessCost") {
+                this.updateInput("FormattedFileAccessCost", oldValue, Session.formatCost(newValue));
             }
             if (name === "__hpcc_changedCount" && newValue > 0) {
                 var getInt = function (item) {
@@ -626,7 +692,7 @@ define([
             registry.byId(this.id + "Resubmit").set("disabled", isArchived || !this.wu.isComplete() || this.wu.isDeleted());
             registry.byId(this.id + "Recover").set("disabled", isArchived || !this.wu.isComplete() || this.wu.isDeleted());
             registry.byId(this.id + "Publish").set("disabled", isArchived || !this.wu.isComplete() || this.wu.isDeleted());
-            registry.byId(this.id + "ZapReport").set("disabled", this.wu.isDeleted());
+            registry.byId(this.id + "ZapReport").set("disabled", isArchived || this.wu.isDeleted());
             registry.byId(this.id + "Reschedule").set("disabled", !this.wu.isAbleToReschedule());
             registry.byId(this.id + "Deschedule").set("disabled", !this.wu.isAbleToDeschedule());
 

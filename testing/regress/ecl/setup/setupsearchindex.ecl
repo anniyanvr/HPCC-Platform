@@ -21,7 +21,6 @@
 #onwarning (3164, ignore); // The merge of tokens has single entries from some of the dataset, and the merge criteria orders between the input datasets
 
 import $.SetupText;
-import $.Options;
 import Std.File;
 
 boolean createMultiPart := (__PLATFORM__[1..4] = 'thor');
@@ -33,5 +32,6 @@ string OriginalTextFilesPath := '' : STORED('OriginalTextFilesEclPath');
 rebuildSearchIndex := OriginalTextFilesIp <> '' AND OriginalTextFilesPath <> '';
 
 IF(rebuildSearchIndex,
-    SetupText.createSearchIndex(),
+    parallel(SetupText.createSearchIndex(),
+    SetupText.createSearchSource()),
     File.DeleteLogicalFile(Files.NameSearchIndex, true));

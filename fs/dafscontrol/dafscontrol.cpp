@@ -53,13 +53,6 @@ void usage()
     exit(1);
 }
 
-const char * queryDaFileSrvExecutable(const IpAddress &ip, StringBuffer &ret)
-{
-    StringBuffer dir; // not currently used
-    return querySlaveExecutable("DaFileSrvProcess", "dafilesrv", NULL, ip, ret, dir);
-}
-
-
 //extern REMOTE_API unsigned getDaliServixVersion(IpAddress &ip,StringBuffer &ver);
 
 enum ApplyMode
@@ -127,7 +120,7 @@ unsigned applyNodes(const char *grpip, ApplyMode mode, unsigned ver, bool isdali
     if (!quiet&&(n>1))
         PROGLOG("Scanning %s...",grpip);
     multiConnect(eps,sockets,to);
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     class casyncfor: public CAsyncFor
     {
         SocketEndpointArray &eps;
@@ -139,7 +132,7 @@ unsigned applyNodes(const char *grpip, ApplyMode mode, unsigned ver, bool isdali
         CriticalSection &sect;
     public:
         casyncfor(ApplyMode _mode, unsigned _ver,SocketEndpointArray &_eps,IPointerArrayOf<ISocket> &_sockets,SocketEndpointArray &_result, StringAttrArray &_resultstr,CriticalSection &_sect) 
-            : eps(_eps), sockets(_sockets), result(_result), resultstr(_resultstr), sect(_sect)
+            : CAsyncFor(SYNC_LOCATION), eps(_eps), sockets(_sockets), result(_result), resultstr(_resultstr), sect(_sect)
         { 
             mode = _mode;
             ver = _ver;
@@ -149,7 +142,7 @@ unsigned applyNodes(const char *grpip, ApplyMode mode, unsigned ver, bool isdali
             ISocket *sock = sockets.item(i);
             StringBuffer epstr;
             SocketEndpoint ep = eps.item(i);
-            ep.getUrlStr(epstr);
+            ep.getEndpointHostText(epstr);
 //          PROGLOG("T.1 %s %x",epstr.str(),(unsigned)sock);
             StringBuffer verstr;
             unsigned rver=0;
@@ -223,7 +216,7 @@ unsigned applyNodes(const char *grpip, ApplyMode mode, unsigned ver, bool isdali
         if (!quiet) {
             StringBuffer epstr;
             ForEachItemIn(i,result) {
-                result.item(i).getUrlStr(epstr.clear());
+                result.item(i).getEndpointHostText(epstr.clear());
                 StringAttrItem &attr = resultstr.item(i);
                 if (attr.text.length()==0) 
                     UERRLOG("%s: %s not running DAFILESRV",grpip,epstr.str());
@@ -246,7 +239,7 @@ unsigned applyNodes(const char *grpip, ApplyMode mode, unsigned ver, bool isdali
             StringBuffer epstr;
             unsigned failed=0;
             ForEachItemIn(i,result) {
-                result.item(i).getUrlStr(epstr.clear());
+                result.item(i).getEndpointHostText(epstr.clear());
                 StringAttrItem &attr = resultstr.item(i);
                 if (attr.text.length()!=0) 
                     PROGLOG("%s,%s,%s",grpip,epstr.str(),attr.text.get());
@@ -261,7 +254,7 @@ unsigned applyNodes(const char *grpip, ApplyMode mode, unsigned ver, bool isdali
         if (!quiet) {
             StringBuffer epstr;
             ForEachItemIn(i,result) {
-                result.item(i).getUrlStr(epstr.clear());
+                result.item(i).getEndpointHostText(epstr.clear());
                 UERRLOG("%s: %s not running DAFILESRV",grpip,epstr.str());
             }
             unsigned numok = eps.ordinality()-result.ordinality();
@@ -289,7 +282,7 @@ int main(int argc, char* argv[])
     }
 
     EnableSEHtoExceptionMapping();
-    attachStandardFileLogMsgMonitor("dafscontrol.log", NULL, MSGFIELD_STANDARD, MSGAUD_all, MSGCLS_all, TopDetail, false);
+    attachStandardFileLogMsgMonitor("dafscontrol.log", NULL, MSGFIELD_STANDARD, MSGAUD_all, MSGCLS_all, TopDetail);
     queryStderrLogMsgHandler()->setMessageFields(MSGFIELD_prefix);
     int ret = 0;
     try {
@@ -382,7 +375,7 @@ int main(int argc, char* argv[])
                             if (ret!=0)
                                 UERRLOG("setDafileSvrTraceFlags returned %d",ret);
                             StringBuffer s("done ");
-                            ep.getUrlStr(s);
+                            ep.getEndpointHostText(s);
                             PROGLOG("%s",s.str());
                         }
                     }
@@ -402,7 +395,7 @@ int main(int argc, char* argv[])
                     if (!isdali||!getCluster(argv[ai+1],eps)) {
                         SocketEndpoint ep(argv[ai+1]);
                         StringBuffer epStr;
-                        ep.getUrlStr(epStr);
+                        ep.getEndpointHostText(epStr);
                         VStringBuffer result("Info for %s", epStr.str());
                         int ret = getDafileSvrInfo(ep, level, result);
                         if (ret!=0)
@@ -414,7 +407,7 @@ int main(int argc, char* argv[])
                         ForEachItemIn(ni,eps) {
                             SocketEndpoint ep = eps.item(ni);
                             StringBuffer epStr;
-                            ep.getUrlStr(epStr);
+                            ep.getEndpointHostText(epStr);
                             VStringBuffer result("Info for %s: ", epStr.str());
                             int ret = getDafileSvrInfo(ep, level, result);
                             if (ret!=0)
@@ -445,7 +438,7 @@ int main(int argc, char* argv[])
                             if (ret!=0)
                                 UERRLOG("setDafileSvrThrottleLimit returned %d, error = %s", ret, errMsg.str());
                             StringBuffer s("done ");
-                            ep.getUrlStr(s);
+                            ep.getEndpointHostText(s);
                             PROGLOG("%s",s.str());
                         }
                     }

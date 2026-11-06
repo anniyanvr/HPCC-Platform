@@ -25,27 +25,34 @@
 #ifdef _USE_OPENLDAP
 #include "ldapsecurity.ipp"
 #endif
+#include "jmetrics.hpp"
+
+static std::shared_ptr<hpccMetrics::GaugeMetric> pActiveRequests;
+
+MODULE_INIT(INIT_PRIORITY_STANDARD)
+{
+    pActiveRequests = hpccMetrics::registerGaugeMetric("esp.requests.active", "Number of active requests", SMeasureCount);
+    return true;
+}
 
 typedef IXslProcessor * (*getXslProcessor_func)();
 
-static atomic_t gActiveRequests;
-
-long ActiveRequests::getCount()
+unsigned ActiveRequests::getCount()
 {
-    return atomic_read(&gActiveRequests);
+    return pActiveRequests->queryValue();
 }
 
-void ActiveRequests::inc()
+ActiveRequests::ActiveRequests()
 {
-    atomic_inc(&gActiveRequests);
+    pActiveRequests->adjust(1);
 }
 
-void ActiveRequests::dec()
+ActiveRequests::~ActiveRequests()
 {
-    atomic_dec(&gActiveRequests);
+    pActiveRequests->adjust(-1);
 }
 
-CEspApplicationPort::CEspApplicationPort(bool viewcfg, CEspProtocol* prot) : viewConfig(viewcfg), rootAuth(false), navWidth(165), navResize(false), navScroll(false), protocol(prot)
+CEspApplicationPort::CEspApplicationPort(bool viewcfg, CEspProtocol* prot) : viewConfig(viewcfg), rootAuth(false), navResize(false), navScroll(false), navWidth(165), protocol(prot)
 {
     build_ver = getBuildVersion();
 
@@ -476,6 +483,8 @@ IPropertyTree *CEspBinding::addNavException(IPropertyTree &folder, const char *m
 
 void CEspBinding::getNavigationData(IEspContext &context, IPropertyTree & data)
 {
+    if (isDynamicBinding() && !isBound())
+        return;
     IEspWsdlSections *wsdl = dynamic_cast<IEspWsdlSections *>(this);
     if (wsdl)
     {
@@ -605,6 +614,13 @@ unsigned CEspApplicationPort::updatePassword(IEspContext &context, IHttpMessage*
     if(streq(oldpass, newpass1))
     {
         message.append("New password can't be the same as current password.");
+        return 1;
+    }
+
+    SecFeatureSet sfs = secmgr->queryImplementedFeatures();
+    if (!(sfs & SMF_UpdateUserPassword))
+    {
+        message.append("Changing password is not supported.");
         return 1;
     }
 

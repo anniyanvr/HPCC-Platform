@@ -83,16 +83,14 @@ set_target_properties(fileview2 PROPERTIES
     COMPILE_FLAGS -D_USRDLL
     DEFINE_SYMBOL FILEVIEW2_EXPORTS )
 install ( TARGETS fileview2 RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( fileview2 
+target_link_libraries ( fileview2 PRIVATE
          jlib 
          mp 
-         hrpc 
          remote 
          nbcd 
          eclrtl 
          jhtree 
          dalibase 
-         environment 
          dllserver 
          deftype 
          workunit 
@@ -100,3 +98,10 @@ target_link_libraries ( fileview2
          hql 
     )
 
+if (CMAKE_DL_LIBS)
+    target_link_libraries ( fileview2 PRIVATE ${CMAKE_DL_LIBS} )
+endif()
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( fileview2 PRIVATE environment )
+endif()

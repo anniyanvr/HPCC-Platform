@@ -25,8 +25,10 @@
 project(mysqlembed)
 
 if(MYSQLEMBED)
-    ADD_PLUGIN(mysqlembed PACKAGES MYSQL)
+    ADD_PLUGIN(mysqlembed)
     if(MAKE_MYSQLEMBED)
+        find_package(unofficial-libmysql REQUIRED)
+        find_package(ZLIB REQUIRED)
         set(
             SRCS
             mysqlembed.cpp)
@@ -39,7 +41,7 @@ if(MYSQLEMBED)
             ./../../rtl/nbcd
             ./../../common/deftype
             ./../../system/jlib
-            ${MYSQL_INCLUDE_DIR})
+        )
 
         add_definitions(-D_USRDLL -DMYSQLEMBED_EXPORTS)
 
@@ -52,13 +54,17 @@ if(MYSQLEMBED)
 
         install(
             TARGETS mysqlembed
-            DESTINATION plugins )
+            DESTINATION plugins
+            CALC_DEPS)
         target_link_libraries(
-            mysqlembed
-            ${MYSQL_LIBRARIES}
+            mysqlembed PRIVATE
             eclrtl
+            nbcd
             roxiemem
-            jlib)
+            jlib
+            unofficial::libmysql::libmysql
+            ZLIB::ZLIB
+        )
     endif()
 endif()
 

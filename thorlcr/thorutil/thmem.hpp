@@ -281,6 +281,7 @@ protected:
     const void **rows = nullptr;
     void **stableTable = nullptr;
     bool throwOnOom = true; // tested during array expansion (resize())
+    bool useMergeSort = true;
     EmptyRowSemantics emptyRowSemantics = ers_forbidden;
     StableSortFlag stableSort = stableSort_none;
     rowidx_t maxRows = 0;  // Number of rows that can fit in the allocated memory.
@@ -326,7 +327,8 @@ public:
             if (!resize(numRows+1))
                 return false;
         }
-        rows[numRows++] = row;
+        rows[numRows] = row;
+        numRows++;
         return true;
     }
     bool binaryInsert(const void *row, ICompare &compare, bool dropLast=false); // NB: takes ownership on success
@@ -355,9 +357,15 @@ public:
     }
     inline rowidx_t ordinality() const { return numRows; }
     inline rowidx_t queryMaxRows() const { return maxRows; }
+    inline bool isFull() const { return numRows >= maxRows; }
 
     inline const void **getRowArray() { return rows; }
     void swap(CThorExpandingRowArray &src);
+    // Exchange row storage only (rows/stableTable/numRows/maxRows) with another array,
+    // leaving each side's configuration (rowIf, stableSort, emptyRowSemantics, throwOnOom)
+    // untouched.  Useful when handing a ptr-array buffer back and forth between cooperating
+    // objects whose own settings should not be perturbed.
+    void swapRowData(CThorExpandingRowArray &src);
     void transfer(CThorExpandingRowArray &from)
     {
         kill();
@@ -409,10 +417,10 @@ class graph_decl CThorSpillableRowArray : private CThorExpandingRowArray, implem
     size32_t commitDelta = CommitStep;  // How many rows need to be written before they are added to the committed region?
     rowidx_t firstRow = 0; // Only rows firstRow..numRows are considered initialized.  Only read/write within cs.
     rowidx_t commitRows = 0;  // can only be updated by writing thread within a critical section
-    mutable CriticalSection cs;
+    mutable CriticalSection cs{SYNC_LOCATION};
     ICopyArrayOf<IWritePosCallback> writeCallbacks;
     size32_t compBlkSz = 0; // means use default
-
+    CRuntimeStatisticCollection stats; // reset after each kill
     bool _flush(bool force);
     void doFlush();
     inline bool needToMoveRows(bool force) { return (firstRow != 0 && (force || (firstRow >= commitRows/2))); }
@@ -479,13 +487,20 @@ public:
 
     //A thread calling the following functions must own the lock, or guarantee no other thread will access
     void sort(ICompare & compare, unsigned maxcores);
-    rowidx_t save(IFile &file, unsigned _spillCompInfo, bool skipNulls, const char *tracingPrefix);
+    rowidx_t save(CFileOwner &file, unsigned _spillCompInfo, bool skipNulls, const char *tracingPrefix);
 
     inline rowidx_t numCommitted() const { return commitRows - firstRow; } //MORE::Not convinced this is very safe!
     inline rowidx_t queryTotalRows() const { return CThorExpandingRowArray::ordinality(); } // includes uncommited rows
+    inline unsigned __int64 getStatistic(StatisticKind kind) const
+    {
+        return stats.getStatisticValue(kind);
+    }
 
 // access to
     void swap(CThorSpillableRowArray &src);
+    // Storage-only swap (see CThorExpandingRowArray::swapRowData); additionally exchanges
+    // firstRow / commitRows.  Does not disturb either side's configuration.
+    void swapRowData(CThorSpillableRowArray &src);
     void transfer(CThorSpillableRowArray &from)
     {
         kill();
@@ -523,7 +538,9 @@ public:
     virtual void lock() const { cs.enter(); }
     virtual void unlock() const { cs.leave(); }
 
-private:
+    // Releases all rows but keeps the underlying ptr-array allocation; also resets
+    // firstRow/commitRows.  Caller must ensure no concurrent users (typically called
+    // under the array lock or when the array is known to be quiescent).
     void clearRows();
 };
 
@@ -541,22 +558,30 @@ interface IThorRowCollectorCommon : extends IInterface, extends IThorArrayLock
     virtual void setup(ICompare *iCompare, StableSortFlag stableSort=stableSort_none, RowCollectorSpillFlags diskMemMix=rc_mixed, unsigned spillPriority=50) = 0;
     virtual void resize(rowidx_t max) = 0;
     virtual void setOptions(unsigned options) = 0;
-    virtual unsigned __int64 getStatistic(StatisticKind kind) = 0;
+    virtual unsigned __int64 getStatistic(StatisticKind kind) const = 0;
     virtual bool hasSpilt() const = 0; // equivalent to numOverlows() >= 1
     virtual void setTracingPrefix(const char *tracing) = 0;
+    virtual void reset() = 0;
 };
 
 interface IThorRowLoader : extends IThorRowCollectorCommon
 {
     virtual IRowStream *load(IRowStream *in, const bool &abort, bool preserveGrouping=false, CThorExpandingRowArray *allMemRows=NULL, memsize_t *memUsage=NULL, bool doReset=true) = 0;
     virtual IRowStream *loadGroup(IRowStream *in, const bool &abort, CThorExpandingRowArray *allMemRows=NULL, memsize_t *memUsage=NULL, bool doReset=true) = 0;
+
+    // Iterator-style API for repeated per-group loads.  Each call reads one group from
+    // 'in', sorts it, and returns the resulting stream.  Returns nullptr when 'in' has
+    // produced no more rows (end of input).  The returned pointer is owned by the
+    // loader and is valid only until the next loadNextGroup/reset/loader destruction.
+    // Designed to allow the in-memory fast path to reuse a single underlying spillable
+    // stream across groups.
+    virtual IRowStream *loadNextGroup(IRowStream *in, const bool &abort) = 0;
 };
 
 interface IThorRowCollector : extends IThorRowCollectorCommon
 {
     virtual void setEmptyRowSemantics(EmptyRowSemantics emptyRowSemantics) = 0;
     virtual IRowWriter *getWriter() = 0;
-    virtual void reset() = 0;
     virtual IRowStream *getStream(bool shared=false, CThorExpandingRowArray *allMemRows=NULL) = 0;
     virtual bool spill(bool critical) = 0; // manual spill. Returns true if anything spilt
     virtual bool flush() = 0; // manual flush (free array space and potentially ptr table)
@@ -568,6 +593,7 @@ extern graph_decl IThorRowLoader *createThorRowLoader(CActivityBase &activity, I
 extern graph_decl IThorRowCollector *createThorRowCollector(CActivityBase &activity, IThorRowInterfaces *rowIf, ICompare *iCompare=NULL, StableSortFlag stableSort=stableSort_none, RowCollectorSpillFlags diskMemMix=rc_mixed, unsigned spillPriority=SPILL_PRIORITY_DEFAULT, EmptyRowSemantics emptyRowSemantics=ers_forbidden);
 
 
+extern graph_decl void *fastLZDecompressToRoxieMem(roxiemem::IVariableRowHeap &heap, const void * src, size32_t &expsz);
 
 
 class CSDSServerStatus;

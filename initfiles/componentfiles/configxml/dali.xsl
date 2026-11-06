@@ -19,6 +19,7 @@
 
 <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xml:space="default">
   <xsl:output method="xml" indent="yes" omit-xml-declaration="no" encoding="UTF-8"/>
+  <xsl:include href="vaults-common.xsl"/>
   <xsl:template match="text()"/>
   <xsl:param name="process" select="'dali'"/>
   <xsl:param name="isLinuxInstance" select="0"/>
@@ -65,6 +66,7 @@
 
 
   <xsl:variable name="daliServerNode" select="/Environment/Software/DaliServerProcess[@name=$process]"/>
+  <xsl:variable name="daliServerPort" select="/Environment/Software/DaliServerProcess[@name=$process]/Instance[1]/@port"/>
 
 
   <xsl:template match="/">
@@ -81,6 +83,9 @@
     <DALI>
       <xsl:attribute name="name">
         <xsl:value-of select="@name"/>
+      </xsl:attribute>
+      <xsl:attribute name="port">
+        <xsl:value-of select="$daliServerPort"/>
       </xsl:attribute>
       <xsl:if test="string(@LogDir)!=''">
         <xsl:attribute name="log_dir">
@@ -100,7 +105,28 @@
         </xsl:attribute>
       </xsl:if>
       <xsl:copy-of select="/Environment/Software/Directories"/>
-
+      <xsl:copy-of select="./protrace"/>
+      <xsl:choose>
+          <xsl:when test="tracing">
+              <xsl:copy-of select="./tracing"/>
+          </xsl:when>
+          <xsl:otherwise>
+              <xsl:copy-of select="/Environment/Software/tracing"/>
+          </xsl:otherwise>
+      </xsl:choose>
+      <!--
+      # Generated for configuration info. accessed by getGlobalConfig()
+      -->
+      <global>
+        <expert>
+          <xsl:copy-of select="/Environment/Software/Globals/@* | /Environment/Software/Globals/*"/>
+        </expert>
+        <xsl:copy-of select="/Environment/Hardware/cost"/>
+        <storage>
+          <xsl:copy-of select="/Environment/Software/Globals/storage/*"/>
+          <xsl:copy-of select="/Environment/Software/Storage/*"/>
+        </storage>
+      </global>
       <xsl:if test="@authMethod='secmgrPlugin'">
       <SecurityManagers>
           <SecurityManager>
@@ -125,10 +151,12 @@
       </SecurityManagers>
      </xsl:if>
 
-      <xsl:element name="SDS">
+      <xsl:element name="sds">
         <xsl:attribute name="store">dalisds.xml</xsl:attribute>
         <xsl:attribute name="caseInsensitive">0</xsl:attribute>
-        <xsl:copy-of select="@recoverFromIncErrors |@snmpSendWarnings | @enableSNMP | @enableSysLog | @snmpErrorMsgLevel | @msgLevel | @lightweightCoalesce | @keepStores | @backupLargeWarningThreshold | @backupSoftQueueLimit | @backupSoftQueueLimitDelay"/>
+        <xsl:copy-of select="@asyncBackup | @deltaSaveThresholdSecs | @deltaTransactionMaxMemMB | @deltaTransactionQueueLimit |
+                             @externalSizeThreshold | @enableSNMP | @enableSysLog | @keepStores | @leakStore | @lightweightCoalesce |
+                             @msgLevel | @nobackup | @recoverFromIncErrors | @saveBinary | @saveAsync | @snmpSendWarnings | @snmpErrorMsgLevel | @useNFSBackupMount"/>
         <xsl:if test="string(@IdlePeriod) != ''">
             <xsl:attribute name="lCIdlePeriod">
                 <xsl:value-of select="@IdlePeriod"/>
@@ -176,11 +204,10 @@
             <xsl:value-of select="/Environment/Hardware/Computer[@name=current()/@backupComputer]/@netAddress"/>
           </xsl:attribute>
         </xsl:if>
-        <xsl:copy-of select="@asyncBackup | @useNFSBackupMount"/>
       </xsl:element>
-      <DFS>
+      <dfs>
       <xsl:copy-of select="@forceGroupUpdate | @numThreads"/>
-      </DFS>
+      </dfs>
       <xsl:element name="Coven">
         <xsl:attribute name="store">dalicoven.xml</xsl:attribute>
         <xsl:element name="Alerts">
@@ -265,7 +292,7 @@
         </xsl:element>
         <xsl:if test="string(@ldapServer) != ''">
           <xsl:element name="ldapSecurity">
-            <xsl:copy-of select="@ldapProtocol | @authMethod | @maxConnections | @workunitsBasedn | @filesDefaultUser | @filesDefaultPassword"/>
+            <xsl:copy-of select="@ldapProtocol | @authMethod | @maxConnections | @workunitsBasedn"/>
             <xsl:variable name="ldapServerName" select="@ldapServer"/>
             <xsl:attribute name="filesBasedn">
                 <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]/@filesBasedn"/>
@@ -275,9 +302,6 @@
             </xsl:attribute>
             <xsl:attribute name="modulesBasedn">
                 <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]/@modulesBasedn"/>
-            </xsl:attribute>
-            <xsl:attribute name="sudoersBasedn">
-                <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]/@sudoersBasedn"/>
             </xsl:attribute>
             <xsl:attribute name="usersBasedn">
                 <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]/@usersBasedn"/>
@@ -290,6 +314,15 @@
             </xsl:attribute>
             <xsl:attribute name="adminGroupName">
                 <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]/@adminGroupName"/>
+            </xsl:attribute>
+            <xsl:attribute name="useLegacyDefaultFileScopePermissionCache">
+                <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]/@useLegacyDefaultFileScopePermissionCache"/>
+            </xsl:attribute>
+            <xsl:attribute name="disableDefaultUser">
+              <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]/@disableDefaultUser"/>
+            </xsl:attribute>
+            <xsl:attribute name="hpccAdminSecretKey">
+              <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]/@hpccAdminSecretKey"/>
             </xsl:attribute>
             <xsl:variable name="ldapServerNode" select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]"/>
             <xsl:if test="not($ldapServerNode)">
@@ -321,11 +354,16 @@
             </xsl:attribute>
 
             <xsl:for-each select="$ldapServerNode">
-              <xsl:copy-of select="@ldapPort | @ldapSecurePort | @ldapTimeoutSecs | @cacheTimeout | @workunitsBasedn | @modulesBasedn | @systemBasedn | @systemCommonName | @systemUser | @systemPassword | @usersBasedn | @groupsBasedn| @viewsBasedn | @serverType"/>
+              <xsl:copy-of select="@ldapPort | @ldapSecurePort | @ldapTimeoutSecs | @ldapCipherSuite | @cacheTimeout | @workunitsBasedn | @modulesBasedn | @systemBasedn | @systemCommonName | @systemUser | @systemPassword | @usersBasedn | @groupsBasedn| @viewsBasedn | @serverType | @ldapTLSValidation | @ldapCACertFile"/>
             </xsl:for-each>
+            <xsl:attribute name="ldapAdminSecretKey">
+              <xsl:value-of select="/Environment/Software/LDAPServerProcess[@name=$ldapServerName]/@ldapAdminSecretKey"/>
+            </xsl:attribute>
           </xsl:element>
         </xsl:if>
       </xsl:element>
+      <xsl:call-template name="addMetricsConfig"/>
+      <xsl:call-template name="addVaultsConfig"/>
     </DALI>
   </xsl:template>
 
@@ -360,6 +398,15 @@
       </xsl:otherwise>
 
     </xsl:choose>
+  </xsl:template>
+
+  <xsl:template name="addMetricsConfig">
+    <xsl:copy-of select="/Environment/Software/metrics"/>
+  </xsl:template>
+
+  <xsl:template name="addVaultsConfig">
+    <xsl:call-template name="validateLdapVaultReferences"/>
+    <xsl:call-template name="copyVaultsConfig"/>
   </xsl:template>
 
 </xsl:stylesheet>

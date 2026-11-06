@@ -30,7 +30,7 @@
 #include "jmutex.hpp"
 #include "jfile.hpp"
 #include "jhtree.hpp"
-
+#include "jsecrets.hpp"
 
 #include "rtldynfield.hpp"
 #include "rtlds_imp.hpp"
@@ -50,27 +50,25 @@
 #include "rmtclient_impl.hpp"
 #include "rmtfile.hpp"
 
-
 //----------------------------------------------------------------------------
 
 //#define TEST_DAFILESRV_FOR_UNIX_PATHS     // probably not needed
 
-static class CSecuritySettings
-{
-    unsigned short daliServixPort;
-public:
-    CSecuritySettings()
-    {
-        querySecuritySettings(nullptr, &daliServixPort, nullptr, nullptr, nullptr);
-    }
-
-    unsigned short queryDaliServixPort() { return daliServixPort; }
-} securitySettings;
-
-
+static std::atomic<unsigned> dafilesrvPort{(unsigned)-1};
+static CriticalSection dafilesrvCs{SYNC_LOCATION};
 unsigned short getDaliServixPort()
 {
-    return securitySettings.queryDaliServixPort();
+    if (dafilesrvPort == (unsigned)-1)
+    {
+        CriticalBlock block(dafilesrvCs);
+        if (dafilesrvPort == (unsigned) -1)
+        {
+            unsigned short daliServixPort;
+            querySecuritySettings(nullptr, &daliServixPort, nullptr, nullptr, nullptr);
+            dafilesrvPort = daliServixPort;
+        }
+    }
+    return dafilesrvPort;
 }
 
 
@@ -224,10 +222,18 @@ CDaliServixFilter *createDaliServixFilter(IPropertyTree &filterProps)
     return filter;
 }
 
+
 class CDaliServixIntercept: public CInterface, implements IDaFileSrvHook
 {
     CIArrayOf<CDaliServixFilter> filters;
     StringAttr forceRemotePattern;
+    CriticalSection secretCrit{SYNC_LOCATION};
+    struct EndpointData
+    {
+        unsigned count;
+        std::string secret;
+    };
+    std::unordered_map<std::string, EndpointData> endpointMap;
 
     void addFilter(CDaliServixFilter *filter)
     {
@@ -248,43 +254,59 @@ public:
         SocketEndpoint ep = filename.queryEndpoint();
         bool noport = (ep.port==0);
         setDafsEndpointPort(ep);
-        if (!filename.isLocal()||(ep.port!=DAFILESRV_PORT && ep.port!=SECURE_DAFILESRV_PORT)) // assume standard port is running on local machine
-        {
+
+        // Check NAS filters FIRST (before any local/remote determination)
+        // NAS filters redirect what appears to be a remote file to a local path via NAS mount
+        // This must happen before other checks to ensure NAS mappings are always consulted
 #ifdef __linux__
 #ifndef USE_SAMBA
-            if (noport && filters.ordinality())
+        if (noport && filters.ordinality())
+        {
+            ForEachItemIn(sn, filters)
             {
-                ForEachItemIn(sn, filters)
+                CDaliServixFilter &filter = filters.item(sn);
+                if (filter.testEp(ep))
                 {
-                    CDaliServixFilter &filter = filters.item(sn);
-                    if (filter.testEp(ep))
+                    StringBuffer lPath;
+                    filename.getLocalPath(lPath);
+                    if (filter.testPath(lPath.str()))
                     {
-                        StringBuffer lPath;
-                        filename.getLocalPath(lPath);
-                        if (filter.testPath(lPath.str()))
+                        if (filter.queryTrace())
                         {
-                            if (filter.queryTrace())
-                            {
-                                StringBuffer fromPath;
-                                filename.getRemotePath(fromPath);
-                                PROGLOG("Redirecting path: '%s' to '%s", fromPath.str(), lPath.str());
-                            }
-                            return ::createIFile(lPath.str());
+                            StringBuffer fromPath;
+                            filename.getRemotePath(fromPath);
+                            PROGLOG("Redirecting path: '%s' to '%s'", fromPath.str(), lPath.str());
                         }
+                        return ::createIFile(lPath.str());
                     }
                 }
             }
+        }
+#endif
+#endif
+
+        // Now check if we need remote file access via dafilesrv
+        if (!filename.isLocal()||(ep.port!=DAFILESRV_PORT && ep.port!=SECURE_DAFILESRV_PORT)) // assume standard port is running on local machine
+        {
+            // check 1st if this is a secret based url
+            StringBuffer storageSecret;
+            getSecretBased(storageSecret, filename);
+            if (storageSecret.length())
+                return createDaliServixFile(filename, storageSecret);
+
+#ifdef __linux__
+#ifndef USE_SAMBA
             return createDaliServixFile(filename);
 #endif
 #else
             if (!noport)            // expect all filenames that specify port to be dafilesrc or daliservix
-                return createDaliServixFile(filename);  
+                return createDaliServixFile(filename);
             if (filename.isUnixPath()
-#ifdef TEST_DAFILESRV_FOR_UNIX_PATHS        
+#ifdef TEST_DAFILESRV_FOR_UNIX_PATHS
                 &&testDaliServixPresent(ep)
 #endif
                 )
-                return createDaliServixFile(filename);  
+                return createDaliServixFile(filename);
 #endif
         }
         else if (forceRemotePattern)
@@ -293,7 +315,15 @@ public:
             filename.getLocalPath(localPath);
             // must be local to be here, check if matches forceRemotePattern
             if (WildMatch(localPath, forceRemotePattern, false))
-                return createDaliServixFile(filename);
+            {
+                // check 1st if this is a secret based url
+                StringBuffer storageSecret;
+                getSecretBased(storageSecret, filename);
+                if (storageSecret.length())
+                    return createDaliServixFile(filename, storageSecret);
+                else
+                    return createDaliServixFile(filename);
+            }
         }
         return NULL;
     }
@@ -341,6 +371,54 @@ public:
     virtual void clearFilters()
     {
         filters.kill();
+    }
+    virtual StringBuffer &getSecretBased(StringBuffer &storageSecret, const RemoteFilename & filename) override
+    {
+        CLeavableCriticalBlock b(secretCrit);
+        if (!endpointMap.empty())
+        {
+            const SocketEndpoint &ep = filename.queryEndpoint();
+
+            StringBuffer endpointStr;
+            ep.getEndpointHostText(endpointStr);
+
+            auto it = endpointMap.find(endpointStr.str());
+            if (it != endpointMap.end())
+            {
+                storageSecret.append(it->second.secret.c_str());
+                b.ensureLeave();
+                if (0 == storageSecret.length())
+                {
+                    VStringBuffer secureUrl("https://%s", endpointStr.str());
+                    generateDynamicUrlSecretName(storageSecret, secureUrl, nullptr);
+                }
+            }
+        }
+        return storageSecret;
+    }
+    virtual void addSecretEndpoint(const char *endpoint, const char *optSecret) override
+    {
+        CriticalBlock b(secretCrit);
+        auto it = endpointMap.find(endpoint);
+        if (it == endpointMap.end())
+            endpointMap[endpoint] = { 1, optSecret ? optSecret : "" };
+        else
+            it->second.count++;
+    }
+    virtual void removeSecretEndpoint(const char *endpoint) override
+    {
+        CriticalBlock b(secretCrit);
+        auto it = endpointMap.find(endpoint);
+        if (it == endpointMap.end())
+        {
+            if (doTrace(traceDaFsClient, traceDetailed))
+                DBGLOG("CDaliServixIntercept::removeSecretEndpoint - endpoint %s not found", endpoint);
+            return;
+        }
+        if (1 == it->second.count)
+            endpointMap.erase(it);
+        else
+            it->second.count--;
     }
 } *DaliServixIntercept = NULL;
 
@@ -603,7 +681,7 @@ class CEndpointCS : public CriticalSection, public CInterface
     CCritTable &table;
     const SocketEndpoint ep;
 public:
-    CEndpointCS(CCritTable &_table, const SocketEndpoint &_ep) : table(_table), ep(_ep) { }
+    CEndpointCS(CCritTable &_table, const SocketEndpoint &_ep) : CriticalSection(SYNC_LOCATION), table(_table), ep(_ep) { }
     const void *queryFindParam() const { return &ep; }
 
     virtual void beforeDispose();
@@ -612,7 +690,7 @@ public:
 class CCritTable : private SimpleHashTableOf<CEndpointCS, const SocketEndpoint>
 {
     typedef SimpleHashTableOf<CEndpointCS, const SocketEndpoint> PARENT;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
 public:
     CEndpointCS *getCrit(const SocketEndpoint &ep)
     {
@@ -665,11 +743,8 @@ class CRemoteFile : public CRemoteBase, implements IFile
     StringAttr remotefilename;
     unsigned flags;
     bool isShareSet;
-public:
-    IMPLEMENT_IINTERFACE_O_USING(CRemoteBase);
 
-    CRemoteFile(const SocketEndpoint &_ep, const char * _filename)
-        : CRemoteBase(_ep, _filename)
+    void commonInit()
     {
         flags = ((unsigned)IFSHread)|((S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH)<<16);
         isShareSet = false;
@@ -678,6 +753,20 @@ public:
             VStringBuffer winDriveFilename("%c:%s", filename[1], filename+3);
             filename.set(winDriveFilename);
         }
+    }
+public:
+    IMPLEMENT_IINTERFACE_O_USING(CRemoteBase);
+
+    CRemoteFile(const SocketEndpoint &_ep, const char * _filename)
+        : CRemoteBase(_ep, _filename)
+    {
+        commonInit();
+    }
+
+    CRemoteFile(const SocketEndpoint &ep, const char *filename, const char *storageSecret)
+        : CRemoteBase(ep, storageSecret, filename)
+    {
+        commonInit();
     }
 
     bool exists()
@@ -1206,12 +1295,24 @@ protected:
     compatIFSHmode compatmode;
     IFEflags extraFlags = IFEnone;
     bool disconnectonexit;
+    bool fileIOCounted = false;
+
+    void noteClosed()
+    {
+        if (fileIOCounted)
+        {
+            parent->noteFileIOClose(disconnectonexit);
+            fileIOCounted = false;
+        }
+    }
 public:
     CRemoteFileIO(CRemoteFile *_parent)
         : parent(_parent), ioReadCycles(0), ioWriteCycles(0), ioReadBytes(0), ioWriteBytes(0), ioReads(0), ioWrites(0), ioRetries(0)
     {
         handle = 0;
         disconnectonexit = false;
+        parent->noteFileIOOpen();
+        fileIOCounted = true;
     }
 
     ~CRemoteFileIO()
@@ -1227,8 +1328,7 @@ public:
                 e->Release();
             }
         }
-        if (disconnectonexit)
-            parent->disconnect();
+        noteClosed();
     }
 
     void close()
@@ -1249,6 +1349,7 @@ public:
                 e->Release();
             }
             handle = 0;
+            noteClosed();
         }
     }
     RemoteFileIOHandle getHandle() const { return handle; }
@@ -1306,7 +1407,7 @@ public:
     bool reopen()
     {
         StringBuffer s;
-        PROGLOG("Attempting reopen of %s on %s",parent->queryLocalName(),parent->queryEp().getUrlStr(s).str());
+        PROGLOG("Attempting reopen of %s on %s",parent->queryLocalName(),parent->queryEp().getEndpointHostText(s).str());
         if (open(mode,compatmode,extraFlags))
             return true;
         return false;
@@ -1356,6 +1457,9 @@ public:
 
     size32_t read(offset_t pos, size32_t len, void * data)
     {
+        if (0 == len)
+            return 0;
+        dbgassertex(data);
         size32_t got;
         MemoryBuffer replyBuffer;
         CCycleTimer timer;
@@ -1403,7 +1507,7 @@ public:
                     if (errCode)
                     {
                         StringBuffer msg;
-                        parent->ep.getUrlStr(msg.append('[')).append("] ");
+                        parent->ep.getEndpointHostText(msg.append('[')).append("] ");
                         if (replyBuffer.getPos()<replyBuffer.length())
                         {
                             StringAttr s;
@@ -1497,23 +1601,6 @@ public:
         return ret;
     }
 
-    offset_t appendFile(IFile *file,offset_t pos,offset_t len)
-    {
-        MemoryBuffer sendBuffer;
-        initSendBuffer(sendBuffer);
-        MemoryBuffer replyBuffer;
-        const char * fname = file->queryFilename();
-        sendBuffer.append((RemoteFileCommandType)RFCappend).append(handle).append(fname).append(pos).append(len);
-        parent->sendRemoteCommand(sendBuffer, replyBuffer, false, true); // retry not safe
-
-        offset_t ret;
-        replyBuffer.read(ret);
-
-        if ((ret==(offset_t)-1) || ((len != ((offset_t)-1)) && (ret < len)))
-            throw createDafsException(DISK_FULL_EXCEPTION_CODE,"append failed, disk full?");    // though could be file missing TBD
-        return ret;
-    }
-
 
     void setSize(offset_t size)
     {
@@ -1525,6 +1612,11 @@ public:
         // retry using reopen TBD
 
 
+    }
+
+    virtual IFile * queryFile() const override
+    {
+        return parent;
     }
 
     void setDisconnectOnExit(bool set) { disconnectonexit = set; }
@@ -1662,7 +1754,7 @@ struct CLocalMountRec: public CInterface
 };
 
 static CIArrayOf<CLocalMountRec> localMounts;
-static CriticalSection           localMountCrit;
+static CriticalSection           localMountCrit{SYNC_LOCATION};
 
 void setDafsLocalMountRedirect(const IpAddress &ip,const char *dir,const char *mountdir)
 {
@@ -1693,20 +1785,21 @@ void setDafsLocalMountRedirect(const IpAddress &ip,const char *dir,const char *m
     }
 }
 
-IFile *createFileLocalMount(const IpAddress &ip, const char * filename)
+IFile *createFileLocalMount(const IpAddress &ip, const char *filename)
 {
     CriticalBlock block(localMountCrit);
-    ForEachItemInRev(i,localMounts) {
+    ForEachItemInRev(i, localMounts) {
         CLocalMountRec &mount = localMounts.item(i);
         if (mount.ip.ipequals(ip)) {
             size32_t bl = mount.dir.length();
-            if (isPathSepChar(mount.dir[bl-1]))
+            dbgassertex(bl > 0);
+            if (isPathSepChar(mount.dir[bl - 1]))
                 bl--;
-            if ((memcmp((void *)filename,(void *)mount.dir.get(),bl)==0)&&(isPathSepChar(filename[bl])||!filename[bl])) { // match
+            if ((memcmp((void *)filename, (void *)mount.dir.get(), bl) == 0) && (isPathSepChar(filename[bl]) || !filename[bl])) { // match
                 StringBuffer locpath(mount.local);
                 if (filename[bl])
-                    addPathSepChar(locpath).append(filename+bl+1);
-                locpath.replace((PATHSEPCHAR=='\\')?'/':'\\',PATHSEPCHAR);
+                    addPathSepChar(locpath).append(filename + bl + 1);
+                locpath.replace((PATHSEPCHAR == '\\') ? '/' : '\\', PATHSEPCHAR);
                 return createIFile(locpath.str());
             }
         }
@@ -1753,6 +1846,13 @@ IFile *createDaliServixFile(const RemoteFilename & file)
     return createRemoteFile(ep, path.str());
 }
 
+IFile *createDaliServixFile(const RemoteFilename & file, const char *storageSecret)
+{
+    StringBuffer path;
+    file.getLocalPath(path);
+    return new CRemoteFile(file.queryEndpoint(), path.str(), storageSecret);
+}
+
 void clientDisconnectRemoteIoOnExit(IFileIO *fileio, bool set)
 {
     CRemoteFileIO *cfileio = QUERYINTERFACE(fileio,CRemoteFileIO);
@@ -1778,7 +1878,7 @@ void disconnectRemoteIoOnExit(IFileIO *fileio,bool set)
 
 bool resetRemoteFilename(IFile *file, const char *newname)
 {
-    return clientResetFilename(file,newname); 
+    return clientResetFilename(file,newname);
 }
 
 
@@ -1789,12 +1889,14 @@ extern bool clientAsyncCopyFileSection(const char *uuid,
                         offset_t fromOfs,
                         offset_t size,
                         ICopyFileProgress *progress,
-                        unsigned timeout)       // returns true when done
+                        unsigned timeout,
+                        CFflags copyFlags)       // returns true when done
 {
     CRemoteFile *cfile = QUERYINTERFACE(from,CRemoteFile);
-    if (!cfile) {
-        // local - do sync
-        from->copySection(to,toOfs,fromOfs,size,progress);
+    if (!cfile || to.isLocal()) {
+        //local - ensure that the file copy is run locally rather than remote
+        Owned<IFile> dest = createIFile(to);
+        copyFileSection(from,dest,toOfs,fromOfs,size,progress,copyFlags);
         return true;
     }
     return cfile->copySectionAsync(uuid,to,toOfs,fromOfs, size, progress, timeout);
@@ -1808,10 +1910,11 @@ bool asyncCopyFileSection(const char *uuid,                 // from genUUID - mu
                             offset_t fromofs,
                             offset_t size,                      // (offset_t)-1 for all file
                             ICopyFileProgress *progress,
-                            unsigned timeout                    // 0 to start, non-zero to wait
+                            unsigned timeout,                   // 0 to start, non-zero to wait
+                            CFflags copyFlags
                         )
 {
-    return  clientAsyncCopyFileSection(uuid,from,to,toofs,fromofs,size,progress,timeout);
+    return  clientAsyncCopyFileSection(uuid,from,to,toofs,fromofs,size,progress,timeout,copyFlags);
 }
 
 
@@ -1845,7 +1948,7 @@ unsigned validateNodes(const SocketEndpointArray &epso,const char *dataDir, cons
         }
     }
 
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     class casyncfor: public CAsyncFor
     {
         const SocketEndpointArray &eps;
@@ -1859,10 +1962,10 @@ unsigned validateNodes(const SocketEndpointArray &epso,const char *dataDir, cons
         const char *filename;
 public:
         casyncfor(const SocketEndpointArray &_eps,const IPointerArrayOf<ISocket> &_sockets,const char *_dataDir,const char *_mirrorDir,bool _chkv, const char *_filename,SocketEndpointArray &_failures, StringArray &_failedmessages,UnsignedArray &_failedcodes,CriticalSection &_sect)
-            : eps(_eps), sockets(_sockets), failures(_failures),
+            : CAsyncFor(SYNC_LOCATION), eps(_eps), sockets(_sockets), failures(_failures),
               failedmessages(_failedmessages), failedcodes(_failedcodes), sect(_sect),
               dataDir(_dataDir), mirrorDir(_mirrorDir)
-        { 
+        {
             chkv = _chkv;
             filename = _filename;
         }
@@ -1967,7 +2070,7 @@ public:
                         size32_t rd = fileio->read(0,sizeof(buf)-1,buf);
                         if ((rd!=sz)||(memcmp(buf,ds.str(),sz)!=0)) {
                             StringBuffer s;
-                            ep.getIpText(s);
+                            ep.getHostText(s);
                             throw MakeStringException(-1,"Data discrepancy on disk read of %s of %s",path.str(),s.str());
                         }
                     }
@@ -2135,15 +2238,21 @@ IDaFileSrvHook *queryDaFileSrvHook()
 
 void enableForceRemoteReads()
 {
+#ifndef _CONTAINERIZED
     const char *forceRemotePattern = queryEnvironmentConf().queryProp("forceRemotePattern");
     if (!isEmptyString(forceRemotePattern))
         queryDaFileSrvHook()->forceRemote(forceRemotePattern);
+#endif
 }
 
 bool testForceRemote(const char *path)
 {
+#ifndef _CONTAINERIZED
     const char *forceRemotePattern = queryEnvironmentConf().queryProp("forceRemotePattern");
     return !isEmptyString(forceRemotePattern) && WildMatch(path, forceRemotePattern, false);
+#else
+    return false;
+#endif
 }
 
 
@@ -2158,10 +2267,15 @@ public:
     IMPLEMENT_IINTERFACE_O_USING(CRemoteBase);
 
     // Really a stream, but life (maybe) easier elsewhere if looks like a file
-    // Sometime should refactor to be based on ISerialStream instead - or maybe IRowStream.
+    // Sometime should refactor to be based on IBufferedSerialInputStream instead - or maybe IRowStream.
     CRemoteFilteredFileIOBase(SocketEndpoint &ep, const char *filename, IOutputMetaData *actual, IOutputMetaData *projected, const RowFilter &fieldFilters, unsigned __int64 chooseN)
         : CRemoteBase(ep, filename)
     {
+        // populate secret if there is one
+        RemoteFilename rfn;
+        rfn.setPath(ep, filename);
+        queryDaFileSrvHook()->getSecretBased(storageSecret, rfn);
+
         // NB: inputGrouped == outputGrouped for now, but may want output to be ungrouped
 
         openRequest();
@@ -2234,7 +2348,6 @@ public:
     }
     virtual offset_t size() override { return -1; }
     virtual size32_t write(offset_t pos, size32_t len, const void * data) override { throwUnexpected(); }
-    virtual offset_t appendFile(IFile *file,offset_t pos=0,offset_t len=(offset_t)-1) override { throwUnexpected(); }
     virtual void setSize(offset_t size) override { throwUnexpected(); }
     virtual void flush() override { throwUnexpected(); }
     virtual void close() override
@@ -2260,6 +2373,11 @@ public:
         if (firstRequest)
             handleFirstRequest();
     }
+    virtual IFile * queryFile() const override
+    {
+        return nullptr;//MORE
+    }
+
 protected:
     StringBuffer &openRequest()
     {
@@ -2309,9 +2427,19 @@ protected:
         mrequest.append((RemoteFileCommandType)RFCStreamRead);
         VStringBuffer json("{ \"handle\" : %u, \"format\" : \"binary\" }", handle);
         mrequest.append(json.length(), json.str());
-        sendRemoteCommand(mrequest, newReply);
-        unsigned newHandle;
-        newReply.read(newHandle);
+        unsigned newHandle = 0;
+        try
+        {
+            sendRemoteCommand(mrequest, newReply, false);
+            newReply.read(newHandle);
+        }
+        catch (IJSOCK_Exception *e)
+        {
+            // will trigger new request with cursor
+            EXCLOG(e, "CRemoteFilteredFileIOBase:: socket failure whilst streaming, will attempt to reconnect with cursor");
+            newHandle = 0;
+            e->Release();
+        }
         if (newHandle == handle)
         {
             reply.swapWith(newReply);
@@ -2377,7 +2505,7 @@ class CRemoteFilteredFileIO : public CRemoteFilteredFileIOBase
 {
 public:
     // Really a stream, but life (maybe) easier elsewhere if looks like a file
-    // Sometime should refactor to be based on ISerialStream instead - or maybe IRowStream.
+    // Sometime should refactor to be based on IBufferedSerialInputStream instead - or maybe IRowStream.
     CRemoteFilteredFileIO(SocketEndpoint &ep, const char *filename, IOutputMetaData *actual, IOutputMetaData *projected, const RowFilter &fieldFilters, bool compressed, bool grouped, unsigned __int64 chooseN)
         : CRemoteFilteredFileIOBase(ep, filename, actual, projected, fieldFilters, chooseN)
     {
@@ -2442,7 +2570,7 @@ class CRemoteFilteredKeyIO : public CRemoteFilteredFileIOBase
 {
 public:
     // Really a stream, but life (maybe) easier elsewhere if looks like a file
-    // Sometime should refactor to be based on ISerialStream instead - or maybe IRowStream.
+    // Sometime should refactor to be based on IBufferedSerialInputStream instead - or maybe IRowStream.
     CRemoteFilteredKeyIO(SocketEndpoint &ep, const char *filename, unsigned crc, IOutputMetaData *actual, IOutputMetaData *projected, const RowFilter &fieldFilters, unsigned __int64 chooseN)
         : CRemoteFilteredFileIOBase(ep, filename, actual, projected, fieldFilters, chooseN)
     {
@@ -2455,7 +2583,7 @@ class CRemoteFilteredKeyCountIO : public CRemoteFilteredFileIOBase
 {
 public:
     // Really a stream, but life (maybe) easier elsewhere if looks like a file
-    // Sometime should refactor to be based on ISerialStream instead - or maybe IRowStream.
+    // Sometime should refactor to be based on IBufferedSerialInputStream instead - or maybe IRowStream.
     CRemoteFilteredKeyCountIO(SocketEndpoint &ep, const char *filename, unsigned crc, IOutputMetaData *actual, const RowFilter &fieldFilters, unsigned __int64 rowLimit)
         : CRemoteFilteredFileIOBase(ep, filename, actual, actual, fieldFilters, rowLimit)
     {
@@ -2470,7 +2598,7 @@ class CRemoteKey : public CSimpleInterfaceOf<IIndexLookup>
     offset_t pos = 0;
     Owned<ISourceRowPrefetcher> prefetcher;
     CThorContiguousRowBuffer prefetchBuffer;
-    Owned<ISerialStream> strm;
+    Owned<IBufferedSerialInputStream> strm;
     bool pending = false;
     SocketEndpoint ep;
     StringAttr filename;
@@ -2487,7 +2615,7 @@ public:
         iRemoteFileIO.setown(new CRemoteFilteredKeyIO(ep, filename, crc, actual, projected, fieldFilters, rowLimit));
         if (!iRemoteFileIO)
             throwStringExceptionV(DAFSERR_cmdstream_openfailure, "Unable to open remote key part: '%s'", filename.get());
-        strm.setown(createFileSerialStream(iRemoteFileIO));
+        strm.setown(createFileSerialStream(iRemoteFileIO, 0, (offset_t)-1, 0)); // bufsize=0 - CRemoteFilteredKeyIO is handling buffering
         prefetcher.setown(projected->createDiskPrefetcher());
         assertex(prefetcher);
         prefetchBuffer.setStream(strm);
@@ -2518,10 +2646,6 @@ public:
         pending = true;
         return prefetchBuffer.queryRow();
     }
-    virtual unsigned querySeeks() const override { return 0; } // not sure how best to handle these, perhaps should log/record somewhere on server-side
-    virtual unsigned queryScans() const override { return 0; }
-    virtual unsigned querySkips() const override { return 0; }
-    virtual unsigned queryWildSeeks() const override { return 0; }
 };
 
 
@@ -2538,4 +2662,3 @@ extern IIndexLookup *createRemoteFilteredKey(SocketEndpoint &ep, const char * fi
     }
     return nullptr;
 }
-

@@ -1,0 +1,62 @@
+{
+    "compilerOptions": {
+        "ignoreDeprecations": "6.0",
+        "baseUrl": ".",
+        "outDir": "./lib",
+        "declarationDir": "./types",
+        "target": "es2022",
+        "module": "AMD",
+        "moduleResolution": "Node",
+        "allowSyntheticDefaultImports": true,
+        "esModuleInterop": false,
+        "sourceMap": true,
+        "declarationMap": true,
+        "declaration": true,
+        "noImplicitAny": false,
+        "noImplicitThis": false,
+        "noEmitOnError": false,
+        "noUnusedLocals": true,
+        "noUncheckedSideEffectImports": false,
+        "strictBindCallApply": false,
+        "strictFunctionTypes": false,
+        "strictNullChecks": false,
+        "useUnknownInCatchVariables": false,
+        "importHelpers": true,
+        "allowJs": true,
+        "skipLibCheck": true,
+        "downlevelIteration": true,
+        "jsx": "react",
+        "lib": [
+            "DOM",
+            "ES2022"
+        ],
+        "typeRoots": [],
+        "types": [],
+        "paths": {
+            "@hpcc-js/wasm-duckdb": [
+                "./node_modules/@hpcc-js/wasm-duckdb",
+                "../../../hpcc-js-wasm/packages/duckdb"
+            ],
+            "@hpcc-js/wasm-graphviz": [
+                "./node_modules/@hpcc-js/wasm-graphviz",
+                "../../../hpcc-js-wasm/packages/graphviz"
+            ],
+            "@hpcc-js/*": [
+                "./node_modules/@hpcc-js/*",
+                "../../../hpcc-js/packages/*",
+                "../../../Visualization/packages/*"
+            ]
+        }
+    },
+    "include": [
+        "src-dojo/index.ts",
+        "src-dojo/nls/**/*"
+    ],
+    "watchOptions": {
+        "watchFile": "useFsEvents",
+        "watchDirectory": "useFsEvents",
+        "excludeDirectories": [
+            "**/node_modules"
+        ]
+    }
+}

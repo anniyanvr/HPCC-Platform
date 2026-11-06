@@ -43,15 +43,23 @@ include_directories (
          ./../../common/dllserver 
          ./../../system/jlib
          ./../../system/security/shared
+         ${HPCC_SOURCE_DIR}/system/codesigner
     )
 
 HPCC_ADD_EXECUTABLE ( eclccserver ${SRCS} ${INCLUDES} )
 install ( TARGETS eclccserver RUNTIME DESTINATION ${EXEC_DIR} )
 
-target_link_libraries ( eclccserver 
+target_link_libraries ( eclccserver PRIVATE 
          jlib
+         mp
+         dalibase
+         dllserver
          workunit
     )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( eclccserver PRIVATE environment )
+endif()
 
 HPCC_ADD_SUBDIRECTORY (vchooks "PLATFORM")
 

@@ -1,33 +1,59 @@
-﻿import { Palette } from "@hpcc-js/common";
-import * as arrayUtil from "dojo/_base/array";
-import * as domConstruct from "dojo/dom-construct";
-import * as entities from "dojox/html/entities";
+﻿import { format as d3Format, Palette } from "@hpcc-js/common";
+import { Level, join } from "@hpcc-js/util";
+import { arrayUtil, domConstruct } from "src-dojo/index";
+import nlsHPCC from "./nlsHPCC";
 
 declare const dojoConfig;
 declare const ActiveXObject;
-declare const require;
 
-export function xmlEncode(str) {
+export function encodeXML(str) {
     str = "" + str;
-    return entities.encode(str);
+
+    const xmlEntities: Record<string, string> = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&apos;",
+        "\n": "&#10;",
+        "\r": "&#13;"
+    };
+
+    return str.replace(/[&"'<>\n\r]/g, (match) => xmlEntities[match]);
 }
 
-export function xmlEncode2(str) {
-    str = "" + str;
-    return str.replace(/&/g, "&amp;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&apos;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/\n/g, "&#10;")
-        .replace(/\r/g, "&#13;")
-        ;
+export function encodeHTML(str?: string): string {
+    if (!str) return str || "";
+
+    const htmlEntities: Record<string, string> = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&apos;",
+        "\u00A0": "&nbsp;", // Non-breaking space (char code 160)
+        "\n": "&#10;",
+        "\r": "&#13;"
+    };
+
+    return str.replace(/[&<>"'\u00A0\n\r]/g, (match) => htmlEntities[match]);
 }
 
-export function decodeHtml(html) {
-    const txt = document.createElement("textarea");
-    txt.innerHTML = html;
-    return txt.value;
+export function decodeHTML(str?: string): string {
+    if (!str) return str || "";
+
+    const htmlEntities: Record<string, string> = {
+        "&amp;": "&",
+        "&lt;": "<",
+        "&gt;": ">",
+        "&quot;": "\"",
+        "&apos;": "'",
+        "&nbsp;": "\u00A0", // Non-breaking space (char code 160)
+        "&#10;": "\n",
+        "&#13;": "\r"
+    };
+
+    return str.replace(/&(?:amp|lt|gt|quot|apos|nbsp);|&#(?:10|13);/g, (match) => htmlEntities[match]);
 }
 
 export function parseXML(val) {
@@ -45,7 +71,8 @@ export function parseXML(val) {
 
 export function csvEncode(cell) {
     if (!isNaN(cell)) return cell;
-    return '"' + String(cell).replace('"', '""') + '"';
+    if (cell === undefined) return "";
+    return '"' + String(cell).replace(/"/g, '""') + '"';
 }
 
 export function espTime2Seconds(duration?: string) {
@@ -53,6 +80,8 @@ export function espTime2Seconds(duration?: string) {
         return 0;
     } else if (!isNaN(+duration)) {
         return parseFloat(duration);
+    } else if (duration.length > 32) {
+        throw new Error("Input too long");
     }
     const re = /(?:(?:(\d+).days.)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+\.\d+|\d+)s))|(?:(\d+\.\d+|\d+)ms|(\d+\.\d+|\d+)us|(\d+\.\d+|\d+)ns)/;
     const match = re.exec(duration);
@@ -86,13 +115,13 @@ export function espTime2SecondsTests() {
     }, this);
 }
 
-export function convertedSize(intsize: number): string {
+export function convertedSize(intsize: number, postfix: string = ""): string {
     const unitConversion = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
-    if (intsize === null || intsize === undefined) {
+    if (isNaN(intsize) || intsize < 1) {
         return "";
     } else {
-        const x = Math.floor(Math.log(intsize) / Math.log(1024));
-        return (intsize / Math.pow(1024, x)).toFixed(2) + " " + unitConversion[x];
+        const x = intsize > 0 ? Math.floor(Math.log(intsize) / Math.log(1024)) : 0;
+        return (intsize / Math.pow(1024, x)).toFixed(2) + " " + unitConversion[x] + postfix;
     }
 }
 
@@ -116,7 +145,6 @@ export function valueCleanUp(intsize): string {
 }
 
 export function removeSpecialCharacters(stringToConvert): string {
-    // eslint-disable-next-line no-useless-escape
     return stringToConvert.replace(/[\!\@\#\$\%\^\&\*\)\(\+\=\.\<\>\{\}\[\]\:\;\'\"\|\~\`\_\-]/g, "");
 }
 
@@ -209,6 +237,49 @@ export function espSkew2NumberTests() {
     }, this);
 }
 
+export interface Column {
+    selectorType?: string;
+    id?: string;
+    csvFormatter?: (value: any, row: any) => string;
+    field: string;
+    label: string;
+}
+export type ColumnMap = { [id: string]: Column };
+export function formatAsDelim(columns: ColumnMap, rows: any, delim = ",") {
+    const container: string[] = [];
+    const headerNames: string[] = [];
+
+    for (const key in columns) {
+        if (key !== columns[key].id && columns[key].selectorType !== "checkbox") {
+            if (!columns[key].label) {
+                const str = csvEncode(columns[key].field);
+                headerNames.push(str);
+            } else {
+                const str = csvEncode(columns[key].label);
+                headerNames.push(str);
+            }
+        }
+    }
+    container.push(headerNames.join(delim));
+
+    rows.forEach(row => {
+        const cells: any[] = [];
+        for (const key in columns) {
+            if (key !== columns[key].id && columns[key].selectorType !== "checkbox") {
+                let value = row[key];
+                if ("csvFormatter" in columns[key]) {
+                    value = columns[key].csvFormatter(row[key], row);
+                }
+                const cell = row[columns[key].field] ?? value;
+                cells.push(csvEncode(cell ?? ""));
+            }
+        }
+        container.push(cells.join(delim));
+    });
+
+    return container.join("\n");
+}
+
 export function downloadToCSV(grid, rows, fileName) {
     let csvContent = "";
     const headers = grid.columns;
@@ -229,7 +300,7 @@ export function downloadToCSV(grid, rows, fileName) {
     container.push(headerNames);
 
     arrayUtil.forEach(rows, function (cells, idx) {
-        container.push(cells);
+        container.push(cells.map(cell => csvEncode(cell ?? "")));
     });
 
     arrayUtil.forEach(container, function (header, idx) {
@@ -241,7 +312,9 @@ export function downloadToCSV(grid, rows, fileName) {
         const a = document.createElement("a");
         mimeType = mimeType || "application/octet-stream";
 
+        // @ts-expect-error
         if (navigator.msSaveBlob) { // IE10
+            // @ts-expect-error
             return navigator.msSaveBlob(new Blob([content], { type: mimeType }), fileName);
         } else if ("download" in a) {
             a.href = "data:" + mimeType + "," + encodeURIComponent(content);
@@ -266,131 +339,240 @@ export function downloadToCSV(grid, rows, fileName) {
     download(csvContent, fileName, "text/csv");
 }
 
-export function isObjectEmpty(obj) {
-    for (const prop in obj) {
-        if (obj.hasOwnProperty(prop))
-            return false;
-    }
-    return true;
+export function isObjectEmpty(obj: object): boolean {
+    return Object.keys(obj).length === 0;
+}
+//  -----------------------------------------------------------------------------------------------
+//  Modified from alphanum-sort:  https://github.com/TrySound/alphanum-sort © Bogdan Chadkin
+//  The MIT License (MIT)
+const zero = "0".charCodeAt(0);
+const plus = "+".charCodeAt(0);
+const minus = "-".charCodeAt(0);
+
+function isWhitespace(code: number) {
+    return code <= 32;
 }
 
-/* alphanum.js (C) Brian Huisman
- * Based on the Alphanum Algorithm by David Koelle
- * The Alphanum Algorithm is discussed at http://www.DaveKoelle.com
- *
- * Distributed under same license as original
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
- */
-
-/* ********************************************************************
- * Alphanum sort() function version - case sensitive
- *  - Slower, but easier to modify for arrays of objects which contain
- *    string properties
- *
- */
-export function alphanum(a, b) {
-    function chunkify(t) {
-        const tz = [];
-        let x = 0;
-        let y = -1;
-        let n = false;
-        let i;
-        let j;
-
-        // eslint-disable-next-line no-cond-assign
-        while (i = (j = t.charAt(x++)).charCodeAt(0)) {
-            // tslint:disable-next-line: triple-equals
-            const m = (i == 46 || (i >= 48 && i <= 57));
-            if (m !== n) {
-                tz[++y] = "";
-                n = m;
-            }
-            tz[y] += j;
-        }
-        return tz;
-    }
-
-    const aa = chunkify(a);
-    const bb = chunkify(b);
-
-    for (let x = 0; aa[x] && bb[x]; x++) {
-        if (aa[x] !== bb[x]) {
-            const c = Number(aa[x]);
-            const d = Number(bb[x]);
-            // tslint:disable-next-line: triple-equals
-            if (c == aa[x] && d == bb[x]) {
-                return c - d;
-            } else return (aa[x] > bb[x]) ? 1 : -1;
-        }
-    }
-    return aa.length - bb.length;
+function isDigit(code: number) {
+    return 48 <= code && code <= 57;
 }
 
-/* ********************************************************************
- * Alphanum sort() function version - case insensitive
- *  - Slower, but easier to modify for arrays of objects which contain
- *    string properties
- *
- */
-export function alphanumCase(a, b) {
-    function chunkify(t) {
-        const tz = [];
-        let x = 0;
-        let y = -1;
-        let n = false;
-        let i;
-        let j;
+function isSign(code: number) {
+    return code === minus || code === plus;
+}
 
-        // eslint-disable-next-line no-cond-assign
-        while (i = (j = t.charAt(x++)).charCodeAt(0)) {
-            // tslint:disable-next-line: triple-equals
-            const m = (i == 46 || (i >= 48 && i <= 57));    // jshint ignore:line
-            if (m !== n) {
-                tz[++y] = "";
-                n = m;
+function compare(a, b, opts: { sign: boolean }) {
+    const checkSign = opts.sign;
+    let ia = 0;
+    let ib = 0;
+    const ma = a.length;
+    const mb = b.length;
+    let ca, cb; // character code
+    let za, zb; // leading zero count
+    let na, nb; // number length
+    let sa, sb; // number sign
+    let ta, tb; // temporary
+    let bias;
+
+    while (ia < ma && ib < mb) {
+        ca = a.charCodeAt(ia);
+        cb = b.charCodeAt(ib);
+        za = zb = 0;
+        na = nb = 0;
+        sa = sb = true;
+        bias = 0;
+
+        // skip over leading spaces
+        while (isWhitespace(ca)) {
+            ia += 1;
+            ca = a.charCodeAt(ia);
+        }
+        while (isWhitespace(cb)) {
+            ib += 1;
+            cb = b.charCodeAt(ib);
+        }
+
+        // skip and save sign
+        if (checkSign) {
+            ta = a.charCodeAt(ia + 1);
+            if (isSign(ca) && isDigit(ta)) {
+                if (ca === minus) {
+                    sa = false;
+                }
+                ia += 1;
+                ca = ta;
             }
-            tz[y] += j;
+            tb = b.charCodeAt(ib + 1);
+            if (isSign(cb) && isDigit(tb)) {
+                if (cb === minus) {
+                    sb = false;
+                }
+                ib += 1;
+                cb = tb;
+            }
         }
-        return tz;
+
+        // compare digits with other symbols
+        if (isDigit(ca) && !isDigit(cb)) {
+            return -1;
+        }
+        if (!isDigit(ca) && isDigit(cb)) {
+            return 1;
+        }
+
+        // compare negative and positive
+        if (!sa && sb) {
+            return -1;
+        }
+        if (sa && !sb) {
+            return 1;
+        }
+
+        // count leading zeros
+        while (ca === zero) {
+            za += 1;
+            ia += 1;
+            ca = a.charCodeAt(ia);
+        }
+        while (cb === zero) {
+            zb += 1;
+            ib += 1;
+            cb = b.charCodeAt(ib);
+        }
+
+        // count numbers
+        while (isDigit(ca) || isDigit(cb)) {
+            if (isDigit(ca) && isDigit(cb) && bias === 0) {
+                if (sa) {
+                    if (ca < cb) {
+                        bias = -1;
+                    } else if (ca > cb) {
+                        bias = 1;
+                    }
+                } else {
+                    if (ca > cb) {
+                        bias = -1;
+                    } else if (ca < cb) {
+                        bias = 1;
+                    }
+                }
+            }
+            if (isDigit(ca)) {
+                ia += 1;
+                na += 1;
+                ca = a.charCodeAt(ia);
+            }
+            if (isDigit(cb)) {
+                ib += 1;
+                nb += 1;
+                cb = b.charCodeAt(ib);
+            }
+        }
+
+        // compare number length
+        if (sa) {
+            if (na < nb) {
+                return -1;
+            }
+            if (na > nb) {
+                return 1;
+            }
+        } else {
+            if (na > nb) {
+                return -1;
+            }
+            if (na < nb) {
+                return 1;
+            }
+        }
+
+        // compare numbers
+        if (bias) {
+            return bias;
+        }
+
+        // compare leading zeros
+        if (sa) {
+            if (za > zb) {
+                return -1;
+            }
+            if (za < zb) {
+                return 1;
+            }
+        } else {
+            if (za < zb) {
+                return -1;
+            }
+            if (za > zb) {
+                return 1;
+            }
+        }
+
+        // compare ascii codes
+        if (ca < cb) {
+            return -1;
+        }
+        if (ca > cb) {
+            return 1;
+        }
+
+        ia += 1;
+        ib += 1;
     }
 
-    const aa = chunkify(a.toLowerCase());
-    const bb = chunkify(b.toLowerCase());
-
-    for (let x = 0; aa[x] && bb[x]; x++) {
-        if (aa[x] !== bb[x]) {
-            const c = Number(aa[x]);
-            const d = Number(bb[x]);
-            // tslint:disable-next-line: triple-equals
-            if (c == aa[x] && d == bb[x]) {   // jshint ignore:line
-                return c - d;
-            } else return (aa[x] > bb[x]) ? 1 : -1;
-        }
+    // compare length
+    if (ma < mb) {
+        return -1;
     }
-    return aa.length - bb.length;
+    if (ma > mb) {
+        return 1;
+    }
+    return 0;
+}
+//  -----------------------------------------------------------------------------------------------
+
+export function onDomMutate(domNode, callback, observerOpts) {
+    observerOpts = observerOpts || { attributes: true, attributeFilter: ["style"] };
+    const observer = new MutationObserver(mutations => {
+        if (domNode.offsetParent === null) return;
+        observer.disconnect();
+        if (typeof callback === "function") {
+            callback();
+        }
+    });
+    observer.observe(domNode, observerOpts);
+}
+
+export function alphanumCompare(_l, _r, caseInsensitive: boolean = true, reverse: boolean = true): number {
+    const l = caseInsensitive && typeof _l === "string" ? _l.toLocaleLowerCase() : _l;
+    const r = caseInsensitive && typeof _r === "string" ? _r.toLocaleLowerCase() : _r;
+    const cmp = compare(l, r, { sign: false });
+    if (cmp !== 0) {
+        return cmp * (reverse ? -1 : 1);
+    }
+    return 0;
+}
+
+export function createAlphanumSortFunc(cols: string[], caseInsensitive: boolean, reverse: boolean = false) {
+    return function (l, r) {
+        for (let i = 0; i < cols.length; ++i) {
+            const col = cols[i];
+            const cmp = alphanumCompare(l[col], r[col], caseInsensitive, reverse);
+            if (cmp !== 0) {
+                return cmp;
+            }
+        }
+        return 0;
+    };
+}
+
+export function copyToClipboard(value: string) {
+    navigator?.clipboard?.writeText(value);
 }
 
 export function alphanumSort(arr, col, caseInsensitive, reverse: boolean = false) {
     if (arr && arr instanceof Array) {
-        arr.sort(function (l, r) {
-            if (caseInsensitive) {
-                return alphanumCase(r[col], l[col]) * (reverse ? -1 : 1);
-            }
-            return alphanum(l[col], r[col]) * (reverse ? -1 : 1);
-        });
+        arr.sort(createAlphanumSortFunc(col, caseInsensitive, reverse));
     }
 }
 
@@ -404,6 +586,7 @@ export function stringLowerSort(arr: object[], col: string) {
 
 export function resolve(hpccWidget, callback) {
     function doLoad(widget) {
+        widget = widget.default ?? widget;
         if (widget[hpccWidget]) {
             widget = widget[hpccWidget];
         }
@@ -415,354 +598,357 @@ export function resolve(hpccWidget, callback) {
 
     switch (hpccWidget) {
         case "ActivityWidget":
-            require(["hpcc/ActivityWidget"], doLoad);
+            import("hpcc/ActivityWidget").then(doLoad);
             break;
         case "ClusterProcessesQueryWidget":
-            require(["hpcc/ClusterProcessesQueryWidget"], doLoad);
+            import("hpcc/ClusterProcessesQueryWidget").then(doLoad);
             break;
         case "CurrentUserDetailsWidget":
-            require(["hpcc/CurrentUserDetailsWidget"], doLoad);
+            import("hpcc/CurrentUserDetailsWidget").then(doLoad);
             break;
         case "DelayLoadWidget":
-            require(["hpcc/DelayLoadWidget"], doLoad);
+            import("hpcc/DelayLoadWidget").then(doLoad);
             break;
         case "DFUQueryWidget":
-            require(["hpcc/DFUQueryWidget"], doLoad);
+            import("hpcc/DFUQueryWidget").then(doLoad);
             break;
         case "DFUSearchWidget":
-            require(["hpcc/DFUSearchWidget"], doLoad);
+            import("hpcc/DFUSearchWidget").then(doLoad);
             break;
         case "DFUWUDetailsWidget":
-            require(["hpcc/DFUWUDetailsWidget"], doLoad);
+            import("hpcc/DFUWUDetailsWidget").then(doLoad);
             break;
         case "DiskUsageWidget":
-            require(["hpcc/DiskUsageWidget"], doLoad);
+            import("hpcc/DiskUsageWidget").then(doLoad);
             break;
         case "DiskUsageDetails":
-            require(["hpcc/DiskUsageDetails"], doLoad);
+            import("hpcc/DiskUsageDetails").then(doLoad);
+            break;
+        case "ComponentUsageDetails":
+            import("hpcc/ComponentUsageDetails").then(doLoad);
             break;
         case "viz/DojoD3Choropleth":
-            require(["hpcc/viz/DojoD3Choropleth"], doLoad);
+            import("hpcc/viz/DojoD3Choropleth").then(doLoad);
             break;
         case "viz/DojoD32DChart":
-            require(["hpcc/viz/DojoD32DChart"], doLoad);
+            import("hpcc/viz/DojoD32DChart").then(doLoad);
             break;
         case "viz/DojoD3NDChart":
-            require(["hpcc/viz/DojoD3NDChart"], doLoad);
+            import("hpcc/viz/DojoD3NDChart").then(doLoad);
             break;
         case "DataPatternsWidget":
-            require(["src/DataPatternsWidget"], doLoad);
+            import("src/DataPatternsWidget").then(doLoad);
             break;
         case "DynamicESDLDefinitionDetailsWidget":
-            require(["hpcc/DynamicESDLDefinitionDetailsWidget"], doLoad);
+            import("hpcc/DynamicESDLDefinitionDetailsWidget").then(doLoad);
             break;
         case "DynamicESDLDefinitionQueryWidget":
-            require(["hpcc/DynamicESDLDefinitionQueryWidget"], doLoad);
+            import("hpcc/DynamicESDLDefinitionQueryWidget").then(doLoad);
             break;
         case "DynamicESDLDetailsWidget":
-            require(["hpcc/DynamicESDLDetailsWidget"], doLoad);
+            import("hpcc/DynamicESDLDetailsWidget").then(doLoad);
             break;
         case "DynamicESDLMethodWidget":
-            require(["hpcc/DynamicESDLMethodWidget"], doLoad);
+            import("hpcc/DynamicESDLMethodWidget").then(doLoad);
             break;
         case "DynamicESDLQueryWidget":
-            require(["hpcc/DynamicESDLQueryWidget"], doLoad);
+            import("hpcc/DynamicESDLQueryWidget").then(doLoad);
             break;
         case "ECLPlaygroundResultsWidget":
-            require(["hpcc/ECLPlaygroundResultsWidget"], doLoad);
+            import("hpcc/ECLPlaygroundResultsWidget").then(doLoad);
             break;
         case "ECLPlaygroundWidget":
-            require(["hpcc/ECLPlaygroundWidget"], doLoad);
+            import("hpcc/ECLPlaygroundWidget").then(doLoad);
             break;
         case "ECLArchiveWidget":
-            require(["src/ECLArchiveWidget"], doLoad);
+            import("src/ECLArchiveWidget").then(doLoad);
             break;
         case "ECLSourceWidget":
-            require(["hpcc/ECLSourceWidget"], doLoad);
+            import("hpcc/ECLSourceWidget").then(doLoad);
             break;
         case "EventScheduleWorkunitWidget":
-            require(["hpcc/EventScheduleWorkunitWidget"], doLoad);
+            import("hpcc/EventScheduleWorkunitWidget").then(doLoad);
             break;
         case "FileBloomsWidget":
-            require(["hpcc/FileBloomsWidget"], doLoad);
+            import("hpcc/FileBloomsWidget").then(doLoad);
             break;
         case "FileBelongsToWidget":
-            require(["hpcc/FileBelongsToWidget"], doLoad);
+            import("hpcc/FileBelongsToWidget").then(doLoad);
             break;
         case "FileHistoryWidget":
-            require(["hpcc/FileHistoryWidget"], doLoad);
+            import("hpcc/FileHistoryWidget").then(doLoad);
             break;
         case "FilePartsWidget":
-            require(["hpcc/FilePartsWidget"], doLoad);
+            import("hpcc/FilePartsWidget").then(doLoad);
             break;
         case "FileProtectListWidget":
-            require(["hpcc/FileProtectListWidget"], doLoad);
+            import("hpcc/FileProtectListWidget").then(doLoad);
             break;
         case "FilterDropDownWidget":
-            require(["hpcc/FilterDropDownWidget"], doLoad);
+            import("hpcc/FilterDropDownWidget").then(doLoad);
             break;
         case "FullResultWidget":
-            require(["hpcc/FullResultWidget"], doLoad);
+            import("hpcc/FullResultWidget").then(doLoad);
             break;
         case "GangliaWidget":
-            require(["ganglia/GangliaWidget"], doLoad);
+            import("ganglia/GangliaWidget").then(doLoad);
             break;
         case "GetDFUWorkunitsWidget":
-            require(["hpcc/GetDFUWorkunitsWidget"], doLoad);
+            import("hpcc/GetDFUWorkunitsWidget").then(doLoad);
             break;
         case "GetNumberOfFilesToCopyWidget":
-            require(["hpcc/GetNumberOfFilesToCopyWidget"], doLoad);
+            import("hpcc/GetNumberOfFilesToCopyWidget").then(doLoad);
             break;
         case "GraphPageWidget":
-            require(["hpcc/GraphPageWidget"], doLoad);
+            import("hpcc/GraphPageWidget").then(doLoad);
             break;
         case "GraphsWidget":
             //  ECLIDE Backward Compatibility  ---
-            require(["hpcc/GraphsWUWidget"], doLoad);
+            import("hpcc/GraphsWUWidget").then(doLoad);
             break;
         case "GraphsWUWidget":
-            require(["hpcc/GraphsWUWidget"], doLoad);
+            import("hpcc/GraphsWUWidget").then(doLoad);
             break;
         case "GraphsQueryWidget":
-            require(["hpcc/GraphsQueryWidget"], doLoad);
+            import("hpcc/GraphsQueryWidget").then(doLoad);
             break;
         case "GraphsLFWidget":
-            require(["hpcc/GraphsLFWidget"], doLoad);
-            break;
-        case "GraphTreeWidget":
-            require(["src/GraphTreeWidget"], doLoad);
+            import("hpcc/GraphsLFWidget").then(doLoad);
             break;
         case "GraphTree7Widget":
-            require(["src/GraphTree7Widget"], doLoad);
+            import("src/GraphTree7Widget").then(doLoad);
             break;
         case "Graph7Widget":
-            require(["src/Graph7Widget"], doLoad);
+            import("src/Graph7Widget").then(doLoad);
             break;
         case "GridDetailsWidget":
-            require(["hpcc/GridDetailsWidget"], doLoad);
+            import("hpcc/GridDetailsWidget").then(doLoad);
             break;
         case "GroupDetailsWidget":
-            require(["hpcc/GroupDetailsWidget"], doLoad);
+            import("hpcc/GroupDetailsWidget").then(doLoad);
             break;
         case "HelpersWidget":
-            require(["hpcc/HelpersWidget"], doLoad);
+            import("hpcc/HelpersWidget").then(doLoad);
             break;
         case "HexViewWidget":
-            require(["hpcc/HexViewWidget"], doLoad);
+            import("hpcc/HexViewWidget").then(doLoad);
             break;
         case "HPCCPlatformECLWidget":
-            require(["hpcc/HPCCPlatformECLWidget"], doLoad);
+            import("hpcc/HPCCPlatformECLWidget").then(doLoad);
             break;
         case "HPCCPlatformFilesWidget":
-            require(["hpcc/HPCCPlatformFilesWidget"], doLoad);
+            import("hpcc/HPCCPlatformFilesWidget").then(doLoad);
             break;
         case "HPCCPlatformMainWidget":
-            require(["hpcc/HPCCPlatformMainWidget"], doLoad);
+            import("hpcc/HPCCPlatformMainWidget").then(doLoad);
             break;
         case "HPCCPlatformOpsWidget":
-            require(["hpcc/HPCCPlatformOpsWidget"], doLoad);
+            import("hpcc/HPCCPlatformOpsWidget").then(doLoad);
             break;
         case "HPCCPlatformRoxieWidget":
-            require(["hpcc/HPCCPlatformRoxieWidget"], doLoad);
+            import("hpcc/HPCCPlatformRoxieWidget").then(doLoad);
             break;
         case "HPCCPlatformServicesPluginWidget":
-            require(["hpcc/HPCCPlatformServicesPluginWidget"], doLoad);
+            import("hpcc/HPCCPlatformServicesPluginWidget").then(doLoad);
             break;
         case "HPCCPlatformWidget":
-            require(["hpcc/HPCCPlatformWidget"], doLoad);
+            import("hpcc/HPCCPlatformWidget").then(doLoad);
             break;
         case "IFrameWidget":
-            require(["hpcc/IFrameWidget"], doLoad);
+            import("hpcc/IFrameWidget").then(doLoad);
             break;
         case "InfoGridWidget":
-            require(["hpcc/InfoGridWidget"], doLoad);
+            import("hpcc/InfoGridWidget").then(doLoad);
             break;
         case "JSGraphWidget":
-            require(["hpcc/JSGraphWidget"], doLoad);
+            import("hpcc/JSGraphWidget").then(doLoad);
             break;
         case "LFDetailsWidget":
-            require(["hpcc/LFDetailsWidget"], doLoad);
+            import("hpcc/LFDetailsWidget").then(doLoad);
             break;
         case "LibrariesUsedWidget":
-            require(["hpcc/LibrariesUsedWidget"], doLoad);
+            import("hpcc/LibrariesUsedWidget").then(doLoad);
             break;
         case "LogsWidget":
-            require(["hpcc/HelpersWidget"], doLoad);
+            import("hpcc/HelpersWidget").then(doLoad);
             break;
         case "LogWidget":
-            require(["hpcc/LogWidget"], doLoad);
+            import("hpcc/LogWidget").then(doLoad);
             break;
         case "LogVisualizationWidget":
-            require(["hpcc/LogVisualizationWidget"], doLoad);
+            import("hpcc/LogVisualizationWidget").then(doLoad);
             break;
         case "LZBrowseWidget":
-            require(["hpcc/LZBrowseWidget"], doLoad);
+            import("hpcc/LZBrowseWidget").then(doLoad);
             break;
         case "MachineInformationWidget":
-            require(["hpcc/MachineInformationWidget"], doLoad);
+            import("hpcc/MachineInformationWidget").then(doLoad);
             break;
         case "MemberOfWidget":
-            require(["hpcc/MemberOfWidget"], doLoad);
+            import("hpcc/MemberOfWidget").then(doLoad);
             break;
         case "MembersWidget":
-            require(["hpcc/MembersWidget"], doLoad);
-            break;
-        case "MonitoringWidget":
-            require(["hpcc/MonitoringWidget"], doLoad);
+            import("hpcc/MembersWidget").then(doLoad);
             break;
         case "PackageMapDetailsWidget":
-            require(["hpcc/PackageMapDetailsWidget"], doLoad);
+            import("hpcc/PackageMapDetailsWidget").then(doLoad);
             break;
         case "PackageMapPartsWidget":
-            require(["hpcc/PackageMapPartsWidget"], doLoad);
+            import("hpcc/PackageMapPartsWidget").then(doLoad);
             break;
         case "PackageMapQueryWidget":
-            require(["hpcc/PackageMapQueryWidget"], doLoad);
+            import("hpcc/PackageMapQueryWidget").then(doLoad);
             break;
         case "PackageMapValidateContentWidget":
-            require(["hpcc/PackageMapValidateContentWidget"], doLoad);
+            import("hpcc/PackageMapValidateContentWidget").then(doLoad);
             break;
         case "PackageMapValidateWidget":
-            require(["hpcc/PackageMapValidateWidget"], doLoad);
+            import("hpcc/PackageMapValidateWidget").then(doLoad);
             break;
         case "PackageSourceWidget":
-            require(["hpcc/PackageSourceWidget"], doLoad);
+            import("hpcc/PackageSourceWidget").then(doLoad);
             break;
         case "PermissionsWidget":
-            require(["hpcc/PermissionsWidget"], doLoad);
+            import("hpcc/PermissionsWidget").then(doLoad);
             break;
         case "PreflightDetailsWidget":
-            require(["hpcc/PreflightDetailsWidget"], doLoad);
+            import("hpcc/PreflightDetailsWidget").then(doLoad);
             break;
         case "QuerySetDetailsWidget":
-            require(["hpcc/QuerySetDetailsWidget"], doLoad);
+            import("hpcc/QuerySetDetailsWidget").then(doLoad);
             break;
         case "QuerySetErrorsWidget":
-            require(["hpcc/QuerySetErrorsWidget"], doLoad);
+            import("hpcc/QuerySetErrorsWidget").then(doLoad);
             break;
         case "QuerySetLogicalFilesWidget":
-            require(["hpcc/QuerySetLogicalFilesWidget"], doLoad);
+            import("hpcc/QuerySetLogicalFilesWidget").then(doLoad);
             break;
         case "QuerySetQueryWidget":
-            require(["hpcc/QuerySetQueryWidget"], doLoad);
+            import("hpcc/QuerySetQueryWidget").then(doLoad);
             break;
         case "QuerySetSuperFilesWidget":
-            require(["hpcc/QuerySetSuperFilesWidget"], doLoad);
+            import("hpcc/QuerySetSuperFilesWidget").then(doLoad);
             break;
         case "QueryTestWidget":
-            require(["hpcc/QueryTestWidget"], doLoad);
+            import("hpcc/QueryTestWidget").then(doLoad);
             break;
         case "RequestInformationWidget":
-            require(["hpcc/RequestInformationWidget"], doLoad);
+            import("hpcc/RequestInformationWidget").then(doLoad);
             break;
         case "ResourcesWidget":
-            require(["hpcc/ResourcesWidget"], doLoad);
+            import("hpcc/ResourcesWidget").then(doLoad);
             break;
         case "ResultsWidget":
-            require(["hpcc/ResultsWidget"], doLoad);
+            import("hpcc/ResultsWidget").then(doLoad);
             break;
         case "ResultWidget":
-            require(["hpcc/ResultWidget"], doLoad);
+            import("hpcc/ResultWidget").then(doLoad);
             break;
         case "SearchResultsWidget":
-            require(["hpcc/SearchResultsWidget"], doLoad);
+            import("hpcc/SearchResultsWidget").then(doLoad);
             break;
         case "SelectionGridWidget":
-            require(["hpcc/SelectionGridWidget"], doLoad);
+            import("hpcc/SelectionGridWidget").then(doLoad);
             break;
         case "SFDetailsWidget":
-            require(["hpcc/SFDetailsWidget"], doLoad);
+            import("hpcc/SFDetailsWidget").then(doLoad);
             break;
         case "ShowAccountPermissionsWidget":
-            require(["hpcc/ShowAccountPermissionsWidget"], doLoad);
+            import("hpcc/ShowAccountPermissionsWidget").then(doLoad);
             break;
         case "ShowIndividualPermissionsWidget":
-            require(["hpcc/ShowIndividualPermissionsWidget"], doLoad);
+            import("hpcc/ShowIndividualPermissionsWidget").then(doLoad);
             break;
         case "ShowInheritedPermissionsWidget":
-            require(["hpcc/ShowInheritedPermissionsWidget"], doLoad);
+            import("hpcc/ShowInheritedPermissionsWidget").then(doLoad);
             break;
         case "ShowPermissionsWidget":
-            require(["hpcc/ShowPermissionsWidget"], doLoad);
+            import("hpcc/ShowPermissionsWidget").then(doLoad);
             break;
         case "SourceFilesWidget":
-            require(["hpcc/SourceFilesWidget"], doLoad);
+            import("hpcc/SourceFilesWidget").then(doLoad);
+            break;
+        case "SummaryStatsQueryWidget":
+            import("hpcc/SummaryStatsQueryWidget").then(doLoad);
             break;
         case "SystemServersQueryWidget":
-            require(["hpcc/SystemServersQueryWidget"], doLoad);
+            import("hpcc/SystemServersQueryWidget").then(doLoad);
             break;
         case "TargetClustersQueryWidget":
-            require(["hpcc/TargetClustersQueryWidget"], doLoad);
+            import("hpcc/TargetClustersQueryWidget").then(doLoad);
             break;
         case "TargetComboBoxWidget":
-            require(["hpcc/TargetComboBoxWidget"], doLoad);
+            import("hpcc/TargetComboBoxWidget").then(doLoad);
             break;
         case "TargetSelectWidget":
-            require(["hpcc/TargetSelectWidget"], doLoad);
+            import("hpcc/TargetSelectWidget").then(doLoad);
             break;
         case "TimingPageWidget":
-            require(["hpcc/TimingPageWidget"], doLoad);
+            import("hpcc/TimingPageWidget").then(doLoad);
             break;
         case "TimingTreeMapWidget":
-            require(["hpcc/TimingTreeMapWidget"], doLoad);
+            import("hpcc/TimingTreeMapWidget").then(doLoad);
             break;
         case "TopologyDetailsWidget":
-            require(["hpcc/TopologyDetailsWidget"], doLoad);
+            import("hpcc/TopologyDetailsWidget").then(doLoad);
             break;
         case "TopologyWidget":
-            require(["hpcc/TopologyWidget"], doLoad);
+            import("hpcc/TopologyWidget").then(doLoad);
             break;
         case "TpClusterInfoWidget":
-            require(["hpcc/TpClusterInfoWidget"], doLoad);
+            import("hpcc/TpClusterInfoWidget").then(doLoad);
             break;
         case "TpThorStatusWidget":
-            require(["hpcc/TpThorStatusWidget"], doLoad);
+            import("hpcc/TpThorStatusWidget").then(doLoad);
             break;
         case "UserDetailsWidget":
-            require(["hpcc/UserDetailsWidget"], doLoad);
+            import("hpcc/UserDetailsWidget").then(doLoad);
             break;
         case "UserQueryWidget":
-            require(["hpcc/UserQueryWidget"], doLoad);
+            import("hpcc/UserQueryWidget").then(doLoad);
             break;
         case "VariablesWidget":
-            require(["hpcc/VariablesWidget"], doLoad);
+            import("hpcc/VariablesWidget").then(doLoad);
             break;
         case "VizWidget":
-            require(["hpcc/VizWidget"], doLoad);
+            import("hpcc/VizWidget").then(doLoad);
             break;
         case "WorkflowsWidget":
-            require(["hpcc/WorkflowsWidget"], doLoad);
+            import("hpcc/WorkflowsWidget").then(doLoad);
+            break;
+        case "ProcessesWidget":
+            import("hpcc/ProcessesWidget").then(doLoad);
             break;
         case "WUDetailsWidget":
-            require(["hpcc/WUDetailsWidget"], doLoad);
+            import("hpcc/WUDetailsWidget").then(doLoad);
             break;
         case "WUQueryWidget":
-            require(["hpcc/WUQueryWidget"], doLoad);
+            import("hpcc/WUQueryWidget").then(doLoad);
             break;
         case "XrefDetailsWidget":
-            require(["hpcc/XrefDetailsWidget"], doLoad);
+            import("hpcc/XrefDetailsWidget").then(doLoad);
             break;
         case "XrefDirectoriesWidget":
-            require(["hpcc/XrefDirectoriesWidget"], doLoad);
+            import("hpcc/XrefDirectoriesWidget").then(doLoad);
             break;
         case "XrefErrorsWarningsWidget":
-            require(["hpcc/XrefErrorsWarningsWidget"], doLoad);
+            import("hpcc/XrefErrorsWarningsWidget").then(doLoad);
             break;
         case "XrefFoundFilesWidget":
-            require(["hpcc/XrefFoundFilesWidget"], doLoad);
+            import("hpcc/XrefFoundFilesWidget").then(doLoad);
             break;
         case "XrefLostFilesWidget":
-            require(["hpcc/XrefLostFilesWidget"], doLoad);
+            import("hpcc/XrefLostFilesWidget").then(doLoad);
             break;
         case "XrefOrphanFilesWidget":
-            require(["hpcc/XrefOrphanFilesWidget"], doLoad);
+            import("hpcc/XrefOrphanFilesWidget").then(doLoad);
             break;
         case "XrefQueryWidget":
-            require(["hpcc/XrefQueryWidget"], doLoad);
+            import("hpcc/XrefQueryWidget").then(doLoad);
             break;
         default:
             console.log("case \"" + hpccWidget + "\":\n" +
-                "    require([\"hpcc/" + hpccWidget + "\"], doLoad);\n" +
+                "    import(\"hpcc/" + hpccWidget + "\").then(doLoad);\n" +
                 "    break;\n");
     }
 }
@@ -777,12 +963,25 @@ export function pathTail(path: string) {
     return pathParts.pop();
 }
 
+export function joinPath(pathSegment, pathSep: string = "/") {
+    let path = join(pathSegment);
+    if (!path.endsWith(pathSep)) {
+        path += pathSep;
+    }
+    return path;
+}
+
+export function normalizePath(path: string) {
+    if (!path) return "";
+    return path?.endsWith("/") ? path.slice(0, -1) : path;
+}
+
 export function getImageURL(name) {
-    return this.getURL("img/" + name);
+    return getURL("img/" + name);
 }
 
 export function getImageHTML(name, tooltip?) {
-    return "<img src='" + this.getImageURL(name) + "'" + (tooltip ? " title='" + tooltip + "'" : "") + " class='iconAlign'/>";
+    return "<img src='" + getImageURL(name) + "'" + (tooltip ? " title='" + tooltip + "'" : "") + " class='iconAlign'/>";
 }
 
 export function debounce(func, threshold, execAsap) {
@@ -808,7 +1007,7 @@ export function DynamicDialogForm(object) {
 
     for (const key in object) {
         const tr = domConstruct.create("tr", {}, table);
-        if (object.hasOwnProperty(key)) {
+        if (key in object) {
             const td = domConstruct.create("td", {
                 style: "width: 30%;"
             }, tr);
@@ -834,7 +1033,7 @@ export function DynamicDialogTable(headingsArr, rows) {
     }, table);
 
     arrayUtil.forEach(headingsArr, function (row, idx) {
-        //  @ts-ignore
+        // @ts-expect-error
         const th = domConstruct.create("th", {
             innerHTML: row,
             style: "text-align: left; padding-left:5px;"
@@ -846,7 +1045,7 @@ export function DynamicDialogTable(headingsArr, rows) {
             style: "padding: 5px 0 5px 0;"
         }, table);
         for (const key in row) {
-            //  @ts-ignore
+            // @ts-expect-error
             const td = domConstruct.create("td", {
                 innerHTML: key === "ServiceName" ? "<a href=" + row.Protocol + "://" + location.hostname + ":" + row.Port + " target='_blank'>" + row[key] + "</a>" : row[key], // TODO improve the ability to add link in any cell
                 style: "style: width: 30%; padding: 5px 0 5px 5px; border: 1px solid #dddddd;"
@@ -901,4 +1100,282 @@ export class Persist {
 
 export function textColor(backgroundColor: string): string {
     return Palette.textColor(backgroundColor);
+}
+
+function toCSVCell(str) {
+    str = "" + str;
+    const mustQuote = (str.indexOf(",") >= 0 || str.indexOf("\"") >= 0 || str.indexOf("\r") >= 0 || str.indexOf("\n") >= 0);
+    if (mustQuote) {
+        let retVal = "\"";
+        for (let i = 0; i < str.length; ++i) {
+            const c = str.charAt(i);
+            retVal += c === "\"" ? "\"\"" : c;
+
+        }
+        retVal += "\"";
+        return retVal;
+    }
+    return str;
+}
+
+function csvFormatHeader(data, delim) {
+    let retVal = "";
+    if (data.length) {
+        for (const key in data[0]) {
+            if (retVal.length)
+                retVal += delim;
+            retVal += key;
+        }
+    }
+    return retVal;
+}
+
+function csvFormatRow(row, idx, delim) {
+    let retVal = "";
+    for (const key in row) {
+        if (retVal.length)
+            retVal += delim;
+        retVal += toCSVCell(row[key]);
+    }
+    return retVal;
+}
+
+function csvFormatFooter(data) {
+    return "";
+}
+
+export function toCSV(data, delim = ",") {
+    let retVal = csvFormatHeader(data, delim) + "\n";
+    data.forEach((item, idx) => {
+        retVal += csvFormatRow(item, idx, delim) + "\n";
+    });
+    retVal += csvFormatFooter(data);
+    return retVal;
+}
+
+function downloadText(content: string, fileName: string, type: "csv" | "plain" = "csv") {
+    const textBlob = new Blob([content], { type: `text/${type}` });
+    const url = window.URL.createObjectURL(textBlob);
+    triggerFileDownload(url, fileName, { cleanup: () => window.URL.revokeObjectURL(url) });
+}
+
+export interface TriggerFileDownloadOptions {
+    cleanup?: () => void;
+}
+
+export function triggerFileDownload(url: string, fileName: string, options: TriggerFileDownloadOptions = {}) {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    try {
+        link.click();
+    } finally {
+        document.body.removeChild(link);
+        options.cleanup?.();
+    }
+}
+
+export function downloadCSV(content: string, fileName: string) {
+    downloadText(content, fileName, "csv");
+}
+
+export function downloadPlain(content: string, fileName: string) {
+    downloadText(content, fileName, "plain");
+}
+
+const d3FormatNum = d3Format(",");
+
+export function parseCookies(): Record<string, any> {
+    const cookies = {};
+    document.cookie.split(";").map(pair => {
+        const [key, ...values] = pair.split("=");
+        cookies[key.trim()] = values.join("=");
+    });
+    return cookies;
+}
+
+export function deleteCookie(name: string) {
+    const expireDate = new Date();
+    expireDate.setSeconds(expireDate.getSeconds() + 1);
+    document.cookie = `${name}=; domain=${window.location.hostname}; expires=${expireDate.toUTCString()}`;
+}
+
+const d3FormatDecimal = d3Format(",.2f");
+const d3FormatInt = d3Format(",.0f");
+
+export function formatDecimal(num: number): string {
+    if (!num) return "";
+    if (isNaN(num)) return num.toString();
+    return d3FormatDecimal(num);
+}
+
+export function formatNum(num: number): string {
+    if (!num) return "";
+    if (isNaN(num)) return num.toString();
+    return d3FormatNum(num);
+}
+
+export function safeFormatNum(num: number): string {
+    if (!num) return "";
+    if (isNaN(num)) return num.toString();
+    if (num < 0) return nlsHPCC.NotAvailable;
+    return d3FormatInt(num);
+}
+
+export function formatNums(obj) {
+    for (const key in obj) {
+        obj[key] = formatNum(obj[key]);
+    }
+    return obj;
+}
+
+export function isNumeric(n: string | undefined | null | number) {
+    return !isNaN(parseFloat(n as string)) && isFinite(n as number);
+}
+
+export function formatLine(labelTpl, obj): string {
+    let retVal = "";
+    let lpos = labelTpl.indexOf("%");
+    let rpos = -1;
+    let replacementFound = lpos >= 0 ? false : true;  //  If a line has no symbols always include it, otherwise only include that line IF a replacement was found  ---
+    while (lpos >= 0) {
+        retVal += labelTpl.substring(rpos + 1, lpos);
+        rpos = labelTpl.indexOf("%", lpos + 1);
+        if (rpos < 0) {
+            console.log("Invalid Label Template");
+            break;
+        }
+        const key = labelTpl.substring(lpos + 1, rpos);
+        replacementFound = replacementFound || !!obj[labelTpl.substring(lpos + 1, rpos)];
+        retVal += !key ? "%" : (obj[labelTpl.substring(lpos + 1, rpos)] || "");
+        lpos = labelTpl.indexOf("%", rpos + 1);
+    }
+    retVal += labelTpl.substring(rpos + 1, labelTpl.length);
+    return replacementFound ? retVal : "";
+}
+
+export function format(labelTpl, obj) {
+    labelTpl = labelTpl.split("\\n").join("\n");
+
+    const lines = labelTpl.split("\n");
+    const result: string[] = [];
+
+    for (const line of lines) {
+        const formattedLine = formatLine(line, obj);
+        if (formattedLine.trim().length > 0) {
+            result.push(decodeHTML(formattedLine));
+        }
+    }
+
+    return result.join("\n");
+}
+
+const TEN_TRILLION = 10000000000000;
+export function nanosToMillis(timestamp: number): number {
+    if (timestamp > TEN_TRILLION) {
+        return Math.round(timestamp / 1000000);
+    } else {
+        return timestamp;
+    }
+}
+
+export function timestampToDate(timestamp: number): Date {
+    const millis = nanosToMillis(timestamp);
+    return new Date(millis);
+}
+
+export function formatDateString(dateStr: string): string {
+    const matches = dateStr.match(/([0-9]{4}(?:-[0-9]{1,2})+)([T\s])((?:[0-9]{1,2}:)+[0-9]{1,2}\.[0-9]{1,3})(Z*)/);
+    if (matches) {
+        return `${matches[1]}T${matches[3]}${matches[4] ? matches[4] : "Z"}`;
+    }
+    return dateStr;
+}
+
+export function logColor(level: Level): { background: string, foreground: string } {
+    const colors = {
+        background: "transparent",
+        foreground: "inherit"
+    };
+
+    switch (level) {
+        case Level.debug:
+            colors.background = "var(--colorStatusSuccessBackground1)";
+            colors.foreground = "var(--colorStatusSuccessForeground1)";
+            break;
+        case Level.info:
+        case Level.notice:
+            break;
+        case Level.warning:
+            colors.background = "var(--colorStatusWarningBackground1)";
+            colors.foreground = "var(--colorStatusWarningForeground1)";
+            break;
+        case Level.error:
+            colors.background = "var(--colorStatusDangerBackground1)";
+            colors.foreground = "var(--colorStatusDangerForeground1)";
+            break;
+        case Level.critical:
+        case Level.alert:
+        case Level.emergency:
+            colors.background = "var(--colorStatusDangerBackground2)";
+            colors.foreground = "var(--colorStatusDangerForeground2)";
+            break;
+    }
+
+    return colors;
+}
+
+export function themeIsDark() {
+    if (typeof window === "undefined" || typeof document === "undefined") return false;
+    return document.body.classList.contains("flat-dark");
+}
+
+export function wrapStringWithTag(string, tag = "span") {
+    let retVal = string;
+    const unallowedTags = ["script", "style", "link", "a", "input", "form", "img", "video", "iframe", "frameset"];
+    if (!unallowedTags.includes(tag)) {
+        const elm = document.createElement(tag);
+        elm.innerText = string;
+        retVal = elm.outerHTML;
+    }
+    return retVal;
+}
+
+export function isSpill(sourceKind: string, targetKind: string): boolean {
+    return sourceKind === "2" || targetKind === "71";
+}
+
+export function wuidToDate(wuid: string): string {
+    return `${wuid.substring(1, 5)}-${wuid.substring(5, 7)}-${wuid.substring(7, 9)}`;
+}
+
+export function wuidToTime(wuid: string): string {
+    return `${wuid.substring(10, 12)}:${wuid.substring(12, 14)}:${wuid.substring(14, 16)}`;
+}
+
+export function wuidToDateTime(wuid: string): Date {
+    return new Date(`${wuidToDate(wuid)}T${wuidToTime(wuid)}Z`);
+}
+
+export function removeAllExcept(arr: any, keysToKeep: string[]): void {
+    for (const key of Object.keys(arr)) {
+        if (keysToKeep.indexOf(key) < 0) {
+            delete arr[key];
+        }
+    }
+}
+
+function pad(n: number): string {
+    return n.toString().padStart(2, "0");
+}
+
+export function formatDate(date: Date, useUTC: boolean): string {
+    const mm = pad(useUTC ? date.getUTCMonth() + 1 : date.getMonth() + 1);
+    const dd = pad(useUTC ? date.getUTCDate() : date.getDate());
+    const yyyy = useUTC ? date.getUTCFullYear() : date.getFullYear();
+    const hh = pad(useUTC ? date.getUTCHours() : date.getHours());
+    const min = pad(useUTC ? date.getUTCMinutes() : date.getMinutes());
+    const sec = pad(useUTC ? date.getUTCSeconds() : date.getSeconds());
+    return `${yyyy}-${mm}-${dd} ${hh}:${min}:${sec}`;
 }

@@ -18,59 +18,64 @@
 #ifndef _JHTREEI_INCL
 #define _JHTREEI_INCL
 
+#include <memory>
+#include <string>
+#include <unordered_map>
+
 #include "jmutex.hpp"
 #include "jhutil.hpp"
+#include "jhcache.hpp"
 #include "jqueue.tpp"
 #include "ctfile.hpp"
 
 #include "jhtree.hpp"
 #include "bloom.hpp"
 
-typedef OwningStringHTMapping<IKeyIndex> CKeyIndexMapping;
-typedef OwningStringSuperHashTableOf<CKeyIndexMapping> CKeyIndexTable;
-typedef CMRUCacheMaxCountOf<const char *, IKeyIndex, CKeyIndexMapping, CKeyIndexTable> CKeyIndexMRUCache;
-
-typedef class MapStringToMyClass<IKeyIndex> KeyCache;
+typedef std::unordered_map<std::string, Owned<IKeyIndex>> CKeyIndexCache;
 
 class CKeyStore
 {
 private:
-    Mutex mutex;
-    CKeyIndexMRUCache keyIndexCache;
+    Mutex mutex{SYNC_LOCATION};
+    CKeyIndexCache keyIndexCache;
     std::atomic<unsigned> nextId { 0x80000000 };
-    unsigned getUniqId(unsigned useId)
-    {
-        if (useId != (unsigned) -1)
-            return useId;
-        return ++nextId;
-    }
-    IKeyIndex *doload(const char *fileName, unsigned crc, IReplicatedFile *part, IFileIO *iFileIO, unsigned fileIdx, IMemoryMappedFile *iMappedFile, bool isTLK, bool allowPreload);
+
+    unsigned getUniqId(unsigned useId, const char * filename);
+    IKeyIndex *doload(const char *fileName, unsigned crc, IReplicatedFile *part, IFileIO *iFileIO, unsigned fileIdx, IMemoryMappedFile *iMappedFile, bool isTLK, IndexReadOptions readOptions);
 public:
     CKeyStore();
     ~CKeyStore();
-    IKeyIndex *load(const char *fileName, unsigned crc, bool isTLK, bool allowPreload);
-    IKeyIndex *load(const char *fileName, unsigned crc, IFileIO *iFileIO, unsigned fileIdx, bool isTLK, bool allowPreload);
-    IKeyIndex *load(const char *fileName, unsigned crc, IMemoryMappedFile *iMappedFile, bool isTLK, bool allowPreload);
+    IKeyIndex *load(const char *fileName, unsigned crc, bool isTLK, IndexReadOptions readOptions);
+    IKeyIndex *load(const char *fileName, unsigned crc, IFileIO *iFileIO, unsigned fileIdx, bool isTLK, IndexReadOptions readOptions);
+    IKeyIndex *load(const char *fileName, unsigned crc, IMemoryMappedFile *iMappedFile, bool isTLK, IndexReadOptions readOptions);
     void clearCache(bool killAll);
     void clearCacheEntry(const char *name);
     void clearCacheEntry(const IFileIO *io);
-    unsigned setKeyCacheLimit(unsigned limit);
     StringBuffer &getMetrics(StringBuffer &xml);
+    void recordEventIndexInformation();
     void resetMetrics();
 };
 
 class CNodeCache;
 enum request { LTE, GTE };
 
-// INodeLoader impl.
 interface INodeLoader
 {
-    virtual CJHTreeNode *loadNode(offset_t offset) = 0;
-    virtual CJHTreeNode *locateFirstNode(KeyStatsCollector &stats) = 0;
-    virtual CJHTreeNode *locateLastNode(KeyStatsCollector &stats) = 0;
+    virtual const CJHTreeNode *loadNode(cycle_t * fetchCycles, offset_t offset) const = 0;
+    virtual const char *queryFileName() const = 0;
 };
 
-class jhtree_decl CKeyIndex : implements IKeyIndex, implements INodeLoader, public CInterface
+// This class stores information that is used when loading a node from a file
+// including a cache of the last data that was read - so that sequential reads can avoid file fetches
+class CLoadNodeCacheState
+{
+public:
+    CCachedIndexRead readCache;     // Information about the last read request
+    size32_t preferredReadSize{0};
+    bool usePageCache{true};        // Set to false if scanning a file sequentially
+};
+
+class jhtree_decl CKeyIndex : implements IKeyIndex, public CInterface
 {
     friend class CKeyStore;
     friend class CKeyCursor;
@@ -81,29 +86,38 @@ private:
 protected:
     unsigned iD;
     StringAttr name;
-    CriticalSection blobCacheCrit;
-    Owned<CJHTreeBlobNode> cachedBlobNode;
+    mutable CriticalSection cacheCrit{SYNC_LOCATION};
+    Owned<const CJHBlobNode> cachedBlobNode;
     CIArrayOf<IndexBloomFilter> bloomFilters;
+    std::atomic<bool> bloomFiltersLoaded = {0};
+    std::atomic<bool> initialised{0};
+    const bool forceTLK; // saved from constructor to be used when loading the index
+    IndexReadOptions readOptions;
     offset_t cachedBlobNodePos;
 
     CKeyHdr *keyHdr;
     CNodeCache *cache;
-    CJHTreeNode *rootNode;
-    RelaxedAtomic<unsigned> keySeeks;
-    RelaxedAtomic<unsigned> keyScans;
-    offset_t latestGetNodeOffset;
+    const CJHSearchNode *rootNode;
+    NodeTypeWithFlags nodeIndexFlags = NodeNoFlags;
+    mutable RelaxedAtomic<unsigned> keySeeks;
+    mutable RelaxedAtomic<unsigned> keyScans;
+    mutable offset_t latestGetNodeOffset;  // NOT SAFE but only used by keydiff
 
-    CJHTreeNode *loadNode(char *nodeData, offset_t pos, bool needsCopy);
-    CJHTreeNode *getNode(offset_t offset, IContextLogger *ctx);
-    CJHTreeBlobNode *getBlobNode(offset_t nodepos);
+    CJHTreeNode *loadNodeFromMemory(const void *nodeData, offset_t pos, bool needsCopy) const;
+    CJHTreeNode *_createNode(const NodeHdr &hdr) const;
+    const CJHSearchNode *getIndexNodeUsingLoader(const INodeLoader &nodeLoader, offset_t offset, NodeTypeWithFlags typeWithFlags, IContextLogger *ctx) const;
+    const CJHBlobNode *getBlobNode(const INodeLoader &nodeLoader, offset_t nodepos, IContextLogger *ctx);
 
-
-    CKeyIndex(unsigned _iD, const char *_name);
+    CKeyIndex(unsigned _iD, const char *_name, bool _forceTLK, IndexReadOptions _readOptions);
     ~CKeyIndex();
-    void init(KeyHdr &hdr, bool isTLK, bool allowPreload);
-    void cacheNodes(CNodeCache *cache, offset_t nodePos, bool isTLK);
-    void loadBloomFilters();
-    
+    void init(KeyHdr &hdr, const INodeLoader & nodeLoader);
+    void loadBloomFilters(const INodeLoader & nodeLoader);
+    void ensureBloomFiltersLoaded(const INodeLoader & nodeLoader) const;
+
+    const CJHSearchNode *getRootNode(const INodeLoader & nodeLoader) const;
+
+    inline bool isTLK() const { return (keyHdr->getKeyType() & HTREE_TOPLEVEL_KEY) != 0; }
+ 
 public:
     IMPLEMENT_IINTERFACE;
     virtual bool IsShared() const { return CInterface::IsShared(); }
@@ -114,36 +128,76 @@ public:
     virtual size32_t keySize();
     virtual bool hasPayload();
     virtual size32_t keyedSize();
-    virtual bool isTopLevelKey() override;
+    virtual bool isTopLevelKey() const override final;
     virtual bool isFullySorted() override;
     virtual __uint64 getPartitionFieldMask() override;
     virtual unsigned numPartitions() override;
     virtual unsigned getFlags() { return (unsigned char)keyHdr->getKeyType(); };
 
     virtual void dumpNode(FILE *out, offset_t pos, unsigned count, bool isRaw);
+    virtual unsigned queryId() const override { return iD; }
 
     virtual unsigned numParts() { return 1; }
     virtual IKeyIndex *queryPart(unsigned idx) { return idx ? NULL : this; }
     virtual unsigned queryScans() { return keyScans; }
     virtual unsigned querySeeks() { return keySeeks; }
-    virtual const byte *loadBlob(unsigned __int64 blobid, size32_t &blobsize);
     virtual offset_t queryBlobHead() { return keyHdr->getHdrStruct()->blobHead; }
     virtual void resetCounts() { keyScans.store(0); keySeeks.store(0); }
     virtual offset_t queryLatestGetNodeOffset() const { return latestGetNodeOffset; }
     virtual offset_t queryMetadataHead();
     virtual IPropertyTree * getMetadata();
-
-    bool bloomFilterReject(const IIndexFilterList &segs) const;
+    virtual bool containsBlobs() const override;
 
     virtual unsigned getNodeSize() { return keyHdr->getNodeSize(); }
     virtual bool hasSpecialFileposition() const;
     virtual bool needsRowBuffer() const;
-    virtual bool prewarmPage(offset_t page);
- 
- // INodeLoader impl.
-    virtual CJHTreeNode *loadNode(offset_t offset) = 0;
-    CJHTreeNode *locateFirstNode(KeyStatsCollector &stats);
-    CJHTreeNode *locateLastNode(KeyStatsCollector &stats);
+    virtual bool prewarmPage(INodeLoader & nodeLoader, offset_t page, NodeType type);
+    virtual offset_t queryFirstBranchOffset() override;
+    virtual void getFirstBranchOffsets(std::vector<offset_t> & firstBranches) override;
+    virtual const BloomFilter * queryBloom(unsigned i) const override;
+    virtual void mergeStats(CRuntimeStatisticCollection & stats) const override {}
+    virtual IKeyIndexPrewarmer * createPrewarmer() override;
+
+    // KeyIndex implementation virtuals...
+    virtual const char *queryFileName() const = 0;
+    virtual const CJHTreeNode *loadNode(cycle_t * fetchCycles, offset_t offset, CLoadNodeCacheState & readState) const = 0;  // Must be implemented in derived classes
+
+    const byte *loadBlob(const INodeLoader &nodeLoader, unsigned __int64 blobid, size32_t &blobsize, IContextLogger *ctx);
+    unsigned getBranchDepth() const { return keyHdr->getHdrStruct()->branchDepth; }
+    bool bloomFilterReject(const IIndexFilterList &segs, IContextLogger *ctx) const;
+
+    const CJHSearchNode *locateFirstLeafNode(INodeLoader & nodeLoader, IContextLogger *ctx) const;
+    const CJHSearchNode *locateLastLeafNode(INodeLoader & nodeLoader, IContextLogger *ctx) const;
+};
+
+//This class maps a INodeLoader to a CKeyIndex - it can only be called from a single thread
+class DefaultNodeLoader : public INodeLoader
+{
+public:
+    DefaultNodeLoader(const CKeyIndex & _key) : key(_key) {}
+
+    virtual const CJHTreeNode * loadNode(cycle_t * fetchCycles, offset_t offset) const override
+    {
+        return key.loadNode(fetchCycles, offset, readState);
+    }
+    virtual const char *queryFileName() const override
+    {
+        return key.queryFileName();
+    }
+
+    CCachedIndexRead & queryReadCache()
+    {
+        return readState.readCache;
+    }
+
+    void setUsePageCache(bool _usePageCache)
+    {
+        readState.usePageCache = _usePageCache;
+    }
+
+protected:
+    const CKeyIndex & key;
+    mutable CLoadNodeCacheState readState;
 };
 
 class jhtree_decl CMemKeyIndex : public CKeyIndex
@@ -153,87 +207,158 @@ private:
 public:
     CMemKeyIndex(unsigned _iD, IMemoryMappedFile *_io, const char *_name, bool _isTLK);
 
-    virtual const char *queryFileName() { return name.get(); }
+    virtual const char *queryFileName() const { return name.get(); }
     virtual const IFileIO *queryFileIO() const override { return nullptr; }
+    virtual void ensureReady() override;
+
 // INodeLoader impl.
-    virtual CJHTreeNode *loadNode(offset_t offset);
+    virtual const CJHTreeNode *loadNode(cycle_t * fetchCycles, offset_t offset, CLoadNodeCacheState & readState) const override;
+    virtual void mergeStats(CRuntimeStatisticCollection & stats) const override {}
 };
 
 class jhtree_decl CDiskKeyIndex : public CKeyIndex
 {
 private:
     Linked<IFileIO> io;
-    void cacheNodes(CNodeCache *cache, offset_t firstnode, bool isTLK);
     
 public:
-    CDiskKeyIndex(unsigned _iD, IFileIO *_io, const char *_name, bool _isTLK, bool _allowPreload);
+    CDiskKeyIndex(unsigned _iD, IFileIO *_io, const char *_name, bool _isTLK, IndexReadOptions _readOptions);
 
-    virtual const char *queryFileName() { return name.get(); }
+    virtual const char *queryFileName() const { return name.get(); }
     virtual const IFileIO *queryFileIO() const override { return io; }
+    virtual void ensureReady() override;
+
 // INodeLoader impl.
-    virtual CJHTreeNode *loadNode(offset_t offset);
+    virtual const CJHTreeNode *loadNode(cycle_t * fetchCycles, offset_t offset, CLoadNodeCacheState & readState) const override;
+    virtual void mergeStats(CRuntimeStatisticCollection & stats) const override { ::mergeStats(stats, io); }
 };
 
-class jhtree_decl CKeyCursor : public CInterfaceOf<IKeyCursor>
+
+class jhtree_decl CKeyCursor : public CInterfaceOf<IKeyCursor>, implements INodeLoader
 {
 protected:
+    static constexpr unsigned maxParentNodes = 4;
     CKeyIndex &key;
     const IIndexFilterList *filter;
-    char *keyBuffer = nullptr;
-    Owned<CJHTreeNode> node;
+    char *recordBuffer = nullptr;
+    Owned<const CJHSearchNode> node;
+    Owned<const CJHSearchNode> parents[maxParentNodes];
+    unsigned int parentNodeKeys[maxParentNodes] = {0};
     unsigned int nodeKey;
-
+    // yield count is initialised to -1 to suppress a yield before the first leaf fetch
+    unsigned int yieldCount = (unsigned)-1;
+    mutable PayloadReference activePayload;
+    NodeTypeWithFlags nodeFilterFlags = NodeNoFlags;   // Set from finalized filters; narrowing calls (nextRange/incrementKey/fixSortSegs) do not recalculate it
+    NodeTypeWithFlags fixedNodeFilterFlags = NodeNoFlags;   // Flags that survive reset()
+    
+    mutable bool fullBufferValid = false;
     bool eof=false;
     bool matched=false; //MORE - this should probably be renamed. It's tracking state from one call of lookup to the next.
     bool logExcessiveSeeks = false;
+    IndexReadOptions readOptions;
+    mutable CLoadNodeCacheState readState;
 public:
-    CKeyCursor(CKeyIndex &_key, const IIndexFilterList *filter, bool _logExcessiveSeeks);
+    CKeyCursor(CKeyIndex &_key, const IIndexFilterList *filter, bool _logExcessiveSeeks, IndexReadOptions _readOptions);
     ~CKeyCursor();
 
-    virtual bool next(char *dst, KeyStatsCollector &stats) override;
     virtual const char *queryName() const override;
     virtual size32_t getSize();
     virtual size32_t getKeyedSize() const;
-    virtual offset_t getFPos(); 
+    virtual offset_t getFPos() const;
     virtual void serializeCursorPos(MemoryBuffer &mb);
-    virtual void deserializeCursorPos(MemoryBuffer &mb, KeyStatsCollector &stats);
+    virtual void deserializeCursorPos(MemoryBuffer &mb, IContextLogger *ctx);
     virtual unsigned __int64 getSequence(); 
-    virtual const byte *loadBlob(unsigned __int64 blobid, size32_t &blobsize);
-    virtual void reset();
-    virtual bool lookup(bool exact, KeyStatsCollector &stats) override;
-    virtual bool lookupSkip(const void *seek, size32_t seekOffset, size32_t seeklen, KeyStatsCollector &stats) override;
+    virtual const byte *loadBlob(unsigned __int64 blobid, size32_t &blobsize, IContextLogger *ctx);
+    virtual void finishSegmentMonitors() override;
+    virtual void reset(IContextLogger *ctx);
+    virtual bool lookup(bool exact, IContextLogger *ctx) override;
+    virtual bool next(IContextLogger *ctx) override;
+    virtual bool lookupSkip(const void *seek, size32_t seekOffset, size32_t seeklen, IContextLogger *ctx) override;
     virtual bool skipTo(const void *_seek, size32_t seekOffset, size32_t seeklen) override;
     virtual IKeyCursor *fixSortSegs(unsigned sortFieldOffset) override;
+    virtual void setStepping(bool stepping) override;
 
-    virtual unsigned __int64 getCount(KeyStatsCollector &stats) override;
-    virtual unsigned __int64 checkCount(unsigned __int64 max, KeyStatsCollector &stats) override;
-    virtual unsigned __int64 getCurrentRangeCount(unsigned groupSegCount, KeyStatsCollector &stats) override;
+    virtual unsigned __int64 getCount(IContextLogger *ctx) override;
+    virtual unsigned __int64 checkCount(unsigned __int64 max, IContextLogger *ctx) override;
+    virtual unsigned __int64 getCurrentRangeCount(unsigned groupSegCount, IContextLogger *ctx) override;
     virtual bool nextRange(unsigned groupSegCount) override;
-    virtual const byte *queryKeyBuffer() const override;
+    virtual const byte *queryRecordBuffer() const override;
+    virtual const byte *queryKeyedBuffer() const override;
+
+ // INodeLoader impl.
+    virtual const CJHTreeNode *loadNode(cycle_t * fetchCycles, offset_t offset) const override;
+
+    // This is the main function that is used to load a node from an index for the current cursor.  The
+    // typical function flow is
+    //
+    // CKeyCursor::getCursorNode()
+    //  IKeyIndex::getIndexNodeUsingLoader(loader)
+    //   CNodeCache::getCachedNode(loader)
+    //    CKeyCursor(INodeLoader)::loadNode()
+    //     IKeyIndex::loadNode(readState);
+    //      CKeyIndex::loadNodeFromMemory(data)
+
+    const CJHSearchNode *getCursorNode(offset_t offset, NodeType type, IContextLogger *ctx) const
+    {
+        return key.getIndexNodeUsingLoader(*this, offset, type | nodeFilterFlags, ctx);
+    }
+
+    // Temporarily ORs extra flags into nodeFilterFlags for the lifetime of the instance, restoring the previous value on destruction
+    class ScopedNodeFilterFlags
+    {
+    public:
+        inline ScopedNodeFilterFlags(CKeyCursor & _cursor, NodeTypeWithFlags flags) : cursor(_cursor), savedFlags(_cursor.nodeFilterFlags)
+        {
+            cursor.nodeFilterFlags |= flags;
+        }
+        inline ~ScopedNodeFilterFlags()
+        {
+            cursor.nodeFilterFlags = savedFlags;
+        }
+    private:
+        CKeyCursor & cursor;
+        NodeTypeWithFlags savedFlags;
+    };
+
 protected:
     CKeyCursor(const CKeyCursor &from);
 
-    bool last(char *dst, KeyStatsCollector &stats);
-    bool gtEqual(const char *src, char *dst, KeyStatsCollector &stats);
-    bool ltEqual(const char *src, KeyStatsCollector &stats);
-    bool _lookup(bool exact, unsigned lastSeg, KeyStatsCollector &stats);
-    void reportExcessiveSeeks(unsigned numSeeks, unsigned lastSeg, size32_t recSize, KeyStatsCollector &stats);
+    // Internal searching functions - set current node/nodekey/matched values
+    bool _last(IContextLogger *ctx);        // Updates node/nodekey
+    bool _gtEqual(IContextLogger *ctx);     // Reads recordBuffer, updates node/nodekey
+    bool _ltEqual(IContextLogger *ctx);     // Reads recordBuffer, updates node/nodekey 
+    bool _next(IContextLogger *ctx);        // Updates node/nodekey 
+    // if _lookup returns true, recordBuffer will contain keyed portion of result
+    bool _lookup(bool exact, unsigned lastSeg, bool unfiltered, IContextLogger *ctx);
+
+    void clearParentNodes();
+    void maybeYield();
+
+    void reportExcessiveSeeks(unsigned numSeeks, unsigned lastSeg, IContextLogger *ctx);
 
     inline void setLow(unsigned segNo)
     {
-        filter->setLow(segNo, keyBuffer);
+        filter->setLow(segNo, recordBuffer);
     }
     inline unsigned setLowAfter(size32_t offset)
     {
-        return filter->setLowAfter(offset, keyBuffer);
+        return filter->setLowAfter(offset, recordBuffer);
     }
     inline bool incrementKey(unsigned segno) const
     {
-        return filter->incrementKey(segno, keyBuffer);
+        return filter->incrementKey(segno, recordBuffer);
     }
     inline void endRange(unsigned segno)
     {
-        filter->endRange(segno, keyBuffer);
+        filter->endRange(segno, recordBuffer);
+    }
+    virtual void mergeStats(CRuntimeStatisticCollection & stats) const override
+    {
+        key.mergeStats(stats);
+    }
+    virtual const char *queryFileName() const override
+    {
+        return key.queryFileName();
     }
 };
 
@@ -270,16 +395,20 @@ public:
     virtual bool matchesBuffer(const void *buffer, unsigned lastSeg, unsigned &matchSeg) const override;
     virtual unsigned getFieldOffset(unsigned idx) const override { return recInfo.getFixedOffset(idx); }
     virtual bool canMatch() const override;
+    virtual bool isUnfiltered() const override;
+    virtual void updateIndexFormat(const RtlRecord & actualRecInfo) override;
+    virtual bool isSingleValue() const override;
 
 protected:
     IndexRowFilter(const IndexRowFilter &_from, const char *fixedVals, unsigned sortFieldOffset);
 
     const RtlRecord &recInfo;
     unsigned lastReal = 0;
-    unsigned lastFull = 0;
+    unsigned lastFull = -1;
     unsigned keyedSize = 0;
     unsigned keySegCount = 0;
-
+    bool unfiltered = true;
+    bool finished = false;
 };
 
 #endif

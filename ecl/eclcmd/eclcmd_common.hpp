@@ -19,7 +19,9 @@
 #define ECLCMD_COMMON_HPP
 
 #include "ws_workunits.hpp"
+#include "ws_fs.hpp"
 #include "eclcc.hpp"
+#include "workunit.hpp"
 
 //=========================================================================================
 
@@ -51,8 +53,34 @@ typedef IEclCommand *(*EclCommandFactory)(const char *cmdname);
 #define ECLOPT_SERVER_INI "eclWatchIP"
 #define ECLOPT_SERVER_ENV "ECL_WATCH_IP"
 #define ECLOPT_SERVER_DEFAULT "."
+
 #define ECLOPT_SSL "--ssl"
 #define ECLOPT_SSL_S "-ssl"
+#define ECLOPT_SSL_INI "eclSSL"
+#define ECLOPT_SSL_ENV "ECL_SSL"
+
+#define ECLOPT_NO_KEEP_ALIVE "--noKeepAlive"
+
+//The following TLS options could be made more verbose, but these match CURL for convenience
+#define ECLOPT_CLIENT_CERT "--cert"
+#define ECLOPT_CA_CERT "--cacert"
+#define ECLOPT_CLIENT_PRIVATE_KEY "--key"
+
+#define ECLOPT_CLIENT_CERT_INI "eclClientCert"
+#define ECLOPT_CLIENT_CERT_ENV "ECL_CLIENT_CERT"
+#define ECLOPT_CLIENT_PRIVATE_KEY_INI "eclClientPrivateKey"
+#define ECLOPT_CLIENT_PRIVATE_KEY_ENV "ECL_CLIENT_PRIVATE_KEY"
+
+#define ECLOPT_CA_CERT_INI "eclCACert"
+#define ECLOPT_CA_CERT_ENV "ECL_CA_CERT"
+
+#define ECLOPT_ACCEPT_SELFSIGNED "--accept-self-signed"
+#define ECLOPT_ACCEPT_SELFSIGNED_INI "eclAcceptSelfSigned"
+#define ECLOPT_ACCEPT_SELFSIGNED_ENV "ECL_ACCEPT_SELF_SIGNED"
+
+#define ECLOPT_SOURCE_SSL "--source-ssl"
+
+#define ECLOPT_SOURCE_NO_SSL "--source-no-ssl"
 
 #define ECLOPT_PORT "--port"
 #define ECLOPT_PORT_INI "eclWatchPort"
@@ -81,14 +109,27 @@ typedef IEclCommand *(*EclCommandFactory)(const char *cmdname);
 #define ECLOPT_OVERWRITE_ENV NULL
 
 #define ECLOPT_DONT_COPY_FILES "--no-files"
+#define ECLOPT_REMOTE_STORAGE "--remote-storage"
+#define ECLOPT_DFU_COPY_FILES "--dfu-copy"
+#define ECLOPT_ONLY_COPY_FILES "--only-copy-files"
 #define ECLOPT_ALLOW_FOREIGN "--allow-foreign"
+#define ECLOPT_DFU_OVERWRITE "--dfu-overwrite"
+#define ECLOPT_STOP_IF_FILES_COPIED "--stop-if-files-copied"
+#define ECLOPT_INIT_PUBLISHER_WUID "--init-publisher-wuid"
+#define ECLOPT_DFU_QUEUE "--dfu-queue"
+#define ECLOPT_DFU_WAIT "--dfu-wait"
+#define ECLOPT_KEY_COMPRESSION "--key-compression"
+#define ECLOPT_DFU_TARGETPLANE "--target-plane"
+#define ECLOPT_IGNORE_PACKAGEMAP_SOURCES "--ignore-packagemap-sources"
 
 #define ECLOPT_ACTIVE "--active"
 #define ECLOPT_ACTIVE_ONLY "--active-only"
 #define ECLOPT_ALL "--all"
+#define ECLOPT_PARALLEL "--parallel"
 #define ECLOPT_INACTIVE "--inactive"
 #define ECLOPT_NO_ACTIVATE "--no-activate"
 #define ECLOPT_ACTIVATE "--activate"
+#define ECLOPT_ACTIVATED "--activated"
 #define ECLOPT_ACTIVATE_S "-A"
 #define ECLOPT_ACTIVATE_INI "activateDefault"
 #define ECLOPT_ACTIVATE_ENV NULL
@@ -123,6 +164,10 @@ typedef IEclCommand *(*EclCommandFactory)(const char *cmdname);
 
 #define ECLOPT_MAIN "--main"
 #define ECLOPT_MAIN_S "-main"  //eclcc compatible format
+#define ECLOPT_MAIN_REPO "--mainrepo"
+#define ECLOPT_MAIN_REPO_VERSION "--mainrepoversion"
+#define ECLOPT_DEFAULT_REPO "--defaultrepo"
+#define ECLOPT_DEFAULT_REPO_VERSION "--defaultrepoversion"
 #define ECLOPT_SNAPSHOT "--snapshot"
 #define ECLOPT_SNAPSHOT_S "-sn"
 #define ECLOPT_ECL_ONLY "--ecl-only"
@@ -159,6 +204,8 @@ typedef IEclCommand *(*EclCommandFactory)(const char *cmdname);
 #define ECLOPT_TARGET_S "-t"
 #define ECLOPT_NAME "--name"
 #define ECLOPT_NAME_S "-n"
+#define ECLOPT_JOB_NAME "--job-name"
+#define ECLOPT_QUERY_NAME "--query-name"
 #define ECLOPT_QUERYSET "--queryset"
 #define ECLOPT_QUERYSET_S "-qs"
 #define ECLOPT_VERSION "--version"
@@ -167,6 +214,9 @@ typedef IEclCommand *(*EclCommandFactory)(const char *cmdname);
 #define ECLOPT_PMID_S "-pm"
 #define ECLOPT_QUERYID "--queryid"
 #define ECLOPT_QUERIES "--queries"
+#define ECLOPT_QUERYIDS "--queryids"
+#define ECLOPT_SUSPENDEDBYUSER "--suspended-by-user"
+#define ECLOPT_DELETE_WORKUNIT "--delete-workunit"
 
 #define ECLOPT_DALIIP "--daliip"
 #define ECLOPT_PROCESS "--process"
@@ -177,6 +227,8 @@ typedef IEclCommand *(*EclCommandFactory)(const char *cmdname);
 #define ECLOPT_INC_THOR_SLAVE_LOGS "--inc-thor-slave-logs"
 #define ECLOPT_PROBLEM_DESC "--description"
 #define ECLOPT_CREATE_DIRS "--create-dirs"
+#define ECLOPT_PLANES "--planes"
+#define ECLOPT_ROXIES "--roxies"
 
 
 #define ECLOPT_LIB_PATH_S "-L"
@@ -190,6 +242,13 @@ typedef IEclCommand *(*EclCommandFactory)(const char *cmdname);
 #define ECLOPT_DEBUG_DASH "-g"
 #define ECLOPT_FAST_SYNTAX "--fastsyntax"
 #define ECLOPT_NO_STD_INC "--nostdinc"
+#define ECLOPT_FETCH_REPOS "--fetchrepos"
+#define ECLOPT_UPDATE_REPOS "--updaterepos"
+#define ECLOPT_CLEAN_REPOS "--cleanrepos"
+#define ECLOPT_CLEAN_INVALID_REPOS "--cleaninvalidrepos"
+#define ECLOPT_DEFAULT_GIT_PREFIX "--defaultgitprefix"
+
+#define ECLOPT_REPO_MAPPING "-R"
 
 #define ECLOPT_VERBOSE "--verbose"
 #define ECLOPT_VERBOSE_S "-v"
@@ -253,22 +312,45 @@ public:
     }
     virtual eclCmdOptionMatchIndicator matchCommandLineOption(ArgvIterator &iter, bool finalAttempt=false);
     virtual bool finalizeOptions(IProperties *globals);
+    inline void setRpcOptions(IEspClientRpcSettings &rpc, unsigned int waitMS = 0)
+    {
+        setRpcRequestTimeouts(rpc, waitMS, optWaitConnectMs, optWaitReadSec);
+        setRpcSSLOptions(rpc, optSSL, optClientCert, optClientPrivateKey, optCACert, optAcceptSelfSigned);
+    }
+    // The read timeout must outlast the server-side wait, otherwise the client gives up before the server responds
+    inline void setRpcOptionsForServerWait(IEspClientRpcSettings &rpc, int serverWaitMs)
+    {
+        const unsigned serverWaitMarginSecs = 30;
+        unsigned readSecs = optWaitReadSec;
+        // Over-estimating is harmless: the server enforces the wait, so this only delays detecting a dead connection
+        if (!readSecs && serverWaitMs >= 0)
+            readSecs = ((unsigned)serverWaitMs + 999) / 1000 + serverWaitMarginSecs;
+        setRpcRequestTimeouts(rpc, 0, optWaitConnectMs, readSecs);
+        setRpcSSLOptions(rpc, optSSL, optClientCert, optClientPrivateKey, optCACert, optAcceptSelfSigned);
+    }
+    void checkFeatures(IClientWsWorkunits *client, bool &useCompression, int &major, int &minor, int &point, unsigned waitMs, unsigned waitConnectMs, unsigned waitReadSec);
 
     virtual void usage()
     {
         fprintf(stdout,
+            " Common Options:\n"
             "   --help                 Display usage information for the given command\n"
             "   -v, --verbose          Output additional tracing information\n"
           );
         if (usesESP)
             fprintf(stdout,
                 "   -s, --server=<ip>      IP of server running ecl services (eclwatch)\n"
-                "   -ssl, --ssl            Use SSL to secure the connection to the server\n"
+                "   -ssl, --ssl            Use SSL to secure the connection to the server(s)\n"
+                "   --accept-self-signed   Allow SSL servers to use self signed certificates\n"
+                "   --cert                 Path to file containing SSL client certificate\n"
+                "   --key                  Path to file containing SSL client certificate private key\n"
+                "   --cacert               Path to file containing SSL CA certificate\n"
                 "   --port=<port>          ECL services port\n"
                 "   -u, --username=<name>  Username for accessing ecl services\n"
                 "   -pw, --password=<pw>   Password for accessing ecl services\n"
                 "   --wait-connect=<Ms>    Timeout while connecting to server (in milliseconds)\n"
                 "   --wait-read=<Sec>      Timeout while reading from socket (in seconds)\n"
+                "   --noKeepAlive          Disable tcp keepalives with the server\n"
               );
     }
 public:
@@ -276,29 +358,39 @@ public:
     StringAttr optPort;
     StringAttr optUsername;
     StringAttr optPassword;
+    StringAttr optClientCert;
+    StringAttr optClientPrivateKey;
+    StringAttr optCACert;
+
     bool optPasswordProvided = false;
     unsigned optWaitConnectMs = 0;
     unsigned optWaitReadSec = 0;
     bool optVerbose;
     bool optSSL;
+    bool optNoKeepAlive = false;
+    bool sslOptProvided = false;
+    bool optAcceptSelfSigned = false;
+    bool selfsignedOptProvided = false;
     bool usesESP;
 };
 
 class EclCmdWithEclTarget : public EclCmdCommon
 {
 public:
-    EclCmdWithEclTarget() : optLegacy(false), optCheckDirty(false), optNoArchive(false), optResultLimit((unsigned)-1), optDebug(false), paramCount(0)
+    EclCmdWithEclTarget() : optResultLimit((unsigned)-1), paramCount(0), optWaitTime((unsigned)-1), optNoArchive(false), optLegacy(false), optDebug(false), optCheckDirty(false), optPoll(false)
     {
     }
     virtual eclCmdOptionMatchIndicator matchCommandLineOption(ArgvIterator &iter, bool finalAttempt=false);
     virtual bool finalizeOptions(IProperties *globals);
+    bool getFullAttributePath(StringBuffer & result);
     bool setTarget(const char *target);
     bool setParam(const char *in, bool final);
+    bool doDeploy(IClientWsWorkunits *client, const char *cluster, const char *name, StringBuffer *wuid, StringBuffer *wucluster, bool noarchive, bool displayWuid, bool compress, bool protect);
 
     virtual void usage()
     {
-        EclCmdCommon::usage();
         fprintf(stdout,
+            " ECL Options:\n"
             "   --main=<definition>    Definition to use from legacy ECL repository\n"
             "   --snapshot,-sn=<label> Snapshot label to use from legacy ECL repository\n"
             "   --ecl-only             Send ECL query to HPCC as text rather than as a generated archive\n"
@@ -307,6 +399,8 @@ public:
             "   -f-<option>[=value]    Set an eclcc command line option (single '-')\n"
             "   -f--<option>[=value]   Set an eclcc command line option (double '-')\n"
             "   -Dname=value           Override the definition of a global attribute 'name'\n"
+            "   --wait=<ms>            Max time to wait in milliseconds\n"
+            "   --poll                 Poll for results and compilation, rather than remain connected\n"
             " eclcc options (everything following):\n"
         );
         for (unsigned line=0; line < _elements_in(helpText); line++)
@@ -332,7 +426,35 @@ public:
             else
                 fprintf(stdout, "%s%s\n", wsPrefix.str(), text);
         }
+        EclCmdCommon::usage();
     }
+
+protected:
+    int checkComplete(IClientWsWorkunits* client, IClientWUWaitRequest* req);
+    WUState checkCompiled(IClientWsWorkunits* client, IClientWUWaitRequest* req);
+    WUState pollForCompile(IClientWsWorkunits* client, const char *wuid, unsigned startTimeMs);
+
+    int getInitialRunWait()
+    {
+        if (!optPoll)
+            return optWaitTime;
+        return (optWaitTime < 10000) ? optWaitTime : 10000; //stay connected for the first 10 seconds even if polling
+    }
+
+    // --wait only limits compilation for compile-only commands, otherwise run/publish would give up before submitting
+    virtual unsigned getCompileWaitLimit() const { return (unsigned)-1; }
+
+    int getInitialCompileWait()
+    {
+        if (!optPoll)
+            return (int)getCompileWaitLimit();
+        unsigned waitLimit = getCompileWaitLimit();
+        unsigned initialWait = getInitialRunWait();
+        if (waitLimit != (unsigned)-1 && waitLimit < initialWait)
+            return (int)waitLimit;
+        return (int)initialWait;
+    }
+
 public:
     StringAttr param;
     StringAttr optTargetCluster;
@@ -341,17 +463,24 @@ public:
     StringBuffer optImpPath;
     StringAttr optManifest;
     StringAttr optAttributePath;
+    StringAttr optAttributeRepo;
+    StringAttr optAttributeRepoVersion;
+    StringAttr optDefaultRepo;
+    StringAttr optDefaultRepoVersion;
     StringAttr optSnapshot;
     IArrayOf<IEspNamedValue> debugValues;
     IArrayOf<IEspNamedValue> definitions;
     unsigned optResultLimit;
     unsigned paramCount;
+    unsigned optWaitTime;
     bool optNoArchive;
     bool optLegacy;
     bool optDebug;
     bool optCheckDirty;
     bool optFastSyntax = false;
     bool optNoStdInc = false;
+    bool optPoll;
+    StringArray extraOptions;
 };
 
 class EclCmdWithQueryTarget : public EclCmdCommon
@@ -371,6 +500,105 @@ public:
 public:
     StringAttr optQuerySet;
     StringAttr optQuery;
+    StringAttr optActivated;
+    bool optSuspendedByUser = false;
+    bool optDeleteWorkunit = false;
+};
+
+class EclCmdOptionsDFU
+{
+public:
+    EclCmdOptionsDFU(){}
+
+    template<class TRequest>
+    void updateRequest(TRequest *req)
+    {
+        req->setRemoteStorage(optRemoteStorage);
+        req->setDfuCopyFiles(optDfuCopyFiles);
+        req->setDfuQueue(optDfuQueue);
+        req->setDfuWait(optDfuWaitSec);
+        req->setDfuOverwrite(optDfuOverwrite);
+        req->setStopIfFilesCopied(optStopIfFilesCopied);
+        req->setOnlyCopyFiles(optOnlyCopyFiles);
+        req->setDfuPublisherWuid(optDfuPublisherWuid);
+        req->setKeyCompression(optKeyCompression);
+        req->setDfuTargetPlane(optDfuTargetPlane);
+    }
+
+    void preallocatePublisherWuid(EclCmdCommon &cmd);
+
+    bool finalizeOptions(EclCmdCommon &cmd, IProperties *globals)
+    {
+        if (optPreallocatePublisherWuid && optDfuCopyFiles)
+            preallocatePublisherWuid(cmd);
+        return true;
+    }
+
+    template<class TResponse>
+    bool report(TResponse *resp)
+    {
+        if (isEmptyString(resp->getDfuPublisherWuid()))
+            return !optOnlyCopyFiles;
+        fprintf(stdout, "\nDFU Publisher file copying Wuid: %s is %s\n", resp->getDfuPublisherWuid(), isEmptyString(resp->getDfuPublisherState()) ? "in unknown state" : resp->getDfuPublisherState());
+        return (!optOnlyCopyFiles && !optStopIfFilesCopied);
+    }
+
+    bool match(ArgvIterator &iter)
+    {
+        if (iter.matchOption(optRemoteStorage, ECLOPT_REMOTE_STORAGE))
+            return true;
+        if (iter.matchFlag(optDfuCopyFiles, ECLOPT_DFU_COPY_FILES))
+            return true;
+        if (iter.matchOption(optDfuQueue, ECLOPT_DFU_QUEUE))
+            return true;
+        if (iter.matchOption(optDfuWaitSec, ECLOPT_DFU_WAIT))
+            return true;
+        if (iter.matchFlag(optDfuOverwrite, ECLOPT_DFU_OVERWRITE))
+            return true;
+        if (iter.matchFlag(optStopIfFilesCopied, ECLOPT_STOP_IF_FILES_COPIED))
+            return true;
+        if (iter.matchFlag(optPreallocatePublisherWuid, ECLOPT_INIT_PUBLISHER_WUID))
+            return true;
+        if (iter.matchFlag(optOnlyCopyFiles, ECLOPT_ONLY_COPY_FILES))
+            return true;
+        if (iter.matchOption(optKeyCompression, ECLOPT_KEY_COMPRESSION))
+            return true;
+        if (iter.matchOption(optDfuTargetPlane, ECLOPT_DFU_TARGETPLANE))
+            return true;
+        return false;
+    }
+    void usage()
+    {
+        fputs(
+            " DFS Options:\n"
+            "   --remote-storage       Use the given remote storage configuration to locate remote files\n"
+            " DFU Options:\n"
+            "   --dfu-copy             Use DFU to copy files during deployment, not on roxie in the background\n"
+            "   --dfu-queue            DFU Queue to use when doing a DFU copy\n"
+            "   --dfu-wait             Amount of time in seconds to wait for DFU copy to complete (if neither --only-copy-files\n"
+            "                            or --stop-if-files-copied are specified) default is 1800 (30 minutes)\n"
+            "   --dfu-overwrite        Set DFU copy command to overwrite physical files that are already on disk.\n"
+            "   --only-copy-files      Copy the files needed for the query, but don't publish the query\n"
+            "   --stop-if-files-copied If all files already exist, publish the query.\n"
+            "                          Otherwise, copy the files needed for the query, but don't publish the query\n"
+            "   --init-publisher-wuid  Allocate and display the publisher wuid immediately, so that it can be tracked\n"
+            "                           even if the command line is disconnected\n"
+            "   --key-compression      When copying a key file, allows the copy to be re-encoded using the new compression\n"
+            "   --target-plane         Override the destination plane (defaults to target cluster) for DFU copy\n",
+            stdout);
+    }
+public:
+    StringAttr optDfuPublisherWuid;
+    StringAttr optRemoteStorage;
+    StringAttr optDfuQueue;
+    StringAttr optKeyCompression;
+    StringAttr optDfuTargetPlane;
+    unsigned optDfuWaitSec = 1800; //30 minutes
+    bool optDfuCopyFiles = false;
+    bool optDfuOverwrite = false;
+    bool optOnlyCopyFiles = false;
+    bool optStopIfFilesCopied = false;
+    bool optPreallocatePublisherWuid = false; //preallocating allows automated tracking to have the publisher wuid available immediately
 };
 
 void outputExceptionEx(IException &e);
@@ -396,7 +624,7 @@ public:
 template <class Iface> Iface *intClient(Iface *client, EclCmdCommon &cmd, const char *service, const char *urlTail)
 {
     if(cmd.optServer.isEmpty())
-        throw MakeStringException(-1, "Server IP not specified");
+        throw MakeStringException(-1, "Server address not specified");
 
     EclCmdURL url(service, cmd.optServer, cmd.optPort, cmd.optSSL, urlTail);
     client->addServiceUrl(url.str());
@@ -408,15 +636,5 @@ template <class Iface> Iface *intClient(Iface *client, EclCmdCommon &cmd, const 
 
 #define createCmdClient(SN, cmd) intClient<IClient##SN>(create##SN##Client(), cmd, #SN, NULL);
 #define createCmdClientExt(SN, cmd, urlTail) intClient<IClient##SN>(create##SN##Client(), cmd, #SN, urlTail);
-
-inline void setCmdRequestTimeouts(IEspClientRpcSettings &rpc, unsigned waitMs, unsigned waitConnectMs, unsigned waitReadSec)
-{
-    if (waitMs==(unsigned)-1)
-        waitMs=0;
-    if (waitConnectMs || waitMs)
-        rpc.setConnectTimeOutMs(waitConnectMs ? waitConnectMs : waitMs);
-    if (waitReadSec || waitMs)
-        rpc.setReadTimeOutSecs(waitReadSec ? waitReadSec : (waitMs / 1000));
-}
 
 #endif

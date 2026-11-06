@@ -20,19 +20,16 @@
 #include "jargv.hpp"
 #include "jflz.hpp"
 
-#include "build-config.h"
-
 #include "ws_workunits.hpp"
 
 #include "eclcmd.hpp"
 #include "eclcmd_common.hpp"
+#include "querycopysetoptions.hpp"
 #include "eclcmd_core.hpp"
 #include "workunit.hpp"
 
 #define INIFILE "ecl.ini"
-#define SYSTEMCONFDIR CONFIG_DIR
 #define DEFAULTINIFILE "ecl.ini"
-#define SYSTEMCONFFILE ENV_CONF_FILE
 
 //=========================================================================================
 
@@ -260,7 +257,7 @@ public:
     {
         Owned<IClientWsWorkunits> client = createCmdClient(WsWorkunits, *this);
         Owned<IClientWUMultiQuerySetDetailsRequest> req = client->createWUMultiQuerysetDetailsRequest();
-        setCmdRequestTimeouts(req->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(req->rpc());
 
         req->setQuerySetName(optTargetCluster.get());
         req->setClusterName(optTargetCluster.get());
@@ -296,8 +293,7 @@ public:
             "   A                      Query is active\n"
             "   S                      Query is suspended in queryset\n"
 //not yet   "   X                      Query is suspended on selected cluster\n"
-            "   U                      Query with no flags set\n"
-            " Common Options:\n",
+            "   U                      Query with no flags set\n",
             stdout);
         EclCmdCommon::usage();
     }
@@ -348,21 +344,51 @@ public:
             fputs("Target must be specified.\n", stderr);
             return false;
         }
-        if (optTarget.isEmpty())
-        {
-            fputs("Query must be specified.\n", stderr);
-            return false;
-        }
         if (!EclCmdCommon::finalizeOptions(globals))
             return false;
         return true;
+    }
+
+    void outputQueryFiles(const char *id, IArrayOf<IConstFileUsedByQuery> &files, IArrayOf<IConstQuerySuperFile> &superfiles)
+    {
+        fputs("------------------\n", stdout);
+        if (!isEmptyString(id))
+            fprintf(stdout, "Query: %s\n", id);
+        if (!files.length())
+            fputs("No files used.\n", stdout);
+        else
+            fputs("Files used:\n", stdout);
+        ForEachItemIn(i, files)
+        {
+            IConstFileUsedByQuery &file = files.item(i);
+            StringBuffer line("  ");
+            line.append(file.getFileName()).append(", ");
+            line.append(file.getFileSize()).append(" bytes, ");
+            line.append(file.getNumberOfParts()).append(" part(s)\n");
+            fputs(line, stdout);
+        }
+        fputs("\n", stdout);
+
+        if (superfiles.length())
+        {
+            fputs("SuperFiles used:\n", stdout);
+            ForEachItemIn(sp, superfiles)
+            {
+                IConstQuerySuperFile &superfile = superfiles.item(sp);
+                fprintf(stdout, "    %s\n", superfile.getName());
+                StringArray &subfiles = superfile.getSubFiles();
+                ForEachItemIn(sb, subfiles)
+                    fprintf(stdout, "    > %s\n", subfiles.item(sb));
+            }
+            fputs("\n", stdout);
+        }
     }
 
     virtual int processCMD()
     {
         Owned<IClientWsWorkunits> client = createCmdClient(WsWorkunits, *this);
         Owned<IClientWUQueryFilesRequest> req = client->createWUQueryFilesRequest();
-        setCmdRequestTimeouts(req->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(req->rpc());
 
         req->setTarget(optTarget.get());
         req->setQueryId(optQuery.get());
@@ -371,21 +397,19 @@ public:
         int ret = outputMultiExceptionsEx(resp->getExceptions());
         if (ret == 0)
         {
-            IArrayOf<IConstFileUsedByQuery> &files = resp->getFiles();
-            if (!files.length())
-                fputs("No files used.\n", stdout);
+            if (optQuery.length())
+                outputQueryFiles(optQuery.str(), resp->getFiles(), resp->getSuperFiles());
             else
-                fputs("Files used:\n", stdout);
-            ForEachItemIn(i, files)
             {
-                IConstFileUsedByQuery &file = files.item(i);
-                StringBuffer line("  ");
-                line.append(file.getFileName()).append(", ");
-                line.append(file.getFileSize()).append(" bytes, ");
-                line.append(file.getNumberOfParts()).append(" part(s)\n");
-                fputs(line, stdout);
+                IArrayOf<IConstQueryFilesUsed> &queries = resp->getQueries();
+                if (!queries.length())
+                    fputs("No queries found.\n", stdout);
+                ForEachItemIn(i, queries)
+                {
+                    IConstQueryFilesUsed &query = queries.item(i);
+                    outputQueryFiles(query.getQueryId(), query.getFiles(), query.getSuperFiles());
+                }
             }
-            fputs("\n", stdout);
         }
         return ret;
     }
@@ -396,11 +420,10 @@ public:
             "The 'queries files' command displays a list of the files currently in use by\n"
             "the given query.\n"
             "\n"
-            "ecl queries files <target> <query>\n\n"
+            "ecl queries files <target> [<query>]\n\n"
             " Options:\n"
             "   <target>               Name of target cluster the query is published on\n"
-            "   <query>                Name of the query to get a list of files in use by\n"
-            " Common Options:\n",
+            "   <query>                Name of the query to get a list of files in use by\n",
             stdout);
         EclCmdCommon::usage();
     }
@@ -412,8 +435,8 @@ private:
 class EclCmdQueriesCopy : public EclCmdCommon
 {
 public:
-    EclCmdQueriesCopy() : optActivate(false), optNoReload(false), optMsToWait(10000), optDontCopyFiles(false), optOverwrite(false), optAllowForeign(false),
-        optUpdateSuperfiles(false), optUpdateCloneFrom(false), optDontAppendCluster(false)
+    EclCmdQueriesCopy() : optMsToWait(10000), optActivate(false), optNoReload(false), optOverwrite(false), optUpdateSuperfiles(false), 
+                          optUpdateCloneFrom(false), optDontAppendCluster(false), optDontCopyFiles(false), optAllowForeign(false)
     {
         optTimeLimit = (unsigned) -1;
         optWarnTimeLimit = (unsigned) -1;
@@ -443,7 +466,16 @@ public:
                 continue;
             if (iter.matchOption(optSourceProcess, ECLOPT_SOURCE_PROCESS))
                 continue;
+
             if (iter.matchFlag(optActivate, ECLOPT_ACTIVATE)||iter.matchFlag(optActivate, ECLOPT_ACTIVATE_S))
+                continue;
+            if (iter.matchFlag(optSourceSSL, ECLOPT_SOURCE_SSL))
+                continue;
+            if (iter.matchFlag(optSourceNoSSL, ECLOPT_SOURCE_NO_SSL))
+                continue;
+            if (iter.matchFlag(optSuspendPrevious, ECLOPT_SUSPEND_PREVIOUS)||iter.matchFlag(optSuspendPrevious, ECLOPT_SUSPEND_PREVIOUS_S))
+                continue;
+            if (iter.matchFlag(optDeletePrevious, ECLOPT_DELETE_PREVIOUS)||iter.matchFlag(optDeletePrevious, ECLOPT_DELETE_PREVIOUS_S))
                 continue;
             if (iter.matchFlag(optNoReload, ECLOPT_NORELOAD))
                 continue;
@@ -483,6 +515,8 @@ public:
                 continue;
             if (iter.matchOption(optName, ECLOPT_NAME)||iter.matchOption(optName, ECLOPT_NAME_S))
                 continue;
+            if (dfuOptions.match(iter))
+                continue;
             eclCmdOptionMatchIndicator ind = EclCmdCommon::matchCommandLineOption(iter, true);
             if (ind != EclCmdOptionMatch)
                 return ind;
@@ -492,6 +526,8 @@ public:
     virtual bool finalizeOptions(IProperties *globals)
     {
         if (!EclCmdCommon::finalizeOptions(globals))
+            return false;
+        if (!dfuOptions.finalizeOptions(*this, globals))
             return false;
         if (optSourceQueryPath.isEmpty() && optTargetCluster.isEmpty())
         {
@@ -508,22 +544,47 @@ public:
             fprintf(stderr, "invalid --priority value of %s.\n", optPriority.get());
             return false;
         }
+        if (!optActivate && (optSuspendPrevious || optDeletePrevious))
+        {
+            fputs("invalid --suspend-prev and --delete-prev require --activate.\n", stderr);
+            return false;
+        }
+        if (optSuspendPrevious && optDeletePrevious)
+        {
+            fputs("invalid --suspend-prev and --delete-prev are mutually exclusive options.\n", stderr);
+            return false;
+        }
 
         return true;
+    }
+
+    inline bool useSSLForSource()
+    {
+        if (optSourceSSL)
+            return true;
+        if (optSourceNoSSL)
+            return false;
+        return optSSL; //default to whether we use SSL to call ESP
     }
 
     virtual int processCMD()
     {
         Owned<IClientWsWorkunits> client = createCmdClient(WsWorkunits, *this);
         Owned<IClientWUQuerySetCopyQueryRequest> req = client->createWUQuerysetCopyQueryRequest();
-        setCmdRequestTimeouts(req->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(req->rpc());
 
         req->setSource(optSourceQueryPath.get());
         req->setTarget(optTargetCluster.get());
         req->setCluster(optTargetCluster.get());
         req->setDaliServer(optDaliIP.get());
         req->setSourceProcess(optSourceProcess);
-        req->setActivate(optActivate);
+        if (optDeletePrevious)
+            req->setActivate(CWUQueryActivationMode_ActivateDeletePrevious);
+        else if (optSuspendPrevious)
+            req->setActivate(CWUQueryActivationMode_ActivateSuspendPrevious);
+        else
+            req->setActivate(optActivate ? CWUQueryActivationMode_Activate : CWUQueryActivationMode_NoActivate);
+
         req->setOverwrite(optOverwrite);
         req->setUpdateSuperFiles(optUpdateSuperfiles);
         req->setUpdateCloneFrom(optUpdateCloneFrom);
@@ -533,6 +594,11 @@ public:
         req->setNoReload(optNoReload);
         req->setAllowForeignFiles(optAllowForeign);
         req->setIncludeFileErrors(true);
+
+        dfuOptions.updateRequest(req.get());
+
+        //default to same tcp/tls as our ESP connection, but can be changed using --source-ssl or --source-no-ssl
+        req->setSourceSSL(useSSLForSource());
 
         if (optTimeLimit != (unsigned) -1)
             req->setTimeLimit(optTimeLimit);
@@ -554,6 +620,8 @@ public:
 
         if (resp->getQueryId() && *resp->getQueryId())
             fprintf(stdout, "%s/%s\n\n", optTargetQuerySet.str(), resp->getQueryId());
+
+        dfuOptions.report(resp.get());
         return ret;
     }
     virtual void usage()
@@ -576,11 +644,15 @@ public:
             "                          in the form: //ip:port/queryset/query\n"
             "                          or: queryset/query\n"
             "   <target>               Name of target cluster to copy the query to\n"
+            "   --source-ssl           Use SSL when connecting to source (default if --ssl is used)\n"
+            "   --source-no-ssl        Do not use SSL when connecting to source (default if --ssl is NOT used)\n"
             "   --no-files             Do not copy DFS file information for referenced files\n"
             "   --daliip=<ip>          Remote Dali DFS to use for copying file information\n"
             "                          (only required if remote environment version < 3.8)\n"
             "   --source-process       Process cluster to copy files from\n"
             "   -A, --activate         Activate the new query\n"
+            "   -sp, --suspend-prev    Suspend previously active query\n"
+            "   -dp, --delete-prev     Delete previously active query\n"
             "   --no-reload            Do not request a reload of the (roxie) cluster\n"
             "   -O, --overwrite        Completely replace existing DFS file information (dangerous)\n"
             "   --update-super-files   Update local DFS super-files if remote DALI has changed\n"
@@ -595,9 +667,9 @@ public:
             "   --priority=<val>       Set the priority for this query. Value can be LOW,\n"
             "                          HIGH, SLA, NONE. NONE will clear current setting.\n"
             "   --comment=<string>     Set the comment associated with this query\n"
-            "   -n, --name=<val>       Destination query name for the copied query\n"
-            " Common Options:\n",
+            "   -n, --name=<val>       Destination query name for the copied query\n",
             stdout);
+        dfuOptions.usage();
         EclCmdCommon::usage();
     }
 private:
@@ -610,10 +682,15 @@ private:
     StringAttr optPriority;
     StringAttr optComment;
     StringAttr optName;
+
+    EclCmdOptionsDFU dfuOptions;
+
     unsigned optMsToWait;
     unsigned optTimeLimit;
     unsigned optWarnTimeLimit;
     bool optActivate;
+    bool optSuspendPrevious = false;
+    bool optDeletePrevious = false;
     bool optNoReload;
     bool optOverwrite;
     bool optUpdateSuperfiles;
@@ -621,13 +698,15 @@ private:
     bool optDontAppendCluster; //Undesirable but here temporarily because DALI may have locking issues
     bool optDontCopyFiles;
     bool optAllowForeign;
+    bool optSourceSSL = false; //user explicitly turning on SSL for accessing the remote source location (ssl defaults to use SSL if we are hitting ESP via SSL)
+    bool optSourceNoSSL = false; //user explicitly turning OFF SSL for accessing the remote source location (ssl defaults to not use SSL if we are not hitting ESP via SSL)
 };
 
 class EclCmdQueriesCopyQueryset : public EclCmdCommon
 {
 public:
-    EclCmdQueriesCopyQueryset() : optCloneActiveState(false), optAllQueries(false), optDontCopyFiles(false), optOverwrite(false), optAllowForeign(false),
-        optUpdateSuperfiles(false), optUpdateCloneFrom(false), optDontAppendCluster(false)
+    EclCmdQueriesCopyQueryset() : optCloneActiveState(false), optOverwrite(false), optUpdateSuperfiles(false), 
+                                  optUpdateCloneFrom(false), optDontAppendCluster(false), optDontCopyFiles(false), optAllowForeign(false), optAllQueries(false)
     {
     }
     virtual eclCmdOptionMatchIndicator parseCommandLineOptions(ArgvIterator &iter)
@@ -651,16 +730,39 @@ public:
                 }
                 continue;
             }
+            if (iter.matchFlag(optSourceSSL, ECLOPT_SOURCE_SSL))
+                continue;
+            if (iter.matchFlag(optSourceNoSSL, ECLOPT_SOURCE_NO_SSL))
+                continue;
             if (iter.matchOption(optDaliIP, ECLOPT_DALIIP))
                 continue;
             if (iter.matchOption(optSourceProcess, ECLOPT_SOURCE_PROCESS))
                 continue;
             if (iter.matchFlag(optCloneActiveState, ECLOPT_CLONE_ACTIVE_STATE))
                 continue;
+            if (iter.matchFlag(optDeletePrevious, ECLOPT_DELETE_PREVIOUS)||iter.matchFlag(optDeletePrevious, ECLOPT_DELETE_PREVIOUS_S))
+                continue;
             if (iter.matchFlag(optDontCopyFiles, ECLOPT_DONT_COPY_FILES))
                 continue;
             if (iter.matchFlag(optAllQueries, ECLOPT_ALL))
                 continue;
+            QueryCopySetParallelOptionMatch parallelOptionMatch = parallelOptions.match(iter);
+            switch (parallelOptionMatch)
+            {
+            case QueryCopySetParallelOptionMatch::Match:
+                continue;
+            case QueryCopySetParallelOptionMatch::InvalidQueueTimeout:
+                fputs("Invalid parallel queue timeout.\n", stderr);
+                return EclCmdOptionNoMatch;
+            case QueryCopySetParallelOptionMatch::InvalidCompileTimeout:
+                fputs("Invalid parallel compile timeout.\n", stderr);
+                return EclCmdOptionNoMatch;
+            case QueryCopySetParallelOptionMatch::InvalidWindowSize:
+                fputs("Invalid parallel window size.\n", stderr);
+                return EclCmdOptionNoMatch;
+            case QueryCopySetParallelOptionMatch::NoMatch:
+                break;
+            }
             if (iter.matchFlag(optAllowForeign, ECLOPT_ALLOW_FOREIGN))
                 continue;
             if (iter.matchFlag(optOverwrite, ECLOPT_OVERWRITE)||iter.matchFlag(optOverwrite, ECLOPT_OVERWRITE_S))
@@ -670,6 +772,8 @@ public:
             if (iter.matchFlag(optUpdateCloneFrom, ECLOPT_UPDATE_CLONE_FROM))
                 continue;
             if (iter.matchFlag(optDontAppendCluster, ECLOPT_DONT_APPEND_CLUSTER))
+                continue;
+            if (dfuOptions.match(iter))
                 continue;
             eclCmdOptionMatchIndicator ind = EclCmdCommon::matchCommandLineOption(iter, true);
             if (ind != EclCmdOptionMatch)
@@ -681,6 +785,39 @@ public:
     {
         if (!EclCmdCommon::finalizeOptions(globals))
             return false;
+        if (!dfuOptions.finalizeOptions(*this, globals))
+            return false;
+        QueryCopySetParallelOptionError parallelOptionError = validateQueryCopySetParallelOptions(parallelOptions.parallel, dfuOptions.optOnlyCopyFiles, dfuOptions.optStopIfFilesCopied);
+        if (parallelOptionError == QueryCopySetParallelOptionError::OnlyCopyFiles)
+        {
+            fputs("--parallel cannot be used with --only-copy-files.\n", stderr);
+            return false;
+        }
+        if (parallelOptionError == QueryCopySetParallelOptionError::StopIfFilesCopied)
+        {
+            fputs("--parallel cannot be used with --stop-if-files-copied.\n", stderr);
+            return false;
+        }
+        if (!optCloneActiveState && optDeletePrevious)
+        {
+            fputs("--delete-prev also requires --clone-active-state.\n", stderr);
+            return false;
+        }
+        if (!queryCopySetTimeoutSecondsValid(parallelOptions.queueTimeout) || !queryCopySetTimeoutSecondsValid(parallelOptions.compileTimeout))
+        {
+            fputs("Parallel timeout values are too large.\n", stderr);
+            return false;
+        }
+        if (parallelOptions.windowSizeSpecified && !queryCopySetParallelWindowSizeValid(parallelOptions.windowSize))
+        {
+            fprintf(stderr, "Parallel window size must be between %u and %u.\n", queryCopySetMinParallelWindowSize, queryCopySetMaxParallelWindowSize);
+            return false;
+        }
+        if (!parallelOptions.controlsAllowed())
+        {
+            fputs("Parallel control options require --parallel.\n", stderr);
+            return false;
+        }
         if (optSourceQuerySet.isEmpty() || optDestQuerySet.isEmpty())
         {
             fputs("source and destination querysets must both be specified.\n", stderr);
@@ -689,11 +826,20 @@ public:
         return true;
     }
 
+    inline bool useSSLForSource()
+    {
+        if (optSourceSSL)
+            return true;
+        if (optSourceNoSSL)
+            return false;
+        return optSSL; //default to whether we use SSL to call ESP
+    }
+
     virtual int processCMD()
     {
         Owned<IClientWsWorkunits> client = createCmdClient(WsWorkunits, *this);
         Owned<IClientWUCopyQuerySetRequest> req = client->createWUCopyQuerySetRequest();
-        setCmdRequestTimeouts(req->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(req->rpc());
 
         req->setActiveOnly(!optAllQueries);
         req->setSource(optSourceQuerySet.get());
@@ -701,6 +847,12 @@ public:
         req->setDfsServer(optDaliIP.get());
         req->setSourceProcess(optSourceProcess);
         req->setCloneActiveState(optCloneActiveState);
+        if (optDeletePrevious)
+            req->setActivate(CWUQueryActivationMode_ActivateDeletePrevious);
+        else if(optCloneActiveState)
+            req->setActivate(CWUQueryActivationMode_ActivateSuspendPrevious);
+        else
+            req->setActivate(CWUQueryActivationMode_NoActivate);
         req->setOverwriteDfs(optOverwrite);
         req->setUpdateSuperFiles(optUpdateSuperfiles);
         req->setUpdateCloneFrom(optUpdateCloneFrom);
@@ -708,6 +860,12 @@ public:
         req->setCopyFiles(!optDontCopyFiles);
         req->setAllowForeignFiles(optAllowForeign);
         req->setIncludeFileErrors(true);
+        parallelOptions.updateRequest(req.get(), CQueryCopyFailurePolicy_Continue, CQueryCopyFailurePolicy_FailFast);
+
+        dfuOptions.updateRequest(req.get());
+
+        //default to same tcp/tls as our ESP connection, but can be changed using --source-ssl or --source-no-ssl
+        req->setSourceSSL(useSSLForSource());
 
         Owned<IClientWUCopyQuerySetResponse> resp = client->WUCopyQuerySet(req);
         int ret = outputMultiExceptionsEx(resp->getExceptions());
@@ -734,6 +892,8 @@ public:
                 fprintf(stdout, "  %s\n", existing.item(i));
             fputs("\n", stdout);
         }
+
+        dfuOptions.report(resp.get());
         return ret;
     }
     virtual void usage()
@@ -744,7 +904,7 @@ public:
             "\n"
             "By default only active queries will be copied.  Use --all to copy all queries.\n"
             "\n"
-            "ecl queries copy-set <source_target> <destination_target> [--clone-active-state]\n"
+            "ecl queries copy-set <source_target> <destination_target> [--clone-active-state] [--parallel]\n"
 
             "ecl queries copy-set roxie1 roxie2\n"
             "ecl queries copy-set //ip:port/roxie1 roxie2 --clone-active-state\n"
@@ -753,18 +913,30 @@ public:
             "   <source_target>        Name of local (or path to remote) target cluster to"
             "                          copy queries from\n"
             "   <destination_target>   Target cluster to copy queries to\n"
+            "   --source-ssl           Use SSL when connecting to source (default if --ssl is used)\n"
+            "   --source-no-ssl        Do not use SSL when connecting to source (default if --ssl is NOT used)\n"
             "   --all                  Copy both active and inactive queries\n"
+            "   --parallel             Prepare independent queries concurrently\n"
+            "   --continue-on-error    Finish processing independent queries before reporting failures\n"
+            "   --parallel-queue-timeout=<seconds>\n"
+            "                          Maximum eclccserver queue wait; zero uses the service default\n"
+            "   --parallel-compile-timeout=<seconds>\n"
+            "                          Maximum compile execution time; zero uses the service default\n"
+            "   --parallel-window-size=<count>\n"
+            "                          Requested active-recompile window (1-1024)\n"
+            "                          Capped by the service limit (default 32)\n"
             "   --no-files             Do not copy DFS file information for referenced files\n"
             "   --daliip=<ip>          Remote Dali DFS to use for copying file information\n"
             "   --source-process       Process cluster to copy files from\n"
             "   --clone-active-state   Make copied queries active if active on source\n"
+            "   -dp, --delete-prev     Delete previously active queries (requires --clone-active-state)\n"
             "   -O, --overwrite        Completely replace existing DFS file information (dangerous)\n"
             "   --update-super-files   Update local DFS super-files if remote DALI has changed\n"
             "   --update-clone-from    Update local clone from location if remote DALI has changed\n"
             "   --dont-append-cluster  Only use to avoid locking issues due to adding cluster to file\n"
-            "   --allow-foreign        Do not fail if foreign files are used in query (roxie)\n"
-            " Common Options:\n",
+            "   --allow-foreign        Do not fail if foreign files are used in query (roxie)\n",
             stdout);
+        dfuOptions.usage();
         EclCmdCommon::usage();
     }
 private:
@@ -772,6 +944,9 @@ private:
     StringAttr optDestQuerySet;
     StringAttr optDaliIP;
     StringAttr optSourceProcess;
+
+    EclCmdOptionsDFU dfuOptions;
+
     bool optCloneActiveState;
     bool optOverwrite;
     bool optUpdateSuperfiles;
@@ -780,12 +955,16 @@ private:
     bool optDontCopyFiles;
     bool optAllowForeign;
     bool optAllQueries;
+    CQueryCopySetParallelOptions parallelOptions;
+    bool optDeletePrevious = false;
+    bool optSourceSSL = false; //user explicitly turning on SSL for accessing the remote source location (ssl defaults to use SSL if we are hitting ESP via SSL)
+    bool optSourceNoSSL = false; //user explicitly turning OFF SSL for accessing the remote source location (ssl defaults to not use SSL if we are not hitting ESP via SSL)
 };
 
 class EclCmdQueriesConfig : public EclCmdCommon
 {
 public:
-    EclCmdQueriesConfig() : optNoReload(false), optMsToWait(10000)
+    EclCmdQueriesConfig() : optMsToWait(10000), optNoReload(false)
     {
         optTimeLimit = (unsigned) -1;
         optWarnTimeLimit = (unsigned) -1;
@@ -857,7 +1036,7 @@ public:
     {
         Owned<IClientWsWorkunits> client = createCmdClient(WsWorkunits, *this);
         Owned<IClientWUQueryConfigRequest> req = client->createWUQueryConfigRequest();
-        setCmdRequestTimeouts(req->rpc(), optMsToWait, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(req->rpc(), optMsToWait);
 
         req->setTarget(optTargetCluster.get());
         req->setQueryId(optQueryId.get());
@@ -905,8 +1084,7 @@ public:
             "                          format <mem> as 500000B, 550K, 100M, 10G, 1T etc.\n"
             "   --priority=<val>       Set the priority for this query. Value can be LOW,\n"
             "                          HIGH, SLA, NONE. NONE will clear current setting.\n"
-            "   --comment=<string>     Set the comment associated with this query\n"
-            " Common Options:\n",
+            "   --comment=<string>     Set the comment associated with this query\n",
             stdout);
         EclCmdCommon::usage();
     }
@@ -1003,6 +1181,8 @@ public:
                 continue;
             if (matchVariableOption(iter, 'f', debugValues, true))
                 continue;
+            if (dfuOptions.match(iter))
+                continue;
             eclCmdOptionMatchIndicator ind = EclCmdCommon::matchCommandLineOption(iter, true);
             if (ind != EclCmdOptionMatch)
                 return ind;
@@ -1012,6 +1192,8 @@ public:
     virtual bool finalizeOptions(IProperties *globals)
     {
         if (!EclCmdCommon::finalizeOptions(globals))
+            return false;
+        if (!dfuOptions.finalizeOptions(*this, globals))
             return false;
         if (optTarget.isEmpty())
         {
@@ -1064,7 +1246,7 @@ public:
 
         Owned<IClientWsWorkunits> client = createCmdClient(WsWorkunits, *this); //upload_ disables maxRequestEntityLength
         Owned<IClientWURecreateQueryRequest> req = client->createWURecreateQueryRequest();
-        setCmdRequestTimeouts(req->rpc(), optMsToWait, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(req->rpc(), optMsToWait);
 
         if (optDeletePrevious)
             req->setActivate(CWUQueryActivationMode_ActivateDeletePrevious);
@@ -1089,6 +1271,8 @@ public:
         req->setAppendCluster(!optDontAppendCluster);
         req->setIncludeFileErrors(true);
         req->setDebugValues(debugValues);
+
+        dfuOptions.updateRequest(req.get());
 
         if (optTimeLimit != (unsigned) -1)
             req->setTimeLimit(optTimeLimit);
@@ -1118,6 +1302,7 @@ public:
         if (outputQueryFileCopyErrors(resp->getFileErrors()))
             ret = 1;
 
+        dfuOptions.report(resp.get());
         return ret;
     }
     virtual void usage()
@@ -1160,6 +1345,7 @@ public:
             "   --comment=<string>     Set the comment associated with this query\n"
             "   --wait=<ms>            Max time to wait in milliseconds\n",
             stdout);
+        dfuOptions.usage();
         EclCmdCommon::usage();
     }
 private:
@@ -1171,6 +1357,9 @@ private:
     StringAttr optMemoryLimit;
     StringAttr optPriority;
     StringAttr optComment;
+
+    EclCmdOptionsDFU dfuOptions;
+
     IArrayOf<IEspNamedValue> debugValues;
     unsigned optMsToWait = (unsigned) -1;
     unsigned optTimeLimit = (unsigned) -1;
@@ -1257,12 +1446,15 @@ public:
             return;
 
         Owned<IFile> file = createIFile(filepath);
-        Owned<IFileIO> io = file->open(IFOcreaterw);
+        Owned<IFileIO> io = file->open(IFOcreate);
 
         fprintf(stdout, "\nWriting to file %s\n", file->queryFilename());
 
         if (io.get())
+        {
             io->write(0, strlen(s), s);
+            io->close();
+        }
         else
             fprintf(stderr, "\nFailed to create file %s\n", file->queryFilename());
     }
@@ -1271,7 +1463,7 @@ public:
     {
         Owned<IClientWsWorkunits> client = createCmdClient(WsWorkunits, *this);
         Owned<IClientWUQuerysetExportRequest> req = client->createWUQuerysetExportRequest();
-        setCmdRequestTimeouts(req->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(req->rpc());
 
         req->setTarget(optTarget);
         req->setActiveOnly(optActiveOnly);
@@ -1317,8 +1509,7 @@ public:
             "   <target>               Name of target cluster to export from\n"
             "   -O,--output=<file>     Filename to save exported backup information to (optional)\n"
             "   --active-only          Only include active queries in the exported queryset\n"
-            "   --protect              Protect the workunits for the included queries\n"
-            " Common Options:\n",
+            "   --protect              Protect the workunits for the included queries\n",
             stdout);
         EclCmdCommon::usage();
     }
@@ -1380,6 +1571,8 @@ public:
                 continue;
             if (iter.matchFlag(optDontAppendCluster, ECLOPT_DONT_APPEND_CLUSTER))
                 continue;
+            if (dfuOptions.match(iter))
+                continue;
             eclCmdOptionMatchIndicator ind = EclCmdCommon::matchCommandLineOption(iter, true);
             if (ind != EclCmdOptionMatch)
                 return ind;
@@ -1388,6 +1581,8 @@ public:
     }
     virtual bool finalizeOptions(IProperties *globals)
     {
+        if (!dfuOptions.finalizeOptions(*this, globals))
+            return false;
         if (!EclCmdCommon::finalizeOptions(globals))
             return false;
         if (optFilename.isEmpty() || optDestQuerySet.isEmpty())
@@ -1403,7 +1598,7 @@ public:
     {
         Owned<IClientWsWorkunits> client = createCmdClient(WsWorkunits, *this);
         Owned<IClientWUQuerysetImportRequest> req = client->createWUQuerysetImportRequest();
-        setCmdRequestTimeouts(req->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(req->rpc());
 
         MemoryBuffer compressed;
         fastLZCompressToBuffer(compressed, content.length()+1, content.str());
@@ -1424,6 +1619,8 @@ public:
         req->setCopyFiles(!optDontCopyFiles);
         req->setAllowForeignFiles(optAllowForeign);
         req->setIncludeFileErrors(true);
+
+        dfuOptions.updateRequest(req.get());
 
         Owned<IClientWUQuerysetImportResponse> resp = client->WUQuerysetImport(req);
         int ret = outputMultiExceptionsEx(resp->getExceptions());
@@ -1460,6 +1657,8 @@ public:
                 fprintf(stdout, "  %s\n", missing.item(i));
             fputs("\n", stdout);
         }
+
+        dfuOptions.report(resp.get());
         return ret;
     }
     virtual void usage()
@@ -1487,9 +1686,9 @@ public:
             "   --update-super-files   Update local DFS super-files if remote DALI has changed\n"
             "   --update-clone-from    Update local clone from location if remote DALI has changed\n"
             "   --dont-append-cluster  Only use to avoid locking issues due to adding cluster to file\n"
-            "   --allow-foreign        Do not fail if foreign files are used in query (roxie)\n"
-            " Common Options:\n",
+            "   --allow-foreign        Do not fail if foreign files are used in query (roxie)\n",
             stdout);
+        dfuOptions.usage();
         EclCmdCommon::usage();
     }
 private:
@@ -1499,6 +1698,9 @@ private:
     StringAttr optDestQuerySet;
     StringAttr optDaliIP;
     StringAttr optSourceProcess;
+
+    EclCmdOptionsDFU dfuOptions;
+
     bool optReplace = false;
     bool optCloneActiveState = false;
     bool optOverwrite = false;
@@ -1561,7 +1763,7 @@ public:
 
 static int doMain(int argc, const char *argv[])
 {
-    EclQueriesCMDShell processor(argc, argv, createEclQueriesCommand, BUILD_TAG);
+    EclQueriesCMDShell processor(argc, argv, createEclQueriesCommand, hpccBuildInfo.buildTag);
     return processor.run();
 }
 

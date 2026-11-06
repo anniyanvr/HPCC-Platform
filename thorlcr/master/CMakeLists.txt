@@ -57,6 +57,8 @@ include_directories (
          ${CMAKE_BINARY_DIR}
          ${CMAKE_BINARY_DIR}/oss
          ./../../system/security/shared
+         ./../../system/security/securesocket
+         ${HPCC_SOURCE_DIR}/common/wuanalysis
     )
 
 ADD_DEFINITIONS( -D_CONSOLE )
@@ -72,7 +74,6 @@ target_link_libraries (  thormaster_lcr
          jhtree 
          dafsclient 
          dalibase 
-         environment 
          dllserver 
          nbcd 
          eclrtl 
@@ -83,12 +84,17 @@ target_link_libraries (  thormaster_lcr
          thorsort_lcr 
          thorhelper 
          thorcodectx_lcr 
-         dalift 
          mfilemanager_lcr 
          graphmaster_lcr 
          activitymasters_lcr 
          swapnodelib
+         wuanalysis
     )
 
+if (USE_OPENSSL)
+    target_link_libraries(thormaster_lcr securesocket)
+endif()
 
-
+if (NOT CONTAINERIZED)
+    target_link_libraries ( thormaster_lcr environment )
+endif()

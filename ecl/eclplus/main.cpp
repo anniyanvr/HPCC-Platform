@@ -35,19 +35,6 @@
 #define ERROR_NO_SERVER                   3
 #define ERROR_CODE_USAGE                  4
 
-//copied from workunit.dll to avoid a dependency.  Should possibly go in jlib.
-static bool localLooksLikeAWuid(const char * wuid)
-{
-    if (!wuid)
-        return false;
-    if (wuid[0] != 'W')
-        return false;
-    if (!isdigit(wuid[1]) || !isdigit(wuid[2]) || !isdigit(wuid[3]) || !isdigit(wuid[4]))
-        return false;
-    if (!isdigit(wuid[5]) || !isdigit(wuid[6]) || !isdigit(wuid[7]) || !isdigit(wuid[8]))
-        return false;
-    return (wuid[9]=='-');
-}
 
 void usage()
 {
@@ -97,14 +84,14 @@ void promptFor(const char *prompt, const char *prop, bool hide, IProperties * gl
         }
         SetConsoleMode(hStdIn, dwInputMode); 
 #else
-        int fn = fileno(stdin);
 #if defined (__linux__)
-        struct termio t;
-        /* If ioctl fails, we're probably not connected to a terminal. */
-        if(!ioctl(fn, TCGETA, &t))
+        int fn = fileno(stdin);
+        struct termios t;
+        /* If tcgetattr fails, we're probably not connected to a terminal. */
+        if (!tcgetattr(fn, &t))
         {
             t.c_lflag &= ~ECHO;
-            ioctl(fn, TCSETA, &t);
+            tcsetattr(fn, TCSANOW, &t);
         }
 #endif
         for (;;)
@@ -115,10 +102,10 @@ void promptFor(const char *prompt, const char *prop, bool hide, IProperties * gl
             result.append(ch);
         }
 #if defined (__linux__)
-        if(!ioctl(fn, TCGETA, &t))
+        if (!tcgetattr(fn, &t))
         {
             t.c_lflag |= ECHO;
-            ioctl(fn, TCSETA, &t);
+            tcsetattr(fn, TCSANOW, &t);
         }
 #endif
 #endif
@@ -147,8 +134,6 @@ bool build_globals(int argc, const char *argv[], IProperties * globals)
         if (arg[0] == '-')
         {
             StringBuffer name;
-            const char * value = NULL;
-
             if (arg[1] == 'f')
             {
                 if (eq)
@@ -197,7 +182,7 @@ bool build_globals(int argc, const char *argv[], IProperties * globals)
         {
             globals->loadProp(arg);
         }
-        else if (localLooksLikeAWuid(arg))
+        else if (looksLikeAWuid(arg))
         {
             globals->setProp("WUID", arg);
         }
@@ -289,7 +274,7 @@ bool build_globals(int argc, const char *argv[], IProperties * globals)
         {
             globals->setProp("action", "query");
             const char * source = globals->queryProp("service");
-            if (localLooksLikeAWuid(source))
+            if (looksLikeAWuid(source))
                 globals->setProp("-fsourceWuid", source);
             else
                 globals->setProp("-fsourceService", source);

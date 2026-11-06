@@ -107,7 +107,8 @@ static node_operator expandLists(node_operator op, HqlExprArray & args, IHqlExpr
     case no_null:
         return op;
     }
-    args.append(*LINK(expr));
+    if (!expr->isAttribute())
+        args.append(*LINK(expr));
     return op;
 }
 
@@ -431,16 +432,12 @@ protected:
 
     void findSplitPoints(IHqlExpression * expr, unsigned pass)
     {
-        //containsNonActiveDataset() would be nice - but that isn't percolated outside assigns etc.
-        if (containsAnyDataset(expr) || containsMustHoist(expr) || !expr->isIndependentOfScope())
+        if (!gathered)
         {
-            if (!gathered)
-            {
-                gatherAmbiguousSelectors(original);
-                gathered = true;
-            }
-            analyse(expr, pass);
+            gatherAmbiguousSelectors(original);
+            gathered = true;
         }
+        analyse(expr, pass);
     }
 
     bool queryHoistDataset(IHqlExpression * ds)
@@ -616,8 +613,11 @@ protected:
                 //if rhs is a new, evaluatable, dataset then we want to add it
                 if ((rhs->isDataset() || rhs->isDictionary()) && isEvaluateable(rhs))
                 {
-                    if (queryNoteDataset(rhs))
-                        return;
+                    if (!rhs->isConstant())
+                    {
+                        if (queryNoteDataset(rhs))
+                            return;
+                    }
                 }
                 break;
             }
@@ -1459,7 +1459,7 @@ IHqlExpression * ActivityInvariantHoister::replaceResourcedReferences(ActivityIn
     {
         bool same = true;
         HqlExprArray args;
-        args.ensure(expr->numChildren());
+        args.ensureCapacity(expr->numChildren());
         ForEachChild(i, expr)
         {
             IHqlExpression * cur = expr->queryChild(i);
@@ -5549,7 +5549,9 @@ void EclResourcer::removeDuplicateIndependentLinks(CSplitterInfo & connections, 
                 ResourcerInfo & sinkInfo = *queryResourceInfo(sink);
                 if (allInputsPulledIndependently(sink))
                 {
+#ifdef TRACE_BALANCED
                     unsigned numRemoved = 0;
+#endif
                     for (unsigned j=info.balancedLinks.ordinality()-1; j > i; j--)
                     {
                         CSplitterLink & next = info.balancedLinks.item(j);
@@ -5557,7 +5559,9 @@ void EclResourcer::removeDuplicateIndependentLinks(CSplitterInfo & connections, 
                         {
                             info.balancedLinks.remove(j);
                             sinkInfo.balancedLinks.zap(next);
+#ifdef TRACE_BALANCED
                             numRemoved++;
+#endif
                         }
                     }
 
@@ -6675,6 +6679,56 @@ void EclResourcer::resourceRemoteGraph(IHqlExpression * expr, HqlExprArray & tra
 
 //---------------------------------------------------------------------------
 
+static IHqlExpression * appendUid(IHqlExpression * expr)
+{
+    switch (expr->getOperator())
+    {
+    case no_mapto:
+    case no_colon:
+    case no_setmeta:
+        return LINK(expr);
+    }
+    return replaceOwnedAttribute(expr, createUniqueId());
+}
+
+static IHqlExpression * ensureActivitiesAreUnique(IHqlExpression * expr)
+{
+    if (!expr->isAction())
+        return LINK(expr);
+
+    switch (expr->getOperator())
+    {
+    case no_if:
+    case no_case:
+    case no_map:
+    case no_actionlist:
+    case no_parallel:
+    case no_sequential:
+    case no_orderedactionlist:
+    case no_compound:
+    case no_comma:
+        break;
+    default:
+        return LINK(expr);
+    }
+
+    HqlExprArray args;
+    ForEachChild(i, expr)
+    {
+        IHqlExpression * cur = expr->queryChild(i);
+        OwnedHqlExpr transformed = ensureActivitiesAreUnique(cur);
+        //Add a unique attribute to each activity - unless it has changed, in which case a (child) activity
+        //will have already have gained the unique id.  Prevents unnecessary ids on nested parallels etc.
+        if (transformed->isAction() && (transformed == cur))
+            args.append(*appendUid(transformed));
+        else
+            args.append(*transformed.getClear());
+    }
+    return expr->clone(args);
+}
+
+
+
 IHqlExpression * resourceThorGraph(HqlCppTranslator & translator, IHqlExpression * _expr, ClusterType targetClusterType, unsigned clusterSize, IHqlExpression * graphIdExpr)
 {
     CResourceOptions options(targetClusterType, clusterSize, translator.queryOptions(), translator.querySpillSequence());
@@ -6684,15 +6738,21 @@ IHqlExpression * resourceThorGraph(HqlCppTranslator & translator, IHqlExpression
     LinkedHqlExpr expr = _expr;
     {
         ActivityInvariantHoister hoister(options);
-        HqlExprArray hoisted;
-        expr.setown(hoister.transformRoot(expr));
-        translator.traceExpression("AfterInvariant Child", expr);
+        OwnedHqlExpr transformed = hoister.transformRoot(expr);
+        sanityCheckTransformation("ActivityInvariantHoister", expr, transformed);
+        transformed.swap(expr);
+        translator.traceExpression("AfterInvariantHoister", expr);
     }
+
+    //Ensure that each action generates a unique activity.  If duplicate activities are shared it is impossible to know
+    //when an activity should be stopped - especially allowing it to be stopped early before the subgraph/graph completes.
+    expr.setown(ensureActivitiesAreUnique(expr));
 
     HqlExprArray transformed;
     {
         EclResourcer resourcer(translator.queryErrorProcessor(), translator.wu(), translator.queryOptions(), options);
         resourcer.resourceGraph(expr, transformed);
+        sanityCheckTransformation("EclResourcer", expr, transformed);
     }
     hoistNestedCompound(translator, transformed);
     return createActionList(transformed);
@@ -6717,9 +6777,10 @@ static IHqlExpression * doResourceGraph(BuildCtx * ctx, HqlCppTranslator & trans
     {
         ActivityInvariantHoister hoister(options);
         hoister.tagActiveCursors(activeRows);
-        HqlExprArray hoisted;
-        expr.setown(hoister.transformRoot(expr));
-        translator.traceExpression("AfterInvariant Child", expr);
+        OwnedHqlExpr transformed = hoister.transformRoot(expr);
+        sanityCheckTransformation("ActivityInvariantHoister", expr, transformed);
+        transformed.swap(expr);
+        translator.traceExpression("AfterInvariantHoister", expr);
     }
 
     {
@@ -6727,6 +6788,7 @@ static IHqlExpression * doResourceGraph(BuildCtx * ctx, HqlCppTranslator & trans
         resourcer.setContext(ctx);
         resourcer.tagActiveCursors(activeRows);
         resourcer.resourceGraph(expr, transformed);
+        sanityCheckTransformation("EclResourcer", expr, transformed);
         totalResults = resourcer.numGraphResults();
     }
 
@@ -6765,7 +6827,7 @@ IHqlExpression * resourceRemoteGraph(HqlCppTranslator & translator, IHqlExpressi
         ActivityInvariantHoister hoister(options);
         HqlExprArray hoisted;
         expr.setown(hoister.transformRoot(expr));
-        translator.traceExpression("AfterInvariant Child", expr);
+        translator.traceExpression("AfterInvariantHoister", expr);
     }
 
     HqlExprArray transformed;

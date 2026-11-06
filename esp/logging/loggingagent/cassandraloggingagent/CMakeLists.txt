@@ -19,6 +19,8 @@
 if(USE_CASSANDRA)
   project( cassandralogagent )
 
+  find_library(CPP_DRIVER_LIBRARY NAMES "cassandra_static" "cassandra" REQUIRED)
+
   include_directories (
      ${HPCC_SOURCE_DIR}/system/include
      ${HPCC_SOURCE_DIR}/system/jlib
@@ -32,7 +34,6 @@ if(USE_CASSANDRA)
      ${HPCC_SOURCE_DIR}/roxie/roxiemem
      ${HPCC_SOURCE_DIR}/common/deftype
      ${HPCC_SOURCE_DIR}/common/environment
-     ${HPCC_SOURCE_DIR}/plugins/cassandra/cpp-driver/include
      ${HPCC_SOURCE_DIR}/plugins/cassandra
      ${HPCC_SOURCE_DIR}/esp/platform
      ${HPCC_SOURCE_DIR}/esp/bindings
@@ -51,8 +52,9 @@ if(USE_CASSANDRA)
 
   install ( TARGETS cassandralogagent RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
   add_dependencies (cassandralogagent espscm)
-  target_link_libraries ( cassandralogagent
+  target_link_libraries ( cassandralogagent PRIVATE
     cassandraembed
+    ${CPP_DRIVER_LIBRARY}
     eclrtl
     esphttp
     jlib

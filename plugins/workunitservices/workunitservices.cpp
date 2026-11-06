@@ -54,6 +54,7 @@ Persists changed?
 #include "workunitservices.ipp"
 #include "environment.hpp"
 #include "seclib.hpp"
+#include "hpccconfig.hpp"
 
 #define WORKUNITSERVICES_VERSION "WORKUNITSERVICES 1.0.2"
 
@@ -89,7 +90,19 @@ static const char * EclDefinition =
                             " unsigned4 col;"
                             " string16  source;"
                             " string20  time;"
-                            " string      message{maxlength(1024)};"
+                            " string    message{maxlength(1024)};"
+                        " end;\n"
+"export WsMessage_v2 := record "
+                            " unsigned4 severity;"
+                            " integer4  code;"
+                            " string32  location;"
+                            " unsigned4 row;"
+                            " unsigned4 col;"
+                            " string16  source;"
+                            " string20  time;"
+                            " unsigned4 priority;"
+                            " real8     cost;"
+                            " string    message{maxlength(1024)};"
                         " end;\n"
 "export WsFileRead := record "
                             " string name{maxlength(256)};"
@@ -142,7 +155,7 @@ static const char * EclDefinition =
 "  varstring WUIDonDate(unsigned4 year,unsigned4 month,unsigned4 day,unsigned4 hour, unsigned4 minute) : entrypoint='wsWUIDonDate'; \n"
 "  varstring WUIDdaysAgo(unsigned4  daysago) : entrypoint='wsWUIDdaysAgo'; \n"
 "  dataset(WsTimeStamp) WorkunitTimeStamps(const varstring wuid) : context,entrypoint='wsWorkunitTimeStamps'; \n"
-"  dataset(WsMessage) WorkunitMessages(const varstring wuid) : context,entrypoint='wsWorkunitMessages'; \n"
+"  dataset(WsMessage_v2) WorkunitMessages(const varstring wuid) : context,entrypoint='wsWorkunitMessages_v2'; \n"
 "  dataset(WsFileRead) WorkunitFilesRead(const varstring wuid) : context,entrypoint='wsWorkunitFilesRead'; \n"
 "  dataset(WsFileWritten) WorkunitFilesWritten(const varstring wuid) : context,entrypoint='wsWorkunitFilesWritten'; \n"
 "  dataset(WsTiming) WorkunitTimings(const varstring wuid) : context,entrypoint='wsWorkunitTimings'; \n"
@@ -178,8 +191,22 @@ namespace nsWorkunitservices {
 IPluginContext * parentCtx = NULL;
 
 
-static void getSashaNodes(SocketEndpointArray &epa)
+static void getSashaWUArchiveNodes(SocketEndpointArray &epa, ICodeContext *ctx)
 {
+    IEngineContext *engineCtx = ctx->queryEngineContext();
+    if (engineCtx && !engineCtx->allowSashaAccess())
+    {
+        Owned<IException> e = makeStringException(-1, "workunitservices cannot access Sasha in this context - this normally means it is being called from a thor worker");
+        EXCLOG(e, NULL);
+        throw e.getClear();
+    }
+
+#ifdef _CONTAINERIZED
+    StringBuffer service;
+    getService(service, "wu-archiver", true);
+    SocketEndpoint sashaep(service);
+    epa.append(sashaep);    
+#else
     Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
     Owned<IConstEnvironment> env = factory->openEnvironment();
     Owned<IPropertyTree> root = &env->getPTree();
@@ -191,6 +218,7 @@ static void getSashaNodes(SocketEndpointArray &epa)
             epa.append(sashaep);
         }
     }
+#endif
 }
 
 static IWorkUnitFactory * getWorkunitFactory(ICodeContext * ctx)
@@ -198,7 +226,7 @@ static IWorkUnitFactory * getWorkunitFactory(ICodeContext * ctx)
     IEngineContext *engineCtx = ctx->queryEngineContext();
     if (engineCtx && !engineCtx->allowDaliAccess())
     {
-        Owned<IException> e = MakeStringException(-1, "workunitservices cannot access Dali in this context - this normally means it is being called from a thor slave");
+        Owned<IException> e = makeStringException(-1, "workunitservices cannot access Dali in this context - this normally means it is being called from a thor worker");
         EXCLOG(e, NULL);
         throw e.getClear();
     }
@@ -209,30 +237,15 @@ static IWorkUnitFactory * getWorkunitFactory(ICodeContext * ctx)
     return getWorkUnitFactory(secmgr, secuser);
 }
 
-static bool securityDisabled = false;
-
 static bool checkScopeAuthorized(IUserDescriptor *user, const char *scopename)
 {
-    if (securityDisabled)
-        return true;
     unsigned auditflags = DALI_LDAP_AUDIT_REPORT|DALI_LDAP_READ_WANTED;
     SecAccessFlags perm = SecAccess_Full;
     if (scopename && *scopename)
     {
         perm = querySessionManager().getPermissionsLDAP("workunit",scopename,user,auditflags);
-        if (perm<0)
-        {
-            if (perm == SecAccess_Unavailable)
-            {
-                perm = SecAccess_Full;
-                securityDisabled = true;
-            }
-            else 
-                perm = SecAccess_None;
-        }
-        if (!HASREADPERMISSION(perm)) 
+        if (perm<0 || !HASREADPERMISSION(perm))
             return false;
-
     }
     return true;
 }
@@ -360,7 +373,7 @@ WORKUNITSERVICES_API void wsWorkunitList(
     MemoryBuffer mb;
     if (archived) {
         SocketEndpointArray sashaeps;
-        getSashaNodes(sashaeps);
+        getSashaWUArchiveNodes(sashaeps, ctx);
         ForEachItemIn(i,sashaeps) {
             Owned<ISashaCommand> cmd = createSashaCommand();    
             cmd->setAction(SCA_WORKUNIT_SERVICES_GET);                          
@@ -398,7 +411,7 @@ WORKUNITSERVICES_API void wsWorkunitList(
             }
             if (i+1>=sashaeps.ordinality()) {
                StringBuffer ips;
-               sashaeps.item(0).getIpText(ips);
+               sashaeps.item(0).getHostText(ips);
                throw MakeStringException(-1,"Time out to Sasha server on %s (server not running or query too complex)",ips.str());
             }
         }
@@ -492,7 +505,7 @@ WORKUNITSERVICES_API bool wsWorkunitExists(ICodeContext *ctx, const char *wuid, 
     if (archived)
     {
         SocketEndpointArray sashaeps;
-        getSashaNodes(sashaeps);
+        getSashaWUArchiveNodes(sashaeps, ctx);
         ForEachItemIn(i,sashaeps) {
             Owned<ISashaCommand> cmd = createSashaCommand();    
             cmd->setAction(SCA_LIST);                           
@@ -570,7 +583,7 @@ WORKUNITSERVICES_API void wsWorkunitTimeStamps(ICodeContext *ctx, size32_t & __l
     __result = mb.detach();
 }
 
-WORKUNITSERVICES_API void wsWorkunitMessages( ICodeContext *ctx, size32_t & __lenResult, void * & __result, const char *wuid )
+void wsWorkunitMessagesImpl( ICodeContext *ctx, size32_t & __lenResult, void * & __result, const char *wuid, bool returnCosts)
 {
     Owned<IConstWorkUnit> wu = getWorkunit(ctx, wuid);
     MemoryBuffer mb;
@@ -591,12 +604,28 @@ WORKUNITSERVICES_API void wsWorkunitMessages( ICodeContext *ctx, size32_t & __le
             fixedAppend(mb, 16, s.str(), s.length());
             e.getTimeStamp(s);
             fixedAppend(mb, 20, s.str(), s.length());
+            if (returnCosts)
+            {
+                mb.append((unsigned) e.getPriority());
+                mb.append((double) e.getCost());
+            }
             e.getExceptionMessage(s);
             varAppendMax(mb, 1024, s.str(), s.length());
         }
     }
     __lenResult = mb.length();
     __result = mb.detach();
+}
+
+
+WORKUNITSERVICES_API void wsWorkunitMessages( ICodeContext *ctx, size32_t & __lenResult, void * & __result, const char *wuid)
+{
+    wsWorkunitMessagesImpl(ctx, __lenResult, __result, wuid, false);
+}
+
+WORKUNITSERVICES_API void wsWorkunitMessages_v2( ICodeContext *ctx, size32_t & __lenResult, void * & __result, const char *wuid)
+{
+    wsWorkunitMessagesImpl(ctx, __lenResult, __result, wuid, true);
 }
 
 WORKUNITSERVICES_API void wsWorkunitFilesRead( ICodeContext *ctx, size32_t & __lenResult, void * & __result, const char *wuid )

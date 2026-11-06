@@ -60,8 +60,6 @@ enum
     MSGFILTER_regex
     };
 
-
-
 // Implementations of filter which pass all or no messages
 
 //MORE: This would benefit from more code moved into this base class
@@ -253,29 +251,6 @@ private:
     bool                      localFlag;
 };
 
-
-// Implementation of filter using component
-
-class ComponentLogMsgFilter : public CLogMsgFilter
-{
-public:
-    ComponentLogMsgFilter(unsigned _compo, bool local) : component(_compo), localFlag(local) {}
-    ComponentLogMsgFilter(MemoryBuffer & in) { in.read(component); in.read(localFlag); }
-    ComponentLogMsgFilter(IPropertyTree * tree) { component = tree->getPropInt("@component", 0); localFlag = tree->hasProp("@local"); }
-
-    bool                      includeMessage(const LogMsg & msg) const { if(localFlag && msg.queryRemoteFlag()) return false; return msg.queryComponent() == component; }
-    bool                      mayIncludeCategory(const LogMsgCategory & cat) const { return true; }
-    unsigned                  queryAudienceMask() const { return MSGAUD_all; }
-    unsigned                  queryClassMask() const { return MSGCLS_all; }
-    LogMsgDetail              queryMaxDetail() const { return TopDetail; }
-    void                      serialize(MemoryBuffer & out, bool preserveLocal) const { out.append(MSGFILTER_component).append(component).append(localFlag && preserveLocal); }
-    void                      addToPTree(IPropertyTree * tree) const;
-    bool                      queryLocalFlag() const { return localFlag; }
-private:
-    unsigned                  component;
-    bool                      localFlag;
-};
-
 // Implementation of filter using regex
 
 class RegexLogMsgFilter : public CLogMsgFilter
@@ -294,7 +269,7 @@ public:
     void                      addToPTree(IPropertyTree * tree) const;
     bool                      queryLocalFlag() const { return localFlag; }
 private:
-    mutable SpinLock          lock; // Regexpr is not threadsafe when called from multiple threads
+    mutable SpinLock          lock{SYNC_LOCATION}; // Regexpr is not threadsafe when called from multiple threads
     StringAttr                regexText;
     RegExpr                   regex;
     bool                      localFlag;
@@ -334,10 +309,10 @@ class AndLogMsgFilter : public CLogMsgFilter
 public:
     AndLogMsgFilter(ILogMsgFilter * _arg1, ILogMsgFilter * _arg2) : arg1(_arg1), arg2(_arg2) {}
     AndLogMsgFilter(MemoryBuffer & in) { arg1.setown(getDeserializedLogMsgFilter(in)); arg2.setown(getDeserializedLogMsgFilter(in)); }
-    AndLogMsgFilter(IPropertyTree * tree) 
-    { 
+    AndLogMsgFilter(IPropertyTree * tree)
+    {
         Owned <IPropertyTreeIterator> iter = tree->getElements("filter");
-        ForEach(*iter) 
+        ForEach(*iter)
         {
             ILogMsgFilter *filter = getLogMsgFilterFromPTree(&(iter->query()));
             if (!arg1.get())
@@ -367,10 +342,10 @@ class OrLogMsgFilter : public CLogMsgFilter
 public:
     OrLogMsgFilter(ILogMsgFilter * _arg1, ILogMsgFilter * _arg2) : arg1(_arg1), arg2(_arg2) {}
     OrLogMsgFilter(MemoryBuffer & in) { arg1.setown(getDeserializedLogMsgFilter(in)); arg2.setown(getDeserializedLogMsgFilter(in)); }
-    OrLogMsgFilter(IPropertyTree * tree) 
-    { 
+    OrLogMsgFilter(IPropertyTree * tree)
+    {
         Owned <IPropertyTreeIterator> iter = tree->getElements("filter");
-        ForEach(*iter) 
+        ForEach(*iter)
         {
             ILogMsgFilter *filter = getLogMsgFilterFromPTree(&(iter->query()));
             if (!arg1.get())
@@ -405,7 +380,7 @@ public:
         yes.setown(getDeserializedLogMsgFilter(in));
         no.setown(getDeserializedLogMsgFilter(in));
     }
-    SwitchLogMsgFilter(IPropertyTree * tree) 
+    SwitchLogMsgFilter(IPropertyTree * tree)
     {
         cond.setown(getLogMsgFilterFromPTree(tree->queryPropTree("filter[1]")));
         yes.setown(getLogMsgFilterFromPTree(tree->queryPropTree("filter[2]")));
@@ -458,17 +433,29 @@ public:
     HandleLogMsgHandler(FILE * _handle, unsigned _fields) : handle(_handle), messageFields(_fields) {}
     virtual ~HandleLogMsgHandler() { flush(); }
 
-    unsigned                  queryMessageFields() const { return messageFields; }
-    void                      setMessageFields(unsigned _fields) { messageFields = _fields; }
-    int                       flush() { CriticalBlock block(crit); return fflush(handle); }
-    char const *              disable() { crit.enter(); return "HANDLER"; }
-    void                      enable() { crit.leave(); }
-    bool                      getLogName(StringBuffer &name) const { return false; }
-    offset_t                  getLogPosition(StringBuffer &name) const { return 0; }
+    virtual unsigned          queryMessageFields() const override { return messageFields; }
+    virtual void              setMessageFields(unsigned _fields) override { messageFields = _fields; }
+    virtual int               flush() override { CriticalBlock block(crit); return fflush(handle); }
+    virtual bool              getLogName(StringBuffer &name) const override { return false; }
+    virtual offset_t          getLogPosition(StringBuffer &name) const override { return 0; }
+    virtual LogHandlerFormat  queryFormatType() const override = 0;
 protected:
     FILE *                    handle;
     unsigned                  messageFields;
-    mutable CriticalSection   crit;
+    mutable CriticalSection   crit{SYNC_LOCATION};
+    StringBuffer              curMsgText;
+};
+
+class HandleLogMsgHandlerJSON : implements HandleLogMsgHandler, public CInterface
+{
+public:
+    HandleLogMsgHandlerJSON(FILE * _handle, unsigned _fields) : HandleLogMsgHandler(_handle, _fields) {}
+    IMPLEMENT_IINTERFACE;
+    virtual void              handleMessage(const LogMsg & msg) override;
+    virtual bool              needsPrep() const override { return false; }
+    virtual void              prep() override {}
+    virtual void              addToPTree(IPropertyTree * tree) const override;
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_json; };
 };
 
 class HandleLogMsgHandlerXML : implements HandleLogMsgHandler, public CInterface
@@ -476,10 +463,11 @@ class HandleLogMsgHandlerXML : implements HandleLogMsgHandler, public CInterface
 public:
     HandleLogMsgHandlerXML(FILE * _handle, unsigned _fields) : HandleLogMsgHandler(_handle, _fields) {}
     IMPLEMENT_IINTERFACE;
-    void                      handleMessage(const LogMsg & msg) { CriticalBlock block(crit); msg.fprintXML(handle, messageFields); }
-    bool                      needsPrep() const { return false; }
-    void                      prep() {}
-    void                      addToPTree(IPropertyTree * tree) const;
+    virtual void              handleMessage(const LogMsg & msg) override;
+    virtual bool              needsPrep() const override { return false; }
+    virtual void              prep() override {}
+    virtual void              addToPTree(IPropertyTree * tree) const override;
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_xml; };
 };
 
 class HandleLogMsgHandlerTable : implements HandleLogMsgHandler, public CInterface
@@ -487,10 +475,11 @@ class HandleLogMsgHandlerTable : implements HandleLogMsgHandler, public CInterfa
 public:
     HandleLogMsgHandlerTable(FILE * _handle, unsigned _fields) : HandleLogMsgHandler(_handle, _fields), prepped(false) {}
     IMPLEMENT_IINTERFACE;
-    void                      handleMessage(const LogMsg & msg) { CriticalBlock block(crit); msg.fprintTable(handle, messageFields); }
-    bool                      needsPrep() const { return !prepped; }
-    void                      prep() { CriticalBlock block(crit); LogMsg::fprintTableHead(handle, messageFields); prepped = true; }
-    void                      addToPTree(IPropertyTree * tree) const;
+    virtual void              handleMessage(const LogMsg & msg) override;
+    virtual bool              needsPrep() const override { return !prepped; }
+    virtual void              prep() override { CriticalBlock block(crit); LogMsg::fprintTableHead(handle, messageFields); prepped = true; }
+    virtual void              addToPTree(IPropertyTree * tree) const override;
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_table; };
 private:
     bool                      prepped;
 };
@@ -502,14 +491,12 @@ class FileLogMsgHandler : public ILogMsgHandler
 public:
     FileLogMsgHandler(const char * _filename, const char * _headerText = 0, unsigned _fields = MSGFIELD_all, bool _append = false, bool _flushes = true);
     virtual ~FileLogMsgHandler();
-    unsigned                  queryMessageFields() const { return messageFields; }
-    void                      setMessageFields(unsigned _fields) { messageFields = _fields; }
-    int                       flush() { CriticalBlock block(crit); return fflush(handle); }
-    char const *              disable();
-    void                      enable();
-    bool                      getLogName(StringBuffer &name) const { name.append(filename); return true; }
-    offset_t                  getLogPosition(StringBuffer &name) const { CriticalBlock block(crit); fflush(handle); name.append(filename); return ftell(handle); }
-                
+    virtual unsigned          queryMessageFields() const override { return messageFields; }
+    virtual void              setMessageFields(unsigned _fields) override { messageFields = _fields; }
+    virtual int               flush() override { CriticalBlock block(crit); return fflush(handle); }
+    virtual bool              getLogName(StringBuffer &name) const override { name.append(filename); return true; }
+    virtual offset_t          getLogPosition(StringBuffer &name) const override { CriticalBlock block(crit); fflush(handle); name.append(filename); return ftell(handle); }
+
 protected:
     FILE *                    handle;
     unsigned                  messageFields;
@@ -517,7 +504,20 @@ protected:
     StringAttr                headerText;
     bool                      append;
     bool                      flushes;
-    mutable CriticalSection   crit;
+    mutable CriticalSection   crit{SYNC_LOCATION};
+    StringBuffer              curMsgText;
+};
+
+class FileLogMsgHandlerJSON : implements FileLogMsgHandler, public CInterface
+{
+public:
+    FileLogMsgHandlerJSON(const char * _filename, const char * _headerText = 0, unsigned _fields = MSGFIELD_all, bool _append = false, bool _flushes = true) : FileLogMsgHandler(_filename, _headerText, _fields, _append, _flushes) {}
+    IMPLEMENT_IINTERFACE;
+    virtual void              handleMessage(const LogMsg & msg) override;
+    virtual bool              needsPrep() const override { return false; }
+    virtual void              prep() override {}
+    virtual void              addToPTree(IPropertyTree * tree) const override;
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_json; };
 };
 
 class FileLogMsgHandlerXML : implements FileLogMsgHandler, public CInterface
@@ -525,10 +525,11 @@ class FileLogMsgHandlerXML : implements FileLogMsgHandler, public CInterface
 public:
     FileLogMsgHandlerXML(const char * _filename, const char * _headerText = 0, unsigned _fields = MSGFIELD_all, bool _append = false, bool _flushes = true) : FileLogMsgHandler(_filename, _headerText, _fields, _append, _flushes) {}
     IMPLEMENT_IINTERFACE;
-    void                      handleMessage(const LogMsg & msg) { CriticalBlock block(crit); msg.fprintXML(handle, messageFields); if(flushes) fflush(handle); }
-    bool                      needsPrep() const { return false; }
-    void                      prep() {}
-    void                      addToPTree(IPropertyTree * tree) const;
+    virtual void              handleMessage(const LogMsg & msg) override;
+    virtual bool              needsPrep() const override { return false; }
+    virtual void              prep() override {}
+    virtual void              addToPTree(IPropertyTree * tree) const override;
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_xml; };
 };
 
 class FileLogMsgHandlerTable : implements FileLogMsgHandler, public CInterface
@@ -536,12 +537,48 @@ class FileLogMsgHandlerTable : implements FileLogMsgHandler, public CInterface
 public:
     FileLogMsgHandlerTable(const char * _filename, const char * _headerText = 0, unsigned _fields = MSGFIELD_all, bool _append = false, bool _flushes = true) : FileLogMsgHandler(_filename, _headerText, _fields, _append, _flushes), prepped(false) {}
     IMPLEMENT_IINTERFACE;
-    void                      handleMessage(const LogMsg & msg) { CriticalBlock block(crit); msg.fprintTable(handle, messageFields); if(flushes) fflush(handle); }
-    bool                      needsPrep() const { return !prepped; }
-    void                      prep() { CriticalBlock block(crit); LogMsg::fprintTableHead(handle, messageFields); prepped = true; }
-    void                      addToPTree(IPropertyTree * tree) const;
+    virtual void              handleMessage(const LogMsg & msg) override;
+    virtual bool              needsPrep() const override { return !prepped; }
+    virtual void              prep() override { CriticalBlock block(crit); LogMsg::fprintTableHead(handle, messageFields); prepped = true; }
+    virtual void              addToPTree(IPropertyTree * tree) const override;
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_table; };
 private:
     bool                      prepped;
+};
+
+class PostMortemLogMsgHandler : public CInterfaceOf<ILogMsgHandler>
+{
+public:
+    PostMortemLogMsgHandler(const char * _filebase, unsigned _maxLinesToKeep, unsigned _messageFields=MSGFIELD_all);
+    void copyTo(const char *target, bool clear);
+    static bool copyPIDFiles(const char *filebase, const char *target, bool clear);
+
+    virtual ~PostMortemLogMsgHandler();
+    virtual void handleMessage(const LogMsg & msg) override;
+    virtual bool needsPrep() const override { return false; }
+    virtual void prep() override {}
+    virtual unsigned queryMessageFields() const override { return messageFields; }
+    virtual void setMessageFields(unsigned _fields) override { messageFields = _fields; }
+    virtual void addToPTree(IPropertyTree * tree) const override;
+    virtual int flush() override { CriticalBlock block(crit); return fflush(handle); }
+    virtual bool getLogName(StringBuffer &name) const override { CriticalBlock block(crit); name.append(filename); return true; }
+    virtual offset_t getLogPosition(StringBuffer &name) const override { CriticalBlock block(crit); fflush(handle); name.append(filename); return ftell(handle); }
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_table; };
+protected:
+    void checkRollover();
+    void doRollover();
+    void openFile();
+protected:
+    mutable FILE *handle = nullptr;
+    StringAttr filebase;
+    mutable StringBuffer filename;
+    mutable CriticalSection crit{SYNC_LOCATION};
+    StringBuffer curMsgText;
+    const unsigned maxLinesToKeep = 0;
+    unsigned messageFields = MSGFIELD_all;
+    unsigned linesInCurrent = 0;
+    unsigned sequence = 0;
+    const bool flushes = true;
 };
 
 class RollingFileLogMsgHandler : implements ILogMsgHandler, public CInterface
@@ -551,7 +588,7 @@ public:
                              const char *initialName = NULL, const char *alias = NULL, bool daily = false, long _maxLogFileSize = 0);
     virtual ~RollingFileLogMsgHandler();
     IMPLEMENT_IINTERFACE;
-    void                      handleMessage(const LogMsg & msg)
+    virtual void              handleMessage(const LogMsg & msg) override
     {
         CriticalBlock block(crit);
         checkRollover();
@@ -561,22 +598,23 @@ public:
             printHeader = false;
         }
         if (currentLogFields)  // If appending to existing log file, use same format as existing
-            msg.fprintTable(handle, currentLogFields);
+            msg.toStringTable(curMsgText.clear(), currentLogFields);
         else
-            msg.fprintTable(handle, messageFields);
+            msg.toStringTable(curMsgText.clear(), messageFields);
+        fputs(curMsgText.str(), handle);
 
         if(flushes) fflush(handle);
     }
-    bool                      needsPrep() const { return false; }
-    void                      prep() {}
-    unsigned                  queryMessageFields() const { return messageFields; }
-    void                      setMessageFields(unsigned _fields) { messageFields = _fields; }
-    void                      addToPTree(IPropertyTree * tree) const;
-    int                       flush() { CriticalBlock block(crit); return fflush(handle); }
-    char const *              disable();
-    void                      enable();
-    bool                      getLogName(StringBuffer &name) const { CriticalBlock block(crit); name.append(filename); return true; }
-    offset_t                  getLogPosition(StringBuffer &name) const { CriticalBlock block(crit); fflush(handle); name.append(filename); return ftell(handle); }
+    virtual bool              needsPrep() const override { return false; }
+    virtual void              prep() override {}
+    virtual unsigned          queryMessageFields() const override { return messageFields; }
+    virtual void              setMessageFields(unsigned _fields) override { messageFields = _fields; }
+    virtual void              addToPTree(IPropertyTree * tree) const override;
+    virtual int               flush() override { CriticalBlock block(crit); return fflush(handle); }
+    virtual bool              getLogName(StringBuffer &name) const override { CriticalBlock block(crit); name.append(filename); return true; }
+    virtual offset_t          getLogPosition(StringBuffer &name) const override { CriticalBlock block(crit); fflush(handle); name.append(filename); return ftell(handle); }
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_table; };
+
 protected:
     void                      checkRollover();
     void                      doRollover(bool daily, const char *forceName = NULL);
@@ -588,9 +626,10 @@ protected:
     StringAttr                filebase;
     StringAttr                fileextn;
     mutable StringBuffer      filename;
+    StringBuffer              curMsgText;
     bool                      append;
     bool                      flushes;
-    mutable CriticalSection   crit;
+    mutable CriticalSection   crit{SYNC_LOCATION};
     mutable struct tm         startTime;
     bool printHeader = true;
     long                      maxLogFileSize = 0;
@@ -606,17 +645,16 @@ public:
     BinLogMsgHandler(const char * _filename, bool _append = false);
     virtual ~BinLogMsgHandler();
     IMPLEMENT_IINTERFACE;
-    void                      handleMessage(const LogMsg & msg);
-    bool                      needsPrep() const { return false; }
-    void                      prep() {}
-    void                      addToPTree(IPropertyTree * tree) const;
-    unsigned                  queryMessageFields() const { return MSGFIELD_all; }
-    void                      setMessageFields(unsigned _fields) {}
-    int                       flush() { return 0; }
-    char const *              disable();
-    void                      enable();
-    bool                      getLogName(StringBuffer &name) const { name.append(filename); return true; }
-    offset_t                  getLogPosition(StringBuffer &name) const { CriticalBlock block(crit); name.append(filename); return fstr->tell(); }
+    virtual void              handleMessage(const LogMsg & msg) override;
+    virtual bool              needsPrep() const override { return false; }
+    virtual void              prep() override {}
+    virtual void              addToPTree(IPropertyTree * tree) const override;
+    virtual unsigned          queryMessageFields() const override { return MSGFIELD_all; }
+    virtual void              setMessageFields(unsigned _fields) override {}
+    virtual int               flush() override { return 0; }
+    virtual bool              getLogName(StringBuffer &name) const override { name.append(filename); return true; }
+    virtual offset_t          getLogPosition(StringBuffer &name) const override { CriticalBlock block(crit); name.append(filename); return fstr->tell(); }
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_undefined; };
 protected:
     StringAttr                filename;
     bool                      append;
@@ -624,7 +662,7 @@ protected:
     OwnedIFileIO              fio;
     OwnedIFileIOStream        fstr;
     mutable MemoryBuffer      mbuff;
-    mutable CriticalSection   crit;
+    mutable CriticalSection   crit{SYNC_LOCATION};
 };
 
 // Implementation of handler which uses the audit event logger
@@ -634,17 +672,16 @@ class SysLogMsgHandler : implements ILogMsgHandler, public CInterface
 public:
     SysLogMsgHandler(ISysLogEventLogger * _logger, unsigned _fields) : logger(_logger), fields(_fields) {}
     IMPLEMENT_IINTERFACE;
-    void                      handleMessage(const LogMsg & msg);
-    bool                      needsPrep() const { return false; }
-    void                      prep() {}
-    void                      addToPTree(IPropertyTree * tree) const;
-    unsigned                  queryMessageFields() const { return fields; }
-    void                      setMessageFields(unsigned _fields) { fields = _fields; }
-    int                       flush() { return 0; }
-    char const *              disable() { return "Audit"; }
-    void                      enable() {}
-    bool                      getLogName(StringBuffer &name) const { return false; }
-    offset_t                  getLogPosition(StringBuffer &logFileName) const { return 0; }
+    virtual void              handleMessage(const LogMsg & msg) override;
+    virtual bool              needsPrep() const override { return false; }
+    virtual void              prep() override {}
+    virtual void              addToPTree(IPropertyTree * tree) const override;
+    virtual unsigned          queryMessageFields() const override { return fields; }
+    virtual void              setMessageFields(unsigned _fields) override { fields = _fields; }
+    virtual int               flush() override { return 0; }
+    virtual bool              getLogName(StringBuffer &name) const override { return false; }
+    virtual offset_t          getLogPosition(StringBuffer &logFileName) const override { return 0; }
+    virtual LogHandlerFormat  queryFormatType() const override { return LOGFORMAT_undefined; };
 protected:
     ISysLogEventLogger *      logger;
     unsigned                  fields;
@@ -700,7 +737,7 @@ private:
         CallbackInterThreadQueueOf<LogMsg, MsgProcessor, false> q;
         unsigned droppingLimit;
         unsigned numToDrop = 1;
-        Mutex pullCycleMutex;
+        TimedMutex pullCycleMutex{SYNC_LOCATION};
     };
     Owned<MsgProcessor> processor;
 
@@ -718,28 +755,11 @@ public:
     bool                      flushQueue(unsigned timeout) { if(processor) return processor->flush(timeout); else return true; }
     void                      report(const LogMsgCategory & cat, const char * format, ...) __attribute__((format(printf,3,4)));
     void                      report_va(const LogMsgCategory & cat, const char * format, va_list args) __attribute__((format(printf,3,0)));
-    void                      mreport_direct(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * msg);
-    void                      mreport_direct(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * msg);
-    void                      mreport_va(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args) __attribute__((format(printf,5,0)));
-    void                      mreport_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args) __attribute__((format(printf,4,0)));
+    void                      mreport_direct(const LogMsgCategory & cat, const char * msg);
+    void                      mreport_va(const LogMsgCategory & cat, const char * format, va_list args) __attribute__((format(printf,3,0)));
     void                      report(const LogMsgCategory & cat, LogMsgCode code, const char * format, ...) __attribute__((format(printf,4,5)));
     void                      report_va(const LogMsgCategory & cat, LogMsgCode code, const char * format, va_list args) __attribute__((format(printf,4,0)));
     void                      report(const LogMsgCategory & cat, const IException * e, const char * prefix = NULL);
-    void                      report(unsigned compo, const LogMsgCategory & cat, const char * format, ...) __attribute__((format(printf,4,5)));
-    void                      report_va(unsigned compo, const LogMsgCategory & cat, const char * format, va_list args) __attribute__((format(printf,4,0)));
-    void                      report(unsigned compo, const LogMsgCategory & cat, LogMsgCode code, const char * format, ...) __attribute__((format(printf,5,6)));
-    void                      report_va(unsigned compo, const LogMsgCategory & cat, LogMsgCode code, const char * format, va_list args) __attribute__((format(printf,5,0)));
-    void                      report(unsigned compo, const LogMsgCategory & cat, const IException * e, const char * prefix = NULL);
-    void                      report(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, ...) __attribute__((format(printf,4,5)));
-    void                      report_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args) __attribute__((format(printf,4,0)));
-    void                      report(const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, ...) __attribute__((format(printf,5,6)));
-    void                      report_va(const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, va_list args) __attribute__((format(printf,5,0)));
-    void                      report(const LogMsgCategory & cat, const LogMsgJobInfo & job, const IException * e, const char * prefix = NULL);
-    void                      report(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, ...) __attribute__((format(printf,5,6)));
-    void                      report_va(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const char * format, va_list args) __attribute__((format(printf,5,0)));
-    void                      report(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, ...) __attribute__((format(printf,6,7)));
-    void                      report_va(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, LogMsgCode code, const char * format, va_list args)__attribute__((format(printf,6,0)));
-    void                      report(unsigned compo, const LogMsgCategory & cat, const LogMsgJobInfo & job, const IException * e, const char * prefix = NULL);
     void                      report(const LogMsg & msg) const { if(prefilter.includeCategory(msg.queryCategory())) doReport(msg); }
     bool                      addMonitor(ILogMsgHandler * handler, ILogMsgFilter * filter);
     bool                      addMonitorOwn(ILogMsgHandler * handler, ILogMsgFilter * filter);
@@ -770,8 +790,7 @@ public:
     virtual offset_t          getLogPosition(StringBuffer &logFileName, const ILogMsgHandler * handler) const;
     virtual LogMsgJobId       addJobId(const char *job);
     virtual void              removeJobId(LogMsgJobId);
-
-    const char *              queryJobId(LogMsgJobId id) const;
+    virtual const char *      queryJobId(LogMsgJobId id) const;
 private:
     void                      sendFilterToChildren(bool locked = false) const;
     aindex_t                  find(const ILogMsgHandler * handler) const;
@@ -786,18 +805,18 @@ private:
 
 private:
     CIArrayOf<LogMsgMonitor>  monitors;
-    mutable ReadWriteLock     monitorLock;
+    mutable ReadWriteLock     monitorLock{SYNC_LOCATION};
     CategoryLogMsgFilter      prefilter;
     std::atomic<LogMsgId>     nextID;
     IArrayOf<ILogMsgLinkToChild> children;
-    mutable ReadWriteLock     childLock;
+    mutable ReadWriteLock     childLock{SYNC_LOCATION};
     bool                      suspendedChildren;
     unsigned                  port;
     LogMsgSessionId           session;
-    CriticalSection           modeLock;
+    CriticalSection           modeLock{SYNC_LOCATION};
     std::atomic<LogMsgJobId>  nextJobId = { 0 };
     mutable MapLogMsgJobIdToStr jobIds;
-    mutable CriticalSection   jobIdLock;
+    mutable CriticalSection   jobIdLock{SYNC_LOCATION};
 };
 
 // Message indicating messages have been dropped
@@ -805,7 +824,7 @@ private:
 class DropLogMsg : public LogMsg
 {
 public:
-    DropLogMsg(CLogMsgManager * owner, LogMsgId id, unsigned _count) : LogMsg(dropWarningCategory, id, unknownJob, NoLogMsgCode, "MISSING LOG MESSAGES: ", 0, owner->port, owner->session), count(_count)
+    DropLogMsg(CLogMsgManager * owner, LogMsgId id, unsigned _count) : LogMsg(dropWarningCategory, id,  NoLogMsgCode, "MISSING LOG MESSAGES: ", owner->port, owner->session), count(_count)
     {
         text.append("message queue length exceeded, dropped ").append(count).append(" messages");
     }
@@ -834,20 +853,164 @@ private:
     bool                      dataLogUsed;
     char *                    dataLogName;
     int                       dataLogFile;
-    CriticalSection           dataLogLock;
+    CriticalSection           dataLogLock{SYNC_LOCATION};
 #endif
 };
 
-// Standard filters, handlers, manager, and audit event logger
+class CLogAccessFilter : public CInterfaceOf<ILogAccessFilter> {};
 
-extern PassAllLogMsgFilter * thePassAllFilter;
-extern PassLocalLogMsgFilter * thePassLocalFilter;
-extern PassNoneLogMsgFilter * thePassNoneFilter;
-extern HandleLogMsgHandlerTable * theStderrHandler;
-extern CLogMsgManager * theManager;
-extern CSysLogEventLogger * theSysLogEventLogger;
+class FieldLogAccessFilter : public CLogAccessFilter
+{
+public:
+    FieldLogAccessFilter(const char * _value, LogAccessFilterType _filterType) : value(_value), type(_filterType) {fprintf(stderr, "-----Creating  FieldLogAccessFilter '%s'", value.str());}
+    FieldLogAccessFilter(IPropertyTree * tree, LogAccessFilterType _filterType)
+    {
+        type = _filterType;
+        VStringBuffer xpath("@%s", logAccessFilterTypeToString(type));
+        value.set(tree->queryProp(xpath.str()));
+    }
 
-// Reset logging-related thread-local variables, when a threadpool starts
-extern void resetThreadLogging();
+    void addToPTree(IPropertyTree * tree) const
+    {
+        IPropertyTree * filterTree = createPTree(ipt_caseInsensitive);
+        filterTree->setProp("@type", logAccessFilterTypeToString(type));
+        filterTree->setProp("@value", value);
+        tree->addPropTree("filter", filterTree);
+    }
+
+    void toString(StringBuffer & out) const
+    {
+        out.set(value);
+    }
+
+    LogAccessFilterType filterType() const
+    {
+        return type;
+    }
+
+protected:
+    StringAttr value;
+    LogAccessFilterType type;
+};
+
+class ColumnLogAccessFilter : public CLogAccessFilter
+{
+public:
+    ColumnLogAccessFilter(const char * _column, const char * _value, LogAccessFilterType _filterType) : value(_value), fieldName(_column), type(_filterType) {fprintf(stderr, "-----CREATING ColumnLogAccessFilter");}
+    ColumnLogAccessFilter(IPropertyTree * tree, LogAccessFilterType _filterType)
+    {
+        type = _filterType;
+        VStringBuffer xpath("@%s", logAccessFilterTypeToString(type));
+        value.set(tree->queryProp(xpath.str()));
+    }
+
+    void addToPTree(IPropertyTree * tree) const
+    {
+        IPropertyTree * filterTree = createPTree(ipt_caseInsensitive);
+        filterTree->setProp("@type", logAccessFilterTypeToString(type));
+        filterTree->setProp("@value", value);
+        tree->addPropTree("filter", filterTree);
+    }
+
+    void toString(StringBuffer & out) const
+    {
+        out.set(value);
+    }
+
+    LogAccessFilterType filterType() const
+    {
+        return type;
+    }
+
+    const char * getFieldName() const
+    {
+        return fieldName.str();
+    }
+
+protected:
+    StringAttr value;
+    StringAttr fieldName;
+    LogAccessFilterType type;
+};
+
+class BinaryLogAccessFilter : public CLogAccessFilter
+{
+public:
+    BinaryLogAccessFilter(ILogAccessFilter * _arg1, ILogAccessFilter * _arg2, LogAccessFilterType _type) : arg1(_arg1), arg2(_arg2)
+    {
+        if (!arg1 || !arg2)
+            throw makeStringException(-1, "Binary Log Access Filter encountered empty operand");
+
+        setType(_type);
+    }
+
+    BinaryLogAccessFilter(IPropertyTree * tree, LogAccessFilterType _type)
+    {
+        setType(_type);
+        Owned<IPropertyTreeIterator> iter = tree->getElements("filter");
+        ForEach(*iter)
+        {
+            ILogAccessFilter *filter = getLogAccessFilterFromPTree(&(iter->query()));
+            if (!arg1.get())
+                arg1.setown(filter);
+            else if (!arg2.get())
+                arg2.setown(filter);
+            else
+                arg2.setown(getBinaryLogAccessFilterOwn(arg2.getClear(), filter, type));
+        }
+    }
+
+    void addToPTree(IPropertyTree * tree) const
+    {
+        IPropertyTree * filterTree = createPTree(ipt_caseInsensitive);
+        filterTree->setProp("@type", logAccessFilterTypeToString(type));
+        arg1->addToPTree(filterTree);
+        arg2->addToPTree(filterTree);
+        tree->addPropTree("filter", filterTree);
+    }
+
+    void toString(StringBuffer & out) const
+    {
+        StringBuffer tmp;
+        out.set("( ");
+        arg1->toString(tmp);
+        out.appendf(" %s %s ", tmp.str(), logAccessFilterTypeToString(type));
+        arg2->toString(tmp.clear());
+        out.appendf(" %s )", tmp.str());
+    }
+
+    LogAccessFilterType filterType() const
+    {
+        return type;
+    }
+
+    ILogAccessFilter * leftFilterClause() const
+    {
+        return arg1;
+    }
+
+    ILogAccessFilter * rightFilterClause() const
+    {
+        return arg2;
+    }
+
+private:
+    Linked<ILogAccessFilter> arg1;
+    Linked<ILogAccessFilter> arg2;
+    LogAccessFilterType type;
+
+    void setType(LogAccessFilterType _type)
+    {
+        switch(_type)
+        {
+        case LOGACCESS_FILTER_or:
+        case LOGACCESS_FILTER_and:
+            type = _type;
+            break;
+        default:
+            throwUnexpectedX("BinaryLogAccessFilter : detected invalid BinaryLogAccessFilter type");
+        }
+    }
+};
 
 #endif

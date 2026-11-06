@@ -54,11 +54,6 @@
                 processName="TopoServerProcess"
                 schema="toposerver.xsd"/>
             <BuildSet installSet="deploy_map.xml"
-                name="sparkthor"
-                path="componentfiles/sparkthor"
-                processName="SparkThorProcess"
-                schema="sparkThor.xsd"/>
-            <BuildSet installSet="deploy_map.xml"
                 name="daliplugin"
                 path="componentfiles/daliplugin"
                 processName="DaliServerPlugin"
@@ -201,6 +196,10 @@
                         path="OthersWorkunitsAccess"
                         resource="OthersWorkunitsAccess"
                         service="ws_workunits"/>
+                    <AuthenticateFeature description="Access to deploy workunits"
+                        path="DeployWorkunitsAccess"
+                        resource="DeployWorkunitsAccess"
+                        service="ws_workunits"/>
                     <AuthenticateFeature description="Access to ESDL configuration service"
                         path="ESDLConfigAccess"
                         resource="ESDLConfigAccess"
@@ -221,6 +220,14 @@
                         path="CodeSignAccess"
                         resource="CodeSignAccess"
                         service="ws_codesign"/>
+                    <AuthenticateFeature description="Access to LogAccess service"
+                        path="WsLogAccess"
+                        resource="WsLogAccess"
+                        service="ws_logaccess"/>
+                    <AuthenticateFeature description="Access to DFS service"
+                        path="DfsAccess"
+                        resource="DfsAccess"
+                        service="ws_dfsservice"/>
                     <ProcessFilters>
                         <Platform name="Windows">
                             <ProcessFilter name="any">
@@ -278,6 +285,10 @@
                     <AuthenticateFeature description="Access to others&apos; workunits"
                         path="OthersWorkunitsAccess"
                         resource="OthersWorkunitsAccess"
+                        service="ws_sql"/>
+                    <AuthenticateFeature description="Access to deploy workunits"
+                        path="DeployWorkunitsAccess"
+                        resource="DeployWorkunitsAccess"
                         service="ws_sql"/>
                 </Properties>
             </BuildSet>
@@ -404,6 +415,12 @@
                 path="componentfiles/esploggingagent"
                 processName="ESPLoggingAgent"
                 schema="esploggingagent.xsd"/>
+            <BuildSet deployable="no"
+                installSet="deploy_map.xml"
+                name="modularlogagent"
+                path="componentfiles/modularlogagent"
+                processName="ModularLogAgent"
+                schema="modularlogagent.xsd"/>
             <BuildSet deployable="no"
                 installSet="deploy_map.xml"
                 name="loggingmanager"

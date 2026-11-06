@@ -55,7 +55,7 @@ public:
 
 class CThorNodeGroupCache: public SuperHashTableOf<CThorNodeGroup, const char>
 {
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     CThorNodeGroup* readNodeGroup(const char* _groupName);
 
 public:
@@ -81,7 +81,7 @@ public:
 
     inline unsigned getHashFromFindParam(const void *fp) const
     {
-        return hashnc((const unsigned char *)fp, strlen((const char *)fp), 0);
+        return hashncz((const unsigned char *)fp, 0);
     }
 
     inline const void * getFindParam(const void *e) const
@@ -109,7 +109,7 @@ public:
 
     virtual void getNavigationData(IEspContext &context, IPropertyTree & data)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
         {
             CHttpSoapBinding::getNavigationData(context, data);
             return;
@@ -138,7 +138,7 @@ public:
 class CWsDfuEx : public CWsDfu
 {
     Owned<IXslProcessor> m_xsl;
-    Mutex m_superfilemutex;
+    Mutex m_superfilemutex{SYNC_LOCATION};
     unsigned nodeGroupCacheTimeout;
     Owned<CThorNodeGroupCache> thorNodeGroupCache;
     std::atomic<bool> m_daliDetached{false};
@@ -147,6 +147,7 @@ class CWsDfuEx : public CWsDfu
     static const unsigned defaultMaxFileAccessExpirySeconds=86400; // 24 hours
 
     void dFUFileAccessCommon(IEspContext &context, const CDfsLogicalFileName &lfn, SessionId clientSessionId, const char *requestId, unsigned expirySecs, bool returnTextResponse, unsigned lockTimeoutMs, IEspDFUFileAccessResponse &resp);
+    void setPublishFileSize(const char *logicalName, IFileDescriptor *fileDesc);
     void clearFileProtections(IDistributedFile *df);
     bool changeFileProtections(IEspContext &context, IEspDFUArrayActionRequest &req, IEspDFUArrayActionResponse &resp);
     bool changeFileRestrictions(IEspContext &context, IEspDFUArrayActionRequest &req, IEspDFUArrayActionResponse &resp);
@@ -160,6 +161,7 @@ public:
     bool onDFUSearchNonSubFiles(IEspContext &context, IEspDFUSearchRequest &req, IEspDFUSearchResponse &resp);
     bool onDFUSearch(IEspContext &context, IEspDFUSearchRequest &req, IEspDFUSearchResponse &resp);
     bool onDFUQuery(IEspContext &context, IEspDFUQueryRequest &req, IEspDFUQueryResponse &resp);
+    bool onDFUGetMetaInquiry(IEspContext &context, IEspDFUMetaInquiryRequest &req, IEspDFUMetaInquiryResponse &resp);
     bool onDFUInfo(IEspContext &context, IEspDFUInfoRequest &req, IEspDFUInfoResponse &resp);
     bool onDFUSpace(IEspContext &context, IEspDFUSpaceRequest &req, IEspDFUSpaceResponse &resp);
     bool onDFUDefFile(IEspContext &context,IEspDFUDefFileRequest &req, IEspDFUDefFileResponse &resp);
@@ -176,6 +178,7 @@ public:
     virtual bool onSavexml(IEspContext &context, IEspSavexmlRequest &req, IEspSavexmlResponse &resp);
     virtual bool onAdd(IEspContext &context, IEspAddRequest &req, IEspAddResponse &resp);
     virtual bool onAddRemote(IEspContext &context, IEspAddRemoteRequest &req, IEspAddRemoteResponse &resp);
+    virtual bool onDFUFileRename(IEspContext &context, IEspDFUFileRenameRequest &req, IEspDFUFileRenameResponse &resp);
     virtual bool onSuperfileList(IEspContext &context, IEspSuperfileListRequest &req, IEspSuperfileListResponse &resp);
     virtual bool onSuperfileAction(IEspContext &context, IEspSuperfileActionRequest &req, IEspSuperfileActionResponse &resp);
     virtual bool onListHistory(IEspContext &context, IEspListHistoryRequest &req, IEspListHistoryResponse &resp);
@@ -203,7 +206,7 @@ private:
     bool doLogicalFileSearch(IEspContext &context, IUserDescriptor* udesc, IEspDFUQueryRequest & req, IEspDFUQueryResponse & resp);
     void doGetFileDetails(IEspContext &context, IUserDescriptor* udesc, const char *name,const char *cluster,
         const char *querySet, const char *query, const char *description, bool includeJsonTypeInfo, bool includeBinTypeInfo,
-        CDFUChangeProtection protect, CDFUChangeRestriction changeRestriction, IEspDFUFileDetail& FileDetails);
+        CDFUChangeProtection protect, CDFUChangeRestriction changeRestriction, IEspDFUFileDetail& FileDetails, bool forceIndexInfo);
     bool createSpaceItemsByDate(IArrayOf<IEspSpaceItem>& SpaceItems, const char * interval, unsigned& yearFrom,
         unsigned& monthFrom, unsigned& dayFrom, unsigned& yearTo, unsigned& monthTo, unsigned& dayTo);
     bool setSpaceItemByScope(IArrayOf<IEspSpaceItem>& SpaceItems64, const char*scopeName, const char*logicalName, __int64 size);
@@ -247,15 +250,14 @@ private:
     void getFilePartsOnClusters(IEspContext &context, const char *clusterReq, StringArray &clusters, IDistributedFile *df,
         IEspDFUFileDetail &fileDetails);
     bool getQueryFile(const char *logicalName, const char *querySet, const char *queryID, IEspDFUFileDetail &fileDetails);
-    void queryFieldNames(IEspContext &context, const char *fileName, const char *cluster,
-        unsigned __int64 fieldMask, StringArray &fieldNames);
-    void parseFieldMask(unsigned __int64 fieldMask, unsigned &fieldCount, IntArray &fieldIndexArray);
-    void getFilePartsInfo(IEspContext &context, IFileDescriptor &fileDesc, bool forFileCreate, IEspDFUFileAccessInfo &accessInfo);
+    void queryFieldNames(IEspContext &context, IDistributedFile * df, const char *fileName, unsigned __int64 fieldMask, StringArray &fieldNames);
+    void getFilePartsInfo(IEspContext &context, const char *dafilesrvHost, IFileDescriptor &fileDesc, bool forFileCreate, IEspDFUFileAccessInfo &accessInfo);
     void getFileDafilesrvConfiguration(StringBuffer &keyPairName, unsigned &port, bool &secure, const char *fileName, std::vector<std::string> &groups);
     void getFileDafilesrvConfiguration(StringBuffer &keyPairName, unsigned &retPort, bool &retSecure, const char *group);
     void exportRecordDefinitionBinaryType(const char *recordDefinition, MemoryBuffer &layoutBin);
     void appendTimeString(const char *in, StringBuffer &out);
     void setTimeRangeFilter(const char *from, const char *to, DFUQFilterField filterID, StringBuffer &filterBuf);
+    void setInt64RangeFilter(__int64 from, __int64 to, DFUQFilterField filterID, StringBuffer &filterBuf);
 
     bool attachServiceToDali() override
     {

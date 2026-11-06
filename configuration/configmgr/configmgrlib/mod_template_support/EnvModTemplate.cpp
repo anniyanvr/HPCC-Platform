@@ -27,11 +27,15 @@
 #include <fstream>
 #include "Utils.hpp"
 
+#ifdef _MSC_VER
+#undef GetObject
+#endif
+
 //
 // Good online resource for validation of modification templates is https://www.jsonschemavalidator.net/
 // Load the schecma (ModTemplateSchema.json) in the left window and the modification template in the right.
 
-EnvModTemplate::EnvModTemplate(EnvironmentMgr *pEnvMgr, const std::string &schemaFile) : m_pEnvMgr(pEnvMgr), m_pTemplate(nullptr), m_pSchema(nullptr)
+EnvModTemplate::EnvModTemplate(EnvironmentMgr *pEnvMgr, const std::string &schemaFile) : m_pSchema(nullptr), m_pTemplate(nullptr), m_pEnvMgr(pEnvMgr)
 {
     if (m_pEnvMgr == nullptr)
     {
@@ -312,7 +316,7 @@ void EnvModTemplate::parseOperation(const rapidjson::Value &operation)
     {
         pOp = std::make_shared<OperationFindNode>();
     }
-    else if (action == "delete_")
+    else if (action == "delete")
     {
         pOp = std::make_shared<OperationDeleteNode>();
     }
@@ -476,7 +480,7 @@ void EnvModTemplate::parseAttribute(const rapidjson::Value &attributeValue, modA
     auto saveInfoIt = attributeData.FindMember("save");
     if (saveInfoIt != attributeData.MemberEnd())
     {
-        pAttribute->saveVariableName = saveInfoIt->value.GetObject().FindMember("save")->value.GetString();
+        pAttribute->saveVariableName = saveInfoIt->value.GetObject().FindMember("name")->value.GetString();
         attrValueIt = saveInfoIt->value.GetObject().FindMember("duplicate_ok");
         if (attrValueIt != saveInfoIt->value.MemberEnd())
             pAttribute->duplicateSaveValueOk = attrValueIt->value.GetBool();

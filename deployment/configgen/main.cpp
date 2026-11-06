@@ -14,17 +14,19 @@
     See the License for the specific language governing permissions and
     limitations under the License.
 ############################################################################## */
+
+
+#include <string>
 #include "jliball.hpp"
 #include "XMLTags.h"
 #include "configengcallback.hpp"
 #include "deploy.hpp"
-#include "build-config.h"
 #include "jutil.hpp"
 #include "jhash.ipp"
 #include "portlist.h"
 
-#define STANDARD_INDIR COMPONENTFILES_DIR"/configxml"
-#define STANDARD_OUTDIR RUNTIME_DIR
+
+static std::string configXmlDir;
 
 void usage()
 {
@@ -48,11 +50,11 @@ void usage()
   puts("          configgencomplist.xml. If not specified, the following ");
   puts("          defaults are used. ");
   puts("          For win32, 'c:\\trunk\\initfiles\\componentfiles\\configxml'");
-  puts("          For Linux, '" COMPONENTFILES_DIR "/configxml/'");
+  printf("          For Linux, '%s'", configXmlDir.c_str());
   puts("   -od <output directory>: The output directory for the generated files.");
   puts("          If not specified, the following defaults are used. ");
   puts("          For win32, '.'");
-  puts("          For Linux, '" CONFIG_DIR "'");
+  printf("          For Linux, '%s'", hpccBuildInfo.configDir);
   puts("   -ldapconfig : Generates a .ldaprc file and puts it in the specified");
   puts("          output directory. If output directory is not specified,");
   puts("          default output directory is used as mentioned in -od option");
@@ -204,7 +206,7 @@ void getTempPath(char* tempPath, unsigned int bufsize, const char* subdir/*=NULL
 void replaceDotWithHostIp(IPropertyTree* pTree, bool verbose)
 {
     StringBuffer ip;
-    queryHostIP().getIpText(ip);
+    queryHostIP().getHostText(ip);
     const char* attrs[] = {"@netAddress", "@roxieAddress", "@daliAddress"};
     StringBuffer xPath;
 
@@ -662,7 +664,8 @@ int processRequest(const char* in_cfgname, const char* out_dirname, const char* 
   else
   {
     StringBuffer out;
-    Owned<IPropertyTree> pSelectedComponents = getInstances(&m_pConstEnvironment->getPTree(), compName, compType, ipAddr, true);
+    Owned<IPropertyTree> envPTree = &m_pConstEnvironment->getPTree();
+    Owned<IPropertyTree> pSelectedComponents = getInstances(envPTree, compName, compType, ipAddr, true);
     Owned<IPropertyTreeIterator> it = pSelectedComponents->getElements("*");
 
     ForEach(*it)
@@ -731,12 +734,12 @@ int processRequest(const char* in_cfgname, const char* out_dirname, const char* 
             {
                out.appendf("%s,%s,%s,%s,%s,%s%c%s,%s\n", processName.str(),
                  pComponent->queryProp("@name"), netAddr.str(),pInst->queryProp("@slaveport"), pInst->queryProp("@slavesPerNode"),
-                 STANDARD_OUTDIR, PATHSEPCHAR, pComponent->queryProp("@name"), pComponent->queryProp("@logDir"));
+                 hpccBuildInfo.runtimeDir, PATHSEPCHAR, pComponent->queryProp("@name"), pComponent->queryProp("@logDir"));
             }
             else
                out.appendf("%s,%s,%s,%s,%s%c%s,%s\n", processName.str(),
                  pComponent->queryProp("@name"), netAddr.str(), port.str(),
-                 STANDARD_OUTDIR, PATHSEPCHAR, pComponent->queryProp("@name"), pComponent->queryProp("@logDir"));
+                 hpccBuildInfo.runtimeDir, PATHSEPCHAR, pComponent->queryProp("@name"), pComponent->queryProp("@logDir"));
           }
         }
         else 
@@ -745,7 +748,7 @@ int processRequest(const char* in_cfgname, const char* out_dirname, const char* 
           port.clear().append(pComponent->queryProp("@port"));
           out.appendf("%s,%s,%s,%s,%s%c%s,%s\n", pComponent->queryName(), 
             pComponent->queryProp("@name"), netAddr.str(), port.str(), 
-              STANDARD_OUTDIR, PATHSEPCHAR, pComponent->queryProp("@name"), pComponent->queryProp("@logDir"));
+              hpccBuildInfo.runtimeDir, PATHSEPCHAR, pComponent->queryProp("@name"), pComponent->queryProp("@logDir"));
         }
       }
     }
@@ -760,11 +763,13 @@ int main(int argc, char** argv)
 {
   InitModuleObjects();
 
+  configXmlDir = std::string(hpccBuildInfo.componentDir) + "/configxml";
+
   Owned<IProperties> globals = createProperties(true);
   const char* in_filename = NULL;
   const char* in_cfgname = NULL;
-  const char* out_dirname = STANDARD_OUTDIR;
-  const char* in_dirname = STANDARD_INDIR;
+  const char* out_dirname = hpccBuildInfo.runtimeDir;
+  const char* in_dirname = configXmlDir.c_str();
   const char* out_filename = NULL;
   const char* compName = NULL;
   const char* compType = NULL;
@@ -822,7 +827,7 @@ int main(int argc, char** argv)
         if (ip.isLoopBack())                // assume they meant any local ip... not sure this is a good idea
           ipAddr.append('.');
         else
-          ip.getIpText(ipAddr);
+          ip.getHostText(ipAddr);
       }
     }
     else if(stricmp(argv[i], "-od") == 0)

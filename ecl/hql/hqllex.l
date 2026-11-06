@@ -655,7 +655,7 @@ ALL                 { RETURNSYM(ALL); }
 ALLNODES            { RETURNSYM(ALLNODES); }
 ANY                 { RETURNSYM(ANY); }
 APPLY               { RETURNSYM(APPLY); }
-_ARRAY_             { RETURNSYM(_ARRAY_); }
+_ARRAY_             { RETURNSYM(TOK_ARRAY); }
 AS                  { RETURNSYM(AS); }
 ASCII               { RETURNSYM(ASCII); }
 ASIN                { RETURNSYM(ASIN); }
@@ -715,6 +715,7 @@ DISTRIBUTION        { RETURNSYM(DISTRIBUTION); }
 DIV                 { RETURNSYM(DIV); }
 DYNAMIC             { RETURNSYM(DYNAMIC); }
 EBCDIC              { RETURNSYM(EBCDIC); }
+ECLAGENT            { RETURNSYM(ECLAGENT); }
 ECLCRC              { RETURNSYM(ECLCRC); }
 ELSE                { RETURNSYM(ELSE); }
 ELSIF               { RETURNSYM(ELSEIF); }
@@ -751,6 +752,7 @@ FILTERED            { RETURNSYM(FILTERED); }
 FIRST               { RETURNSYM(FIRST); }
 FIXED               { RETURNSYM(TOK_FIXED); }
 FLAT                { RETURNSYM(FLAT); }
+FORMENCODED         { RETURNSYM(FORMENCODED); }             // Dynamically enabled based on the context
 FORMAT              { RETURNSYM(FORMAT_ATTR); }             // Dynamically enabled based on the context
 FORWARD             { RETURNSYM(FORWARD); }
 FROM                { RETURNSYM(FROM); }
@@ -760,6 +762,7 @@ FROMXML             { RETURNSYM(FROMXML); }
 FULL                { RETURNSYM(FULL); }
 FUNCTION            { RETURNHARD(FUNCTION); }
 GETENV              { RETURNSYM(GETENV); }
+GETSECRET           { RETURNSYM(GETSECRET); }
 GLOBAL              { RETURNSYM(GLOBAL); }
 GRAPH               { RETURNSYM(GRAPH); }
 GROUP               { RETURNSYM(GROUP); }
@@ -801,6 +804,7 @@ LABEL               { RETURNSYM(LABEL); }
 LAST                { RETURNSYM(LAST); }
 LEFT                { RETURNSYM(LEFT); }
 LENGTH              { RETURNSYM(LENGTH); }
+LENGTHSIZE          { RETURNSYM(LENGTHSIZE); }
 LIBRARY             { RETURNSYM(LIBRARY); }
 LIKELY              { RETURNSYM(LIKELY); }
 LIMIT               { RETURNSYM(LIMIT); }
@@ -911,6 +915,7 @@ RECORDOF            { RETURNSYM(RECORDOF); }
 RECOVERY            { RETURNSYM(RECOVERY); }
 REFRESH             { RETURNSYM(REFRESH); }
 REGEXFIND           { RETURNSYM(REGEXFIND); }
+REGEXEXTRACT        { RETURNSYM(REGEXEXTRACT); }
 REGEXFINDSET        { RETURNSYM(REGEXFINDSET); }
 REGEXREPLACE        { RETURNSYM(REGEXREPLACE); }
 REGROUP             { RETURNSYM(REGROUP); }
@@ -990,6 +995,7 @@ TRIM                { RETURNSYM(TRIM); }
 TRUNCATE            { RETURNSYM(TRUNCATE); }
 TYPE                { RETURNSYM(TYPE); }
 TYPEOF              { RETURNSYM(TYPEOF); }
+UNCOMPRESSED        { RETURNSYM(UNCOMPRESSED); }
 UNICODEORDER        { RETURNSYM(UNICODEORDER); }
 UNGROUP             { RETURNSYM(UNGROUP); }
 UNLIKELY            { RETURNSYM(UNLIKELY); }
@@ -1073,6 +1079,10 @@ __STAND_ALONE__     {
                         return (__STAND_ALONE__);
                     }
 __TARGET_PLATFORM__ { RETURNSYM(__TARGET_PLATFORM__); }
+
+__CONTAINERIZED__   {   setupdatepos;
+                        return isContainerized() ? TOK_TRUE : TOK_FALSE;
+                    }
 
 {percent}{alphanumcolon}*{percent} {
                         setupdatepos;
@@ -1168,7 +1178,7 @@ DATA{digit}*        {
                         if (!(likely(lookupFlags & LEXresolve)))
                             return lookupIdentifierToken(returnToken, lexer, lookupFlags, activeState, CUR_TOKEN_TEXT);
 
-                      unsigned size = lexer->getTypeSize(4);
+                      unsigned size = lexer->getTypeSize(returnToken, 4);
                       ITypeInfo *dataType = makeDataType(size);
                       if (!dataType)
                       {
@@ -1183,15 +1193,15 @@ STRING{digit}*      {
                         if (!(likely(lookupFlags & LEXresolve)))
                             return lookupIdentifierToken(returnToken, lexer, lookupFlags, activeState, CUR_TOKEN_TEXT);
 
-                      unsigned size = lexer->getTypeSize(6);
-                      ITypeInfo *strType = makeStringType(size,NULL,NULL);
-                      if (!strType)
-                      {
+                        unsigned size = lexer->getTypeSize(returnToken, 6);
+                        ITypeInfo *strType = makeStringType(size,NULL,NULL);
+                        if (!strType)
+                        {
                             lexer->reportError(returnToken, ERR_ILLSIZE_STRING, "Invalid size for STRING type");
                             strType = makeStringType(1, NULL, NULL);
-                      }
-                      returnToken.setType(strType);
-                      return(SIMPLE_TYPE);
+                        }
+                        returnToken.setType(strType);
+                        return(SIMPLE_TYPE);
                     }
 UNICODE(_{letter}+)?{digit}* {
                       //Note letter includes _ so this include en_US etc.
@@ -1209,7 +1219,7 @@ UNICODE(_{letter}+)?{digit}* {
                           getNormalizedLocaleName(digitstart-8, CUR_TOKEN_TEXT+8, locale);
                       }
 
-                      unsigned length = lexer->getTypeSize(digitstart);
+                      unsigned length = lexer->getTypeSize(returnToken, digitstart);
                       ITypeInfo *uniType = makeUnicodeType(length, createLowerCaseAtom(locale.str()));
                       if (!uniType)
                       {
@@ -1237,7 +1247,7 @@ UTF8(_{letter}+)?(_{digit}+)? {
 
                       if(CUR_TOKEN_TEXT[digitstart] == '_')
                           digitstart++;
-                      unsigned length = lexer->getTypeSize(digitstart);
+                      unsigned length = lexer->getTypeSize(returnToken, digitstart);
                       ITypeInfo *uniType = makeUtf8Type(length, createLowerCaseAtom(locale.str()));
                       if (!uniType)
                       {
@@ -1252,7 +1262,7 @@ VARSTRING{digit}*   {
                         if (!(likely(lookupFlags & LEXresolve)))
                             return lookupIdentifierToken(returnToken, lexer, lookupFlags, activeState, CUR_TOKEN_TEXT);
 
-                      unsigned size = lexer->getTypeSize(9);
+                      unsigned size = lexer->getTypeSize(returnToken, 9);
                       ITypeInfo *vStrType = makeVarStringType(size);
                       if (!vStrType)
                       {
@@ -1277,7 +1287,7 @@ VARUNICODE(_{letter}+)?{digit}* {
                           getNormalizedLocaleName(digitstart-11, CUR_TOKEN_TEXT+11, locale);
                       }
 
-                      unsigned length = lexer->getTypeSize(digitstart);
+                      unsigned length = lexer->getTypeSize(returnToken, digitstart);
                       ITypeInfo *vUniType = makeVarUnicodeType(length, createLowerCaseAtom(locale.str()));
                       if(!vUniType)
                       {
@@ -1292,8 +1302,8 @@ QSTRING{digit}*     {
                         if (!(likely(lookupFlags & LEXresolve)))
                             return lookupIdentifierToken(returnToken, lexer, lookupFlags, activeState, CUR_TOKEN_TEXT);
 
-                      unsigned size = lexer->getTypeSize(7);
-                      ITypeInfo * type = makeQStringType(size);
+                      unsigned length = lexer->getTypeSize(returnToken, 7);
+                      ITypeInfo * type = makeQStringType(length);
                       assertex(type);
                       returnToken.setType(type);
                       return(SIMPLE_TYPE);
@@ -1535,7 +1545,9 @@ FUNCTIONMACRO|MACRO {
                         Owned<IFileContents> macroContents;
                         if (!isFunctionMacro)
                         {
-                            macroContents.setown(createFileContentsFromText(len, lexer->yyBuffer+startpos, lexer->sourcePath, lexer->yyParser->inSignedModule, lexer->yyParser->gpgSignature, 0));
+                            // Propogate isImplicitlySigned to child IFileContents 
+                            bool contentsIsSigned = lexer->yyParser->insideSignedMacro();
+                            macroContents.setown(createFileContentsFromText(len, lexer->yyBuffer+startpos, lexer->sourcePath, contentsIsSigned, lexer->yyParser->gpgSignature, 0));
 #if defined(TRACE_TOKEN)
                             PrintLog("TOKEN>> macro body read: \"%.*s\"", len, lexer->yyBuffer+startpos);
 #endif
@@ -1552,7 +1564,9 @@ FUNCTIONMACRO|MACRO {
                             memcpy(macroBuf, prefix, lenPrefix);
                             memcpy(macroBuf + lenPrefix, lexer->yyBuffer+startpos, len);
                             memcpy(macroBuf + lenPrefix + len, suffix, lenSuffix);
-                            macroContents.setown(createFileContentsFromText(lenSuffix + len + lenPrefix, macroBuf, lexer->sourcePath,lexer->yyParser->inSignedModule, lexer->yyParser->gpgSignature, 0));
+                            // Propogate isImplicitlySigned to child IFileContents 
+                            bool contentsIsSigned = lexer->yyParser->insideSignedMacro();
+                            macroContents.setown(createFileContentsFromText(lenSuffix + len + lenPrefix, macroBuf, lexer->sourcePath, contentsIsSigned, lexer->yyParser->gpgSignature, 0));
 #if defined(TRACE_TOKEN)
                             PrintLog("TOKEN>> macro body read: \"%.*s\"",len+lenPrefix+lenSuffix, macroBuf);
 #endif
@@ -1654,8 +1668,8 @@ FUNCTIONMACRO|MACRO {
                             int len = endpos-startpos;
                             Owned<IValue> unicodeValue;
                             // Special handling required for trailing \ char which suppresses the following linefeed, as unicode unescape does not handle it
-                            StringBuffer source(len, lexer->yyBuffer+startpos);
-                            source.replaceString("\\\n","");
+                            StringBuffer source;
+                            lexer->stripSlashNewline(returnToken, source, len, lexer->yyBuffer+startpos);
                             if (isUtf8)
                             {
                                 size32_t chars = rtlUtf8Length(source.length(), source.str());
@@ -1909,9 +1923,9 @@ FUNCTIONMACRO|MACRO {
                         setupdatepos;
                         if (likely(lookupFlags & LEXstring))
                         {
-                            unsigned len = (CUR_TOKEN_LENGTH-3)/2;    // round sign
-                            char *data =(char *)malloc(len+1);
-                            hex2str(data, (char *)CUR_TOKEN_TEXT+2, CUR_TOKEN_LENGTH-3);
+                            unsigned len = (CUR_TOKEN_LENGTH-3+1)/2;
+                            char *data =(char *)malloc(len);
+                            hex2str(data, (const char *)CUR_TOKEN_TEXT+2, CUR_TOKEN_LENGTH-3);
                             returnToken.setExpr(createConstant(createDataValue(data, len)));
                             free(data);
                         }
@@ -1924,18 +1938,13 @@ FUNCTIONMACRO|MACRO {
 
                         if (likely(lookupFlags & LEXstring))
                         {
-                            lexer->reportWarning(CategorySyntax, returnToken, ERR_HEXDATA_ODDDIGITS,"hex data must have even number of hex digits");
-                            char* str = (char*)malloc(CUR_TOKEN_LENGTH-1);
-                            str[0] = '0'; // add a leading zero
-                            strncpy(str+1,(char*)CUR_TOKEN_TEXT+2,CUR_TOKEN_LENGTH-3);
-                            str[CUR_TOKEN_LENGTH-2] = 0;
-                            unsigned len = (CUR_TOKEN_LENGTH-2)/2;    // round sign
-                            char *data =(char *)malloc(len+1);
-
-                            hex2str(data, str, CUR_TOKEN_LENGTH-2);
+                            //Could common up, because except for this warning this code is identical to the token above...
+                            lexer->reportWarning(CategorySyntax, returnToken, ERR_HEXDATA_ODDDIGITS,"hex data should have an even number of hex digits");
+                            unsigned len = (CUR_TOKEN_LENGTH-3+1)/2;    // round up
+                            char *data =(char *)malloc(len);
+                            hex2str(data, CUR_TOKEN_TEXT+2, CUR_TOKEN_LENGTH-3);
                             returnToken.setExpr(createConstant(createDataValue(data, len)));
                             free(data);
-                            free(str);
                         }
                         return (DATA_CONST);
                     }
@@ -1956,12 +1965,7 @@ FUNCTIONMACRO|MACRO {
                             msg.append("hex data can only contains 0-9a-fA-F: ");
                             msg.append(CUR_TOKEN_TEXT);
                             lexer->reportError(returnToken, ERR_HEXDATA_ILL, "%s", msg.str());
-
-                            // recovering
-                            char data[2], str[3] = "00";
-
-                            hex2str((char*)data, (char*)str, 2);
-                            returnToken.setExpr(createConstant(createDataValue(data, 2)));
+                            returnToken.setExpr(createConstant(createDataValue(nullptr, 0U)));
                         }
                         return (DATA_CONST);
                     }

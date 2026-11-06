@@ -50,7 +50,8 @@ ADD_DEFINITIONS( -D_USRDLL -DDAFSCLIENT_EXPORTS )
 HPCC_ADD_LIBRARY( dafsclient SHARED ${SRCS}  )
 install ( TARGETS dafsclient RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
 
-target_link_libraries ( dafsclient 
+target_link_libraries ( dafsclient PRIVATE
+    eclrtl
     jlib
     jhtree 
     hql   
@@ -58,8 +59,12 @@ target_link_libraries ( dafsclient
     remote
     )
 
+if (CMAKE_DL_LIBS)
+    target_link_libraries ( dafsclient PRIVATE ${CMAKE_DL_LIBS} )
+endif()
+
 IF (USE_OPENSSL)
-    target_link_libraries ( dafsclient 
+    target_link_libraries ( dafsclient PRIVATE
     	securesocket
     )
 ENDIF()

@@ -1,5 +1,5 @@
-﻿################################################################################
-#    HPCC SYSTEMS software Copyright (C) 2019 HPCC Systems®.
+################################################################################
+#    HPCC SYSTEMS software Copyright (C) 2018 HPCC Systems®.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -18,15 +18,16 @@
 #  This CMakeLists intended to be used in docs/PT_BR
 #    Refactored for internationalization
 ###
-#    Last Mod GP 5/2019
-#  Removed ECL Plugin For Eclipse
-####################
-#
+# Last Mod GP 11/2023
+#  Removed AWS
+#  Removed HPCC in a VM
+#  Removed Monitoring  
+#  Removed ECLWatch  
+#####################
 # Doc dirs to include.
 #
 
 
-cmake_minimum_required(VERSION 2.8)
 PROJECT(docs_pt_br)
 
 #define_property(GLOBAL PROPERTY DOC_TARGETS BRIEF_DOCS "docs_pt_br" FULL_DOCS "docs_pt_br")
@@ -70,28 +71,21 @@ add_subdirectory(HPCCClientTools)
 add_subdirectory(HPCCCertify)
 add_subdirectory(HPCCDataHandling)
 add_subdirectory(HPCCDataTutorial)
-add_subdirectory(HPCCMonitoring)
+
 add_subdirectory(HPCCSystemAdmin)
 add_subdirectory(HPCCSpark)
-add_subdirectory(IMDB)
-add_subdirectory(InstantCloud)
 add_subdirectory(Installing_and_RunningTheHPCCPlatform)
 add_subdirectory(RoxieReference)
-add_subdirectory(RunningHPCCinaVirtualMachine)
-
-#add_subdirectory(ECLPluginForEclipse)
 add_subdirectory(ECLScheduler)
-add_subdirectory(ECLWatch)
+#add_subdirectory(ECLWatch)
 add_subdirectory(VisualizingECL)
-#9/16
 add_subdirectory(WsSQLUG)
-#add_subdirectory(PortalHTML)
-
+##add_subdirectory(PortalHTML)
+add_subdirectory(ContainerizedHPCC)
 
 
 
 # Docs automation
-##CommentedOut4PT_BR_TESTING
 ##if (DOCS_AUTO)
 #   add_subdirectory(XMLGeneration)
 ##   add_subdirectory(ConfiguringHPCC)

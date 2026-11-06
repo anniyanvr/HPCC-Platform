@@ -1,15 +1,12 @@
-import * as arrayUtil from "dojo/_base/array";
-import * as lang from "dojo/_base/lang";
-import * as QueryResults from "dojo/store/util/QueryResults";
+import { arrayUtil, lang, QueryResults } from "src-dojo/index";
 import { UndefinedMemory } from "./ESPUtil";
 
 export class GraphStore extends UndefinedMemory {
-    idProperty: string;
+
     cacheColumns = {};
 
     constructor(idProperty: string = "id") {
-        super();
-        this.idProperty = idProperty;
+        super(idProperty);
     }
 
     setData(data) {
@@ -118,11 +115,10 @@ export class GraphStore extends UndefinedMemory {
 }
 
 export class GraphTreeStore extends GraphStore {
-    idProperty = "id";
 
     //  Store API  ---
     constructor() {
-        super();
+        super("id");
     }
 
     query(query, options) {

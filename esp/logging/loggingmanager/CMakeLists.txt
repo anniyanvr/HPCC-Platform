@@ -52,7 +52,7 @@ include_directories (
     ./..
 )
 
-ADD_DEFINITIONS( -D_USRDLL -DLOGGINGCOMMON_EXPORTS -DLOGGINGMANAGER_EXPORTS )
+ADD_DEFINITIONS( -D_USRDLL -DLOGGINGCOMMON_EXPORTS -DLOGGINGMANAGER_EXPORTS -DWSLOGGING_API_LOCAL )
 
 if (RELEASE_BUILD EQUAL 1)
     ADD_DEFINITIONS( -DISC_NO_MAIN)
@@ -64,10 +64,13 @@ add_dependencies( loggingmanager espscm )
 
 install ( TARGETS loggingmanager RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
 
-target_link_libraries ( loggingmanager
-    ${XALAN_LIBRARIES} ${XERCES_LIBRARIES}
+target_link_libraries ( loggingmanager PRIVATE
     jlib
     xmllib
     logginglib
     esphttp
 )
+
+if (CMAKE_DL_LIBS)
+    target_link_libraries ( loggingmanager PRIVATE ${CMAKE_DL_LIBS} )
+endif()

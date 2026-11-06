@@ -26,10 +26,11 @@
 #include "mpbuff.hpp"
 #include "mptag.hpp"
 
+const unsigned MPVerboseMsgThreshold = 110; // greater than default logging detail
+
 // timeout values
 #define MP_WAIT_FOREVER ((unsigned)-1)
 #define MP_ASYNC_SEND   ((unsigned)-2)
-
 
 interface ICommunicator: extends IInterface
 {
@@ -53,7 +54,7 @@ interface ICommunicator: extends IInterface
 
     virtual void flush  (mptag_t tag) = 0;    // flushes pending buffers
 
-    virtual bool verifyConnection(rank_t rank, unsigned timeout=1000*60*5) = 0; // verifies connected to rank
+    virtual bool verifyConnection(rank_t rank, unsigned timeout=1000*60*5, bool allowConnect=true) = 0; // verifies connected to rank
     virtual bool verifyAll(bool duplex=false, unsigned timeout=1000*60*30, unsigned perConnectionTimeout=0) = 0;
     virtual void disconnect(INode *node) = 0;
     virtual void barrier() = 0;
@@ -106,7 +107,7 @@ interface IMPServer : extends IInterface
 
 extern mp_decl void startMPServer(unsigned port, bool paused=false, bool listen=false);
 extern mp_decl void startMPServer(unsigned __int64 role, unsigned port, bool paused=false, bool listen=false);
-extern mp_decl void stopMPServer();
+extern mp_decl void stopMPServer(bool dumpQueue=true);
 extern mp_decl IMPServer *getMPServer();
 extern mp_decl IMPServer *startNewMPServer(unsigned port, bool listen=false);
 

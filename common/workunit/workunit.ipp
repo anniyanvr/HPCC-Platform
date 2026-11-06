@@ -29,11 +29,10 @@
 
 class WORKUNIT_API CLocalWUAppValue : implements IConstWUAppValue, public CInterface
 {
-    Owned<IPropertyTree> p;
-    StringAttr prop;
+    Owned<const IPropertyTree> owner, props;
 public:
     IMPLEMENT_IINTERFACE;
-    CLocalWUAppValue(IPropertyTree *p,unsigned child);
+    CLocalWUAppValue(const IPropertyTree *_owner, const IPropertyTree *_props);
 
     virtual const char *queryApplication() const;
     virtual const char *queryName() const;
@@ -43,11 +42,11 @@ public:
 
 class WORKUNIT_API CLocalWUStatistic : implements IConstWUStatistic, public CInterface
 {
-    Owned<IPropertyTree> p;
+    Owned<const IPropertyTree> p;
 public:
     IMPLEMENT_IINTERFACE;
 
-    CLocalWUStatistic(IPropertyTree *p);
+    CLocalWUStatistic(const IPropertyTree *p);
 
     virtual IStringVal & getCreator(IStringVal & str) const override;
     virtual IStringVal & getDescription(IStringVal & str, bool createDefault) const override;
@@ -66,7 +65,7 @@ public:
 
 //==========================================================================================
 
-template <typename T, typename IT> struct CachedTags
+template <typename T, typename IT, void (* ADD)(const IPropertyTree *p, IArrayOf<IT> &dst)> struct CachedTags
 {
     CachedTags(): cached(false) {}
     void load(IPropertyTree* p,const char* xpath)
@@ -77,9 +76,8 @@ template <typename T, typename IT> struct CachedTags
             Owned<IPropertyTreeIterator> r = p->getElements(xpath);
             for (r->first(); r->isValid(); r->next())
             {
-                IPropertyTree *rp = &r->query();
-                rp->Link();
-                tags.append(*new T(rp));
+                const IPropertyTree &rp = r->query();
+                ADD(&rp, tags); // NB: links items it adds
             }
             cached = true;
         }
@@ -96,22 +94,22 @@ template <typename T, typename IT> struct CachedTags
                 Owned<IPropertyTreeIterator> r = branch->getElements("*");
                 for (r->first(); r->isValid(); r->next())
                 {
-                    IPropertyTree *rp = &r->query();
-                    rp->Link();
-                    tags.append(*new T(rp));
+                    const IPropertyTree &rp = r->query();
+                    ADD(&rp, tags); // NB: links items it adds
                 }
             }
             cached = true;
         }
     }
-    void append(IPropertyTree * p)
-    {
-        tags.append(*new T(p));
-    }
 
     operator IArrayOf<IT>&() { return tags; }
     unsigned ordinality() const { return tags.ordinality(); }
     IT & item(unsigned i) const { return tags.item(i); }
+
+    void append(const IPropertyTree * p)
+    {
+        ADD(p, tags); // NB: links p
+    }
 
     void kill()
     {
@@ -123,66 +121,21 @@ template <typename T, typename IT> struct CachedTags
     IArrayOf<IT> tags;
 };
 
-template <>  struct CachedTags<CLocalWUAppValue, IConstWUAppValue>
+void addStatistic(const IPropertyTree * p, IArrayOf<IConstWUStatistic> &dst)
 {
-    CachedTags(): cached(false) {}
-    void load(IPropertyTree* p,const char* xpath)
-    {
-        if (!cached)
-        {
-            assertex(tags.length() == 0);
-            Owned<IPropertyTreeIterator> r = p->getElements(xpath);
-            for (r->first(); r->isValid(); r->next())
-            {
-                IPropertyTree *rp = &r->query();
-                Owned<IPropertyTreeIterator> v = rp->getElements("*");
-                unsigned pos = 1;
-                for (v->first(); v->isValid(); v->next())
-                {
-                    rp->Link();
-                    tags.append(*new CLocalWUAppValue(rp,pos++));
-                }
-            }
-            cached = true;
-        }
-    }
-    void loadBranch(IPropertyTree* p,const char* xpath)
-    {
-        if (!cached)
-        {
-            assertex(tags.length() == 0);
-            Owned<IPropertyTree> branch = p->getBranch(xpath);
-            if (branch)
-            {
-                Owned<IPropertyTreeIterator> r = branch->getElements("*");
-                for (r->first(); r->isValid(); r->next())
-                {
-                    IPropertyTree *rp = &r->query();
-                    Owned<IPropertyTreeIterator> v = rp->getElements("*");
-                    unsigned pos = 1;
-                    for (v->first(); v->isValid(); v->next())
-                    {
-                        rp->Link();
-                        tags.append(*new CLocalWUAppValue(rp,pos++));
-                    }
-                }
-            }
-            cached = true;
-        }
-    }
+    dst.append(*new CLocalWUStatistic(&OLINK(*p)));
+}
 
+void addWUAppValues(const IPropertyTree *p, IArrayOf<IConstWUAppValue> &dst)
+{
+    Owned<IPropertyTreeIterator> v = p->getElements("*");
+    for (v->first(); v->isValid(); v->next())
+        dst.append(*new CLocalWUAppValue(&OLINK(*p), &v->get()));
+}
 
-    operator IArrayOf<IConstWUAppValue>&() { return tags; }
+typedef CachedTags<CLocalWUStatistic, IConstWUStatistic, addStatistic> CachedStatistics;
+typedef CachedTags<CLocalWUStatistic, IConstWUAppValue, addWUAppValues> CachedWUAppValues;
 
-    void kill()
-    {
-        cached = false;
-        tags.kill();
-    }
-
-    bool cached;
-    IArrayOf<IConstWUAppValue> tags;
-};
 
 //==========================================================================================
 
@@ -190,19 +143,22 @@ class WORKUNIT_API CLocalWorkUnit : implements IWorkUnit , implements IExtendedW
 {
     friend StringBuffer &exportWorkUnitToXML(const IConstWorkUnit *wu, StringBuffer &str, bool decodeGraphs, bool includeProgress, bool hidePasswords);
     friend void exportWorkUnitToXMLFile(const IConstWorkUnit *wu, const char * filename, unsigned extraXmlFlags, bool decodeGraphs, bool includeProgress, bool hidePasswords, bool regressionTest);
+    friend class CLocalWUGraph;
 
 protected:
     Owned<IPropertyTree> p;
-    mutable CriticalSection crit;
+    mutable CriticalSection crit{SYNC_LOCATION};
     mutable Owned<IWUQuery> query;
     mutable Owned<IWUWebServicesInfo> webServicesInfo;
     mutable Owned<IWorkflowItemIterator> workflowIterator;
+    mutable Owned<IPropertyTree> indirectTree;
     mutable bool workflowIteratorCached;
     mutable bool resultsCached;
     mutable unsigned char graphsCached;  // 0 means uncached, 1 means light, 2 means heavy
     mutable bool temporariesCached;
     mutable bool variablesCached;
     mutable bool exceptionsCached;
+    mutable StringAttr failMessage;
     mutable bool pluginsCached;
     mutable bool librariesCached;
     mutable bool activitiesCached;
@@ -215,23 +171,24 @@ protected:
     mutable IArrayOf<IWUResult> results;
     mutable IArrayOf<IWUResult> temporaries;
     mutable IArrayOf<IWUResult> variables;
-    mutable CachedTags<CLocalWUAppValue,IConstWUAppValue> appvalues;
-    mutable CachedTags<CLocalWUStatistic,IConstWUStatistic> statistics;
+    mutable CachedWUAppValues appvalues;
+    mutable CachedStatistics statistics;
     mutable Owned<IUserDescriptor> userDesc;
-    Mutex locked;
+    Mutex locked{SYNC_LOCATION};
     Owned<ISecManager> secMgr;
     Owned<ISecUser> secUser;
 
 protected:
-    
+
 public:
     IMPLEMENT_IINTERFACE;
 
     CLocalWorkUnit(ISecManager *secmgr, ISecUser *secuser);
     void loadPTree(IPropertyTree *ptree);
     void beforeDispose();
-    
+
     IPropertyTree *getUnpackedTree(bool includeProgress) const;
+    IPropertyTree *queryMergedTree() const;
 
     ISecManager *querySecMgr() { return secMgr.get(); }
     ISecUser *querySecUser() { return secUser.get(); }
@@ -240,6 +197,7 @@ public:
     virtual void forceReload() {};
     virtual WUAction getAction() const;
     virtual const char *queryActionDesc() const;
+    virtual const char *queryFailMessage() const;
     virtual IStringVal & getApplicationValue(const char * application, const char * propname, IStringVal & str) const;
     virtual int getApplicationValueInt(const char * application, const char * propname, int defVal) const;
     virtual IConstWUAppValueIterator & getApplicationValues() const;
@@ -276,7 +234,7 @@ public:
     virtual void setGraphState(const char *graphName, unsigned wfid, WUGraphState state) const;
     virtual void setNodeState(const char *graphName, WUGraphIDType nodeId, WUGraphState state) const;
     virtual WUGraphState queryNodeState(const char *graphName, WUGraphIDType nodeId) const;
-    virtual IWUGraphStats *updateStats(const char *graphName, StatisticCreatorType creatorType, const char * creator, unsigned _wfid, unsigned subgraph) const override;
+    virtual IWUGraphStats *updateStats(const char *graphName, StatisticCreatorType creatorType, const char * creator, unsigned _wfid, unsigned subgraph, bool merge) const override;
     void clearGraphProgress() const;
     virtual void import(IPropertyTree *wuTree, IPropertyTree *graphProgressTree) {}; //No GraphProgressTree in CLocalWorkUnit.
 
@@ -285,6 +243,7 @@ public:
     virtual IConstWUPluginIterator & getPlugins() const;
     virtual IConstWULibraryIterator & getLibraries() const;
     virtual WUPriorityClass getPriority() const;
+    virtual double getCost() const;
     virtual const char *queryPriorityDesc() const;
     virtual int getPriorityLevel() const;
     virtual int getPriorityValue() const;
@@ -300,6 +259,7 @@ public:
     virtual WUState getState() const;
     virtual IStringVal & getStateEx(IStringVal & str) const;
     virtual __int64 getAgentSession() const;
+    virtual __int64 getEngineSession() const;
     virtual unsigned getAgentPID() const;
     virtual const char *queryStateDesc() const;
     virtual IConstWUResult * getTemporaryByName(const char * name) const;
@@ -311,6 +271,7 @@ public:
     virtual const IPropertyTree *getXmlParams() const;
     virtual unsigned __int64 getHash() const;
     virtual IStringIterator *getLogs(const char *type, const char *component) const;
+    virtual IPropertyTreeIterator *getProcessTypes() const;
     virtual IStringIterator *getProcesses(const char *type) const;
     virtual IPropertyTreeIterator* getProcesses(const char *type, const char *instance) const;
     virtual IStringVal & getSnapshot(IStringVal & str) const;
@@ -325,6 +286,7 @@ public:
     virtual bool isProtected() const;
     virtual bool isPausing() const;
     virtual IWorkUnit& lock();
+    virtual IConstWorkUnit *unlock();
     virtual void requestAbort();
     virtual unsigned calculateHash(unsigned prevHash);
     virtual void copyWorkUnit(IConstWorkUnit *cached, bool copyStats, bool all);
@@ -338,7 +300,6 @@ public:
     virtual unsigned getCodeVersion() const;
     virtual unsigned getWuidVersion() const;
     virtual void getBuildVersion(IStringVal & buildVersion, IStringVal & eclVersion) const;
-    virtual IPropertyTree * getDiskUsageStats();
     virtual IPropertyTreeIterator & getFileIterator() const;
     virtual bool archiveWorkUnit(const char *base,bool del,bool ignoredllerrors,bool deleteOwned,bool exportAssociatedFiles);
     virtual IJlibDateTime & getTimeScheduled(IJlibDateTime &val) const;
@@ -350,11 +311,16 @@ public:
     virtual unsigned getTotalThorTime() const;
     virtual IStringVal & getAbortBy(IStringVal & str) const;
     virtual unsigned __int64 getAbortTimeStamp() const;
-
+    virtual IStringVal & getAbortReason(IStringVal & str) const;
+    virtual cost_type getExecuteCost() const;
+    virtual cost_type getFileAccessCost() const;
+    virtual cost_type getCompileCost() const;
+    virtual cost_type getCostSavingPotential() const;
     void clearExceptions(const char *source=nullptr);
     void commit();
     IWUException *createException();
     void addProcess(const char *type, const char *instance, unsigned pid, unsigned max, const char *pattern, bool singleLog, const char *log);
+    bool setContainerizedProcessInfo(const char *type, const char *instance, const char *podName, const char *containerName, const char *graphName, const char *sequence);
     void setAction(WUAction action);
     void setApplicationValue(const char * application, const char * propname, const char * value, bool overwrite);
     void setApplicationValueInt(const char * application, const char * propname, int value, bool overwrite);
@@ -368,12 +334,15 @@ public:
     void setDebugValueInt(const char * propname, int value, bool overwrite);
     void setJobName(const char * value);
     void setPriority(WUPriorityClass cls);
+    void setCost(double cost);
     void setPriorityLevel(int level);
     void setRescheduleFlag(bool value);
     void setResultLimit(unsigned value);
     void setState(WUState state);
     void setStateEx(const char * text);
+    void recordAbortDetails(const char * reason, const char * abortBy);
     void setAgentSession(__int64 sessionId);
+    void setEngineSession(__int64 sessionId);
     bool setDistributedAccessToken(const char * user);
     void setStatistic(StatisticCreatorType creatorType, const char * creator, StatisticScopeType scopeType, const char * scope, StatisticKind kind, const char * optDescription, unsigned __int64 value, unsigned __int64 count, unsigned __int64 maxValue, StatsMergeAction mergeAction);
     void setTracingValue(const char * propname, const char * value);
@@ -414,9 +383,11 @@ public:
     void resetBeforeGeneration();
     void deleteTempFiles(const char *graph, bool deleteOwned, bool deleteJobOwned);
     void deleteTemporaries();
-    void addDiskUsageStats(__int64 avgNodeUsage, unsigned minNode, __int64 minNodeUsage, unsigned maxNode, __int64 maxNodeUsage, __int64 graphId);
     void setTimeScheduled(const IJlibDateTime &val);
     virtual void subscribe(WUSubscribeOptions options) {};
+
+    virtual bool getSummary(SummaryType type, SummaryMap &map) const override;
+    virtual void setSummary(SummaryType type, const SummaryMap &map) override;
 
 // ILocalWorkUnit - used for debugging etc
     void loadXML(const char *xml);
@@ -426,7 +397,7 @@ public:
     IWorkUnit &lockRemote(bool commit);
     void unlockRemote();
     void abort();
-    bool switchThorQueue(const char *cluster, IQueueSwitcher *qs);
+    bool switchThorQueue(const char *cluster, IQueueSwitcher *qs, const char *item);
     void setAllowedClusters(const char *value);
     IStringVal & getAllowedClusters(IStringVal & str) const;
     void remoteCheckAccess(IUserDescriptor *user, bool writeaccess) const;
@@ -629,7 +600,7 @@ public:
         const char *importDir, const char *app, const char *user, ISecManager *secMgr, ISecUser *secUser);
     virtual bool deleteWorkUnit(const char * wuid, ISecManager *secmgr, ISecUser *secuser);
     virtual bool deleteWorkUnitEx(const char * wuid, bool throwException, ISecManager *secmgr, ISecUser *secuser);
-    virtual IConstWorkUnit * openWorkUnit(const char * wuid, ISecManager *secmgr, ISecUser *secuser);
+    virtual IConstWorkUnit * openWorkUnit(const char * wuid, ISecManager *secmgr, ISecUser *secuser, bool expected);
     virtual IWorkUnit * updateWorkUnit(const char * wuid, ISecManager *secmgr, ISecUser *secuser);
     virtual bool restoreWorkUnit(const char *base, const char *wuid, bool restoreAssociated);
     virtual int setTracingLevel(int newlevel);
@@ -660,7 +631,7 @@ public:
     }
 
 protected:
-    void reportAbnormalTermination(const char *wuid, WUState &state, SessionId agent);
+    void reportAbnormalTermination(const char *wuid, WUState &state, SessionId agent, const char *sessionText);
 
     // These need to be implemented by the derived classes
     virtual CLocalWorkUnit* _createWorkUnit(const char *wuid, ISecManager *secmgr, ISecUser *secuser) = 0;
@@ -676,20 +647,20 @@ class WORKUNIT_API CLocalWUGraph : implements IConstWUGraph, public CInterface
     mutable Owned<IPropertyTree> graph; // cached copy of graph xgmml
     unsigned wuidVersion;
 
-    void mergeProgress(IPropertyTree &tree, IPropertyTree &progressTree, const unsigned &progressV) const;
+    void mergeProgress(IPropertyTree &tree, const IPropertyTree &progressTree, const unsigned progressV) const;
 
 public:
     IMPLEMENT_IINTERFACE;
     CLocalWUGraph(const CLocalWorkUnit &owner, IPropertyTree *p);
 
-    virtual IStringVal & getXGMML(IStringVal & ret, bool mergeProgress) const override;
+    virtual IStringVal & getXGMML(IStringVal & ret, bool mergeProgress, bool doFormatStats) const override;
     virtual IStringVal & getName(IStringVal & ret) const override;
     virtual IStringVal & getLabel(IStringVal & ret) const override;
     virtual IStringVal & getTypeName(IStringVal & ret) const override;
     virtual WUGraphType getType() const override;
     virtual WUGraphState getState() const override;
     virtual unsigned getWfid() const override;
-    virtual IPropertyTree * getXGMMLTree(bool mergeProgress) const override;
+    virtual IPropertyTree * getXGMMLTree(bool mergeProgress, bool doFormatStats) const override;
     virtual IPropertyTree * getXGMMLTreeRaw() const override;
 
     void setName(const char *str);
@@ -703,21 +674,22 @@ public:
 class WORKUNIT_API CWuGraphStats : public CInterfaceOf<IWUGraphStats>
 {
 public:
-    CWuGraphStats(IPropertyTree *_progress, StatisticCreatorType _creatorType, const char * _creator, unsigned wfid, const char * _rootScope, unsigned _id);
+    CWuGraphStats(StatisticCreatorType _creatorType, const char * _creator, unsigned wfid, const char * _rootScope, unsigned _id, bool _merge);
     virtual void beforeDispose();
     virtual IStatisticGatherer & queryStatsBuilder();
 protected:
-    Owned<IPropertyTree> progress;
+    virtual IPropertyTree &queryProgressTree() = 0;
     Owned<IStatisticGatherer> collector;
     StringAttr creator;
     StatisticCreatorType creatorType;
     unsigned id;
+    bool merge;
 };
 
 class WORKUNIT_API CWorkUnitWatcher : public CInterface, implements IWorkUnitWatcher, implements ISDSSubscription
 {
 protected:
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     IWorkUnitSubscriber *subscriber; // not linked - it will generally link me
     SubscriptionId abortId, stateId, actionId;
 public:
@@ -730,22 +702,35 @@ public:
 
 class WorkUnitWaiter : public CInterface, implements IAbortHandler, implements IWorkUnitSubscriber
 {
-    Semaphore changed;
+    Semaphore changed{SYNC_LOCATION};
     Owned<IWorkUnitWatcher> watcher;
-    bool aborted;
+    mutable bool aborted = false;
+    mutable bool abortDirty = false;
+    StringAttr wuid;
 public:
     IMPLEMENT_IINTERFACE;
-    WorkUnitWaiter(const char *wuid, WUSubscribeOptions watchFor)
+    WorkUnitWaiter(const char *_wuid, WUSubscribeOptions watchFor) : wuid(_wuid)
     {
         Owned<IWorkUnitFactory> factory = getWorkUnitFactory();
         watcher.setown(factory->getWatcher(this, watchFor, wuid));
-        aborted = false;
+        if (watchFor & SubscribeOptionAbort)
+            abortDirty = true;
     }
     ~WorkUnitWaiter()
     {
         unsubscribe();
     }
-    bool isAborted() const { return aborted; }
+    bool isAborted() const
+    {
+        if (!aborted && abortDirty)
+        {
+            Owned<IWorkUnitFactory> factory = getWorkUnitFactory();
+            if (factory->isAborting(wuid))
+                aborted = true;
+            abortDirty = false;
+        }
+        return aborted;
+    }
     bool wait(unsigned timeout)
     {
         return changed.wait(timeout) && !aborted;
@@ -761,6 +746,8 @@ public:
 // IWorkUnitSubscriber
     virtual void notify(WUSubscribeOptions flags, unsigned valueLen, const void *valueData) override
     {
+        if (SubscribeOptionAbort == flags)
+             abortDirty = true;
         changed.signal();
     }
 // IAbortHandler

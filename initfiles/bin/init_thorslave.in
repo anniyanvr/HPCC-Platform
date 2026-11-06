@@ -44,48 +44,49 @@ slavename=thorslave_${hpcc_compname}
 stop_slaves()
 {
     local timer=15
-    local isAlive=0
-
-    log "Attempting to kill $slavename with SIGTERM"
-    killall -SIGTERM $slavename > /dev/null 2>&1
-    while [[ $isAlive -eq 0 && $timer -gt 0 ]];do
-        killall -0 $slavename > /dev/null 2>&1
-        isAlive=$?
-        [[ $isAlive -eq 0 ]] && sleep 0.5
-        ((timer--))
+    local _pidarray
+    local _pidname
+    
+    _pidarray=($( ls -1 ${PID_DIR} | grep -E "${slavename}_[1-9][0-9]*\.pid" ))
+    for _pidname in ${_pidarray[@]}; do
+        kill_process ${PID_DIR}/$_pidname $slavename $timer
     done
-
-    if [[ $isAlive -eq 0 ]]; then
-        log "Failed to kill slaves with SIGTERM. Sending SIGKILL"
-        killall -SIGKILL $slavename > /dev/null
-    fi
-
-    # need regex here to prevent removing other Thor instance pid files
-    find ${PID_DIR} -maxdepth 1 -type f -regex ".*/${slavename}_[1-9][0-9]*\.pid" -delete > /dev/null 2>&1
+   
 }
 
 start_slaves()
 {
-    killall -0 dafilesrv > /dev/null 2>&1
-    if [[ $? -ne 0 ]];then
-        # insuring dafilesrv is running on the machine as it is a prerequisite
-        dafilesrv_owner=$(stat -c "%U" ${INIT_PATH}/dafilesrv 2>/dev/null || stat -f %Su ${INIT_PATH}/dafilesrv 2>/dev/null)
-        # use full path as with CentOS devtoolset another sudo is found in path
-        # which does not work properly with changes in sudoers.d hpcc file
-        [[ "${dafilesrv_owner}" != "${user}" ]] && cmd_prefix="/usr/bin/sudo"
-        ${cmd_prefix} ${INIT_PATH}/dafilesrv start > /dev/null
-        if [[ $? -ne 0 ]];then
-            exit 1
-        fi
-    fi
-
+    
     # insuring parent directory structure is setup properly
     mkdir -p $instancedir
     mkdir -p $(dirname $logfile)
 
     cd $instancedir
 
-    log "dependency dafilesrv started"
+    log "checking killall dependency"
+    if ! command -v killall > /dev/null 2>&1 ; then
+        log "killall dependency not met. Cannot start thorslaves"
+        exit 1
+    fi
+
+    if [[ "${HPCC_SKIP_DAFILESRV_DEPENDENCY}" = "1" ]]; then
+        log "Skipping dafilesrv dependency check/start (HPCC_SKIP_DAFILESRV_DEPENDENCY=1)"
+    else
+        killall -0 dafilesrv > /dev/null 2>&1
+        if [[ $? -ne 0 ]];then
+            # insuring dafilesrv is running on the machine as it is a prerequisite
+            dafilesrv_owner=$(stat -c "%U" ${INIT_PATH}/dafilesrv 2>/dev/null || stat -f %Su ${INIT_PATH}/dafilesrv 2>/dev/null)
+            # use full path as with CentOS devtoolset another sudo is found in path
+            # which does not work properly with changes in sudoers.d hpcc file
+            [[ "${dafilesrv_owner}" != "${user}" ]] && cmd_prefix="/usr/bin/sudo"
+            ${cmd_prefix} ${INIT_PATH}/dafilesrv start > /dev/null
+            if [[ $? -ne 0 ]];then
+                exit 1
+            fi
+        fi
+
+        log "dependency dafilesrv started"
+    fi
 
     ulimit -Sc hard > /dev/null
     [[ $? -ne 0 ]] && log "Failed to set ulimit for core file size"
@@ -105,7 +106,8 @@ start_slaves()
         rsync_att=3
         rsync_stat=1
         while [[ $rsync_stat -ne 0 && $rsync_att -gt 0 ]] ; do
-            rsync -e "ssh -o LogLevel=QUIET -o StrictHostKeyChecking=no" --timeout=60 $master:$instancedir/slaves $slavesfname
+            # reset LD_LIBRARY_PATH here so ssh cmd doesn't use HPCC libssl/crypto as they may be different
+            LD_LIBRARY_PATH=: rsync -e "ssh -o LogLevel=QUIET -o StrictHostKeyChecking=no" --timeout=60 $master:$instancedir/slaves $slavesfname
             rsync_stat=$?
             ((rsync_att--))
             log "rsync returns ${rsync_stat}"

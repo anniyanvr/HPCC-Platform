@@ -24,13 +24,19 @@
 #define jhtree_decl DECL_IMPORT
 #endif
 
+#include <vector>
+
 #include "jiface.hpp"
 #include "jfile.hpp"
 #include "jlog.hpp"
+#include "jplane.hpp"
 #include "errorlist.h"
+
+enum NodeType : byte;
 
 class BloomFilter;
 interface IIndexFilterList;
+interface IPropertyTree;
 
 interface jhtree_decl IDelayedFile : public IInterface
 {
@@ -38,45 +44,32 @@ interface jhtree_decl IDelayedFile : public IInterface
     virtual IFileIO *getFileIO() = 0;
 };
 
-class KeyStatsCollector
-{
-public:
-    IContextLogger *ctx;
-    unsigned seeks = 0;
-    unsigned scans = 0;
-    unsigned wildseeks = 0;
-    unsigned skips = 0;
-    unsigned nullskips = 0;
-
-    KeyStatsCollector(IContextLogger *_ctx) : ctx(_ctx) {}
-    void reset();
-    void noteSeeks(unsigned lseeks, unsigned lscans, unsigned lwildseeks);
-    void noteSkips(unsigned lskips, unsigned lnullSkips);
-
-};
-
 interface jhtree_decl IKeyCursor : public IInterface
 {
-    virtual bool next(char *dst, KeyStatsCollector &stats) = 0; // MORE - remove
     virtual const char *queryName() const = 0;
     virtual size32_t getSize() = 0;  // Size of current row
     virtual size32_t getKeyedSize() const = 0;  // Size of keyed fields
     virtual void serializeCursorPos(MemoryBuffer &mb) = 0;
-    virtual void deserializeCursorPos(MemoryBuffer &mb, KeyStatsCollector &stats) = 0;
+    virtual void deserializeCursorPos(MemoryBuffer &mb, IContextLogger *ctx) = 0;
     virtual unsigned __int64 getSequence() = 0;
-    virtual const byte *loadBlob(unsigned __int64 blobid, size32_t &blobsize) = 0;
-    virtual void reset() = 0;
-    virtual bool lookup(bool exact, KeyStatsCollector &stats) = 0;
-
-    virtual bool lookupSkip(const void *seek, size32_t seekOffset, size32_t seeklen, KeyStatsCollector &stats) = 0;
+    virtual offset_t getFPos() const = 0;
+    virtual const byte *loadBlob(unsigned __int64 blobid, size32_t &blobsize, IContextLogger *ctx) = 0;
+    virtual void finishSegmentMonitors() = 0;
+    virtual void reset(IContextLogger *ctx) = 0;
+    virtual bool lookup(bool exact, IContextLogger *ctx) = 0;
+    virtual bool next(IContextLogger *ctx) = 0;
+    virtual bool lookupSkip(const void *seek, size32_t seekOffset, size32_t seeklen, IContextLogger *ctx) = 0;
     virtual bool skipTo(const void *_seek, size32_t seekOffset, size32_t seeklen) = 0;
     virtual IKeyCursor *fixSortSegs(unsigned sortFieldOffset) = 0;
+    virtual void setStepping(bool stepping) = 0;
 
-    virtual unsigned __int64 getCount(KeyStatsCollector &stats) = 0;
-    virtual unsigned __int64 checkCount(unsigned __int64 max, KeyStatsCollector &stats) = 0;
-    virtual unsigned __int64 getCurrentRangeCount(unsigned groupSegCount, KeyStatsCollector &stats) = 0;
+    virtual unsigned __int64 getCount(IContextLogger *ctx) = 0;
+    virtual unsigned __int64 checkCount(unsigned __int64 max, IContextLogger *ctx) = 0;
+    virtual unsigned __int64 getCurrentRangeCount(unsigned groupSegCount, IContextLogger *ctx) = 0;
     virtual bool nextRange(unsigned groupSegCount) = 0;
-    virtual const byte *queryKeyBuffer() const = 0;
+    virtual const byte *queryRecordBuffer() const = 0;
+    virtual const byte *queryKeyedBuffer() const = 0;
+    virtual void mergeStats(CRuntimeStatisticCollection & stats) const = 0;
 };
 
 interface IKeyIndex;
@@ -88,12 +81,14 @@ interface jhtree_decl IKeyIndexBase : public IInterface
     virtual bool IsShared() const = 0;
 };
 
+interface INodeLoader;
+interface IKeyIndexPrewarmer;
 interface jhtree_decl IKeyIndex : public IKeyIndexBase
 {
     virtual IKeyCursor *getCursor(const IIndexFilterList *filter, bool logExcessiveSeeks) = 0;
     virtual size32_t keySize() = 0;
     virtual bool isFullySorted() = 0;
-    virtual bool isTopLevelKey() = 0;
+    virtual bool isTopLevelKey() const = 0;
     virtual __uint64 getPartitionFieldMask() = 0;
     virtual unsigned numPartitions() = 0;
     virtual unsigned getFlags() = 0;
@@ -102,18 +97,30 @@ interface jhtree_decl IKeyIndex : public IKeyIndexBase
     virtual unsigned querySeeks() = 0;
     virtual size32_t keyedSize() = 0;
     virtual bool hasPayload() = 0;
-    virtual const char *queryFileName() = 0;
+    virtual const char *queryFileName() const = 0;
+    virtual unsigned queryId() const = 0;
     virtual offset_t queryBlobHead() = 0;
     virtual void resetCounts() = 0;
     virtual offset_t queryLatestGetNodeOffset() const = 0;
     virtual offset_t queryMetadataHead() = 0;
     virtual IPropertyTree * getMetadata() = 0;
+    virtual bool containsBlobs() const = 0;
 
     virtual unsigned getNodeSize() = 0;
     virtual const IFileIO *queryFileIO() const = 0;
     virtual bool hasSpecialFileposition() const = 0;
     virtual bool needsRowBuffer() const = 0;
-    virtual bool prewarmPage(offset_t offset) = 0;
+    virtual void mergeStats(CRuntimeStatisticCollection & stats) const = 0;
+    virtual offset_t queryFirstBranchOffset() = 0;
+    virtual void getFirstBranchOffsets(std::vector<offset_t> & firstBranches) = 0;
+    virtual const BloomFilter * queryBloom(unsigned i) const = 0;
+    virtual IKeyIndexPrewarmer * createPrewarmer() = 0;
+    virtual void ensureReady() = 0; // Ensure the index is loaded and rady for
+};
+
+interface IKeyIndexPrewarmer : extends IInterface
+{
+    virtual bool prewarmPage(offset_t offset, NodeType type) = 0;
 };
 
 interface IKeyArray : extends IInterface
@@ -135,56 +142,51 @@ interface jhtree_decl IKeyIndexSet : public IKeyIndexBase
 
 interface ICacheInfoRecorder
 {
-    virtual void noteWarm(unsigned fileIdx, offset_t page, size32_t len) = 0;
+    virtual void noteWarm(unsigned fileIdx, offset_t page, size32_t len, NodeType type) = 0;
 };
 
 
 extern jhtree_decl void clearKeyStoreCache(bool killAll);
 extern jhtree_decl void clearKeyStoreCacheEntry(const char *name);
 extern jhtree_decl void clearKeyStoreCacheEntry(const IFileIO *io);
-extern jhtree_decl unsigned setKeyIndexCacheSize(unsigned limit);
 extern jhtree_decl void clearNodeCache();
+extern jhtree_decl void logCacheState();
 // these methods return previous values
-extern jhtree_decl bool setNodeCachePreload(bool preload);
-extern jhtree_decl size32_t setNodeCacheMem(size32_t cacheSize);
-extern jhtree_decl size32_t setLeafCacheMem(size32_t cacheSize);
-extern jhtree_decl size32_t setBlobCacheMem(size32_t cacheSize);
+extern jhtree_decl size_t setNodeCacheMem(size_t cacheSize);
+extern jhtree_decl size_t setLeafCacheMem(size_t cacheSize);
+extern jhtree_decl size_t setBlobCacheMem(size_t cacheSize);
+extern jhtree_decl void setNodeFetchThresholdNs(__uint64 thresholdNs);
+extern jhtree_decl void setIndexWarningThresholds(IPropertyTree * options);
 
 extern jhtree_decl void getNodeCacheInfo(ICacheInfoRecorder &cacheInfo);
 
-extern jhtree_decl IKeyIndex *createKeyIndex(const char *filename, unsigned crc, bool isTLK, bool preloadAllowed);
-extern jhtree_decl IKeyIndex *createKeyIndex(const char *filename, unsigned crc, IFileIO &ifile, unsigned fileIdx, bool isTLK, bool preloadAllowed);
-extern jhtree_decl IKeyIndex *createKeyIndex(const char *filename, unsigned crc, IDelayedFile &ifile, unsigned fileIdx, bool isTLK, bool preloadAllowed);
+extern jhtree_decl IKeyIndex *createKeyIndex(const char *filename, unsigned crc, bool isTLK, IndexReadOptions readOptions);
+extern jhtree_decl IKeyIndex *createKeyIndex(const char *filename, unsigned crc, IFileIO &ifile, unsigned fileIdx, bool isTLK, IndexReadOptions readOptions);
+extern jhtree_decl IKeyIndex *createKeyIndex(const char *filename, unsigned crc, IDelayedFile &ifile, unsigned fileIdx, bool isTLK, IndexReadOptions readOptions);
 
 extern jhtree_decl bool isIndexFile(const char *fileName);
 extern jhtree_decl bool isIndexFile(IFile *file);
-extern jhtree_decl void validateKeyFile(const char *keyfile, offset_t nodepos = 0);
 extern jhtree_decl IKeyIndexSet *createKeyIndexSet();
 extern jhtree_decl IKeyArray *createKeyArray();
 extern jhtree_decl StringBuffer &getIndexMetrics(StringBuffer &);
 extern jhtree_decl void resetIndexMetrics();
+extern jhtree_decl void recordEventIndexInformation();
 
 extern jhtree_decl RelaxedAtomic<unsigned> nodesLoaded;
-extern jhtree_decl RelaxedAtomic<unsigned> cacheHits;
-extern jhtree_decl RelaxedAtomic<unsigned> cacheAdds;
-extern jhtree_decl RelaxedAtomic<unsigned> blobCacheHits;
-extern jhtree_decl RelaxedAtomic<unsigned> blobCacheAdds;
-extern jhtree_decl RelaxedAtomic<unsigned> leafCacheHits;
-extern jhtree_decl RelaxedAtomic<unsigned> leafCacheAdds;
-extern jhtree_decl RelaxedAtomic<unsigned> nodeCacheHits;
-extern jhtree_decl RelaxedAtomic<unsigned> nodeCacheAdds;
-extern jhtree_decl RelaxedAtomic<unsigned> preloadCacheHits;
-extern jhtree_decl RelaxedAtomic<unsigned> preloadCacheAdds;
-extern jhtree_decl bool linuxYield;
-extern jhtree_decl bool traceSmartStepping;
+
+extern std::atomic<unsigned __int64> branchSearchCycles;
+extern std::atomic<unsigned __int64> leafSearchCycles;
+
+
+extern jhtree_decl unsigned indexYieldFrequency;
 extern jhtree_decl bool flushJHtreeCacheOnOOM;
 extern jhtree_decl bool useMemoryMappedIndexes;
-extern jhtree_decl void clearNodeStats();
-
+extern jhtree_decl void logNodeCacheStats(const char *prefix);
+extern jhtree_decl void setCheckIndexCrcs(bool check);
 
 #define CHEAP_UCHAR_DEF
 #ifdef _WIN32
-typedef wchar_t UChar;
+typedef char16_t UChar;
 #else //_WIN32
 typedef unsigned short UChar;
 #endif //_WIN32
@@ -199,12 +201,13 @@ class jhtree_decl SegMonitorList : public CInterfaceOf<IIndexFilterList>
 {
     unsigned cachedLRS = 0;
     bool modified = true;
+    bool unfiltered = true;
     const RtlRecord &recInfo;
     unsigned keySegCount;
     IArrayOf<IKeySegmentMonitor> segMonitors;
 
     size32_t getSize() const;
-    unsigned _lastRealSeg() const;
+    unsigned _lastRealSeg();
     SegMonitorList(const SegMonitorList &_from, const char *fixedVals, unsigned sortFieldOffset);
 public:
     SegMonitorList(const RtlRecord &_recInfo);
@@ -221,6 +224,7 @@ public:
     virtual bool incrementKey(unsigned segno, void *keyBuffer) const override;
     virtual void endRange(unsigned segno, void *keyBuffer) const override;
     virtual unsigned lastRealSeg() const override { assertex(!modified); return cachedLRS; }
+    virtual bool isUnfiltered() const override { assertex(!modified); return unfiltered; }
     unsigned lastFullSeg() const override;
     virtual unsigned numFilterFields() const override { return segMonitors.length(); }
     virtual IIndexFilterList *fixSortSegs(const char *fixedVals, unsigned sortFieldOffset) const override
@@ -235,6 +239,8 @@ public:
     virtual bool matchesBuffer(const void *buffer, unsigned lastSeg, unsigned &matchSeg) const override;
     virtual unsigned getFieldOffset(unsigned idx) const override { return recInfo.getFixedOffset(idx); }
     virtual bool canMatch() const override;
+    virtual void updateIndexFormat(const RtlRecord & actualRecInfo) override;
+    virtual bool isSingleValue() const override;
 };
 
 interface IIndexLookup : extends IInterface // similar to a small subset of IKeyManager
@@ -243,10 +249,6 @@ interface IIndexLookup : extends IInterface // similar to a small subset of IKey
     virtual const void *nextKey() = 0;
     virtual unsigned __int64 getCount() = 0;
     virtual unsigned __int64 checkCount(unsigned __int64 limit) = 0;
-    virtual unsigned querySeeks() const = 0;
-    virtual unsigned queryScans() const = 0;
-    virtual unsigned querySkips() const = 0;
-    virtual unsigned queryWildSeeks() const = 0;
 };
 
 interface IKeyManager : public IInterface, extends IIndexReadContext
@@ -256,24 +258,21 @@ interface IKeyManager : public IInterface, extends IIndexReadContext
 
     virtual const byte *queryKeyBuffer() = 0; //if using RLT: fpos is the translated value, so correct in a normal row
     virtual unsigned __int64 querySequence() = 0;
-    virtual size32_t queryRowSize() = 0;     // Size of current row as returned by queryKeyBuffer()
+    virtual offset_t queryFPos() const = 0;   // filepos from current row as returned by queryKeyBuffer()
+    virtual size32_t queryRowSize() = 0;      // Size of current row as returned by queryKeyBuffer()
 
     virtual bool lookup(bool exact) = 0;
     virtual unsigned __int64 getCount() = 0;
     virtual unsigned __int64 getCurrentRangeCount(unsigned groupSegCount) = 0;
     virtual bool nextRange(unsigned groupSegCount) = 0;
-    virtual void setKey(IKeyIndexBase * _key) = 0;
+    virtual void clearKey() = 0;
+    virtual void setKey(IKeyIndexBase * _key, const RtlRecord & actualRecInfo) = 0;
     virtual void setChooseNLimit(unsigned __int64 _rowLimit) = 0; // for choosen type functionality
     virtual unsigned __int64 checkCount(unsigned __int64 limit) = 0;
     virtual void serializeCursorPos(MemoryBuffer &mb) = 0;
     virtual void deserializeCursorPos(MemoryBuffer &mb) = 0;
-    virtual unsigned querySeeks() const = 0;
-    virtual unsigned queryScans() const = 0;
-    virtual unsigned querySkips() const = 0;
-    virtual unsigned queryWildSeeks() const = 0;
-    virtual const byte *loadBlob(unsigned __int64 blobid, size32_t &blobsize) = 0;
+    virtual const byte *loadBlob(unsigned __int64 blobid, size32_t &blobsize, IContextLogger *ctx) = 0;
     virtual void releaseBlobs() = 0;
-    virtual void resetCounts() = 0;
 
     virtual void setLayoutTranslator(const IDynamicTransform * trans) = 0;
     virtual void finishSegmentMonitors() = 0;
@@ -282,14 +281,13 @@ interface IKeyManager : public IInterface, extends IIndexReadContext
     virtual bool lookupSkip(const void *seek, size32_t seekGEOffset, size32_t seeklen) = 0;
     virtual unsigned getPartition() = 0;  // Use PARTITION() to retrieve partno, if possible, or zero to mean read all
 
+    virtual unsigned numActiveKeys() const = 0;
+    virtual void mergeStats(CRuntimeStatisticCollection & stats) const = 0;
 };
 
 inline offset_t extractFpos(IKeyManager * manager)
 {
-    byte const * keyRow = manager->queryKeyBuffer();
-    size32_t rowSize = manager->queryRowSize();
-    size32_t offset = rowSize - sizeof(offset_t);
-    return rtlReadBigUInt8(keyRow + offset);
+    return manager->queryFPos();
 }
 
 class RtlRecord;
@@ -301,14 +299,15 @@ extern jhtree_decl IKeyManager *createSingleKeyMerger(const RtlRecord &_recInfo,
 class KLBlobProviderAdapter : implements IBlobProvider
 {
     IKeyManager *klManager;
+    IContextLogger *ctx;
 public:
-    KLBlobProviderAdapter(IKeyManager *_klManager) : klManager(_klManager) {};
+    KLBlobProviderAdapter(IKeyManager *_klManager, IContextLogger *_ctx) : klManager(_klManager), ctx(_ctx) {};
     ~KLBlobProviderAdapter() 
     {
         if (klManager)
             klManager->releaseBlobs(); 
     }
-    virtual const byte * lookupBlob(unsigned __int64 id) { size32_t dummy; return klManager->loadBlob(id, dummy); }
+    virtual const byte * lookupBlob(unsigned __int64 id) { size32_t dummy; return klManager->loadBlob(id, dummy, ctx); }
 };
 
 extern jhtree_decl bool isCompressedIndex(const char *filename);
@@ -318,5 +317,49 @@ extern jhtree_decl bool isIndexFile(IFile *filename);
 extern jhtree_decl IIndexLookup *createIndexLookup(IKeyManager *keyManager);
 
 #define JHTREE_KEY_NOT_SORTED JHTREE_ERROR_START
+#define JHTREE_KEY_UNKNOWN_COMPRESSION (JHTREE_ERROR_START+1)
+
+constexpr bool isIndexReadActivity(ThorActivityKind actKind)
+{
+    switch (actKind)
+    {
+        case TAKindexread:
+        case TAKindexnormalize:
+        case TAKindexaggregate:
+        case TAKindexcount:
+        case TAKindexgroupaggregate:
+        case TAKindexexists:
+        case TAKindexgroupexists:
+        case TAKindexgroupcount:
+        case TAKkeyedjoin:
+        case TAKkeyeddistribute:
+        case TAKkeyeddenormalize:
+        case TAKkeyeddenormalizegroup:
+            return true;
+        default:
+            return false;
+    }
+}
+
+extern jhtree_decl void setDynamicPayloadExpansion(bool value);
+extern jhtree_decl const char * queryIndexNodeTypeText(NodeType type);
+
+//No jhtree_decl because it is not used outside of jhtree
+class CKeyIdAndPos
+{
+public:
+    unsigned keyId;
+    unsigned padding{0};
+    offset_t pos;
+
+    CKeyIdAndPos(unsigned _keyId, offset_t _pos) { keyId = _keyId; pos = _pos; }
+
+    bool operator==(const CKeyIdAndPos &other) { return keyId == other.keyId && pos == other.pos; }
+};
+
+
+extern jhtree_decl void ensureDiskPageCacheInitialized(bool propagateInitError);
+extern jhtree_decl void clearDiskPageCache();
+extern jhtree_decl size32_t getPageCachePageSize();
 
 #endif

@@ -26,6 +26,11 @@
 #define FunctionScopePrefix "f"
 #define WorkflowScopePrefix "w"
 #define ChildGraphScopePrefix "c"
+#define FileScopePrefix "p"
+#define ChannelScopePrefix "x"
+#define DFUWorkunitScopePrefix "D"
+#define SectionScopePrefix "n"
+#define OperationScopePrefix ">"
 
 #define MATCHES_CONST_PREFIX(search, prefix) (strncmp(search, prefix, strlen(prefix)) == 0)
 
@@ -63,12 +68,14 @@ enum StatisticScopeType
     SSTactivity,
     SSTallocator,                       // identifies an allocator
     SSTsection,                         // A section within the query - not a great differentiator
-    SSTcompilestage,                    // a stage within the compilation process
+    SSToperation,                       // an operation or stage in processing
     SSTdfuworkunit,                     // a reference to an executing dfu workunit
     SSTedge,
     SSTfunction,                        // a function call
     SSTworkflow,
     SSTchildgraph,
+    SSTfile,
+    SSTchannel,                         // a Roxie channel
     SSTunknown,
     SSTmax
 };
@@ -112,6 +119,12 @@ enum StatisticMeasure
 //The values in this enumeration are stored persistently.  The associated values must not be changed.
 //If you add an entry here you must also update statsMetaData
 //NOTE: All statistic names should be unique with the type prefix removed. Since the prefix is replaced with Skew/Min/etc.
+//
+// A guide to naming
+// NumXXX           - Should be a plural noun, indicating a count of something
+// WhenXXX          - Should be a past tense of a verb, indicating a time when something happened
+// TimeXXX          - Less clear
+// CostXXX          - Should be the infinitive of a verb
 enum StatisticKind
 {
     StKindNone,
@@ -233,6 +246,134 @@ enum StatisticKind
     StTimeBlocked,
     StCycleBlockedCycles,
     StCostExecute,
+    StSizeAgentReply,
+    StTimeAgentWait,
+    StCycleAgentWaitCycles,
+    StCostFileAccess,
+    StNumPods,
+    StCostCompile,
+    StTimeNodeLoad,
+    StCycleNodeLoadCycles,
+    StTimeLeafLoad,
+    StCycleLeafLoadCycles,
+    StTimeBlobLoad,
+    StCycleBlobLoadCycles,
+    StTimeDependencies,
+    StCycleDependenciesCycles,
+    StTimeStart,
+    StCycleStartCycles,
+    StEnumActivityCharacteristics,
+    StTimeNodeRead,
+    StCycleNodeReadCycles,
+    StTimeLeafRead,
+    StCycleLeafReadCycles,
+    StTimeBlobRead,
+    StCycleBlobReadCycles,
+    StNumNodeDiskFetches,
+    StNumLeafDiskFetches,
+    StNumBlobDiskFetches,
+    StTimeNodeFetch,
+    StCycleNodeFetchCycles,
+    StTimeLeafFetch,
+    StCycleLeafFetchCycles,
+    StTimeBlobFetch,
+    StCycleBlobFetchCycles,
+    StSizeGraphSpill,
+    StTimeAgentQueue,
+    StCycleAgentQueueCycles,
+    StTimeIBYTIDelay,
+    StCycleIBYTIDelayCycles,
+    StWhenQueued,
+    StWhenDequeued,
+    StWhenK8sLaunched,
+    StWhenK8sStarted,
+    StWhenK8sReady,
+    StNumSocketWrites,
+    StSizeSocketWrite,
+    StTimeSocketWriteIO,
+    StCycleSocketWriteIOCycles,
+    StNumSocketReads,
+    StSizeSocketRead,
+    StTimeSocketReadIO,
+    StCycleSocketReadIOCycles,
+    StSizeMemory,   // StSizePeakMemory above
+    StSizeRowMemory,
+    StSizePeakRowMemory,
+    StSizeAgentSend,
+    StTimeIndexCacheBlocked,
+    StCycleIndexCacheBlockedCycles,
+    StTimeAgentProcess,
+    StCycleAgentProcessCycles,
+    StNumAckRetries,
+    StSizeContinuationData,
+    StNumContinuationRequests,
+    StNumFailures,
+    StNumLocalRows,
+    StNumRemoteRows,
+    StSizeRemoteWrite,
+    StSizePeakTempDisk,
+    StSizePeakEphemeralDisk,
+    StNumMatchLeftRowsMax,
+    StNumMatchRightRowsMax,
+    StNumMatchCandidates,
+    StNumMatchCandidatesMax,
+    StNumParallelExecute,
+    StNumAgentRequests,
+    StSizeAgentRequests,
+    StTimeSoapcallDNS,                  // Time spent in DNS lookups for soapcalls
+    StTimeSoapcallConnect,              // Time spent in connect[+SSL_connect] for soapcalls
+    StCycleSoapcallDNSCycles,
+    StCycleSoapcallConnectCycles,
+    StNumSoapcallConnectFailures,
+    StTimeLookAhead,
+    StCycleLookAheadCycles,
+    StNumCacheHits,                     // Generic 'cache hit' stats, potentially used for many caches; Roxie-specific stats are above
+    StNumCacheAdds,                     // Generic 'cache add/miss' stats, potentially used for many caches; Roxie-specific stats are above
+    StNumPeakCacheObjects,              // Peak number of objects in a generic cache
+    StNumCacheDuplicates,
+    StNumCacheEvictions,
+    StSizeOffsetBranches,
+    StSizeBranchMemory,
+    StSizeLeafMemory,
+    StSizeLargestExpandedLeaf,
+    StTimeDelayed,                      // Time waiting for minimum query time to pass
+    StCycleDelayedCycles,
+    StTimePostMortemCapture,
+    StCyclePostMortemCaptureCycles,
+    StNumBloomAccepts,
+    StNumBloomRejects,
+    StNumBloomSkips,
+    StNumAccepts,
+    StNumWaits,
+    StTimeProvision,
+    StCycleProvisionCycles,
+    StCostStart,
+    StTimeWaitSuccess,
+    StCycleWaitSuccessCycles,
+    StTimeWaitFailure,
+    StCycleWaitFailureCycles,
+    StCostWait,
+    StNumAborts,
+    StCostAbort,
+    StNumRowsRead,
+    StNumRowsWritten,
+    StTimeQueryConsume,
+    StCycleQueryConsumeCycles,
+    StNumSuccesses,
+    StNumSoapcallRetries,
+    StTimeQueryPreparation,
+    StCycleQueryPreparationCycles,
+    StCostSavingPotential,
+    StCostFailed,
+    StSizeOffsetRoot,
+    StTimeFilePrepare,
+    StCycleFilePrepareCycles,
+    StTimeSmartJoinDelay,               // Time spent delaying smart join broadcasts because of congestion
+    StCycleSmartJoinDelayCycles,        // Cpu cycles spent delaying smart join broadcasts because of congestion
+    StNumParallelReadAheadThreads,
+    StSizeParallelReadAheadChunk,
+    StTimeParallelReadAheadConsumerWait,
+    StCycleParallelReadAheadConsumerWaitCycles,
     StMax,
 
     //For any quantity there is potentially the following variants.

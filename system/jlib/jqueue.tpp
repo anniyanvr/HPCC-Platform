@@ -33,7 +33,7 @@ class QueueOf
     unsigned headp;
     unsigned tailp;
     unsigned max;
-    unsigned num;
+    RelaxedAtomic<unsigned> num; // atomic so that it can be read without a critical section
     void expand()
     {
         unsigned inc;
@@ -61,6 +61,11 @@ public:
             memmove(ptrs+headp+n, ptrs+headp, (num-tailp-1)*sizeof(BASE *));
             headp += n;
         }
+        else if (num==0)
+        {
+            headp = 0;
+            tailp = max-1;
+        }
     }
     inline BASE *head() const { return num?ptrs[headp]:NULL; }
     inline BASE *tail() const { return num?ptrs[tailp]:NULL; }
@@ -74,38 +79,28 @@ public:
     }
     inline void enqueue(BASE *e)
     {
-        if (ALLOWNULLS || e) {
-            if (num==max) 
+        if (ALLOWNULLS || e)
+        {
+            if (unlikely(num==max))
                 expand();
-            if (num==0) {
-                headp = 0;
-                tailp = 0;
-            }
-            else {
-                tailp++;
-                if (tailp==max)
-                    tailp=0;
-            }
+            tailp++;
+            if (tailp==max)
+                tailp=0;
             ptrs[tailp] = e;
-            num++;
+            num.fastAdd(1); // Do not use increment which is atomic
         }
     }
     void enqueueHead(BASE *e)
     {
-        if (ALLOWNULLS || e) {
-            if (num==max) 
+        if (ALLOWNULLS || e)
+        {
+            if (unlikely(num==max))
                 expand();
-            if (num==0) {
-                headp = 0;
-                tailp = 0;
-            }
-            else {
-                if (headp==0)
-                    headp=max;
-                headp--;
-            }
+            if (headp==0)
+                headp=max;
+            headp--;
             ptrs[headp] = e;
-            num++;
+            num.fastAdd(1); // Do not use increment which is atomic
         }
     }
     void enqueue(BASE *e,unsigned i)
@@ -133,7 +128,7 @@ public:
                     p = n;
                 } while (p!=i);
                 ptrs[i] = e;
-                num++;
+                num.fastAdd(1); // Do not use increment which is atomic
             }
         }
     }
@@ -159,7 +154,7 @@ public:
         headp++;
         if (headp==max)
             headp = 0;
-        num--;
+        num.fastAdd(-1); // Do not use decrement which is atomic
         return ret;
     }
     BASE *dequeueTail()
@@ -170,7 +165,7 @@ public:
         if (tailp==0)
             tailp=max;
         tailp--;
-        num--;
+        num.fastAdd(-1); // Do not use decrement which is atomic
         return ret;
     }
     BASE *dequeue(unsigned i)
@@ -196,7 +191,7 @@ public:
         headp++;
         if (headp==max)
             headp = 0;
-        num--;
+        num.fastAdd(-1); // Do not use decrement which is atomic
         return ret;
     }
     void set(unsigned idx, BASE *v)
@@ -247,8 +242,9 @@ template <class BASE, bool ALLOWNULLS>
 class SafeQueueOf : private QueueOf<BASE, ALLOWNULLS>
 {
     typedef SafeQueueOf<BASE, ALLOWNULLS> SELF;
+    typedef QueueOf<BASE, ALLOWNULLS> PARENT;
 protected:
-    mutable CriticalSection crit;
+    mutable CriticalSection crit{SYNC_LOCATION};
     inline void unsafeenqueue(BASE *e) { QueueOf<BASE, ALLOWNULLS>::enqueue(e); }
     inline void unsafeenqueueHead(BASE *e) { QueueOf<BASE, ALLOWNULLS>::enqueue(e); }
     inline void unsafeenqueue(BASE *e,priorityGreaterFunction p) { QueueOf<BASE, ALLOWNULLS>::enqueue(e,p); }
@@ -270,19 +266,22 @@ public:
     BASE *dequeue(unsigned i) { CriticalBlock b(crit); return QueueOf<BASE, ALLOWNULLS>::dequeue(i); }
     unsigned find(BASE *e) { CriticalBlock b(crit); return QueueOf<BASE, ALLOWNULLS>::find(e); }
     void dequeue(BASE *e) { CriticalBlock b(crit); return QueueOf<BASE, ALLOWNULLS>::dequeue(e); }
-    inline unsigned ordinality() const { CriticalBlock b(crit); return QueueOf<BASE, ALLOWNULLS>::ordinality(); }
+    inline unsigned ordinality() const { return QueueOf<BASE, ALLOWNULLS>::ordinality(); }
     void set(unsigned idx, BASE *e) { CriticalBlock b(crit); return QueueOf<BASE, ALLOWNULLS>::set(idx, e); }
+    using PARENT::ensure;
 };
 
+//Sending signals once the critical section has been released generally gives better performance.
+#define SIGNAL_OUTSIDE
 
 template <class BASE, bool ALLOWNULLS> 
 class SimpleInterThreadQueueOf : protected SafeQueueOf<BASE, ALLOWNULLS>
 {
     typedef SimpleInterThreadQueueOf<BASE, ALLOWNULLS> SELF;
 protected:
-    Semaphore deqwaitsem;
+    Semaphore deqwaitsem{SYNC_LOCATION};
     unsigned deqwaiting;
-    Semaphore enqwaitsem;
+    Semaphore enqwaitsem{SYNC_LOCATION};
     unsigned enqwaiting;
     bool stopped;
     unsigned limit;
@@ -291,6 +290,10 @@ protected:
     bool qwait(Semaphore &sem,unsigned &waiting,unsigned timeout,unsigned &start) 
     { 
         // in crit block
+        // Prevent any more threads from waiting once the queue has been stopped
+        if (stopped)
+            return false;
+
         unsigned remaining;
         if (timeout) {
             if (timeout==INFINITE) 
@@ -341,13 +344,13 @@ protected:
     }
 
 public:
-    SimpleInterThreadQueueOf<BASE, ALLOWNULLS>() 
+    SimpleInterThreadQueueOf() 
     {
         limit = 0; // no limit
         reset();
     }
 
-    ~SimpleInterThreadQueueOf<BASE, ALLOWNULLS>() 
+    ~SimpleInterThreadQueueOf() 
     {
         stop();
     }
@@ -359,20 +362,57 @@ public:
         stopped = false;
     }
 
+    bool queryStopped() const { return stopped; }
+
     bool enqueue(BASE *e,unsigned timeout=INFINITE) 
     { 
-        CriticalBlock b(SELF::crit);    
-        if (limit) {
-            unsigned start=0;
-            while (limit<=SafeQueueOf<BASE, ALLOWNULLS>::unsafeordinality()) 
-                if (stopped||!qwait(deqwaitsem,deqwaiting,timeout,start))
-                    return false;
-        }
-        SafeQueueOf<BASE, ALLOWNULLS>::unsafeenqueue(e); 
-        if (enqwaiting) {
-            enqwaitsem.signal(enqwaiting);
+        unsigned numToSignal = 0;
+        {
+            CriticalBlock b(SELF::crit);
+            if (limit) {
+                unsigned start=0;
+                while (limit<=SafeQueueOf<BASE, ALLOWNULLS>::unsafeordinality())
+                    if (stopped||!qwait(deqwaitsem,deqwaiting,timeout,start))
+                        return false;
+            }
+            SafeQueueOf<BASE, ALLOWNULLS>::unsafeenqueue(e);
+#ifdef SIGNAL_OUTSIDE
+            numToSignal = enqwaiting;
             enqwaiting = 0;
+#else
+            if (enqwaiting) {
+                enqwaitsem.signal(enqwaiting);
+                enqwaiting = 0;
+            }
+#endif
         }
+        // Signal when critical section no longer held so the reader can actually remove the item
+        if (numToSignal)
+            enqwaitsem.signal(numToSignal);
+        return true;
+    }
+
+    bool enqueueMany(unsigned num, BASE * *e,unsigned timeout=INFINITE)
+    {
+        assertex(!limit);
+        unsigned numToSignal = 0;
+        {
+            CriticalBlock b(SELF::crit);
+            for (unsigned i=0; i < num; i++)
+                SafeQueueOf<BASE, ALLOWNULLS>::unsafeenqueue(e[i]);
+
+#ifdef SIGNAL_OUTSIDE
+            numToSignal = enqwaiting;
+            enqwaiting = 0;
+#else
+            if (enqwaiting) {
+                enqwaitsem.signal(enqwaiting);
+                enqwaiting = 0;
+            }
+#endif
+        }
+        if (numToSignal)
+            enqwaitsem.signal(numToSignal);
         return true;
     }
 
@@ -412,21 +452,31 @@ public:
 
     BASE *dequeue(unsigned timeout=INFINITE) 
     { 
-        CriticalBlock b(SELF::crit); 
-        unsigned start=0;
-        while (!stopped) {
-            BASE *ret;
-            if (get(ret,false)) {
-                if (deqwaiting) {
-                    deqwaitsem.signal(deqwaiting);
+        BASE *ret = nullptr;
+        unsigned numToSignal = 0;
+        {
+            CriticalBlock b(SELF::crit);
+            unsigned start=0;
+            while (!stopped) {
+                if (get(ret,false)) {
+#ifdef SIGNAL_OUTSIDE
+                    numToSignal = deqwaiting;
                     deqwaiting = 0;
+#else
+                    if (deqwaiting) {
+                        deqwaitsem.signal(deqwaiting);
+                        deqwaiting = 0;
+                    }
+#endif
+                    break;
                 }
-                return ret;
+                if (!qwait(enqwaitsem,enqwaiting,timeout,start))
+                    break;
             }
-            if (!qwait(enqwaitsem,enqwaiting,timeout,start))
-                break;
         }
-        return NULL;
+        if (numToSignal)
+            deqwaitsem.signal(numToSignal);
+        return ret;
     }
 
     BASE *dequeueTail(unsigned timeout=INFINITE) 
@@ -481,21 +531,15 @@ public:
     void stop() // stops all waiting operations
     {
         CriticalBlock b(SELF::crit); 
-        do {
-            stopped = true;
-            if (enqwaiting) {
-                enqwaitsem.signal(enqwaiting);
-                enqwaiting = 0;
-            }
-            if (deqwaiting) {
-                deqwaitsem.signal(deqwaiting);
-                deqwaiting = 0;
-            }
-            {
-                CriticalUnblock ub(SELF::crit); 
-                Sleep(10);      // bit of a kludge
-            }
-        } while (enqwaiting||deqwaiting);
+        stopped = true;
+        if (enqwaiting) {
+            enqwaitsem.signal(enqwaiting);
+            enqwaiting = 0;
+        }
+        if (deqwaiting) {
+            deqwaitsem.signal(deqwaiting);
+            deqwaiting = 0;
+        }
     }
 };
 
@@ -538,6 +582,78 @@ public:
         }
         return ret;
     }
+};
+
+//A lighter-weight limited thread queue which does not allow timeouts.
+//Linux futexes mean that semaphores now perform very well...
+template <class BASE, bool ALLOWNULLS>
+class ReallySimpleInterThreadQueueOf : protected SafeQueueOf<BASE, ALLOWNULLS>
+{
+    typedef ReallySimpleInterThreadQueueOf<BASE, ALLOWNULLS> SELF;
+    typedef SafeQueueOf<BASE, ALLOWNULLS> PARENT;
+protected:
+    Semaphore space{SYNC_LOCATION};
+    Semaphore avail{SYNC_LOCATION};
+    unsigned limit = 0;
+    std::atomic<bool> stopped{false};
+
+public:
+    ReallySimpleInterThreadQueueOf()
+    {
+    }
+
+    ~ReallySimpleInterThreadQueueOf()
+    {
+    }
+
+    void reset()
+    {
+        space.reinit(limit);
+        avail.reinit(0);
+        stopped = false;
+    }
+
+    bool enqueue(BASE *e)
+    {
+        space.wait();
+        if (stopped)
+            return false;
+        PARENT::enqueue(e);
+        avail.signal();
+        return true;
+    }
+
+    BASE *dequeue()
+    {
+        avail.wait();
+        if (stopped)
+            return nullptr;
+        BASE * result = PARENT::dequeue();
+        space.signal();
+        return result;
+    }
+
+    void setLimit(unsigned num)
+    {
+        limit = num;
+        space.reinit(limit);
+        PARENT::ensure(limit);
+    }
+
+    void stop(unsigned maxReaders, unsigned maxWriters) // stops all waiting operations
+    {
+        assertex(maxReaders && maxWriters);
+        stopped = true;
+        avail.signal(maxReaders);
+        space.signal(maxWriters);
+    }
+
+    BASE *dequeueNow()
+    {
+        return PARENT::dequeue();
+    }
+
+    using PARENT::ordinality;
 };
 
 #define ForEachQueueItemIn(x,y)     unsigned numItems##x = (y).ordinality();     \

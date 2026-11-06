@@ -34,11 +34,15 @@ set (    SRCS
          dadfs.cpp 
          dadiags.cpp 
          dafdesc.cpp 
+         dafsaudit.cpp
+         dameta.cpp
          danqs.cpp 
          dasds.cpp 
-         dasess.cpp 
+         dasess.cpp
+         dastats.cpp
          dasubs.cpp 
-         dautils.cpp 
+         dautils.cpp
+         sysinfologger.cpp
     )
     
 set (    INCLUDES
@@ -48,13 +52,19 @@ set (    INCLUDES
          dadfs.hpp
          dadiags.hpp
          dafdesc.hpp
+         dafsaudit.hpp
+         dameta.hpp
          danqs.hpp
          daqueue.hpp
          dasds.hpp
          dasess.hpp
+         dastats.hpp
          dasubs.hpp
          dautils.hpp
+         sysinfologger.hpp
     )   
+
+set_source_files_properties(dasds.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 include_directories ( 
          ${HPCC_SOURCE_DIR}/common/deftype 
@@ -66,9 +76,10 @@ include_directories (
          ${HPCC_SOURCE_DIR}/rtl/include 
          ${HPCC_SOURCE_DIR}/system/security/shared
          ${HPCC_SOURCE_DIR}/system/security/cryptohelper
+         ${HPCC_SOURCE_DIR}/testing/unittests
     )
 
-ADD_DEFINITIONS( -DLOGMSGCOMPONENT=3 -D_USRDLL -DDALI_EXPORTS )
+ADD_DEFINITIONS( -D_USRDLL -DDALI_EXPORTS -DNULL_DALIUSER_STACKTRACE)
 
 HPCC_ADD_LIBRARY( dalibase SHARED ${SRCS} ${INCLUDES} )
 
@@ -79,10 +90,11 @@ if(NOT PLUGIN)
         LIBRARY DESTINATION ${LIB_DIR}
     )
     target_link_libraries(
-        dalibase 
+        dalibase PRIVATE
         jlib
         mp 
         hrpc 
         dafsclient
+        ${CppUnit_LIBRARIES}
     )
 endif()

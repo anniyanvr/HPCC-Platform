@@ -22,6 +22,7 @@ define([
     "src/Clippy",
 
     "dojo/text!../templates/ActivityPageWidget.html",
+    "dojo/text!../templates/ActivityPageContainerWidget.html",
 
     "dijit/form/ToggleButton",
     "dijit/layout/TabContainer",
@@ -34,7 +35,7 @@ define([
     registry, Button, ToolbarSeparator, Tooltip,
     selector, tree,
     GridDetailsWidget, ESPActivity, DelayLoadWidget, ESPUtil, Utility, DiskUsage, Clippy,
-    template
+    template, templateContainer
 ) {
 
     var DelayedRefresh = declare("DelayedRefresh", [], {
@@ -65,7 +66,7 @@ define([
 
     var nlsHPCC = nlsHPCCMod.default;
     return declare("ActivityWidget", [GridDetailsWidget], {
-        templateString: template,
+        templateString: dojoConfig.isContainer ? templateContainer : template,
         i18n: nlsHPCC,
         gridTitle: nlsHPCC.title_Activity,
         idProperty: "__hpcc_id",
@@ -236,16 +237,18 @@ define([
             var context = this;
 
             this._diskSummaryPane = registry.byId(this.id + "DiskSummaryCP");
-            var origResize = this._diskSummaryPane.resize;
-            this._diskSummaryPane.resize = function (size) {
-                origResize.apply(this, arguments);
-                if (context._diskUsage) {
-                    context._diskUsage
-                        .resize({ width: size.w, height: size.h || context._diskSummaryPane.h })
-                        .lazyRender()
-                        ;
-                }
-            };
+            if (this._diskSummaryPane) {
+                var origResize = this._diskSummaryPane.resize;
+                this._diskSummaryPane.resize = function (size) {
+                    origResize.apply(this, arguments);
+                    if (context._diskUsage) {
+                        context._diskUsage
+                            .resize({ width: size.w, height: size.h || context._diskSummaryPane.h })
+                            .lazyRender()
+                            ;
+                    }
+                };
+            }
         },
 
         doSearch: function (searchText) {
@@ -259,17 +262,19 @@ define([
                 return;
 
             var context = this;
-            this._diskUsage = new DiskUsage.Summary()
-                .target(this.id + "DiskSummary")
-                .on("click", function (gauge, details) {
-                    var tab = context.ensurePane({ details: details, __hpcc_id: "Usage:" + details.Name }, { usage: true });
-                    if (tab) {
-                        context.selectChild(tab);
-                    }
-                })
-                .render()
-                .refresh()
-                ;
+            if (this._diskSummaryPane) {
+                this._diskUsage = new DiskUsage.Summary()
+                    .target(this.id + "DiskSummary")
+                    .on("click", function (gauge, details) {
+                        var tab = context.ensurePane({ details: details, __hpcc_id: "Usage:" + details.Name }, { usage: true });
+                        if (tab) {
+                            context.selectChild(tab);
+                        }
+                    })
+                    .render()
+                    .refresh()
+                    ;
+            }
 
             this.autoRefreshButton = registry.byId(this.id + "AutoRefresh");
             this.activity.disableMonitor(true);
@@ -285,6 +290,7 @@ define([
                 }
             });
             this.createStackControllerTooltip(this.id + "AutoRefresh", this.i18n.AutoRefresh + ": " + this.autoRefreshButton.get("checked"));
+            this.resize();
         },
 
         createGrid: function (domID) {
@@ -450,12 +456,12 @@ define([
                             var img = row.getStateImage();
                             if (context.activity.isInstanceOfQueue(row)) {
                                 if (row.ClusterType === 3) {
-                                    return "<img src='" + img + "'/>&nbsp;<a href='#' onClick='return false;' class='dgrid-row-url'>" + _name + "</a>";
+                                    return `<img src="${img}" />&nbsp;<a href="#" onClick="return false;" class="dgrid-row-url">${Utility.encodeHTML(_name)}</a>`;
                                 } else {
-                                    return "<img src='" + img + "'/>&nbsp;" + _name;
+                                    return `<img src="${img}" />&nbsp;<span>${Utility.encodeHTML(_name)}</span>`;
                                 }
                             }
-                            return "<img src='" + img + "'/>&nbsp;<a href='#' onClick='return false;' class='dgrid-row-url'>" + row.Wuid + "</a>";
+                            return `<img src="${img}" />&nbsp;<a href="#" onClick="return false;" class="dgrid-row-url">${Utility.encodeHTML(row.Wuid)}</a>`;
                         }
                     }),
                     GID: {
@@ -463,7 +469,7 @@ define([
                         formatter: function (_gid, row) {
                             if (context.activity.isInstanceOfWorkunit(row)) {
                                 if (row.GraphName) {
-                                    return "<a href='#' onClick='return false;' class='dgrid-row-url2'>" + row.GraphName + "-" + row.GID + "</a>";
+                                    return `<a href="#" onClick="return false;" class="dgrid-row-url2">${Utility.encodeHTML(row.GraphName + "-" + row.GID)}</a>`;
                                 }
                             }
                             return "";
@@ -474,7 +480,7 @@ define([
                         sortable: false,
                         formatter: function (state, row) {
                             if (context.activity.isInstanceOfQueue(row)) {
-                                return row.isNormal() ? "" : row.StatusDetails;
+                                return row.isNormal() ? "" : Utility.encodeHTML(row.StatusDetails);
                             }
                             if (row.Duration) {
                                 return state + " (" + row.Duration + ")";
@@ -598,9 +604,11 @@ define([
         },
 
         refreshUsage: function (bypassCachedResult) {
-            this._diskUsage
-                .refresh(bypassCachedResult)
-                ;
+            if (this._diskUsage) {
+                this._diskUsage
+                    .refresh(bypassCachedResult)
+                    ;
+            }
         },
 
         refreshGrid: function () {

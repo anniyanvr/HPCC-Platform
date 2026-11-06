@@ -9,6 +9,14 @@
 #include "jmisc.hpp"
 #include "jregexp.hpp"
 #include "jset.hpp"
+#include "jfile.hpp"
+#include "jplane.hpp"
+#include "jutil.hpp"
+#include "jsocket.hpp"
+
+#include <memory>
+#include <unordered_map>
+#include <charconv>
 
 #include "mpbase.hpp"
 #include "mpcomm.hpp"
@@ -19,10 +27,11 @@
 #include "dalienv.hpp"
 #include "rmtfile.hpp"
 
-#include "saserver.hpp"
 #include "sautil.hpp"
+#include "saxref.hpp"
 #include "sacoalescer.hpp"
 #include "sacmd.hpp"
+#include "salds.hpp"
 
 #define DEFAULT_MAXDIRTHREADS 500
 #define DEFAULT_MAXMEMORY 4096
@@ -43,7 +52,7 @@
 
 #define DEFAULT_RECENT_CUTOFF_DAYS 1
 
-inline bool nextCsvToken(const char *&s,StringBuffer &tok) 
+inline bool nextCsvToken(const char *&s,StringBuffer &tok)
 {
     if (!s)
         return false;
@@ -67,24 +76,101 @@ inline bool nextCsvToken(const char *&s,StringBuffer &tok)
     return true;
 }
 
+inline bool isDirPerPartSupported() { return isContainerized(); }
+
+// A simple allocator to track memory usage and throw an exception if the
+// requested size exceeds @memoryLimit or resources/@memory in containerized
+class XRefAllocator
+{
+public:
+    XRefAllocator(unsigned _maxMB)
+    {
+        maxBytes = ((size_t)_maxMB) * 0x100000;
+    }
+
+    ~XRefAllocator()
+    {
+        if (usedBytes != 0)
+            OWARNLOG(LOGPFX "XRefAllocator::~XRefAllocator : Memory leak detected: %zu bytes", usedBytes.load());
+    }
+
+    void *alloc(unsigned sz)
+    {
+        size_t oldUsed = usedBytes.fetch_add(sz);
+        if ((sz+oldUsed)>maxBytes)
+        {
+            usedBytes.fetch_sub(sz); // Roll back the increment
+            throw makeStringExceptionV(0, "XRefAllocator::alloc : Requested size too large: req: %d, used: %zu, max: %zu", sz, oldUsed, maxBytes);
+        }
+
+        void *ret = malloc(sz);
+        if (ret == nullptr) throw std::bad_alloc();
+
+        return ret;
+    }
+
+    void dealloc(void *ptr, unsigned sz)
+    {
+        free(ptr);
+        usedBytes.fetch_sub(sz);
+    }
+
+private:
+    size_t maxBytes = 0;
+    std::atomic<size_t> usedBytes = 0;
+};
 
 
 struct cMisplacedRec
 {
-    cMisplacedRec *next;
-    unsigned short nn;  // node on (+N*drv)
-    unsigned short pn;  // part number 
-    bool marked;
+private:
+    cMisplacedRec(XRefAllocator *_allocator)
+        : allocator(_allocator)
+    {}
+public:
+    static cMisplacedRec *create(XRefAllocator *allocator)
+    {
+        return new(allocator) cMisplacedRec(allocator);
+    }
+
+    static void *operator new(size_t baseSize, XRefAllocator *allocator)
+    {
+        return allocator->alloc(baseSize);
+    }
+
+    static void operator delete(void* p, XRefAllocator* allocator) noexcept
+    {
+        // Called if constructor throws
+        allocator->dealloc(p, sizeof(cMisplacedRec));
+    }
+
+    static void operator delete(void *ptr) noexcept
+    {
+        cMisplacedRec *desc = static_cast<cMisplacedRec *>(ptr);
+        desc->allocator->dealloc(ptr, sizeof(cMisplacedRec));
+    }
+
+    XRefAllocator *allocator = nullptr;
+    cMisplacedRec *next = nullptr;
+    unsigned short nn = 0;  // node on (+N*drv)
+    unsigned short pn = 0;  // part number
+    bool marked = false;
+    unsigned short stripeNum = 0;      // actual stripe directory number (0 if non-striped)
+    unsigned short dirPerPartNum = 0;  // actual dir-per-part directory number (0 if none)
 
     void init(unsigned drv,
               unsigned pf,      // part
               unsigned xn,      // node located on
-              unsigned tn)      // total nodes
+              unsigned tn,      // total nodes
+              unsigned sn,      // stripe number
+              unsigned dn)      // dir-per-part number
     {
         nn = (unsigned short)(xn+tn*drv);
         pn = (unsigned short)pf;
         marked = false;
-        next = NULL;
+        next = nullptr;
+        stripeNum = (unsigned short)sn;
+        dirPerPartNum = (unsigned short)dn;
     }
 
     bool eq(unsigned drv,
@@ -95,6 +181,20 @@ struct cMisplacedRec
         if (pn != (unsigned short)pf)
             return false;
         return (nn == (unsigned short)(xn+tn*drv));
+    }
+
+    bool eq(unsigned drv,
+              unsigned pf,      // part
+              unsigned xn,      // node located on
+              unsigned tn,      // total nodes
+              unsigned sn,      // stripe number
+              unsigned dn)      // dir-per-part number
+    {
+        if (stripeNum != (unsigned short)sn)
+            return false;
+        if (dirPerPartNum != (unsigned short)dn)
+            return false;
+        return eq(drv, pf, xn, tn);
     }
 
     unsigned getDrv(unsigned tn)
@@ -109,42 +209,96 @@ struct cMisplacedRec
 };
 
 
-
 struct cFileDesc // no virtuals
 {
+private:
+    cFileDesc(const char *_name, unsigned nameLen, unsigned mapLen, unsigned numParts, bool d, unsigned fnLen, XRefAllocator *_allocator)
+        : allocator(_allocator)
+    {
+        N = (unsigned short)numParts;
+        isDirPerPart = d;
+        filenameLen = (byte)fnLen;
+
+        name[0] = (byte)nameLen;
+        memcpy(&name[1],_name,nameLen);
+        memset(map(),0,mapLen);
+        hash = hashc((const byte *)_name,nameLen,17);
+    }
+
+public:
+    XRefAllocator *allocator = nullptr;
     unsigned hash;
-    unsigned short N;           // num parts 
-    const char *owningfile;     // for crosslinked
-    cMisplacedRec *misplaced;   // for files on the wrong node
-    byte name[1];               // first byte length
+    unsigned short N;                     // num parts
+    bool isDirPerPart;                    // directory-per-part number present in physical path
+    byte filenameLen;                     // length of file name excluding extension i.e. ._$P$_of_$N$
+    const char *owningfile = nullptr;     // for crosslinked
+    cMisplacedRec *misplaced = nullptr;   // for files on the wrong node
+    byte name[1];                         // first byte length
     // char namestr[name[1]]
     // bitset presentc[N];
     // bitset presentd[N];
     // bitset markedc[N];
     // bitset markedd[N];
 
-    static cFileDesc * create(CLargeMemoryAllocator &mem,const char *_name,unsigned n)
-    {
-        size32_t sl = strlen(_name); 
-        if (sl>255) {
-            OWARNLOG(LOGPFX "File name %s longer than 255 chars, truncating",_name);
-            sl = 255;
-        }
-        size32_t ml = (n*4+7)/8;
-        size32_t sz = sizeof(cFileDesc)+sl+ml;
-        cFileDesc * ret = (cFileDesc *)mem.alloc(sz);
-        ret->N = (unsigned short)n;
-        ret->name[0] = (byte)sl;
-        ret->owningfile = NULL;
-        ret->misplaced = NULL;
 
-        memcpy(&ret->name[1],_name,sl);
-        memset(ret->map(),0,ml);
-        ret->hash = hashc((const byte *)_name,sl,17);
-        return ret;
+    static cFileDesc *create(const char *name, unsigned numParts, bool isDirPerPart, unsigned fnLen, XRefAllocator *allocator)
+    {
+        unsigned mapLen;
+        if (numParts==NotFound)
+        {
+            // numParts==NotFound is used for files without a part mask. Treat them as single files
+            mapLen = 1;
+            numParts = 1;
+        }
+        else if (numParts<=0xfff)
+            mapLen = (numParts*4+7)/8;
+        else
+            throw makeStringExceptionV(0, "cFileDesc::create : numParts too large: %d (max 4096)", numParts);
+
+        size_t nameLen = strlen(name);
+        if (nameLen>255)
+        {
+            OWARNLOG(LOGPFX "File name %s longer than 255 chars, truncating",name);
+            nameLen = 255;
+        }
+        return new(nameLen, mapLen, allocator) cFileDesc(name, nameLen, mapLen, numParts, isDirPerPart, fnLen, allocator);
     }
 
+    static void *operator new(size_t baseSize, unsigned nameLen, unsigned mapLen, XRefAllocator *allocator)
+    {
+        return allocator->alloc(baseSize+nameLen+mapLen);
+    }
 
+    static void operator delete(void *ptr, XRefAllocator* allocator) noexcept
+    {
+        // Called if constructor throws
+        cFileDesc *desc = static_cast<cFileDesc *>(ptr);
+        allocator->dealloc(ptr, desc->getSize());
+    }
+
+    static void operator delete(void *ptr) noexcept
+    {
+        cFileDesc *desc = static_cast<cFileDesc *>(ptr);
+        desc->allocator->dealloc(ptr, desc->getSize());
+    }
+
+    ~cFileDesc()
+    {
+        // Clean up misplaced records
+        while (misplaced)
+        {
+            cMisplacedRec *next = misplaced->next;
+            delete misplaced;
+            misplaced = next;
+        }
+    }
+
+    unsigned getSize() const
+    {
+        size32_t nameLen = name[0];
+        size32_t mapLen = (N*4+7)/8;
+        return sizeof(cFileDesc)+nameLen+mapLen;
+    }
     inline byte *map() const
     {
         return (byte *)&name+1+name[0];
@@ -181,22 +335,36 @@ struct cFileDesc // no virtuals
     bool eq(const char *key)
     {
         size32_t sl = strlen(key);
-        if (sl>255) 
+        if (sl>255)
             sl = 255;
         if (sl!=(byte)name[0])
             return false;
         return memcmp(key,name+1,sl)==0;
     }
 
-    StringBuffer &getName(StringBuffer &buf)
+    bool isHPCCFile() const
+    {
+        return filenameLen > 0;
+    }
+
+    bool getName(StringBuffer &buf) const
+    {
+        // Check mask exists
+        if (filenameLen == 0)
+            return false;
+        buf.append((size32_t)filenameLen, (const char *)(name+1));
+        return true;
+    }
+
+    StringBuffer &getNameMask(StringBuffer &buf) const
     {
         return buf.append((size32_t)name[0],(const char *)(name+1));
     }
 
-    StringBuffer &getPartName(StringBuffer &buf,unsigned p)
+    StringBuffer &getPartName(StringBuffer &buf,unsigned p) const
     {
         StringBuffer mask;
-        getName(mask);
+        getNameMask(mask);
         return expandMask(buf, mask, p, N);
     }
 
@@ -206,19 +374,13 @@ struct cFileDesc // no virtuals
         return NULL;
         // not used
     }
-    
+
     static unsigned getHash(const char *key)
     {
         size32_t sl = strlen(key);
-        if (sl>255) 
+        if (sl>255)
             sl = 255;
         return  hashc((const byte *)key,sl,17);
-    }
-    
-
-    static void destroy(cFileDesc *)
-    {
-        // not owning
     }
 
 
@@ -228,29 +390,10 @@ struct cFileDesc // no virtuals
 
 struct cDirDesc
 {
-    unsigned hash;
-    CMinHashTable<cDirDesc> dirs;       
-    CMinHashTable<cFileDesc> files; 
-    offset_t totalsize[2];              //  across all nodes
-    offset_t minsize[2];                //  smallest node size
-    offset_t maxsize[2];                //  largest node size
-    unsigned short minnode[2];          //  smallest node (1..)
-    unsigned short maxnode[2];          //  largest node (1..)
-
-
-
-
-    byte *name;                     // first byte length  NB this is the tail name
-    // char namestr[*name]
-
-    cDirDesc(CLargeMemoryAllocator &mem,const char *_name)
+private:
+    cDirDesc(const char *_name, size32_t sl, XRefAllocator *_allocator)
+        : allocator(_allocator)
     {
-        size32_t sl = strlen(_name);
-        if (sl>255) {
-            OWARNLOG(LOGPFX "Directory name %s longer than 255 chars, truncating",_name);
-            sl = 255;
-        }
-        name = (byte *)mem.alloc(sl+1);
         name[0] = (byte)sl;
         memcpy(name+1,_name,sl);
         hash = hashc((const byte *)_name,sl,17);
@@ -261,47 +404,80 @@ struct cDirDesc
             maxnode[drv] = 0;
             maxsize[drv] = 0;
         }
+        dirPerPartNum = readDigits(_name, sl, false);
     }
-    ~cDirDesc()
+
+public:
+    XRefAllocator *allocator = nullptr;
+    unsigned hash;
+    std::unordered_map<std::string, std::unique_ptr<cDirDesc>> dirs;
+    std::unordered_map<std::string, std::unique_ptr<cFileDesc>> files;
+    CriticalSection dirsCrit{SYNC_LOCATION};
+    CriticalSection filesCrit{SYNC_LOCATION};
+    CriticalSection dirDescCrit{SYNC_LOCATION};
+    std::atomic<unsigned> activeReferences{0};
+    offset_t totalsize[2];              //  across all nodes
+    offset_t minsize[2];                //  smallest node size
+    offset_t maxsize[2];                //  largest node size
+    unsigned short minnode[2];          //  smallest node (1..)
+    unsigned short maxnode[2];          //  largest node (1..)
+    unsigned dirPerPartNum = 0;         //  only >0 if the directory *looks* like a dir-per-part dir
+
+    byte name[1];                     // first byte length  NB this is the tail name
+    // char namestr[*name]
+
+    static cDirDesc *create(const char * name, XRefAllocator *allocator)
     {
-        unsigned i;
-        cDirDesc *d = dirs.first(i);
-        while (d) {
-            delete d;
-            d = dirs.next(i);
+        size32_t nameLen = strlen(name);
+        if (nameLen>255)
+        {
+            OWARNLOG(LOGPFX "Directory name %s longer than 255 chars, truncating",name);
+            nameLen = 255;
         }
-        // don't delete the files (they are from mem)
+        return new(nameLen, allocator) cDirDesc(name, nameLen, allocator);
     }
+
+    static void *operator new(size_t baseSize, unsigned nameLen, XRefAllocator *allocator)
+    {
+        return allocator->alloc(baseSize+nameLen);
+    }
+
+    static void operator delete(void *ptr, XRefAllocator* allocator) noexcept
+    {
+        // Called if constructor throws
+        cDirDesc *desc = static_cast<cDirDesc *>(ptr);
+        allocator->dealloc(ptr, desc->getSize());
+    }
+
+    static void operator delete(void *ptr) noexcept
+    {
+        cDirDesc *desc = static_cast<cDirDesc *>(ptr);
+        desc->allocator->dealloc(ptr, desc->getSize());
+    }
+
+    unsigned getSize() const
+    {
+        size32_t nameLen = name[0];
+        return sizeof(cDirDesc)+nameLen;
+    }
+
 
     bool eq(const char *key)
     {
         size32_t sl = strlen(key);
-        if (sl>255) 
+        if (sl>255)
             sl = 255;
         if (sl!=(byte)name[0])
             return false;
         return memcmp(key,name+1,sl)==0;
     }
 
-    static cDirDesc * create(const char *)
-    {
-        assertex(false);
-        return NULL;
-        // not used
-    }
-    
     static unsigned getHash(const char *key)
     {
         size32_t sl = strlen(key);
-        if (sl>255) 
+        if (sl>255)
             sl = 255;
         return  hashc((const byte *)key,sl,17);
-    }
-    
-
-    static void destroy(cDirDesc *)
-    {
-        // not owning
     }
 
     StringBuffer &getName(StringBuffer &buf)
@@ -309,82 +485,304 @@ struct cDirDesc
         return buf.append((size32_t)name[0],(const char *)name+1);
     }
 
-    cDirDesc *lookupDir(const char *name,CLargeMemoryAllocator *mem)
-    { 
-        cDirDesc *ret = dirs.find(name,false);
-        if (!ret&&mem) {
-            ret = new cDirDesc(*mem,name);
-            dirs.add(ret);
+    const char *queryName() const
+    {
+        return (const char *)name+1;
+    }
+
+    size32_t getNameLen() const
+    {
+        return (size32_t)name[0];
+    }
+
+    bool isDirPerPartCandidate() const
+    {
+        return dirPerPartNum > 0; // I look like a dir-per-dir directory
+    }
+
+    bool isDirPerPartMatch(unsigned partNum) const
+    {
+        assertex(isDirPerPartCandidate());
+        return partNum==(dirPerPartNum-1);
+    }
+
+    void noteAcquire()
+    {
+        activeReferences.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void noteRelease()
+    {
+        activeReferences.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    void removeIfEmpty(const char *name)
+    {
+        CriticalBlock block(dirsCrit);
+        auto it = dirs.find(name);
+        if (it == dirs.end())
+            return;
+        if (it->second->activeReferences.load(std::memory_order_relaxed) != 0)
+            return;
+        if (!it->second->empty())
+            return;
+        dirs.erase(it);
+    }
+
+    cFileDesc *getFile(const char *filename)
+    {
+        CriticalBlock block(filesCrit);
+        auto it = files.find(filename);
+        if (it != files.end())
+            return it->second.get();
+        return nullptr;
+    }
+
+    cFileDesc *ensureFile(const char *filename, unsigned numParts, bool isDirPerPart, unsigned filenameLen, XRefAllocator *allocator)
+    {
+        CriticalBlock block(filesCrit);
+        auto it = files.find(filename);
+        cFileDesc *file = nullptr;
+        if (it != files.end())
+            file = it->second.get();
+        else
+        {
+            file = cFileDesc::create(filename, numParts, isDirPerPart, filenameLen, allocator);
+            files.emplace(filename, file);
         }
+        return file;
+    }
+
+    void addExistingFile(const char *filename, cFileDesc *file)
+    {
+        CriticalBlock block(filesCrit);
+        files.emplace(filename, file);
+    }
+
+    cDirDesc *lookupDirNonThreadSafe(const char *name, XRefAllocator *allocator)
+    {
+        auto it = dirs.find(name);
+        if (it != dirs.end())
+            return it->second.get();
+
+        if (!allocator)
+            return nullptr;
+
+        // NB: Creation only happens during scanDirectories, this function should be called from [thread-safe] lookupDir()
+        // lookupDirNonThreadSafe is also called in findDirectory during scanLogicalFiles. It will not reach here, and does not need to be thread safe )
+        cDirDesc *ret = cDirDesc::create(name, allocator);
+        dirs.emplace(name, ret);
         return ret;
     }
 
-    const char *decodeName(unsigned drv,const char *name,unsigned node, unsigned numnodes,
-                    StringAttr &mask,   // decoded mask
-                    unsigned &pf,       // part node
-                    unsigned &nf)       // num parts
+    cDirDesc *lookupDir(const char *name, XRefAllocator *allocator)
+    {
+        CriticalBlock block(dirsCrit);
+        cDirDesc *ret = lookupDirNonThreadSafe(name, allocator);
+        if (ret)
+            ret->noteAcquire(); // Mark as in-use so the parent cannot remove it while it is being scanned.
+        return ret;
+    }
+
+    static const char *decodeName(unsigned drv,const char *name,unsigned node, unsigned numnodes,
+                    StringAttr &mask,       // decoded mask
+                    unsigned &pf,           // part node
+                    unsigned &nf,           // num parts
+                    unsigned &filenameLen)  // length of file name excluding extension i.e. ._$P$_of_$N$
     {
         const char *fn = name;
         // first see if tail fits a mask
-        if (deduceMask(fn, true, mask, pf, nf))
+        if (deduceMask(fn, true, mask, pf, nf, filenameLen))
             fn = mask.get();
         else {  // didn't match mask so use straight name
             //PROGLOG("**unmatched(%d,%d,%d) %s",drv,node,numnodes,name);
             pf = (node+numnodes-drv)%numnodes;
-            nf = numnodes;
+            nf = NotFound;
         }
         return fn;
     }
 
-
-    cFileDesc *addFile(unsigned drv,const char *name,__int64 sz,CDateTime &dt,unsigned node, const SocketEndpoint &ep, IGroup &grp, unsigned numnodes, CLargeMemoryAllocator *mem)
+    static bool isMisplaced(unsigned partNum, unsigned numParts, const SocketEndpoint &ep, IGroup &grp, const char *fullPath, unsigned filePathOffset, unsigned stripeNum, unsigned numStripedDevices, unsigned filenameLen)
     {
+        // External files (i.e. no ._n_of_m suffix) are considered misplaced so we can get
+        // the node where the external file was found for addExternalFoundFile later
+        if (numParts==NotFound)
+            return true;
 
-        unsigned nf;
-        unsigned pf;
-        StringAttr mask;
-        const char *fn = decodeName(drv,name,node,numnodes,mask,pf,nf);
-        bool misplaced = nf!=grp.ordinality() || pf>=grp.ordinality() || !grp.queryNode(pf).endpoint().equals(ep);
-        cFileDesc *file = files.find(fn,false);
-        if (!file) {
-            if (!mem)
-                return NULL;
-            file = cFileDesc::create(*mem,fn,nf);
-            files.add(file);
+        if (isDirPerPartSupported() || numStripedDevices > 1)
+        {
+            // MORE: How can we check hosted planes?
+            // Checking against group info would still make sense in containerized if hosted plane
+            // if (hostedPlane)
+            //     return numParts!=grp.ordinality() || partNum>=grp.ordinality() || !grp.queryNode(partNum).endpoint().equals(ep);
+
+            if ((numStripedDevices>1)&&((stripeNum>numStripedDevices)||(stripeNum<1)))
+                return true;
+
+            // Get pointer to filename
+            filePathOffset++; // fullPath+filePathOffset will always be a slash, so skip it
+            const char *filePath = fullPath+filePathOffset;
+            unsigned filePathLen = strlen(filePath);
+            const char *filenameEndPtr = filePath+filePathLen;
+            const char *filename = filenameEndPtr-1;
+            while (filename>filePath)
+            {
+                if (*filename=='/')
+                    break;
+                filename--;
+            }
+
+            unsigned dirPerPartNum = 0;
+            const char *dirPerPartPtr = nullptr; // If dirPerPartNum != 0, this points to the slash before the dir name of the dir-per-part directory
+            if (filename==filePath)
+            {
+                // If filename starts at filePathOffset, the file was found in the root directory
+                // Skip checking for a dir-per-part number because there is no directory name to check
+            }
+            else
+            {
+                // Calculate dir-per-part number from the file path
+                // A file path can contain numeric directories that are not dir-per-part directories,
+                // so we only check maxDirPerPartDigits to avoid false positives
+                // Scan the filename backwards checking for digits until maxDirPerPartDigits is reached
+                // or a non-digit character is found or a '/' is found
+                constexpr unsigned maxDirPerPartDigits = 6;
+                constexpr unsigned pow10[maxDirPerPartDigits] = {1, 10, 100, 1000, 10000, 100000};
+                const char *tailDirEndPtr = filename-1; // Points to last character in dir name then if dir-per-part is found, it points to the slash before the dir name
+                dirPerPartPtr = tailDirEndPtr;
+                unsigned dirPerPartDigits = 0;
+                while (true)
+                {
+                    if (isdigit(*dirPerPartPtr))
+                    {
+                        if (dirPerPartDigits>=maxDirPerPartDigits)
+                        {
+                            // Too many digits to be a dir-per-part directory
+                            dirPerPartNum = 0;
+                            break;
+                        }
+                        dirPerPartNum = dirPerPartNum + ((*dirPerPartPtr - '0') * pow10[dirPerPartDigits]);
+                        dirPerPartPtr--;
+                        dirPerPartDigits++;
+                    }
+                    else if (*dirPerPartPtr=='/')
+                    {
+                        if (dirPerPartPtr==tailDirEndPtr)
+                            throw makeStringExceptionV(-1, LOGPFX "isMisplaced: Invalid directory name in file path: %s", fullPath);
+
+                        // Reached end of directory name and found only digits, likely a dir-per-part directory
+                        break;
+                    }
+                    else
+                    {
+                        // Not a digit or '/' means this is not a dir-per-part directory
+                        dirPerPartNum = 0;
+                        break;
+                    }
+                }
+
+                // Check dirPerPartNum against partNum if dirPerPartNum is not zero and is less than the number of file parts
+                // to avoid directories like /2025 or /092325 which are clearly dates and not dir-per-part numbers
+                if ((dirPerPartNum>0)&&(dirPerPartNum<=numParts)&&(partNum!=(dirPerPartNum-1)))
+                    return true;
+            }
+
+            // No more checks for non-striped containerized planes
+            if (numStripedDevices==1)
+                return false;
+
+            // Use filenameLen to determine the end of the base filename (excluding the ._P_of_N
+            // part mask and any trailing extension like .tmp). The hash should only cover the
+            // logical file name (scopes + base filename), matching how the stripe was originally calculated.
+            const char *ext = nullptr;
+            if (filenameLen > 0)
+            {
+                // filename points at the '/' separating the last scope from the base filename,
+                // except for a file in the root directory where it points at the first character
+                // of the base filename itself (no leading '/' to skip).
+                const char *baseName = (filename==filePath) ? filename : filename + 1;
+                ext = baseName + filenameLen; // points past the base filename to the part mask
+            }
+            else
+            {
+                ext = filenameEndPtr - 1;
+                while (true)
+                {
+                    if (ext==filename)
+                    {
+                        // No extension found, reset to end ptr to use full filename for hashing
+                        ext = filenameEndPtr;
+                        break;
+                    }
+                    else if (*ext=='.')
+                        break;
+                    ext--;
+                }
+            }
+
+            // Calculate hash from the file path
+            unsigned lfnHash = 0;
+            if (dirPerPartNum)
+            {
+                // Catch dir-per-part files found in the root directory e.g. /prefix/1/afile._1_of_1
+                if (dirPerPartPtr < filePath)
+                    lfnHash = 0; // Nothing to hash
+                else
+                    lfnHash = getLfnHashFromPath(dirPerPartPtr-filePath,filePath);
+                filename++; // Skip past leading slash
+                lfnHash = appendLfnHashFromPath(ext-filename, filename, lfnHash);
+            }
+            else
+                lfnHash = getLfnHashFromPath(ext-filePath, filePath, lfnHash);
+
+            return calcStripeNumber(partNum, lfnHash, numStripedDevices)!=stripeNum;
         }
+        else
+            return numParts!=grp.ordinality() || partNum>=grp.ordinality() || !grp.queryNode(partNum).endpoint().equals(ep);
+    }
+
+    void setMisplacedAndPresent(cFileDesc *file, bool misplaced, unsigned partNum, unsigned drv, const char *filePath, unsigned node, unsigned numnodes, unsigned stripeNum, unsigned dirPerPartNum)
+    {
+        CriticalBlock block(filesCrit);
+
         if (misplaced) {
             cMisplacedRec *mp = file->misplaced;
             while (mp) {
-                if (mp->eq(drv,pf,node,numnodes)) {
-                    OERRLOG(LOGPFX "Duplicate file with mismatched tail (%d,%d) %s",pf,node,name);
-                    return NULL;
+                if (mp->eq(drv,partNum,node,numnodes,stripeNum,dirPerPartNum)) {
+                    OERRLOG(LOGPFX "Duplicate file with mismatched tail (%d,%d) %s",partNum,node,filePath);
+                    return;
                 }
                 mp = mp->next;
             }
-            if (!mem)
-                return NULL;
-            mp = (cMisplacedRec *)mem->alloc(sizeof(cMisplacedRec));
-            mp->init(drv,pf,node,numnodes);
+            mp = cMisplacedRec::create(allocator);
+            mp->init(drv,partNum,node,numnodes,stripeNum,dirPerPartNum);
             mp->next = file->misplaced;
             file->misplaced = mp;
             // NB: still perform setpresent() below, so that later 'orphan' and 'found' scanning can spot the part as orphaned or part of a found file.
         }
-        if (file->setpresent(drv,pf)) {
-            OERRLOG(LOGPFX "Duplicate file with mismatched tail (%d) %s",pf,name);
-            file = NULL;
-        }
-        return file;
+
+        // If it is not an HPCC file, the partNum represents the node it was found on because there was no suffix to indicate the part number.
+        // External files are treated as single-part files, so index 0 is their only valid bitmap index.
+        unsigned bitmapIndex = file->isHPCCFile() ? partNum : 0;
+        if (file->setpresent(drv, bitmapIndex))
+            OERRLOG(LOGPFX "Duplicate file with mismatched tail (%d) %s", partNum, filePath);
     }
 
     bool markFile(unsigned drv,const char *name, unsigned node, const SocketEndpoint &ep, IGroup &grp, unsigned numnodes)
     {
         unsigned nf;
         unsigned pf;
+        unsigned filenameLen;
         StringAttr mask;
-        const char *fn = decodeName(drv,name,node,numnodes,mask,pf,nf);
-        bool misplaced = nf!=grp.ordinality() || pf>=grp.ordinality() || !grp.queryNode(pf).endpoint().equals(ep);
-        cFileDesc *file = files.find(fn,false);
-        if (file) {
+        const char *fn = decodeName(drv,name,node,numnodes,mask,pf,nf,filenameLen);
+        // NB: markFile is only called on files found from logical file metadata. Cannot check if file was striped
+        // to correct location since processFiles only checks the expected location.
+        bool misplaced = !isContainerized() && (nf!=grp.ordinality() || pf>=grp.ordinality() || !grp.queryNode(pf).endpoint().equals(ep));
+
+        CriticalBlock block(filesCrit); // NB: currently, markFile is only called from scanOrphans, which is single-threaded
+        auto it = files.find(fn);
+        if (it != files.end()) {
+            cFileDesc *file = it->second.get();
             if (misplaced) {
                 cMisplacedRec *mp = file->misplaced;
                 while (mp) {
@@ -407,6 +805,8 @@ struct cDirDesc
     {
         if (drv>1)
             drv = 1;
+
+        CriticalBlock block(dirDescCrit);
         totalsize[drv] += sz;
         if (!minnode[drv]||(minsize[drv]>sz)) {
             minnode[drv] = node+1;
@@ -420,21 +820,33 @@ struct cDirDesc
 
     bool empty(unsigned drv)
     {
+        // NB: Called after directory scan completes when the structure is read-only,
+        // and from removeIfEmpty() during the scan after activeReferences==0 has established that
+        // no thread is still scanning or modifying this directory. removeIfEmpty also calls empty
+        // under a the dirs CriticalSection to be thread-safe.
         // empty if no files, and all subdirs are empty
-        if ((files.ordinality()!=0)||(totalsize[drv]!=0))
+        if ((!files.empty())||(totalsize[drv]!=0))
             return false;
-        if (dirs.ordinality()==0)
+        if (dirs.empty())
             return true;
-        unsigned i;
-        cDirDesc *sd = dirs.first(i);
-        while (sd) {
-            if (sd->empty(drv))
+        for (const auto& dirPair : dirs) {
+            if (!dirPair.second->empty(drv))
                 return false;
-            sd = dirs.next(i);
         }
         return true;
     }
 
+    bool empty()
+    {
+        // Containerized doesn't have the same replication as bare metal, only check first drive
+        int drvs = isContainerized() ? 1 : 2;
+        for (int drv = 0; drv < drvs; drv++)
+        {
+            if (!empty(drv))
+                return false;
+        }
+        return true;
+    }
 };
 
 
@@ -449,53 +861,103 @@ struct cMessage: public CInterface
 };
 
 
+constexpr int64_t oneSecondNS = 1000 * 1000 * 1000; // 1 second in nanoseconds
+constexpr int64_t oneHourNS = 60 * 60 * oneSecondNS; // 1 hour in nanoseconds
+class XRefPeriodicTimer : public PeriodicTimer
+{
+public:
+    XRefPeriodicTimer() = default;
+    XRefPeriodicTimer(unsigned seconds, bool suppressFirst, const char *_clustname)
+    : clustname(_clustname) { reset(seconds, suppressFirst, clustname); }
+
+    unsigned calcElapsedMinutes() const
+    {
+        int64_t elapsedNS = cycle_to_nanosec(lastElapsedCycles - startCycles);
+        return elapsedNS / oneSecondNS / 60;
+    }
+
+    bool hasElapsed()
+    {
+        // MORE: Could make PeriodicTimer::hasElapsed thread safe and remove CriticalBlock
+        CriticalBlock block(timerSect);
+        return PeriodicTimer::hasElapsed();
+    }
+
+    int64_t queryElapsedNS() const
+    {
+        return cycle_to_nanosec(get_cycles_now() - startCycles);
+    }
+
+    void reset(unsigned seconds, bool suppressFirst, const char *_clustname)
+    {
+        clustname = _clustname;
+        PeriodicTimer::reset(seconds*1000, suppressFirst);
+        startCycles = lastElapsedCycles;
+    }
+
+    // Double the time period until it reaches 1 hour
+    void updatePeriod()
+    {
+        int64_t timePeriodNS = cycle_to_nanosec(timePeriodCycles) + 1; // 1 second is lost converting to nanoseconds
+        if (timePeriodNS < oneHourNS)
+        {
+            int64_t newTimePeriodNS = timePeriodNS >= oneHourNS / 2 ? oneHourNS : timePeriodNS * 2;
+            timePeriodCycles = nanosec_to_cycle(newTimePeriodNS);
+
+            unsigned intervalMinutes = newTimePeriodNS / oneSecondNS / 60;
+            if (clustname)
+                DBGLOG(LOGPFX "[%s] Heartbeat interval increased to %u minutes", clustname, intervalMinutes);
+            else
+                DBGLOG(LOGPFX "Heartbeat interval increased to %u minutes", intervalMinutes);
+        }
+    }
+
+private:
+    CriticalSection timerSect{SYNC_LOCATION};
+    const char *clustname = nullptr; // Cluster name for logging
+    cycle_t startCycles = 0;
+};
+
 class CNewXRefManagerBase
 {
 public:
-    CriticalSection logsect;
+    CriticalSection logsect{SYNC_LOCATION};
     Owned<IRemoteConnection> logconn;
     StringAttr logcache;
     StringAttr clustname;
     CIArrayOf<cMessage> errors;
     CIArrayOf<cMessage> warnings;
     StringAttr rootdir;
-    unsigned lastlog;
-    unsigned sfnum;
-    unsigned fnum;
+    unsigned lastlog = 0;
+    unsigned sfnum = 0;
+    unsigned fnum = 0;
+    std::atomic<uint64_t> processedDirs{0};
+    std::atomic<uint64_t> processedFiles{0};
+    XRefPeriodicTimer heartbeatTimer;
+
     Owned<IPropertyTree> foundbranch;
     Owned<IPropertyTree> lostbranch;
     Owned<IPropertyTree> orphansbranch;
     Owned<IPropertyTree> dirbranch;
+    bool saveToPlane = false;
 
-    void log(const char * format, ...) __attribute__((format(printf, 2, 3)))
+    void log(bool forceStatusUpdate, const char * format, ...) __attribute__((format(printf, 3, 4)))
     {
-        CriticalBlock block(logsect);
+        StringBuffer line;
         va_list args;
         va_start(args, format);
-        StringBuffer line;
         line.valist_appendf(format, args);
         va_end(args);
+
         if (clustname.get())
             PROGLOG(LOGPFX "[%s] %s",clustname.get(),line.str());
         else
             PROGLOG(LOGPFX "%s",line.str());
-        if (logconn) {
-            logcache.set(line.str());
-            updateStatus(false);
-        }
-    }
 
-    void statlog(const char * format, ...) __attribute__((format(printf, 2, 3)))
-    {
-        CriticalBlock block(logsect);
-        va_list args;
-        va_start(args, format);
-        StringBuffer line;
-        line.valist_appendf(format, args);
-        va_end(args);
         if (logconn) {
+            CriticalBlock block(logsect);
             logcache.set(line.str());
-            updateStatus(false);
+            updateStatus(forceStatusUpdate);
         }
     }
 
@@ -509,7 +971,7 @@ public:
         va_end(args);
         if (errors.ordinality()<1000) {
             errors.append(*new cMessage(lname,line.str()));
-            if (errors.ordinality()==1000) 
+            if (errors.ordinality()==1000)
                 errors.append(*new cMessage("","error limit exceeded (1000), truncating"));
         }
 
@@ -526,7 +988,7 @@ public:
         va_end(args);
         if (warnings.ordinality()<1000) {
             warnings.append(*new cMessage(lname,line.str()));
-            if (warnings.ordinality()==1000) 
+            if (warnings.ordinality()==1000)
                 warnings.append(*new cMessage("","warning limit (1000) exceeded, truncating"));
         }
         OWARNLOG("%s: %s",lname,line.str());
@@ -547,21 +1009,101 @@ public:
 
     }
 
+    void startHeartbeat(const char * op)
+    {
+        processedDirs = 0;
+        processedFiles = 0;
+        heartbeatTimer.reset(60, true, clustname.get()); // 1 minute interval
+        log(true, "%s heartbeat started (interval: 1 minute)", op);
+    }
+
+    void finishHeartbeat(const char * op)
+    {
+        StringBuffer time;
+        formatTime(time, heartbeatTimer.queryElapsedNS());
+        const uint64_t dirs = processedDirs.load();
+        const uint64_t files = processedFiles.load();
+        log(true, "%s complete. Total time: %s, Total dirs: %" I64F "u, Total files: %" I64F "u", op, time.str(), (unsigned __int64)dirs, (unsigned __int64)files);
+    }
+
+    void checkHeartbeat(const char * op)
+    {
+        time_t now = time(NULL);
+        if (!heartbeatTimer.hasElapsed())
+            return;
+
+        unsigned elapsedMinutes = heartbeatTimer.calcElapsedMinutes();
+        unsigned elapsedHours = elapsedMinutes / 60;
+        unsigned elapsedDays = elapsedHours / 24;
+        unsigned remainingHours = elapsedHours % 24;
+        unsigned remainingMinutes = elapsedMinutes % 60;
+
+        struct tm *utc_tm = gmtime(&now);
+        char timestamp[32];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", utc_tm);
+        const uint64_t dirs = processedDirs.load();
+        const uint64_t files = processedFiles.load();
+
+        if (elapsedDays > 0)
+            log(true, "%s - elapsed: %ud %uh processed: %" I64F "u dirs, %" I64F "u files (%s UTC)", op, elapsedDays, remainingHours, (unsigned __int64)dirs, (unsigned __int64)files, timestamp);
+        else if (elapsedHours > 0)
+            log(true, "%s - elapsed: %uh %um processed: %" I64F "u dirs, %" I64F "u files (%s UTC)", op, elapsedHours, remainingMinutes, (unsigned __int64)dirs, (unsigned __int64)files, timestamp);
+        else
+            log(true, "%s - elapsed: %um processed: %" I64F "u dirs, %" I64F "u files (%s UTC)", op, elapsedMinutes, (unsigned __int64)dirs, (unsigned __int64)files, timestamp);
+
+        heartbeatTimer.updatePeriod();
+    }
+
+    void saveBranchToSashaPlane(const char *sashaDir, const char *name, IPropertyTree *branch, size32_t blockSize)
+    {
+        if (!branch)
+            return;
+        try
+        {
+            branch->setProp("Cluster",clustname);
+            StringBuffer filepath(sashaDir);
+            addPathSepChar(filepath).append(name).append(".xml");
+
+            Owned<IFile> file = createIFile(filepath.str());
+            Owned<IFileIO> fileIO = file->open(IFOcreate);
+            if (!fileIO)
+            {
+                warn(filepath.str(), "Failed to create file");
+                return;
+            }
+
+            PROGLOG(LOGPFX "Saving branch %s to %s", name, filepath.str());
+
+            Owned<IFileIOStream> stream = createBufferedIOStream(fileIO, blockSize);
+            saveXML(*stream, branch, 0, XML_Format);
+            stream.clear();
+            fileIO->close();
+
+            PROGLOG(LOGPFX "Saved branch %s to %s", name, filepath.str());
+        }
+        catch (IException *e)
+        {
+            StringBuffer errMsg;
+            warn(name, "Error saving branch to Sasha plane: %s", e->errorMessage(errMsg).str());
+            e->Release();
+        }
+    }
+
     void addBranch(IPropertyTree *root,const char *name,IPropertyTree *branch)
     {
         if (!branch)
             return;
+
         branch->setProp("Cluster",clustname);
         StringBuffer datastr;
         toXML(branch,datastr);
+
         root->addPropTree(name,createPTree(name))->setPropBin("data",datastr.length(),datastr.str());
     }
 
-    CNewXRefManagerBase()
+    CNewXRefManagerBase(bool _saveToPlane) : saveToPlane(_saveToPlane)
     {
-        lastlog = 0;
-        sfnum = 0;
-        fnum = 0;
+        saveToPlane = getExpertOptBool("saveToDebugPlane", isContainerized());
     }
 
     void start(bool updateeclwatch,const char *clname)
@@ -573,24 +1115,22 @@ public:
                 return;
             IPropertyTree *xrefroot = conn->queryRoot();
             xpath.appendf("Cluster[@name=\"%s\"]", clname);
-
         }
         if (updateeclwatch) {
             xpath.insert(0,"/DFU/XREF/");
             logconn.setown(querySDS().connect(xpath.str(),myProcessSession(),0 ,INFINITE));
         }
-        log("Starting");
+        log(false, "Starting");
     }
 
     void finish(bool aborted)
     {
         if (aborted)
-            log("Aborted");
+            log(false, "Aborted");
         logconn.clear(); // final message done by save to eclwatch
     }
 
-
-    void addErrorsWarnings(IPropertyTree *croot)
+    IPropertyTree *createErrorWarningMessageTree()
     {
         Owned<IPropertyTree> message = createPTree("Messages");
         ForEachItemIn(i1,errors) {
@@ -605,19 +1145,23 @@ public:
             t->addProp("File",item.lname.get());
             t->addProp("Text",item.msg.get());
         }
+        return message.getClear();
+    }
+
+    void addErrorsWarnings(IPropertyTree *croot)
+    {
+        Owned<IPropertyTree> message = createErrorWarningMessageTree();
         addBranch(croot,"Messages",message);
     }
 
-
-
-    void saveToEclWatch(bool &abort,bool byscheduler) 
+    void saveToEclWatch(bool &abort,bool byscheduler)
     {
         if (abort)
             return;
-        log("Saving information");
+        log(false,"Saving information");
         Owned<IPropertyTree> croot = createPTree("Cluster");
         croot->setProp("@name",clustname);
-        if (!rootdir.isEmpty()) 
+        if (!rootdir.isEmpty())
             croot->setProp("@rootdir",rootdir);
         CDateTime dt;
         dt.setNow();
@@ -632,11 +1176,63 @@ public:
         else if (fnum)
             ss.appendf("  [%d files]",fnum);
         croot->setProp("@status",ss.str());
-        addBranch(croot,"Orphans",orphansbranch);
-        addBranch(croot,"Lost",lostbranch);
-        addBranch(croot,"Found",foundbranch);
-        addBranch(croot,"Directories",dirbranch);
-        addErrorsWarnings(croot);
+
+        // Check if we should use Sasha plane for storage (configurable, default to containerized)
+
+        // Read configuration - make this an expert option
+        if (saveToPlane)
+        {
+            // Create directory structure: <prefix>/xref/<cluster>/<datestamp>/
+            StringBuffer sashaDir;
+            getLdsPath("xref", sashaDir);
+            addPathSepChar(sashaDir).append(clustname);
+
+            // Create date+time based subdirectory
+            StringBuffer dateTimeDir;
+            dt.getString(dateTimeDir, false);  // YYYY-MM-DDTHH:MM:SS format
+            addPathSepChar(sashaDir).append(dateTimeDir);
+
+            if (!recursiveCreateDirectory(sashaDir))
+                throw makeStringExceptionV(0, LOGPFX "Failed to create directory: %s", sashaDir.str());
+            PROGLOG(LOGPFX "Using Sasha storage at: %s", sashaDir.str());
+
+            // Get block size once based on the plane of the file path
+            StringBuffer planeName;
+            findPlaneFromPath(sashaDir.str(), planeName);
+            constexpr size32_t defaultBlockSize = 0x400000; // 4MB
+            size32_t blockSize = (planeName.length() == 0) ? defaultBlockSize : getBlockedFileIOSize(planeName, defaultBlockSize);
+
+            // Save branches to Sasha plane files
+            saveBranchToSashaPlane(sashaDir.str(), "Orphans", orphansbranch, blockSize);
+            saveBranchToSashaPlane(sashaDir.str(), "Lost", lostbranch, blockSize);
+            saveBranchToSashaPlane(sashaDir.str(), "Found", foundbranch, blockSize);
+            saveBranchToSashaPlane(sashaDir.str(), "Directories", dirbranch, blockSize);
+
+            // Save Messages
+            Owned<IPropertyTree> message = createErrorWarningMessageTree();
+            saveBranchToSashaPlane(sashaDir.str(), "Messages", message, blockSize);
+
+            StringBuffer savePath(sashaDir);
+            // Store path reference in Dali
+            if (!isContainerized() && isAbsolutePath(sashaDir)) // convert to UNC path
+            {
+                RemoteFilename rfn;
+                rfn.setLocalPath(sashaDir.str());
+                rfn.getRemotePath(savePath.clear());
+            }
+            croot->setProp("@xrefPath", savePath);
+            PROGLOG(LOGPFX "Saved XREF data to Sasha plane with path: %s", savePath.str());
+        }
+        else
+        {
+            // Use traditional Dali storage
+            addBranch(croot,"Orphans",orphansbranch);
+            addBranch(croot,"Lost",lostbranch);
+            addBranch(croot,"Found",foundbranch);
+            addBranch(croot,"Directories",dirbranch);
+            addErrorsWarnings(croot);
+        }
+
         if (abort)
             return;
         logconn.clear();
@@ -649,55 +1245,70 @@ public:
         xrefroot->removeProp(xpath.str());
         xrefroot->addPropTree("Cluster",croot.getClear());
     }
-
 };
 
 
 class CNewXRefManager: public CNewXRefManagerBase
 {
-    cDirDesc *root;     
-    CriticalSection crit;
-    bool iswin;                     // set by scanDirectories
-    IpAddress *iphash;
-    unsigned *ipnum;
-    unsigned iphashsz;
+    XRefAllocator allocator;
+    std::unique_ptr<cDirDesc> root;
+    bool iswin = false;             // set by scanDirectories
+    IpAddress *iphash = nullptr;
+    unsigned *ipnum = nullptr;
+    unsigned iphashsz = 0;          // set by setGroup
     IArrayOf<IPropertyTree> sorteddirs;
 
 public:
     Owned<IGroup> grp, rawgrp;
     StringArray clusters;           // list of matching cluster (used in xref)
     StringBuffer clusterscsl;       // comma separated list of cluster (used in xref)
-    unsigned numnodes;
+    unsigned numnodes = 0;          // set by setGroup
     StringArray lostfiles;
-    CLargeMemoryAllocator mem;
-    bool verbose;
+    bool verbose = true;
     unsigned numuniqnodes = 0;
     Owned<IUserDescriptor> udesc;
+    Linked<const IPropertyTree> storagePlane;
+    bool isPlaneStriped = false;
+    unsigned numStripedDevices = 1;
+    bool filterScopesEnabled = false;
+    StringArray scopeFilters;
 
-    CNewXRefManager(unsigned maxMb=DEFAULT_MAXMEMORY)
-        : mem(0x100000*((memsize_t)maxMb),0x10000,true)
+    CNewXRefManager(const IPropertyTree *plane, unsigned maxMb, bool saveToPlane, const char *_scopeFilters)
+        : CNewXRefManagerBase(saveToPlane), allocator(maxMb)
     {
-        iswin = false; // set later
-        root = new cDirDesc(mem,"");
-        verbose = true;
-        iphash = NULL;
-        ipnum = NULL;
+        root.reset(cDirDesc::create("", &allocator));
         foundbranch.setown(createPTree("Found"));
         lostbranch.setown(createPTree("Lost"));
         orphansbranch.setown(createPTree("Orphans"));
         dirbranch.setown(createPTree("Directories"));
-        log("Max memory = %d MB", maxMb);
+        log(false, "Max memory = %d MB", maxMb);
 
         StringBuffer userName;
-        serverConfig->getProp("@sashaUser", userName);
+        getComponentConfigSP()->getProp("@user", userName);
+        if (userName.isEmpty()) // for backward compatibility
+            getComponentConfigSP()->getProp("@sashaUser", userName);
         udesc.setown(createUserDescriptor());
         udesc->set(userName.str(), nullptr);
+
+        if (plane)
+        {
+            storagePlane.set(plane);
+            unsigned numDevices = storagePlane->getPropInt("@numDevices", 1);
+            isPlaneStriped = !storagePlane->hasProp("@hostGroup") && (numDevices>1);
+            numStripedDevices = isPlaneStriped ? numDevices : 1;
+        }
+
+        if (!isEmptyString(_scopeFilters))
+        {
+            log(false, "Filter Scopes Enabled: searching for files in: %s", _scopeFilters);
+            filterScopesEnabled = true;
+            scopeFilters.appendList(_scopeFilters, ",");
+        }
     }
 
     ~CNewXRefManager()
     {
-        delete root;
-        if (iphash) 
+        if (iphash)
             delete [] iphash;
         delete [] ipnum;
     }
@@ -707,7 +1318,7 @@ public:
     {
         CNewXRefManagerBase::start(updateeclwatch,clustname);
     }
-    
+
 
 
     void addIpHash(const IpAddress &ip,unsigned n)
@@ -715,7 +1326,7 @@ public:
         unsigned r;
         _cpyrev4(&r,&ip);
         unsigned h = hashc((const byte *)&r,sizeof(r),0)%iphashsz;
-        while (!iphash[h].isNull()) 
+        while (!iphash[h].isNull())
             if (++h==iphashsz)
                 h = 0;
         iphash[h] = ip;
@@ -755,12 +1366,15 @@ public:
             OERRLOG(LOGPFX "Cluster %s node group %s not found",clustname.get(),grpstr.str());
             return false;
         }
-        ForEachItemIn(i1,done) {
-            GroupRelation gr = done.item(i1).compare(grp);
-            if ((gr==GRidentical)||(gr==GRsubset)) {
-                if (strcmp(basedir.str(),donedir.item(i1))==0) {
-                    OWARNLOG(LOGPFX "Node group %s already done",grpstr.str());
-                    return false;
+        // Group overlap doesn't apply to containerized. Should be cleaned up once planes are fully integrated
+        if (!isContainerized()) {
+            ForEachItemIn(i1,done) {
+                GroupRelation gr = done.item(i1).compare(grp);
+                if ((gr==GRidentical)||(gr==GRsubset)) {
+                    if (strcmp(basedir.str(),donedir.item(i1))==0) {
+                        OWARNLOG(LOGPFX "Node group %s already done",grpstr.str());
+                        return false;
+                    }
                 }
             }
         }
@@ -777,67 +1391,73 @@ public:
         SocketEndpointArray deduppedEps;
         ForEachNodeInGroup(i,*grp) {
             const SocketEndpoint &ep = grp->queryNode(i).endpoint();
-            if (ep.port!=0) 
+            if (ep.port!=0)
                 OWARNLOG(LOGPFX "Group has ports!");
             // check port 0 TBD
             if (NotFound == checkIpHash(ep)) {
                 addIpHash(ep,i);
                 deduppedEps.append(ep);
             }
-        }   
+        }
         rawgrp.setown(createIGroup(deduppedEps));
         numuniqnodes = rawgrp->ordinality();
         clusters.kill();
         clusterscsl.clear().append(grpstr);
         clusters.append(grpstr.str());
-        Owned<INamedGroupIterator> giter = queryNamedGroupStore().getIterator(rawgrp,false);
-        StringBuffer gname;
-        ForEach(*giter) {
-            giter->get(gname.clear());
-            if (strcmp(grpname,gname.str())!=0) {
-                clusters.append(gname.str());
-                clusterscsl.append(',').append(gname.str());
+        if (!isContainerized()) {
+            // This code is locating all other groups that are a subset of the group being scanned.
+            // and builds this list up into 'clustercsl', which is used when XREF identifies a lost
+            // file, tagging them with this list, as possible candidate clusters it may be part of.
+            Owned<INamedGroupIterator> giter = queryNamedGroupStore().getIterator(rawgrp,false);
+            StringBuffer gname;
+            ForEach(*giter) {
+                giter->get(gname.clear());
+                if (strcmp(grpname,gname.str())!=0) {
+                    clusters.append(gname.str());
+                    clusterscsl.append(',').append(gname.str());
+                }
             }
+            // add the first IP also
+            rawgrp->queryNode(0).endpoint().getHostText(gname.clear());
+            clusters.append(gname.str());
+            clusterscsl.append(',').append(gname.str());
         }
-        // add the first IP also
-        rawgrp->queryNode(0).endpoint().getIpText(gname.clear());
-        clusters.append(gname.str());
-        clusterscsl.append(',').append(gname.str());
-        if (basedir.length()==0) {
+        if (isContainerized())
+            rootdir.set(storagePlane->queryProp("@prefix"));
+        else if (basedir.length()==0) {
             const char *ddir = "thor";
             const char *rdir = "thor";
             StringBuffer datadir;
             StringBuffer repdir;
-            if (getConfigurationDirectory(serverConfig->queryPropTree("Directories"),"data","thor",_clustname,datadir))
+            if (getConfigurationDirectory(getComponentConfigSP()->queryPropTree("Directories"),"data","thor",_clustname,datadir))
                 ddir = datadir.str();
-            if (getConfigurationDirectory(serverConfig->queryPropTree("Directories"),"mirror","thor",_clustname,repdir))
+            if (getConfigurationDirectory(getComponentConfigSP()->queryPropTree("Directories"),"mirror","thor",_clustname,repdir))
                 rdir = repdir.str();
             iswin = grp->ordinality()?(getDaliServixOs(grp->queryNode(0).endpoint())==DAFS_OSwindows):false;
             setBaseDirectory(ddir,0,iswin?DFD_OSwindows:DFD_OSunix);
             setBaseDirectory(rdir,1,iswin?DFD_OSwindows:DFD_OSunix);
-            rootdir.set(queryBaseDirectory(grp_unknown, 0, iswin?DFD_OSwindows:DFD_OSunix));
+            rootdir.set(queryUnknownBaseDirectory(0, iswin?DFD_OSwindows:DFD_OSunix));
         }
         else {
             rootdir.set(basedir);
             iswin = getPathSepChar(rootdir.get())=='\\';
         }
+        assertex(!rootdir.isEmpty());
         return true;
     }
 
 
     void clear()
     {
-        mem.reset();
-        delete root;
-        root = new cDirDesc(mem,"");
+        root.reset(cDirDesc::create("", &allocator));
     }
 
     cDirDesc *findDirectory(const char *name)
-    { 
-        if (stricmp(name,rootdir)==0) 
-            return root;
-        if (!*name) 
-            return NULL;
+    {
+        if (stricmp(name,rootdir)==0)
+            return root.get();
+        if (!*name)
+            return nullptr;
         StringBuffer pdir;
         const char *tail = splitDirTail(name,pdir);
         size32_t dl = pdir.length();
@@ -845,8 +1465,25 @@ public:
             pdir.setLength(--dl);
         cDirDesc *p = findDirectory(pdir.str());
         if (!p)
-            return NULL;
-        return p->lookupDir(tail,NULL);
+            return nullptr;
+        // When the cDirDesc hierarchy is built, stripe directories are excluded from the path (see scanDirectories' casyncfor::Do),
+        // so prevent incorrect traversal into striped directory structures and return root instead
+        if (isPlaneStriped&&p==root.get()&&tail[0]=='d'&&readDigits(tail+1)!=0)
+            return p;
+
+        cDirDesc *dir = p->lookupDirNonThreadSafe(tail, nullptr);
+        if (dir)
+        {
+            // If dir is a dir-per-part candidate, likely all part files are combined in the parent
+            if (isDirPerPartSupported()&&dir->isDirPerPartCandidate()&&dir->empty())
+                return p;
+            else
+                return dir;
+        }
+        else if (isDirPerPartSupported()&&readDigits(tail)!=0)
+            return p; // Likely dir-per-part cDirDesc was removed because it was empty
+        else
+            return nullptr;
     }
 
     bool dirFiltered(const char *filename)
@@ -872,12 +1509,101 @@ public:
         return false;
     }
 
-
-    bool scanDirectory(unsigned node,const SocketEndpoint &ep,StringBuffer &path, unsigned drv, cDirDesc *pdir, IFile *cachefile)
+    // Helper function to check if a scope matches a filter
+    // allowPartialMatch: true = partial match (for directories), false = full match (for files)
+    bool checkScopeMatchesFilter(const char *path, bool allowPartialMatch)
     {
+        if (!filterScopesEnabled)
+            return true;
+
+        ForEachItemIn(i, scopeFilters)
+        {
+            const char *filter = scopeFilters.item(i);
+            const char *scope = path;
+            size_t filterLen = 0;
+            size_t scopeLen = 0;
+
+            while (true)
+            {
+                const char *filterSep = strstr(filter, "::");
+                const char *scopeSep = strstr(scope, "/");
+                filterLen = filterSep ? (filterSep - filter) : strlen(filter);
+                scopeLen = scopeSep ? (scopeSep - scope) : strlen(scope);
+
+                if (filterSep && scopeSep)
+                {
+                    // Common Case: Both filter and scope have more subscopes, check that they match so far
+                    if (filterLen != scopeLen || strncmp(filter, scope, filterLen) != 0)
+                        break;
+
+                    filter = filterSep + 2;
+                    scope = scopeSep + 1;
+                }
+                else if (filterSep)
+                {
+                    // Filter has more subscopes than scope
+                    if (allowPartialMatch)
+                    {
+                        if (filterLen == scopeLen && strncmp(filter, scope, filterLen) == 0)
+                            return true;
+                    }
+                    // For full match: filter is longer, no match
+                    break;
+                }
+                else if (scopeSep)
+                {
+                    // Scope has more subscopes than filter
+                    if (filterLen != scopeLen || strncmp(filter, scope, scopeLen) != 0)
+                        break;
+
+                    // Check if remaining scope is a dir-per-part directory
+                    if (isDirPerPartSupported())
+                    {
+                        // The remaining scope must be numeric and have no additional subscopes
+                        scope = scopeSep + 1;
+                        std::string_view sv = scope;
+                        int value = 0;
+                        auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
+                        if (value > 0 && *ptr == '\0')
+                            return true; // Remaining scope is a dir-per-part directory, consider it a match
+                    }
+
+                    break;
+                }
+                else
+                {
+                    // Both filter and scope are out of subscopes, check final match
+                    if (streq(filter, scope))
+                        return true;
+                    else
+                        break;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    // Checks that a scope matches the beginning of a filter
+    // Returns true if a partial scope matches any filter, false otherwise
+    bool partialScopeMatchesFilter(const char *path)
+    {
+        return checkScopeMatchesFilter(path, true);
+    }
+
+    // Checks that a logical file scope matches the filter (scope does not include filename)
+    // Returns true if the full scope matches any filter, false otherwise
+    bool fullScopeMatchesFilter(const char *path)
+    {
+        return checkScopeMatchesFilter(path, false);
+    }
+
+    bool scanDirectory(unsigned node, const SocketEndpoint &ep, StringBuffer &path, unsigned drv, cDirDesc *pdir, IFile *cachefile, unsigned filePathOffset, unsigned stripeNum, cDirDesc *parent, offset_t &parentScopeSz)
+    {
+        checkHeartbeat("Directory scan");
         size32_t dsz = path.length();
-        if (pdir==NULL) 
-            pdir = root;
+        if (pdir==NULL)
+            pdir = root.get();
         RemoteFilename rfn;
         rfn.setPath(ep,path.str());
         Owned<IFile> file;
@@ -887,57 +1613,182 @@ public:
             file.setown(createIFile(rfn));
         Owned<IDirectoryIterator> iter;
         Owned<IException> e;
+        try
         {
-            CriticalUnblock unblock(crit); // not strictly necessary if numThreads==1, but no harm
-            try {
-                iter.setown(file->directoryFiles(NULL,false,true));
-            }
-            catch (IException *_e) {
-                e.setown(_e);
-            }
+            iter.setown(file->directoryFiles(NULL,false,true));
         }
-        if (e) {
+        catch (IException *_e)
+        {
+            e.setown(_e);
+        }
+
+        if (e)
+        {
             StringBuffer tmp(LOGPFX "scanDirectory ");
             rfn.getRemotePath(tmp);
             EXCLOG(e,tmp.str());
             return false;
         }
         StringBuffer fname;
-        offset_t nsz = 0;
+        offset_t scopeSz = 0;
         StringArray dirs;
+        bool scanFiles = fullScopeMatchesFilter(path.str()+filePathOffset+1);
         ForEach(*iter) {
             iter->getName(fname.clear());
             if (iswin)
                 fname.toLowerCase();
             addPathSepChar(path).append(fname);
-            if (iter->isDir())  {
-                if (!dirFiltered(path.str())) {
+            if (iter->isDir())
+            {
+                if (partialScopeMatchesFilter(path.str()+filePathOffset+1))
                     dirs.append(fname.str());
-                }
             }
-            else {
+            else if (scanFiles) {
                 CDateTime dt;
-                offset_t fsz = iter->getFileSize();
-                nsz += fsz;
+                offset_t filesz = iter->getFileSize();
                 iter->getModifiedTime(dt);
-                if (!fileFiltered(path.str(),dt)) {
-                    pdir->addFile(drv,fname.str(),fsz,dt,node,ep,*grp,numnodes,&mem);
+                if (!fileFiltered(path.str(),dt))
+                {
+                    try
+                    {
+                        unsigned numParts;    // num parts
+                        unsigned partNum;     // part num
+                        unsigned filenameLen; // length of file name excluding extension i.e. ._$P$_of_$N$
+                        StringAttr mask;
+                        const char *fn = cDirDesc::decodeName(drv,fname,node,numnodes,mask,partNum,numParts,filenameLen);
+                        bool misplaced = cDirDesc::isMisplaced(partNum,numParts,ep,*grp,path,filePathOffset,stripeNum,numStripedDevices,filenameLen);
+
+                        cFileDesc *file = nullptr;
+                        bool addToParent = false;
+                        if (parent)
+                        {
+                            if (pdir->isDirPerPartCandidate())
+                            {
+                                if (pdir->isDirPerPartMatch(partNum))
+                                {
+                                    // In a containerized deployment, a dir-per-part is on by default, and this branch
+                                    // is expected to be the normal/common case, all other branches are exceptions.
+                                    file = pdir->getFile(fn);
+                                    if (file && !file->isDirPerPart)
+                                    {
+                                        // If the current file part matched the directory name and a non-dir-per-part file
+                                        // was found in the current directory, likely this whole file is not a dir-per-part
+                                        // file, and this part is the only match.
+                                        scopeSz += filesz;
+                                    }
+                                    else
+                                    {
+                                        // This is still in a directory that looks like a dir-per-part, and the file was not found
+                                        // so create it in the parent (above the dir-per-part directory), i.e. effectively ignoring
+                                        // the dir-per-part dir itself.
+                                        file = parent->ensureFile(fn, numParts, true, filenameLen, &allocator);
+                                        parentScopeSz += filesz;
+                                        addToParent = true;
+                                    }
+                                }
+                                else // we are in a dir-per-part directory, but part doesn't look like it belongs in a dir-per-part structure
+                                {
+                                    if (misplaced)
+                                    {
+                                        // Keep misplaced dir-per-part parts attached to the parent logical file.
+                                        // Otherwise the misplaced part is tracked as a separate local file and
+                                        // xref emits duplicate orphan entries for the same logical file.
+                                        file = parent->ensureFile(fn, numParts, true, filenameLen, &allocator);
+                                        parentScopeSz += filesz;
+                                        addToParent = true;
+                                    }
+                                    else
+                                    {
+                                        // Not a dir-per-part file, check for previously moved file
+                                        CLeavableCriticalBlock parentBlock(parent->filesCrit);
+                                        auto it = parent->files.find(fn);
+                                        if (it != parent->files.end() && it->second->isDirPerPart)
+                                        {
+                                            // Move file to current directory
+                                            it->second->isDirPerPart = false;
+                                            file = it->second.release();
+                                            parent->files.erase(it);
+                                            parentScopeSz -= filesz;
+
+                                            parentBlock.ensureLeave();
+
+                                            pdir->addExistingFile(fn, file);
+                                            scopeSz += filesz; // moved file - MORE this isn't really correct
+                                        }
+                                        else
+                                        {
+                                            // No previously moved file and no dir-per-part. Create in current directory
+                                            parentBlock.ensureLeave();
+
+                                            file = pdir->ensureFile(fn, numParts, false, filenameLen, &allocator);
+                                        }
+                                        scopeSz += filesz;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                file = pdir->ensureFile(fn, numParts, false, filenameLen, &allocator);
+                                scopeSz += filesz;
+                            }
+                        }
+                        else
+                        {
+                            file = pdir->ensureFile(fn, numParts, false, filenameLen, &allocator);
+                            scopeSz += filesz;
+                        }
+
+                        cDirDesc *currentOrParent = addToParent ? parent : pdir;
+                        currentOrParent->setMisplacedAndPresent(file, misplaced, partNum, drv, path, node, numnodes, stripeNum, pdir->dirPerPartNum);
+
+                        processedFiles++;
+                    }
+                    catch (IException *e)
+                    {
+                        StringBuffer filepath, errMsg;
+                        addPathSepChar(rfn.getRemotePath(filepath)).append(fname);
+                        error(filepath.str(), "scanDirectory Error adding file : %s", e->errorMessage(errMsg).str());
+                        e->Release();
+                    }
                 }
             }
             path.setLength(dsz);
         }
         iter.clear();
-        ForEachItemIn(i,dirs) {
+        ForEachItemIn(i,dirs)
+        {
             addPathSepChar(path).append(dirs.item(i));
             if (file.get()&&!resetRemoteFilename(file,path.str())) // sneaky way of avoiding cache
                 file.clear();
-            if (!scanDirectory(node,ep,path,drv,pdir->lookupDir(dirs.item(i),&mem),file))
+            cDirDesc *child = pdir->lookupDir(dirs.item(i),&allocator);
+            if (!scanDirectory(node,ep,path,drv,child,file,filePathOffset,stripeNum,pdir,scopeSz))
+            {
+                if (child)
+                    child->noteRelease();
                 return false;
+            }
             path.setLength(dsz);
-        }
-        pdir->addNodeStats(node,drv,nsz);
-        return true;
 
+            if (child)
+            {
+                bool childIsDirPerPart = child->isDirPerPartCandidate();
+                child->noteRelease();
+                if (childIsDirPerPart)
+                {
+                    // Try to remove this directory if there are currently no other threads accessing it.
+                    // It is possible that this dir-per-part dir is deleted and then another thread re-creates
+                    // it during its scan. This is ok as it should also be cleaned up if still empty.
+                    pdir->removeIfEmpty(dirs.item(i));
+                }
+            }
+        }
+
+        if (!pdir->isDirPerPartCandidate() || !pdir->empty())
+            pdir->addNodeStats(node,drv,scopeSz);
+
+        processedDirs++;
+
+        return true;
     }
 
     bool scanDirectories(bool &abort, unsigned numThreads)
@@ -948,12 +1799,11 @@ public:
             const char *rootdir;
             unsigned n;
             unsigned r;
-            CriticalSection &crit;
             bool &abort;
         public:
             bool ok;
-            casyncfor(CNewXRefManager &_parent,const char *_rootdir,CriticalSection &_crit,bool &_abort)
-                : parent(_parent), crit(_crit), abort(_abort)
+            casyncfor(CNewXRefManager &_parent,const char *_rootdir,bool &_abort)
+                : CAsyncFor(SYNC_LOCATION), parent(_parent), abort(_abort)
             {
                 rootdir = _rootdir;
                 n = parent.numuniqnodes;
@@ -962,40 +1812,88 @@ public:
             }
             void Do(unsigned i)
             {
-                if (abort)
-                    return;
-                CriticalBlock block(crit);
+                /* NB: Threading behavior depends on deployment type and cluster configuration:
+                *
+                * Bare-metal deployments:
+                *   - Multi-threaded: Each thread scans a different node (i = node number)
+                *   - Single-threaded: When only one node is available
+                *
+                * Containerized deployments:
+                *   - Striped planes: Multi-threaded, each thread scans a different stripe directory (i = stripe number)
+                *   - Non-striped planes: Single-threaded scan
+                *
+                * @param i Thread index - represents either node number (bare-metal) or stripe number (containerized)
+                */
                 if (!ok||abort)
                     return;
+
                 StringBuffer path(rootdir);
-                SocketEndpoint ep = parent.rawgrp->queryNode(i).endpoint();
-                StringBuffer tmp;
-                parent.log("Scanning %s directory %s",ep.getUrlStr(tmp).str(),path.str());
-                if (!parent.scanDirectory(i,ep,path,0,NULL,NULL)) {
-                    ok = false;
-                    return;
+                if (parent.isPlaneStriped)
+                {
+                    assertex(!parent.storagePlane->hasProp("@hostGroup"));
+
+                    // A hosted plane will never be striped, so for striped planes, use local host
+                    SocketEndpoint localEP;
+                    localEP.setLocalHost(0);
+                    // Add stripe directory to path so each thread scans a different stripe directory
+                    addPathSepChar(path).append('d').append(i+1);
+
+                    parent.log(false,"Scanning %s directory %s",parent.storagePlane->queryProp("@name"),path.str());
+                    offset_t rootsz = 0;
+                    if (!parent.scanDirectory(0,localEP,path,0,parent.root.get(),NULL,path.length(),i+1,nullptr,rootsz))
+                    {
+                        ok = false;
+                        return;
+                    }
                 }
-                i = (i+r)%n;
-                setReplicateFilename(path,1);   
-                ep = parent.rawgrp->queryNode(i).endpoint();
-                parent.log("Scanning %s directory %s",ep.getUrlStr(tmp.clear()).str(),path.str());
-                if (!parent.scanDirectory(i,ep,path,1,NULL,NULL)) {
-                    ok = false;
+                else
+                {
+                    StringBuffer hostStr;
+                    SocketEndpoint ep = parent.rawgrp->queryNode(i).endpoint();
+                    parent.log(false,"Scanning %s directory %s",ep.getEndpointHostText(hostStr).str(),path.str());
+                    offset_t rootsz = 0;
+                    if (!parent.scanDirectory(i,ep,path,0,NULL,NULL,path.length(),0,nullptr,rootsz))
+                    {
+                        ok = false;
+                        return;
+                    }
+                    if (!isContainerized())
+                    {
+                        // MORE: If containerized, a hosted plane may still have replication
+                        i = (i+r)%n;
+                        StringBuffer replicatePath(path);
+                        setReplicateFilename(replicatePath,1);
+                        SocketEndpoint primaryEp(ep);
+                        ep = parent.rawgrp->queryNode(i).endpoint();
+                        if (!streq(replicatePath, path) || !ep.equals(primaryEp))
+                        {
+                            rootsz = 0;
+                            parent.log(false,"Scanning %s directory %s",ep.getEndpointHostText(hostStr.clear()).str(),replicatePath.str());
+                            if (!parent.scanDirectory(i,ep,replicatePath,1,NULL,NULL,replicatePath.length(),0,nullptr,rootsz))
+                                ok = false;
+                        }
+                    }
                 }
-//              PROGLOG("Done %i - %d used",i,parent.mem.maxallocated());
+    //             PROGLOG("Done %i - %d used",i,parent.mem.maxallocated());
             }
-        } afor(*this,rootdir,crit,abort);
-        if (numThreads > numuniqnodes)
-            numThreads = numuniqnodes;
-        afor.For(numuniqnodes,numThreads,true,numThreads>1);
-        if (afor.ok)
-            log("Directory scan complete");
+        } afor(*this,rootdir,abort);
+        unsigned numMaxThreads = 0;
+        if (isPlaneStriped)
+            numMaxThreads = numStripedDevices;
         else
-            log("Directory scan complete");
+            numMaxThreads = numuniqnodes;
+        if (numThreads > numMaxThreads)
+            numThreads = numMaxThreads;
+        startHeartbeat("Directory scan"); // Initialize heartbeat mechanism
+        afor.For(numMaxThreads,numThreads,true,numThreads>1);
+        if (afor.ok)
+            finishHeartbeat("Directory scan");
+        else
+            log(true,"Errors occurred during scan");
         return afor.ok;
     }
 
-    void scanLogicalFiles(bool &abort) 
+    void scanLogicalFiles(bool &abort)
     {
         if (!grp||abort)
             return;
@@ -1011,7 +1909,7 @@ public:
                     return false;
                 StringArray groups;
                 getFileGroups(&file,groups);
-                if (groups.ordinality()==0) { 
+                if (groups.ordinality()==0) {
                     parent.error(filename,"File has no group defined");
                     return false;
                 }
@@ -1031,13 +1929,37 @@ public:
             {
                 return !abort;
             }
-            
+
+            bool isLfnFilterMatch(const StringBuffer &logicalFileName)
+            {
+                if (!parent.filterScopesEnabled)
+                    return true; // if filtering is not enabled, include all files
+
+                const char *fileScope = logicalFileName.str();
+                std::string_view sv(fileScope, logicalFileName.length());
+                size_t pos = sv.rfind("::");
+                size_t prefixLength = (pos != std::string_view::npos) ? pos : sv.size();
+
+                // Check if scope matches any filter
+                ForEachItemIn(i,parent.scopeFilters)
+                {
+                    size_t filterLen = strlen(parent.scopeFilters.item(i));
+                    if (filterLen != prefixLength)
+                        continue;
+                    if (strncmp(fileScope, parent.scopeFilters.item(i), filterLen) == 0)
+                        return true;
+                }
+                return false;
+            }
 
             void processFile(IPropertyTree &file,StringBuffer &name)
             {
                 if (abort)
                     return;
-                parent.log("Process file %s",name.str());
+                if (!isLfnFilterMatch(name))
+                    return;
+                parent.checkHeartbeat("Logical file scan");
+                parent.log(false,"Process file %s",name.str());
                 parent.fnum++;
 
                 Owned<IFileDescriptor> fdesc;
@@ -1060,13 +1982,13 @@ public:
                     StringBuffer lastdir;
                     cDirDesc *pdir = NULL;
                     bool islost = false;
-                    bool incluster = true;          
+                    bool incluster = true;
                     for (unsigned p=0;p<np;p++) {
                         if (abort)
                             return;
                         unsigned matched = 0;
                         unsigned nc = fdesc->numCopies(p);
-                        if (nc==0) 
+                        if (nc==0)
                             continue;   // ignore if no parts
                         for (unsigned c=0;c<nc;c++) {
                             RemoteFilename rfn;
@@ -1082,7 +2004,7 @@ public:
                                 const char *tail = splitDirTail(fn.str(),dir.clear());
                                 if (dir.length()&&isPathSepChar(dir.charAt(dir.length()-1)))
                                     dir.setLength(dir.length()-1);
-                                unsigned drv = getPathDrive(dir.str()); // should match c
+                                unsigned drv = isContainerized() ? 0 : getPathDrive(dir.str()); // should match c
                                 if (drv)
                                     setReplicateFilename(dir,0);
                                 if ((lastdir.length()==0)||(strcmp(lastdir.str(),dir.str())!=0)) {
@@ -1092,7 +2014,6 @@ public:
                                 if (pdir&&pdir->markFile(drv,tail,nn,ep,*parent.grp,parent.numnodes)) {
                                     matched++;
                                 }
-                                
                             }
                             else if (p==0) { // skip file
                                 if (parent.verbose)
@@ -1114,6 +2035,7 @@ public:
                 else {
                     parent.error(name.str(),"cannot create file descriptor");
                 }
+                parent.processedFiles++;
             }
         public:
 
@@ -1138,9 +2060,9 @@ public:
 
         } filescan(*this,abort);
 
+        startHeartbeat("Logical file scan");
         filescan.scan();
-        log("File scan complete");
-
+        finishHeartbeat("Logical file scan");
     }
 
     bool checkOrphanPhysicalFile(RemoteFilename &rfn,offset_t &sz,CDateTime &dt)
@@ -1149,7 +2071,7 @@ public:
             Owned<IFile> file = createIFile(rfn);
             bool isdir;
             bool ret = false;
-            if (file->getInfo(isdir,sz,dt)&&!isdir) 
+            if (file->getInfo(isdir,sz,dt)&&!isdir)
                 ret = true;
 #ifdef _DEBUG
             StringBuffer dbgname;
@@ -1162,6 +2084,7 @@ public:
             StringBuffer tmp(LOGPFX "listOrphans reading ");
             rfn.getRemotePath(tmp);
             EXCLOG(e,tmp.str());
+            e->Release();
         }
         return false;
     }
@@ -1179,11 +2102,70 @@ public:
             pb->setPropInt("Num",i);
             pb = branch->addPropTree("Part",pb);
         }
-        pb->setProp(rep?"RNode":"Node",ep.getUrlStr(tmp.clear()).str());
-    }   
+        pb->setProp(rep?"RNode":"Node",ep.getEndpointHostText(tmp.clear()).str());
+    }
 
+    void addExternalFoundFile(cFileDesc *file, const char *currentPath, unsigned int recentCutoffDays)
+    {
+        // Files that are non-conforming will be marked as misplaced in the directory scan
+        assertex(file->misplaced);
 
-    void listOrphans(cFileDesc *f,const char *basedir,bool &abort,unsigned int recentCutoffDays)
+        // Get stripe where file was found from misplaced info
+        StringBuffer filePath(rootdir);
+        unsigned stripeNum = file->misplaced->stripeNum;
+        if (stripeNum>0)
+            addPathSepChar(filePath).append("d").append(stripeNum);
+        filePath.append(currentPath+rootdir.length());
+        // If the file was found in a dir-per-part directory, the dir-per-part cDirDesc would have
+        // stayed in the hierarchy i.e. the dir-per-part num is already in the path.
+        file->getNameMask(addPathSepChar(filePath));
+
+        // Check physical file location
+        unsigned node = 0;
+        node = file->misplaced->getNode(grp->ordinality());
+        SocketEndpoint ep = grp->queryNode(node).endpoint();
+        RemoteFilename rfn;
+        rfn.setPath(ep, filePath.str());
+        offset_t sz;
+        CDateTime dt;
+        bool found;
+        {
+            CheckTime ct("checkOrphanPhysicalFile ");
+            found = checkOrphanPhysicalFile(rfn,sz,dt);
+            if (ct.slow())
+                ct.appendMsg(filePath.str());
+        }
+        if (found)
+        {
+            CDateTime now;
+            now.setNow();
+            CDateTime co(dt);
+            co.adjustTime(recentCutoffDays*60*24);
+            if (co.compare(now)>=0) {
+                warn(filePath.str(),"Recent external file ignored");
+                return;
+            }
+
+            StringBuffer tmp;
+            Owned<IPropertyTree> branch;
+            addOrphanPartNode(branch,rfn.queryEndpoint(),0,false);
+            branch->setPropInt64("Size",sz);
+            branch->setProp("Partmask",filePath.str());
+            branch->setProp("Modified",dt.getString(tmp.clear()));
+            branch->setPropInt("Numparts",1);
+            branch->setPropInt("Partsfound",1);
+            foundbranch->addPropTree("File",branch.getClear());
+        }
+        else
+        {
+            StringBuffer pathStr;
+            rfn.getRemotePath(pathStr);
+            pathStr.append(" no longer exists");
+            warn(pathStr.str(),"Orphan file no longer exists");
+        }
+    }
+
+    void listOrphans(cFileDesc *f,const char *currentPath,const char *currentScope,bool &abort,unsigned int recentCutoffDays)
     {
         if (abort)
             return;
@@ -1192,36 +2174,45 @@ public:
         // first check if any orhans at all (maybe could do this faster)
 #ifdef _DEBUG
         StringBuffer dbgname;
-        f->getName(dbgname);
+        f->getNameMask(dbgname);
         PROGLOG("listOrphans TEST FILE(%s)",dbgname.str());
 #endif
 
+        // Non-conforming files won't have a part mask and should be treated as single files
+        if (!f->isHPCCFile()) {
+            addExternalFoundFile(f,currentPath,recentCutoffDays);
+            return;
+        }
+
         unsigned drv;
-        for (drv=0;drv<2;drv++) {
+        unsigned drvs = isContainerized() ? 1 : 2;
+        for (drv=0;drv<drvs;drv++) {
             unsigned i0;
-            for (i0=0;i0<f->N;i0++) 
-                if (f->testpresent(drv,i0)&&!f->testmarked(drv,i0)) 
+            for (i0=0;i0<f->N;i0++)
+                if (f->testpresent(drv,i0)&&!f->testmarked(drv,i0))
                     break;
             if (i0<f->N)
                 break;
         }
-        if (drv==2)
+        if (drv==drvs)
             return; // no orphans
-        StringBuffer mask(basedir);
-        addPathSepChar(mask);
-        f->getName(mask);
-        CDfsLogicalFileName lfn;
-        if (lfn.setFromMask(mask.str(),rootdir)) { // orphans are only orphans if there doesn't exist a valid file
-            try {
-                if (queryDistributedFileDirectory().exists(lfn.get(),udesc,true,false)) {
-                    warn(mask.str(),"Orphans ignored as %s exists",lfn.get());
-                    return;
-                }
-            }
-            catch (IException *e) {
-                EXCLOG(e,"CNewXRefManager::listOrphans");
+        StringBuffer mask;
+        StringBuffer scopeBuf;
+        if (!isEmptyString(currentScope))
+            scopeBuf.append(currentScope).append("::");
+        f->getNameMask(mask);
+        assertex(f->getName(scopeBuf)); // Should always return true for HPCC files
+        // orphans are only orphans if there doesn't exist a valid file
+        try {
+            if (queryDistributedFileDirectory().exists(scopeBuf.str(),udesc,true,false)) {
+                warn(mask.str(),"Orphans ignored as %s exists",scopeBuf.str());
                 return;
             }
+        }
+        catch (IException *e) {
+            EXCLOG(e,"CNewXRefManager::listOrphans");
+            e->Release();
+            return;
         }
         // treat drive differently for orphans (bit silly but bward compatible
         MemoryAttr buf;
@@ -1235,21 +2226,20 @@ public:
         unsigned ndone[2];
         ndone[0] = 0;
         ndone[1] = 0;
-        for (drv=0;drv<2;drv++) {
+        unsigned fnameHash = getFilenameHash(scopeBuf.str());
+        for (drv=0;drv<drvs;drv++) {
             if (abort)
                 return;
             bool warnnotexists = true;
-            StringBuffer path(basedir);
-            addPathSepChar(path);
+            StringBuffer path;
             if (drv)
-                setReplicateFilename(path,drv);
+                setReplicateFilename(addPathSepChar(path.append(currentPath)),drv);
             size32_t psz = path.length();
             StringBuffer tmp;
             for (unsigned pn=0;pn<f->N;pn++) {
                 if (f->testpresent(drv,pn)&&!f->testmarked(drv,pn)) {
-                    f->getPartName(path,pn);
                     RemoteFilename rfn;
-                    rfn.setPath(grp->queryNode((pn+drv)%numnodes).endpoint(),path.str());
+                    constructPartFilename(grp, pn+1, drv, f->N, fnameHash, drv, f->isDirPerPart, scopeBuf.str(), rootdir, mask.str(), numStripedDevices, rfn);
                     offset_t sz;
                     CDateTime dt;
                     bool found;
@@ -1262,7 +2252,7 @@ public:
                         }
                     }
                     if (found) {
-                        if (mostrecent[drv].isNull()||(dt.compare(mostrecent[drv],false)>0)) 
+                        if (mostrecent[drv].isNull()||(dt.compare(mostrecent[drv],false)>0))
                             mostrecent[drv].set(dt);
                         completed[pn] = true;
                         totsize[drv] += sz;
@@ -1283,8 +2273,8 @@ public:
             return;
         // check if complete here
         unsigned ncomplete = 0;
-        for (unsigned i=0;i<f->N;i++) 
-            if (completed[i]) 
+        for (unsigned i=0;i<f->N;i++)
+            if (completed[i])
                 ncomplete++;
         if (ncomplete!=f->N) {  // if a found file ignore misplaces
             cMisplacedRec *mp = f->misplaced;
@@ -1294,19 +2284,13 @@ public:
                     return;
                 if (!mp->marked) {
                     unsigned drv = mp->getDrv(numnodes);
-                    unsigned n = mp->getNode(numnodes);
-                    StringBuffer path(basedir);
-                    if (*basedir)
-                        addPathSepChar(path);
-                    if (drv) 
-                        setReplicateFilename(path,drv);
-                    f->getPartName(path,mp->pn);
+                    unsigned node = mp->getNode(numnodes);
                     RemoteFilename rfn;
-                    rfn.setPath(grp->queryNode(n).endpoint(),path.str());
+                    constructPartFilename(grp, mp->pn+1, f->N, node, drv, f->isDirPerPart ? mp->dirPerPartNum : 0, scopeBuf.str(), rootdir, mask.str(), mp->stripeNum, rfn);
                     offset_t sz;
                     CDateTime dt;
                     if (checkOrphanPhysicalFile(rfn,sz,dt)) {
-                        if (mostrecent[drv].isNull()||(dt.compare(mostrecent[drv],false)>0)) 
+                        if (mostrecent[drv].isNull()||(dt.compare(mostrecent[drv],false)>0))
                             mostrecent[drv].set(dt);
                         totsize[drv] += sz;
                         ndone[drv]++;
@@ -1325,12 +2309,12 @@ public:
         CDateTime now;
         now.setNow();
         StringBuffer tmp;
-        for (drv=0;drv<2;drv++) {
+        for (drv=0;drv<drvs;drv++) {
             if (abort)
                 return;
             if (branch[drv]) {
-                tmp.clear().append(mask.str());
-                if (drv) 
+                addPathSepChar(tmp.clear().append(currentPath)).append(mask.str());
+                if (drv)
                     setReplicateFilename(tmp,1);
                 CDateTime co(mostrecent[drv]);
                 co.adjustTime(recentCutoffDays*60*24);
@@ -1343,9 +2327,10 @@ public:
                 branch[drv]->setPropInt64("Size",totsize[drv]);
                 branch[drv]->setProp("Modified",mostrecent[drv].getString(tmp.clear()));
                 branch[drv]->setPropInt("Numparts",f->N);
+                branch[drv]->setPropBool("IsDirPerPart", f->isDirPerPart);
             }
             if (ncomplete!=f->N) {
-                if (branch[drv]) 
+                if (branch[drv])
                     branch[drv]->setPropInt("Partsfound",ndone[drv]);
             }
         }
@@ -1377,11 +2362,11 @@ public:
 
     void listDirectory(cDirDesc *d,const char *name,bool &abort)
     {
-        for (unsigned drv=0;drv<2;drv++) {
+        unsigned drvs = isContainerized() ? 1 : 2;
+        for (unsigned drv=0;drv<drvs;drv++) {
             if (abort)
                 return;
-            if ((d->files.ordinality()!=0)||(d->totalsize[drv]!=0)||d->empty(drv)) { // final empty() is to make sure only truly empty dirs get added
-                                                                                  // but not empty parents
+            if (!d->empty(drv)) {
                 Owned<IPropertyTree> dt = createPTree("Directory");
                 if (drv) {
                     StringBuffer tmp(name);
@@ -1390,18 +2375,18 @@ public:
                 }
                 else
                     dt->addProp("Name",name);
-                dt->addPropInt("Num",d->files.ordinality());
+                dt->addPropInt("Num",d->files.size());
                 dt->addPropInt64("Size",d->totalsize[drv]);
                 if (d->totalsize[drv]) {
                     StringBuffer s1;
                     if (d->maxnode[drv]) {
                         dt->addPropInt64("MaxSize",d->maxsize[drv]);
-                        grp->queryNode(d->maxnode[drv]-1).endpoint().getIpText(s1);
+                        grp->queryNode(d->maxnode[drv]-1).endpoint().getHostText(s1);
                         dt->addProp("MaxIP",s1.str());
                     }
                     if (d->minnode[drv]) {
                         dt->addPropInt64("MinSize",d->minsize[drv]);
-                        grp->queryNode(d->minnode[drv]-1).endpoint().getIpText(s1.clear());
+                        grp->queryNode(d->minnode[drv]-1).endpoint().getHostText(s1.clear());
                         dt->addProp("MinIP",s1.str());
                     }
                     if (d->minsize[drv]<d->maxsize[drv]) {
@@ -1421,12 +2406,13 @@ public:
         }
     }
 
-    void listOrphans(cDirDesc *d,StringBuffer &basedir,bool &abort,unsigned int recentCutoffDays)
+    void listOrphans(cDirDesc *d,StringBuffer &basedir,StringBuffer &scope,bool &abort,unsigned int recentCutoffDays)
     {
+        checkHeartbeat("Orphan scan");
         if (abort)
             return;
         if (!d) {
-            d = root;
+            d = root.get();
             if (!d)
                 return;
             basedir.append(rootdir);
@@ -1437,27 +2423,40 @@ public:
         PROGLOG("listOrphans TEST DIR(%s)",dbgname.str());
 #endif
         size32_t bds = basedir.length();
-        if (bds!=0) 
+        size32_t scopeLen = scope.length();
+        if (bds!=0)
             addPathSepChar(basedir);
+        if (scopeLen!=0)
+            scope.append("::");
         d->getName(basedir);
+        d->getName(scope);
         listDirectory(d,basedir.str(),abort);
-        unsigned i =0;
-        cFileDesc *file = d->files.first(i);
-        while (file) {
-            listOrphans(file,basedir,abort,recentCutoffDays);
+
+        for (auto& dirPair : d->dirs) {
+            cDirDesc *dir = dirPair.second.get();
+            listOrphans(dir,basedir,scope,abort,recentCutoffDays);
             if (abort)
                 return;
-            file = d->files.next(i);
         }
-        i = 0;
-        cDirDesc *dir = d->dirs.first(i);
-        while (dir) {
-            listOrphans(dir,basedir,abort,recentCutoffDays);
+
+        for (auto& filePair : d->files) {
+            cFileDesc *file = filePair.second.get();
+            try {
+                listOrphans(file,basedir,scope,abort,recentCutoffDays);
+            }
+            catch (IException *e) {
+                StringBuffer filepath, errMsg;
+                file->getNameMask(addPathSepChar(filepath.append(basedir)));
+                error(filepath.str(),"listOrphans Error processing file : %s",e->errorMessage(errMsg).str());
+                e->Release();
+            }
+            processedFiles++;
             if (abort)
                 return;
-            dir = d->dirs.next(i);
         }
         basedir.setLength(bds);
+        scope.setLength(scopeLen);
+        processedDirs++;
     }
 
     static int compareDirs(IInterface * const *t1,IInterface * const *t2)
@@ -1474,26 +2473,29 @@ public:
     }
 
     void listOrphans(bool &abort,unsigned int recentCutoffDays)
-    {   
+    {
         // also does directories
-        log("Scanning for orphans");
+        log(true,"Scanning for orphans");
+        startHeartbeat("Orphan scan");
         StringBuffer basedir;
-        listOrphans(NULL,basedir,abort,recentCutoffDays);
+        StringBuffer scope;
+        listOrphans(NULL,basedir,scope,abort,recentCutoffDays);
         if (abort)
             return;
-        log("Orphan scan complete");
+        finishHeartbeat("Orphan scan");
         sorteddirs.sort(compareDirs);   // NB sort reverse
         while (!abort&&sorteddirs.ordinality())
             dirbranch->addPropTree("Directory",&sorteddirs.popGet());
-        log("Directories sorted");
+        log(true,"Directories sorted");
     }
 
 
     void listLost(bool &abort,bool ignorelazylost,unsigned int recentCutoffDays)
     {
-        log("Scanning for lost files");
+        startHeartbeat("Lost file scan");
         StringBuffer tmp;
         ForEachItemIn(i0,lostfiles) {
+            checkHeartbeat("Lost file scan");
             if (abort)
                 return;
             CDfsLogicalFileName lfn;
@@ -1503,7 +2505,8 @@ public:
             }
             Owned<IDistributedFile> file;
             try {
-                file.setown(queryDistributedFileDirectory().lookup(lfn,udesc,false,false,false,nullptr,defaultPrivilegedUser));
+                // setPreferredClusters()/setSingleClusterOnly() below mutate the file's cluster metadata - use writeMeta.
+                file.setown(queryDistributedFileDirectory().lookup(lfn,udesc,AccessMode::writeLogicalMeta,false,false,nullptr,defaultPrivilegedUser));
             }
             catch (IException *e) {
                 EXCLOG(e,"CNewXRefManager::listLost");
@@ -1541,7 +2544,7 @@ public:
                 ft->setProp("Modified",tmp.str());
             }
             unsigned np = file->numParts();
-            unsigned cn = 0;                    
+            unsigned cn = 0;
             ft->setProp("Name",lfn.get());
             tmp.clear().append(file->queryPartMask()).toLowerCase();
             ft->setProp("Partmask",tmp.str());
@@ -1590,6 +2593,7 @@ public:
                         StringBuffer tmp(LOGPFX "Checking file ");
                         rfn.getRemotePath(tmp);
                         EXCLOG(e, tmp.str());
+                        e->Release();
                         ok = false;
                     }
                     if (!ok)
@@ -1597,7 +2601,7 @@ public:
                     if (lost) {
                         Owned<IPropertyTree> pt = createPTree("Part");
                         StringBuffer tmp;
-                        rfn.queryEndpoint().getIpText(tmp);
+                        rfn.queryEndpoint().getHostText(tmp);
                         pt->setProp("Node",tmp.str());
                         pt->setPropInt("Num",pn+1);
                         if (copy>0)
@@ -1615,7 +2619,7 @@ public:
                     rc++;
                     c++;
                 }
-                else if (primlost[i1]) 
+                else if (primlost[i1])
                     pc++;
                 else if (replost[i1])
                     rc++;
@@ -1629,8 +2633,9 @@ public:
                 ft->addPropInt("Replicatedlost",rc);
                 lostbranch->addPropTree("File",ft.getClear());
             }
+            processedFiles++;
         }
-        log("Lost scan complete");
+        finishHeartbeat("Lost file scan");
     }
 
 
@@ -1658,7 +2663,7 @@ class CSuperfileCheckManager: public CNewXRefManagerBase
 {
 public:
 
-    CSuperfileCheckManager()
+    CSuperfileCheckManager(bool saveToPlane) : CNewXRefManagerBase(saveToPlane)
     {
         clustname.set("SuperFiles");
     }
@@ -1709,7 +2714,7 @@ public:
         }
         if (errors.ordinality()<1000) {
             errors.append(*new cMessage(lname,line.str()));
-            if (errors.ordinality()==1000) 
+            if (errors.ordinality()==1000)
                 errors.append(*new cMessage("","error limit exceeded (1000), truncating"));
         }
 
@@ -1722,8 +2727,6 @@ public:
         StringArray superowned;
         StringArray fileowned;
         StringArray fileowner;
-        sfnum = 0;
-        fnum = 0;
         class cfilescan1: public CSDSFileScanner
         {
             CSuperfileCheckManager &parent;
@@ -1759,7 +2762,7 @@ public:
                             fileowner.append(owner);
                             owned = true;
                         }
-                    }   
+                    }
                 }
                 if (owned)
                     parent.fnum++;
@@ -1767,7 +2770,7 @@ public:
             void processSuperFile(IPropertyTree &file,StringBuffer &name)
             {
                 parent.sfnum++;
-                parent.log("Scanning SuperFile %s",name.str());
+                parent.log(false,"Scanning SuperFile %s",name.str());
                 unsigned numsub = file.getPropInt("@numsubfiles");
                 unsigned n = 0;
                 Owned<IPropertyTreeIterator> iter = file.getElements("SubFile");
@@ -1823,12 +2826,12 @@ public:
 
         bool fix = false;
 
-        log("Crossreferencing %d SuperFiles",superowner.ordinality());
+        log(false,"Crossreferencing %d SuperFiles",superowner.ordinality());
         ForEachItemIn(i1,superowner) {
             const char *owner = superowner.item(i1);
             const char *owned = superowned.item(i1);
             bool ok = false;
-            if (*owned=='{') 
+            if (*owned=='{')
                 ok = true;
             else {
                 ForEachItemIn(i2,fileowned) {
@@ -1866,8 +2869,8 @@ public:
                     }
                 }
             }
-        }       
-        log("Crossreferencing %d Files",fileowned.ordinality());
+        }
+        log(false,"Crossreferencing %d Files",fileowned.ordinality());
         ForEachItemIn(i3,fileowned) {
             const char *fowner = fileowner.item(i3);
             const char *fowned = fileowned.item(i3);
@@ -1887,7 +2890,7 @@ public:
                     StringBuffer lfnpath;
                     lfn.makeFullnameQuery(lfnpath,DXB_SuperFile);
                     Owned<IRemoteConnection> conn = querySDS().connect(lfnpath.str(),myProcessSession(),0, INFINITE);
-                    if (conn) 
+                    if (conn)
                         errornotrecent(fowner,"FAILED nosublink to %s",fowned);
                     else {
                         bool fixed = false;
@@ -1911,7 +2914,7 @@ public:
                     }
                 }
             }
-        }       
+        }
 
     }
 
@@ -1970,7 +2973,7 @@ int main(int argc, char* argv[])
     SocketEndpointArray epa;
     ep.set(argv[1],DALI_SERVER_PORT);
     epa.append(ep);
-    Owned<IGroup> group = createIGroup(epa); 
+    Owned<IGroup> group = createIGroup(epa);
     try {
         initClientProcess(group,DCR_Dfu);
         setPasswordsFromSDS();
@@ -1993,37 +2996,44 @@ int main(int argc, char* argv[])
 #endif
 
 
+static constexpr float maxMemPercentage = 0.9; // In containerized, leave some headroom for the pod
 class CSashaXRefServer: public ISashaServer, public Thread
-{  
+{
     bool stopped;
-    Semaphore stopsem;
-    Mutex runmutex;
+    Semaphore stopsem{SYNC_LOCATION};
+    Mutex runmutex{SYNC_LOCATION};
     bool ignorelazylost, suspendCoalescer;
+    Owned<IPropertyTree> props;
+    std::unordered_map<std::string, Linked<IPropertyTree>> storagePlanes;
 
     class cRunThread: public Thread
     {
         CSashaXRefServer &parent;
         StringAttr servers;
+        StringAttr filterScopes;
     public:
-        cRunThread(CSashaXRefServer &_parent,const char *_servers)
-            : parent(_parent), servers(_servers)
+        cRunThread(CSashaXRefServer &_parent,const char *_servers, const char *_filterScopes)
+         : Thread("SashaXRefServerThread"), parent(_parent), servers(_servers), filterScopes(_filterScopes)
         {
         }
         int run()
         {
-            parent.runXRef(servers,false,false);
+            parent.runXRef(servers,false,false,filterScopes);
             return 0;
         }
-    }; 
+    };
 
 
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
 
     CSashaXRefServer()
         : Thread("CSashaXRefServer")
     {
-        suspendCoalescer = true; // can be overridden by configuration setting
+        if (!isContainerized())
+            suspendCoalescer = true; // can be overridden by configuration setting
+        else
+            suspendCoalescer = false;
         stopped = false;
     }
 
@@ -2033,13 +3043,13 @@ public:
 
     void start()
     {
-        Thread::start();
+        Thread::start(false);
     }
 
     void ready()
     {
     }
-    
+
     void stop()
     {
         if (!stopped) {
@@ -2051,7 +3061,7 @@ public:
             OERRLOG("CSashaXRefServer aborted");
     }
 
-    void runXRef(const char *clustcsl,bool updateeclwatch,bool byscheduler)
+    void runXRef(const char *clustcsl,bool updateeclwatch,bool byscheduler, const char *filterScopes)
     {
         if (stopped||!clustcsl||!*clustcsl)
             return;
@@ -2069,13 +3079,15 @@ public:
                 resumeCoalescingServer();
             }
         };
-        Owned<CSimpleInterface> suspendresume;
-        if (suspendCoalescer)
-            suspendresume.setown(new CSuspendResume());
+        if (!isContainerized()) {
+            Owned<CSimpleInterface> suspendresume;
+            if (suspendCoalescer)
+                suspendresume.setown(new CSuspendResume());
+        }
         synchronized block(runmutex);
         if (stopped)
             return;
-        CSuspendAutoStop suspendstop;
+        Owned<IInterface> suspendstop = queryServerContext().createAutoStopSuspender();
         PROGLOG(LOGPFX "Started %s",clustcsl);
         StringArray list;
         getFileGroups(clustcsl, list);
@@ -2086,31 +3098,79 @@ public:
                 list.remove(i0);
             }
         }
-        Owned<IRemoteConnection> conn = querySDS().connect("/Environment/Software", myProcessSession(), RTM_LOCK_READ, SDS_CONNECT_TIMEOUT);
-        if (!conn) {
-            OERRLOG("Could not connect to /Environment/Software");
-            return;
-        }
+        // Revisit: XREF should really be plane centric only
         StringArray groups;
         StringArray cnames;
-        clustersToGroups(conn->queryRoot(),list,cnames,groups,NULL);
+        // NB: must be a list of planes only
+        ForEachItemIn(i1, list) {
+            const char *planeName = list.item(i1);
+            Owned<IPropertyTreeIterator> planesIter = getPlanesIterator("data", planeName);
+            ForEach(*planesIter) {
+                IPropertyTree &plane = planesIter->query();
+                bool isNotCopy = !plane.getPropBool("@copy", false);
+                bool isNotHthorPlane = !plane.getPropBool("@hthorplane", false);
+                if (isNotCopy && isNotHthorPlane) {
+                    planeName = plane.queryProp("@name");
+                    if (isContainerized()) {
+                        groups.append(planeName);
+                        cnames.append(planeName);
+                    }
+                    storagePlanes[planeName].set(&plane);
+                }
+            }
+        }
+        if (!isContainerized()) {
+            Owned<IRemoteConnection> conn = querySDS().connect("/Environment/Software", myProcessSession(), RTM_LOCK_READ, SDS_CONNECT_TIMEOUT);
+            if (!conn) {
+                OERRLOG("Could not connect to /Environment/Software");
+                return;
+            }
+
+            // Bare-metal only: resolve cluster names to node groups by matching against
+            // ThorCluster/RoxieCluster entries under /Environment/Software.
+            // Clusters that don't match a Thor or Roxie entry (e.g. standalone data
+            // planes) will not be added to 'groups' and will be skipped by the XREF scan.
+            clustersToGroups(conn->queryRoot(),list,cnames,groups,NULL);
+        }
         IArrayOf<IGroup> groupsdone;
         StringArray dirsdone;
+        bool saveToPlane = false;
+        if (isContainerized())
+            saveToPlane = getComponentConfigSP()->getPropBool("expert/@saveToPlane", true);
+        else
+        {
+            // default off in BM
+            // NB: BM does not have a per component expert section atm (only at the global level)
+            saveToPlane = getGlobalConfigSP()->getPropBool("expert/@xrefSaveToPlane", false);
+        }
+
         ForEachItemIn(i,groups) {
 #ifdef TESTINGSUPERFILELINKAGE
             continue;
-#endif          
+#endif
             const char *gname = groups.item(i);
-            unsigned maxMb = serverConfig->getPropInt("DfuXRef/@memoryLimit", DEFAULT_MAXMEMORY);
-            CNewXRefManager manager(maxMb);
-            if (!manager.setGroup(cnames.item(i),gname,groupsdone,dirsdone)) 
+            unsigned maxMb;
+            if (isContainerized()) {
+                const char *resourcedMemory = props->queryProp("resources/@memory");
+                if (!isEmptyString(resourcedMemory)) {
+                    offset_t sizeBytes = friendlyStringToSize(resourcedMemory);
+                    maxMb = (unsigned)(sizeBytes / 0x100000);
+                }
+                else
+                    maxMb = DEFAULT_MAXMEMORY;
+                maxMb *= maxMemPercentage;
+            }
+            else
+                maxMb = props->getPropInt("@memoryLimit", DEFAULT_MAXMEMORY);
+            CNewXRefManager manager(storagePlanes[gname],maxMb,saveToPlane,filterScopes);
+            if (!manager.setGroup(cnames.item(i),gname,groupsdone,dirsdone))
                 continue;
             manager.start(updateeclwatch);
             manager.updateStatus(true);
             if (stopped)
                 break;
-            unsigned numThreads = serverConfig->getPropInt("DfuXRef/@numThreads", DEFAULT_MAXDIRTHREADS);
-            unsigned int recentCutoffDays = serverConfig->getPropInt("DfuXRef/@cutoff", DEFAULT_RECENT_CUTOFF_DAYS);
+            unsigned numThreads = props->getPropInt("@numThreads", DEFAULT_MAXDIRTHREADS);
+            unsigned int recentCutoffDays = props->getPropInt("@cutoff", DEFAULT_RECENT_CUTOFF_DAYS);
             if (manager.scanDirectories(stopped,numThreads)) {
                 manager.updateStatus(true);
                 manager.scanLogicalFiles(stopped);
@@ -2128,7 +3188,7 @@ public:
                 break;
         }
         if (checksuperfiles&&!stopped) {
-            CSuperfileCheckManager scmanager;
+            CSuperfileCheckManager scmanager(saveToPlane);
             scmanager.start(updateeclwatch);
             scmanager.updateStatus(true);
             if (stopped)
@@ -2141,15 +3201,17 @@ public:
         PROGLOG(LOGPFX "%s %s",clustcsl,stopped?"Stopped":"Done");
     }
 
-    void xrefRequest(const char *servers)
+    void xrefRequest(const char *servers, const char *filterScopes)
     {
-        cRunThread *thread = new cRunThread(*this,servers);
+        //MORE: This could still be running when the server terminates which will likely cause the thread to core
+        cRunThread *thread = new cRunThread(*this,servers,filterScopes);
         thread->startRelease();
     }
 
-    bool checkClusterSubmitted(StringBuffer &cname)
+    bool checkClusterSubmitted(StringBuffer &cname, StringBuffer &filterScopes)
     {
         cname.clear();
+        filterScopes.clear();
         Owned<IRemoteConnection> conn = querySDS().connect("/DFU/XREF",myProcessSession(),RTM_LOCK_WRITE ,INFINITE);
         Owned<IPropertyTreeIterator> clusters= conn->queryRoot()->getElements("Cluster");
         ForEach(*clusters) {
@@ -2162,6 +3224,10 @@ public:
                     if (cname.length())
                         cname.append(',');
                     cname.append(name);
+                    // Get filterScopes for this cluster
+                    const char *scopes = cluster.queryProp("@filterScopes");
+                    if (!isEmptyString(scopes))
+                        filterScopes.set(scopes).toLowerCase();
                 }
             }
         }
@@ -2177,14 +3243,28 @@ public:
 
     int run()
     {
-        Owned<IPropertyTree> props = serverConfig->getPropTree("DfuXRef");
-        if (!props)
-            props.setown(createPTree("DfuXRef"));
-        bool eclwatchprovider = props->getPropBool("@eclwatchProvider");
+        if (isContainerized())
+            props.setown(getComponentConfig());
+        else
+        {
+            props.setown(getComponentConfigSP()->getPropTree("DfuXRef"));
+            if (!props)
+                props.setown(createPTree("DfuXRef"));
+        }
+
+        bool eclwatchprovider = true;
+        if (!isContainerized()) // NB: containerized does not support xref any other way.
+        {
+            // eclwatchProvider sets useSasha in call to setSubmittedOk
+            eclwatchprovider = props->getPropBool("@eclwatchProvider");
+        }
+
         unsigned interval = props->getPropInt("@interval",DEFAULT_XREF_INTERVAL);
-        const char *clusters = props->queryProp("@clusterlist");
+        const char *clusters = props->queryProp(isContainerized() ? "@planes" : "@clusterlist");
         StringBuffer clusttmp;
-        if (props->getPropBool("@checkSuperFiles",true)) {
+        // TODO: xref should support checking superfiles in containerized
+        if (props->getPropBool("@checkSuperFiles",isContainerized()?false:true))
+        {
             if (!clusters||!*clusters)
                 clusters = "SuperFiles";
             else
@@ -2193,12 +3273,13 @@ public:
         if (!interval)
             stopped = !eclwatchprovider;
         setSubmittedOk(eclwatchprovider);
-        suspendCoalescer = props->getPropBool("@suspendCoalescerDuringXref", true);
+        if (!isContainerized())
+            suspendCoalescer = props->getPropBool("@suspendCoalescerDuringXref", true);
         ignorelazylost = props->getPropBool("@ignoreLazyLost",true);
         PROGLOG(LOGPFX "min interval = %d hr", interval);
         unsigned initinterval = (interval-1)/2+1;  // wait a bit til dali has started
         CSashaSchedule schedule;
-        if (interval) 
+        if (interval)
             schedule.init(props,interval,initinterval);
         initinterval *= 60*60*1000; // ms
         unsigned started = msTick();
@@ -2208,8 +3289,10 @@ public:
             if (stopped)
                 break;
             StringBuffer cname;
+            StringBuffer filterScopes;
             bool byscheduler=false;
-            if (!eclwatchprovider||!checkClusterSubmitted(cname.clear())) {         
+            if (!eclwatchprovider||!checkClusterSubmitted(cname.clear(), filterScopes.clear()))
+            {
                 if (!interval||((started!=(unsigned)-1)&&(msTick()-started<initinterval)))
                     continue;
                 started = (unsigned)-1;
@@ -2217,9 +3300,11 @@ public:
                     continue;
                 byscheduler = true;
             }
-            try {
-                runXRef(cname.length()?cname.str():clusters,true,byscheduler);
+            try
+            {
+                runXRef(cname.length()?cname.str():clusters,true,byscheduler,filterScopes.length()?filterScopes.str():nullptr);
                 cname.clear();
+                filterScopes.clear();
             }
             catch (IException *e)
             {
@@ -2245,11 +3330,12 @@ ISashaServer *createSashaXrefServer()
 
 void processXRefRequest(ISashaCommand *cmd)
 {
-    if (sashaXRefServer) {
-        StringBuffer clusterlist(cmd->queryCluster());
+    if (sashaXRefServer)
+    {
+        const char *clusterlist = cmd->queryCluster();
         // only support single cluster for the moment
-        if (clusterlist.length())
-            sashaXRefServer->xrefRequest(clusterlist);
+        if (!isEmptyString(clusterlist))
+            sashaXRefServer->xrefRequest(clusterlist, cmd->queryFilterScopes());
     }
 }
 
@@ -2258,22 +3344,28 @@ void processXRefRequest(ISashaCommand *cmd)
 // File Expiry monitor
 
 class CSashaExpiryServer: public ISashaServer, public Thread
-{  
+{
     bool stopped;
-    Semaphore stopsem;
-    Mutex runmutex;
+    Semaphore stopsem{SYNC_LOCATION};
+    Mutex runmutex{SYNC_LOCATION};
     Owned<IUserDescriptor> udesc;
+    Linked<IPropertyTree> props;
+    bool dryRun = false;
 
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
 
-    CSashaExpiryServer()
-        : Thread("CSashaExpiryServer")
+    CSashaExpiryServer(IPropertyTree *_config)
+        : Thread("CSashaExpiryServer"), props(_config)
     {
         stopped = false;
 
         StringBuffer userName;
-        serverConfig->getProp("@sashaUser", userName);
+#ifdef _CONTAINERIZED
+        props->getProp("@user", userName);
+#else
+        getComponentConfigSP()->getProp("@sashaUser", userName);
+#endif
         udesc.setown(createUserDescriptor());
         udesc->set(userName.str(), nullptr);
     }
@@ -2284,13 +3376,13 @@ public:
 
     void start()
     {
-        Thread::start();
+        Thread::start(false);
     }
 
     void ready()
     {
     }
-    
+
     void stop()
     {
         if (!stopped) {
@@ -2308,33 +3400,221 @@ public:
         if (stopped)
             return;
         PROGLOG(LOGPFX2 "Started");
-        unsigned defaultExpireDays = serverConfig->getPropInt("DfuExpiry/@expiryDefault", DEFAULT_EXPIRYDAYS);
-        unsigned defaultPersistExpireDays = serverConfig->getPropInt("DfuExpiry/@persistExpiryDefault", DEFAULT_PERSISTEXPIRYDAYS);
+
+        dryRun = getComponentConfigSP()->getPropBool("@dryRun");
+
+        constexpr unsigned minWindowDays = 3; // Minimum time window size
+        constexpr unsigned maxWindowDays = 365 * 6; // Maximum time window size (6 years). If it dynamically grows to this size, the window is unbounded at the start.
+
+        unsigned defaultExpireDays = props->getPropInt("@expiryDefault", DEFAULT_EXPIRYDAYS);
+        unsigned defaultPersistExpireDays = props->getPropInt("@persistExpiryDefault", DEFAULT_PERSISTEXPIRYDAYS);
+        unsigned maxFileLimit = props->getPropInt("@maxFileLimit", UINT_MAX);
+
+        // Determine the effective limit for adaptive windowing
+        unsigned effectiveLimit = (UINT_MAX != maxFileLimit) ? maxFileLimit : 100000; // 100k is server default
+        unsigned lowWaterMark = effectiveLimit / 5; // 20% threshold for expanding window
+
+        std::vector<DFUQResultField> selectiveFields = {DFUQResultField::expireDays, DFUQResultField::accessed, DFUQResultField::persistent, DFUQResultField::term};
+
+        unsigned totalProcessed = 0;
+        unsigned totalDeleted = 0;
+
+        // Try fetching all files first (no time filter)
+        bool allMatchingFilesReceived;
+        unsigned fetchCount = 0;
+
+        StringBuffer baseFilterBuf;
+        // all non-superfiles
+        baseFilterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileType).append(DFUQFilterSeparator).append(DFUQFFTnonsuperfileonly).append(DFUQFilterSeparator);
+        // hasProp,SuperOwner,"false" - meaning not owned by a superfile
+        baseFilterBuf.append(DFUQFThasProp).append(DFUQFilterSeparator).append(getDFUQFilterFieldName(DFUQFFsuperowner)).append(DFUQFilterSeparator).append("false").append(DFUQFilterSeparator);
+        // hasProp,Attr/@expireDays,"true" - meaning file has @expireDays attribute
+        baseFilterBuf.append(DFUQFThasProp).append(DFUQFilterSeparator).append(getDFUQFilterFieldName(DFUQFFexpiredays)).append(DFUQFilterSeparator).append("true").append(DFUQFilterSeparator);
+        if (UINT_MAX != maxFileLimit)
+            baseFilterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFMaxFiles).append(DFUQFilterSeparator).append(maxFileLimit);
+
+        StringBuffer filterBuf(baseFilterBuf);
+        Owned<IPropertyTreeIterator> iter = queryDistributedFileDirectory().getDFAttributesFilteredIterator(filterBuf,
+            nullptr, selectiveFields.data(), udesc, true, allMatchingFilesReceived, &fetchCount);
+
+        CDateTime now;
+        now.setNow();
+
+        // Always process the initial batch
+        PROGLOG(LOGPFX2 "Fetched %u files in initial query", fetchCount);
+        if (fetchCount > 0)
+        {
+            unsigned deleted = processExpiryBatch(iter, now, defaultExpireDays, defaultPersistExpireDays);
+            totalProcessed += fetchCount;
+            totalDeleted += deleted;
+        }
+
+        if (!allMatchingFilesReceived)
+        {
+            // Need to use time-windowing approach for remaining files
+            // Use time windows to partition the file space
+            // Start from 'now' (a known reference point) and work backwards in time, since we cannot
+            // easily determine the oldest file date without an additional query that might also hit limits.
+            OWARNLOG(LOGPFX2 "Exceeded maximum retrievable files (fetched: %u), using time-windowed approach for remaining files", fetchCount);
+
+            unsigned windowDays = 365;
+            CDateTime windowEnd = now;
+            unsigned windowIteration = 0;
+
+            // Note: The initial batch (processed above) contained an arbitrary set of files in semi-deterministic order,
+            // so there will inevitably be some overlap between those files and the files in the first time window.
+            // This is acceptable - files already deleted won't be found again, and files already checked will simply
+            // be re-checked.
+            while (!stopped)
+            {
+                windowIteration++;
+                CDateTime windowStart = windowEnd;
+                windowStart.adjustTime(-60*24*windowDays);
+
+                StringBuffer startStr, endStr;
+                windowStart.getString(startStr);
+                windowEnd.getString(endStr);
+
+                // Build filter with time range
+                // If window is at maximum, use unbounded start (modified < windowEnd)
+                // Otherwise use bounded range (windowStart <= modified < windowEnd)
+                filterBuf.clear().append(baseFilterBuf).append(DFUQFilterSeparator);
+                filterBuf.append(DFUQFTstringRange).append(DFUQFilterSeparator);
+                filterBuf.append(getDFUQFilterFieldName(DFUQFFtimemodified)).append(DFUQFilterSeparator);
+                if (windowDays < maxWindowDays) // else - empty 'from' - unbounded start
+                    filterBuf.append(startStr);
+                filterBuf.append(DFUQFilterSeparator);
+                filterBuf.append(endStr).append(DFUQFilterSeparator);
+
+                fetchCount = 0;
+                try
+                {
+                    iter.setown(queryDistributedFileDirectory().getDFAttributesFilteredIterator(filterBuf,
+                        nullptr, selectiveFields.data(), udesc, true, allMatchingFilesReceived, &fetchCount));
+
+                    if (windowDays >= maxWindowDays)
+                        PROGLOG(LOGPFX2 "Window iteration %u: Fetched %u files (modified < %s)",
+                            windowIteration, fetchCount, endStr.str());
+                    else
+                        PROGLOG(LOGPFX2 "Window iteration %u: Fetched %u files (%s <= modified < %s)",
+                            windowIteration, fetchCount, startStr.str(), endStr.str());
+
+                    if (fetchCount > 0)
+                    {
+                        unsigned deleted = processExpiryBatch(iter, now, defaultExpireDays, defaultPersistExpireDays);
+                        totalProcessed += fetchCount;
+                        totalDeleted += deleted;
+                    }
+
+                    if (allMatchingFilesReceived)
+                    {
+                        if (windowDays >= maxWindowDays)
+                        {
+                            // Unbounded query with complete coverage - we're done
+                            PROGLOG(LOGPFX2 "Unbounded query with complete coverage, all remaining files processed");
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        // Exceeded limit within this time window - reduce window and retry same time period
+                        if (windowDays > minWindowDays)
+                        {
+                            windowDays /= 2;
+                            if (windowDays < minWindowDays)
+                                windowDays = minWindowDays;
+                            PROGLOG(LOGPFX2 "Exceeded limit, reducing window to %u days and retrying time period", windowDays);
+                            continue;
+                        }
+                        else
+                        {
+                            // Window at minimum but still exceeding limit
+                            // Process what we got and move to next window (accept incomplete coverage of this period).
+                            // As expired files are deleted over successive runs, the total file count should decrease,
+                            // eventually allowing complete coverage in future expiry cycles.
+                            OWARNLOG(LOGPFX2 "Window at or below minimum %u days but still exceeding limit (%u files), some files in this period may not be processed", minWindowDays, fetchCount);
+                        }
+                    }
+
+                    // Successfully processed this window (or accepted partial coverage)
+                    // Optimize window size for next iteration based on file count
+                    if (fetchCount < lowWaterMark)
+                    {
+                        if (fetchCount == 0)
+                        {
+                            // No files found in window
+                            if (windowDays >= maxWindowDays)
+                            {
+                                // Already using unbounded query with no files - we're done
+                                PROGLOG(LOGPFX2 "No files found with unbounded query, all remaining files processed");
+                                break;
+                            }
+                            else
+                            {
+                                // Jump to unbounded query and retry
+                                windowDays = maxWindowDays;
+                                PROGLOG(LOGPFX2 "No files found in window, switching to unbounded query");
+                                continue;
+                            }
+                        }
+                        else if (windowDays >= maxWindowDays)
+                        {
+                            // Unbounded query with low file count - we're done
+                            PROGLOG(LOGPFX2 "Unbounded query returned low file count (%u), all remaining files processed", fetchCount);
+                            break;
+                        }
+                        else
+                        {
+                            // Some files found - expand window cautiously
+                            windowDays = (windowDays * 2 > maxWindowDays) ? maxWindowDays : windowDays * 2;
+                            PROGLOG(LOGPFX2 "Low file count (%u < %u), expanding next window to %u days",
+                                fetchCount, lowWaterMark, windowDays);
+                        }
+                    }
+                }
+                catch (IException *e)
+                {
+                    OWARNLOG(e, LOGPFX2 "Window iteration failed, moving to next window");
+                    e->Release();
+                }
+                // Move to next window (going backwards in time)
+                windowEnd = windowStart;
+            }
+        }
+
+        PROGLOG(LOGPFX2 "%s - Processed %u files, deleted %u",
+            stopped ? "Stopped" : "Done", totalProcessed, totalDeleted);
+    }
+
+    unsigned processExpiryBatch(IPropertyTreeIterator *iter, const CDateTime &now,
+        unsigned defaultExpireDays, unsigned defaultPersistExpireDays)
+    {
         StringArray expirylist;
-        Owned<IDFAttributesIterator> iter = queryDistributedFileDirectory().getDFAttributesIterator("*",udesc,true,false);
+
         ForEach(*iter)
         {
-            IPropertyTree &attr=iter->query();
+            if (stopped)
+                break;
+
+            IPropertyTree &attr = iter->query();
             if (attr.hasProp("@expireDays"))
             {
                 unsigned expireDays = attr.getPropInt("@expireDays");
-                const char * name = attr.queryProp("@name");
+                const char *name = attr.queryProp("@name");
                 const char *lastAccessed = attr.queryProp("@accessed");
-                if (lastAccessed && name&&*name)
+                if (lastAccessed && name && *name)
                 {
                     if (0 == expireDays)
                     {
                         bool isPersist = attr.getPropBool("@persistent");
                         expireDays = isPersist ? defaultPersistExpireDays : defaultExpireDays;
                     }
-                    CDateTime now;
-                    now.setNow();
                     CDateTime expires;
                     try
                     {
                         expires.setString(lastAccessed);
                         expires.adjustTime(60*24*expireDays);
-                        if (now.compare(expires,false)>0)
+                        if (now.compare(expires, false) > 0)
                         {
                             expirylist.append(name);
                             StringBuffer expiresStr;
@@ -2344,49 +3624,52 @@ public:
                     }
                     catch (IException *e)
                     {
-                        StringBuffer s;
                         EXCLOG(e, LOGPFX2 "setdate");
                         e->Release();
                     }
                 }
             }
         }
-        iter.clear();
-        ForEachItemIn(i,expirylist)
+
+        unsigned deleted = 0;
+        ForEachItemIn(i, expirylist)
         {
             if (stopped)
                 break;
             const char *lfn = expirylist.item(i);
-            PROGLOG(LOGPFX2 "Deleting %s",lfn);
             try
             {
                 /* NB: 0 timeout, meaning fail and skip, if there is any locking contention.
                  * If the file is locked, it implies it is being accessed.
                  */
-                queryDistributedFileDirectory().removeEntry(lfn, udesc, NULL, 0, true);
-                PROGLOG(LOGPFX2 "Deleted %s",lfn);
+                if (dryRun)
+                    PROGLOG(LOGPFX2 "Dry run - would delete %s", lfn);
+                else
+                {
+                    queryDistributedFileDirectory().removeEntry(lfn, udesc, NULL, 0, true);
+                    PROGLOG(LOGPFX2 "Deleted %s", lfn);
+                }
+                deleted++;
             }
             catch (IException *e) // may want to just detach if fails
             {
-                EXCLOG(e, LOGPFX2 "remove");
+                OWARNLOG(e, LOGPFX2 "remove");
                 e->Release();
             }
         }
-        PROGLOG(LOGPFX2 "%s",stopped?"Stopped":"Done");
+
+        return deleted;
     }
 
     int run()
     {
-        Owned<IPropertyTree> props = serverConfig->getPropTree("DfuExpiry");
-        if (!props)
-            props.setown(createPTree("DfuExpiry"));
         unsigned interval = props->getPropInt("@interval",DEFAULT_EXPIRY_INTERVAL);
         if (!interval)
             stopped = true;
         PROGLOG(LOGPFX2 "min interval = %d hr", interval);
         unsigned initinterval = (interval-1)/2;  // wait a bit til dali has started
         CSashaSchedule schedule;
-        if (interval) 
+        if (interval)
             schedule.init(props,interval,initinterval);
         initinterval *= 60*60*1000; // ms
         unsigned started = msTick();
@@ -2420,6 +3703,530 @@ public:
 ISashaServer *createSashaFileExpiryServer()
 {
     assertex(!sashaExpiryServer); // initialization problem
-    sashaExpiryServer = new CSashaExpiryServer();
+#ifdef _CONTAINERIZED
+    Owned<IPropertyTree> config = getComponentConfig();
+#else
+    Owned<IPropertyTree> config = getComponentConfigSP()->getPropTree("DfuExpiry");
+    if (!config)
+        config.setown(createPTree("DfuExpiry"));
+#endif
+    sashaExpiryServer = new CSashaExpiryServer(config);
     return sashaExpiryServer;
 }
+
+void runExpiryCLI()
+{
+    Owned<IPropertyTree> config = getComponentConfigSP()->getPropTree("DfuExpiry");
+    if (!config)
+        config.setown(createPTree("DfuExpiry"));
+    Owned<CSashaExpiryServer> sashaExpiryServer = new CSashaExpiryServer(config);
+    sashaExpiryServer->runExpiry();
+}
+
+
+#ifdef _USE_CPPUNIT
+
+#include <cppunit/extensions/HelperMacros.h>
+#include <thread>
+#include <vector>
+
+class XRefAllocatorTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(XRefAllocatorTest);
+        CPPUNIT_TEST(testBasicAllocation);
+        CPPUNIT_TEST(testDeallocation);
+        CPPUNIT_TEST(testMemoryLimit);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void testBasicAllocation()
+    {
+        const int numThreads = 10;
+        const size_t allocMBs = 1;
+        const size_t allocSize = allocMBs * 1024 * 1024;
+        XRefAllocator allocator(numThreads * allocMBs);
+        std::vector<std::thread> threads;
+        threads.reserve(numThreads);
+        std::vector<void*> allocatedPtrs(numThreads);
+        bool allAllocationsSucceeded = true;
+
+        // Lambda function for each thread to allocate memory
+        auto threadFunc = [&](int threadId)
+        {
+            try
+            {
+                void *ptr = allocator.alloc(allocSize);
+                if (ptr != nullptr)
+                    allocatedPtrs[threadId] = ptr;
+                else
+                    allAllocationsSucceeded = false;
+            }
+            catch (...)
+            {
+                allAllocationsSucceeded = false;
+            }
+        };
+
+        // Create and start 10 threads
+        for (int i = 0; i < numThreads; i++)
+            threads.emplace_back(threadFunc, i);
+
+        for (auto& thread : threads)
+            thread.join();
+
+        // Verify all allocations succeeded
+        CPPUNIT_ASSERT(allAllocationsSucceeded);
+
+        // Verify all pointers are non-null and unique using a set
+        std::set<void*> uniquePtrs;
+        for (void* ptr : allocatedPtrs)
+        {
+            CPPUNIT_ASSERT(ptr != nullptr);
+            auto result = uniquePtrs.insert(ptr);
+            CPPUNIT_ASSERT(result.second); // insertion should succeed, i.e., ptr is unique
+        }
+        // Deallocate memory
+        for (void* ptr : allocatedPtrs)
+            allocator.dealloc(ptr, allocSize);
+    }
+
+    void testDeallocation()
+    {
+        XRefAllocator allocator(1); // 1MB limit
+
+        void *ptr1 = allocator.alloc(512);
+        void *ptr2 = allocator.alloc(512);
+
+        CPPUNIT_ASSERT(ptr1 != nullptr);
+        CPPUNIT_ASSERT(ptr2 != nullptr);
+        CPPUNIT_ASSERT(ptr1 != ptr2);
+
+        allocator.dealloc(ptr1, 512);
+        allocator.dealloc(ptr2, 512);
+    }
+
+    void testMemoryLimit()
+    {
+        XRefAllocator allocator(1); // 1MB limit
+
+        // Try to allocate more than the limit
+        try
+        {
+            void *ptr = allocator.alloc(2 * 1024 * 1024); // 2MB
+            allocator.dealloc(ptr, 2 * 1024 * 1024); // cleanup in case test fails
+            CPPUNIT_FAIL("Should have thrown an exception for memory limit exceeded");
+        }
+        catch (...)
+        {
+            // Expected behavior
+        }
+    }
+};
+
+
+class XRefcMisplacedRecTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(XRefcMisplacedRecTest);
+        CPPUNIT_TEST(testCreation);
+        CPPUNIT_TEST(testInitialization);
+        CPPUNIT_TEST(testEquality);
+        CPPUNIT_TEST(testGetters);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void testCreation()
+    {
+        XRefAllocator allocator(1); // 1MB limit
+        std::unique_ptr<cMisplacedRec> rec(cMisplacedRec::create(&allocator));
+
+        CPPUNIT_ASSERT(rec != nullptr);
+        CPPUNIT_ASSERT(rec->allocator == &allocator);
+    }
+
+    void testInitialization()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cMisplacedRec> rec(cMisplacedRec::create(&allocator));
+
+        rec->init(0, 5, 2, 4, 4, 2); // drv=0, part=5, node=2, totalNodes=4, stripe=4, dir-per-part=2
+
+        CPPUNIT_ASSERT_EQUAL((unsigned short)5, rec->pn);
+        CPPUNIT_ASSERT_EQUAL((unsigned short)2, rec->nn);
+        CPPUNIT_ASSERT_EQUAL((unsigned short)4, rec->stripeNum);
+        CPPUNIT_ASSERT_EQUAL((unsigned short)2, rec->dirPerPartNum);
+        CPPUNIT_ASSERT_EQUAL(false, rec->marked);
+        CPPUNIT_ASSERT(rec->next == nullptr);
+    }
+
+    void testEquality()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cMisplacedRec> rec(cMisplacedRec::create(&allocator));
+
+        rec->init(0, 5, 2, 4, 0, 0);
+
+        CPPUNIT_ASSERT(rec->eq(0, 5, 2, 4));
+        CPPUNIT_ASSERT(!rec->eq(0, 6, 2, 4)); // different part
+        CPPUNIT_ASSERT(!rec->eq(0, 5, 3, 4)); // different node
+    }
+
+    void testGetters()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cMisplacedRec> rec(cMisplacedRec::create(&allocator));
+
+        rec->init(1, 5, 2, 4, 0, 0); // drv=1, part=5, node=2, totalNodes=4, stripe=0
+
+        CPPUNIT_ASSERT_EQUAL(1U, rec->getDrv(4));
+        CPPUNIT_ASSERT_EQUAL(2U, rec->getNode(4));
+    }
+};
+
+
+class XRefcFileDescTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(XRefcFileDescTest);
+        CPPUNIT_TEST(testCreation);
+        CPPUNIT_TEST(testPresentBits);
+        CPPUNIT_TEST(testMarkedBits);
+        CPPUNIT_TEST(testHPCCFile);
+        CPPUNIT_TEST(testGetNameAndMask);
+        CPPUNIT_TEST(testGetPartName);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void testCreation()
+    {
+        XRefAllocator allocator(1);
+        const char *testName = "testfile.$N$_of_$P$";
+        std::unique_ptr<cFileDesc> file(cFileDesc::create(testName, 400, true, 8, &allocator));
+
+        CPPUNIT_ASSERT(file != nullptr);
+        CPPUNIT_ASSERT(file->eq(testName));
+        CPPUNIT_ASSERT_EQUAL((unsigned short)400, file->N);
+        CPPUNIT_ASSERT_EQUAL(true, file->isDirPerPart);
+        CPPUNIT_ASSERT_EQUAL((byte)8, file->filenameLen);
+        CPPUNIT_ASSERT(file->eq(testName));
+        CPPUNIT_ASSERT(!file->eq("differentfile.$N$_of_$P$"));
+    }
+
+    void testPresentBits()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cFileDesc> file(cFileDesc::create("testfile.$N$_of_$P$", 400, true, 8, &allocator));
+
+        // Test setting and getting present bits
+        CPPUNIT_ASSERT_EQUAL(false, file->setpresent(0, 1));    // should return false (not previously set)
+        CPPUNIT_ASSERT_EQUAL(true, file->testpresent(0, 1));    // should now be set
+        CPPUNIT_ASSERT_EQUAL(true, file->setpresent(0, 1));     // should return true (previously set)
+        CPPUNIT_ASSERT_EQUAL(false, file->testpresent(0, 400)); // should be false (not set)
+        CPPUNIT_ASSERT_EQUAL(false, file->setpresent(0, 400));  // should return false (not previously set)
+        CPPUNIT_ASSERT_EQUAL(true, file->testpresent(0, 400));  // should now be set
+    }
+
+    void testMarkedBits()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cFileDesc> file(cFileDesc::create("testfile.$N$_of_$P$", 400, true, 8, &allocator));
+
+        // Test setting and getting marked bits
+        CPPUNIT_ASSERT_EQUAL(false, file->setmarked(0, 1));    // should return false (not previously set)
+        CPPUNIT_ASSERT_EQUAL(true, file->testmarked(0, 1));    // should now be set
+        CPPUNIT_ASSERT_EQUAL(true, file->setmarked(0, 1));     // should return true (previously set)
+        CPPUNIT_ASSERT_EQUAL(false, file->testmarked(0, 400)); // should be false (not set)
+        CPPUNIT_ASSERT_EQUAL(false, file->setmarked(0, 400));  // should return false (not previously set)
+        CPPUNIT_ASSERT_EQUAL(true, file->testmarked(0, 400));  // should now be set
+    }
+
+    void testHPCCFile()
+    {
+        XRefAllocator allocator(1);
+
+        std::unique_ptr<cFileDesc> hpccFile(cFileDesc::create("testfile.$N$_of_$P$", 4, false, 8, &allocator));
+        CPPUNIT_ASSERT(hpccFile->isHPCCFile());
+
+        // For non-HPCC files, filenameLen will be 0 because deduceMask fails to find a partmask
+        std::unique_ptr<cFileDesc> nonHpccFile(cFileDesc::create("testfile.dat", 4, false, 0, &allocator));
+        CPPUNIT_ASSERT(!nonHpccFile->isHPCCFile());
+    }
+
+    void testGetNameAndMask()
+    {
+        XRefAllocator allocator(1);
+
+        // Test HPCC file with filename length
+        std::unique_ptr<cFileDesc> hpccFile(cFileDesc::create("testfile.$N$_of_$P$", 4, false, 8, &allocator));
+
+        StringBuffer nameBuf;
+        CPPUNIT_ASSERT(hpccFile->getName(nameBuf));
+        CPPUNIT_ASSERT_EQUAL(std::string("testfile"), std::string(nameBuf.str()));
+
+        StringBuffer maskBuf;
+        hpccFile->getNameMask(maskBuf);
+        CPPUNIT_ASSERT_EQUAL(std::string("testfile.$N$_of_$P$"), std::string(maskBuf.str()));
+        // Test non-HPCC file (no filename length)
+        std::unique_ptr<cFileDesc> nonHpccFile(cFileDesc::create("regularfile.dat", 1, false, 0, &allocator));
+
+        StringBuffer nameBuf2;
+        CPPUNIT_ASSERT(!nonHpccFile->getName(nameBuf2)); // Should return false
+    }
+
+    void testGetPartName()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cFileDesc> file(cFileDesc::create("testfile.$N$_of_$P$", 4, false, 8, &allocator));
+
+        StringBuffer partName;
+        file->getPartName(partName, 1);
+
+        // Should expand the mask with part number
+        // Note: The exact expansion depends on expandMask implementation
+        CPPUNIT_ASSERT(partName.length() > 0);
+        CPPUNIT_ASSERT(strstr(partName.str(), "testfile") != nullptr);
+    }
+};
+
+
+class XRefcDirDescTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(XRefcDirDescTest);
+        CPPUNIT_TEST(testCreation);
+        CPPUNIT_TEST(testEmpty);
+        CPPUNIT_TEST(testAddFile);
+        CPPUNIT_TEST(testIsMisplaced);
+        CPPUNIT_TEST(testSetMisplacedAndPresent);
+        CPPUNIT_TEST(testEnsureFile);
+        CPPUNIT_TEST(testSetMisplacedAndPresentMultipleMisplaced);
+        CPPUNIT_TEST(testGetFileNotExist);
+        CPPUNIT_TEST(testEnsureFileExternalFile);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void testCreation()
+    {
+        XRefAllocator allocator(1);
+        const char *testName = "directory";
+
+        std::unique_ptr<cDirDesc> dir(cDirDesc::create(testName, &allocator));
+
+        CPPUNIT_ASSERT(dir != nullptr);
+        CPPUNIT_ASSERT(dir->eq(testName));
+        CPPUNIT_ASSERT(!dir->eq("directory2"));
+    }
+
+    void testEmpty()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cDirDesc> dir(cDirDesc::create("directory", &allocator));
+
+        // Initially, directory should be empty
+        CPPUNIT_ASSERT(dir->empty(0));
+        CPPUNIT_ASSERT(dir->empty(1));
+
+        // Add a file to the directory
+        const char *testName = "testfile.$N$_of_$P$";
+        std::unique_ptr<cFileDesc> file(cFileDesc::create(testName, 400, true, 8, &allocator));
+        dir->files.emplace(testName, file.release());
+        CPPUNIT_ASSERT(!dir->empty(0));
+        CPPUNIT_ASSERT(!dir->empty(1));
+    }
+
+    void testAddFile()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cDirDesc> dir(cDirDesc::create("directory", &allocator));
+
+        // Simulate scanDirectory logic for adding a file
+        unsigned numNodes = 20;
+        unsigned nodeNum = 0;
+        unsigned drv = 0;
+        unsigned partNum = 122; // 0-based
+        unsigned numParts = 456; // logical part count
+        unsigned filenameLen = 8; // length of "testfile"
+        const char *fn = "testfile._$P$_of_456";
+        cFileDesc *file = dir->ensureFile(fn, numParts, false, filenameLen, &allocator);
+        dir->setMisplacedAndPresent(file, false, partNum, drv, "/home/test/testfile._123_of_456", nodeNum, numNodes, 0, 0);
+        CPPUNIT_ASSERT(!dir->empty(0));
+        CPPUNIT_ASSERT(!dir->empty(1));
+
+        // Check file was created properly
+        cFileDesc *found = dir->getFile(fn);
+        CPPUNIT_ASSERT(found != nullptr);
+        CPPUNIT_ASSERT(found->misplaced == nullptr);
+        CPPUNIT_ASSERT(found->N == numParts);
+        CPPUNIT_ASSERT(found->filenameLen == filenameLen);
+        CPPUNIT_ASSERT(found->eq(fn));
+
+        // Check present bit
+        CPPUNIT_ASSERT(found->testpresent(drv, partNum));
+    }
+
+    void testSetMisplacedAndPresent()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cDirDesc> dir(cDirDesc::create("directory", &allocator));
+
+        unsigned numNodes = 20;
+        unsigned nodeNum = 0;
+        unsigned drv = 0;
+        unsigned partNum = 5;
+        unsigned numParts = 10;
+        unsigned filenameLen = 8;
+        const char *fn = "misplacedfile._$P$_of_10";
+        cFileDesc *file = dir->ensureFile(fn, numParts, false, filenameLen, &allocator);
+
+        // Mark as misplaced
+        dir->setMisplacedAndPresent(file, true, partNum, drv, "/home/test/misplacedfile._6_of_10", nodeNum, numNodes, 0, 0);
+        CPPUNIT_ASSERT(file->misplaced != nullptr);
+        CPPUNIT_ASSERT(file->misplaced->pn == partNum);
+        CPPUNIT_ASSERT(file->misplaced->nn == nodeNum);
+        CPPUNIT_ASSERT(file->misplaced->marked == false);
+
+        // Mark as present (not misplaced)
+        dir->setMisplacedAndPresent(file, false, partNum, drv, "/home/test/misplacedfile._6_of_10", nodeNum, numNodes, 0, 0);
+        CPPUNIT_ASSERT(file->testpresent(drv, partNum));
+    }
+
+    void testEnsureFile()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cDirDesc> dir(cDirDesc::create("directory", &allocator));
+
+        unsigned numParts = 5;
+        unsigned filenameLen = 8;
+        const char *fn = "ensurefile._$P$_of_5";
+
+        // Ensure file creation
+        cFileDesc *file = dir->ensureFile(fn, numParts, false, filenameLen, &allocator);
+        CPPUNIT_ASSERT(file != nullptr);
+        CPPUNIT_ASSERT(file->N == numParts);
+        CPPUNIT_ASSERT(file->filenameLen == filenameLen);
+
+        // Ensure file lookup returns same pointer
+        cFileDesc *found = dir->getFile(fn);
+        CPPUNIT_ASSERT(found == file);
+
+        // EnsureFile should not create duplicate
+        cFileDesc *file2 = dir->ensureFile(fn, numParts, false, filenameLen, &allocator);
+        CPPUNIT_ASSERT(file2 == file);
+        CPPUNIT_ASSERT(dir->files.size() == 1);
+    }
+
+    void testIsMisplaced()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cDirDesc> dir(cDirDesc::create("directory", &allocator));
+
+        // Test external files (numParts == NotFound) - should always return true
+        SocketEndpointArray emptyEpa;
+        Owned<IGroup> emptyGroup = createIGroup(emptyEpa);
+        CPPUNIT_ASSERT(dir->isMisplaced(0, NotFound, SocketEndpoint(), *emptyGroup, "/test/file.dat", 5, 1, 1, 0));
+
+        if (isContainerized())
+        {
+            // Test stripe number validation - invalid stripe numbers should return true
+            CPPUNIT_ASSERT(dir->isMisplaced(0, 4, SocketEndpoint(), *emptyGroup, "/test/file._1_of_4", 5, 0, 2, 4)); // stripeNum < 1
+            CPPUNIT_ASSERT(dir->isMisplaced(0, 4, SocketEndpoint(), *emptyGroup, "/test/file._1_of_4", 5, 3, 2, 4)); // stripeNum > numStripedDevices
+
+            // Test dir-per-part detection
+
+            // Valid dir-per-part where part matches directory number
+            CPPUNIT_ASSERT(!dir->isMisplaced(41, 4, SocketEndpoint(), *emptyGroup, "/test/scope/42/file._42_of_45", 11, 1, 1, 4));
+
+            // Invalid dir-per-part where part doesn't match directory number
+            CPPUNIT_ASSERT(dir->isMisplaced(19, 40, SocketEndpoint(), *emptyGroup, "/test/scope/21/file._20_of_40", 11, 1, 1, 4));
+
+            // Directory number too large (beyond numParts) - should be ignored, not considered misplaced
+            CPPUNIT_ASSERT(!dir->isMisplaced(0, 4, SocketEndpoint(), *emptyGroup, "/test/scope/999/file._1_of_4", 11, 1, 1, 4));
+            CPPUNIT_ASSERT(!dir->isMisplaced(0, 4, SocketEndpoint(), *emptyGroup, "/test/scope/20250101/file._1_of_4", 11, 1, 1, 4));
+
+            // Test files in root directory (no dir-per-part to check)
+            CPPUNIT_ASSERT(!dir->isMisplaced(0, 4, SocketEndpoint(), *emptyGroup, "/file._1_of_4", 0, 1, 1, 4));
+
+            // Test striped files
+            CPPUNIT_ASSERT(!dir->isMisplaced(0, 4, SocketEndpoint(), *emptyGroup, "/test/scope/subdir/file._1_of_4", 11, calcStripeNumber(0, "subdir::file", 20), 20, 4));
+            CPPUNIT_ASSERT(!dir->isMisplaced(0, 4, SocketEndpoint(), *emptyGroup, "/test/scope/subdir/file._1_of_4.tmp", 11, calcStripeNumber(0, "subdir::file", 20), 20, 4));
+            CPPUNIT_ASSERT(!dir->isMisplaced(99, 4, SocketEndpoint(), *emptyGroup, "/test/scope/subdir/100/file._100_of_400", 11, calcStripeNumber(99, "subdir::file", 20), 20, 4));
+
+            // Test striped file in the root directory (no scopes). The stripe hash must cover only
+            // the base logical filename ("rootfile"), excluding the ._$P$_of_$N$ part mask. If the
+            // filename-boundary handling is off-by-one for root-scope files, the hash covers
+            // "rootfile." instead and this file is wrongly flagged as misplaced.
+            CPPUNIT_ASSERT(!dir->isMisplaced(0, 4, SocketEndpoint(), *emptyGroup, "/rootfile._1_of_4", 0, calcStripeNumber(0, "rootfile", 20), 20, 8));
+
+            // Test edge case with single digit dir-per-part
+            CPPUNIT_ASSERT(!dir->isMisplaced(2, 4, SocketEndpoint(), *emptyGroup, "/test/scope/3/file._3_of_4", 11, 1, 1, 4));
+
+            // Test leading zeros in directory names (should still parse correctly)
+            // MORE: I don't think an actual dir-per-part will have leading zeros. This may be an edge case to handle.
+            CPPUNIT_ASSERT(!dir->isMisplaced(0, 4, SocketEndpoint(), *emptyGroup, "/test/scope/01/file._1_of_4", 11, 1, 1, 4));
+        }
+        else
+        {
+            // Test non-containerized paths
+            SocketEndpointArray epa;
+            for (unsigned i = 0; i < 4; i++)
+            {
+                SocketEndpoint ep;
+                ep.set("127.0.0.1", 7070 + i);
+                epa.append(ep);
+            }
+            Owned<IGroup> grp = createIGroup(epa);
+
+            // Test mismatched group size
+            CPPUNIT_ASSERT(dir->isMisplaced(0, 5, epa.item(0), *grp, "/test/file._1_of_5", 5, 1, 1, 4)); // numParts != grp.ordinality()
+
+            // Test part number out of range
+            CPPUNIT_ASSERT(dir->isMisplaced(4, 4, epa.item(0), *grp, "/test/file._5_of_4", 5, 1, 1, 4)); // partNum >= grp.ordinality()
+
+            // Test endpoint mismatch
+            SocketEndpoint wrongEp;
+            wrongEp.set("192.168.1.1", 8080);
+            CPPUNIT_ASSERT(dir->isMisplaced(0, 4, wrongEp, *grp, "/test/file._1_of_4", 5, 1, 1, 4)); // endpoint not in group
+
+            // Test correct placement
+            CPPUNIT_ASSERT(!dir->isMisplaced(0, 4, epa.item(0), *grp, "/test/file._1_of_4", 5, 1, 1, 4)); // correct placement
+            CPPUNIT_ASSERT(!dir->isMisplaced(1, 4, epa.item(1), *grp, "/test/file._2_of_4", 5, 1, 1, 4)); // correct placement
+        }
+    }
+
+    void testSetMisplacedAndPresentMultipleMisplaced()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cDirDesc> dir(cDirDesc::create("directory", &allocator));
+        const char *fn = "multi._$P$_of_10";
+        cFileDesc *file = dir->ensureFile(fn, 10, false, 8, &allocator);
+        dir->setMisplacedAndPresent(file, true, 1, 0, "/home/test/multi._2_of_10", 0, 20, 0, 0);
+        dir->setMisplacedAndPresent(file, true, 2, 0, "/home/test/multi._3_of_10", 0, 20, 0, 0);
+        CPPUNIT_ASSERT(file->misplaced != nullptr);
+        CPPUNIT_ASSERT(file->misplaced->next != nullptr);
+        CPPUNIT_ASSERT(file->misplaced->pn == 2 && file->misplaced->next->pn == 1);
+    }
+
+    void testGetFileNotExist()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cDirDesc> dir(cDirDesc::create("directory", &allocator));
+        CPPUNIT_ASSERT(dir->getFile("doesnotexist._$P$_of_1") == nullptr);
+    }
+
+    void testEnsureFileExternalFile()
+    {
+        XRefAllocator allocator(1);
+        std::unique_ptr<cDirDesc> dir(cDirDesc::create("directory", &allocator));
+        const char *fn = "externalfile.dat";
+        cFileDesc *file = dir->ensureFile(fn, NotFound, false, 0, &allocator);
+        CPPUNIT_ASSERT(file != nullptr);
+        CPPUNIT_ASSERT(file->N == 1);
+        dir->setMisplacedAndPresent(file, true, 0, 0, "/home/test/externalfile.dat", 0, 1, 0, 0);
+        CPPUNIT_ASSERT(file->misplaced != nullptr);
+    }
+};
+
+
+CPPUNIT_TEST_SUITE_REGISTRATION(XRefAllocatorTest);
+CPPUNIT_TEST_SUITE_REGISTRATION(XRefcMisplacedRecTest);
+CPPUNIT_TEST_SUITE_REGISTRATION(XRefcFileDescTest);
+CPPUNIT_TEST_SUITE_REGISTRATION(XRefcDirDescTest);
+
+#endif // _USE_CPPUNIT

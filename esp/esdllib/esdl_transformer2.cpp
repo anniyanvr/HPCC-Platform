@@ -176,7 +176,7 @@ void Esdl2LocalContext::handleDataFor(IXmlWriterExt & writer)
 // class Esdl2Base
 
 Esdl2Base::Esdl2Base(Esdl2Transformer *xformer, IEsdlDefObject* def, EsdlBasicElementType t, bool might_skip_root_)
-: m_def(def), might_skip_root(might_skip_root_), data_for(NULL), type_id(t)
+: m_def(def), type_id(t), data_for(NULL), might_skip_root(might_skip_root_)
 {
     if (def->queryProp("optional"))
         param_group.set(def->queryProp("optional"));
@@ -224,7 +224,7 @@ void Esdl2Base::serialize_attributes(StringBuffer &out)
         {
             if (stricmp(key, "base_type") != 0)
             {
-                const char *value = m_def->queryProp(key);
+                const char *value = piter->queryPropValue();
                 if (value && *value)
                     out.appendf(" %s=\"%s\"", key, value);
             }
@@ -1311,7 +1311,7 @@ void Esdl2Request::addDefaults(IPropertyTree *req)
         const char *path = iter->getPropKey();
         if (!req->hasProp(path))
         {
-            const char *value = defvals->queryProp(path);
+            const char *value = iter->queryPropValue();
             ensurePTree(req, path);
             req->setProp(path, value);
         }
@@ -1628,12 +1628,15 @@ int Esdl2Transformer::process(IEspContext &ctx, EsdlProcessMode mode, const char
             tctx.root_type.set(root->queryName());
             root->process(tctx, (root_name) ? root_name : root_type);
             rc = tctx.counter;
-            if (mode==EsdlRequestMode)
+            if (mode!=EsdlRequestMode)
+                out.set(respWriter->str());
+            else
             {
                 Esdl2Request *rootreq = dynamic_cast<Esdl2Request *>(root);
-                if (rootreq)
+                if (!rootreq || !rootreq->hasDefaults())
+                    out.set(respWriter->str());
+                else
                 {
-                    DBGLOG("XML: %s", respWriter->str());
                     OwnedPTree req = createPTreeFromXMLString(respWriter->str(), false);
                     if (!req.get())
                         req.setown(createPTree(root_type,false));
@@ -1715,7 +1718,7 @@ int Esdl2Transformer::process(IEspContext &ctx, EsdlProcessMode mode, const char
         tctx.skip_root = false;
         tctx.root_type.set(root->queryName());
 
-        root->process(tctx, &in, root_type);
+        root->process(tctx, &in, root_type, nullptr, true);
         rc = tctx.counter;
     }
     catch (...)

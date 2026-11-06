@@ -1,0 +1,335 @@
+import * as React from "react";
+import { CommandBar, ContextualMenuItemType, ICommandBarItemProps } from "./CommandBarV9";
+import { LockClosedFilled } from "@fluentui/react-icons";
+import { Link } from "@fluentui/react-components";
+import { FileSpray, FileSprayService, SashaService, WsSasha } from "@hpcc-js/comms";
+import { scopedLogger } from "@hpcc-js/util";
+import { SizeMe } from "../layouts/SizeMe";
+import * as ESPDFUWorkunit from "src/ESPDFUWorkunit";
+import { formatCost } from "src/Session";
+import * as Utility from "src/Utility";
+import { QuerySortItem } from "src/store/Store";
+import nlsHPCC from "src/nlsHPCC";
+import { useConfirm } from "../hooks/confirm";
+import { useMyAccount } from "../hooks/user";
+import { HolyGrail } from "../layouts/HolyGrail";
+import { pushParams } from "../util/history";
+import { FluentPagedGrid, FluentPagedFooter, useCopyButtons, useFluentStoreState, FluentColumns } from "./controls/Grid";
+import { Filter } from "./forms/Filter";
+import { Fields } from "./forms/Fields";
+import { selector } from "./DojoGrid";
+
+const logger = scopedLogger("src-react/components/DFUWorkunits.tsx");
+
+const FilterFields: Fields = {
+    "Archived": { type: "checkbox", label: nlsHPCC.ArchivedOnly },
+    "Wuid": { type: "string", label: nlsHPCC.WUID, placeholder: "D20201203-171723" },
+    "Owner": { type: "string", label: nlsHPCC.Owner, placeholder: nlsHPCC.jsmi },
+    "Jobname": { type: "string", label: nlsHPCC.Jobname, placeholder: nlsHPCC.log_analysis_1 },
+    "Command": { type: "dropdown", options: Object.entries(FileSpray.DFUCommand).map(([text, key]) => ({ key, text })), label: nlsHPCC.Type },
+    "Cluster": { type: "target-cluster", label: nlsHPCC.Cluster, placeholder: nlsHPCC.Owner },
+    "StateReq": { type: "dfuworkunit-state", label: nlsHPCC.State, placeholder: nlsHPCC.Created },
+};
+
+function formatQuery(_filter): { [id: string]: any } {
+    const filter = { ..._filter };
+    if (filter.StartDate) {
+        filter.StartDate = new Date(filter.StartDate).toISOString();
+    }
+    if (filter.EndDate) {
+        filter.EndDate = new Date(filter.EndDate).toISOString();
+    }
+    return filter;
+}
+
+const defaultUIState = {
+    hasSelection: false,
+    hasProtected: false,
+    hasNotProtected: false,
+    hasFailed: false,
+    hasNotFailed: false
+};
+
+const sashaService = new SashaService({ baseUrl: "" });
+const fileSprayService = new FileSprayService({ baseUrl: "" });
+
+interface DFUWorkunitsProps {
+    filter?: { [id: string]: any };
+    sort?: QuerySortItem;
+    store?: any;
+    page?: number;
+}
+
+const emptyFilter = {};
+const defaultSort = { attribute: "Wuid", descending: true };
+
+export const DFUWorkunits: React.FunctionComponent<DFUWorkunitsProps> = ({
+    filter = emptyFilter,
+    sort = defaultSort,
+    store,
+    page
+}) => {
+
+    const hasFilter = React.useMemo(() => Object.keys(filter).length > 0, [filter]);
+
+    const [showFilter, setShowFilter] = React.useState(false);
+    const { currentUser } = useMyAccount();
+    const [uiState, setUIState] = React.useState({ ...defaultUIState });
+    const {
+        selection, setSelection,
+        pageNum, setPageNum,
+        pageSize, setPageSize,
+        total, setTotal,
+        refreshTable } = useFluentStoreState({ page });
+
+    //  Grid ---
+    const gridStore = React.useMemo(() => {
+        return store || ESPDFUWorkunit.CreateWUQueryStore();
+    }, [store]);
+
+    const query = React.useMemo(() => {
+        return formatQuery(filter);
+    }, [filter]);
+
+    const columns = React.useMemo((): FluentColumns => {
+        return {
+            col1: selector({
+                width: 27,
+                selectorType: "checkbox"
+            }),
+            isProtected: {
+                headerIconElement: <LockClosedFilled aria-label={nlsHPCC.Protected} />,
+                width: 18,
+                sortable: false,
+                formatter: (_protected) => {
+                    if (_protected === true) {
+                        return <LockClosedFilled />;
+                    }
+                    return "";
+                }
+            },
+            ID: {
+                label: nlsHPCC.WUID,
+                width: 130,
+                formatter: (ID, idx) => {
+                    const wu = ESPDFUWorkunit.Get(ID);
+                    return <>
+                        <img src={wu.getStateImage()} alt="" style={{ minWidth: "16px" }} />
+                        &nbsp;
+                        <Link href={`#/dfuworkunits/${ID}`}>{ID}</Link>
+                    </>;
+                }
+            },
+            Type: {
+                label: nlsHPCC.Type,
+                width: 110,
+                formatter: (_type, row) => {
+                    const message = row?.CommandMessage || "unknown";
+                    return message[0].toUpperCase() + message.slice(1);
+                }
+            },
+            Owner: {
+                label: nlsHPCC.Owner, width: 90,
+                formatter: (_owner, row) => {
+                    return row.User;
+                }
+            },
+            JobName: { label: nlsHPCC.JobName, width: 220 },
+            Cluster: {
+                label: nlsHPCC.Cluster, width: 70,
+                formatter: (_cluster, row) => {
+                    return row.ClusterName;
+                },
+            },
+            State: {
+                label: nlsHPCC.State, width: 70,
+                formatter: (_state, row) => {
+                    return row.StateMessage;
+                }
+            },
+            PCTDone: {
+                label: nlsHPCC.PctComplete, width: 80,
+                formatter: (_pctdone, row) => {
+                    if (row.PercentDone === undefined) return "";
+                    return `${row.PercentDone}%`;
+                }
+            },
+            TimeStarted: { label: nlsHPCC.TimeStarted, width: 100, sortable: false },
+            TimeStopped: { label: nlsHPCC.TimeStopped, width: 100, sortable: false },
+            KbPerSec: {
+                label: nlsHPCC.TransferRate, width: 90, sortable: false,
+                formatter: (_kbPerSec, row) => {
+                    return Utility.convertedSize(row.KbPerSec * 1024, " / sec");
+                }
+            },
+            KbPerSecAve: { // KbPerSecAve seems to never be different than KbPerSec, see HPCC-29894
+                label: nlsHPCC.TransferRateAvg, width: 90, sortable: false,
+                formatter: (_kbPerSecAve, row) => {
+                    return Utility.convertedSize(row.KbPerSecAve * 1024, " / sec");
+                }
+            },
+            FileAccessCost: {
+                label: nlsHPCC.FileAccessCost, width: 100, sortable: false,
+                justify: "right",
+                formatter: (fileAccessCost) => formatCost(fileAccessCost ?? 0),
+            }
+        };
+    }, []);
+
+    const [DeleteConfirm, setShowDeleteConfirm] = useConfirm({
+        title: nlsHPCC.Delete,
+        message: nlsHPCC.DeleteSelectedWorkunits,
+        items: selection.map(s => s?.Wuid).filter(wuid => wuid !== undefined),
+        onSubmit: React.useCallback(() => {
+            const wuids = selection.map(s => s?.Wuid).filter(wuid => wuid !== undefined);
+            fileSprayService.DFUWorkunitsAction({ wuids: { Item: wuids }, Type: FileSpray.DFUWUActions.Delete }).then(() => refreshTable.call(true));
+        }, [refreshTable, selection])
+    });
+
+    //  Command Bar  ---
+    const buttons = React.useMemo((): ICommandBarItemProps[] => [
+        {
+            key: "refresh", text: nlsHPCC.Refresh, iconProps: { iconName: "Refresh" },
+            onClick: () => refreshTable.call()
+        },
+        { key: "divider_1", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "open", text: nlsHPCC.Open, disabled: !uiState.hasSelection, iconProps: { iconName: "WindowEdit" },
+            onClick: () => {
+                if (selection.length === 1) {
+                    window.location.href = `#/dfuworkunits/${selection[0].Wuid}`;
+                } else {
+                    for (let i = selection.length - 1; i >= 0; --i) {
+                        window.open(`#/dfuworkunits/${selection[i].Wuid}`, "_blank");
+                    }
+                }
+            }
+        },
+        {
+            key: "delete", text: nlsHPCC.Delete, disabled: !uiState.hasNotProtected, iconProps: { iconName: "Delete" },
+            onClick: () => setShowDeleteConfirm(true)
+        },
+        { key: "divider_2", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "setFailed", text: nlsHPCC.SetToFailed, disabled: !uiState.hasNotProtected,
+            onClick: () => {
+                const wuids = selection.map(s => s?.Wuid).filter(wuid => wuid !== undefined);
+                fileSprayService.DFUWorkunitsAction({ wuids: { Item: wuids }, Type: FileSpray.DFUWUActions.SetToFailed });
+            }
+        },
+        { key: "divider_3", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "restore", text: nlsHPCC.Restore, disabled: !uiState.hasSelection,
+            onClick: () => {
+                const wuids = selection.map(s => s?.Wuid).filter(wuid => wuid !== undefined);
+                Promise.all(wuids.map(wuid =>
+                    sashaService.RestoreWU({
+                        Wuid: wuid,
+                        WUType: WsSasha.WUTypes.DFU
+                    })
+                )).then(() => {
+                    refreshTable.call(true);
+                }).catch(err => {
+                    logger.error(err);
+                });
+            }
+        },
+        {
+            key: "protect", text: nlsHPCC.Protect, disabled: !uiState.hasNotProtected,
+            onClick: () => {
+                const wuids = selection.map(s => s?.Wuid).filter(wuid => wuid !== undefined);
+                fileSprayService.DFUWorkunitsAction({ wuids: { Item: wuids }, Type: FileSpray.DFUWUActions.Protect }).then(() => refreshTable.call());
+            }
+        },
+        {
+            key: "unprotect", text: nlsHPCC.Unprotect, disabled: !uiState.hasProtected,
+            onClick: () => {
+                const wuids = selection.map(s => s?.Wuid).filter(wuid => wuid !== undefined);
+                fileSprayService.DFUWorkunitsAction({ wuids: { Item: wuids }, Type: FileSpray.DFUWUActions.Unprotect }).then(() => refreshTable.call());
+            }
+        },
+        { key: "divider_4", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "filter", text: nlsHPCC.Filter, disabled: !!store, iconProps: { iconName: hasFilter ? "FilterSolid" : "Filter" },
+            onClick: () => {
+                setShowFilter(true);
+            }
+        },
+        {
+            key: "mine", text: nlsHPCC.Mine, disabled: !currentUser?.username || !total, iconProps: { iconName: "Contact" }, canCheck: true, checked: filter["Owner"] === currentUser.username,
+            onClick: () => {
+                if (filter["Owner"] === currentUser.username) {
+                    filter["Owner"] = "";
+                } else {
+                    filter["Owner"] = currentUser.username;
+                }
+                pushParams(filter);
+            }
+        },
+    ], [currentUser, filter, hasFilter, refreshTable, selection, setShowDeleteConfirm, store, total, uiState.hasNotProtected, uiState.hasProtected, uiState.hasSelection]);
+
+    const copyButtons = useCopyButtons(columns, selection, "dfuworkunits");
+
+    //  Filter  ---
+    const filterFields: Fields = {};
+    for (const field in FilterFields) {
+        filterFields[field] = { ...FilterFields[field], value: filter[field] };
+    }
+
+    //  Selection  ---
+    React.useEffect(() => {
+        const state = { ...defaultUIState };
+
+        for (let i = 0; i < selection.length; ++i) {
+            state.hasSelection = true;
+            if (selection[i] && selection[i].isProtected && selection[i].isProtected !== false) {
+                state.hasProtected = true;
+            } else {
+                state.hasNotProtected = true;
+            }
+            if (selection[i] && selection[i].State && selection[i].State === 5) {
+                state.hasFailed = true;
+            } else {
+                state.hasNotFailed = true;
+            }
+        }
+        setUIState(state);
+    }, [selection]);
+
+    return <HolyGrail
+        header={<CommandBar items={buttons} farItems={copyButtons} />}
+        main={
+            <>
+                <SizeMe>{({ size }) =>
+                    <div style={{ width: "100%", height: "100%" }}>
+                        <div style={{ position: "absolute", width: "100%", height: `${size.height}px` }}>
+                            <FluentPagedGrid
+                                store={gridStore}
+                                query={query}
+                                sort={sort}
+                                pageNum={pageNum}
+                                pageSize={pageSize}
+                                total={total}
+                                columns={columns}
+                                height={`${size.height}px`}
+                                setSelection={setSelection}
+                                setTotal={setTotal}
+                                refresh={refreshTable}
+                            ></FluentPagedGrid>
+                        </div>
+                    </div>
+                }</SizeMe>
+                <Filter showFilter={showFilter} setShowFilter={setShowFilter} filterFields={filterFields} onApply={pushParams} />
+                <DeleteConfirm />
+            </>
+        }
+        footer={<FluentPagedFooter
+            persistID={"dfuworkunits"}
+            pageNum={pageNum}
+            selectionCount={selection.length}
+            setPageNum={setPageNum}
+            setPageSize={setPageSize}
+            total={total}
+        ></FluentPagedFooter>}
+    />;
+};

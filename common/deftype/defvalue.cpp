@@ -121,7 +121,7 @@ int rangeCompare(double value, ITypeInfo * targetType)
 inline unsigned getTargetLength(ITypeInfo * type, unsigned dft)
 {
     unsigned length = type->getStringLen();
-    if (length == UNKNOWN_LENGTH)
+    if (isUnknownLength(length))
         length = dft;
     return length;
 }
@@ -226,7 +226,7 @@ IValue * CValue::doCastTo(unsigned osize, const char * text, ITypeInfo *t)
 VarStringValue::VarStringValue(unsigned len, const char *v, ITypeInfo *_type) : CValue(_type)
 {
     unsigned typeLen = type->getStringLen();
-    assertex(typeLen != UNKNOWN_LENGTH);
+    assertex(!isUnknownLength(typeLen));
     if (len >= typeLen)
         val.set(v, typeLen);
     else
@@ -335,7 +335,7 @@ void VarStringValue::deserialize(MemoryBuffer &src)
 
 IValue * createVarStringValue(unsigned len, const char * value, ITypeInfo *type)
 {
-    if (type->getSize() != UNKNOWN_LENGTH)
+    if (!isUnknownLength(type->getSize()))
         return new VarStringValue(len, value, type);
     ITypeInfo * newType = getStretchedType(len, type);
     type->Release();
@@ -366,7 +366,7 @@ int VarStringValue::rangeCompare(ITypeInfo * targetType)
 
 MemoryValue::MemoryValue(const void *v, ITypeInfo *_type) : CValue(_type)
 {
-    assertex(_type->getSize() != UNKNOWN_LENGTH);
+    assertex(!isUnknownLength(_type->getSize()));
     val.set(_type->getSize(), v);
 }
 
@@ -385,6 +385,9 @@ unsigned MemoryValue::getHash(unsigned initval)
 {
     size32_t size = getSize();
     assertThrow(val.length()>=size);
+    constexpr unsigned maxHashLength = 0x100000;     //Only hash the first 1M - to avoid pathological performance for (string4000000000)'x' etc.
+    if (size > maxHashLength)
+        size = maxHashLength;
     return hashc((unsigned char *) val.get(), size, initval);
 }
 
@@ -454,7 +457,7 @@ StringValue::StringValue(const char *v, ITypeInfo *_type) : MemoryValue(_type)
 {
     //store a null terminated string for ease of conversion
     unsigned len = _type->getSize();
-    assertex(len != UNKNOWN_LENGTH);
+    assertex(!isUnknownLength(len));
     char * temp = (char *)val.allocate(len+1);
     memcpy_iflen(temp, v, len);
     temp[len] = 0;
@@ -567,8 +570,8 @@ IValue *createStringValue(const char *val, unsigned size)
 
 IValue *createStringValue(const char *val, ITypeInfo *type)
 {
-    assertex(type->getSize() != UNKNOWN_LENGTH);
-    if (type->getSize() == UNKNOWN_LENGTH)
+    assertex(!isUnknownLength(type->getSize()));
+    if (isUnknownLength(type->getSize()))
     {
         ITypeInfo * newType = getStretchedType((size32_t)strlen(val), type);
         type->Release();
@@ -581,7 +584,7 @@ IValue *createStringValue(const char *val, ITypeInfo *type, size32_t srcLength, 
 {
     ITranslationInfo * translation = queryDefaultTranslation(type->queryCharset(), srcCharset);
     size32_t tgtLength = type->getSize();
-    if (tgtLength == UNKNOWN_LENGTH)
+    if (isUnknownLength(tgtLength))
     {
         ITypeInfo * newType = getStretchedType(srcLength, type);
         type->Release();
@@ -615,7 +618,7 @@ IValue *createStringValue(const char *val, ITypeInfo *type, size32_t srcLength, 
 UnicodeValue::UnicodeValue(UChar const * _value, ITypeInfo * _type) : MemoryValue(_type)
 {
     unsigned len = _type->getSize();
-    assertex(len != UNKNOWN_LENGTH);
+    assertex(!isUnknownLength(len));
     val.set(len, _value);
 }
 
@@ -659,7 +662,7 @@ IValue *UnicodeValue::castTo(ITypeInfo *t)
     switch (tc)
     {
     case type_unicode:
-        if ((t->getSize() == UNKNOWN_LENGTH) && (type->queryLocale() == t->queryLocale()))
+        if (isUnknownLength(t->getSize()) && (type->queryLocale() == t->queryLocale()))
             return LINK(this);
         return createUnicodeValue(uchars, olen, LINK(t));
     case type_string:
@@ -771,7 +774,7 @@ IValue *createUtf8Value(size32_t len, char const * value, char const * locale, b
 
 IValue *createUnicodeValue(char const * value, ITypeInfo * type)
 {
-    if(type->getSize() == UNKNOWN_LENGTH)
+    if (isUnknownLength(type->getSize()))
     {
         type->Release();
         return createUnicodeValue(value, (size32_t)strlen(value), str(type->queryLocale()), false);
@@ -781,7 +784,7 @@ IValue *createUnicodeValue(char const * value, ITypeInfo * type)
 
 IValue *createUnicodeValue(char const * value, ITypeInfo * type, unsigned srclen)
 {
-    if(type->getSize() == UNKNOWN_LENGTH)
+    if (isUnknownLength(type->getSize()))
     {
         type->Release();
         return createUnicodeValue(value, srclen, str(type->queryLocale()), false);
@@ -796,7 +799,7 @@ IValue *createUnicodeValue(char const * value, ITypeInfo * type, unsigned srclen
 IValue * createUnicodeValue(UChar const * text, size32_t len, ITypeInfo * type)
 {
     size32_t nlen = type->getStringLen();
-    if(nlen == UNKNOWN_LENGTH)
+    if(isUnknownLength(nlen))
     {
         ITypeInfo * newType = getStretchedType(len, type);
         type->Release();
@@ -840,7 +843,7 @@ void UnicodeAttr::setown(UChar * _text)
 VarUnicodeValue::VarUnicodeValue(unsigned len, const UChar * v, ITypeInfo * _type) : CValue(_type)
 {
     unsigned typeLen = type->getStringLen();
-    assertex(typeLen != UNKNOWN_LENGTH);
+    assertex(!isUnknownLength(typeLen));
     if (len >= typeLen)
         val.set(v, typeLen);
     else
@@ -1013,7 +1016,7 @@ IValue *createVarUnicodeValue(char const * value, unsigned size, char const * lo
 IValue * createVarUnicodeValue(UChar const * text, size32_t len, ITypeInfo * type)
 {
     size32_t nlen = type->getStringLen();
-    if(nlen == UNKNOWN_LENGTH)
+    if(isUnknownLength(nlen))
     {
         ITypeInfo * newType = getStretchedType(len, type);
         type->Release();
@@ -1042,7 +1045,7 @@ IValue * createVarUnicodeValue(size32_t len, const void * text, ITypeInfo * type
 Utf8Value::Utf8Value(const char * _value, ITypeInfo * _type) : MemoryValue(_type)
 {
     unsigned len = _type->getStringLen();
-    assertex(len != UNKNOWN_LENGTH);
+    assertex(!isUnknownLength(len));
     unsigned size = rtlUtf8Size(len, _value);
     val.set(size, _value);
 }
@@ -1100,7 +1103,7 @@ IValue *Utf8Value::castTo(ITypeInfo *t)
     case type_utf8:
         {
             unsigned targetLength = t->getStringLen();
-            if (targetLength == UNKNOWN_LENGTH)
+            if (isUnknownLength(targetLength))
             {
                 if (type->queryLocale() == t->queryLocale())
                     return LINK(this);
@@ -1199,7 +1202,7 @@ IValue * createUtf8Value(const char * text, ITypeInfo * type)
 IValue * createUtf8Value(size32_t len, const char * text, ITypeInfo * type)
 {
     size32_t nlen = type->getStringLen();
-    if(nlen == UNKNOWN_LENGTH)
+    if(isUnknownLength(nlen))
     {
         ITypeInfo * newType = getStretchedType(len, type);
         type->Release();
@@ -1244,7 +1247,7 @@ IValue *DataValue::castTo(ITypeInfo *t)
     switch (tc)
     {
     case type_data:
-        if (nsize == UNKNOWN_LENGTH)
+        if (isUnknownLength(nsize))
             return LINK(this);
         if (nsize <= osize)
             return new DataValue(val.get(), LINK(t));
@@ -1259,7 +1262,7 @@ IValue *DataValue::castTo(ITypeInfo *t)
         }
         break;
     case type_string:
-        if (nsize == UNKNOWN_LENGTH)
+        if (isUnknownLength(nsize))
         {
             nsize = osize;
             t = getStretchedType(osize, t);
@@ -1324,7 +1327,7 @@ IValue *createDataValue(const char *val, unsigned size)
 
 IValue *createDataValue(const char *val, ITypeInfo *type)
 {
-    assertex(type->getSize() != UNKNOWN_LENGTH);
+    assertex(!isUnknownLength(type->getSize()));
     return new DataValue(val, type);
 }
 
@@ -1332,7 +1335,7 @@ IValue *createDataValue(const char *val, ITypeInfo *type)
 IValue *createDataValue(const char *val, ITypeInfo *type, size32_t srcLen)
 {
     size32_t targetSize = type->getSize();
-    assertex(targetSize != UNKNOWN_LENGTH);
+    assertex(!isUnknownLength(targetSize));
     if (srcLen >= targetSize)
         return new DataValue(val, type);
 
@@ -1455,7 +1458,7 @@ void QStringValue::pushDecimalValue()
 
 IValue *createQStringValue(unsigned len, const char *val, ITypeInfo *type)
 {
-    if (type->getSize() == UNKNOWN_LENGTH)
+    if (isUnknownLength(type->getSize()))
     {
         ITypeInfo * newType = getStretchedType(len, type);
         type->Release();
@@ -1485,6 +1488,7 @@ const char *CharValue::generateCPP(StringBuffer &out, CompilerType compiler)
         case '\r': out.append("'\\r'"); break;
         case '\t': out.append("'\\t'"); break;
         case '\'': out.append("'\\''"); break;
+        case '\\': out.append("'\\\\'"); break;
         default:
             if ((val >= ' ') && (val <= 126))
                 out.append('\'').append(val).append('\'');
@@ -1626,7 +1630,7 @@ IValue *IntValue::castTo(ITypeInfo *t)
         return castViaString(t);
     case type_string:
     {
-        if (nLen == UNKNOWN_LENGTH)
+        if (isUnknownLength(nLen))
             return castViaString(t);
 
         char *newstr = (char *) checked_malloc(nLen, DEFVALUE_MALLOC_FAILED);
@@ -1694,6 +1698,7 @@ static void generateUnsignedCPP(StringBuffer &s, __uint64 val, unsigned size, Co
     switch (compiler)
     {
     case GccCppCompiler:
+    case ClangCppCompiler:
         if (val && (size > sizeof(unsigned)))
             s.append("LLU");
         else
@@ -1722,6 +1727,7 @@ static void generateSignedCPP(StringBuffer &s, __int64 val, unsigned size, Compi
             switch (compiler)
             {
             case GccCppCompiler:
+            case ClangCppCompiler:
                 s.append("LL");
                 break;
             case Vs6CppCompiler:
@@ -2027,6 +2033,7 @@ void RealValue::toMem(void *target)
     RealUnion u;
 
     size32_t size = type->getSize();
+    u.r8 = 0;
     switch (size)
     {
     case 4:
@@ -2044,6 +2051,7 @@ unsigned RealValue::getHash(unsigned initval)
     RealUnion u;
 
     size32_t size = type->getSize();
+    u.r8 = 0;
     switch (size)
     {
     case 4:
@@ -2227,7 +2235,7 @@ const char *DecimalValue::generateCPP(StringBuffer &s, CompilerType compiler)
 
 const char *DecimalValue::getStringValue(StringBuffer &s)
 {
-    char strval[64];
+    char strval[MAX_DECIMAL_CHARS];
     BcdCriticalBlock bcdBlock;
     pushDecimalValue();
     DecPopCString(sizeof(strval), strval);

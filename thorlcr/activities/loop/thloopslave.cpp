@@ -120,10 +120,10 @@ public:
         CSlaveActivity::processDone(mb);
         ((CSlaveGraph *)queryContainer().queryLoopGraph()->queryGraph())->serializeDone(mb);
     }
-    virtual void serializeStats(MemoryBuffer &mb) override
+    virtual void gatherActiveStats(CRuntimeStatisticCollection &activeStats) const
     {
-        stats.setStatistic(StNumIterations, loopCounter);
-        PARENT::serializeStats(mb);
+        PARENT::gatherActiveStats(activeStats);
+        activeStats.setStatistic(StNumIterations, loopCounter);
     }
 };
 
@@ -163,7 +163,7 @@ class CLoopSlaveActivity : public CLoopSlaveActivityBase
             stopped = true;
             stopping = false;
             smartbuf.setown(createSmartInMemoryBuffer(activity, activity, SMALL_SMART_BUFFER_SIZE));
-            threaded.init(this);
+            threaded.init(this, true);
         }
         ~CNextRowFeeder()
         {
@@ -297,7 +297,6 @@ public:
     }
     const void *getNextRow(bool stopping)
     {
-        ActivityTimer t(slaveTimerStats, timeActivities);
         if (!abortSoon && !eof)
         {
             unsigned emptyIterations = 0;
@@ -305,12 +304,32 @@ public:
             {
                 while (!abortSoon)
                 {
-                    OwnedConstThorRow ret = (void *)curInput->nextRow();
-                    if (!ret)
+                    OwnedConstThorRow ret;
                     {
-                        ret.setown(curInput->nextRow()); // more cope with groups somehow....
-                        if (!ret)
-                            break;
+                        if (loopCounter==1)
+                        {
+                            // The disk reads occur in the first iteration only so track lookahead time
+                            // in the first iteration only. In subsequent iterations, it is reading the
+                            // output from previous iterations.
+                            LookAheadTimer t(slaveTimerStats, timeActivities);
+                            ret.setown(curInput->nextRow());
+                            if (!ret)
+                            {
+                                ret.setown(curInput->nextRow()); // more cope with groups somehow....
+                                if (!ret)
+                                    break;
+                            }
+                        }
+                        else
+                        {
+                            ret.setown(curInput->nextRow());
+                            if (!ret)
+                            {
+                                ret.setown(curInput->nextRow()); // more cope with groups somehow....
+                                if (!ret)
+                                    break;
+                            }
+                        }
                     }
 
                     if (finishedLooping || 
@@ -439,6 +458,7 @@ public:
     }
     CATCH_NEXTROW()
     {
+        ActivityTimer t(slaveTimerStats, timeActivities);
         return nextRowFeeder->nextRow();
     }
     virtual void stop() override
@@ -519,9 +539,7 @@ public:
                 if (condLoopCounter)
                     boundGraph->prepareCounterResult(*this, results, condLoopCounter, 0);
                 sendLoopingCount(loopCounter, 0);
-                size32_t parentExtractSz;
-                const byte *parentExtract = queryGraph().queryParentExtract(parentExtractSz);
-                boundGraph->queryGraph()->executeChild(parentExtractSz, parentExtract, results, loopResults);
+                boundGraph->queryGraph()->executeChild(extractBuilder.size(), extractBuilder.getbytes(), results, loopResults);
             }
             int iNumResults = loopResults->count();
             Owned<IThorResult> finalResult = loopResults->getResult(iNumResults-1); //Get the last result, which isnt necessarily 'maxIterations'
@@ -868,7 +886,6 @@ public:
     }
     virtual void start() override
     {
-        ActivityTimer s(slaveTimerStats, timeActivities);
         stopUnselectedInputs();
         if (queryInput(branch))
         {

@@ -35,9 +35,10 @@
 #include "thorcommon.hpp"
 #include "enginecontext.hpp"
 
+#include <set>
+
 #define MAX_EDGEDATA_LENGTH 30000
 #define MAX_HEX_SIZE 500
-#define DEFAULT_PERSIST_COPIES (-1)
 
 class EclGraph;
 typedef unsigned __int64 graphid_t;
@@ -69,9 +70,9 @@ public:
     {
         return ctx->isResult(name, sequence);
     }
-    virtual unsigned getWorkflowId()
+    virtual unsigned getWorkflowIdDeprecated() override
     {
-        return ctx->getWorkflowId();
+        throwUnexpected();
     }
     virtual void doNotify(char const * name, char const * text)
     {
@@ -165,25 +166,25 @@ public:
     {
         return ctx->updateWorkUnit();
     }
-    virtual ILocalOrDistributedFile *resolveLFN(const char *logicalName, const char *errorTxt, bool optional, bool noteRead, bool write, StringBuffer * expandedlfn, bool isPrivilegedUser)
+    virtual ILocalOrDistributedFile *resolveLFN(const char *logicalName, const char *errorTxt, bool optional, bool noteRead, AccessMode accessMode, StringBuffer * expandedlfn, bool isPrivilegedUser, IDistributedFileTransaction * transaction=nullptr)
     {
-        return ctx->resolveLFN(logicalName, errorTxt, optional, noteRead, write, expandedlfn, isPrivilegedUser);
+        return ctx->resolveLFN(logicalName, errorTxt, optional, noteRead, accessMode, expandedlfn, isPrivilegedUser, transaction);
     }
     virtual StringBuffer & getTempfileBase(StringBuffer & buff)
     {
         return ctx->getTempfileBase(buff);
     }
-    virtual const char *noteTemporaryFile(const char *fname)
+    virtual const char *noteTemporaryFile(const char *name) override
     {
-        return ctx->noteTemporaryFile(fname);
+        return ctx->noteTemporaryFile(name);
     }
-    virtual const char *noteTemporaryFilespec(const char *fspec)
+    virtual const char *queryTemporaryFile(const char *name) override
     {
-        return ctx->noteTemporaryFilespec(fspec);
+        return ctx->queryTemporaryFile(name);
     }
-    virtual const char *queryTemporaryFile(const char *fname)
+    virtual void removeTemporaryFile(const char *fname) override
     {
-        return ctx->queryTemporaryFile(fname);
+        ctx->removeTemporaryFile(fname);
     }
     virtual void reloadWorkUnit()
     {
@@ -193,9 +194,9 @@ public:
     {
         return ctx->resolveName(in, out, outlen);
     }
-    virtual void logFileAccess(IDistributedFile * file, char const * component, char const * type, EclGraph & graph)
+    virtual const DFSAuditContext & queryBaseAuditContext() const
     {
-        ctx->logFileAccess(file, component, type, graph);
+        return ctx->queryBaseAuditContext();
     }
     virtual void addWuException(const char * text, unsigned code, unsigned severity, char const * source)
     {
@@ -250,7 +251,15 @@ public:
     virtual double queryAgentMachineCost() const override
     {
         return ctx->queryAgentMachineCost();
-    };
+    }
+    virtual void updateAggregates(IWorkUnit* lockedwu) override
+    {
+        ctx->updateAggregates(lockedwu);
+    }
+    virtual void mergeAggregatorStats(IStatisticCollection & stats, unsigned wfid, const char *graphname, unsigned sgId) override
+    {
+        ctx->mergeAggregatorStats(stats, wfid, graphname, sgId);
+    }
 
 protected:
     IAgentContext * ctx;
@@ -262,17 +271,6 @@ class EclAgent;
 
 class EclAgentWorkflowMachine : public WorkflowMachine
 {
-private:
-    class PersistVersion : public CInterface
-    {
-    public:
-        PersistVersion(char const * _logicalName, unsigned _eclCRC, unsigned __int64 _allCRC, bool _isFile) : logicalName(_logicalName), eclCRC(_eclCRC), allCRC(_allCRC), isFile(_isFile) {}
-        StringAttr logicalName;
-        unsigned eclCRC;
-        unsigned __int64 allCRC;
-        bool isFile;
-    };
-
 public:
     EclAgentWorkflowMachine(EclAgent & _agent);
     void returnPersistVersion(char const * logicalName, unsigned eclCRC, unsigned __int64 allCRC, bool isFile)
@@ -281,21 +279,28 @@ public:
     }
 
 protected:
-    virtual void begin();
+    virtual void begin() override;
+    virtual IRemoteConnection *startPersist(const char * logicalName) override;
+    virtual void finishPersist(const char * persistName, IRemoteConnection *persistLock) override;
+    virtual void deleteLRUPersists(const char * logicalName, unsigned keep) override;
+    virtual void updatePersist(IRemoteConnection *persistLock, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC) override;
+    virtual bool checkFreezePersists(const char *logicalName, unsigned eclCRC) override;
+    virtual bool isPersistUptoDate(Owned<IRemoteConnection> &persistLock, IRuntimeWorkflowItem & item, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC, bool isFile) override;
+    virtual void checkPersistSupported() override;
+    virtual bool isPersistAlreadyLocked(const char * logicalName) override;
+    virtual bool getParallelFlag() const override;
+    virtual unsigned getThreadNumFlag() const override;
 
-    virtual bool getParallelFlag() const;
-    virtual unsigned getThreadNumFlag() const;
-
-    virtual void end();
-    virtual void schedulingStart();
-    virtual bool schedulingPull();
-    virtual bool schedulingPullStop();
-    virtual void reportContingencyFailure(char const * type, IException * e);
-    virtual void checkForAbort(unsigned wfid, IException * handling);
-    virtual void doExecutePersistItem(IRuntimeWorkflowItem & item);
-    virtual void doExecuteCriticalItem(IRuntimeWorkflowItem & item);
-    virtual bool getPersistTime(time_t & when, IRuntimeWorkflowItem & item);
-    virtual void noteTiming(unsigned wfid, timestamp_type startTime, stat_type elapsedNs);
+    virtual void end() override;
+    virtual void schedulingStart() override;
+    virtual bool schedulingPull() override;
+    virtual bool schedulingPullStop() override;
+    virtual void reportContingencyFailure(char const * type, IException * e) override;
+    virtual void checkForAbort(unsigned wfid, IException * handling) override;
+    virtual void doExecutePersistItem(IRuntimeWorkflowItem & item) override;
+    virtual void doExecuteCriticalItem(IRuntimeWorkflowItem & item) override;
+    virtual bool getPersistTime(time_t & when, IRuntimeWorkflowItem & item) override;
+    virtual void noteTiming(unsigned wfid, timestamp_type startTime, stat_type elapsedNs) override;
 
 private:
     void prelockPersists();
@@ -309,7 +314,6 @@ private:
     IRemoteConnection * obtainCriticalLock(const char *name);
     void releaseCriticalLock(IRemoteConnection *r);
     Owned<IWorkflowScheduleConnection> wfconn;
-    Owned<PersistVersion> persist;
     bool persistsPrelocked;
     MapStringToMyClass<IRemoteConnection> persistCache;
 };
@@ -348,7 +352,6 @@ public:
     virtual bool onDebuggerTimeout();
 };
 
-
 class CHThorDebugContext;
 class EclAgent : implements IAgentContext, implements ICodeContext, implements IRowAllocatorMetaActIdCacheCallback, implements IEngineContext, public CInterface
 {
@@ -365,7 +368,7 @@ private:
     bool checkVersion;
     bool resetWorkflow;
     bool noRetry;
-    volatile bool isAborting;
+    std::atomic<bool> isAborting;
     bool useProductionLibraries;
     bool isStandAloneExe;
     bool isRemoteWorkunit;
@@ -375,9 +378,9 @@ private:
     Owned<IUserDescriptor> standAloneUDesc;
     outputFmts outputFmt = ofSTD;
     unsigned __int64 stopAfter;
-    mutable CriticalSection wusect;
-    StringArray tempFiles;
-    CriticalSection tfsect;
+    mutable CriticalSection wusect{SYNC_LOCATION};
+    std::set<std::string> tempFileSet; // Set of actual temp file names on disk
+    CriticalSection tfsect{SYNC_LOCATION};
     IArray persistReadLocks;
     StringArray processedPersists;
 
@@ -387,7 +390,7 @@ private:
     unsigned int clusterWidth;
     Owned<IDistributedFileTransaction> superfiletransaction;
     mutable Owned<IRowAllocatorMetaActIdCache> allocatorMetaCache;
-    CriticalSection activeGraphCritSec;
+    CriticalSection activeGraphCritSec{SYNC_LOCATION};
     PointerArrayOf<EclGraph> activeGraphs;
     Owned<CHThorDebugContext> debugContext;
     Owned<IProbeManager> probeManager;
@@ -398,9 +401,12 @@ private:
     Owned<IOrderedOutputSerializer> outputSerializer;
     int retcode;
     double agentMachineCost = 0;
+    StatisticsAggregator statsAggregator;
+    DFSAuditContext baseAuditContext;
 
 private:
     void doSetResultString(type_t type, const char * stepname, unsigned sequence, int len, const char *val);
+    void buildTempFilename(StringBuffer & tempFilename, const char *filename);
     IEclProcess *loadProcess();
     StringBuffer & getTempfileBase(StringBuffer & buff);
     const char *queryTempfilePath();
@@ -439,7 +445,7 @@ private:
     {
         EclAgent &parent;
     public:
-        Semaphore sem;
+        Semaphore sem{SYNC_LOCATION};
         bool stopping;
         unsigned guillotinetimeout = 0;
         cost_type guillotineCost = 0;
@@ -463,7 +469,7 @@ public:
     EclAgent(IConstWorkUnit *wu, const char *_wuid, bool _checkVersion, bool _resetWorkflow, bool _noRetry, char const * _logname, const char *_allowedPipeProgs, IPropertyTree *_queryXML, ILogMsgHandler * _logMsgHandler);
     ~EclAgent();
 
-    void setBlocked();
+    void setBlocked(const char *reason);
     void setRunning();
     void setDebugPaused();
     void setDebugRunning();
@@ -518,6 +524,7 @@ public:
     virtual IUserDescriptor *queryUserDescriptor();
     virtual void selectCluster(const char * cluster);
     virtual void restoreCluster();
+    virtual unsigned getElapsedMs() const override {UNIMPLEMENTED;} //Implementing for roxie first, not sure what this means from an eclagent perspective.  ECL plugin implies elapsed time of entire query
 
     IRemoteConnection *startPersist(const char * name);
     bool alreadyLockedPersist(const char * persistName);
@@ -541,6 +548,11 @@ public:
     {
         return queryNullSectionTimer();
     }
+
+    virtual ISectionTimer * registerStatsTimer(unsigned activityId, const char * name, unsigned int statsOption)
+    {
+        return queryNullSectionTimer();
+    }
 // IEngineContext
     virtual DALI_UID getGlobalUniqueIds(unsigned num, SocketEndpoint *_foreignNode)
     {
@@ -560,14 +572,17 @@ public:
         return ::getGlobalUniqueIds(num, &foreignNode);
     }
     virtual bool allowDaliAccess() const  { return true; }
+    virtual bool allowSashaAccess() const { return true; }
     virtual StringBuffer &getQueryId(StringBuffer &result, bool isShared) const
     {
         result.append("workunit"); // No distinction between global, workunit and query scopes for eclagent
         return result;
     }
-    virtual const StringArray &queryManifestFiles(const char *type) const override
+    virtual void getManifestFiles(const char *type, StringArray &files) const override
     {
-        return dll->queryManifestFiles(type, wuid);
+        const StringArray &dllFiles = dll->queryManifestFiles(type, wuid);
+        ForEachItemIn(idx, dllFiles)
+            files.append(dllFiles.item(idx));
     }
 
     virtual void onTermination(QueryTermCallback callback, const char *key, bool isShared) const
@@ -591,8 +606,8 @@ public:
     virtual void getEventExtra(size32_t & outLen, char * & outStr, const char * tag);
     //virtual void logException(IEclException *e);
     virtual char *resolveName(const char *in, char *out, unsigned outlen);
-    virtual void logFileAccess(IDistributedFile * file, char const * component, char const * type, EclGraph & graph);
-    virtual ILocalOrDistributedFile  *resolveLFN(const char *logicalName, const char *errorTxt, bool optional, bool noteRead, bool write, StringBuffer * expandedlfn, bool isPrivilegedUser);
+    virtual const DFSAuditContext & queryBaseAuditContext() const;
+    virtual ILocalOrDistributedFile  *resolveLFN(const char *logicalName, const char *errorTxt, bool optional, bool noteRead, AccessMode accessMode, StringBuffer * expandedlfn, bool isPrivilegedUser, IDistributedFileTransaction * transaction=nullptr);
 
     virtual void executeGraph(const char * graphName, bool realThor, size32_t parentExtractSize, const void * parentExtract);
     virtual IHThorGraphResults * executeLibraryGraph(const char * libraryName, unsigned expectedInterfaceHash, unsigned activityId, const char * embeddedGraphName, const byte * parentExtract);
@@ -603,9 +618,9 @@ public:
 
     virtual unsigned __int64 getDatasetHash(const char * name, unsigned __int64 hash);
     virtual void reportProgress(const char *msg, unsigned flags=0);
-    virtual const char *noteTemporaryFile(const char *fname);
-    virtual const char *noteTemporaryFilespec(const char *fspec);
-    virtual const char *queryTemporaryFile(const char *fname);
+    virtual const char *noteTemporaryFile(const char *name) override;
+    virtual const char *queryTemporaryFile(const char *name) override;
+    virtual void removeTemporaryFile(const char *fname) override;
     virtual void deleteFile(const char * logicalName);
 
     void addException(ErrorSeverity severity, const char * source, unsigned code, const char * text, const char * filename, unsigned lineno, unsigned column, bool failOnError, bool isAbort);
@@ -625,7 +640,7 @@ public:
     virtual const char *loadResource(unsigned id);
     virtual ICodeContext *queryCodeContext();
     virtual bool isResult(const char * name, unsigned sequence);
-    virtual unsigned getWorkflowId();
+    virtual unsigned getWorkflowIdDeprecated() override; // IGlobalCodeContext virtual - unused. deprecated. Left here to avoid changing interface.
     virtual IConstWorkUnit *queryWorkUnit() const override;  // no link
     virtual IWorkUnit *updateWorkUnit() const; // links
     virtual void reloadWorkUnit();
@@ -639,6 +654,7 @@ public:
     virtual unsigned __int64 getFileOffset(const char *logicalPart) { UNIMPLEMENTED; return 0; }
     virtual char *getOutputDir() { UNIMPLEMENTED; }
     virtual char *getWuid();
+    virtual unsigned getWorkflowId() const override { throwUnexpected(); } // ICodeContext virtual
     virtual const char *queryWuid();
     virtual IDistributedFileTransaction *querySuperFileTransaction();
     virtual unsigned getPriority() const { return 0; }
@@ -708,7 +724,14 @@ public:
     {
         return agentMachineCost;
     }
-
+    virtual void updateAggregates(IWorkUnit* lockedwu) override
+    {
+        statsAggregator.updateAggregates(lockedwu);
+    }
+    virtual void mergeAggregatorStats(IStatisticCollection & stats, unsigned wfid, const char *graphname, unsigned sgId) override
+    {
+        statsAggregator.recordStats(&stats, wfid, graphname, sgId);
+    }
 };
 
 //---------------------------------------------------------------------------
@@ -779,6 +802,7 @@ public:
 
     void ready();
     void execute() { if (!alreadyUpdated) activity->execute(); }
+    void onStart(const byte * parentExtract, CHThorDebugContext * debugContext);
     void stop() { if (!alreadyUpdated) activity->stop(); }
 
     IHThorException * makeWrappedException(IException * e);
@@ -813,6 +837,7 @@ public:
     CICopyArrayOf<EclGraphElement> dependentOnActivity;
     IntArray dependentControlId;
     IProbeManager * probeManager;
+    const byte * savedParentExtract = nullptr;
 
     Owned<EclBoundLoopGraph> loopGraph;
 };
@@ -901,7 +926,7 @@ protected:
 
 protected:
     IArrayOf<IHThorGraphResult> results;
-    CriticalSection cs;
+    CriticalSection cs{SYNC_LOCATION};
 };
 
 
@@ -926,108 +951,36 @@ class EclSubGraph : public CInterface, implements ILocalEclGraphResults, public 
     friend class EclGraphElement;
 private:
 
-    class LegacyInputProbe : public CInterface, implements IHThorInput, implements IEngineRowStream
-    {
-        IHThorInput  *in;
-        EclSubGraph  *owner;
-        size32_t    maxRowSize;
-        unsigned sourceId;
-        unsigned outputIndex;
-
-        StringAttr edgeId;
-
-    public:
-        IMPLEMENT_IINTERFACE;
-
-        LegacyInputProbe(IHThorInput *_in, EclSubGraph *_owner, unsigned _sourceId, int outputidx)
-            : in(_in), owner(_owner), sourceId(_sourceId), outputIndex(outputidx)
-        {
-            StringAttrBuilder edgeIdText(edgeId);
-            edgeIdText.append(_sourceId).append("_").append(outputidx);
-            maxRowSize = 0;
-        }
-
-        IOutputMetaData * queryOutputMeta() const { return in->queryOutputMeta(); }
-
-        void ready()
-        {
-            in->ready();
-        }
-
-        void stop()
-        {
-            in->stop();
-        }
-
-        virtual void resetEOF()
-        {
-            in->resetEOF();
-        }
-
-        IEngineRowStream &queryStream()
-        {
-            return *this;
-        }
-
-        bool isGrouped() { return in->isGrouped(); }
-
-        bool nextGroup(ConstPointerArray & group)
-        {
-            const void * next;
-            while ((next = nextRow()) != NULL)
-                group.append(next);
-            if (group.ordinality())
-                return true;
-            return false;
-        }
-
-        const void *nextRow()
-        {
-            const void *ret = in->nextRow();
-            if (ret)
-            {
-                size32_t size = in->queryOutputMeta()->getRecordSize(ret);
-                if (size > maxRowSize)
-                    maxRowSize = size;
-            }
-            return ret;
-        }
-
-        virtual void updateProgress(IStatisticGatherer &progress) const
-        {
-            {
-                StatsEdgeScope scope(progress, sourceId, outputIndex);
-                progress.addStatistic(StSizeMaxRowSize, maxRowSize);
-            }
-            if (in)
-                in->updateProgress(progress);
-        }
-    };
-
     RedirectedAgentContext subgraphAgentContext;
-    class SubGraphCodeContext : public IndirectCodeContext
+    class SubGraphCodeContext : public IndirectCodeContextEx
     {
     public:
-        virtual IEclGraphResults * resolveLocalQuery(__int64 activityId)
-        {
-            if (activityId == container->queryId())
-                return container;
-            return ctx->resolveLocalQuery(activityId);
-        }
         void setContainer(EclSubGraph * _container)
         {
             container = _container;
         }
-
+        void setWfid(unsigned _wfid)
+        {
+            wfid = _wfid;
+        }
+    // ICodeContext
+        virtual IEclGraphResults * resolveLocalQuery(__int64 activityId) override
+        {
+            if ((unsigned __int64)activityId == container->queryId())
+                return container;
+            return ctx->resolveLocalQuery(activityId);
+        }
+        virtual unsigned getWorkflowId() const override
+        {
+            return wfid;
+        }
     protected:
-        EclSubGraph * container;
+        EclSubGraph * container = nullptr;
+        unsigned wfid = 0;
     } subgraphCodeContext;
 
-    friend class LegacyInputProbe;
-    bool probeEnabled;
-
 public:
-    EclSubGraph(IAgentContext & _agent, EclGraph &parent, EclSubGraph * _owner, unsigned subGraphSeqNo, bool enableProbe, CHThorDebugContext * _debugContext, IProbeManager * _probeManager);
+    EclSubGraph(IAgentContext & _agent, EclGraph &parent, EclSubGraph * _owner, unsigned subGraphSeqNo, CHThorDebugContext * _debugContext, IProbeManager * _probeManager);
     IMPLEMENT_IINTERFACE
 
     void createFromXGMML(EclGraph * graph, ILoadedDllEntry * dll, IPropertyTree * xgmml, unsigned & subGraphSeqNo, EclSubGraph * resultsGraph);
@@ -1041,22 +994,6 @@ public:
     void updateProgress();
     void doExecuteChild(const byte * parentExtract);
     IEclLoopGraph * resolveLoopGraph(unsigned id);
-
-    IHThorInput *createLegacyProbe(IHThorInput      *in,
-                             unsigned           sourceId,
-                             unsigned           targetId,
-                             int                outputidx,
-                             IConstWorkUnit     *workunit)
-    {
-        if (probeEnabled)
-        {
-            LegacyInputProbe *probe = new LegacyInputProbe(in, this, sourceId, outputidx);
-            probes.append(*probe);
-            return probe;
-        }
-        else
-            return in;
-    }
 
 //interface IEclGraphResults
     virtual IHThorGraphResult * queryResult(unsigned id);
@@ -1105,7 +1042,7 @@ public:
     IAgentContext * agent;
     CHThorDebugContext * debugContext;
     IProbeManager * probeManager;
-    CriticalSection evaluateCrit;
+    CriticalSection evaluateCrit{SYNC_LOCATION};
     bool isChildGraph;
     bool isLoopBody;
 };
@@ -1116,26 +1053,41 @@ typedef MapBetween<graphid_t, graphid_t, EclSubGraphPtr, EclSubGraphPtr> SubGrap
 
 class EclGraph : public CInterface
 {
+    AtomicShared<IFileReadPropertiesUpdater> fileReadPropsUpdater;
+    CriticalSection fileReadPropsUpdaterCrit{SYNC_LOCATION};
+    AtomicShared<IDistributedFileTransaction> readFilesTransaction;
+    CriticalSection readFilesTransactionCrit{SYNC_LOCATION};
+
+    void publishFileReadProperties(bool ignoreExceptions);
+
     RedirectedAgentContext graphAgentContext;
-    class SubGraphCodeContext : public IndirectCodeContext
+    class SubGraphCodeContext : public IndirectCodeContextEx
     {
     public:
-        IThorChildGraph * resolveChildQuery(__int64 subgraphId, IHThorArg * colocal)
-        {
-            return container->resolveChildQuery((unsigned)subgraphId);
-        }
-
-        IEclGraphResults * resolveLocalQuery(__int64 activityId)
-        {
-            return container->resolveLocalQuery((unsigned)activityId);
-        }
         void setContainer(EclGraph * _container)
         {
             container = _container;
         }
-
+        void setWfid(unsigned _wfid)
+        {
+            wfid = _wfid;
+        }
+    // ICodeContext
+        virtual IThorChildGraph * resolveChildQuery(__int64 subgraphId, IHThorArg * colocal) override
+        {
+            return container->resolveChildQuery((unsigned)subgraphId);
+        }
+        virtual IEclGraphResults * resolveLocalQuery(__int64 activityId) override
+        {
+            return container->resolveLocalQuery((unsigned)activityId);
+        }
+        virtual unsigned getWorkflowId() const override
+        {
+            return wfid;
+        }
     protected:
-        EclGraph * container;
+        EclGraph * container = nullptr;
+        unsigned wfid = 0;
     } graphCodeContext;
 
 public:
@@ -1144,6 +1096,7 @@ public:
     {
         isLibrary = _isLibrary;
         graphCodeContext.set(_agent.queryCodeContext());
+        graphCodeContext.setWfid(wfid);
         graphCodeContext.setContainer(this);
         graphAgentContext.setCodeContext(&graphCodeContext);
         graphAgentContext.set(&_agent);
@@ -1151,12 +1104,12 @@ public:
         aborted = false;
     }
 
-    void createFromXGMML(ILoadedDllEntry * dll, IPropertyTree * xgmml, bool enableProbe);
+    void createFromXGMML(ILoadedDllEntry * dll, IPropertyTree * xgmml);
     void execute(const byte * parentExtract);
     void executeLibrary(const byte * parentExtract, IHThorGraphResults * results);
     IWUGraphStats *updateStats(StatisticCreatorType creatorType, const char * creator, unsigned wfid, unsigned subgraph);
     void updateWUStatistic(IWorkUnit* lockedwu, StatisticScopeType scopeType, const char* scope, StatisticKind kind, const char* descr, long long unsigned int value);
-
+    void updateAggregates(IWorkUnit* lockedwu);
     EclSubGraph * idToGraph(unsigned id);
     EclGraphElement * idToActivity(unsigned id);
     const char *queryGraphName() { return graphName; }
@@ -1171,7 +1124,8 @@ public:
 
     inline bool queryLibrary() const { return isLibrary; }
     inline unsigned queryWfid() const { return wfid; }
-
+    IFileReadPropertiesUpdater * queryFileReadPropsUpdater();
+    IDistributedFileTransaction * queryReadFilesTransaction();
 protected:
     IAgentContext * agent;
     CIArrayOf<EclSubGraph> graphs;

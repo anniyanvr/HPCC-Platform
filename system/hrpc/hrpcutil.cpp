@@ -113,12 +113,12 @@ IHRPCtransport * TryMakeServerTransport(unsigned port, const char * errorMessage
 
 #define MAXCONNECTIONS 16
 
-static CriticalSection mcsect;
+static CriticalSection mcsect{SYNC_LOCATION};
 
 
 bool FastMultipleConnect(unsigned n,HRPCmodule **modules,bool *done,int timeout)
 {
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     IPointerArrayOf<ISocket> sockets;
     SocketEndpointArray eps;
     unsigned i;
@@ -140,7 +140,7 @@ bool FastMultipleConnect(unsigned n,HRPCmodule **modules,bool *done,int timeout)
         }
         else {
             StringBuffer epstr;
-            eps.item(i).getUrlStr(epstr);
+            eps.item(i).getEndpointHostText(epstr);
             //ERRLOG("Failed to connect to %s",epstr.str());
             ret = false;
         }
@@ -168,7 +168,7 @@ void MultipleConnect(unsigned n,HRPCmodule **modules,int timeout,bool fast)
         bool *done;
         int timeout;
     public:
-        casyncfor(HRPCmodule **_modules,bool *_done,int _timeout)
+        casyncfor(HRPCmodule **_modules,bool *_done,int _timeout) : CAsyncFor(SYNC_LOCATION)
         { 
             modules = _modules;
             done = _done;

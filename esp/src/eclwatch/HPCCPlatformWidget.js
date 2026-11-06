@@ -8,7 +8,6 @@ define([
     "dojo/dom-class",
     "dojo/dom-form",
     "dojo/dom-style",
-    "dojo/dom-geometry",
     "dojo/cookie",
     "dojo/query",
     "dojo/topic",
@@ -20,8 +19,11 @@ define([
     "dojox/widget/UpgradeBar",
     "dojox/widget/ColorPicker",
 
-    "src/CodeMirror",
+    "@hpcc-js/codemirror",
     "src/react/index",
+    "src-react/components/About",
+    "src-react/components/controls/ComingSoon",
+    "src-react/hooks/platform",
 
     "hpcc/_TabContainerWidget",
     "src/ESPRequest",
@@ -34,8 +36,20 @@ define([
     "src/ws_machine",
     "hpcc/LockDialogWidget",
     "src/UserPreferences/EnvironmentTheme",
+    "src/Utility",
 
     "dojo/text!../templates/HPCCPlatformWidget.html",
+
+    /* DEBUG_ONLY
+    "src-dojo/nls/bs/hpcc",
+    "src-dojo/nls/es/hpcc",
+    "src-dojo/nls/fr/hpcc",
+    "src-dojo/nls/hr/hpcc",
+    "src-dojo/nls/hu/hpcc",
+    "src-dojo/nls/pt-br/hpcc",
+    "src-dojo/nls/sr/hpcc",
+    "src-dojo/nls/zh/hpcc",
+    /* */
 
     "hpcc/DelayLoadWidget",
     "dijit/layout/BorderContainer",
@@ -43,13 +57,17 @@ define([
     "dijit/layout/StackContainer",
     "dijit/layout/StackController",
     "dijit/layout/ContentPane",
+    "dijit/DropDownMenu",
     "dijit/form/Form",
+    "dijit/form/Button",
     "dijit/form/DropDownButton",
     "dijit/form/TextBox",
     "dijit/form/Textarea",
     "dijit/form/CheckBox",
     "dijit/Dialog",
     "dijit/ConfirmDialog",
+    "dijit/Menu",
+    "dijit/MenuItem",
     "dijit/MenuSeparator",
     "dijit/PopupMenuItem",
 
@@ -57,12 +75,25 @@ define([
     "hpcc/TableContainer",
     "hpcc/InfoGridWidget"
 
-], function (declare, lang, nlsHPCCMod, arrayUtil, dom, domConstruct, domClass, domForm, domStyle, domGeo, cookie, query, topic, xhr,
+], function (declare, lang, nlsHPCCMod, arrayUtil, dom, domConstruct, domClass, domForm, domStyle, cookie, query, topic, xhr,
     registry, Tooltip,
     UpgradeBar, ColorPicker,
-    CodeMirror, srcReact,
-    _TabContainerWidget, ESPRequest, ESPActivity, ESPUtil, WsAccount, WsAccess, WsSMC, WsTopology, WsMachine, LockDialogWidget, EnvironmentTheme,
-    template) {
+    CodeMirror, srcReact, AboutModule, ComingSoonModule, platformModule,
+    _TabContainerWidget, ESPRequest, ESPActivity, ESPUtil, WsAccount, WsAccess, WsSMC, WsTopology, WsMachine, LockDialogWidget, EnvironmentTheme, Utility,
+    template,
+
+    /* DEBUG_ONLY
+    bs_hpcc,
+    es_hpcc,
+    fr_hpcc,
+    hr_hpcc,
+    hu_hpcc,
+    pt_br_hpcc,
+    sr_hpcc,
+    zh_hpcc,
+    /* */
+
+) {
 
     declare("HPCCColorPicker", [ColorPicker], {
         _underlay: "/esp/files/eclwatch/img/underlay.png",
@@ -71,6 +102,15 @@ define([
         _huePickerPointer: "/esp/files/eclwatch/img/hueHandle.png",
         _huePickerPointerAlly: "/esp/files/eclwatch/img/hueHandleA11y.png"
     });
+
+    function encodeHTML(str) {
+        if (typeof str === "string") {
+            return Utility.encodeHTML(str);
+        }
+        return str;
+    }
+
+    const configErrors = [/Page Not Found/i, /Error/i];
 
     var nlsHPCC = nlsHPCCMod.default;
     return declare("HPCCPlatformWidget", [_TabContainerWidget], {
@@ -112,17 +152,54 @@ define([
             });
         },
 
+        comingSoonRoot: undefined,
         startup: function (args) {
             this.inherited(arguments);
             domStyle.set(dom.byId(this.id + "StackController_stub_Plugins").parentNode.parentNode, {
-                visibility: "hidden"
+                display: "none"
             });
             domStyle.set(dom.byId(this.id + "StackController_stub_ErrWarn").parentNode.parentNode, {
-                visibility: "hidden"
+                display: "none"
             });
             domStyle.set(dom.byId(this.id + "StackController_stub_Config").parentNode.parentNode, {
-                visibility: "hidden"
+                display: "none"
             });
+            /* DEBUG_ONLY
+            registry.byId(this.id + "Debug").set("hidden", false);
+            /* */
+            var teaserNode = dom.byId(this.id + "teaser");
+            this.comingSoonRoot = srcReact.ReactRoot.create(teaserNode);
+            this.comingSoonRoot.render(ComingSoonModule.ComingSoon, {});
+
+            const DAY = 1000 * 60 * 60 * 24;
+            platformModule.fetchCheckFeatures().then(function (features) {
+                if (!features || !features.BuildTagTimestamp) return;
+                const age = features.BuildTagTimestamp ? Math.floor((Date.now() - new Date(features.BuildTagTimestamp).getTime()) / DAY) : 0;
+                let message = nlsHPCC.PlatformBuildIsNNNDaysOld.replace("NNN", `${age}`);
+                let severity = "Info";
+                if (age > 90) {
+                    severity = "Alert";
+                    message += `  ${nlsHPCC.PleaseUpgradeToLaterPointRelease}`;
+                } else if (age > 60) {
+                    severity = "Error";
+                    message += `  ${nlsHPCC.PleaseUpgradeToLaterPointRelease}`;
+                } else if (age > 30) {
+                    severity = "Warning";
+                    message += `  ${nlsHPCC.PleaseUpgradeToLaterPointRelease}`;
+                } else {
+                    severity = "Info";
+                }
+                dojo.publish("hpcc/brToaster", {
+                    Severity: severity,
+                    Source: "eclwatch/HPCCPlatformWidget.js",
+                    Exceptions: [{ Source: "", Message: message }]
+                });
+            });
+        },
+
+        destroy: function (args) {
+            this.comingSoonRoot?.dispose();
+            this.inherited(arguments);
         },
 
         //  Implementation  ---
@@ -139,12 +216,12 @@ define([
                 this.bannerColor = activity.BannerColor;
                 this.bannerSize = activity.BannerSize;
                 if (this.showBanner) {
-                    var msg = "<marquee id='" + this.id + "Marquee' width='100%' direction='left' scrollamount='" + activity.BannerScroll + "' style='color:" + activity.BannerColor + ";font-size:" + ((activity.BannerSize / 2) * 100) + "%'>" + activity.BannerContent + "</marquee>";
-                    this.upgradeBar.notify(msg);
                     var marquee = dom.byId(this.id + "Marquee");
-                    var height = domGeo.getContentBox(marquee).h;
+                    var height = activity.BannerSize * 2;
+                    var msg = "<marquee id='" + this.id + "Marquee' width='100%' direction='left' scrollamount='" + encodeHTML(activity.BannerScroll) + "' style='color:" + encodeHTML(activity.BannerColor) + ";font-size:" + activity.BannerSize + "px;line-height:" + height + "px'>" + encodeHTML(activity.BannerContent) + "</marquee>";
+                    this.upgradeBar.notify(msg);
                     domStyle.set(this.upgradeBar.domNode, "height", height + "px");
-                    domStyle.set(marquee.parentNode, { top: "auto", "margin-top": "auto" });
+                    domStyle.set(marquee.parentNode, { top: "auto", "margin-top": "auto", height: height + "px" });
                 } else {
                     this.upgradeBar.notify("");
                     domStyle.set(this.upgradeBar.domNode, "height", "0px");
@@ -185,23 +262,22 @@ define([
                 if (lang.exists("MyAccountResponse.username", response)) {
                     context.userName = response.MyAccountResponse.username;
                     dojoConfig.username = response.MyAccountResponse.username;
-                    cookie("User", response.MyAccountResponse.username);
                     context.checkIfAdmin(context.userName);
                     context.refreshUserName();
                     if (!cookie("PasswordExpiredCheck")) {
-                        cookie("PasswordExpiredCheck", "true", { expires: 1 });
+                        cookie("PasswordExpiredCheck", "true", { expires: 1, path: "/" });
                         if (lang.exists("MyAccountResponse.passwordDaysRemaining", response)) {
                             switch (response.MyAccountResponse.passwordDaysRemaining) {
                                 case null:
                                     break;
-                                case -1:
+                                case -1: // password has expired
                                     alert(context.i18n.PasswordExpired);
                                     context._onUserID();
                                     break;
-                                case -2:
+                                case -2: // password never expires
                                     break;
                                 default:
-                                    if (response.MyAccountResponse.passwordDaysRemaining <= response.MyAccountResponse.passwordExpirationWarningDays) {
+                                    if (response.MyAccountResponse.passwordDaysRemaining && response.MyAccountResponse.passwordDaysRemaining <= response.MyAccountResponse.passwordExpirationWarningDays) {
                                         if (confirm(context.i18n.PasswordExpirePrefix + response.MyAccountResponse.passwordDaysRemaining + context.i18n.PasswordExpirePostfix)) {
                                             context._onUserID();
                                         }
@@ -218,7 +294,7 @@ define([
             }).then(function (response) {
                 if (lang.exists("TpGetServicePluginsResponse.Plugins.Plugin", response) && response.TpGetServicePluginsResponse.Plugins.Plugin.length) {
                     domStyle.set(dom.byId(context.id + "StackController_stub_Plugins").parentNode.parentNode, {
-                        visibility: "visible"
+                        display: "inline"
                     });
                 }
             });
@@ -251,15 +327,7 @@ define([
             });
             this.storage.setItem("Status", "Unlocked");
 
-            EnvironmentTheme.checkCurrentState(this.id, this);
-
-            this.environmentTextCB.on("change", function (state) {
-                if (state) {
-                    context.environmentText.set("disabled", false);
-                } else {
-                    context.environmentText.set("value", "");
-                }
-            });
+            this._onUpdateToolbarDom();
         },
 
         _onUpdateFromStorage: function (msg) {
@@ -306,6 +374,20 @@ define([
                         username: user
                     }
                 }).then(function (response) {
+                    if (response?.Exceptions) {
+                        const err = response.Exceptions.Exception[0];
+                        const errMessage = `${context.i18n.UnableToRetrieveGroups},\n\t${context.i18n.CausedBy}: "${err.Message}"`;
+                        dojo.publish("hpcc/brToaster", {
+                            Severity: "Info",
+                            Source: "ws_access.UserEdit",
+                            Exceptions: [{
+                                Source: context.i18n.Error,
+                                Message: errMessage,
+                                duration: -1
+                            }]
+                        });
+                        return false;
+                    }
                     if (lang.exists("UserEditResponse.isLDAPAdmin", response)) {
                         if (response.UserEditResponse.isLDAPAdmin === true) {
                             dojoConfig.isAdmin = true;
@@ -344,10 +426,6 @@ define([
             }
         },
 
-        setEnvironmentTheme: function () {
-            EnvironmentTheme.setEnvironmentTheme(this.id, this);
-        },
-
         //  Hitched actions  ---
         _onUserID: function (evt) {
             var userDialog = registry.byId(this.id + "UserDialog");
@@ -373,7 +451,7 @@ define([
         },
 
         _openNewTab: function (url) {
-            var win = window.open(url, "_blank");
+            var win = window.open(url, "_blank", "noopener");
             if (win && win.focus) {
                 win.focus();
             }
@@ -388,7 +466,7 @@ define([
         },
 
         _onOpenJira: function (evt) {
-            this._openNewTab("https://track.hpccsystems.com/issues");
+            this._openNewTab("https://github.com/hpcc-systems/HPCC-Platform/issues");
         },
 
         _onOpenForums: function (evt) {
@@ -417,18 +495,30 @@ define([
                     },
                     handleAs: "text"
                 }).then(function (response) {
+                    if (configErrors.some(reg => reg.test(response))) {
+                        dojo.publish("hpcc/brToaster", {
+                            Severity: "Info",
+                            Source: "eclwatch/HPCCPlatformWidget.js",
+                            Exceptions: [{ Source: "", Message: context.i18n.ErrorLoadingConfigurationFile }]
+                        });
+                        response = context.i18n.ErrorLoadingConfigurationFile;
+                    }
+
                     context.configText = context.formatXml(response);
-                    context.configSourceCM = CodeMirror.fromTextArea(dom.byId(context.id + "ConfigTextArea"), {
-                        tabMode: "indent",
-                        matchBrackets: true,
-                        lineNumbers: true,
-                        mode: "xml",
-                        readOnly: true,
-                        foldGutter: true,
-                        gutters: ["CodeMirror-linenumbers", "CodeMirror-foldgutter"]
+                    context.configSourceCM = new CodeMirror.XMLEditor();
+
+                    var t = window.setTimeout(() => {
+                        context.configSourceCM.target(dom.byId(context.id + "_Config")).render();
+                        dom.byId(context.id + "ConfigTextArea").style.display = "none";
+                        window.clearTimeout(t);
+                    }, 50);
+                    context.configSourceCM.text(context.configText);
+                }).catch(function (err) {
+                    dojo.publish("hpcc/brToaster", {
+                        Severity: "Warning",
+                        Source: "eclwatch/HPCCPlatformWidget.js",
+                        Exceptions: [{ Source: "", Message: err }]
                     });
-                    context.configSourceCM.setSize("100%", "100%");
-                    context.configSourceCM.setValue(context.configText);
                 });
             }
             this.stackContainer.selectChild(this.widget._Config);
@@ -439,61 +529,67 @@ define([
         },
 
         _ondebugLanguageFiles: function () {
+            /* DEBUG_ONLY
             var context = this;
-            require(["src/nls/hpcc"], function (lang) {
+            require(["src-dojo/nls/hpcc"], function (lang) {
                 var languageID = [];
                 var languageRequire = [];
                 for (var key in lang) {
                     if (key !== "root") {
                         languageID.push(key);
-                        languageRequire.push("src/nls/" + key + "/hpcc");
+                        languageRequire.push("src-dojo/nls/" + key + "/hpcc");
                     }
                 }
-                require(languageRequire, function () {
-                    var errWarnGrid = registry.byId(context.id + "ErrWarnGrid");
-                    arrayUtil.forEach(arguments, function (otherLang, idx) {
-                        var langID = languageID[idx];
-                        for (var key in lang.root) {
-                            if (!otherLang[key]) {
-                                errWarnGrid.loadTopic({
-                                    Severity: "Error",
-                                    Source: context.i18n.Missing,
-                                    Exceptions: [{
-                                        Code: langID,
-                                        FileName: languageRequire[idx] + ".js - " + key,
-                                        Message: "'" + lang.root[key] + "'",
-                                        Javascript: key + ": \"\","
-                                    }]
-                                }, true);
-                            } else if (otherLang[key] === lang.root[key]) {
-                                errWarnGrid.loadTopic({
-                                    Severity: /[a-z]/.test(otherLang[key]) ? "Warning" : "Info",
-                                    Source: context.i18n.EnglishQ,
-                                    Exceptions: [{
-                                        Code: langID,
-                                        FileName: languageRequire[idx] + ".js - " + key,
-                                        Message: otherLang[key],
-                                        Javascript: key + ": \"\","
-                                    }]
-                                }, true);
-                            }
+                var errWarnGrid = registry.byId(context.id + "ErrWarnGrid");
+                arrayUtil.forEach([bs_hpcc, es_hpcc, fr_hpcc, hr_hpcc, hu_hpcc, pt_br_hpcc, sr_hpcc, zh_hpcc], function (otherLang, idx) {
+                    var langID = languageID[idx];
+                    for (var key in lang.root) {
+                        if (!otherLang[key]) {
+                            errWarnGrid.loadTopic({
+                                Severity: "Error",
+                                Source: context.i18n.Missing,
+                                Exceptions: [{
+                                    Code: langID,
+                                    FileName: languageRequire[idx] + ".js - " + key,
+                                    Message: "'" + lang.root[key] + "'",
+                                    Javascript: key + ": \"\","
+                                }]
+                            }, true);
+                        } else if (otherLang[key] === lang.root[key]) {
+                            errWarnGrid.loadTopic({
+                                Severity: /[a-z]/.test(otherLang[key]) ? "Warning" : "Info",
+                                Source: context.i18n.EnglishQ,
+                                Exceptions: [{
+                                    Code: langID,
+                                    FileName: languageRequire[idx] + ".js - " + key,
+                                    Message: otherLang[key],
+                                    Javascript: key + ": \"\","
+                                }]
+                            }, true);
                         }
-                    });
-                    errWarnGrid.refreshTopics();
+                    }
                 });
+                errWarnGrid.refreshTopics();
             });
             this.stackContainer.selectChild(this.errWarnPage);
+            /* */
+        },
+
+        _onECLWatchV9: function (evt) {
+            this.comingSoonRoot.render(ComingSoonModule.ComingSoon, { value: true });
         },
 
         _onAboutLoaded: false,
         _onAbout: function (evt) {
-            var aboutNode = dom.byId(this.id + "AboutDialog");
-            srcReact.render(srcReact.AboutDialog, {
-                version: this.build.orig,
-                handleClose: function () {
-                    srcReact.unrender(aboutNode);
+            var placeholderNode = dom.byId(this.id + "DialogPlaceholder");
+            const root = srcReact.ReactRoot.create(placeholderNode);
+            root.lightThemedRender(AboutModule.About, {
+                eclwatchVersion: "5",
+                show: true,
+                onClose: function () {
+                    root.dispose();
                 }
-            }, aboutNode);
+            });
         },
 
         _onShowLock: function (evt) {
@@ -516,16 +612,17 @@ define([
             this.logoutConfirm.show();
             query(".dijitDialogUnderlay").style("opacity", "0.5");
             this.logoutConfirm.on("execute", function () {
-                xhr("esp/logout", {
+                xhr("/esp/logout", {
                     method: "post"
                 }).then(function (data) {
                     if (data) {
-                        cookie("ECLWatchUser", "", { expires: -1 });
-                        cookie("ESPSessionID" + location.port + " = '' ", "", { expires: -1 });
+                        Utility.deleteCookie("ECLWatchUser");
+                        Utility.deleteCookie("ESPSessionID");
+                        Utility.deleteCookie("Status");
+                        Utility.deleteCookie("User");
+                        Utility.deleteCookie("ESPSessionState");
                         window.location.reload();
                         context.storage.setItem("Status", "logged_out");
-                        cookie("Status", "", { expires: -1 });
-                        cookie("User", "", { expires: -1 });
                     }
                 });
             });
@@ -563,16 +660,44 @@ define([
         },
 
         _onSetToolbarOk: function (evt) {
-            this.setEnvironmentTheme();
+            EnvironmentTheme.setEnvironmentTheme({
+                active: this.environmentTextCB.get("checked"),
+                text: this.environmentText.value,
+                color: this.toolbarColor.value
+            });
+            this._onUpdateToolbarDom();
         },
 
         _onSetToolbarCancel: function (evt) {
             this.setToolbarDialog.hide();
         },
 
+        _onUpdateToolbarDom: function (evt) {
+            EnvironmentTheme.getEnvironmentTheme().then(theme => {
+                if (theme === undefined) return;
+                this.environmentTextCB.set("checked", theme.active);
+                this.environmentText.set("value", theme.text);
+                this.toolbarColor.set("value", theme.color);
+
+                domConstruct.destroy(this.id + "BannerInnerText");
+
+                if (theme.active && theme.text !== "") {
+                    var searchUserMoreComponents = dom.byId(this.id + "searchUserMoreComponents");
+                    var parent = domConstruct.create("div", { id: this.id + "BannerInnerText", class: "environmentText" }, searchUserMoreComponents, "before");
+                    domConstruct.create("span", { id: this.id + "BannerContent", style: { color: Utility.textColor(theme.color) }, innerHTML: theme.text }, parent);
+                    document.title = theme.text;
+                } else {
+                    document.title = dojoConfig.pageTitle;
+                }
+
+                domStyle.set(this.id + "Titlebar", { backgroundColor: theme.color ? theme.color : EnvironmentTheme.defaults.color });
+            });
+        },
+
         _onSetToolbarReset: function (evt) {
             if (confirm(this.i18n.AreYouSureYouWantToResetTheme)) {
-                EnvironmentTheme._onResetDefaultTheme(this.id, this);
+                EnvironmentTheme._onResetDefaultTheme();
+                this._onUpdateToolbarDom();
                 this._onSetToolbarCancel();
             }
         },

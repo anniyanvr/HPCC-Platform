@@ -20,6 +20,7 @@
 <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
  xmlns:fo="http://www.w3.org/1999/XSL/Format" xml:space="default">
     <xsl:output method="xml" version="1.0" encoding="UTF-8" indent="yes" omit-xml-declaration="yes"/>
+  <xsl:include href="vaults-common.xsl"/>
     <xsl:param name="process" select="'thor'"/>
     <xsl:param name="isLinuxInstance" select="0"/>
     <xsl:param name="tempPath" select="'c:\temp\'"/>
@@ -189,8 +190,33 @@
       </xsl:attribute>
 
       <xsl:apply-templates select="@*[string(.) != '']"/>
-      
+
+      <xsl:call-template name="copyVaultsConfig"/>
+      <xsl:copy-of select="./pageCache"/>
       <xsl:copy-of select="/Environment/Software/Directories"/> 
+      <xsl:copy-of select="./protrace"/>
+      <xsl:choose>
+          <xsl:when test="tracing">
+              <xsl:copy-of select="./tracing"/>
+          </xsl:when>
+          <xsl:otherwise>
+              <xsl:copy-of select="/Environment/Software/tracing"/>
+          </xsl:otherwise>
+      </xsl:choose>
+      <!--
+      # Generated for configuration info. accessed by getGlobalConfig()
+      -->
+      <global>
+        <storage>
+          <xsl:copy-of select="/Environment/Software/RemoteStorage/*"/>
+          <xsl:copy-of select="/Environment/Software/Globals/storage/*"/>
+          <xsl:copy-of select="/Environment/Software/Storage/*"/>
+        </storage>
+        <expert>
+          <xsl:copy-of select="/Environment/Software/Globals/@* | /Environment/Software/Globals/*"/>
+        </expert>
+        <xsl:copy-of select="/Environment/Hardware/cost"/>
+      </global>
       @XSL_PLUGIN_DEFINITION@
       <Debug>
         <xsl:for-each select="Debug/@*">
@@ -206,6 +232,7 @@
           </xsl:if>
         </xsl:for-each>
       </SSH>
+      <xsl:copy-of select="analyzerOptions"/>
     </Thor>
   </xsl:template>
 

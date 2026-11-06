@@ -892,6 +892,12 @@ void BuildCtx::selectElse(IHqlStmt * stmt)
     }
 }
 
+void BuildCtx::selectPass(IHqlStmt * pass)
+{
+    assertex(pass->getStmt() == pass_stmt);
+    selectCompound(pass);
+}
+
 
 unsigned BuildCtx::setPriority(unsigned newPrio)
 {
@@ -1000,6 +1006,42 @@ IHqlStmt * BuildCtx::selectBestContext(IHqlExpression * expr)
     expr->gatherTablesUsed(inScope);
 
     return recursiveGetBestContext(curStmts, inScope);
+}
+
+bool BuildCtx::isGlobalContext() const
+{
+    HqlStmts * stmts = curStmts;
+    for (;;)
+    {
+        HqlStmt * container = stmts->queryStmt();
+        if (!container)
+            return true;
+        switch (container->getStmt())
+        {
+        case group_stmt:
+        case pass_stmt:
+            break;
+        default:
+            return false;
+        }
+        stmts = container->queryContainer();
+    }
+}
+
+void BuildCtx::selectGlobalContext()
+{
+    HqlStmt * nestedStmt = nullptr;
+    for (;;)
+    {
+        if (isGlobalContext())
+        {
+            if (nestedStmt)
+                setNextPriority(nestedStmt->queryPriority());
+            return;
+        }
+        nestedStmt = curStmts->queryStmt();
+        curStmts = nestedStmt->queryContainer();
+    }
 }
 
 //---------------------------------------------------------------------------
@@ -1222,7 +1264,7 @@ HqlStmt::HqlStmt(StmtKind _kind, HqlStmts * _container)
 void HqlStmt::addExpr(IHqlExpression * expr)
 {
     //Only allocate a single extra expression at a time, since statements generally have very few (1) expressions
-    exprs.ensure(exprs.ordinality()+1);
+    exprs.ensureSpace(1);
     exprs.append(*expr);
 }
 
@@ -1283,6 +1325,11 @@ bool HqlStmt::hasChildren() const
     return false;
 }
             
+bool HqlStmt::hasOption(IAtom * name) const
+{
+    return hasAttribute(name, exprs);
+}
+
 bool HqlStmt::isIncluded() const
 {
     if (!included)
@@ -1414,7 +1461,7 @@ int queryMemsetChar(IHqlExpression * expr)
     if (expr->getOperator() != no_constant)
         return -1;
     unsigned size = expr->queryType()->getSize();
-    if (size == 0 || size == UNKNOWN_LENGTH)
+    if (size == 0 || isUnknownLength(size))
         return -1;
     const byte * data = (const byte *)expr->queryValue()->queryValue();
     byte match = data[0];

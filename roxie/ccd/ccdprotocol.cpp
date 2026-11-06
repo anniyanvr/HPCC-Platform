@@ -22,13 +22,14 @@
 #include "rtlcommon.hpp"
 
 #include "roxie.hpp"
+#include "ccd.hpp"
 #include "roxiehelper.hpp"
 #include "ccdprotocol.hpp"
 #include "securesocket.hpp"
 
 //================================================================================================================================
 
-IHpccProtocolListener *createProtocolListener(const char *protocol, IHpccProtocolMsgSink *sink, unsigned port, unsigned listenQueue, const char *certFile, const char *keyFile, const char *passPhrase);
+IHpccProtocolListener *createProtocolListener(const char *protocol, IHpccProtocolMsgSink *sink, unsigned port, unsigned listenQueue, const ISyncedPropertyTree *tlsConfig);
 
 class CHpccProtocolPlugin : implements IHpccProtocolPlugin, public CInterface
 {
@@ -56,12 +57,12 @@ public:
         defaultXmlReadFlags = ctx.ctxGetPropBool("@defaultStripLeadingWhitespace", true) ? ptr_ignoreWhiteSpace : ptr_none;
         trapTooManyActiveQueries = ctx.ctxGetPropBool("@trapTooManyActiveQueries", true);
         numRequestArrayThreads = ctx.ctxGetPropInt("@requestArrayThreads", 5);
-        maxHttpConnectionRequests = ctx.ctxGetPropInt("@maxHttpConnectionRequests", 10);
+        maxHttpConnectionRequests = ctx.ctxGetPropInt("@maxHttpConnectionRequests", 0);
         maxHttpKeepAliveWait = ctx.ctxGetPropInt("@maxHttpKeepAliveWait", 5000); // In milliseconds
     }
-    IHpccProtocolListener *createListener(const char *protocol, IHpccProtocolMsgSink *sink, unsigned port, unsigned listenQueue, const char *config, const char *certFile=nullptr, const char *keyFile=nullptr, const char *passPhrase=nullptr)
+    IHpccProtocolListener *createListener(const char *protocol, IHpccProtocolMsgSink *sink, unsigned port, unsigned listenQueue, const char *config, const ISyncedPropertyTree *tlsConfig)
     {
-        return createProtocolListener(protocol, sink, port, listenQueue, certFile, keyFile, passPhrase);
+        return createProtocolListener(protocol, sink, port, listenQueue, tlsConfig);
     }
 public:
     StringArray targetNames;
@@ -69,7 +70,7 @@ public:
     PTreeReaderOptions defaultXmlReadFlags;
     unsigned maxBlockSize;
     unsigned numRequestArrayThreads;
-    unsigned maxHttpConnectionRequests = 10;
+    unsigned maxHttpConnectionRequests = 0;
     unsigned maxHttpKeepAliveWait = 5000;
     bool trapTooManyActiveQueries;
 };
@@ -79,7 +80,7 @@ Owned<CHpccProtocolPlugin> global;
 class ProtocolListener : public Thread, implements IHpccProtocolListener, implements IThreadFactory
 {
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
     ProtocolListener(IHpccProtocolMsgSink *_sink) : Thread("RoxieListener")
     {
         running = false;
@@ -114,19 +115,22 @@ public:
             }
 #endif /* GLIBC */
             if (traceLevel)
-                traceAffinity(&cpuMask);
+                traceAffinitySettings(&cpuMask);
         }
 #endif
     }
 
-    virtual void start()
+    virtual void start() override
     {
         // Note we allow a few additional threads than requested - these are the threads that return "Too many active queries" responses
-        pool.setown(createThreadPool("RoxieSocketWorkerPool", this, NULL, sink->getPoolSize()+5, INFINITE));
+        // and reduce start delay
+        pool.setown(createThreadPool("RoxieSocketWorkerPool", this, false, nullptr, sink->getPoolSize()+5, 1));
         assertex(!running);
-        Thread::start();
+        Thread::start(false);
         started.wait();
     }
+
+    virtual ISocket *createSecureSocket (ISocket *base) const = 0;
 
     virtual bool stop()
     {
@@ -166,14 +170,14 @@ public:
                         }
                     }
                 }
-                if (traceLevel > 3)
-                    traceAffinity(&threadMask);
+                if (doTrace(traceAffinity))
+                    traceAffinitySettings(&threadMask);
                 pthread_setaffinity_np(GetCurrentThreadId(), sizeof(cpu_set_t), &threadMask);
             }
             else
             {
-                if (traceLevel > 3)
-                    traceAffinity(&cpuMask);
+                if (doTrace(traceAffinity))
+                    traceAffinitySettings(&cpuMask);
                 pthread_setaffinity_np(GetCurrentThreadId(), sizeof(cpu_set_t), &cpuMask);
             }
         }
@@ -181,8 +185,8 @@ public:
     }
 
 protected:
-    bool running;
-    Semaphore started;
+    std::atomic<bool> running;
+    Semaphore started{SYNC_LOCATION};
     Owned<IThreadPool> pool;
 
     Linked<IHpccNativeProtocolMsgSink> sink;
@@ -193,7 +197,7 @@ protected:
     static unsigned lastCore;
 
 private:
-    static void traceAffinity(cpu_set_t *mask)
+    static void traceAffinitySettings(cpu_set_t *mask)
     {
         StringBuffer trace;
         for (unsigned core = 0; core < CPU_SETSIZE; core++)
@@ -221,22 +225,25 @@ class ProtocolSocketListener : public ProtocolListener
     Owned<ISocket> socket;
     SocketEndpoint ep;
     StringAttr protocol;
-    StringAttr certFile;
-    StringAttr keyFile;
-    StringAttr passPhrase;
     Owned<ISecureSocketContext> secureContext;
+    bool isSSL = false;
 
 public:
-    ProtocolSocketListener(IHpccProtocolMsgSink *_sink, unsigned _port, unsigned _listenQueue, const char *_protocol, const char *_certFile, const char *_keyFile, const char *_passPhrase)
+    ProtocolSocketListener(IHpccProtocolMsgSink *_sink, unsigned _port, unsigned _listenQueue, const char *_protocol, const ISyncedPropertyTree *_tlsConfig)
       : ProtocolListener(_sink)
     {
         port = _port;
         listenQueue = _listenQueue;
         ep.set(port, queryHostIP());
         protocol.set(_protocol);
-        certFile.set(_certFile);
-        keyFile.set(_keyFile);
-        passPhrase.set(_passPhrase);
+        isSSL = streq(protocol.str(), "ssl");
+
+#ifdef _USE_OPENSSL
+        if (isSSL)
+        {
+            secureContext.setown(createSecureSocketContextSynced(_tlsConfig, ServerSocket));
+        }
+#endif
     }
 
     IHpccProtocolMsgSink *queryMsgSink()
@@ -270,88 +277,87 @@ public:
         }
     }
 
-    virtual void runOnce(const char *query);
-
-    virtual void cleanupSocket(ISocket *sock)
+    virtual bool isRunning()
     {
-        if (!sock)
-            return;
-        try
-        {
-            sock->shutdown();
-        }
-        catch (IException *e)
-        {
-            e->Release();
-        }
-        try
-        {
-            sock->close();
-        }
-        catch (IException *e)
-        {
-            e->Release();
-        }
+        return running;
     }
 
+    virtual void runOnce(const char *query);
+
+    void cleanupSocket(ISocket *sock) const
+    {
+        shutdownAndCloseNoThrow(sock);
+    }
+
+    virtual ISocket *createSecureSocket (ISocket *base) const override
+    {
+        if (!isSSL)
+            return base;
+#ifdef _USE_OPENSSL
+        Owned<ISecureSocket> ssock;
+        try
+        {
+            ssock.setown(secureContext->createSecureSocket(base));
+            int loglevel = SSLogMin;
+            if (doTrace(traceSockets))
+                loglevel = SSLogMax;
+            int status = ssock->secure_accept(loglevel);
+            if (status < 0)
+            {
+                // secure_accept may also DBGLOG() errors ...
+                cleanupSocket(ssock);
+                return nullptr;
+            }
+        }
+        catch (IException *E)
+        {
+            StringBuffer s;
+            E->errorMessage(s);
+            OWARNLOG("%s", s.str());
+            E->Release();
+            cleanupSocket(ssock);
+            ssock.clear();
+            return nullptr;
+        }
+        catch (...)
+        {
+            OWARNLOG("ProtocolSocketListener failure to establish secure connection");
+            cleanupSocket(ssock);
+            ssock.clear();
+            return nullptr;
+        }
+        return ssock.getClear();
+#else
+        OWARNLOG("ProtocolSocketListener failure to establish secure connection: OpenSSL disabled in build");
+        return nullptr;
+#endif
+
+    }
     virtual int run()
     {
         DBGLOG("ProtocolSocketListener (%d threads) listening to socket on port %d", sink->getPoolSize(), port);
-        socket.setown(ISocket::create(port, listenQueue));
+
+        try
+        {
+            socket.setown(ISocket::create(port, listenQueue));
+        }
+        catch (IException *e)
+        {
+            started.signal();
+            StringBuffer s;
+            e->errorMessage(s);
+            OERRLOG("%s", s.str());
+            e->Release();
+            return 0;
+        }
+
         running = true;
         started.signal();
         while (running)
         {
             Owned<ISocket> client = socket->accept(true);
-            Owned<ISecureSocket> ssock;
             if (client)
             {
-                if (streq(protocol.str(), "ssl"))
-                {
-#ifdef _USE_OPENSSL
-                    try
-                    {
-                        if (!secureContext)
-                            secureContext.setown(createSecureSocketContextEx(certFile.get(), keyFile.get(), passPhrase.get(), ServerSocket));
-                        ssock.setown(secureContext->createSecureSocket(client.getClear()));
-                        int loglevel = 0;
-                        if (traceLevel > 1)
-                            loglevel = traceLevel;
-                        int status = ssock->secure_accept(loglevel);
-                        if (status < 0)
-                        {
-                            // secure_accept may also DBGLOG() errors ...
-                            cleanupSocket(ssock);
-                            continue;
-                        }
-                    }
-                    catch (IException *E)
-                    {
-                        StringBuffer s;
-                        E->errorMessage(s);
-                        OWARNLOG("%s", s.str());
-                        E->Release();
-                        cleanupSocket(ssock);
-                        ssock.clear();
-                        cleanupSocket(client);
-                        client.clear();
-                        continue;
-                    }
-                    catch (...)
-                    {
-                        OWARNLOG("ProtocolSocketListener failure to establish secure connection");
-                        cleanupSocket(ssock);
-                        ssock.clear();
-                        cleanupSocket(client);
-                        client.clear();
-                        continue;
-                    }
-                    client.setown(ssock.getClear());
-#else
-                    OWARNLOG("ProtocolSocketListener failure to establish secure connection: OpenSSL disabled in build");
-                    continue;
-#endif
-                }
                 client->set_linger(-1);
                 pool->start(client.getClear());
             }
@@ -380,15 +386,13 @@ public:
 
     ProtocolQueryWorker(ProtocolListener *_listener) : listener(_listener)
     {
-        qstart = msTick();
-        time(&startTime);
+        resetStartTime();
     }
 
     //  interface IPooledThread
     virtual void init(void *) override
     {
-        qstart = msTick();
-        time(&startTime);
+        resetStartTime();
     }
 
     virtual bool canReuse() const override
@@ -403,9 +407,15 @@ public:
         return true;
     }
 
+    void resetStartTime()
+    {
+        startNs = nsTick();
+        time(&startTime);
+    }
+
 protected:
     ProtocolListener *listener;
-    unsigned qstart;
+    stat_type startNs;
     time_t startTime;
 
 };
@@ -514,7 +524,7 @@ class CHpccNativeResultsWriter : implements IHpccNativeProtocolResultsWriter, pu
 {
 protected:
     SafeSocket *client;
-    CriticalSection resultsCrit;
+    CriticalSection resultsCrit{SYNC_LOCATION};
     IPointerArrayOf<FlushingStringBuffer> resultMap;
 
     StringAttr queryName;
@@ -696,13 +706,13 @@ public:
             else if (mlFmt==MarkupFmt_XML)
             {
                 assertex(transformer);
-                CommonXmlWriter writer(xmlReadFlags|XWFnoindent, 0, r);
+                CommonXmlWriter writer((unsigned)xmlReadFlags|XWFnoindent, 0, r);
                 transformer->toXML(isAll, len, (byte *)data, writer);
             }
             else if (mlFmt==MarkupFmt_JSON)
             {
                 assertex(transformer);
-                CommonJsonWriter writer(xmlReadFlags|XWFnoindent, 0, r);
+                CommonJsonWriter writer((unsigned)xmlReadFlags|XWFnoindent, 0, r);
                 transformer->toXML(isAll, len, (byte *)data, writer);
             }
             else
@@ -859,24 +869,6 @@ public:
             }
         }
     }
-    virtual void appendProbeGraph(const char *xml)
-    {
-        if (!xml)
-        {
-            if (probe)
-                probe.clear();
-            return;
-        }
-        if (!probe)
-        {
-            probe.setown(new FlushingStringBuffer(client, isBlocked, MarkupFmt_XML, false, isHTTP, logctx));
-            probe->startDataset("_Probe", NULL, (unsigned) -1);  // initialize it
-        }
-
-        probe->append("\n");
-        probe->append(xml);
-    }
-
 };
 
 class CHpccXmlResultsWriter : public CHpccNativeResultsWriter
@@ -1009,7 +1001,7 @@ protected:
     PTreeReaderOptions xmlReadFlags;
     Owned<CHpccNativeResultsWriter> results; //hpcc results section
     IPointerArrayOf<FlushingStringBuffer> contentsMap; //other sections
-    CriticalSection contentsCrit;
+    CriticalSection contentsCrit{SYNC_LOCATION};
     unsigned protocolFlags;
     bool isHTTP;
 
@@ -1114,11 +1106,6 @@ public:
             results->flush();
         ForEachItemIn(i, contentsMap)
             contentsMap.item(i)->flush(true);
-    }
-    virtual void appendProbeGraph(const char *xml)
-    {
-        if (results)
-            results->appendProbeGraph(xml);
     }
 };
 
@@ -1368,14 +1355,17 @@ private:
     PTreeReaderOptions xmlReadFlags;
     unsigned &memused;
     unsigned &agentReplyLen;
-    CriticalSection crit;
+    unsigned &agentDuplicates;
+    unsigned &agentResends;
+    CriticalSection crit{SYNC_LOCATION};
     unsigned flags;
 
 public:
     CHttpRequestAsyncFor(const char *_queryName, IHpccProtocolMsgSink *_sink, IHpccProtocolMsgContext *_msgctx, IArrayOf<IPropertyTree> &_requestArray,
-            SafeSocket &_client, HttpHelper &_httpHelper, unsigned _flags, unsigned &_memused, unsigned &_agentReplyLen, const char *_queryText, const IContextLogger &_logctx, PTreeReaderOptions _xmlReadFlags, const char *_querySetName)
-    : querySetName(_querySetName), logctx(_logctx), requestArray(_requestArray), sink(_sink), msgctx(_msgctx), client(_client), httpHelper(_httpHelper), xmlReadFlags(_xmlReadFlags)
-      , memused(_memused), agentReplyLen(_agentReplyLen), flags(_flags)
+            SafeSocket &_client, HttpHelper &_httpHelper, unsigned _flags, unsigned &_memused, unsigned &_agentReplyLen, unsigned &_agentDuplicates, unsigned &_agentResends,
+            const char *_queryText, const IContextLogger &_logctx, PTreeReaderOptions _xmlReadFlags, const char *_querySetName)
+    : CAsyncFor("CHttpRequestAsyncFor"), querySetName(_querySetName), logctx(_logctx), requestArray(_requestArray), sink(_sink), msgctx(_msgctx), client(_client), httpHelper(_httpHelper), xmlReadFlags(_xmlReadFlags)
+      , memused(_memused), agentReplyLen(_agentReplyLen), agentDuplicates(_agentDuplicates), agentResends(_agentResends), flags(_flags)
     {
         queryName = _queryName;
         queryText = _queryText;
@@ -1398,7 +1388,9 @@ public:
         {
             IPropertyTree &request = requestArray.item(idx);
             Owned<IHpccProtocolResponse> protocol = createProtocolResponse(request.queryName(), &client, httpHelper, logctx, flags, xmlReadFlags);
-            sink->onQueryMsg(msgctx, &request, protocol, flags, xmlReadFlags, querySetName, idx, memused, agentReplyLen);
+            // MORE - agentReply etc should really be atomic
+            StringAttr statsWuid;
+            sink->onQueryMsg(msgctx, &request, protocol, flags, xmlReadFlags, querySetName, idx, memused, agentReplyLen, agentDuplicates, agentResends, statsWuid);
         }
         catch (IException * E)
         {
@@ -1541,10 +1533,33 @@ public:
 };
 
 static Owned<IActiveQueryLimiterFactory> queryLimiterFactory;
+static constexpr const char * FORWARDED_FOR_ADDRESS_HEADER_NAME = "X-Forwarded-For";
+// Extract original client IP from headers or inline properties, update peer input param
+static inline void updatePeerAddressFromHeaders(StringBuffer & peer, const IProperties * headers)
+{
+    StringBuffer originalClientAddress;
+    const char *forwardedFor = headers->queryProp(FORWARDED_FOR_ADDRESS_HEADER_NAME);
+    if (!isEmptyString(forwardedFor))
+    {
+        const char *comma = strchr(forwardedFor, ',');
+        if (comma)
+            originalClientAddress.append(comma - forwardedFor, forwardedFor);
+        else
+            originalClientAddress.append(forwardedFor);
+        originalClientAddress.trim();
+    }
+
+    if (isIPAddress(originalClientAddress.str()))
+    {
+        if (!originalClientAddress.isEmpty() && (peer.isEmpty() || !streq(originalClientAddress.str(), peer.str())))
+            peer.set(originalClientAddress);
+    }
+}
 
 class RoxieSocketWorker : public ProtocolQueryWorker
 {
     SocketEndpoint ep;
+    Owned<ISocket> rawClient;
     Owned<SafeSocket> client;
     Owned<IHpccNativeProtocolMsgSink> sink;
 
@@ -1558,13 +1573,24 @@ public:
     //  interface IPooledThread
     virtual void init(void *_r) override
     {
-        client.setown(new CSafeSocket((ISocket *) _r));
+        rawClient.setown((ISocket *) _r);
         ProtocolQueryWorker::init(_r);
     }
 
     virtual void threadmain() override
     {
-        doMain("");
+        ISocket *secure = listener->createSecureSocket(rawClient.getLink());
+        if (secure)
+        {
+            client.setown(new CSafeSocket(secure));
+            rawClient.clear();
+            doMain("");
+        }
+        else
+        {
+            rawClient->shutdownNoThrow();
+            rawClient.clear();
+        }
     }
 
     virtual void runOnce(const char *query)
@@ -1644,7 +1670,7 @@ private:
             throw MakeStringException(ROXIE_DATA_ERROR, "Malformed request");
     }
 
-    void sanitizeQuery(Owned<IPropertyTree> &queryPT, StringAttr &queryName, StringBuffer &saniText, HttpHelper &httpHelper, const char *&uid, bool &isBlind, bool &isDebug)
+    void sanitizeQuery(Owned<IPropertyTree> &queryPT, StringAttr &queryName, StringBuffer &saniText, HttpHelper &httpHelper, const char *&uid, bool &isBlind, bool &isDebug, IProperties * inlineHeaders)
     {
         if (queryPT)
         {
@@ -1653,7 +1679,29 @@ private:
             if (!uid)
                 uid = queryPT->queryProp("_TransactionId");
             isBlind = queryPT->getPropBool("@blind", false) || queryPT->getPropBool("_blind", false);
-            isDebug = queryPT->getPropBool("@debug") || queryPT->getPropBool("_Probe", false);
+            isDebug = queryPT->getPropBool("@debug");
+
+            if (inlineHeaders)
+            {
+                if (queryPT->hasProp("_trace"))
+                {
+                    if (queryPT->hasProp("_trace/traceparent"))
+                        inlineHeaders->setProp("traceparent", queryPT->queryProp("_trace/traceparent"));
+                    if (queryPT->hasProp("_trace/Global-Id"))
+                        inlineHeaders->setProp("Global-Id", queryPT->queryProp("_trace/Global-Id"));
+                    if (queryPT->hasProp("_trace/Caller-Id"))
+                        inlineHeaders->setProp("caller.id", queryPT->queryProp("_trace/Caller-Id"));
+                }
+
+                if (queryPT->hasProp("_client"))
+                {
+                    if (queryPT->hasProp("_client/X-Forwarded-For"))
+                        inlineHeaders->setProp("X-Forwarded-For", queryPT->queryProp("_client/X-Forwarded-For"));
+                    if (queryPT->hasProp("_client/X-Client-ID"))
+                        inlineHeaders->setProp("X-Client-ID", queryPT->queryProp("_client/X-Client-ID"));
+                }
+            }
+
             toXML(queryPT, saniText, 0, isBlind ? (XML_SingleQuoteAttributeValues | XML_Sanitize) : XML_SingleQuoteAttributeValues);
         }
     }
@@ -1698,27 +1746,19 @@ private:
         return id;
     }
 
-    const char *queryRequestGlobalIdHeader(HttpHelper &httpHelper, IContextLogger &logctx, StringAttr &headerused)
+    const char *queryRequestGlobalIdHeader(HttpHelper &httpHelper, IContextLogger &logctx)
     {
-        const char *id = queryRequestIdHeader(httpHelper, logctx.queryGlobalIdHttpHeader(), headerused);
+        const char *id = httpHelper.queryRequestHeader(kGlobalIdHttpHeaderName);
         if (!id || !*id)
-        {
-            id = queryRequestIdHeader(httpHelper, "Global-Id", headerused);
-            if (!id || !*id)
-                id = queryRequestIdHeader(httpHelper, "HPCC-Global-Id", headerused);
-        }
+            id = httpHelper.queryRequestHeader(kLegacyGlobalIdHttpHeaderName);        // Backward compatibility - passed on as global-id
         return id;
     }
 
-    const char *queryRequestCallerIdHeader(HttpHelper &httpHelper, IContextLogger &logctx, StringAttr &headerused)
+    const char *queryRequestCallerIdHeader(HttpHelper &httpHelper, IContextLogger &logctxheaderused)
     {
-        const char *id = queryRequestIdHeader(httpHelper, logctx.queryCallerIdHttpHeader(), headerused);
+        const char *id = httpHelper.queryRequestHeader(kCallerIdHttpHeaderName);
         if (!id || !*id)
-        {
-            id = queryRequestIdHeader(httpHelper, "Caller-Id", headerused);
-            if (!id || !*id)
-                id = queryRequestIdHeader(httpHelper, "HPCC-Caller-Id", headerused);
-        }
+            id = httpHelper.queryRequestHeader(kLegacyCallerIdHttpHeaderName);        // Backward compatibility - passed on as caller-id
         return id;
     }
 
@@ -1728,18 +1768,20 @@ private:
         unsigned memused = 0;
         IpAddress peer;
         bool continuationNeeded = false;
+        bool resetQstart = false;
         bool isStatus = false;
         unsigned remainingHttpConnectionRequests = global->maxHttpConnectionRequests ? global->maxHttpConnectionRequests : 1;
         unsigned readWait = WAIT_FOREVER;
 
         Owned<IHpccProtocolMsgContext> msgctx = sink->createMsgContext(startTime);
-        IContextLogger &logctx = *msgctx->queryLogContext();
 
 readAnother:
         unsigned agentsReplyLen = 0;
+        unsigned agentsDuplicates = 0;
+        unsigned agentsResends = 0;
         StringArray allTargets;
         sink->getTargetNames(allTargets);
-        HttpHelper httpHelper(&allTargets);
+        HttpHelper httpHelper(&allTargets, global->targetAliases.get());
         try
         {
             if (client)
@@ -1747,7 +1789,7 @@ readAnother:
                 client->querySocket()->getPeerAddress(peer);
                 if (!client->readBlocktms(rawText.clear(), readWait, &httpHelper, continuationNeeded, isStatus, global->maxBlockSize))
                 {
-                    if (traceLevel > 8)
+                    if (doTrace(traceSockets, TraceFlags::Max))
                     {
                         StringBuffer b;
                         DBGLOG("No data reading query from socket");
@@ -1756,15 +1798,31 @@ readAnother:
                     return;
                 }
             }
-            if (continuationNeeded)
+            if (resetQstart)
             {
-                qstart = msTick();
-                time(&startTime);
+                resetQstart = false;
+                resetStartTime();
+                msgctx.setown(sink->createMsgContext(startTime));
             }
         }
         catch (IException * E)
         {
-            if (traceLevel > 0)
+            bool expectedError = false;
+            if (resetQstart) //persistent connection - initial request has already been processed
+            {
+                switch (E->errorCode())
+                {
+                    //closing of persistent socket is not an error
+                    case JSOCKERR_not_opened:
+                    case JSOCKERR_broken_pipe:
+                    case JSOCKERR_timeout_expired:
+                    case JSOCKERR_graceful_close:
+                        expectedError = true;
+                    default:
+                        break;
+                }
+            }
+            if (doTrace(traceSockets) && !expectedError)
             {
                 StringBuffer b;
                 IERRLOG("Error reading query from socket: %s", E->errorMessage(b).str());
@@ -1774,6 +1832,16 @@ readAnother:
             return;
         }
 
+        if (shuttingDown.load(std::memory_order_relaxed))
+        {
+            client.clear();
+            return;
+        }
+
+        SpanTimeStamp spanStartTimeStamp(true);
+
+        PerfTracer perf;
+        IRoxieContextLogger &logctx = static_cast<IRoxieContextLogger&>(*msgctx->queryLogContext());
         bool isHTTP = httpHelper.isHttp();
         if (isHTTP)
         {
@@ -1793,15 +1861,6 @@ readAnother:
             {
                 mlResponseFmt = httpHelper.queryResponseMlFormat();
                 mlRequestFmt = httpHelper.queryRequestMlFormat();
-
-                StringAttr globalIdHeader, callerIdHeader;
-                const char *globalId = queryRequestGlobalIdHeader(httpHelper, logctx, globalIdHeader);
-                const char *callerId = queryRequestCallerIdHeader(httpHelper, logctx, callerIdHeader);
-                logctx.setHttpIdHeaders(globalIdHeader, callerIdHeader);
-                if (globalId && *globalId)
-                    msgctx->setTransactionId(globalId, callerId, true);  //logged and forwarded through SOAPCALL/HTTPCALL
-                else if (callerId && *callerId)
-                    msgctx->setCallerId(callerId); //may not matter, but maintain old behavior
             }
         }
 
@@ -1811,15 +1870,17 @@ readAnother:
         bool isBlind = false;
         bool isDebug = false;
         unsigned protocolFlags = isHTTP ? 0 : HPCC_PROTOCOL_NATIVE;
+        unsigned requestArraySize = 0; //for logging, considering all the ways requests can be counted this name seems least confusing
 
         Owned<IPropertyTree> queryPT;
         StringBuffer sanitizedText;
         StringBuffer peerStr;
-        peer.getIpText(peerStr);
+        peer.getHostText(peerStr);
         const char *uid = "-";
 
         StringAttr queryName;
         StringAttr queryPrefix;
+        StringAttr statsWuid;
         WhiteSpaceHandling whitespace = WhiteSpaceHandling::Default;
         try
         {
@@ -1841,18 +1902,30 @@ readAnother:
                 if (httpHelper.isHttp())
                     httpHelper.setUseEnvelope(extractor.isSoap);
             }
+
+            if (!queryName && !isStatus)
+            {
+                // or should we set("") ?  Is an empty queryName ever valid ?
+                if (doTrace(traceSockets, TraceFlags::Max))
+                {
+                    DBGLOG("missing/invalid query name from socket");
+                }
+                client.clear();
+                return;
+            }
+
             if (streq(queryPrefix.str(), "control"))
             {
                 if (httpHelper.isHttp())
                     client->setHttpMode(queryName, false, httpHelper);
 
-                bool aclupdate = strieq(queryName, "aclupdate"); //ugly
+                bool aclupdate = strieq(queryName.str(), "aclupdate"); //ugly
                 byte iptFlags = aclupdate ? ipt_caseInsensitive|ipt_fast : ipt_fast;
 
                 createQueryPTree(queryPT, httpHelper, rawText, iptFlags, (PTreeReaderOptions)(ptr_ignoreWhiteSpace|ptr_ignoreNameSpaces), queryName);
 
                 //IPropertyTree *root = queryPT;
-                if (!strchr(queryName, ':'))
+                if (!strchr(queryName.str(), ':'))
                 {
                     VStringBuffer fullname("control:%s", queryName.str()); //just easier to keep for debugging and internal checking
                     queryPT->renameProp("/", fullname);
@@ -1860,7 +1933,7 @@ readAnother:
                 Owned<IHpccProtocolResponse> protocol = createProtocolResponse(queryPT->queryName(), client, httpHelper, logctx, protocolFlags | HPCC_PROTOCOL_CONTROL, global->defaultXmlReadFlags);
                 sink->onControlMsg(msgctx, queryPT, protocol);
                 protocol->finalize(0);
-                if (streq(queryName, "lock") || streq(queryName, "childlock"))
+                if (streq(queryName.str(), "lock") || streq(queryName.str(), "childlock")) //don't reset startNs, lock time should be included
                     goto readAnother;
             }
             else if (isStatus)
@@ -1891,6 +1964,8 @@ readAnother:
                 unsigned readFlags = (unsigned) global->defaultXmlReadFlags | ptr_ignoreNameSpaces;
                 readFlags &= ~ptr_ignoreWhiteSpace;
                 readFlags |= (whitespace == WhiteSpaceHandling::Strip ? ptr_ignoreWhiteSpace : ptr_none);
+
+                CCycleTimer xmlTimer;
                 try
                 {
                     createQueryPTree(queryPT, httpHelper, rawText.str(), ipt_caseInsensitive|ipt_fast, (PTreeReaderOptions)readFlags, queryName);
@@ -1903,10 +1978,20 @@ readAnother:
                 }
 
                 uid = NULL;
-                sanitizeQuery(queryPT, queryName, sanitizedText, httpHelper, uid, isBlind, isDebug);
-                if (uid)
-                    msgctx->setTransactionId(uid, nullptr, false);
-                else
+                Owned<IProperties> inlineHeaders = createProperties(true);
+                sanitizeQuery(queryPT, queryName, sanitizedText, httpHelper, uid, isBlind, isDebug, inlineHeaders);
+
+                __uint64 timeProcessQueryText = xmlTimer.elapsedNs();
+
+                // Update peer address to use original client IP if available from proxy headers
+                updatePeerAddressFromHeaders(peerStr, isHTTP ? httpHelper.queryRequestHeaders() : inlineHeaders);
+
+                msgctx->startSpan(uid, querySetName, queryName, isHTTP ? httpHelper.queryRequestHeaders() : inlineHeaders, &spanStartTimeStamp);
+
+                //This must be set after the startSpan - since that resets the stats in the logctx
+                logctx.noteStatistic(StTimeQueryConsume, timeProcessQueryText); // include in the span and complete lines.
+
+                if (!uid)
                     uid = "-";
 
                 sink->checkAccess(peer, queryName, sanitizedText, isBlind);
@@ -1973,7 +2058,18 @@ readAnother:
                                     {
                                         fixedreq->addPropTree(iter->query().queryName(), LINK(&iter->query()));
                                     }
+                                    Owned<IAttributeIterator> aiter = queryPT->getAttributes();
+                                    ForEach(*aiter)
+                                    {
+                                        fixedreq->setProp(aiter->queryName(), aiter->queryValue());
+                                    }
+                                    Owned<IAttributeIterator> aiter2 = reqIter->query().getAttributes();
+                                    ForEach(*aiter2)
+                                    {
+                                        fixedreq->setProp(aiter2->queryName(), aiter2->queryValue());
+                                    }
                                     requestArray.append(*fixedreq);
+                                    requestArraySize++;
                                 }
                             }
                             else
@@ -1984,7 +2080,13 @@ readAnother:
                                 {
                                     fixedreq->addPropTree(iter->query().queryName(), LINK(&iter->query()));
                                 }
+                                Owned<IAttributeIterator> aiter = queryPT->getAttributes();
+                                ForEach(*aiter)
+                                {
+                                    fixedreq->setProp(aiter->queryName(), aiter->queryValue());
+                                }
                                 requestArray.append(*fixedreq);
+                                requestArraySize = 1;
 
                                 msgctx->setIntercept(queryPT->getPropBool("@log", false));
                                 msgctx->setTraceLevel(queryPT->getPropInt("@traceLevel", logctx.queryTraceLevel()));
@@ -2021,19 +2123,22 @@ readAnother:
                                 protocolFlags |= HPCC_PROTOCOL_TRIM;
                             msgctx->setIntercept(queryPT->getPropBool("@log", false));
                             msgctx->setTraceLevel(queryPT->getPropInt("@traceLevel", logctx.queryTraceLevel()));
+                            if (queryPT->getPropBool("@perf", false))
+                                perf.start();
                         }
 
                         msgctx->noteQueryActive();
+                        logctx.noteStatistic(StTimeQueryPreparation, nsTick() - startNs); // include in the span and complete lines.
 
                         if (isHTTP)
                         {
-                            CHttpRequestAsyncFor af(queryName, sink, msgctx, requestArray, *client, httpHelper, protocolFlags, memused, agentsReplyLen, sanitizedText, logctx, (PTreeReaderOptions)readFlags, querySetName);
+                            CHttpRequestAsyncFor af(queryName, sink, msgctx, requestArray, *client, httpHelper, protocolFlags, memused, agentsReplyLen, agentsDuplicates, agentsResends, sanitizedText, logctx, (PTreeReaderOptions)readFlags, querySetName);
                             af.For(requestArray.length(), global->numRequestArrayThreads);
                         }
                         else
                         {
                             Owned<IHpccProtocolResponse> protocol = createProtocolResponse(queryPT->queryName(), client, httpHelper, logctx, protocolFlags, (PTreeReaderOptions)readFlags);
-                            sink->onQueryMsg(msgctx, queryPT, protocol, protocolFlags, (PTreeReaderOptions)readFlags, querySetName, 0, memused, agentsReplyLen);
+                            sink->onQueryMsg(msgctx, queryPT, protocol, protocolFlags, (PTreeReaderOptions)readFlags, querySetName, 0, memused, agentsReplyLen, agentsDuplicates, agentsResends, statsWuid);
                         }
                     }
                 }
@@ -2101,11 +2206,22 @@ readAnother:
             }
         }
         unsigned bytesOut = client? client->bytesOut() : 0;
-        unsigned elapsed = msTick() - qstart;
-        sink->noteQuery(msgctx.get(), peerStr, failed, bytesOut, elapsed,  memused, agentsReplyLen, continuationNeeded);
+        stat_type elapsedNs = nsTick() - startNs;
+        if (client)
+        {
+            logctx.noteStatistic(StTimeSocketReadIO, client->getStatistic(StTimeSocketReadIO));
+            logctx.noteStatistic(StTimeSocketWriteIO, client->getStatistic(StTimeSocketWriteIO));
+            logctx.noteStatistic(StSizeSocketRead, client->getStatistic(StSizeSocketRead));
+            logctx.noteStatistic(StSizeSocketWrite, client->getStatistic(StSizeSocketWrite));
+            logctx.noteStatistic(StNumSocketReads, client->getStatistic(StNumSocketReads));
+            logctx.noteStatistic(StNumSocketWrites, client->getStatistic(StNumSocketWrites));
+        }
+
+        sink->noteQuery(msgctx.get(), peerStr, failed, bytesOut, elapsedNs,  memused, agentsReplyLen, agentsDuplicates, agentsResends, continuationNeeded, requestArraySize);
         if (continuationNeeded)
         {
             rawText.clear();
+            resetQstart = true;
             goto readAnother;
         }
         else
@@ -2114,11 +2230,38 @@ readAnother:
             {
                 if (client && !isHTTP && !isStatus)
                 {
-                    if (msgctx->getIntercept())
+                    if (queryPT)
                     {
-                        FlushingStringBuffer response(client, (protocolFlags & HPCC_PROTOCOL_BLOCKED), mlResponseFmt, (protocolFlags & HPCC_PROTOCOL_NATIVE_RAW), false, logctx);
-                        response.startDataset("Tracing", NULL, (unsigned) -1);
-                        msgctx->outputLogXML(response);
+                        if (queryPT->getPropBool("@perf", false))
+                        {
+                            perf.stop();
+                            StringBuffer &perfInfo = perf.queryResult();
+                            FlushingStringBuffer response(client, (protocolFlags & HPCC_PROTOCOL_BLOCKED), mlResponseFmt, (protocolFlags & HPCC_PROTOCOL_NATIVE_RAW), false, logctx);
+                            response.startDataset("PerfTrace", NULL, (unsigned) -1);
+                            response.flushXML(perfInfo, true);
+                        }
+                        if (msgctx->getIntercept())
+                        {
+                            FlushingStringBuffer response(client, (protocolFlags & HPCC_PROTOCOL_BLOCKED), mlResponseFmt, (protocolFlags & HPCC_PROTOCOL_NATIVE_RAW), false, logctx);
+                            response.startDataset("Tracing", NULL, (unsigned) -1);
+                            msgctx->outputLogXML(response);
+                        }
+                        if (statsWuid.length())
+                        {
+                            FlushingStringBuffer response(client, (protocolFlags & HPCC_PROTOCOL_BLOCKED), mlResponseFmt, (protocolFlags & HPCC_PROTOCOL_NATIVE_RAW), false, logctx);
+                            response.startDataset("Statistics", NULL, (unsigned) -1);
+                            VStringBuffer xml(" <wuid>%s</wuid>\n", statsWuid.str());
+                            response.flushXML(xml, true);
+                        }
+                        if (queryPT->getPropBool("@summaryStats", alwaysSendSummaryStats))
+                        {
+                            unsigned elapsedMs = nanoToMilli(elapsedNs);
+                            FlushingStringBuffer response(client, (protocolFlags & HPCC_PROTOCOL_BLOCKED), mlResponseFmt, (protocolFlags & HPCC_PROTOCOL_NATIVE_RAW), false, logctx);
+                            response.startDataset("SummaryStats", NULL, (unsigned) -1);
+                            VStringBuffer s(" COMPLETE: %s %s complete in %u msecs memory=%u Mb agentsreply=%u duplicatePackets=%u resentPackets=%u resultsize=%u continue=%d", queryName.get(), uid, elapsedMs, memused, agentsReplyLen, agentsDuplicates, agentsResends, bytesOut, continuationNeeded);
+                            logctx.getStats(s).newline();
+                            response.flushXML(s, true);
+                        }
                     }
                     unsigned replyLen = 0;
                     client->write(&replyLen, sizeof(replyLen));
@@ -2126,6 +2269,7 @@ readAnother:
                 if (isHTTP && --remainingHttpConnectionRequests > 0)
                 {
                     readWait = global->maxHttpKeepAliveWait;
+                    resetQstart = true;
                     goto readAnother;
                 }
 
@@ -2159,11 +2303,20 @@ void ProtocolSocketListener::runOnce(const char *query)
     p->runOnce(query);
 }
 
-IHpccProtocolListener *createProtocolListener(const char *protocol, IHpccProtocolMsgSink *sink, unsigned port, unsigned listenQueue, const char *certFile=nullptr, const char *keyFile=nullptr, const char *passPhrase=nullptr)
+IHpccProtocolListener *createProtocolListener(const char *protocol, IHpccProtocolMsgSink *sink, unsigned port, unsigned listenQueue, const ISyncedPropertyTree *tlsConfig)
 {
     if (traceLevel)
-        DBGLOG("Creating Roxie socket listener, protocol %s, pool size %d, listen queue %d%s", protocol, sink->getPoolSize(), listenQueue, sink->getIsSuspended() ? " SUSPENDED":"");
-    return new ProtocolSocketListener(sink, port, listenQueue, protocol, certFile, keyFile, passPhrase);
+    {
+        const char *certIssuer = "none";
+        if (tlsConfig)
+        {
+            Owned<const IPropertyTree> tlsInfo = tlsConfig->getTree();
+            if (tlsInfo && tlsInfo->hasProp("@issuer"))
+                certIssuer = tlsInfo->queryProp("@issuer");
+        }
+        DBGLOG("Creating Roxie socket listener, protocol %s, issuer=%s, pool size %d, listen queue %d%s", protocol, certIssuer, sink->getPoolSize(), listenQueue, sink->getIsSuspended() ? " SUSPENDED":"");
+    }
+    return new ProtocolSocketListener(sink, port, listenQueue, protocol, tlsConfig);
 }
 
 extern IHpccProtocolPlugin *loadHpccProtocolPlugin(IHpccProtocolPluginContext *ctx, IActiveQueryLimiterFactory *_limiterFactory)
@@ -2184,4 +2337,94 @@ extern void unloadHpccProtocolPlugin()
     global.clear();
 }
 
+#if defined(_DEBUG) && defined(_USE_CPPUNIT)
+#include "unittests.hpp"
+
+class CcdProtocolUnitTests : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(CcdProtocolUnitTests);
+        CPPUNIT_TEST(testSingleEntryForwardForAddressExtraction);
+        CPPUNIT_TEST(testMultipleEntryForwardForAddressExtraction);
+        CPPUNIT_TEST(testNoForwardForHeaderExtraction);
+        CPPUNIT_TEST(testEmptyForwardForHeaderExtraction);
+        CPPUNIT_TEST(testWhiteSpaceForwardForHeaderExtraction);
+        CPPUNIT_TEST(testInvalidIpForwardForHeaderExtraction);
+        CPPUNIT_TEST(testValidIpv6ForwardForHeaderExtraction);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void testSingleEntryForwardForAddressExtraction()
+    {
+        Owned<IProperties> headers = createProperties();
+        headers->setProp(FORWARDED_FOR_ADDRESS_HEADER_NAME, "192.168.1.1");
+        StringBuffer peer;
+        peer.set("1.0.0.1");
+        updatePeerAddressFromHeaders(peer, headers);
+        CPPUNIT_ASSERT_EQUAL(std::string("192.168.1.1"), std::string(peer.str()));
+    }
+
+    void testMultipleEntryForwardForAddressExtraction()
+    {
+        Owned<IProperties> headers = createProperties();
+        headers->setProp(FORWARDED_FOR_ADDRESS_HEADER_NAME, "10.1.1.1, 172.16.0.1, 192.168.1.1");
+        StringBuffer peer;
+        peer.set("1.0.0.1");
+        updatePeerAddressFromHeaders(peer, headers);
+        CPPUNIT_ASSERT_EQUAL(std::string("10.1.1.1"), std::string(peer.str()));
+    }
+
+    void testNoForwardForHeaderExtraction()
+    {
+        Owned<IProperties> headers = createProperties();
+        StringBuffer peer;
+        peer.set("1.0.0.1");
+        updatePeerAddressFromHeaders(peer, headers);
+        CPPUNIT_ASSERT_EQUAL(std::string("1.0.0.1"), std::string(peer.str()));
+    }
+
+    void testEmptyForwardForHeaderExtraction()
+    {
+        Owned<IProperties> headers = createProperties();
+        headers->setProp(FORWARDED_FOR_ADDRESS_HEADER_NAME, "");
+        StringBuffer peer;
+        peer.set("1.0.0.1");
+        updatePeerAddressFromHeaders(peer, headers);
+        CPPUNIT_ASSERT_EQUAL(std::string("1.0.0.1"), std::string(peer.str()));
+    }
+
+    void testWhiteSpaceForwardForHeaderExtraction()
+    {
+        Owned<IProperties> headers = createProperties();
+        headers->setProp(FORWARDED_FOR_ADDRESS_HEADER_NAME, "  127.0.0.1  , 10.0.0.2");
+        StringBuffer peer;
+        peer.set("1.0.0.1");
+        updatePeerAddressFromHeaders(peer, headers);
+        CPPUNIT_ASSERT_EQUAL(std::string("127.0.0.1"), std::string(peer.str()));
+    }
+
+    void testInvalidIpForwardForHeaderExtraction()
+    {
+        Owned<IProperties> headers = createProperties();
+        headers->setProp(FORWARDED_FOR_ADDRESS_HEADER_NAME, "not_an_ip, 10.0.0.2");
+        StringBuffer peer;
+        peer.set("1.0.0.1");
+        updatePeerAddressFromHeaders(peer, headers);
+        // Should not update peer since IP is invalid
+        CPPUNIT_ASSERT_EQUAL(std::string("1.0.0.1"), std::string(peer.str()));
+    }
+
+    void testValidIpv6ForwardForHeaderExtraction()
+    {
+        Owned<IProperties> headers = createProperties();
+        headers->setProp(FORWARDED_FOR_ADDRESS_HEADER_NAME, "2001:0db8:85a3:0000:0000:8a2e:0370:7334, 10.0.0.2");
+        StringBuffer peer;
+        peer.set("1.0.0.1");
+        updatePeerAddressFromHeaders(peer, headers);
+        // Should update peer to the valid IPv6 address
+        CPPUNIT_ASSERT_EQUAL(std::string("2001:0db8:85a3:0000:0000:8a2e:0370:7334"), std::string(peer.str()));
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(CcdProtocolUnitTests);
+#endif
 //================================================================================================================================

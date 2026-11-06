@@ -1,25 +1,14 @@
-import * as lang from "dojo/_base/lang";
-import * as aspect from "dojo/aspect";
-import * as dom from "dojo/dom";
-
-import * as registry from "dijit/registry";
+import { declare, lang, aspect, dom, registry } from "src-dojo/index";
 
 import { ScopeGraph, Workunit } from "@hpcc-js/comms";
 import { Graph as GraphWidget, Subgraph, Vertex } from "@hpcc-js/graph";
 import { hashSum } from "@hpcc-js/util";
 
-// @ts-ignore
-import * as _Widget from "hpcc/_Widget";
+import _Widget from "hpcc/_Widget";
 
-// @ts-ignore
-import * as template from "dojo/text!hpcc/templates/Graph7Widget.html";
+// @ts-expect-error
+import template from "dojo/text!hpcc/templates/Graph7Widget.html";
 
-import "dijit/layout/BorderContainer";
-import "dijit/layout/ContentPane";
-import "dijit/Toolbar";
-import "dijit/ToolbarSeparator";
-
-import { declareDecorator } from "./DeclareDecorator";
 import nlsHPCC from "./nlsHPCC";
 import { WUScopeController } from "./WUScopeController";
 
@@ -31,23 +20,19 @@ type _Widget = {
     setDisabled(id: string, disabled: boolean, icon?: string, disabledIcon?: string);
 };
 
-export interface Graph7Widget extends _Widget {
-}
+export const Graph7Widget = declare("Graph7Widget", [_Widget], {
+    templateString: template,
+    i18n: nlsHPCC,
 
-@declareDecorator("Graph7Widget", _Widget)
-export class Graph7Widget {
-    templateString = template;
-    static baseClass = "Graph7Widget";
-    i18n = nlsHPCC;
+    wuid: "",
 
-    wuid = "";
+    graphStatus: null,
 
-    graphStatus = null;
-
-    _graph: GraphWidget;
-    _gc = new WUScopeController();
+    _graph: undefined as GraphWidget | undefined,
+    _gc: undefined as WUScopeController | undefined,
 
     constructor() {
+        this._gc = new WUScopeController();
         this._gc.minClick = (sg: Subgraph) => {
             this.loadGraph(w => {
                 this._graph
@@ -56,11 +41,11 @@ export class Graph7Widget {
                     ;
             });
         };
-    }
+    },
 
     //  Data ---
-    private _prevHashSum;
-    private _prevScopeGraph: Promise<ScopeGraph>;
+    _prevHashSum: undefined as string | undefined,
+    _prevScopeGraph: undefined as Promise<ScopeGraph> | undefined,
     fetchScopeGraph(wuid: string, graphID: string, refresh: boolean = false): Promise<ScopeGraph> {
         this.graphStatus.innerText = this.i18n.FetchingData;
         const hash = hashSum({
@@ -82,34 +67,34 @@ export class Graph7Widget {
             });
         }
         return this._prevScopeGraph;
-    }
+    },
     //  --- ---
 
-    buildRendering(args) {
-        this.inherited(arguments);
-    }
+    buildRendering: function buildRendering(args) {
+        this.inherited(buildRendering, arguments);
+    },
 
-    postCreate(args) {
-        this.inherited(arguments);
+    postCreate: function postCreate(args) {
+        this.inherited(postCreate, arguments);
         this._initGraphControls();
-    }
+    },
 
-    startup(args) {
-        this.inherited(arguments);
-    }
+    startup: function startup(args) {
+        this.inherited(startup, arguments);
+    },
 
-    resize(s) {
-        this.inherited(arguments);
+    resize: function resize(s) {
+        this.inherited(resize, arguments);
         this.widget.MainBorderContainer.resize();
-    }
+    },
 
-    layout(args) {
-        this.inherited(arguments);
-    }
+    layout: function layout(args) {
+        this.inherited(layout, arguments);
+    },
 
-    destroy(args) {
-        this.inherited(arguments);
-    }
+    destroy: function destroy(args) {
+        this.inherited(destroy, arguments);
+    },
 
     //  Implementation  ---
     _initGraphControls() {
@@ -121,11 +106,11 @@ export class Graph7Widget {
                     ;
             }
         });
-    }
+    },
 
     _onRefresh() {
         this.refreshData();
-    }
+    },
 
     _onGraphRefresh() {
         this._graph.data().subgraphs.forEach((sg: Subgraph) => {
@@ -135,7 +120,7 @@ export class Graph7Widget {
         this.loadGraph(w => {
             this._graph.zoomToFit();
         });
-    }
+    },
 
     _onPartial(args) {
         this._graph.data().subgraphs.forEach((sg: Subgraph) => {
@@ -144,7 +129,7 @@ export class Graph7Widget {
         this.loadGraph(w => {
             this._graph.zoomToFit();
         });
-    }
+    },
 
     _onMax(args) {
         this._graph.data().subgraphs.forEach((sg: Subgraph) => {
@@ -153,53 +138,53 @@ export class Graph7Widget {
         this.loadGraph(w => {
             this._graph.zoomToFit();
         });
-    }
+    },
 
     _onZoomToFit(args) {
         this._graph.zoomToFit();
-    }
+    },
 
     _onZoomToWidth(args) {
         this._graph.zoomToWidth();
-    }
+    },
 
     _onZoomToPlus(args) {
         this._graph.zoomPlus();
-    }
+    },
 
     _onZoomToMinus(args) {
         this._graph.zoomMinus();
-    }
+    },
 
     isWorkunit() {
         return lang.exists("params.Wuid", this);
-    }
+    },
 
     isQuery() {
         return lang.exists("params.QueryId", this);
-    }
+    },
 
-    init(params) {
-        if (this.inherited(arguments))
+    init: function init(params) {
+        if (this.inherited(init, arguments))
             return;
 
         this.initGraph();
 
-        this.doInit(params);
-    }
+        this.doInit(params.Wuid);
+    },
 
     clear() {
         this._graph
             .data({ vertices: [], edges: [] })
             .render()
             ;
-    }
+    },
 
     doInit(wuid: string) {
-        this.wuid = wuid;
+        this.wuid = this.params.Wuid = wuid;
 
         this.refreshData();
-    }
+    },
 
     refreshData() {
         if (this.isWorkunit()) {
@@ -207,13 +192,13 @@ export class Graph7Widget {
         } else if (this.isQuery()) {
         }
         return Promise.resolve();
-    }
+    },
 
     loadGraphFromWu(wuid, graphName, refresh: boolean = false) {
         return this.fetchScopeGraph(wuid, graphName, refresh).then(() => {
             this.loadGraph();
         });
-    }
+    },
 
     initGraph() {
         this.graphStatus = dom.byId(this.id + "GraphStatus");
@@ -241,7 +226,7 @@ export class Graph7Widget {
         this._graph.tooltipHTML((v: Vertex) => {
             return this._gc.calcGraphTooltip2(v);
         });
-    }
+    },
 
     loadGraph(callback?) {
         this._graph
@@ -249,4 +234,4 @@ export class Graph7Widget {
             .render(callback)
             ;
     }
-}
+});

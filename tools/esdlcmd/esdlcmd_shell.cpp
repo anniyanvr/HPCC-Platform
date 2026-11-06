@@ -21,8 +21,6 @@
 #include "jargv.hpp"
 #include "jprop.hpp"
 
-#include "build-config.h"
-
 #include "esdlcmd.hpp"
 #include "esdlcmd_core.hpp"
 
@@ -157,7 +155,7 @@ bool EsdlCMDShell::parseCommandLineOptions(ArgvIterator &iter)
         }
         if (iter.matchFlag(boolValue, ESDLOPT_VERSION))
         {
-            fprintf(stdout, "%s\n", BUILD_TAG);
+            fprintf(stdout, "%s\n", hpccBuildInfo.buildTag);
             return false;
         }
         StringAttr tempArg;
@@ -198,6 +196,7 @@ void EsdlCMDShell::usage()
            "   bind-method       Configure method associated with existing ESDL binding.\n"
            "   unbind-method     Remove method associated with existing ESDL binding.\n"
            "   get-binding       Get ESDL binding.\n"
+           "   manifest          Build a service binding or bundle from a manifest file.\n"
            "   bind-log-transform  	Configure log transform associated with existing ESDL binding.\n"
            "   unbind-log-transform	Remove log transform associated with existing ESDL binding.\n"
            "   monitor           Generate ECL code for result monitoring / differencing\n"

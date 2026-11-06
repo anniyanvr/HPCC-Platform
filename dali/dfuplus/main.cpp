@@ -16,14 +16,13 @@
 ############################################################################## */
 
 #pragma warning (disable : 4786)
-#include <build-config.h>
 #include "daftcfg.hpp"
 #include "dfuerror.hpp"
 #include "dfuplus.hpp"
 
 void printVersion()
 {
-    printf("DFU Version: %d %s\n", DAFT_VERSION, BUILD_TAG);
+    printf("DFU Version: %d %s\n", DAFT_VERSION, hpccBuildInfo.buildTag);
 }
 
 void handleSyntax()
@@ -64,6 +63,7 @@ void handleSyntax()
     out.append("                                   source file set is empty.\n");
     out.append("    spray options:\n");
     out.append("        srcip=<source-machine-ip>\n");
+    out.append("        srcplane=<source-storage-plane-name>\n");
     out.append("        srcfile=<source-file-path>\n");
     out.append("        srcxml=<xml-file> -- replaces srcip and srcfile\n");
     out.append("        dstname=<destination-logical-name>\n");
@@ -71,6 +71,7 @@ void handleSyntax()
     out.append("        format=fixed|csv|delimited|xml|json|variable|recfmv|recfmvb\n");
     out.append("        prefix=filename{:length},filesize{:[B|L][1-8]}\n");
     out.append("        expireDays=<days-to-auto-delete-file>  -- optional, default is '' (empty), no expire\n");
+    out.append("        dstNumParts=<number-of-destination-parts>  -- optional, specify number of destination parts\n");
     out.append("        options for fixed:\n");
     out.append("            recordsize=<record-size>\n");
     out.append("        options for csv/delimited:\n");
@@ -102,6 +103,7 @@ void handleSyntax()
     out.append("    despray options:\n");
     out.append("        srcname=<source-logical-name>\n");
     out.append("        dstip=<destination-machine-ip>\n");
+    out.append("        dstplane=<destination-storage-plane-name>\n");
     out.append("        dstfile=<destination-file-path>\n");
     out.append("        dstxml=<xml-file> -- replaces dstip and dstfile\n");
     out.append("        splitprefix=... use prefix (same format as /prefix) to split file up\n");
@@ -122,6 +124,7 @@ void handleSyntax()
     out.append("        diffkeydst=<old-key-name>  -- use keydiff/keypatch (dst old name)\n");
     out.append("        multicopy=0|1  -- each destination part gets whole file\n");
     out.append("        preservecompression=1|0  -- optional, default is 1 (preserve)\n");
+    out.append("        ensure=0|1  -- optional, only copy file parts if not copied\n");
     out.append("    remove options:\n");
     out.append("        name=<logical-name>\n");
     out.append("        names=<multiple-logical-names-separated-by-comma>\n");
@@ -129,6 +132,10 @@ void handleSyntax()
     out.append("    rename options:\n");
     out.append("        srcname=<source-logical-name>\n");
     out.append("        dstname=<destination-logical-name>\n");
+    out.append("            -- Single file rename (backward compatible)\n");
+    out.append("        srcnames=<source-logical-names-separated-by-comma>\n");
+    out.append("        dstnames=<destination-logical-names-separated-by-comma>\n");
+    out.append("            -- Multiple file renames (srcnames and dstnames must have same number of items)\n");
     out.append("    list options:\n");
     out.append("        name=<logical-name-mask>\n");
     out.append("        saveto=<path and file name to save the result>\n");
@@ -160,12 +167,15 @@ void handleSyntax()
     out.append("        dstname=<destination-logical-name>\n");
     out.append("            -- To add remote files from another dali directly, use these\n");
     out.append("               options instead of srcxml:\n");
+    out.append("        dstcluster=<destination-cluster> -- which cluster contains the files\n");
     out.append("        srcname=<source-logical-name>\n");
     out.append("        srcdali=<source-dali-ip>\n");
     out.append("        srcusername=<user-name-for-source-dali>\n");
     out.append("        srcpassword=<password-for-source-dali>\n");
     out.append("    status options:\n");
     out.append("        wuid=<dfu-workunit-id>\n");
+    out.append("        limit=<limit> -- For publisher wuids, maximum number of child workunits\n");
+    out.append("                         to list, default is 1000. Set to 0 for parent status only.\n");
     out.append("    abort options:\n");
     out.append("        wuid=<dfu-workunit-id>\n");
     out.append("    resubmit options:\n");
@@ -252,6 +262,17 @@ int main(int argc, const char* argv[])
 
     //queryLogMsgManager()->changeMonitorFilterOwn(queryStderrLogMsgHandler(), getPassNoneLogMsgFilter());
 
+    // Every process must call loadConfiguration (if it has a configuration), or call initNullConfiguration
+    // before getComponentConfig or getGlobalConfig is called (used in common code, e.g. from jsocket)
+    // dfuplus does not have a standard configuration and is not normally used with one. It optionally processes
+    // an ini file (dfuplus.ini) found in the current working directory.
+    // It would be better if dfuplus moved over to a regular xml based config file, and the code below used getComponentConfig,
+    // then we could switch to loadConfiguration, and this code could be removed, but pragmatically, we want to keep it this way
+    // to preserve current usage patterns on bare-metal systems.
+    // In practice it is not expected that dfuplus will be used in a containerized environment, and if it were, it is not
+    // expected to have a local dfuplus.ini file.
+    initNullConfiguration();
+
     Owned<IProperties> globals = createProperties("dfuplus.ini", true);
 
     if(!build_globals(argc, argv, globals))
@@ -268,7 +289,7 @@ int main(int argc, const char* argv[])
     if(!action || !*action)
     {
         handleSyntax();
-        fprintf(stderr, "\nERROR: please specify one action");
+        fprintf(stderr, "\nERROR: please specify one action\n");
         releaseAtoms();
         return DFUERR_TooFewArguments;
     }

@@ -37,6 +37,7 @@ set(SRCS
     ../../bindings/http/platform/msgbuilder.cpp
     ../../bindings/SOAP/client/soapclient.cpp
     ../../bindings/SOAP/Platform/soapbind.cpp
+    ../../bindings/SOAP/Platform/soaphidlbind.cpp
     ../../bindings/SOAP/Platform/soapmessage.cpp
     ../../bindings/SOAP/Platform/soapservice.cpp
     ../../bindings/SOAP/Platform/soapparam.cpp
@@ -64,19 +65,23 @@ include_directories(
     ./../../../system/security/shared
     ./../../../system/security/LdapSecurity
     ./../../../system/security/zcrypt
-    ./../../../system/mp 
+    ./../../../system/mp
     ./../../../dali/base
     ./../../../common/workunit
     ${HPCC_SOURCE_DIR}/common/thorhelper
+    ${HPCC_SOURCE_DIR}/esp/esdllib
     )
 
-add_definitions(-DESPHTTP_EXPORTS -DESP_TIMING -D_USRDLL -DESP_PLUGIN)
-
+add_definitions(-DESPHTTP_EXPORTS -DESP_TIMING -D_USRDLL -DESP_PLUGIN -DTXSUMMARY_EXPORTS)
+if(USE_OPENLDAP)
+    add_definitions(-D_USE_OPENLDAP)
+endif()
 HPCC_ADD_LIBRARY(esphttp SHARED ${SRCS})
 add_dependencies(esphttp  espscm)
+
 install(TARGETS esphttp RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR})
 target_link_libraries(
-    esphttp
+    esphttp PRIVATE
     ${XALAN_LIBRARIES}
     ${XERCES_LIBRARIES}
     jlib
@@ -84,25 +89,35 @@ target_link_libraries(
     dalibase
     thorhelper      # this should not be dependent on the engine helper dll
     workunit        # neither should it be dependent on the wokunit dll
+    esdllib
+    ${CppUnit_LIBRARIES}
     )
+
+IF (USE_OPENSSL)
+    target_link_libraries (esphttp PRIVATE ${OPENSSL_LIBRARIES})
+ENDIF()
 
 if(LIBMEMCACHED_FOUND)
     if(MEMCACHED_USE_EXTERNAL_LIBRARY)
-        target_link_libraries(esphttp libmemcached libmemcachedutil)
+        target_link_libraries(esphttp PRIVATE libmemcached libmemcachedutil)
         add_dependencies(esphttp generate-libmemcached)
         install(CODE "set(ENV{LD_LIBRARY_PATH} \"\$ENV{LD_LIBRARY_PATH}:${PROJECT_BINARY_DIR}:${CMAKE_BINARY_DIR}/build-libmemcached/libmemcached/.libs\")")
     else()
-        target_link_libraries(esphttp ${LIBMEMCACHED_LIBRARIES})
+        target_link_libraries(esphttp PRIVATE ${LIBMEMCACHED_LIBRARIES})
     endif()
 endif()
 
 if(USE_OPENLDAP)
-    target_link_libraries(esphttp LdapSecurity)
+    target_link_libraries(esphttp PRIVATE LdapSecurity)
 endif(USE_OPENLDAP)
 
 IF (USE_ZLIB)
-    target_link_libraries ( esphttp
-        ${ZLIB_LIBRARIES}
+    target_link_libraries ( esphttp PRIVATE
         zcrypt
     )
 ENDIF()
+
+if (CMAKE_DL_LIBS)
+    target_link_libraries(esphttp PRIVATE ${CMAKE_DL_LIBS})
+endif()
+

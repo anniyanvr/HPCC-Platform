@@ -37,7 +37,9 @@
           ser usado como abreviação do contêiner da pasta atual. O uso do
           acento circunflexo no especificador de módulo (como por exemplo,
           myModule.^) seleciona o contêiner dessa pasta. O acento circunflexo
-          principal especifica a raíz lógica da árvore do arquivo.</entry>
+          principal especifica a raíz lógica da árvore do arquivo. Dentro de
+          uma MACRO ou FUNCTIONMACRO, <link linkend="_HASH_DOLLAR">#$</link>
+          refere-se ao módulo e ao pacote em que a macro foi definida.</entry>
         </row>
 
         <row>
@@ -100,11 +102,9 @@
   as definições EXPORT (e SHARED da mesma <emphasis>pasta</emphasis>) para
   serem usadas no código ECL atual.</para>
 
-  <para/>
+  <para><?hard-pagebreak ?>Exemplos:</para>
 
-  <para>Exemplos:</para>
-
-  <programlisting>IMPORT $;                      //makes all definitions from the same folder available
+  <programlisting lang="ECL">IMPORT $;                      //makes all definitions from the same folder available
 
 IMPORT $, Std;                 //makes the standard library functions available, also
 
@@ -116,11 +116,12 @@ IMPORT $.^.MyOtherModule       //makes available the definitions from MyOtherMod
 IMPORT $.^.^.SomeOtherModule   //makes available the definitions from SomeOtherModule folder,
                                //which is located in the grandparent folder of current folder
 
-IMPORT SomeFolder.SomeFile;    //make the specific file available
+IMPORT SomeFolder.SomeFile;    // make available a specific file
+                               // containing an EXPORTed MODULE
 
 IMPORT SomeReallyLongFolderName AS SN;  //alias the long name as "SN"
 
-IMPORT ^ as root;              //allows access to non-modules defined 
+IMPORT ^ AS root;              //allows access to non-modules defined 
                                //in the root of the repository
 
 IMPORT Def1,Def2 FROM Fred;    //makes Def1 and Def2 from Fred folder available, unqualified

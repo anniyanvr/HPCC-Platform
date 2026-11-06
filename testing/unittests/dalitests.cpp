@@ -31,12 +31,18 @@
 #include "dasds.hpp"
 #include "danqs.hpp"
 #include "dautils.hpp"
+#include "dastats.hpp"
+
+#include "wujobq.hpp"
 
 #include <vector>
 #include <future>
 #include <math.h>
 
+#include "jthread.hpp"
+
 #include "unittests.hpp"
+#include "sysinfologger.hpp"
 
 //#define COMPAT
 
@@ -44,11 +50,13 @@
 
 static __int64 subchangetotal;
 static unsigned subchangenum;
-static CriticalSection subchangesect;
+static CriticalSection subchangesect{SYNC_LOCATION};
 static IRemoteConnection *Rconn;
 static IDistributedFileDirectory & dir = queryDistributedFileDirectory();
 static IUserDescriptor *user = createUserDescriptor();
 static unsigned initCounter = 0; // counter for initialiser
+static unsigned numStdFiles = 0;
+static unsigned numSuperFiles = 0;
 
 // Declared in dadfs.cpp *only* when CPPUNIT is active
 extern void removeLogical(const char *fname, IUserDescriptor *user);
@@ -107,7 +115,7 @@ void checkFilePart(IChecker *checker,IDistributedFilePart *part,bool blocked)
     for (unsigned copy=0;copy<n;copy++) {
         INode *node = part->queryNode(copy);
         if (node)
-            checker->add(copy,"queryNode",node->endpoint().getUrlStr(tmp.clear()).str());
+            checker->add(copy,"queryNode",node->endpoint().getEndpointHostText(tmp.clear()).str());
         else
             checker->error("missing node");
         checker->add(copy,"getFilename",part->getFilename(rfn,copy).getRemotePath(tmp.clear()).str());
@@ -211,7 +219,7 @@ void checkFiles(const char *fn)
     if (fn) {
         checker.title(1,fn);
         try {
-            Owned<IDistributedFile> file=queryDistributedFileDirectory().lookup(fn,user,false,false,false,nullptr,defaultNonPrivilegedUser);
+            Owned<IDistributedFile> file=queryDistributedFileDirectory().lookup(fn,user,AccessMode::readLogicalMeta,false,false,nullptr,defaultNonPrivilegedUser);
             if (!file)
                 printf("file '%s' not found\n",fn);
             else
@@ -477,8 +485,9 @@ public:
         Owned<IGroup> grp = createIGroup("10.150.10.1-3");
         RemoteFilename rfn;
         for (unsigned i=0;i<3;i++)
-            for (unsigned ic=0;ic<mspec.defaultCopies;ic++) {
-                constructPartFilename(grp,i+1,3,(i==1)?"test.txt":NULL,"test._$P$_of_$N$","/c$/thordata/test",ic,mspec,rfn);
+            for (unsigned ic=0;ic<mspec.defaultCopies;ic++)
+            {
+                constructPartFilename(grp,i+1,ic,3,0,0,false,(i==1)?"test.txt":NULL,"/c$/thordata/test","test._$P$_of_$N$",0,rfn);
                 StringBuffer tmp;
                 printf("%d,%d: %s\n",i,ic,rfn.getRemotePath(tmp).str());
             }
@@ -610,7 +619,7 @@ public:
         for (i=0;i<100;i++) {
             s.clear().append("daregress::test").append(t);
             ASSERT(dir.exists(s.str(),user) && "Could not find sub-file");
-            Owned<IDistributedFile> dfile = dir.lookup(s.str(), user, false, false, false, nullptr, false);
+            Owned<IDistributedFile> dfile = dir.lookup(s.str(), user, AccessMode::readLogicalMeta, false, false, nullptr, false);
             ASSERT(dfile && "Could not find sub-file");
             offset_t totsz = 0;
             n = 11;
@@ -672,7 +681,7 @@ public:
             sfile->addSubFile(s.str());
         }
         sfile.clear();
-        sfile.setown(dir.lookupSuperFile("daregress::superfile1", user));
+        sfile.setown(dir.lookupSuperFile("daregress::superfile1", user, AccessMode::writeLogicalMeta));
         ASSERT(sfile && "Could not find added superfile");
         __int64 savcrc = crctot;
         crctot = 0;
@@ -699,7 +708,7 @@ public:
         ASSERT(totrows==tr && "Superfile size does not match part sum");
         sfile->detach();
         sfile.clear();
-        sfile.setown(dir.lookupSuperFile("daregress::superfile1",user));
+        sfile.setown(dir.lookupSuperFile("daregress::superfile1", user, AccessMode::writeLogicalMeta));
         ASSERT(!sfile && "Superfile deletion failed");
         t = 37;
         for (i=0;i<100;i++) {
@@ -711,7 +720,7 @@ public:
         t = 39;
         for (i=0;i<100;i++) {
             ASSERT(!dir.exists(s.str(),user) && "Found dir after deletion");
-            Owned<IDistributedFile> dfile = dir.lookup(s.str(), user, false, false, false, nullptr, false);
+            Owned<IDistributedFile> dfile = dir.lookup(s.str(), user, AccessMode::readLogicalMeta, false, false, nullptr, false);
             ASSERT(!dfile && "Found file after deletion");
             t = (t+39)%100;
         }
@@ -828,7 +837,7 @@ class CDaliSDSStressTests : public CppUnit::TestFixture
         public:
             IMPLEMENT_IINTERFACE;
 
-            CNodeSubCommitThread(const char *_xpath, bool _finalDelete) : threaded("CNodeSubCommitThread"), xpath(_xpath), finalDelete(_finalDelete)
+            CNodeSubCommitThread(const char *_xpath, bool _finalDelete) : xpath(_xpath), finalDelete(_finalDelete), threaded("CNodeSubCommitThread")
             {
             }
             virtual void threadmain() override
@@ -851,7 +860,7 @@ class CDaliSDSStressTests : public CppUnit::TestFixture
             }
             void start()
             {
-                threaded.init(this);
+                threaded.init(this, false);
             }
             void join()
             {
@@ -1048,8 +1057,8 @@ public:
             unsigned count;
 
         public:
-            Semaphore stopsem;
-            CChange(unsigned _n)
+            Semaphore stopsem{SYNC_LOCATION};
+            CChange(unsigned _n) : Thread("CChange")
             {
                 n = _n;
                 StringBuffer s("/DAREGRESS/CONSUB");
@@ -1069,7 +1078,7 @@ public:
                     id[i] = querySDS().subscribe(s.str(),*sub,false,true);
                 }
                 count = 0;
-                start();
+                start(false);
             }
 
             virtual int run()
@@ -1123,9 +1132,9 @@ public:
     {
         class CResult
         {
-            Semaphore sem;
+            Semaphore sem{SYNC_LOCATION};
             StringBuffer resultString;
-            CriticalSection crit;
+            CriticalSection crit{SYNC_LOCATION};
         public:
             CResult()
             {
@@ -1172,7 +1181,7 @@ public:
                 bool sub;
                 CResult &result;
             public:
-                CSubscriber(CResult &_result, const char *_xpath, bool _sub) : result(_result), xpath(_xpath), sub(_sub)
+                CSubscriber(CResult &_result, const char *_xpath, bool _sub) : xpath(_xpath), sub(_sub), result(_result)
                 {
                 }
                 virtual void notify(SubscriptionId id, const char *_xpath, SDSNotifyFlags flags, unsigned valueLen, const void *valueData)
@@ -1289,7 +1298,7 @@ public:
         {
             StringArray results;
             CRC32 crc;
-            CriticalSection crit;
+            CriticalSection crit{SYNC_LOCATION};
         public:
             void add(const char *out)
             {
@@ -1316,7 +1325,7 @@ public:
             CResults &results;
             unsigned expectedNotifications;
             std::atomic<unsigned> notifications = {0};
-            Semaphore joinSem;
+            Semaphore joinSem{SYNC_LOCATION};
         public:
             IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
 
@@ -1773,7 +1782,7 @@ static IFileDescriptor *createDescriptor(const char* dir, const char* name, unsi
     SocketEndpoint ep;
     ep.setLocalHost(0);
     StringBuffer ip;
-    ep.getIpText(ip);
+    ep.getHostText(ip);
     for (unsigned k=0;k<parts;k++) {
         s.clear().append(ip);
         Owned<INode> node = createINode(s.str());
@@ -1842,6 +1851,7 @@ static void setupDFS(const IContextLogger &logctx, const char *scope, unsigned s
         // Make sure it got created
         ASSERT(dir.exists(sub.str(),user,true,false) && "Can't add physical files");
     }
+    numStdFiles = subsToCreate;
 }
 
 class CDaliDFSStressTests : public CppUnit::TestFixture
@@ -1903,7 +1913,7 @@ public:
         sfile1->addSubFile("regress::trans::sub1", false, NULL, false, transaction);
         sfile1->addSubFile("regress::trans::sub2", false, NULL, false, transaction);
         sfile1.clear();
-        sfile1.setown(dir.lookupSuperFile("regress::trans::super1", user, transaction));
+        sfile1.setown(dir.lookupSuperFile("regress::trans::super1", user, AccessMode::readLogicalMeta, transaction));
         ASSERT(sfile1.get() && "non-transactional add super1 failed");
         ASSERT(sfile1->numSubFiles() == 2 && "auto-commit add sub failed, not all subs were added");
         ASSERT(strcmp(sfile1->querySubFile(0).queryLogicalName(), "regress::trans::sub1") == 0 && "auto-commit add sub failed, wrong name for sub1");
@@ -1919,7 +1929,7 @@ public:
         transaction->rollback();
         ASSERT(sfile2->numSubFiles() == 0 && "transactional rollback failed, some subs were added");
         sfile2.clear();
-        sfile2.setown(dir.lookupSuperFile("regress::trans::super2", user, transaction));
+        sfile2.setown(dir.lookupSuperFile("regress::trans::super2", user, AccessMode::readLogicalMeta, transaction));
         ASSERT(!sfile2.get() && "transactional rollback super2 failed, it exists!");
 
         // Commit
@@ -1930,7 +1940,7 @@ public:
         sfile3->addSubFile("regress::trans::sub4", false, NULL, false, transaction);
         transaction->commit();
         sfile3.clear();
-        sfile3.setown(dir.lookupSuperFile("regress::trans::super3", user, transaction));
+        sfile3.setown(dir.lookupSuperFile("regress::trans::super3", user, AccessMode::readLogicalMeta, transaction));
         ASSERT(sfile3.get() && "transactional add super3 failed");
         ASSERT(sfile3->numSubFiles() == 2 && "transactional add sub failed, not all subs were added");
         ASSERT(strcmp(sfile3->querySubFile(0).queryLogicalName(), "regress::trans::sub3") == 0 && "transactional add sub failed, wrong name for sub3");
@@ -1948,7 +1958,7 @@ public:
          * the super files, this should _not_ cause an issue, as no single super file will contain
          * mismatched subfiles.
         */
-        Owned<IDistributedFile> sub1 = dir.lookup("regress::trans::sub1", user, false, false, false, NULL, false, timeout);
+        Owned<IDistributedFile> sub1 = dir.lookup("regress::trans::sub1", user, AccessMode::readLogicalMeta, false, false, NULL, false, timeout);
         assertex(sub1);
         sub1->lockProperties();
         sub1->queryAttributes().setPropBool("@local", true);
@@ -1970,11 +1980,11 @@ public:
         logctx.CTXLOG("Promote (1, -, -) - first iteration");
         dir.promoteSuperFiles(3, sfnames, "regress::trans::sub1", delsub, createonlyone, user, timeout, outlinked);
         {
-            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile1.get() && "promote failed, super1 doesn't exist");
             ASSERT(sfile1->numSubFiles() == 1 && "promote failed, super1 should have one subfile");
             ASSERT(strcmp(sfile1->querySubFile(0).queryLogicalName(), "regress::trans::sub1") == 0 && "promote failed, wrong name for sub1");
-            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(!sfile2.get() && "promote failed, super2 does exist");
             ASSERT(outlinked.length() == 0 && "promote failed, outlinked expected empty");
         }
@@ -1982,15 +1992,15 @@ public:
         logctx.CTXLOG("Promote (2, 1, -) - second iteration");
         dir.promoteSuperFiles(3, sfnames, "regress::trans::sub2", delsub, createonlyone, user, timeout, outlinked);
         {
-            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile1.get() && "promote failed, super1 doesn't exist");
             ASSERT(sfile1->numSubFiles() == 1 && "promote failed, super1 should have one subfile");
             ASSERT(strcmp(sfile1->querySubFile(0).queryLogicalName(), "regress::trans::sub2") == 0 && "promote failed, wrong name for sub2");
-            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile2.get() && "promote failed, super2 doesn't exist");
             ASSERT(sfile2->numSubFiles() == 1 && "promote failed, super2 should have one subfile");
             ASSERT(strcmp(sfile2->querySubFile(0).queryLogicalName(), "regress::trans::sub1") == 0 && "promote failed, wrong name for sub1");
-            Owned<IDistributedSuperFile> sfile3 = dir.lookupSuperFile("regress::trans::super3", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile3 = dir.lookupSuperFile("regress::trans::super3", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(!sfile3.get() && "promote failed, super3 does exist");
             ASSERT(outlinked.length() == 0 && "promote failed, outlinked expected empty");
         }
@@ -1998,15 +2008,15 @@ public:
         logctx.CTXLOG("Promote (3, 2, 1) - third iteration");
         dir.promoteSuperFiles(3, sfnames, "regress::trans::sub3", delsub, createonlyone, user, timeout, outlinked);
         {
-            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile1.get() &&* "promote failed, super1 doesn't exist");
             ASSERT(sfile1->numSubFiles() == 1 && "promote failed, super1 should have one subfile");
             ASSERT(strcmp(sfile1->querySubFile(0).queryLogicalName(), "regress::trans::sub3") == 0 && "promote failed, wrong name for sub3");
-            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile2.get() && "promote failed, super2 doesn't exist");
             ASSERT(sfile2->numSubFiles() == 1 && "promote failed, super2 should have one subfile");
             ASSERT(strcmp(sfile2->querySubFile(0).queryLogicalName(), "regress::trans::sub2") == 0 && "promote failed, wrong name for sub2");
-            Owned<IDistributedSuperFile> sfile3 = dir.lookupSuperFile("regress::trans::super3", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile3 = dir.lookupSuperFile("regress::trans::super3", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile3.get() && "promote failed, super3 doesn't exist");
             ASSERT(sfile3->numSubFiles() == 1 && "promote failed, super3 should have one subfile");
             ASSERT(strcmp(sfile3->querySubFile(0).queryLogicalName(), "regress::trans::sub1") == 0 && "promote failed, wrong name for sub1");
@@ -2016,45 +2026,45 @@ public:
         logctx.CTXLOG("Promote (4, 3, 2) - fourth iteration, expect outlinked");
         dir.promoteSuperFiles(3, sfnames, "regress::trans::sub4", delsub, createonlyone, user, timeout, outlinked);
         {
-            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile1.get() && "promote failed, super1 doesn't exist");
             ASSERT(sfile1->numSubFiles() == 1 && "promote failed, super1 should have one subfile");
             ASSERT(strcmp(sfile1->querySubFile(0).queryLogicalName(), "regress::trans::sub4") == 0 && "promote failed, wrong name for sub4");
-            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile2.get() && "promote failed, super2 doesn't exist");
             ASSERT(sfile2->numSubFiles() == 1 && "promote failed, super2 should have one subfile");
             ASSERT(strcmp(sfile2->querySubFile(0).queryLogicalName(), "regress::trans::sub3") == 0 && "promote failed, wrong name for sub3");
-            Owned<IDistributedSuperFile> sfile3 = dir.lookupSuperFile("regress::trans::super3", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile3 = dir.lookupSuperFile("regress::trans::super3", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile3.get() && "promote failed, super3 doesn't exist");
             ASSERT(sfile3->numSubFiles() == 1 && "promote failed, super3 should have one subfile");
             ASSERT(strcmp(sfile3->querySubFile(0).queryLogicalName(), "regress::trans::sub2") == 0 && "promote failed, wrong name for sub2");
             ASSERT(outlinked.length() == 1 && "promote failed, outlinked expected only one item");
             ASSERT(strcmp(outlinked.popGet(), "regress::trans::sub1") == 0 && "promote failed, outlinked expected to be sub1");
-            Owned<IDistributedFile> sub1 = dir.lookup("regress::trans::sub1", user, false, false, false, NULL, false, timeout);
+            Owned<IDistributedFile> sub1 = dir.lookup("regress::trans::sub1", user, AccessMode::readLogicalMeta, false, false, NULL, false, timeout);
             ASSERT(sub1.get() && "promote failed, sub1 was physically deleted");
         }
 
         logctx.CTXLOG("Promote ([2,3], 4, 3) - fifth iteration, two in-files");
         dir.promoteSuperFiles(3, sfnames, "regress::trans::sub2,regress::trans::sub3", delsub, createonlyone, user, timeout, outlinked);
         {
-            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile1 = dir.lookupSuperFile("regress::trans::super1", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile1.get() && "promote failed, super1 doesn't exist");
             ASSERT(sfile1->numSubFiles() == 2 && "promote failed, super1 should have two subfiles");
             ASSERT(strcmp(sfile1->querySubFile(0).queryLogicalName(), "regress::trans::sub2") == 0 && "promote failed, wrong name for sub1");
             ASSERT(strcmp(sfile1->querySubFile(1).queryLogicalName(), "regress::trans::sub3") == 0 && "promote failed, wrong name for sub2");
-            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile2 = dir.lookupSuperFile("regress::trans::super2", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile2.get() && "promote failed, super2 doesn't exist");
             ASSERT(sfile2->numSubFiles() == 1 && "promote failed, super2 should have one subfile");
             ASSERT(strcmp(sfile2->querySubFile(0).queryLogicalName(), "regress::trans::sub4") == 0 && "promote failed, wrong name for sub4");
-            Owned<IDistributedSuperFile> sfile3 = dir.lookupSuperFile("regress::trans::super3", user, NULL, timeout);
+            Owned<IDistributedSuperFile> sfile3 = dir.lookupSuperFile("regress::trans::super3", user, AccessMode::readLogicalMeta, NULL, timeout);
             ASSERT(sfile3.get() && "promote failed, super3 doesn't exist");
             ASSERT(sfile3->numSubFiles() == 1 && "promote failed, super3 should have one subfile");
             ASSERT(strcmp(sfile3->querySubFile(0).queryLogicalName(), "regress::trans::sub3") == 0 && "promote failed, wrong name for sub3");
             ASSERT(outlinked.length() == 1 && "promote failed, outlinked expected only one item");
             ASSERT(strcmp(outlinked.popGet(), "regress::trans::sub2") == 0 && "promote failed, outlinked expected to be sub2");
-            Owned<IDistributedFile> sub1 = dir.lookup("regress::trans::sub1", user, false, false, false, NULL, false, timeout);
+            Owned<IDistributedFile> sub1 = dir.lookup("regress::trans::sub1", user, AccessMode::readLogicalMeta, false, false, NULL, false, timeout);
             ASSERT(sub1.get() && "promote failed, sub1 was physically deleted");
-            Owned<IDistributedFile> sub2 = dir.lookup("regress::trans::sub2", user, false, false, false, NULL, false, timeout);
+            Owned<IDistributedFile> sub2 = dir.lookup("regress::trans::sub2", user, AccessMode::readLogicalMeta, false, false, NULL, false, timeout);
             ASSERT(sub2.get() && "promote failed, sub2 was physically deleted");
         }
     }
@@ -2083,16 +2093,16 @@ public:
         for (i=0;i<file->numClusters();i++)
             PROGLOG("cluster[%d] = %s",i,file->getClusterName(i,name.clear()).str());
         file.clear();
-        file.setown(queryDistributedFileDirectory().lookup("test::testfile1",user,false,false,false,nullptr,defaultNonPrivilegedUser));
+        file.setown(queryDistributedFileDirectory().lookup("test::testfile1",user,AccessMode::readLogicalMeta,false,false,nullptr,defaultNonPrivilegedUser));
         for (i=0;i<file->numClusters();i++)
             PROGLOG("cluster[%d] = %s",i,file->getClusterName(i,name.clear()).str());
         file.clear();
-        file.setown(queryDistributedFileDirectory().lookup("test::testfile1@testgrp1",user,false,false,false,nullptr,defaultNonPrivilegedUser));
+        file.setown(queryDistributedFileDirectory().lookup("test::testfile1@testgrp1",user,AccessMode::readLogicalMeta,false,false,nullptr,defaultNonPrivilegedUser));
         for (i=0;i<file->numClusters();i++)
             PROGLOG("cluster[%d] = %s",i,file->getClusterName(i,name.clear()).str());
         file.clear();
         removeLogical("test::testfile1@testgrp2", user);
-        file.setown(queryDistributedFileDirectory().lookup("test::testfile1",user,false,false,false,nullptr,defaultNonPrivilegedUser));
+        file.setown(queryDistributedFileDirectory().lookup("test::testfile1",user,AccessMode::readLogicalMeta,false,false,nullptr,defaultNonPrivilegedUser));
         for (i=0;i<file->numClusters();i++)
             PROGLOG("cluster[%d] = %s",i,file->getClusterName(i,name.clear()).str());
     }
@@ -2180,14 +2190,14 @@ public:
 
 
         logctx.CTXLOG("Removing regress::del::sub1 from super1, no del");
-        sfile.setown(transaction->lookupSuperFile("regress::del::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::del::super1", AccessMode::writeLogicalMeta));
         sfile->removeSubFile("regress::del::sub1", false, false, transaction);
         ASSERT(sfile->numSubFiles() == 1 && "File sub1 was not removed from super1");
         sfile.clear();
         ASSERT(dir.exists("regress::del::sub1", user) && "File sub1 was removed from the file system");
 
         logctx.CTXLOG("Removing regress::del::sub4 from super1, del");
-        sfile.setown(transaction->lookupSuperFile("regress::del::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::del::super1", AccessMode::writeLogicalMeta));
         sfile->removeSubFile("regress::del::sub4", true, false, transaction);
         ASSERT(!sfile->numSubFiles() && "File sub4 was not removed from super1");
         sfile.clear();
@@ -2298,12 +2308,12 @@ public:
         transaction->start();
 
         logctx.CTXLOG("Removing sub1 from super1, within transaction");
-        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1", AccessMode::writeLogicalMeta));
         sfile->removeSubFile("regress::clearadd::sub1", false, false, transaction);
         sfile.clear();
 
         logctx.CTXLOG("Adding sub1 back into to super1, within transaction");
-        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1", AccessMode::writeLogicalMeta));
         sfile->addSubFile("regress::clearadd::sub1", false, NULL, false, transaction);
         sfile.clear();
         try
@@ -2317,7 +2327,7 @@ public:
             CPPUNIT_ASSERT_MESSAGE(eStr.str(), 0);
             e->Release();
         }
-        sfile.setown(dir.lookupSuperFile("regress::clearadd::super1", user));
+        sfile.setown(dir.lookupSuperFile("regress::clearadd::super1", user, AccessMode::readLogicalMeta));
         ASSERT(NULL != sfile->querySubFileNamed("regress::clearadd::sub1") && "regress::clearadd::sub1, should be a subfile of super1");
 
         // same but remove all (clear)
@@ -2325,17 +2335,17 @@ public:
         transaction->start();
 
         logctx.CTXLOG("Adding sub2 into to super1, within transaction");
-        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1", AccessMode::writeLogicalMeta));
         sfile->addSubFile("regress::clearadd::sub2", false, NULL, false, transaction);
         sfile.clear();
 
         logctx.CTXLOG("Removing all sub files from super1, within transaction");
-        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1", AccessMode::writeLogicalMeta));
         sfile->removeSubFile(NULL, false, false, transaction);
         sfile.clear();
 
         logctx.CTXLOG("Adding sub2 back into to super1, within transaction");
-        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::clearadd::super1", AccessMode::writeLogicalMeta));
         sfile->addSubFile("regress::clearadd::sub2", false, NULL, false, transaction);
         sfile.clear();
         try
@@ -2349,7 +2359,7 @@ public:
             CPPUNIT_ASSERT_MESSAGE(eStr.str(), 0);
             e->Release();
         }
-        sfile.setown(dir.lookupSuperFile("regress::clearadd::super1", user));
+        sfile.setown(dir.lookupSuperFile("regress::clearadd::super1", user, AccessMode::readLogicalMeta));
         ASSERT(NULL != sfile->querySubFileNamed("regress::clearadd::sub2") && "regress::clearadd::sub2, should be a subfile of super1");
         ASSERT(NULL == sfile->querySubFileNamed("regress::clearadd::sub1") && "regress::clearadd::sub1, should NOT be a subfile of super1");
         ASSERT(NULL == sfile->querySubFileNamed("regress::clearadd::sub4") && "regress::clearadd::sub4, should NOT be a subfile of super1");
@@ -2388,17 +2398,17 @@ public:
         dir.renamePhysical("regress::rename2::sub2", "regress::rename2::renamedsub2", user, transaction);
 
         logctx.CTXLOG("Removing regress::rename2::sub1 from regress::rename2::super1");
-        sfile.setown(transaction->lookupSuperFile("regress::rename2::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::rename2::super1", AccessMode::writeLogicalMeta));
         sfile->removeSubFile("regress::rename2::sub1", false, false, transaction);
         sfile.clear();
 
         logctx.CTXLOG("Adding renamedsub2 to super1");
-        sfile.setown(transaction->lookupSuperFile("regress::rename2::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::rename2::super1", AccessMode::writeLogicalMeta));
         sfile->addSubFile("regress::rename2::renamedsub2", false, NULL, false, transaction);
         sfile.clear();
 
         logctx.CTXLOG("Adding back sub1 to super1");
-        sfile.setown(transaction->lookupSuperFile("regress::rename2::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::rename2::super1", AccessMode::writeLogicalMeta));
         sfile->addSubFile("regress::rename2::sub1", false, NULL, false, transaction);
         sfile.clear();
 
@@ -2418,7 +2428,7 @@ public:
 
         // validate..
         ASSERT(dir.exists("regress::rename2::renamedsub2", user, true, false) && "regress::rename2::renamedsub2 should exist now transaction committed");
-        sfile.setown(dir.lookupSuperFile("regress::rename2::super1", user));
+        sfile.setown(dir.lookupSuperFile("regress::rename2::super1", user, AccessMode::readLogicalMeta));
 
         ASSERT(NULL != sfile->querySubFileNamed("regress::rename2::renamedsub2") && "regress::rename2::renamedsub2, should be a subfile of super1");
         ASSERT(NULL != sfile->querySubFileNamed("regress::rename2::sub1") && "regress::rename2::sub1, should be a subfile of super1");
@@ -2579,6 +2589,281 @@ public:
 CPPUNIT_TEST_SUITE_REGISTRATION( CDaliDFSStressTests );
 CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( CDaliDFSStressTests, "CDaliDFSStressTests" );
 
+
+class DaliDFSIteratorTests : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(DaliDFSIteratorTests);
+        CPPUNIT_TEST(testInit);
+        CPPUNIT_TEST(testIteratorSetup);
+        CPPUNIT_TEST(testDirectoryIterator);
+        CPPUNIT_TEST(testDFAttrIteratorSimple);
+        CPPUNIT_TEST(testDFAttrIterator);
+        CPPUNIT_TEST(testDFAttrIteratorSelectFields);
+        CPPUNIT_TEST(testGetLogicalFilesSorted);
+    CPPUNIT_TEST_SUITE_END();
+
+    const IContextLogger &logctx;
+
+public:
+    DaliDFSIteratorTests() : logctx(queryDummyContextLogger())
+    {
+    }
+    ~DaliDFSIteratorTests()
+    {
+        daliClientEnd();
+    }
+    void testInit()
+    {
+        daliClientInit();
+    }
+    void testIteratorSetup()
+    {
+        setupDFS(logctx, "iterator", 1, 4);
+        Owned<IDistributedSuperFile> sfile1 = dir.createSuperFile("regress::iterator::super1", user, false);
+        sfile1->addSubFile("regress::iterator::sub1");
+        sfile1->addSubFile("regress::iterator::sub2");
+        sfile1.clear();
+        numSuperFiles++;
+
+        // Remove first
+        if (dir.exists("regress::iterator::othergroup", user, true, false))
+            ASSERT(dir.removeEntry("regress::iterator::othergroup", user) && "Can't remove sub-file");
+
+        Owned<IFileDescriptor> fdesc = createDescriptor("regress/iterator", "othergroup", 1, 17);
+        Owned<IGroup> grp1 = createIGroup("127.0.0.1");
+        ClusterPartDiskMapSpec mapping;
+        fdesc->setClusterGroup(0, grp1);
+        fdesc->setClusterGroupName(0, "grp1");
+        Owned<IGroup> grp2 = createIGroup("127.0.0.2");
+        fdesc->addCluster("grp2", grp2, mapping);
+        Owned<IDistributedFile> dsub = dir.createNew(fdesc);
+        dsub->attach("regress::iterator::othergroup", user);
+        dsub.clear();
+        fdesc.clear();
+        numStdFiles += 2; // iterators treats as one per group
+    }
+
+    void testDirectoryIterator()
+    {
+        // Test basic directory iterator functionality, check counts
+        // and populate some attributes for other tests
+
+        IDistributedFileDirectory &dir = queryDistributedFileDirectory();
+
+        Owned<IDistributedFileIterator> iter = dir.getIterator("regress::iterator::*", false, user, false);
+        unsigned count = 0;
+        ForEach(*iter)
+            ++count;
+        CPPUNIT_ASSERT_MESSAGE("testDirectoryIterator: expected 5 sub files", count == numStdFiles);
+
+        iter.setown(dir.getIterator("regress::iterator::*", true, nullptr, false));
+        count = 0;
+        ForEach(*iter)
+            ++count;
+        CPPUNIT_ASSERT_MESSAGE("testDirectoryIterator: expected 6 sub files", count == (numStdFiles+numSuperFiles));
+
+        iter.setown(dir.getIterator("regress::iterator::*", false, nullptr, false));
+
+        ForEach(*iter)
+        {
+            IDistributedFile &file = iter->query();
+            const char *logicalName = file.queryLogicalName();
+            CDfsLogicalFileName lfn;
+            lfn.set(logicalName);
+
+            CDateTime dt;
+            dt.setNow();
+            file.setAccessedTime(dt);
+            file.setExpire(4);
+
+            DistributedFilePropertyLock lock(&file);
+            IPropertyTree &attr = lock.queryAttributes();
+            const char *tail = lfn.queryTail();
+            StringBuffer attrValue(tail);
+            attr.setProp("@job", attrValue);
+            attr.setProp("@owner", attrValue);
+            attr.setProp("@workunit", attrValue);
+        }
+    }
+
+    void testDFAttrIteratorSimple()
+    {
+        IDistributedFileDirectory &dir = queryDistributedFileDirectory();
+
+        const char *wildName = "regress::iterator::*";
+        Owned<IPropertyTreeIterator> iter = dir.getDFAttributesIterator(wildName, user, true, false);
+        unsigned count = 0;
+        ForEach(*iter)
+            ++count;
+        VStringBuffer msg("testDFAttrIteratorSimple: expected %u files", numStdFiles);
+        CPPUNIT_ASSERT_MESSAGE(msg, count == numStdFiles);
+    }
+
+    void testDFAttrIterator()
+    {
+        IDistributedFileDirectory &dir = queryDistributedFileDirectory();
+
+        const char *wildName = "regress::iterator::*";
+        StringBuffer filterBuf;
+        // all non-superfiles
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileType).append(DFUQFilterSeparator).append(DFUQFFTnonsuperfileonly).append(DFUQFilterSeparator);
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileNameWithPrefix).append(DFUQFilterSeparator).append(wildName).append(DFUQFilterSeparator);
+
+        bool allReceived = false;
+        Owned<IPropertyTreeIterator> iter = dir.getDFAttributesFilteredIterator(filterBuf,
+            nullptr,                      // no local filters
+            nullptr,                      // no fields specified (default all)
+            user,                         // user context
+            true,                         // recursive
+            allReceived,                  // output parameter
+            nullptr                       // pointer to receive total count
+        );
+        CPPUNIT_ASSERT(allReceived);
+
+        unsigned count = 0;
+        ForEach(*iter)
+        {
+            const IPropertyTree &attrs = iter->query();
+            CPPUNIT_ASSERT_MESSAGE("testDFAttrIterator: missing 'name' attribute", attrs.hasProp(getDFUQResultFieldName(DFUQResultField::name)));
+            CPPUNIT_ASSERT_MESSAGE("testDFAttrIterator: missing 'group' attribute", attrs.hasProp(getDFUQResultFieldName(DFUQResultField::nodegroup)));
+            CPPUNIT_ASSERT_MESSAGE("testDFAttrIterator: missing 'modified' attribute", attrs.hasProp(getDFUQResultFieldName(DFUQResultField::timemodified)));
+            CPPUNIT_ASSERT_MESSAGE("testDFAttrIterator: missing 'numparts' attribute", attrs.hasProp(getDFUQResultFieldName(DFUQResultField::numparts)));
+            CPPUNIT_ASSERT_MESSAGE("testDFAttrIterator: missing 'partmask' attribute", attrs.hasProp(getDFUQResultFieldName(DFUQResultField::partmask)));
+            ++count;
+        }
+        VStringBuffer msg("testDFAttrIterator: expected %u files", numStdFiles);
+        CPPUNIT_ASSERT_MESSAGE(msg, count == numStdFiles);
+
+        // very fake local filter test - DFUQFFgroup is the only local filter supported
+        const char *groupText = "grp2";
+        // server side filter to get only files with this group
+        filterBuf.append(DFUQFTcontainString).append(DFUQFilterSeparator).append(getDFUQFilterFieldName(DFUQFFgroup)).append(DFUQFilterSeparator).append(groupText).append(DFUQFilterSeparator).append(",").append(DFUQFilterSeparator);
+
+        StringBuffer localFilterBuf;
+        localFilterBuf.append(DFUQFTwildcardMatch).append(DFUQFilterSeparator).append(getDFUQFilterFieldName(DFUQFFgroup)).append(DFUQFilterSeparator).append(groupText);
+
+        iter.setown(dir.getDFAttributesFilteredIterator(filterBuf,
+            localFilterBuf,
+            nullptr,                      // no fields specified (default all)
+            user,                         // user context
+            true,                         // recursive
+            allReceived,                  // output parameter
+            nullptr                       // pointer to receive total count
+        ));
+        CPPUNIT_ASSERT(allReceived);
+
+        count = 0;
+        ForEach(*iter)
+            ++count;
+        CPPUNIT_ASSERT_MESSAGE("testDFAttrIterator: expected 1 files", count == 1);
+    }
+
+    void testDFAttrIteratorSelectFields()
+    {
+        IDistributedFileDirectory &dir = queryDistributedFileDirectory();
+
+        const char *wildName = "regress::iterator::sub4";
+        StringBuffer filterBuf;
+        // all non-superfiles
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileType).append(DFUQFilterSeparator).append(DFUQFFTnonsuperfileonly).append(DFUQFilterSeparator);
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileNameWithPrefix).append(DFUQFilterSeparator).append(wildName).append(DFUQFilterSeparator);
+
+        std::vector<DFUQResultField> fields = {DFUQResultField::recordsize, DFUQResultField::term};
+
+        bool allReceived = false;
+        Owned<IPropertyTreeIterator> iter = dir.getDFAttributesFilteredIterator(filterBuf,
+            nullptr,                      // no local filters
+            fields.data(),                // select fields
+            user,                         // user context
+            true,                         // recursive
+            allReceived,                  // output parameter
+            nullptr                       // pointer to receive total count
+        );
+        CPPUNIT_ASSERT(allReceived);
+
+        unsigned count = 0;
+        ForEach(*iter)
+        {
+            const IPropertyTree &attrs = iter->query();
+            CPPUNIT_ASSERT_MESSAGE("testDFAttrIteratorSelectFields: recordSize attribute should be present", attrs.hasProp("@recordSize"));
+            CPPUNIT_ASSERT_MESSAGE("testDFAttrIteratorSelectFields: directory attribute should NOT be present", !attrs.hasProp("@directory"));
+            ++count;
+        }
+        CPPUNIT_ASSERT_MESSAGE("testDFAttrIteratorSelectFields: expected 1 file", count == 1);
+
+        auto testInclusionExclusion = [&](bool inclusion)
+        {
+            // test includeAll with an exclusion
+            if (inclusion)
+                fields = { DFUQResultField::includeAll, DFUQResultField::recordsize|DFUQResultField::exclude, DFUQResultField::term};
+            else
+                fields = { DFUQResultField::includeAll|DFUQResultField::exclude, DFUQResultField::recordsize, DFUQResultField::term};
+
+            iter.setown(dir.getDFAttributesFilteredIterator(filterBuf,
+                nullptr,                      // no local filters
+                fields.data(),                // select fields
+                user,                         // user context
+                true,                         // recursive
+                allReceived,                  // output parameter
+                nullptr                       // pointer to receive total count
+            ));
+            CPPUNIT_ASSERT(allReceived);
+            count = 0;
+            ForEach(*iter)
+            {
+                const IPropertyTree &attrs = iter->query();
+                CPPUNIT_ASSERT(inclusion == attrs.hasProp("@directory"));
+                CPPUNIT_ASSERT(inclusion == attrs.hasProp("@job"));
+                CPPUNIT_ASSERT(inclusion == attrs.hasProp("@owner"));
+                CPPUNIT_ASSERT(inclusion == attrs.hasProp("@workunit"));
+                CPPUNIT_ASSERT(inclusion == !attrs.hasProp("@recordSize"));
+                ++count;
+            }
+            CPPUNIT_ASSERT_MESSAGE("testDFAttrIteratorSelectFields: expected 1 file", count == 1);
+        };
+        testInclusionExclusion(true);
+        testInclusionExclusion(false);
+    }
+
+    void testGetLogicalFilesSorted()
+    {
+        IDistributedFileDirectory &dir = queryDistributedFileDirectory();
+
+        const char *wildName = "regress::iterator::sub*";
+        StringBuffer filterBuf;
+        // all non-superfiles
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileType).append(DFUQFilterSeparator).append(DFUQFFTnonsuperfileonly).append(DFUQFilterSeparator);
+        filterBuf.append(DFUQFTspecial).append(DFUQFilterSeparator).append(DFUQSFFileNameWithPrefix).append(DFUQFilterSeparator).append(wildName).append(DFUQFilterSeparator);
+
+        std::vector<DFUQResultField> fields = {DFUQResultField::size, DFUQResultField::cost, DFUQResultField::term};
+
+        DFUQResultField sortOrder[2] = {DFUQResultField::job|DFUQResultField::reverse, DFUQResultField::term};
+        __int64 hint;
+        unsigned totalFiles;
+        bool allMatchingFilesReceived;
+        Owned<IPropertyTreeIterator> iter = dir.getLogicalFilesSorted(nullptr, sortOrder, filterBuf.str(),
+            nullptr, fields.data(), 0, INFINITE, &hint, &totalFiles, &allMatchingFilesReceived);
+
+        unsigned subJobs = numStdFiles - 2; // -2 exclude iterator::othergroup files
+        VStringBuffer expectedJob("sub%u", subJobs); // <numStdFiles> subs, <numStdFiles> jobs, reverse order
+        ForEach(*iter)
+        {
+            const IPropertyTree &attrs = iter->query();
+            CPPUNIT_ASSERT_MESSAGE("testGetLogicalFilesSorted: group property missing", attrs.hasProp("@group"));
+            VStringBuffer msg("testGetLogicalFilesSorted: expected @job == %s", expectedJob.str());
+            CPPUNIT_ASSERT_MESSAGE(msg.str(), streq(attrs.queryProp("@job"), expectedJob.str()));
+            expectedJob.setf("sub%u", --subJobs);
+            bool costAttrsPresent = attrs.hasProp("@cost") && attrs.hasProp("@readCost") && attrs.hasProp("@writeCost") && attrs.hasProp("@atRestCost");
+            CPPUNIT_ASSERT_MESSAGE("testGetLogicalFilesSorted: Missing cost attributes", costAttrsPresent);
+            bool dirAttrsPresent = attrs.hasProp("@directory");
+            CPPUNIT_ASSERT_MESSAGE("testGetLogicalFilesSorted: directory attribute should NOT be present", !dirAttrsPresent);
+        }
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( DaliDFSIteratorTests );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( DaliDFSIteratorTests, "DaliDFSIteratorTests" );
+
 class CDaliDFSRetrySlowTests : public CppUnit::TestFixture
 {
     CPPUNIT_TEST_SUITE(CDaliDFSRetrySlowTests);
@@ -2614,7 +2899,7 @@ public:
         }
         virtual void threadmain() override
         {
-            Owned<IDistributedFile> file=queryDistributedFileDirectory().lookup(fileName,nullptr,false,false,false,nullptr,defaultNonPrivilegedUser);
+            Owned<IDistributedFile> file=queryDistributedFileDirectory().lookup(fileName,nullptr,AccessMode::readLogicalMeta,false,false,nullptr,defaultNonPrivilegedUser);
 
             if (!file)
             {
@@ -2627,7 +2912,7 @@ public:
 
             PROGLOG("Unlocking file: %s", fileName.get());
         }
-        void start() { threaded.start(); }
+        void start() { threaded.start(false); }
     };
 
     void testDFSAddFailReAdd()
@@ -2655,9 +2940,9 @@ public:
         transaction->start();
 
         logctx.CTXLOG("Adding contents of regress::addreadd::super1 to regress::addreadd::super2, within transaction");
-        sfile.setown(transaction->lookupSuperFile("regress::addreadd::super2"));
+        sfile.setown(transaction->lookupSuperFile("regress::addreadd::super2", AccessMode::writeLogicalMeta));
         sfile->addSubFile("regress::addreadd::super1", false, NULL, true, transaction); // add contents of super1 to super2
-        sfile.setown(transaction->lookupSuperFile("regress::addreadd::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::addreadd::super1", AccessMode::writeLogicalMeta));
         sfile->removeSubFile(NULL, false, false, transaction); // clears super1
         sfile.clear();
 
@@ -2673,12 +2958,12 @@ public:
             e->Release();
         }
         transaction.clear();
-        sfile.setown(dir.lookupSuperFile("regress::addreadd::super2", user));
+        sfile.setown(dir.lookupSuperFile("regress::addreadd::super2", user, AccessMode::readLogicalMeta));
         ASSERT(3 == sfile->numSubFiles() && "regress::addreadd::super2 should contain 3 subfiles");
         ASSERT(NULL != sfile->querySubFileNamed("regress::addreadd::sub1") && "regress::addreadd::sub1, should be a subfile of super2");
         ASSERT(NULL != sfile->querySubFileNamed("regress::addreadd::sub2") && "regress::addreadd::sub2, should be a subfile of super2");
         ASSERT(NULL != sfile->querySubFileNamed("regress::addreadd::sub3") && "regress::addreadd::sub3, should be a subfile of super2");
-        sfile.setown(dir.lookupSuperFile("regress::addreadd::super1", user));
+        sfile.setown(dir.lookupSuperFile("regress::addreadd::super1", user, AccessMode::readLogicalMeta));
         ASSERT(0 == sfile->numSubFiles() && "regress::addreadd::super1 should contain 0 subfiles");
     }
     void testDFSRetrySuperLock()
@@ -2695,7 +2980,7 @@ public:
         CShortLock sL("regress::retrysuperlock::super1", 15);
         sL.start();
 
-        sfile.setown(dir.lookupSuperFile("regress::retrysuperlock::super1", user));
+        sfile.setown(dir.lookupSuperFile("regress::retrysuperlock::super1", user, AccessMode::writeLogicalMeta));
         if (sfile)
         {
             logctx.CTXLOG("Removing subfiles from regress::retrysuperlock::super1");
@@ -2711,7 +2996,7 @@ public:
         logctx.CTXLOG("Starting transaction");
         transaction->start();
 
-        sfile.setown(transaction->lookupSuperFile("regress::retrysuperlock::super1"));
+        sfile.setown(transaction->lookupSuperFile("regress::retrysuperlock::super1", AccessMode::writeLogicalMeta));
         if (sfile)
         {
             logctx.CTXLOG("Removing subfiles from regress::retrysuperlock::super1 with transaction");
@@ -2731,9 +3016,34 @@ CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( CDaliDFSRetrySlowTests, "CDaliDFSRetrySlo
 class CDaliUtils : public CppUnit::TestFixture
 {
     CPPUNIT_TEST_SUITE(CDaliUtils);
+      CPPUNIT_TEST(testIsForeignFilename);
       CPPUNIT_TEST(testDFSLfn);
     CPPUNIT_TEST_SUITE_END();
 public:
+    void testIsForeignFilename()
+    {
+        struct TestCase
+        {
+            const char *name;
+            bool expected;
+        };
+        const TestCase testCases[] = {
+            { nullptr, false },
+            { "", false },
+            { "foreign::192.168.16.1::scope::file", true },
+            { "~foreign::192.168.16.1::scope::file", true },
+            { "  ~ FOREIGN :: 192.168.16.1::scope::file", true },
+            { "foreign::192.168.16.1", false },
+            { "scope::foreign::192.168.16.1::file", false },
+            { "file::192.168.16.1::path::file", false },
+            { "{scope::file, foreign::192.168.16.1::file}", true },
+            { "{scope::file, file::192.168.16.1::path::file}", false }
+        };
+
+        for (const TestCase &testCase : testCases)
+            CPPUNIT_ASSERT_EQUAL_MESSAGE(testCase.name ? testCase.name : "(null)", testCase.expected, isForeignFilename(testCase.name));
+    }
+
     void testDFSLfn()
     {
         const char *lfns[] = { "~foreign::192.168.16.1::scope1::file1",
@@ -2777,6 +3087,19 @@ public:
                                { "{~foreign::192.168.16.1::.::.::multi1, ~foreign::192.168.16.2::multi2::.::fname}", "{foreign::192.168.16.1::multi1,foreign::192.168.16.2::multi2::fname}" },
                                { nullptr, nullptr }                             // terminator
                              };
+        const char *scopes[][2] = {
+                               { "~file::127.0.0.1::var::lib::^H^P^C^C^Systems::mydropzone::afile", "file::127.0.0.1::var::lib::^h^p^c^c^systems::mydropzone"},
+                               { "~remote::dfs1::ascope::afile", "remote::dfs1::ascope"},
+                               { nullptr, nullptr }                            // terminator
+        };
+
+        const char *externalUrlChecks[][2] = {
+                               { "~file::127.0.0.1::var::lib::^H^P^C^C^Systems::mydropzone::ascope::afile", "/var/lib/HPCCSystems/mydropzone/ascope/afile"},
+                               { "~file::10.3.2.1::var::lib::^H^P^C^C^Systems::mydropzone::ascope::afile", "//10.3.2.1/var/lib/HPCCSystems/mydropzone/ascope/afile"},
+                               { "~plane::mydropzone::ascope::afile", "/var/lib/HPCCSystems/mydropzone/ascope/afile"},
+                               { "~plane::dropzone2::ascope::afile", "//10.4.3.2/var/lib/HPCCSystems/mydropzone/ascope/afile"},
+                               { nullptr, nullptr }                            // terminator
+        };
         PROGLOG("Checking valid logical filenames");
         unsigned nlfn=0;
         for (;;)
@@ -2816,6 +3139,91 @@ public:
                 const char *result = dlfn.get();
                 if (!streq(result, expected))
                     err.appendf("Logical filename '%s' should have translated to '%s', but result was '%s'.", lfn, expected, result);
+            }
+            catch (IException *e)
+            {
+                err.appendf("Logical filename '%s' failed: ", lfn);
+                e->errorMessage(err);
+                e->Release();
+            }
+            if (err.length())
+            {
+                ERRLOG("%s", err.str());
+                CPPUNIT_FAIL(err.str());
+            }
+        }
+        PROGLOG("Checking getScopes");
+        nlfn = 0;
+        for (;;)
+        {
+            const char **entry = scopes[nlfn++];
+            if (nullptr == entry[0])
+                break;
+            const char *lfn = entry[0];
+            const char *expected = entry[1];
+            PROGLOG("lfn = %s, expect scopes = %s", lfn, expected);
+            CDfsLogicalFileName dlfn;
+            StringBuffer err;
+            try
+            {
+                dlfn.set(lfn);
+                StringBuffer result;
+                dlfn.getScopes(result);
+                if (!streq(result, expected))
+                    err.appendf("Logical filename '%s' scopes should be '%s', but result was '%s'.", lfn, expected, result.str());
+            }
+            catch (IException *e)
+            {
+                err.appendf("Logical filename '%s' failed: ", lfn);
+                e->errorMessage(err);
+                e->Release();
+            }
+            if (err.length())
+            {
+                ERRLOG("%s", err.str());
+                CPPUNIT_FAIL(err.str());
+            }
+        }
+
+        constexpr const char * globalConfigYaml = R"!!(
+        storage:
+          planes:
+          - name: data
+            category: data
+            prefix: /var/lib/HPCCSystems/hpcc-data
+          - name: mydropzone
+            category: lz
+            prefix: /var/lib/HPCCSystems/mydropzone
+          - name: dropzone2
+            category: lz
+            prefix: /var/lib/HPCCSystems/mydropzone
+            hosts:
+            - 10.4.3.2
+        )!!";
+        Owned<IPropertyTree> globalConfig = createPTreeFromYAMLString(globalConfigYaml);
+        replaceComponentConfig(getComponentConfigSP(), globalConfig);
+
+        PROGLOG("Checking physical file paths");
+        nlfn = 0;
+        for (;;)
+        {
+            const char **entry = externalUrlChecks[nlfn++];
+            if (nullptr == entry[0])
+                break;
+            const char *lfn = entry[0];
+            const char *expected = entry[1];
+            PROGLOG("lfn = %s, expect = %s", lfn, expected);
+            CDfsLogicalFileName dlfn;
+            StringBuffer err;
+            try
+            {
+                dlfn.set(lfn);
+                RemoteFilename rfn;
+                dlfn.getExternalFilename(rfn);
+                StringBuffer filePath;
+                rfn.getPath(filePath);
+                if (!streq(filePath, expected))
+                    err.appendf("Logical filename '%s' external url should be '%s', but result was '%s'.", lfn, expected, filePath.str());
             }
             catch (IException *e)
             {
@@ -2917,7 +3325,7 @@ public:
             try
             {
                 ASSERT(internalFile == normalizeExternal(lfn, res, false));
-                normalizeName(lfn, res, false);
+                normalizeName(lfn, res, false, true, false);
                 PROGLOG("res = '%s'", res.str());
                 ASSERT(fileNameMatch == streq(res.str(), validInternalLfns[nlfn][normalizedFileName]))
             }
@@ -2935,5 +3343,1433 @@ public:
 
 CPPUNIT_TEST_SUITE_REGISTRATION( CFileNameNormalizeUnitTest );
 CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( CFileNameNormalizeUnitTest, "CFileNameNormalizeUnitTest" );
+
+#define SOURCE_COMPONENT_UNITTEST "sysinfologger-unittest"
+
+class DaliSysInfoLoggerTester : public CppUnit::TestFixture
+{
+    /* Note: global messages will be written for dates between 2000-02-04 and 2000-02-05 */
+    /* Note: All global messages with time stamp before 2000-03-31 will be deleted */
+    CPPUNIT_TEST_SUITE(DaliSysInfoLoggerTester);
+        CPPUNIT_TEST(testInit);
+        CPPUNIT_TEST(testSysInfoLogger);
+    CPPUNIT_TEST_SUITE_END();
+
+    struct TestCase
+    {
+        LogMsgCategory cat;
+        LogMsgCode code;
+        bool hidden;
+        const char * dateTimeStamp;
+        const char * msg;
+    };
+
+    const std::vector<TestCase> testCases =
+    {
+        {
+            LogMsgCategory(MSGAUD_operator, MSGCLS_information, DefaultDetail),
+            42301,
+            false,
+            "2000-02-03T10:01:22.342343",
+            "CSysInfoLogger Unit test message 1"
+        },
+        {
+            LogMsgCategory(MSGAUD_operator, MSGCLS_information, DefaultDetail),
+            42302,
+            false,
+            "2000-02-03T12:03:42.114233",
+            "CSysInfoLogger Unit test message 2"
+        },
+        {
+            LogMsgCategory(MSGAUD_operator, MSGCLS_information, DefaultDetail),
+            42303,
+            true,
+            "2000-02-03T14:02:13.678443",
+            "CSysInfoLogger Unit test message 3"
+        },
+        {
+            LogMsgCategory(MSGAUD_operator, MSGCLS_information, DefaultDetail),
+            42304,
+            true,
+            "2000-02-03T16:05:18.8324832",
+            "CSysInfoLogger Unit test message 4"
+        },
+        {
+            LogMsgCategory(MSGAUD_operator, MSGCLS_information, DefaultDetail),
+            42301,
+            false,
+            "2000-02-04T03:01:42.5754",
+            "CSysInfoLogger Unit test message 5"
+        },
+        {
+            LogMsgCategory(MSGAUD_operator, MSGCLS_information, DefaultDetail),
+            42302,
+            false,
+            "2000-02-04T09:06:25.133132",
+            "CSysInfoLogger Unit test message 6"
+        },
+        {
+            LogMsgCategory(MSGAUD_operator, MSGCLS_information, DefaultDetail),
+            42303,
+            false,
+            "2000-02-04T11:09:32.78439",
+            "CSysInfoLogger Unit test message 7"
+        },
+        {
+            LogMsgCategory(MSGAUD_operator, MSGCLS_information, DefaultDetail),
+            42304,
+            true,
+            "2000-02-04T13:02:12.82821",
+            "CSysInfoLogger Unit test message 8"
+        },
+        {
+            LogMsgCategory(MSGAUD_operator, MSGCLS_information, DefaultDetail),
+            42304,
+            true,
+            "2000-02-04T18:32:11.23421",
+            "CSysInfoLogger Unit test message 9"
+        }
+    };
+
+    struct WrittenLogMessage
+    {
+        unsigned __int64 msgId;
+        unsigned __int64 ts;
+        unsigned testCaseIndex;
+    };
+    std::vector<WrittenLogMessage> writtenMessages;
+
+    unsigned testRead(bool hiddenOnly=false, bool visibleOnly=false, unsigned year=0, unsigned month=0, unsigned day=0)
+    {
+        unsigned readCount=0;
+        try
+        {
+            std::set<unsigned> matchedMessages; // used to make sure every message written has been read back
+            Owned<ISysInfoLoggerMsgIterator> iter = createSysInfoLoggerMsgIterator(visibleOnly, hiddenOnly, year, month, day, SOURCE_COMPONENT_UNITTEST);
+            ForEach(*iter)
+            {
+                const IConstSysInfoLoggerMsg & sysInfoMsg = iter->query();
+
+                if (strcmp(sysInfoMsg.querySource(), SOURCE_COMPONENT_UNITTEST)!=0)
+                    continue; // not a message written by this unittest so ignore
+
+                // Check written message matches read message
+                unsigned __int64 msgId = sysInfoMsg.queryLogMsgId();
+                auto matched = std::find_if(writtenMessages.begin(), writtenMessages.end(), [msgId] (const auto & wm){ return (wm.msgId == msgId); });
+                CPPUNIT_ASSERT_MESSAGE("Message read back not matching messages written by this unittest", matched!=writtenMessages.end());
+
+                // Make sure written messages matches message read back
+                matchedMessages.insert(matched->testCaseIndex);
+                const TestCase & testCase = testCases[matched->testCaseIndex];
+                ASSERT(testCase.hidden==sysInfoMsg.queryIsHidden());
+                ASSERT(testCase.code==sysInfoMsg.queryLogMsgCode());
+                ASSERT(strcmp(testCase.msg,sysInfoMsg.queryMsg())==0);
+                ASSERT(testCase.cat.queryAudience()==sysInfoMsg.queryAudience());
+                ASSERT(testCase.cat.queryClass()==sysInfoMsg.queryClass());
+
+                readCount++;
+            }
+            ASSERT(readCount==matchedMessages.size()); // make sure there are no duplicates
+        }
+        catch (IException *e)
+        {
+            StringBuffer msg;
+            msg.appendf("testRead(hidden=%s, visible=%s) failed: ", boolToStr(hiddenOnly), boolToStr(visibleOnly));
+            e->errorMessage(msg);
+            msg.appendf("(code %d)", e->errorCode());
+            e->Release();
+            CPPUNIT_FAIL(msg.str());
+        }
+        return readCount;
+    }
+
+public:
+    ~DaliSysInfoLoggerTester()
+    {
+        daliClientEnd();
+    }
+    void testInit()
+    {
+        daliClientInit();
+    }
+    void testWrite()
+    {
+        writtenMessages.clear();
+        unsigned testCaseIndex=0;
+        for (const auto & testCase: testCases)
+        {
+            try
+            {
+                CDateTime dateTime;
+                dateTime.setString(testCase.dateTimeStamp);
+
+                unsigned __int64 ts = dateTime.getTimeStamp();
+                unsigned __int64 msgId = logSysInfoError(testCase.cat, testCase.code, SOURCE_COMPONENT_UNITTEST, testCase.msg, ts);
+                writtenMessages.push_back({msgId, ts, testCaseIndex++});
+                if (testCase.hidden)
+                {
+                    Owned<ISysInfoLoggerMsgFilter> msgFilter = createSysInfoLoggerMsgFilter(msgId, SOURCE_COMPONENT_UNITTEST);
+                    ASSERT(hideLogSysInfoMsg(msgFilter)==1);
+                }
+            }
+            catch (IException *e)
+            {
+                StringBuffer msg;
+                msg.append("logSysInfoError failed: ");
+                e->errorMessage(msg);
+                msg.appendf("(code %d)", e->errorCode());
+                e->Release();
+                CPPUNIT_FAIL(msg.str());
+            }
+        }
+        ASSERT(testCases.size()==writtenMessages.size());
+    }
+    void testSysInfoLogger()
+    {
+        // cleanup - remove messages that may have been left over from previous run
+        deleteOlderThanLogSysInfoMsg(false, false, 2001, 03, 00, SOURCE_COMPONENT_UNITTEST);
+        // Start of tests
+        testWrite();
+        ASSERT(testRead(false, false)==9);
+        ASSERT(testRead(false, false, 2000, 02, 03)==4);
+        ASSERT(testRead(false, false, 2000, 02, 04)==5);
+        ASSERT(testRead(false, true)==5); //all visible messages
+        ASSERT(testRead(true, false)==4); //all hidden messages
+        ASSERT(deleteOlderThanLogSysInfoMsg(false, true, 2000, 02, 03, SOURCE_COMPONENT_UNITTEST)==2);
+        ASSERT(deleteOlderThanLogSysInfoMsg(true, false, 2000, 02, 04, SOURCE_COMPONENT_UNITTEST)==5);
+
+        // testCase[7] and [8] are the only 2 remaining
+        // Delete single message test: delete testCase[7]
+        unsigned testCaseId = 7;
+        auto matched = std::find_if(writtenMessages.begin(), writtenMessages.end(), [testCaseId] (const auto & wm){ return (wm.testCaseIndex == testCaseId); });
+        if (matched==writtenMessages.end())
+            throw makeStringExceptionV(-1, "Can't find test case %u in written messages", testCaseId);
+
+        Owned<ISysInfoLoggerMsgFilter> msgFilter = createSysInfoLoggerMsgFilter(matched->msgId, SOURCE_COMPONENT_UNITTEST);
+        ASSERT(deleteLogSysInfoMsg(msgFilter)==1);
+
+        // Verify only 1 message remaining
+        ASSERT(testRead(false, false)==1);
+        // Delete 2000/02/04 and 2000/02/03 (one message but there are 2 parents remaining)
+        ASSERT(deleteOlderThanLogSysInfoMsg(false, false, 2000, 02, 05, SOURCE_COMPONENT_UNITTEST)==1);
+        // There shouldn't be any records remaining
+        ASSERT(testRead(false, false)==0);
+
+        testWrite();
+
+        // delete all messages with MsgCode 42303 -> 3 messages
+        msgFilter.setown(createSysInfoLoggerMsgFilter(SOURCE_COMPONENT_UNITTEST));
+        msgFilter->setMatchCode(42304);
+        ASSERT(deleteLogSysInfoMsg(msgFilter)==3);
+
+        // delete all messages matching source=SOURCE_COMPONENT_UNITTEST
+        msgFilter.setown(createSysInfoLoggerMsgFilter(SOURCE_COMPONENT_UNITTEST));
+        ASSERT(deleteLogSysInfoMsg(msgFilter)==6);
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( DaliSysInfoLoggerTester );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( DaliSysInfoLoggerTester, "DaliSysInfoLoggerTester" );
+
+class DaliFileReadPropertiesUpdaterTester : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(DaliFileReadPropertiesUpdaterTester);
+        CPPUNIT_TEST(testInit);
+        CPPUNIT_TEST(testFileReadPropertiesUpdater);
+    CPPUNIT_TEST_SUITE_END();
+
+    static constexpr const char *scope = "testfileupdate";
+    std::vector<std::string> subFileNames = {
+        std::string(scope) + "::subfile1",
+        std::string(scope) + "::subfile2",
+        std::string(scope) + "::subfile3"
+    };
+    std::vector<std::string> superFileNames = {
+        std::string(scope) + "::superfile",
+        std::string(scope) + "::supersuperfile"
+    };
+    bool daliClientInitialized = false;
+    void cleanupTestFiles(bool assertOnFailure)
+    {
+        try
+        {
+            for (auto it = superFileNames.rbegin(); it != superFileNames.rend(); ++it)
+                dir.removeSuperFile(it->c_str(), false, user);
+            for (auto &subFileName : subFileNames)
+                dir.removeEntry(subFileName.c_str(), user);
+        }
+        catch (IException *e)
+        {
+            StringBuffer errMsg;
+            e->errorMessage(errMsg);
+            e->Release();
+            fprintf(stderr, "Exception in cleanupTestFiles: %s\n", errMsg.str());
+            ASSERT(!assertOnFailure && "Failed to clean up test files");
+        }
+    }
+    void createTestFiles()
+    {
+        // Create subfiles
+        for (auto &subFileName : subFileNames)
+        {
+            Owned<IFileDescriptor> fdesc = createFileDescriptor();
+            fdesc->setDefaultDir((std::string("thordata/") + scope).c_str());
+
+            // Set file properties
+            fdesc->queryProperties().setPropInt("@recordSize", 17);
+            fdesc->queryProperties().setPropInt("@fileType", 1); // Flat file
+
+            // Create the distributed file
+            Owned<IDistributedFile> dfile = dir.createNew(fdesc);
+            ASSERT(dfile && "Failed to create distributed file");
+
+            // Attach the file to the logical name
+            dfile->attach(subFileName.c_str(), user);
+
+            ASSERT(dir.exists(subFileName.c_str(), user) && "Subfile was not created successfully");
+        }
+
+        // Create the superfile and add subfiles to the superfile
+        Owned<IDistributedSuperFile> superfile = dir.createSuperFile(superFileNames[0].c_str(), user, true, false);
+        ASSERT(superfile && "Failed to create superfile");
+        for (auto &subFileName : subFileNames)
+            superfile->addSubFile(subFileName.c_str());
+        superfile.clear();
+
+        // Create the supersuperfile and add superfile to it
+        Owned<IDistributedSuperFile> supersuperfile = dir.createSuperFile(superFileNames[1].c_str(), user, true, false);
+        ASSERT(supersuperfile && "Failed to create supersuperfile");
+        supersuperfile->addSubFile(superFileNames[0].c_str());
+        supersuperfile.clear();
+
+        // Some quick integrity checks
+        supersuperfile.setown(dir.lookupSuperFile(superFileNames[1].c_str(), user, AccessMode::readLogicalMeta));
+        ASSERT(supersuperfile && "Failed to find created supersuperfile");
+        unsigned numSubFiles = supersuperfile->numSubFiles();
+        ASSERT(numSubFiles == 1 && "Supersuperfile does not contain expected number of subfiles");
+
+        superfile.setown(dir.lookupSuperFile(superFileNames[0].c_str(), user, AccessMode::readLogicalMeta));
+        ASSERT(superfile && "Could not find created superfile");
+        numSubFiles = superfile->numSubFiles();
+        ASSERT(numSubFiles == subFileNames.size() && "Superfile does not contain expected number of subfiles");
+        size32_t superRecordSize = (size32_t)superfile->queryAttributes().getPropInt("@recordSize", -1);
+        ASSERT(superRecordSize == 17 && "Superfile record size does not match subfiles");
+    }
+
+public:
+    DaliFileReadPropertiesUpdaterTester() : daliClientInitialized(false) {}
+    ~DaliFileReadPropertiesUpdaterTester()
+    {
+        if (daliClientInitialized)
+            daliClientEnd();
+    }
+    void testInit()
+    {
+        daliClientInit();
+        daliClientInitialized = (initCounter > 0);
+    }
+
+    void testFileReadPropertiesUpdater()
+    {
+        cleanupTestFiles(false);
+        createTestFiles();
+
+        unsigned expectedSuperNumReads = 0;
+        unsigned expectedSuperReadCost = 0;
+        {
+            Owned<IFileReadPropertiesUpdater> fileReadPropertiesUpdater = createFileReadPropertiesUpdater(user);
+            for (size_t idx = 0; idx < subFileNames.size(); idx++)
+            {
+                Owned<IDistributedFile> subfile = dir.lookup(subFileNames[idx].c_str(), user, AccessMode::writeLogicalMeta, false, false, nullptr, true);
+                unsigned numReads = 10 + idx + 1; // create unique number of reads for each subfile
+                unsigned readCost = 1000 + idx + 1; // create unique read cost for each subfile
+                expectedSuperNumReads += numReads;
+                expectedSuperReadCost += readCost;
+                fileReadPropertiesUpdater->addCostAndNumReads(subfile, numReads, readCost);
+            }
+            fileReadPropertiesUpdater->publish();
+        }
+        // Each owning superfiles should have the same number of reads and read cost as calculated above
+        for(auto &superFileName : superFileNames)
+        {
+            Owned<IDistributedSuperFile> superfile = dir.lookupSuperFile(superFileName.c_str(), user, AccessMode::readLogicalMeta);
+            ASSERT(superfile && "Failed to find superfile");
+            unsigned superNumReads = superfile->queryAttributes().getPropInt("@numDiskReads", -1);
+            unsigned superReadCost = superfile->queryAttributes().getPropInt("@readCost", -1);
+            ASSERT(superNumReads == expectedSuperNumReads && "Superfile @numDiskReads does not match expected value");
+            ASSERT(superReadCost == expectedSuperReadCost && "Superfile @readCost does not match expected value");
+        }
+        cleanupTestFiles(true);
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( DaliFileReadPropertiesUpdaterTester );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( DaliFileReadPropertiesUpdaterTester, "DaliFileReadPropertiesUpdaterTester" );
+
+
+static constexpr bool traceJobQueue = false;
+static unsigned jobQueueStartTick = 0;
+//The following allows the tests to be slowed down to make it easier to debug problems
+static constexpr unsigned tickScaling = 1;
+static unsigned getJobQueueTick()
+{
+    return (msTick() - jobQueueStartTick) / tickScaling;
+}
+static void jobQueueSleep(unsigned ms)
+{
+    MilliSleep(ms * tickScaling);
+}
+class DaliJobQueueTester : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE(DaliJobQueueTester);
+        CPPUNIT_TEST(testInit);
+        CPPUNIT_TEST(testFlood);
+        CPPUNIT_TEST(testCppServer);
+        CPPUNIT_TEST(testSingle);
+        CPPUNIT_TEST(testDouble);
+        CPPUNIT_TEST(testMany);
+        CPPUNIT_TEST(testCleanup);
+    CPPUNIT_TEST_SUITE_END();
+
+    static constexpr const char * mainQueueName = "DaliTestJobQueue";
+    static constexpr const char * childQueueName = "DaliTestCppQueue";
+
+    struct JobEntry
+    {
+        unsigned delayMs;
+        const char * name;
+        unsigned processingMs;
+        int priority;
+    };
+
+    class JobProcessor : public Thread
+    {
+    public:
+        JobProcessor(Semaphore & _startedSem, Semaphore & _processedSem, IJobQueue * _queue, unsigned _id)
+         : Thread("JobProcessor"), startedSem(_startedSem), processedSem(_processedSem), queue(_queue), id(_id)
+        {
+        }
+
+         virtual int run() override
+         {
+            startedSem.signal();
+            try
+            {
+                processAll();
+            }
+            catch (IException * _e)
+            {
+                e.setown(_e);
+            }
+            return 0;
+         }
+
+         bool processItem(IJobQueueItem * item)
+         {
+            assertex(item);
+            const char * name = item->queryWUID();
+            if (traceJobQueue)
+                DBGLOG("===%s===@%u", name, getJobQueueTick());
+            if (name[0] == '!')
+                return false;
+            output.append(name);
+            if (!log.isEmpty())
+                log.append(",");
+            log.append(name).append("@").append(getJobQueueTick());
+            unsigned delay = item->getPort();
+            jobQueueSleep(delay);
+            processedSem.signal();
+            return true;
+         }
+
+        const char * queryOutput()
+        {
+            if (e)
+                throw e.getClear();
+            return output.str();
+        }
+
+        const char * queryLog()
+        {
+            return log.str();
+        }
+
+        virtual void processAll() = 0;
+
+    public:
+        Semaphore & startedSem;
+        Semaphore & processedSem;
+        Linked<IJobQueue> queue;
+        StringBuffer output;
+        StringBuffer log;
+        Owned<IException> e;
+        unsigned id;
+    };
+
+    // Read the first (highest priority) item on the queue - no minimum priority
+    class StandardJobProcessor : public JobProcessor
+    {
+    public:
+        StandardJobProcessor(Semaphore & _startedSem, Semaphore & _processedSem, IJobQueue * _queue, unsigned _id)
+        : JobProcessor(_startedSem, _processedSem, _queue, _id)
+        {
+        }
+
+        virtual void processAll() override
+        {
+            for (;;)
+            {
+                Owned<IJobQueueItem> item = queue->dequeue();
+                if (!processItem(item))
+                    break;
+            }
+        }
+
+    };
+
+    // Read the first item on the queue, but wait for 200ms to see if there is an item queued with a prioprity >= the last item that was dequeued.
+    // This is only used for bare metal, and I'm not sure the semantics are very helpful.  I think NewThor may be better approach.
+    class ThorJobProcessor : public JobProcessor
+    {
+    public:
+        ThorJobProcessor(Semaphore & _startedSem, Semaphore & _processedSem, IJobQueue * _queue, unsigned _id)
+        : JobProcessor(_startedSem, _processedSem, _queue, _id)
+        {
+        }
+
+        virtual void processAll() override
+        {
+            for (;;)
+            {
+                Owned<IJobQueueItem> item = queue->dequeue(0, INFINITE, 200*tickScaling);
+                bool ret = processItem(item);
+                if (!ret)
+                    break;
+            }
+        }
+    };
+
+    // For 200ms check to see if there is an item queued with the same priority that this thread last dequeued.  Then wait for any item.
+    // This means if there is a single high priority job, the other threads do not wait for that high priority job.
+    class NewThorJobProcessor : public JobProcessor
+    {
+    public:
+        NewThorJobProcessor(Semaphore & _startedSem, Semaphore & _processedSem, IJobQueue * _queue, unsigned _id)
+        : JobProcessor(_startedSem, _processedSem, _queue, _id)
+        {
+        }
+
+        virtual void processAll() override
+        {
+            for (;;)
+            {
+                Owned<IJobQueueItem> item = queue->dequeue(lastPrio, 200*tickScaling, 0);
+                if (!item)
+                    item.setown(queue->dequeue(0, INFINITE, 0));
+                lastPrio = item->getPriority();
+                bool ret = processItem(item);
+                if (!ret)
+                    break;
+            }
+        }
+
+    protected:
+        int lastPrio = 0;
+
+    };
+
+    class PriorityJobProcessor : public JobProcessor
+    {
+    public:
+        PriorityJobProcessor(Semaphore & _startedSem, Semaphore & _processedSem, IJobQueue * _queue, unsigned _id)
+        : JobProcessor(_startedSem, _processedSem, _queue, _id)
+        {
+        }
+
+        virtual void processAll() override
+        {
+            __uint64 priority = 0;
+            for (;;)
+            {
+                Owned<IJobQueueItem> item = queue->dequeuePriority(priority);
+                bool ret = processItem(item);
+                if (!ret)
+                    break;
+                priority = getTimeStampNowValue();
+            }
+        }
+    };
+
+    //This class mimics the behaviour of the c++ job that is started to compile a single workunit.
+    //It reads items off a child queue and lingers to see if any other workunits are ready to be compiled.
+    class CppJobProcessor : public JobProcessor
+    {
+    public:
+        CppJobProcessor(Semaphore & _startedSem, Semaphore & _processedSem, IJobQueue * _queue, unsigned _id)
+        : JobProcessor(_startedSem, _processedSem, _queue, _id)
+        {
+        }
+
+        virtual void processAll() override
+        {
+            for (;;)
+            {
+                __uint64 priority = getTimeStampNowValue();
+                unsigned cppTimeout = 100 * tickScaling;
+                Owned<IJobQueueItem> item = queue->dequeuePriority(priority, cppTimeout);
+                //Check for time out - linger period has expired so this job will exit
+                if (!item)
+                {
+                    output.append("*");
+                    log.append("*");
+                    break;
+                }
+                bool ret = processItem(item);
+                if (!ret)
+                {
+                    //Test case has finished - requeue the item so the calling eclccserver will
+                    //also terminate, and then exit.
+                    queue->setActiveQueue(mainQueueName);
+                    queue->enqueue(item.getClear());
+                    break;
+                }
+            }
+        }
+    };
+
+    //This class mimics the behaviour of the cppserver.
+    //It listens on the main queue with a default priority.  When it gets an item it adds it to a child
+    //queue and then starts a job to process items from that queue.  (This may be picked up by a job that
+    //is already running - deliberate design.)  It waits until that job terminates and then listens to
+    //the queue again.
+    class CppServerJobProcessor : public JobProcessor
+    {
+    public:
+        CppServerJobProcessor(Semaphore & _startedSem, Semaphore & _processedSem, IJobQueue * _queue, unsigned _id)
+        : JobProcessor(_startedSem, _processedSem, _queue, _id)
+        {
+        }
+
+        virtual void processAll() override
+        {
+            Owned<IJobQueue> childQueue = createJobQueue(childQueueName);
+            childQueue->connect(true);
+            for (;;)
+            {
+                Owned<IJobQueueItem> item = queue->dequeue();
+                assertex(item);
+                const char * name = item->queryWUID();
+                if (name[0] == '!')
+                    break;
+
+                childQueue->enqueue(item.getClear());
+
+                StringBuffer cppQueues;
+                cppQueues.append(mainQueueName).append(",").append(childQueueName);
+
+                Owned<IJobQueue> localQueues = createJobQueue(cppQueues);
+                Semaphore dummySem{SYNC_LOCATION};
+                Owned<JobProcessor> child = new CppJobProcessor(dummySem, processedSem, localQueues, id);
+
+                child->start(true);
+                child->join();
+                output.append(child->output);
+                log.append(child->log).append("#");
+            }
+        }
+    };
+
+    enum JobProcessorType
+    {
+        StandardProcessor,
+        ThorProcessor,
+        NewThorProcessor,
+        PriorityProcessor,
+        CppServerProcessor,
+    };
+
+    void testInit()
+    {
+        daliClientInit();
+    }
+
+    void testCleanup()
+    {
+        daliClientEnd();
+    }
+
+    void runTestCase(const char * name, const std::initializer_list<JobEntry> & jobs, const std::initializer_list<JobProcessorType> & processors, const std::initializer_list<const char *> & expectedResults)
+    {
+        try
+        {
+            Owned<IJobQueue> queue = createJobQueue(mainQueueName);
+            queue->connect(true);
+            queue->clear();
+
+            Semaphore startedSem{SYNC_LOCATION};
+            Semaphore processedSem{SYNC_LOCATION};
+
+            CIArrayOf<JobProcessor> jobProcessors;
+            for (auto & processor : processors)
+            {
+                JobProcessor * cur = nullptr;
+                //All listening threads must have a unique queue objects
+                Owned<IJobQueue> localQueue = createJobQueue(mainQueueName);
+                localQueue->connect(true);
+
+                switch (processor)
+                {
+                case StandardProcessor:
+                    cur = new StandardJobProcessor(startedSem, processedSem, localQueue, jobProcessors.ordinality());
+                    break;
+                case ThorProcessor:
+                    cur = new ThorJobProcessor(startedSem, processedSem, localQueue, jobProcessors.ordinality());
+                    break;
+                case NewThorProcessor:
+                    cur = new NewThorJobProcessor(startedSem, processedSem, localQueue, jobProcessors.ordinality());
+                    break;
+                case PriorityProcessor:
+                    cur = new PriorityJobProcessor(startedSem, processedSem, localQueue, jobProcessors.ordinality());
+                    break;
+                case CppServerProcessor:
+                    cur = new CppServerJobProcessor(startedSem, processedSem, localQueue, jobProcessors.ordinality());
+                    break;
+                default:
+                    UNIMPLEMENTED;
+                }
+                jobProcessors.append(*cur);
+                cur->start(true);
+            }
+
+            for (auto & processor : processors)
+                startedSem.wait();
+
+            IArrayOf<IConversation> conversations;
+            jobQueueStartTick = msTick();
+            for (auto & job : jobs)
+            {
+                jobQueueSleep(job.delayMs);
+                if (traceJobQueue)
+                    DBGLOG("Add (%s, %d, %d) @%u", job.name, job.delayMs, job.processingMs, getJobQueueTick());
+                if (job.name)
+                {
+                    Owned<IJobQueueItem> item = createJobQueueItem(job.name);
+                    item->setPort(job.processingMs);
+                    item->setPriority(job.priority);
+
+                    queue->enqueue(item.getClear());
+                }
+            }
+
+            for (;;)
+            {
+                //Wait until all the items have been processed before adding the special end markers
+                //otherwise the ends will be interpreted as valid items, and may cause the items to
+                //be dequeued by the wrong thread.
+                unsigned connected;
+                unsigned waiting;
+                unsigned enqueued;
+                queue->getStats(connected,waiting,enqueued);
+                if (enqueued == 0)
+                    break;
+                MilliSleep(100 * tickScaling);
+            }
+
+            ForEachItemIn(i1, jobProcessors)
+            {
+                if (traceJobQueue)
+                    DBGLOG("Add (eoj) @%u", getJobQueueTick());
+
+                //The queue code dedups by "wuid", so we need to add a unique "stop" entry
+                std::string end = std::string("!") + std::to_string(i1);
+                Owned<IJobQueueItem> item = createJobQueueItem(end.c_str());
+                queue->enqueue(item.getClear());
+            }
+
+            ForEachItemIn(i2, jobProcessors)
+            {
+                if (traceJobQueue)
+                    DBGLOG("Wait for %u", i2);
+                jobProcessors.item(i2).join();
+            }
+
+            DBGLOG("%s: %ums", name, getJobQueueTick());
+            ForEachItemIn(i3, jobProcessors)
+            {
+                JobProcessor & cur = jobProcessors.item(i3);
+                DBGLOG("  Result: '%s' '%s'", cur.queryOutput(), cur.queryLog());
+            }
+
+            ForEachItemIn(i4, jobProcessors)
+            {
+                //If expected results are provided, check that the result matches one of them (it is undefined which
+                //processor will match which result)
+                JobProcessor & cur = jobProcessors.item(i4);
+                if (expectedResults.size())
+                {
+                    bool matched = false;
+                    StringBuffer expectedText;
+                    for (auto & expected : expectedResults)
+                    {
+                        if (streq(expected, cur.queryOutput()))
+                        {
+                            matched = true;
+                            break;
+                        }
+                        expectedText.append(", ").append(expected);
+                    }
+                    if (!matched)
+                    {
+                        DBGLOG("Test %s: No match for output %u: %s", name, i4, expectedText.str()+2);
+                        CPPUNIT_ASSERT_MESSAGE("Result does not match any of the expected results", false);
+                    }
+                }
+            }
+        }
+        catch (IException * e)
+        {
+            StringBuffer msg("Fail: ");
+            e->errorMessage(msg);
+            e->Release();
+            CPPUNIT_ASSERT_MESSAGE(msg.str(), 0);
+        }
+    }
+
+    static constexpr std::initializer_list<JobEntry> singleWuTest = {
+        { 0, "a", 90, 0 },
+        { 100, "b", 90, 0 },
+        { 100, "c", 90, 0 },
+        { 100, "d", 90, 0 },
+    };
+
+    static constexpr std::initializer_list<JobEntry> dripSingleTest = {
+        { 0, "a", 10, 0 },
+        { 200, "b", 10, 0 },
+        { 200, "c", 10, 0 },
+        { 200, "d", 10, 0 },
+        { 20, nullptr, 0, 0 },      // Ensure d has completed before termination is sent
+    };
+
+    static constexpr std::initializer_list<JobEntry> twoWuTest = {
+        { 0, "a", 90, 0 },
+        { 50, "A", 90, 0},
+        { 50, "b", 90, 0 },
+        { 50, "B", 90, 0 },
+        { 50, "c", 90, 0 },
+        { 50, "C", 90, 0 },
+        { 50, "d", 90, 0 },
+        { 50, "D", 90, 0 },
+    };
+
+    static constexpr std::initializer_list<JobEntry> lowHighTest = {
+        { 0, "a", 90, 0 },
+        { 50, "A", 90, 1},
+        { 50, "b", 90, 0 },
+        { 50, "B", 90, 1 },
+        { 50, "c", 90, 0 },
+        { 50, "C", 90, 1 },
+        { 50, "d", 90, 0 },
+        { 50, "D", 90, 1 },
+    };
+
+    static constexpr std::initializer_list<JobEntry> lowHigh2Test = {
+        { 0, "a", 90, 0 },
+        { 50, "A", 90, 1},
+        { 10, "b", 90, 0 },
+        { 10, "B", 90, 1 },
+        { 10, "c", 90, 0 },
+        { 10, "C", 90, 1 },
+        { 10, "d", 90, 0 },
+        { 10, "D", 90, 1 },
+    };
+
+    static constexpr std::initializer_list<JobEntry> lowHigh3Test = {
+        { 0, "a", 90, 0 },
+        { 50, "A", 90, 1},
+        { 10, "b", 90, 0 },
+    };
+
+    static constexpr std::initializer_list<JobEntry> dripFeedTest = {
+        { 0, "a", 10, 0 },
+        { 100, "b", 10, 0},
+        { 100, "c", 10, 0},
+        { 100, "d", 10, 0},
+        { 100, "e", 10, 0},
+        { 100, "f", 10, 0},
+        { 100, "g", 10, 0},
+        { 100, "h", 10, 0},
+        { 100, "i", 10, 0},
+        { 100, "j", 10, 0},
+    };
+
+    static constexpr std::initializer_list<JobEntry> drip2FeedTest = {
+        {  0, "a", 60, 0 },
+        { 50, "b", 60, 0},
+        { 50, "c", 60, 0},
+        { 50, "d", 60, 0},
+        { 50, "e", 60, 0},
+        { 50, "f", 60, 0},
+        { 50, "g", 60, 0},
+        { 50, "h", 60, 0},
+        { 50, "i", 60, 0},
+        { 50, "j", 60, 0},
+        { 50, "k", 60, 0},
+        { 50, "l", 60, 0},
+        { 50, "m", 60, 0},
+        { 50, "n", 60, 0},
+        { 50, "o", 60, 0},
+    };
+
+    static constexpr std::initializer_list<JobEntry> Cpp1Test = {
+        {  0, "a", 50, 0 },
+        { 60, "b", 50, 0},
+        { 60, "c", 50, 0},
+        { 60, "d", 50, 0},
+        { 60, "e", 50, 0},
+        { 10, "f", 80, 0},
+        { 50, "g", 50, 0},
+        { 40, "h", 50, 0},
+        { 60, "i", 50, 0},
+        { 60, "j", 50, 0},
+        { 200, nullptr, 0, 0 },
+    };
+
+    static constexpr std::initializer_list<JobEntry> Cpp2Test = {
+        {  0, "a", 50, 0 },
+        { 60, "b", 50, 0},
+        { 10, "c", 50, 0},
+        { 10, "d", 50, 0},
+        { 10, "e", 50, 0},
+        { 10, "f", 50, 0},
+        { 70, "g", 50, 0},
+        { 20, "h", 50, 0},
+        { 60, "i", 50, 0},
+        { 200, nullptr, 0, 0 },
+    };
+
+    static constexpr std::initializer_list<JobEntry> Cpp3Test = {
+        {  0, "a", 50, 0 },
+        { 10, "b", 50, 0},
+        { 40, "c", 50, 0},
+        { 20, "d", 50, 0},
+        { 70, "e", 50, 0},
+        { 60, "f", 50, 0},
+        { 60, "g", 50, 0},
+        { 10, "h", 50, 0},
+        { 10, "i", 50, 0},
+        { 10, "j", 50, 0},
+        { 100, "k", 50, 0},
+        { 200, nullptr, 0, 0 },
+    };
+
+    static constexpr std::initializer_list<JobEntry> CppPairTest = {
+        {  0, "a", 20, 0 },
+        { 30, "b", 20, 0},
+        { 30, "c", 20, 0},
+        { 30, "d", 20, 0},
+        { 0,  "e", 20, 0},
+        { 60, "f", 20, 0},
+        { 0,  "g", 20, 0},
+        { 10, "h", 20, 0},
+        { 10, "i", 20, 0},
+    };
+
+    //MODEL The way that cpp server should work - an agent that listens to the main queue, and jobs that listen to the main queue and a child queue
+    //Timings are very temperamental - and if there are a choice of threads to restart processing then it isn't well defined which one will pick it up
+    void testCppServer()
+    {
+        runTestCase("single, 1 c++", singleWuTest, { CppServerProcessor }, { "abcd" });
+        runTestCase("drip, 1 c++", dripSingleTest, { CppServerProcessor }, { "a*b*c*d" });
+        runTestCase("single, 2 c++", singleWuTest, { CppServerProcessor, CppServerProcessor }, { "abcd", "" });
+        runTestCase("cpp, 2 c++", Cpp1Test, { CppServerProcessor, CppServerProcessor }, { "abcdeg*", "fhij*" });
+        runTestCase("cpp, 3 c++", Cpp1Test, { CppServerProcessor, CppServerProcessor, CppServerProcessor }, { "abcdeg*", "fhij*", "" });
+        runTestCase("cpp2, 3 c++", Cpp2Test, { CppServerProcessor, CppServerProcessor, CppServerProcessor }, { "abeg*", "cfhi*", "d*" });
+        runTestCase("cpp3, 2 c++", Cpp3Test, { CppServerProcessor, CppServerProcessor }, { "ac*hjk*", "bdefgi*" });
+        //Send in a 3 requests all handled by a single server, then pairs
+        runTestCase("cpp, 2 c++", CppPairTest, { CppServerProcessor, CppServerProcessor }, { "abcdgi", "efh" });
+
+    }
+    void testSingle()
+    {
+        runTestCase("1 wu, 1 standard", singleWuTest, { StandardProcessor }, { "abcd" });
+        runTestCase("2 wu, 1 standard", twoWuTest, { StandardProcessor }, { "aAbBcCdD" });
+        runTestCase("lo hi wu, 1 standard", lowHighTest, { StandardProcessor }, { "aABCDbcd" });
+        runTestCase("lo hi2 wu, 1 standard", lowHigh2Test, { StandardProcessor }, { "aABCDbcd" });
+        runTestCase("lo hi2 wu, 1 thor", lowHigh2Test, { ThorProcessor }, {});
+        runTestCase("lo hi2 wu, 1 newthor", lowHigh2Test, { NewThorProcessor }, {});
+        runTestCase("drip wu, 1 std", dripFeedTest, { StandardProcessor }, { "abcdefghij" });
+        runTestCase("drip wu, 1 std", dripFeedTest, { PriorityProcessor }, { "abcdefghij" });
+    }
+
+    void testDouble()
+    {
+        runTestCase("2 wu, 2 standard", twoWuTest, { StandardProcessor, StandardProcessor }, { "abcd", "ABCD" });
+        runTestCase("lo hi wu, 2 standard", lowHighTest, { StandardProcessor, StandardProcessor }, { "abcd", "ABCD" });
+        runTestCase("lo hi2  wu, 2 standard", lowHigh2Test, { StandardProcessor, StandardProcessor }, { "aBDc", "ACbd" });
+        runTestCase("lo hi2  wu, 2 thor", lowHigh2Test, { ThorProcessor, ThorProcessor }, { "aBDc", "ACbd" });
+        runTestCase("lo hi2  wu, 2 newthor", lowHigh2Test, { NewThorProcessor, NewThorProcessor }, {});
+
+        runTestCase("lo hi3  wu, 2 thor", lowHigh3Test, { ThorProcessor, ThorProcessor }, {});
+        runTestCase("lo hi3  wu, 2 newthor", lowHigh3Test, { NewThorProcessor, NewThorProcessor }, {});
+        runTestCase("lo hi3  wu, 2 prio", lowHigh3Test, { PriorityProcessor, PriorityProcessor }, {});
+        runTestCase("drip wu, 2 std", dripFeedTest, { StandardProcessor, StandardProcessor }, {});
+        runTestCase("drip wu, 2 newthor", dripFeedTest, { NewThorProcessor, NewThorProcessor }, {});
+        runTestCase("drip wu, 2 prio", dripFeedTest, { PriorityProcessor, PriorityProcessor }, { "abcdefghij", "" });
+    }
+
+    void testMany()
+    {
+        runTestCase("drip wu, 3 std", dripFeedTest, { StandardProcessor, StandardProcessor, StandardProcessor }, {});
+        runTestCase("drip2 wu, 3 std", drip2FeedTest, { StandardProcessor, StandardProcessor, StandardProcessor }, {});
+        runTestCase("drip wu, 3 prio", dripFeedTest, { PriorityProcessor, PriorityProcessor, PriorityProcessor }, { "abcdefghij", "", "" });
+        runTestCase("drip wu, 10 prio", dripFeedTest, { PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor }, { "abcdefghij", "", "", "", "", "", "", "", "", ""});
+        runTestCase("drip wu, 20 prio", dripFeedTest, { PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor, PriorityProcessor }, { });
+        runTestCase("drip2 wu, 3 prio", drip2FeedTest, { PriorityProcessor, PriorityProcessor, PriorityProcessor }, { "acegikmo", "bdfhjln", ""});
+    }
+
+    static constexpr std::initializer_list<JobEntry> floodTest = {
+        { 0, "a01", 20, 0 }, { 0, "a02", 20, 0 }, { 0, "a03", 20, 0 }, { 0, "a04", 20, 0 }, { 0, "a05", 20, 0 },
+        { 0, "a06", 20, 0 }, { 0, "a07", 20, 0 }, { 0, "a08", 20, 0 }, { 0, "a09", 20, 0 }, { 0, "a10", 20, 0 },
+        { 0, "a11", 20, 0 }, { 0, "a12", 20, 0 }, { 0, "a13", 20, 0 }, { 0, "a14", 20, 0 }, { 0, "a15", 20, 0 },
+        { 0, "a16", 20, 0 }, { 0, "a17", 20, 0 }, { 0, "a18", 20, 0 }, { 0, "a19", 20, 0 }, { 0, "a20", 20, 0 },
+        { 100, "b", 20, 0},
+        { 0, "c01", 20, 0 }, { 0, "c02", 20, 0 }, { 0, "c03", 20, 0 }, { 0, "c04", 20, 0 }, { 0, "c05", 20, 0 },
+        { 0, "c06", 20, 0 }, { 0, "c07", 20, 0 }, { 0, "c08", 20, 0 }, { 0, "c09", 20, 0 }, { 0, "c10", 20, 0 },
+        { 0, "c11", 20, 0 }, { 0, "c12", 20, 0 }, { 0, "c13", 20, 0 }, { 0, "c14", 20, 0 }, { 0, "c15", 20, 0 },
+        { 0, "c16", 20, 0 }, { 0, "c17", 20, 0 }, { 0, "c18", 20, 0 }, { 0, "c19", 20, 0 }, { 0, "c20", 20, 0 },
+    };
+
+    // Send in 20 requests, each of which take 20ms to process, then send in 20 more requests
+    void testFlood()
+    {
+        runTestCase("flood wu, 3 std", floodTest, { StandardProcessor, StandardProcessor, StandardProcessor }, {});
+        runTestCase("flood wu, 3 prio", floodTest, { PriorityProcessor, PriorityProcessor, PriorityProcessor }, {} );
+        runTestCase("flood wu, 3 cpp", floodTest, { CppServerProcessor, CppServerProcessor, CppServerProcessor }, {} );
+    }
+
+
+
+    //MORE Tests:
+    //Many requests at a time in waves
+    //Priority 1,2,3 fixed - not dynamic
+    //Stopping listening after N to check priorities removed correctly
+    //Mix standard and priority
+    //Priority with expiring and gaps to ensure the correct client picks up the items.
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( DaliJobQueueTester );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( DaliJobQueueTester, "DaliJobQueueTester" );
+
+//---------------------------------------------------------------------------------------------------------------------
+
+class GlobalMetricDumper : implements IGlobalMetricRecorder
+{
+public:
+    //MORE: Need to pass the start and end time.
+    virtual void processGlobalStatistics(const char * category, const MetricsDimensionList & dimensions, const char * startTime, const char * endTime, const GlobalStatisticsList & stats) override
+    {
+        //Only take account of metrics that are part of the unit test
+        if (!startsWith(category, "testCategory"))
+            return;
+
+        out.append(category).append("[");
+        if (dimensions.size())
+        {
+            for (const auto & dimension : dimensions)
+            {
+                out.append(dimension.first).append("=");
+                out.append(dimension.second).append(",");
+            }
+            out.setLength(out.length()-1);
+        }
+
+        out.appendf("] (%s..%s) => {", startTime, endTime);
+
+        if (stats.size())
+        {
+            for (const auto & stat : stats)
+            {
+                out.append(queryStatisticName(stat.first)).append("=");
+                out.append(stat.second).append(",");
+            }
+            out.setLength(out.length()-1);
+        }
+
+        out.append("}").newline();
+    }
+
+public:
+    StringBuffer out;
+};
+
+
+
+class DaliGlobalMetricsTester : public CppUnit::TestFixture
+{
+    /* Note: global messages will be written for dates between 2000-02-04 and 2000-02-05 */
+    /* Note: All global messages with time stamp before 2000-03-31 will be deleted */
+    CPPUNIT_TEST_SUITE(DaliGlobalMetricsTester);
+        CPPUNIT_TEST(doStart);
+        CPPUNIT_TEST(testGlobalMetrics);
+        CPPUNIT_TEST(testTimeslots);
+        CPPUNIT_TEST(testMultiThread);
+        CPPUNIT_TEST(doStop);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void doStart()
+    {
+        daliClientInit();
+    }
+    void doStop()
+    {
+        daliClientEnd();
+    }
+    void verifyGlobalMetrics(const char * optCategory, const MetricsDimensionList & optDimensions, const CDateTime & startTime, const CDateTime * endTime, const char * expected)
+    {
+        CDateTime now;
+        if (!endTime)
+        {
+            now.setNow();
+            endTime = &now;
+        }
+
+        GlobalMetricDumper visitor;
+        visitor.out.newline();  // start with a newline to allow cleaner definitions of the expected output
+        gatherGlobalMetrics(optCategory, optDimensions, startTime, *endTime, visitor);
+        if (expected)
+            CPPUNIT_ASSERT_EQUAL_STR(expected, visitor.out.str());
+        else
+            DBGLOG("Results: %s", visitor.out.str());
+    }
+
+    void testGlobalMetrics()
+    {
+        CDateTime startTime;
+        startTime.setString("1999-01-13T12:00:00", nullptr, false);
+
+        setGlobalMetricNowTime("1999-01-13T12:00:00");
+        try
+        {
+            resetGlobalMetrics("testCategory", MetricsDimensionList());
+            resetGlobalMetrics("testCategory2", MetricsDimensionList());
+
+            recordGlobalMetrics("testCategory", MetricsDimensionList{}, { StTimeBlocked }, { 10000 });
+
+            verifyGlobalMetrics(nullptr, MetricsDimensionList{}, startTime, nullptr,
+                                "\ntestCategory[] (1999011312..1999011312) => {TimeBlocked=10000}\n");
+
+            recordGlobalMetrics("testCategory", MetricsDimensionList{}, { StTimeBlocked, StTimeLocalExecute }, { 10000, 12345 });
+            recordGlobalMetrics("testCategory", MetricsDimensionList{{"user","gavin"},{"instance","thor400"}}, { StTimeLocalExecute, StCostExecute }, { 54321, 1290 });
+            recordGlobalMetrics("testCategory", MetricsDimensionList{{"user","gavin"}}, { StTimeLocalExecute, StCostExecute }, { 11111, 999 });
+
+            {
+                constexpr const char * expected = R"!(
+testCategory[] (1999011312..1999011312) => {TimeBlocked=20000,TimeLocalExecute=12345}
+testCategory[user=gavin,instance=thor400] (1999011312..1999011312) => {TimeLocalExecute=54321,CostExecute=1290}
+testCategory[user=gavin] (1999011312..1999011312) => {TimeLocalExecute=11111,CostExecute=999}
+)!";
+                verifyGlobalMetrics(nullptr, MetricsDimensionList{}, startTime, nullptr, expected);
+            }
+
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{{"plane", "data1"},{"user","gavin"}}, { StCostFileAccess }, { 11111 });
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{{"plane", "data2"},{"user","gavin"}}, { StCostFileAccess }, { 22222 });
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{{"plane", "data2"},{"user","jim"}}, { StCostFileAccess }, { 33333 });
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{{"plane", "data3"},{"user","bob"}}, { StCostFileAccess }, { 9999 });
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{{"plane", "data1"},{"user","gavin"}}, { StCostFileAccess }, { 11111 });
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{{"plane", "data2"},{"user","gavin"}}, { StCostFileAccess }, { 22222 });
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{{"plane", "data2"},{"user","jim"}}, { StCostFileAccess }, { 33333 });
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{{"plane", "data2"},{"user","gavin"}}, { StCostFileAccess }, { 22222 });
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{{"plane", "data2"},{"user","jim"}}, { StCostFileAccess }, { 33333 });
+
+            {
+                constexpr const char * expected = R"!(
+testCategory[] (1999011312..1999011312) => {TimeBlocked=20000,TimeLocalExecute=12345}
+testCategory[user=gavin,instance=thor400] (1999011312..1999011312) => {TimeLocalExecute=54321,CostExecute=1290}
+testCategory[user=gavin] (1999011312..1999011312) => {TimeLocalExecute=11111,CostExecute=999}
+testCategory2[plane=data1,user=gavin] (1999011312..1999011312) => {CostFileAccess=22222}
+testCategory2[plane=data2,user=gavin] (1999011312..1999011312) => {CostFileAccess=66666}
+testCategory2[plane=data2,user=jim] (1999011312..1999011312) => {CostFileAccess=99999}
+testCategory2[plane=data3,user=bob] (1999011312..1999011312) => {CostFileAccess=9999}
+)!";
+                verifyGlobalMetrics(nullptr, MetricsDimensionList{}, startTime, nullptr, expected);
+            }
+        }
+        catch (IException * e)
+        {
+            StringBuffer msg;
+            e->errorMessage(msg);
+            e->Release();
+            CPPUNIT_FAIL(msg.str());
+        }
+    }
+
+    void testTimeslots()
+    {
+        const char * slot1 = "1999-01-13T12:00:00";
+        const char * slot1End = "1999-01-13T12:59:99";
+        const char * slot1b = "1999-01-13T12:58:00";
+        const char * slot2 = "1999-01-13T13:00:00";
+        const char * slot3 = "1999-01-14T13:00:00";
+        const char * slot4 = "2000-01-14T13:00:00";
+
+        CDateTime slot1Time;
+        slot1Time.setString(slot1);
+        CDateTime slot1EndTime;
+        slot1EndTime.setString(slot1End);
+        CDateTime slot2Time;
+        slot2Time.setString(slot2);
+        CDateTime slot3Time;
+        slot3Time.setString(slot3);
+        CDateTime slot4Time;
+        slot4Time.setString(slot4);
+
+        try
+        {
+            resetGlobalMetrics("testCategory", MetricsDimensionList());
+            resetGlobalMetrics("testCategory2", MetricsDimensionList());
+
+            setGlobalMetricNowTime(slot1);
+            recordGlobalMetrics("testCategory", MetricsDimensionList{}, { StTimeLocalExecute }, { 10 });
+            setGlobalMetricNowTime(slot1b);
+            recordGlobalMetrics("testCategory", MetricsDimensionList{}, { StTimeLocalExecute }, { 20 });
+
+            setGlobalMetricNowTime(slot2);
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{}, { StTimeLocalExecute }, { 40 });
+
+            setGlobalMetricNowTime(slot3);
+            recordGlobalMetrics("testCategory2", MetricsDimensionList{}, { StTimeLocalExecute }, { 80 });
+
+            setGlobalMetricNowTime(slot4);
+            recordGlobalMetrics("testCategory", MetricsDimensionList{}, { StTimeLocalExecute }, { 160 });
+
+            {
+                constexpr const char * expected = R"!(
+testCategory[] (1999011312..1999011312) => {TimeLocalExecute=30}
+testCategory[] (2000011413..2000011413) => {TimeLocalExecute=160}
+testCategory2[] (1999011313..1999011313) => {TimeLocalExecute=40}
+testCategory2[] (1999011413..1999011413) => {TimeLocalExecute=80}
+)!";
+                verifyGlobalMetrics(nullptr, MetricsDimensionList{}, slot1Time, nullptr, expected);
+            }
+
+            {
+                constexpr const char * expected = R"!(
+)!";
+                verifyGlobalMetrics("unknown", MetricsDimensionList{}, slot1Time, nullptr, expected);
+            }
+
+            {
+                constexpr const char * expected = R"!(
+testCategory[] (1999011312..1999011312) => {TimeLocalExecute=30}
+testCategory[] (2000011413..2000011413) => {TimeLocalExecute=160}
+)!";
+                verifyGlobalMetrics("testCategory", MetricsDimensionList{}, slot1Time, nullptr, expected);
+            }
+
+            {
+                constexpr const char * expected = R"!(
+testCategory[] (1999011312..1999011312) => {TimeLocalExecute=30}
+)!";
+                verifyGlobalMetrics(nullptr, MetricsDimensionList{}, slot1Time, &slot1Time, expected);
+            }
+
+            {
+                constexpr const char * expected = R"!(
+testCategory[] (1999011312..1999011312) => {TimeLocalExecute=30}
+)!";
+                verifyGlobalMetrics(nullptr, MetricsDimensionList{}, slot1Time, &slot1EndTime, expected);
+            }
+
+            {
+                constexpr const char * expected = R"!(
+testCategory[] (1999011312..1999011312) => {TimeLocalExecute=30}
+testCategory2[] (1999011313..1999011313) => {TimeLocalExecute=40}
+)!";
+                verifyGlobalMetrics(nullptr, MetricsDimensionList{}, slot1Time, &slot2Time, expected);
+            }
+
+        }
+        catch (IException * e)
+        {
+            StringBuffer msg;
+            e->errorMessage(msg);
+            e->Release();
+            CPPUNIT_FAIL(msg.str());
+        }
+    }
+
+    class GlobalMetricReporter : public Thread
+    {
+    public:
+        GlobalMetricReporter(const char * _queueName, unsigned _numIterations)
+         : Thread("GlobalMetricReporter"), queueName(_queueName), numIterations(_numIterations)
+        {
+        }
+
+        virtual int run()
+        {
+            sem.wait();
+            for (unsigned i = 0; i < numIterations; i++)
+            {
+                recordGlobalMetrics("testCategory", MetricsDimensionList{{"component","thor"},{"name",queueName.str()}}, { StTimeLocalExecute, StNumStarts }, { 1234, i });
+                MilliSleep(0);
+            }
+            return 0;
+        }
+
+    public:
+        StringAttr queueName;
+        Semaphore sem{SYNC_LOCATION};
+        unsigned numIterations;
+    };
+
+    void testMultiThread()
+    {
+        const unsigned numQueues = 4;
+        const unsigned numThreadsPerQueue = 20;
+        const unsigned numIterations = 200;
+
+        CDateTime startTime;
+        startTime.setString("1999-01-13T12:00:00", nullptr, false);
+        setGlobalMetricNowTime("1999-01-13T12:00:00");
+
+        resetGlobalMetrics("testCategory", MetricsDimensionList());
+        resetGlobalMetrics("testCategory2", MetricsDimensionList());
+
+        CIArrayOf<GlobalMetricReporter> threads;
+        for (unsigned queue=0; queue < numQueues; queue++)
+        {
+            VStringBuffer queueName("queue%u", queue);
+            for (unsigned thread=0; thread < numThreadsPerQueue; thread++)
+            {
+                threads.append(*new GlobalMetricReporter(queueName, numIterations));
+                threads.tos().start(true);
+            }
+        }
+
+        CCycleTimer timer;
+        ForEachItemIn(i, threads)
+            threads.item(i).sem.signal();
+
+        ForEachItemIn(i2, threads)
+            threads.item(i2).join();
+
+        __uint64 elapsedNs = timer.elapsedNs();
+        unsigned numEvents = numQueues * numThreadsPerQueue * numIterations;
+        DBGLOG("Processing %u events took %lluns (%llu per event)", numEvents, elapsedNs, elapsedNs / numEvents);
+        {
+            constexpr const char * expected = nullptr;
+            DBGLOG("Expected TimeLocalExecute=%u NumStarts=%u", 1234 * numThreadsPerQueue * numIterations, numThreadsPerQueue * numIterations * (numIterations - 1) / 2);
+            verifyGlobalMetrics(nullptr, MetricsDimensionList{}, startTime, nullptr, expected);
+        }
+
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( DaliGlobalMetricsTester );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( DaliGlobalMetricsTester, "DaliGlobalMetricsTester" );
+
+//---------------------------------------------------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------------------------------------------------
+
+class DaliBinaryDataTester : public CppUnit::TestFixture
+{
+    /* Note: global messages will be written for dates between 2000-02-04 and 2000-02-05 */
+    /* Note: All global messages with time stamp before 2000-03-31 will be deleted */
+    CPPUNIT_TEST_SUITE(DaliBinaryDataTester);
+        CPPUNIT_TEST(doStart);
+        CPPUNIT_TEST(testSimpleBinary);
+        CPPUNIT_TEST(testCompression);
+        CPPUNIT_TEST(doCleanup);
+        CPPUNIT_TEST(doStop);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    void doStart()
+    {
+        daliClientInit();
+    }
+    void doCleanup()
+    {
+        Owned<IRemoteConnection> conn = querySDS().connect("/testext", myProcessSession(), RTM_DELETE_ON_DISCONNECT, 2000);
+    }
+    void doStop()
+    {
+        daliClientEnd();
+    }
+
+    void testSimpleBinary(size32_t size, CompressionMethod compression)
+    {
+        DBGLOG("testBinary %u %s", size, translateFromCompMethod(compression));
+
+        Owned<IRemoteConnection> conn = querySDS().connect("/testext", myProcessSession(), RTM_CREATE, 2000);
+        IPropertyTree *root = conn->queryRoot();
+        MemoryBuffer mb;
+        // fill mem buffer with random data - 100k
+        void *mem = mb.reserveTruncate(size);
+        for (size32_t i = 0; i < size; i++)
+            ((byte *)mem)[i] = (i & 256) ? rand() : i;      // ensure some data is not random
+        root->setPropBin("bin", mb.length(), mb.toByteArray(), compression);
+
+        MemoryBuffer result;
+        root->getPropBin("bin", result);
+
+        CPPUNIT_ASSERT_EQUAL(mb.length(), result.length());
+        CPPUNIT_ASSERT(memcmp(mb.toByteArray(), result.toByteArray(), mb.length()) == 0);
+    }
+
+    void testDaliBinary(size32_t size, CompressionMethod compression)
+    {
+        DBGLOG("testDaliBinary %u %s", size, translateFromCompMethod(compression));
+
+        Owned<IRemoteConnection> conn = querySDS().connect("/testext", myProcessSession(), RTM_CREATE, 2000);
+        IPropertyTree *root = conn->queryRoot();
+        MemoryBuffer mb;
+        // fill mem buffer with random data - 100k
+        void *mem = mb.reserveTruncate(size);
+        for (size32_t i = 0; i < size; i++)
+            ((byte *)mem)[i] = (i & 256) ? rand() : i;      // ensure some data is not random
+        root->setPropBin("bin", mb.length(), mb.toByteArray(), compression);
+        conn->commit();
+        conn.clear();
+
+        conn.setown(querySDS().connect("/testext", myProcessSession(), RTM_LOCK_READ, 2000));
+        root = conn->queryRoot();
+        Owned<IPropertyTree> clonedRoot = createPTreeFromIPT(root);
+
+        MemoryBuffer result;
+        clonedRoot->getPropBin("bin", result);
+
+        CPPUNIT_ASSERT_EQUAL(mb.length(), result.length());
+        CPPUNIT_ASSERT(memcmp(mb.toByteArray(), result.toByteArray(), mb.length()) == 0);
+    }
+
+    void testSimpleBinary()
+    {
+        for (size32_t size=0x100; size < 0x1000000; size *= 2)
+        {
+            testSimpleBinary(size, COMPRESS_METHOD_NONE);
+            testDaliBinary(size, COMPRESS_METHOD_NONE);
+        }
+    }
+
+    void testCompression()
+    {
+        auto options = { COMPRESS_METHOD_LZW, COMPRESS_METHOD_FASTLZ, COMPRESS_METHOD_LZ4, COMPRESS_METHOD_LZ4HC };
+        for (auto compression : options)
+        {
+            testSimpleBinary(0x100000, compression);
+            testDaliBinary(0x100000, compression);
+        }
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( DaliBinaryDataTester );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( DaliBinaryDataTester, "DaliBinaryDataTester" );
+
+
+
 
 #endif // _USE_CPPUNIT

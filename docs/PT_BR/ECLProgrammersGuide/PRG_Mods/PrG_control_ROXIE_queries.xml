@@ -2,7 +2,7 @@
 <!DOCTYPE sect1 PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
 "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <sect1 id="Controlling_Roxie_Queries">
-  <title><emphasis role="bold">Controlando Consultas Roxie</emphasis></title>
+  <title>Controlando Consultas Roxie</title>
 
   <para>Há várias funções ECL projetadas especificamente para ajudar a
   otimizar as consultas para execução no Roxie. Esses incluem PRELOAD,
@@ -40,7 +40,7 @@
             <row>
               <entry><emphasis role="bold">Thor</emphasis></entry>
 
-              <entry>Os grafos são executados em múltiplos nós filhos em
+              <entry>Os grafos são executados em múltiplos nós secundários em
               paralelo.</entry>
             </row>
 
@@ -48,7 +48,7 @@
               <entry/>
 
               <entry>As leituras de índice/disco são feitas localmente por
-              cada nó filho.</entry>
+              cada nó secundário.</entry>
             </row>
 
             <row>
@@ -173,7 +173,7 @@
 
       <para>2) Como uma opção na operação:</para>
 
-      <programlisting>JOIN(... ,LOCAL) 
+      <programlisting>JOIN(... ,LOCAL)
 FETCH(... ,LOCAL)</programlisting>
     </blockquote>
 

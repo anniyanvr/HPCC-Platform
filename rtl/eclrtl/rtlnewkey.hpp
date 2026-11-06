@@ -45,6 +45,9 @@ interface IIndexFilterList : public IInterface, public IIndexReadContext
     virtual bool matchesBuffer(const void *keyBuffer, unsigned lastSeg, unsigned &matchSeg) const = 0;
     virtual unsigned getFieldOffset(unsigned idx) const = 0;
     virtual bool canMatch() const = 0;
+    virtual bool isUnfiltered() const = 0;
+    virtual void updateIndexFormat(const RtlRecord & actualRecInfo) = 0;
+    virtual bool isSingleValue() const = 0;    // Does the filter narrow the supplied keyed fields to a single value (trailing fields may be wild)?
 };
 
 BITMASK_ENUM(TransitionMask);
@@ -64,6 +67,7 @@ public:
     void createSegmentMonitors(IIndexReadContext *irc);
     void extractKeyFilter(const RtlRecord & record, IConstArrayOf<IFieldFilter> & keyFilters) const;
     void extractMemKeyFilter(const RtlRecord & record, const UnsignedArray &sortOrder, IConstArrayOf<IFieldFilter> & keyFilters) const;
+    void splitIntoKeyFilter(const RtlRecord & record, RowFilter &keyFilter);
     unsigned numFilterFields() const { return filters.ordinality(); }
     const IFieldFilter & queryFilter(unsigned i) const { return filters.item(i); }
     const IFieldFilter *findFilter(unsigned fieldIdx) const;
@@ -74,6 +78,7 @@ public:
     void remove(unsigned idx);
     RowFilter & clear();
     void appendFilters(const IConstArrayOf<IFieldFilter> &_filters);
+    void sortByFieldOrder();
 protected:
     IConstArrayOf<IFieldFilter> filters;
     unsigned numFieldsRequired = 0;

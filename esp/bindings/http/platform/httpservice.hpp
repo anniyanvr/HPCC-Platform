@@ -69,7 +69,7 @@ class CEspHttpServer : implements IHttpServerService, public CInterface
 {
     bool isSSL = false;
     bool shouldClose = false;
-    CriticalSection critDaliSession;
+    CriticalSection critDaliSession{SYNC_LOCATION};
     ISocketReturner* m_socketReturner = nullptr;
 protected:
     ISocket&                m_socket;
@@ -83,10 +83,15 @@ protected:
     time_t lastSessionCleanUpTime = 0;
 
     int unsupported();
+    int unsupported(StringBuffer& httpRequestMethod);
     EspHttpBinding* getBinding();
     EspAuthState checkUserAuth();
     void readAuthRequest(EspAuthRequest& req);
     EspAuthState preCheckAuth(EspAuthRequest& authReq);
+    void readTempCookieToContext(IEspContext* ctx, bool setUserIDAsName);
+    void addTempCookie(IEspContext* ctx);
+    void readDomainAuthDataFromSecureContext(IEspContext* ctx, IPropertyTree* tree);
+    void setDomainAuthDataInSecureContext(IEspContext* ctx, IPropertyTree* tree);
     EspAuthState verifyCookies(EspAuthRequest& authReq);
     void verifyCookie(EspAuthRequest& authReq, CESPCookieVerification& cookie);
     bool verifyESPSessionIDCookie(EspAuthRequest& authReq);
@@ -97,8 +102,8 @@ protected:
     EspAuthState checkUserAuthPerRequest(EspAuthRequest& authReq);
     EspAuthState checkUserAuthPerSession(EspAuthRequest& authReq, StringBuffer& authorizationHeader);
     EspAuthState authNewSession(EspAuthRequest& authReq, const char* _userName, const char* _password, const char* sessionStartURL, bool unlock);
-    EspAuthState authExistingSession(EspAuthRequest& req, unsigned sessionID);
-    void logoutSession(EspAuthRequest& authReq, unsigned sessionID, IPropertyTree* domainSessions, bool lock);
+    EspAuthState authExistingSession(EspAuthRequest& req, const char* sessionID);
+    void logoutSession(EspAuthRequest& authReq, const char* sessionID, IPropertyTree* domainSessions, bool lock);
     void askUserLogin(EspAuthRequest& authReq, const char* msg);
     bool changeRedirectURL(EspAuthRequest& authReq);
     EspAuthState handleUserNameOnlyMode(EspAuthRequest& authReq);
@@ -106,28 +111,31 @@ protected:
     EspHttpBinding* getEspHttpBinding(EspAuthRequest& req);
     bool isAuthRequiredForBinding(EspAuthRequest& req);
     void authOptionalGroups(EspAuthRequest& req);
-    unsigned createHTTPSession(EspHttpBinding* authBinding, const char* userID, const char* loginURL);
+    const char* createHTTPSession(IEspContext* ctx, EspHttpBinding* authBinding, const char* userID, const char* loginURL, StringBuffer& sessionID);
     void timeoutESPSessions(EspHttpBinding* authBinding, IPropertyTree* espSessions);
     void addCookie(const char* cookieName, const char *cookieValue, int maxAgeSec, bool httpOnly);
     void clearCookie(const char* cookieName);
     void clearSessionCookies(EspAuthRequest& authReq);
-    unsigned readCookie(const char* cookieName);
     const char* readCookie(const char* cookieName, StringBuffer& cookieValue);
     void sendLockResponse(bool lock, bool error, const char* msg);
     void sendAuthorizationMsg(EspAuthRequest& authReq);
     void sendGetAuthTypeResponse(EspAuthRequest& authReq, const char* authType);
     void createGetSessionTimeoutResponse(StringBuffer& resp, ESPSerializationFormat format, IPropertyTree* sessionTree);
-    void resetSessionTimeout(EspAuthRequest& authReq, unsigned sessionID, StringBuffer& resp, ESPSerializationFormat format, IPropertyTree* sessionTree);
+    void resetSessionTimeout(EspAuthRequest& authReq, const char* sessionID, StringBuffer& resp, ESPSerializationFormat format, IPropertyTree* sessionTree);
     void sendException(EspAuthRequest& authReq, unsigned code, const char* msg);
+    void sendInternalError(bool loggedDetails);
     void sendMessage(const char* msg, const char* msgType);
     void sendSessionReloadHTMLPage(IEspContext* ctx, EspAuthRequest& authReq, const char* msg);
     bool isServiceMethodReq(EspAuthRequest& authReq, const char* serviceName, const char* methodName);
     IRemoteConnection* getSDSConnection(const char* xpath, unsigned mode, unsigned timeout);
+    bool isMalformedUserName(const char *userName);
+
+    void traceRequest(IEspContext* ctx, const char* normalizedMethod);
 
 public:
     IMPLEMENT_IINTERFACE;
 
-    CEspHttpServer(ISocket& sock, CEspApplicationPort* apport, bool viewConfig, int maxRequestEntityLength);
+    CEspHttpServer(ISocket& sock, CEspApplicationPort& apport, bool viewConfig, int maxRequestEntityLength);
     virtual ~CEspHttpServer();
 
     //IEspService
@@ -167,6 +175,7 @@ public:
         m_request->setSocketReturner(returner);
         m_response->setSocketReturner(returner);
     }
+    IEspContext* queryContext() {return m_request->queryContext();}
 };
 
 

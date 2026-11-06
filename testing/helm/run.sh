@@ -4,6 +4,30 @@ options="--set global.image.version=someversion --set global.image.pullPolicy=Al
 hpccchart=$scriptdir/../../helm/hpcc
 failed=0
 
+assert_contains() {
+   local file=$1
+   local pattern=$2
+   local message=$3
+
+   if ! grep -q -- "$pattern" "$file"
+   then
+      echo "$message"
+      failed=1
+   fi
+}
+
+assert_not_contains() {
+   local file=$1
+   local pattern=$2
+   local message=$3
+
+   if grep -q -- "$pattern" "$file"
+   then
+      echo "$message"
+      failed=1
+   fi
+}
+
 helm version
 echo Testing unmodified values file
 helm lint $hpccchart ${options} > results.txt 2> errors.txt
@@ -25,6 +49,53 @@ do
       cat errors.txt
       cat results.txt
       failed=1
+   else
+      helm template $hpccchart ${options} --values $file > results.txt 2> errors.txt
+      if [ $? -ne 0 ]
+      then
+         echo $file failed
+         cat errors.txt
+         cat results.txt
+         failed=1
+      else
+             base=$(basename "$file" .yaml)
+             if [[ "$base" == "aliasprefixcollision" ]]; then
+                # skipped alias must not consume an alias number; mounts must match volumes
+                assert_contains results.txt "name: data-volume-alias-1" "$file did not render data-volume-alias-1"
+                assert_not_contains results.txt "name: data-volume-alias-2" "$file unexpectedly rendered data-volume-alias-2"
+             fi
+             if [[ "$base" =~ ^component-config-sasha-([^-]+)-(enabled|disabled)$ ]]; then
+                service="${BASH_REMATCH[1]}"
+                state="${BASH_REMATCH[2]}"
+                configmap_name="sasha-${service}-configmap-volume"
+                mount_path="/etc/component-configs/sasha-${service}"
+
+                if [[ "$state" == "enabled" ]]; then
+                   assert_contains results.txt "$mount_path" "$file did not mount $mount_path for $service enabled"
+                   assert_contains results.txt "name: $configmap_name" "$file did not render $configmap_name for $service enabled"
+                else
+                   assert_not_contains results.txt "$mount_path" "$file unexpectedly mounted $mount_path for $service disabled"
+                   assert_not_contains results.txt "name: $configmap_name" "$file unexpectedly rendered $configmap_name for $service disabled"
+                fi
+             elif [[ "$base" == "roxie-storage-planes" ]]; then
+                assert_contains results.txt "directAccessPlanes:" "$file did not render directAccessPlanes"
+                assert_contains results.txt "- direct-plane-alpha" "$file did not render the first direct-access plane"
+                assert_contains results.txt "- direct-plane-beta" "$file did not render the second direct-access plane"
+                assert_contains results.txt "preferredPlanes:" "$file did not render preferredPlanes"
+                assert_contains results.txt "- name: preferred-plane-alpha" "$file did not render the first preferred plane as an object"
+                assert_contains results.txt "- name: preferred-plane-beta" "$file did not render the second preferred plane as an object"
+                assert_contains results.txt "priority: 25" "$file did not render the preferred-plane priority"
+             fi
+             if [[ "$base" == "ephemeralplanes" ]]; then
+                assert_contains results.txt "ephemeral: true" "$file did not pass ephemeral through to the plane config"
+                assert_contains results.txt "storageSize: 10Gi" "$file did not pass storageSize through to the plane config"
+                assert_contains results.txt "mountPath: \"/var/lib/HPCCSystems/spill\"" "$file did not mount the ephemeral spill plane"
+                assert_contains results.txt "The configuration contains ephemeral planes: \\[spill temp\\]" "$file did not warn about the explicit ephemeral planes"
+                assert_contains results.txt "The configuration contains dynamically provisioned planes:" "$file did not describe dynamic storageClass planes"
+                assert_not_contains results.txt "The configuration contains dynamically provisioned planes: \[dali" "$file incorrectly described the static dali plane as dynamically provisioned"
+                assert_not_contains results.txt "sizeLimit" "$file unexpectedly generated an emptyDir sizeLimit"
+             fi
+      fi
    fi
 done
 
@@ -54,7 +125,7 @@ if type kubeval >/dev/null 2> /dev/null; then
    helm template $hpccchart ${options} | kubeval --strict - >results.txt 2>errors.txt
    if [ $? -ne 0 ]
    then
-      echo $file failed
+      echo kubeval --strict failed
       cat errors.txt
       cat results.txt
       failed=1
@@ -62,17 +133,18 @@ if type kubeval >/dev/null 2> /dev/null; then
 fi
 
 if type kube-score >/dev/null 2> /dev/null; then
-   echo Running kube-score...
+   echo Running $(kube-score version)
    # Note we force all replicas to be > 1 as some checks are not done on replicas=1 cases e.g. antiaffinity
    helm template $hpccchart ${options} | sed "s/replicas: 1/replicas: 2/" | \
      kube-score score --output-format ci \
         --ignore-container-cpu-limit \
         --ignore-container-memory-limit \
         --ignore-test deployment-has-poddisruptionbudget \
+        --ignore-test statefulset-has-poddisruptionbudget \
         - >results.txt 2>errors.txt
    if [ $? -ne 0 ]
    then
-      echo $file failed
+      echo Running kube-score failed
       cat errors.txt
       cat results.txt
       failed=1

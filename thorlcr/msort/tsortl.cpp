@@ -25,6 +25,7 @@
 #include <process.h>
 #endif
 
+#include "mpcomm.hpp"
 #include "jfile.hpp"
 #include "jio.hpp"
 #include "jsocket.hpp"
@@ -33,17 +34,15 @@
 #include "thbuf.hpp"
 #include "thmem.hpp"
 
+#include "securesocket.hpp"
+
 #ifdef _DEBUG
 //#define _FULL_TRACE
 #endif
 
-#define DEFAULTTIMEOUT 3600 // 60 minutes 
-#define CONNECTTIMEOUT 300  // seconds
-
 #ifdef _MSC_VER
 #pragma warning( disable : 4355 )
 #endif
-
 
 class CREcheck { 
     bool &busy;
@@ -61,8 +60,12 @@ public:
 
 #define RECHECK(b) CREcheck checkRE(b)
 
+// unique/random pattern used to validate header is of expected protocol on connect
+static constexpr unsigned __int64 transferStreamSignature = 0x0ea614193fb99496;
+
 struct TransferStreamHeader
 {
+    unsigned __int64 hdrSig = transferStreamSignature; // used to validate hdr is of expected protocol on connect
     rowcount_t numrecs;
     rowcount_t pos;
     unsigned id;
@@ -73,7 +76,6 @@ struct TransferStreamHeader
         crc = getCrc();
     }
     TransferStreamHeader() {}
-    void winrev() { _WINREV(pos); _WINREV(numrecs); _WINREV(id); _WINREV(crc); }
     unsigned getCrc() const
     {
         unsigned retCrc = crc32((const char *)&numrecs, sizeof(numrecs), 0);
@@ -84,18 +86,13 @@ struct TransferStreamHeader
 };
 
 
-static ISocket *DoConnect(SocketEndpoint &nodeaddr)
-{
-    return ISocket::connect_wait(nodeaddr,CONNECTTIMEOUT*1000);
-}
-
 class CSocketRowStream: public CSimpleInterface, implements IRowStream
 {
     MemoryBuffer inbuf;
     Linked<IEngineRowAllocator> allocator;
     Linked<IOutputRowDeserializer> deserializer;
     Linked<ISocket> socket;
-    Owned<ISerialStream> bufferStream;
+    Owned<IBufferedSerialInputStream> bufferStream;
     CThorStreamDeserializerSource dsz;
     unsigned id;
     bool stopped;
@@ -122,11 +119,11 @@ public:
         if (dsz.eos()) {
             inbuf.clear();
 #ifdef _FULL_TRACE
-            LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowStream.nextRow recv (%d,%x)",id,(unsigned)(memsize_t)socket.get());
+            LOG(MCthorDetailedDebugInfo, "CSocketRowStream.nextRow recv (%d,%x)",id,(unsigned)(memsize_t)socket.get());
 #endif
             size32_t sz = socket->receive_block_size();
 #ifdef _FULL_TRACE
-            LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowStream.nextRow(%d,%x,%d)",id,(unsigned)(memsize_t)socket.get(),sz);
+            LOG(MCthorDetailedDebugInfo, "CSocketRowStream.nextRow(%d,%x,%d)",id,(unsigned)(memsize_t)socket.get(),sz);
 #endif
             if (sz==0) {
                 // eof so terminate (no need to confirm)
@@ -138,7 +135,7 @@ public:
             socket->receive_block(buf,sz);
             assertex(!dsz.eos());
 #ifdef _FULL_TRACE
-            LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowStream.nextRow got (%d,%x,%d)",id,(unsigned)(memsize_t)socket.get(),sz);
+            LOG(MCthorDetailedDebugInfo, "CSocketRowStream.nextRow got (%d,%x,%d)",id,(unsigned)(memsize_t)socket.get(),sz);
 #endif
         }
         RtlDynamicRowBuilder rowBuilder(allocator);
@@ -154,16 +151,16 @@ public:
             stopped = true;
             try {
 #ifdef _FULL_TRACE
-                LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowStream.stop(%x)",(unsigned)(memsize_t)socket.get());
+                LOG(MCthorDetailedDebugInfo, "CSocketRowStream.stop(%x)",(unsigned)(memsize_t)socket.get());
 #endif
                 bool eof = true;
                 socket->write(&eof,sizeof(eof)); // confirm stop
 #ifdef _FULL_TRACE
-                LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowStream.stopped(%x)",(unsigned)(memsize_t)socket.get());
+                LOG(MCthorDetailedDebugInfo, "CSocketRowStream.stopped(%x)",(unsigned)(memsize_t)socket.get());
 #endif
             }
             catch (IException *e) {
-                EXCLOG(e,"CSocketRowStream::stop");
+                IERRLOG(e,"CSocketRowStream::stop");
                 e->Release();
             }
         }
@@ -206,7 +203,7 @@ public:
             preallocated = bufsize+initSize;
 
 #ifdef _FULL_TRACE
-        LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowWriter(%d,%x) preallocated = %d",id,(unsigned)(memsize_t)socket.get(),preallocated);
+        LOG(MCthorDetailedDebugInfo, "CSocketRowWriter(%d,%x) preallocated = %d",id,(unsigned)(memsize_t)socket.get(),preallocated);
 #endif
     }
 
@@ -227,11 +224,11 @@ public:
             flush();
         try {
 #ifdef _FULL_TRACE
-            LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowWriter.stop(%x)",(unsigned)(memsize_t)socket.get());
+            LOG(MCthorDetailedDebugInfo, "CSocketRowWriter.stop(%x)",(unsigned)(memsize_t)socket.get());
 #endif
             socket->send_block(NULL,0);
 #ifdef _FULL_TRACE
-            LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowWriter.stopped(%x)",(unsigned)(memsize_t)socket.get());
+            LOG(MCthorDetailedDebugInfo, "CSocketRowWriter.stopped(%x)",(unsigned)(memsize_t)socket.get());
 #endif
         }
         catch (IJSOCK_Exception *e) { // already gone!
@@ -241,7 +238,7 @@ public:
         }
     }
 
-    void putRow(const void *row)
+    inline void _putRow(const void *row, bool _release)
     {
         if (row==NULL) 
             stop();
@@ -254,17 +251,29 @@ public:
             if (outbuf.length()>bufsize) 
                 flush();
         }
-        ReleaseThorRow(row);
+        if (_release)
+            ReleaseThorRow(row);
     }
+
+    void putRow(const void *row)
+    {
+        _putRow(row, true);
+    }
+
+    void writeRow(const void *row)
+    {
+        _putRow(row, false);
+    }
+
     void flush()
     {
         size32_t l = outbuf.length();
 #ifdef _FULL_TRACE
-        LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowWriter.flush(%d,%x,%d)",id,(unsigned)(memsize_t)socket.get(),l);
+        LOG(MCthorDetailedDebugInfo, "CSocketRowWriter.flush(%d,%x,%d)",id,(unsigned)(memsize_t)socket.get(),l);
 #endif
         if (l) {
             if (!socket->send_block(outbuf.bufferBase(),l)) {
-                LOG(MCthorDetailedDebugInfo, thorJob, "CSocketRowWriter remote stop");
+                LOG(MCthorDetailedDebugInfo, "CSocketRowWriter remote stop");
                 stopped = true;
             }
             pos += l;
@@ -273,6 +282,9 @@ public:
                 preallocated = l;  // assume the worst
             initbuf = true;
         }
+    }
+    virtual void noteStopped() override
+    {
     }
     virtual offset_t getPosition()
     {
@@ -286,16 +298,14 @@ public:
 };
 
 
-IRowStream *ConnectMergeRead(unsigned id, IThorRowInterfaces *rowif,SocketEndpoint &nodeaddr,rowcount_t startrec,rowcount_t numrecs)
+IRowStream *ConnectMergeRead(unsigned id, IThorRowInterfaces *rowif,SocketEndpoint &nodeaddr,rowcount_t startrec,rowcount_t numrecs, ISocket *socket)
 {
-    Owned<ISocket> socket = DoConnect(nodeaddr);
     TransferStreamHeader hdr(startrec, numrecs, id);
 #ifdef _FULL_TRACE
     StringBuffer s;
-    nodeaddr.getUrlStr(s);
-    LOG(MCthorDetailedDebugInfo, thorJob, "ConnectMergeRead(%d,%s,%x,%" RCPF "d,%" RCPF "u)",id,s.str(),(unsigned)(memsize_t)socket.get(),startrec,numrecs);
+    nodeaddr.getEndpointHostText(s);
+    LOG(MCthorDetailedDebugInfo, "ConnectMergeRead(%d,%s,%x,%" RCPF "d,%" RCPF "u)",id,s.str(),(unsigned)(memsize_t)socket.get(),startrec,numrecs);
 #endif
-    hdr.winrev();
     socket->write(&hdr,sizeof(hdr));
     return new CSocketRowStream(id,rowif->queryRowAllocator(),rowif->queryRowDeserializer(),socket);
 }
@@ -321,19 +331,28 @@ ISocketRowWriter *ConnectMergeWrite(IThorRowInterfaces *rowif,ISocket *socket,si
         remaining -= read;
         dst += read;
     }
-    hdr.winrev();
+    if (hdr.hdrSig != transferStreamSignature)
+    {
+        char name[100];
+        int port = socket->peer_name(name,sizeof(name));
+        StringBuffer hdrRaw;
+        hexdump2string((byte const *)&hdr, sizeof(hdr), hdrRaw);
+        throw makeStringExceptionV(TE_SortConnectProtocolErr, "SORT connection protocol mismatch from: %s:%u, raw hdr = %s", name, port, hdrRaw.str());
+    }
     if (hdr.getCrc() != hdr.crc)
     {
         char name[100];
         int port = socket->peer_name(name,sizeof(name));
-        throw makeStringExceptionV(TE_InvalidSortConnect, "Invalid SORT connection from: %s:%u", name, port);
+        StringBuffer hdrRaw;
+        hexdump2string((byte const *)&hdr, sizeof(hdr), hdrRaw);
+        throw makeStringExceptionV(TE_SortConnectCrcErr, "SORT connection failed crc check from: %s:%u, raw hdr = %s", name, port, hdrRaw.str());
     }
     startrec = hdr.pos;
     numrecs = hdr.numrecs;
 #ifdef _FULL_TRACE
     char name[100];
     int port = socket->peer_name(name,sizeof(name));
-    LOG(MCthorDetailedDebugInfo, thorJob, "ConnectMergeWrite(%d,%s:%d,%x,%" RCPF "d,%" RCPF "u)",hdr.id,name,port,(unsigned)(memsize_t)socket,startrec,numrecs);
+    LOG(MCthorDetailedDebugInfo, "ConnectMergeWrite(%d,%s:%d,%x,%" RCPF "d,%" RCPF "u)",hdr.id,name,port,(unsigned)(memsize_t)socket,startrec,numrecs);
 #endif
     return new CSocketRowWriter(hdr.id,rowif,socket,bufsize);
 }

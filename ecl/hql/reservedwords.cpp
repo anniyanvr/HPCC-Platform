@@ -67,6 +67,7 @@ static const char * eclReserved2[] = { //HPCC and OS environment settings
 
     "clustersize",
     "getenv",
+    "getsecret",
     NULL
 };
 
@@ -122,6 +123,7 @@ static const char * eclReserved4[] = { //String functions
     "keyunicode",
     "length",
     "realformat",
+    "regexextract",
     "regexfind",
     "regexfindset",
     "regexreplace",
@@ -432,6 +434,7 @@ static const char * eclReserved14[] = { //Attribute functions (some might actual
     "default",
     "escape",
     "format",
+    "formencoded",
     "global",
     "groupby",
     "guard",
@@ -474,6 +477,7 @@ static const char * eclReserved14[] = { //Attribute functions (some might actual
     "timelimit",
     "timeout",
     "token",
+    "uncompressed",
     "unstable",
     "update",
     "use",
@@ -539,6 +543,7 @@ static const char * eclReserved15[] = { //Actions and statements
 static const char * eclReserved16[] = { //Compiler directive/hints
     "__common__",
     "distributed",
+    "eclagent",
     "evaluate",
     "forward",
     "hint",

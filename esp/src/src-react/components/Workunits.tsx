@@ -1,41 +1,54 @@
 import * as React from "react";
-import { CommandBar, ContextualMenuItemType, ICommandBarItemProps } from "@fluentui/react";
-import { useConst } from "@fluentui/react-hooks";
-import * as domClass from "dojo/dom-class";
-import * as WsWorkunits from "src/WsWorkunits";
-import * as ESPWorkunit from "src/ESPWorkunit";
-import * as Utility from "src/Utility";
+import { IDetailsRowProps } from "./controls/Grid";
+import { CommandBar, ContextualMenuItemType, ICommandBarItemProps } from "./CommandBarV9";
+import { LockClosedFilled } from "@fluentui/react-icons";
+import { Link, Tooltip } from "@fluentui/react-components";
+import { hsl as d3Hsl } from "@hpcc-js/common";
+import { SashaService, WsSasha, Workunit, WsWorkunits, WorkunitsService } from "@hpcc-js/comms";
+import { scopedLogger } from "@hpcc-js/util";
+import { SizeMe } from "../layouts/SizeMe";
+import { defaultSort, emptyFilter, getStateImage, formatQuery } from "src/ESPWorkunit";
+import { formatCost } from "src/Session";
+import { userKeyValStore } from "src/KeyValStore";
+import { QuerySortItem } from "src/store/Store";
 import nlsHPCC from "src/nlsHPCC";
+import { useConfirm } from "../hooks/confirm";
+import { useMyAccount } from "../hooks/user";
+import { useUserStore } from "../hooks/store";
+import { useLogicalClustersPalette } from "../hooks/platform";
+import { calcSearch, pushParams, pushUrl } from "../util/history";
 import { HolyGrail } from "../layouts/HolyGrail";
-import { pushParams } from "../util/history";
-import { Fields, Filter } from "./Filter";
-import { ShortVerticalDivider } from "./Common";
-import { DojoGrid, selector } from "./DojoGrid";
+import { CreateWUQueryStore, WUQueryStore } from "../comms/workunit";
+import { FluentPagedGrid, FluentPagedFooter, useCopyButtons, useFluentStoreState, FluentColumns } from "./controls/Grid";
+import { Fields } from "./forms/Fields";
+import { Filter } from "./forms/Filter";
+import { ZAPImport } from "./forms/ZAPImport";
+
+const logger = scopedLogger("src-react/components/Workunits.tsx");
+const sashaService = new SashaService({ baseUrl: "" });
+const wuService = new WorkunitsService({ baseUrl: "" });
 
 const FilterFields: Fields = {
     "Type": { type: "checkbox", label: nlsHPCC.ArchivedOnly },
+    "Protected": { type: "checkbox", label: nlsHPCC.Protected },
     "Wuid": { type: "string", label: nlsHPCC.WUID, placeholder: "W20200824-060035" },
     "Owner": { type: "string", label: nlsHPCC.Owner, placeholder: nlsHPCC.jsmi },
-    "JobName": { type: "string", label: nlsHPCC.JobName, placeholder: nlsHPCC.log_analysis_1 },
-    "Cluster": { type: "target-cluster", label: nlsHPCC.Cluster, placeholder: nlsHPCC.Owner },
-    "State": { type: "workunit-state", label: nlsHPCC.State, placeholder: nlsHPCC.Created },
+    "Jobname": { type: "string", label: nlsHPCC.JobName, placeholder: nlsHPCC.log_analysis_1 },
+    "Cluster": { type: "target-cluster", label: nlsHPCC.Cluster, placeholder: "", multiSelect: true },
+    "State": { type: "workunit-state", label: nlsHPCC.State, placeholder: "" },
+    "MinimumCompileCost": { type: "string", label: nlsHPCC.MinimumCompileCost, placeholder: "0.001" },
+    "MinimumExecuteCost": { type: "string", label: nlsHPCC.MinimumExecuteCost, placeholder: "0.0002" },
+    "MinimumFileAccessCost": { type: "string", label: nlsHPCC.MinimumFileAccessCost, placeholder: "0.03" },
     "ECL": { type: "string", label: nlsHPCC.ECL, placeholder: nlsHPCC.dataset },
-    "LogicalFile": { type: "string", label: nlsHPCC.LogicalFile, placeholder: nlsHPCC.somefile },
+    "ErrorContents": { type: "string", label: nlsHPCC.Errors, placeholder: nlsHPCC.UnexpectedProcessTermination },
+    "LogicalFile": { type: "string", label: nlsHPCC.LogicalFile, placeholder: nlsHPCC.LogicalFilePlaceholder },
     "LogicalFileSearchType": { type: "logicalfile-type", label: nlsHPCC.LogicalFileType, placeholder: "", disabled: (params: Fields) => !params.LogicalFile.value },
-    "StartDate": { type: "datetime", label: nlsHPCC.FromDate, placeholder: "" },
-    "EndDate": { type: "datetime", label: nlsHPCC.ToDate, placeholder: "" },
-    "LastNDays": { type: "string", label: nlsHPCC.LastNDays, placeholder: "2" }
+    "LastNDays": { type: "string", label: nlsHPCC.LastNDays, placeholder: "2" },
+    "StartDate": { type: "date", label: nlsHPCC.FromDate },
+    "StartTime": { type: "time", label: nlsHPCC.FromTime },
+    "EndDate": { type: "date", label: nlsHPCC.ToDate },
+    "EndTime": { type: "time", label: nlsHPCC.ToTime },
 };
-
-function formatQuery(filter) {
-    if (filter.StartDate) {
-        filter.StartDate = new Date(filter.StartDate).toISOString();
-    }
-    if (filter.EndDate) {
-        filter.EndDate = new Date(filter.StartDate).toISOString();
-    }
-    return filter;
-}
 
 const defaultUIState = {
     hasSelection: false,
@@ -47,31 +60,180 @@ const defaultUIState = {
     hasNotCompleted: false
 };
 
-interface WorkunitsProps {
-    filter?: object;
-    store?: any;
+const WORKUNITS_SHOWTIMELINE = "workunits_showTimeline";
+
+export function resetWorkunitOptions() {
+    const store = userKeyValStore();
+    return store?.delete(WORKUNITS_SHOWTIMELINE);
 }
 
-const emptyFilter = {};
+interface WorkunitsProps {
+    filter?: { [id: string]: any };
+    sort?: QuerySortItem;
+    store?: WUQueryStore;
+    page?: number;
+}
 
 export const Workunits: React.FunctionComponent<WorkunitsProps> = ({
     filter = emptyFilter,
+    sort = defaultSort,
+    page = 1,
     store
 }) => {
 
-    const [grid, setGrid] = React.useState<any>(undefined);
+    const hasFilter = React.useMemo(() => Object.keys(filter).length > 0, [filter]);
+
     const [showFilter, setShowFilter] = React.useState(false);
-    const [mine, setMine] = React.useState(false);
-    const [selection, setSelection] = React.useState([]);
+    const [showZapImport, setShowZapImport] = React.useState(false);
+    const { currentUser } = useMyAccount();
     const [uiState, setUIState] = React.useState({ ...defaultUIState });
+    const [showTimeline, setShowTimeline] = useUserStore<boolean>(WORKUNITS_SHOWTIMELINE, true);
+    const {
+        selection, setSelection,
+        pageNum, setPageNum,
+        pageSize, setPageSize,
+        total, setTotal,
+        refreshTable } = useFluentStoreState({ page });
+    const [, , palette] = useLogicalClustersPalette();
+
+    //  Grid ---
+    const query = React.useMemo(() => {
+        return formatQuery(filter);
+    }, [filter]);
+
+    const gridStore = React.useMemo(() => {
+        return store ? store : CreateWUQueryStore();
+    }, [store]);
+
+    const columns = React.useMemo((): FluentColumns => {
+        return {
+            Protected: {
+                headerIconElement: <LockClosedFilled aria-label={nlsHPCC.Protected} />,
+                headerTooltip: nlsHPCC.Protected,
+                width: 24,
+                resizable: false,
+                sortable: true,
+                formatter: (_protected) => {
+                    if (_protected === true) {
+                        return <LockClosedFilled aria-label="Protected" />;
+                    }
+                    return "";
+                },
+                field: nlsHPCC.Protected,
+            },
+            Wuid: {
+                label: nlsHPCC.WUID, width: 180,
+                sortable: true,
+                formatter: (Wuid: string, wu: Workunit) => {
+                    const search = calcSearch(filter);
+                    return <>
+                        {wu?.FailureDesc ?
+                            <Tooltip content={wu?.FailureDesc ?? ""} relationship="description">
+                                <img src={getStateImage(wu.StateID, wu.isComplete(), wu.Archived)} alt="" style={{ width: "16px", height: "16px" }} />
+                            </Tooltip>
+                            :
+                            <img src={getStateImage(wu.StateID, wu.isComplete(), wu.Archived)} alt="" style={{ width: "16px", height: "16px" }} />
+                        }
+                        &nbsp;
+                        <Link href={search ? `#/workunits!${calcSearch(filter)}/${Wuid}` : `#/workunits/${Wuid}`}>{Wuid}</Link >
+                    </>;
+                }
+            },
+            Owner: { label: nlsHPCC.Owner },
+            Jobname: { label: nlsHPCC.JobName, width: 180 },
+            Cluster: { label: nlsHPCC.Cluster },
+            RoxieCluster: { label: nlsHPCC.RoxieCluster, width: 100, sortable: false },
+            State: {
+                label: nlsHPCC.State,
+                width: 80,
+                formatter: (state, wu) => {
+                    if (wu?.FailureDesc) {
+                        return <Tooltip content={wu?.FailureDesc ?? ""} relationship="description"><span>{state}</span></Tooltip>;
+                    } else {
+                        return state;
+                    }
+                }
+            },
+            TotalClusterTime: {
+                label: nlsHPCC.TotalClusterTime, width: 120,
+                justify: "right",
+            },
+            "Compile Cost": {
+                label: nlsHPCC.CompileCost, width: 100,
+                justify: "right",
+                formatter: (cost, row) => `${formatCost(row.CompileCost)}`,
+                csvFormatter: (cost, row) => row.CompileCost,
+            },
+            "Execution Cost": {
+                label: nlsHPCC.ExecuteCost, width: 100,
+                justify: "right",
+                formatter: (cost, row) => `${formatCost(row.ExecuteCost)}`,
+                csvFormatter: (cost, row) => row.ExecuteCost,
+            },
+            "File Access Cost": {
+                label: nlsHPCC.FileAccessCost, width: 100,
+                justify: "right",
+                formatter: (cost, row) => `${formatCost(row.FileAccessCost)}`,
+                csvFormatter: (cost, row) => row.FileAccessCost,
+            }
+        };
+    }, [filter]);
+
+    const copyButtons = useCopyButtons(columns, selection, "workunits");
+
+    const doActionWithWorkunits = React.useCallback(async (action: "Delete" | "Abort", abortReason?: string) => {
+        const unknownWUs = selection.filter(wu => wu.State === "unknown");
+        if (action === "Delete" && unknownWUs.length) {
+            await wuService.WUAction({ Wuids: { Item: unknownWUs.map(item => item.Wuid) }, WUActionType: WsWorkunits.ECLWUActions.SetToFailed });
+        }
+        await wuService.WUAction({ Wuids: { Item: selection.map(item => item.Wuid) }, WUActionType: WsWorkunits.ECLWUActions[action], AbortReason: abortReason });
+        refreshTable.call(true);
+    }, [refreshTable, selection]);
+
+    const [DeleteConfirm, setShowDeleteConfirm] = useConfirm({
+        title: nlsHPCC.Delete,
+        message: nlsHPCC.DeleteSelectedWorkunits,
+        items: selection.map(s => s?.Wuid).filter(wuid => wuid !== undefined),
+        onSubmit: () => doActionWithWorkunits("Delete").catch(err => logger.error(err))
+    });
+
+    const [AbortConfirm, setShowAbortConfirm] = useConfirm({
+        title: nlsHPCC.Abort,
+        message: nlsHPCC.AbortSelectedWorkunits,
+        items: selection.map(s => s?.Wuid).filter(wuid => wuid !== undefined),
+        fields: [{ id: "AbortReason", label: nlsHPCC.AbortReason }],
+        onSubmit: (values) => doActionWithWorkunits("Abort", values?.AbortReason).catch(err => logger.error(err))
+    });
+
+    //  Filter  ---
+    const filterFields: Fields = {};
+    for (const fieldID in FilterFields) {
+        filterFields[fieldID] = { ...FilterFields[fieldID], value: filter[fieldID] };
+    }
+
+    // Split ISO datetime strings into separate date and time fields
+    if (filter.StartDate) {
+        const startDateTime = new Date(filter.StartDate);
+        if (!isNaN(startDateTime.getTime())) {
+            filterFields.StartDate.value = startDateTime.toISOString().split("T")[0];
+            filterFields.StartTime.value = startDateTime.toISOString().split("T")[1]?.slice(0, 5);
+        }
+    }
+    if (filter.EndDate) {
+        const endDateTime = new Date(filter.EndDate);
+        if (!isNaN(endDateTime.getTime())) {
+            filterFields.EndDate.value = endDateTime.toISOString().split("T")[0];
+            filterFields.EndTime.value = endDateTime.toISOString().split("T")[1]?.slice(0, 5);
+        }
+    }
 
     //  Command Bar  ---
-    const buttons: ICommandBarItemProps[] = [
+    const buttons = React.useMemo((): ICommandBarItemProps[] => [
         {
             key: "refresh", text: nlsHPCC.Refresh, iconProps: { iconName: "Refresh" },
-            onClick: () => refreshTable()
+            onClick: () => refreshTable.call()
         },
-        { key: "divider_1", itemType: ContextualMenuItemType.Divider, onRender: () => <ShortVerticalDivider /> },
+        { key: "divider_1", itemType: ContextualMenuItemType.Divider },
         {
             key: "open", text: nlsHPCC.Open, disabled: !uiState.hasSelection, iconProps: { iconName: "WindowEdit" },
             onClick: () => {
@@ -85,123 +247,78 @@ export const Workunits: React.FunctionComponent<WorkunitsProps> = ({
             }
         },
         {
-            key: "delete", text: nlsHPCC.Delete, disabled: !uiState.hasNotProtected, iconProps: { iconName: "Delete" },
+            key: "compare", text: nlsHPCC.Compare, disabled: selection.length < 2, iconProps: { iconName: "DiffSideBySide" },
             onClick: () => {
-                const list = selection.map(s => s.Wuid);
-                if (confirm(nlsHPCC.DeleteSelectedWorkunits + "\n" + list)) {
-                    WsWorkunits.WUAction(selection, "Delete").then(() => refreshTable(true));
-                }
+                const wuids = selection.map(wu => wu.Wuid).join(",");
+                pushUrl(`/workunits/${wuids}`);
             }
         },
-        { key: "divider_2", itemType: ContextualMenuItemType.Divider, onRender: () => <ShortVerticalDivider /> },
+        {
+            key: "delete", text: nlsHPCC.Delete, disabled: !uiState.hasNotProtected, iconProps: { iconName: "Delete" },
+            onClick: () => setShowDeleteConfirm(true)
+        },
+        { key: "divider_2", itemType: ContextualMenuItemType.Divider },
         {
             key: "setFailed", text: nlsHPCC.SetToFailed, disabled: !uiState.hasNotProtected,
-            onClick: () => { WsWorkunits.WUAction(selection, "SetToFailed"); }
+            onClick: () => { wuService.WUAction({ Wuids: { Item: selection.map(item => item.Wuid) }, WUActionType: WsWorkunits.ECLWUActions.SetToFailed }).then(() => refreshTable.call()); }
         },
         {
             key: "abort", text: nlsHPCC.Abort, disabled: !uiState.hasNotCompleted,
-            onClick: () => { WsWorkunits.WUAction(selection, "Abort"); }
+            onClick: () => setShowAbortConfirm(true)
         },
-        { key: "divider_3", itemType: ContextualMenuItemType.Divider, onRender: () => <ShortVerticalDivider /> },
+        { key: "divider_3", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "restore", text: nlsHPCC.Restore, disabled: !(filter.Type === true && uiState.hasSelection),
+            onClick: () => {
+                const wuids = selection.map(item => item?.Wuid || item.ID).filter(wuid => wuid !== undefined);
+                Promise.all(wuids.map(wuid =>
+                    sashaService.RestoreWU({
+                        Wuid: wuid,
+                        WUType: WsSasha.WUTypes.ECL
+                    })
+                ))
+                    .then(() => refreshTable.call(true))
+                    .catch(err => logger.error(err));
+            }
+        },
         {
             key: "protect", text: nlsHPCC.Protect, disabled: !uiState.hasNotProtected,
-            onClick: () => { WsWorkunits.WUAction(selection, "Protect"); }
+            onClick: () => {
+                wuService.WUAction({ Wuids: { Item: selection.map(item => item.Wuid) }, WUActionType: WsWorkunits.ECLWUActions.Protect }).then(() => refreshTable.call());
+            }
         },
         {
             key: "unprotect", text: nlsHPCC.Unprotect, disabled: !uiState.hasProtected,
-            onClick: () => { WsWorkunits.WUAction(selection, "Unprotect"); }
-        },
-        { key: "divider_4", itemType: ContextualMenuItemType.Divider, onRender: () => <ShortVerticalDivider /> },
-        {
-            key: "filter", text: nlsHPCC.Filter, disabled: !!store, iconProps: { iconName: "Filter" },
             onClick: () => {
-                setShowFilter(true);
+                wuService.WUAction({ Wuids: { Item: selection.map(item => item.Wuid) }, WUActionType: WsWorkunits.ECLWUActions.Unprotect }).then(() => refreshTable.call());
             }
         },
+        { key: "divider_4", itemType: ContextualMenuItemType.Divider },
         {
-            key: "mine", text: nlsHPCC.Mine, disabled: true, iconProps: { iconName: "Contact" }, canCheck: true, checked: mine,
-            onClick: () => {
-                setMine(!mine);
-            }
-        },
-    ];
-
-    const rightButtons: ICommandBarItemProps[] = [
-        {
-            key: "copy", text: nlsHPCC.CopyWUIDs, disabled: !uiState.hasSelection || !navigator?.clipboard?.writeText, iconOnly: true, iconProps: { iconName: "Copy" },
-            onClick: () => {
-                const wuids = selection.map(s => s.Wuid);
-                navigator?.clipboard?.writeText(wuids.join("\n"));
-            }
+            key: "filter", text: nlsHPCC.Filter, disabled: !!store, iconProps: { iconName: hasFilter ? "FilterSolid" : "Filter" },
+            onClick: () => { setShowFilter(true); }
         },
         {
-            key: "download", text: nlsHPCC.DownloadToCSV, disabled: !uiState.hasSelection, iconOnly: true, iconProps: { iconName: "Download" },
+            key: "mine", text: nlsHPCC.Mine, disabled: !currentUser?.username || !total, iconProps: { iconName: "Contact" }, canCheck: true, checked: filter.Owner === currentUser.username,
             onClick: () => {
-                Utility.downloadToCSV(grid, selection.map(row => ([row.Protected, row.Wuid, row.Owner, row.Jobname, row.Cluster, row.RoxieCluster, row.State, row.TotalClusterTime])), "workunits.csv");
-            }
-        }
-    ];
-
-    //  Grid ---
-    const gridStore = useConst(store || ESPWorkunit.CreateWUQueryStore({}));
-    const gridQuery = useConst(formatQuery(filter));
-    const gridSort = useConst([{ attribute: "Wuid", "descending": true }]);
-    const gridColumns = useConst({
-        col1: selector({
-            width: 27,
-            selectorType: "checkbox"
-        }),
-        Protected: {
-            renderHeaderCell: function (node) {
-                node.innerHTML = Utility.getImageHTML("locked.png", nlsHPCC.Protected);
-            },
-            width: 25,
-            sortable: false,
-            formatter: function (_protected) {
-                if (_protected === true) {
-                    return Utility.getImageHTML("locked.png");
+                if (filter.Owner === currentUser.username) {
+                    filter.Owner = "";
+                } else {
+                    filter.Owner = currentUser.username;
                 }
-                return "";
+                pushParams(filter);
             }
         },
-        Wuid: {
-            label: nlsHPCC.WUID, width: 180,
-            formatter: function (Wuid) {
-                const wu = ESPWorkunit.Get(Wuid);
-                return `${wu.getStateImageHTML()}&nbsp;<a href='#/workunits/${Wuid}' class='dgrid-row-url''>${Wuid}</a>`;
-            }
+        { key: "divider_5", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "timeline", text: nlsHPCC.Timeline, canCheck: true, checked: showTimeline, iconProps: { iconName: "TimelineProgress" },
+            onClick: () => { setShowTimeline(!showTimeline); }
         },
-        Owner: { label: nlsHPCC.Owner, width: 90 },
-        Jobname: { label: nlsHPCC.JobName, width: 500 },
-        Cluster: { label: nlsHPCC.Cluster, width: 90 },
-        RoxieCluster: { label: nlsHPCC.RoxieCluster, width: 99 },
-        State: { label: nlsHPCC.State, width: 90 },
-        TotalClusterTime: {
-            label: nlsHPCC.TotalClusterTime, width: 117,
-            renderCell: function (object, value, node) {
-                domClass.add(node, "justify-right");
-                node.innerText = value;
-            }
-        }
-    });
-
-    const refreshTable = (clearSelection = false) => {
-        grid?.set("query", formatQuery(filter));
-        if (clearSelection) {
-            grid?.clearSelection();
-        }
-    };
-
-    //  Filter  ---
-    const filterFields: Fields = {};
-    for (const field in FilterFields) {
-        filterFields[field] = { ...FilterFields[field], value: filter[field] };
-    }
-
-    React.useEffect(() => {
-        refreshTable();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [filter]);
+        {
+            key: "zapImport", text: nlsHPCC.Import, disabled: !!store,
+            onClick: () => { setShowZapImport(true); }
+        },
+    ], [currentUser.username, filter, hasFilter, refreshTable, selection, setShowAbortConfirm, setShowDeleteConfirm, setShowTimeline, showTimeline, store, total, uiState.hasNotCompleted, uiState.hasNotProtected, uiState.hasProtected, uiState.hasSelection]);
 
     //  Selection  ---
     React.useEffect(() => {
@@ -222,7 +339,7 @@ export const Workunits: React.FunctionComponent<WorkunitsProps> = ({
                 } else {
                     state.hasNotFailed = true;
                 }
-                if (WsWorkunits.isComplete(selection[i].StateID, selection[i].ActionEx)) {
+                if (selection[i].isComplete()) {
                     state.hasCompleted = true;
                 } else {
                     state.hasNotCompleted = true;
@@ -232,13 +349,68 @@ export const Workunits: React.FunctionComponent<WorkunitsProps> = ({
         setUIState(state);
     }, [selection]);
 
+    const renderRowTimings = React.useCallback((props: IDetailsRowProps) => {
+        if (props?.item?.__timeline_timings) {
+            const total = props.item.__timeline_timings.page.end - props.item.__timeline_timings.page.start;
+            const startPct = 100 - (props.item.__timeline_timings.start - props.item.__timeline_timings.page.start) / total * 100;
+            const endPct = 100 - (props.item.__timeline_timings.end - props.item.__timeline_timings.page.start) / total * 100;
+            const backgroundColor = palette(props.item.Cluster);
+            const borderColor = d3Hsl(backgroundColor).darker().toString();
+
+            return <div style={{
+                position: "absolute",
+                top: 4,
+                bottom: 4,
+                left: `${endPct}%`,
+                width: `${startPct - endPct}%`,
+                backgroundColor,
+                borderColor,
+                borderWidth: 1,
+                borderStyle: "solid",
+                opacity: .33,
+                pointerEvents: "none"
+            }} />;
+        }
+        return null;
+    }, [palette]);
+
     return <HolyGrail
-        header={<CommandBar items={buttons} overflowButtonProps={{}} farItems={rightButtons} />}
+        header={<CommandBar items={buttons} farItems={copyButtons} />}
         main={
             <>
-                <DojoGrid store={gridStore} query={gridQuery} sort={gridSort} columns={gridColumns} setGrid={setGrid} setSelection={setSelection} />
+                <SizeMe>{({ size }) =>
+                    <div style={{ width: "100%", height: "100%" }}>
+                        <div style={{ position: "absolute", width: "100%", height: `${size.height}px` }}>
+                            <FluentPagedGrid
+                                store={gridStore}
+                                query={query}
+                                sort={sort}
+                                pageNum={pageNum}
+                                pageSize={pageSize}
+                                total={total}
+                                columns={columns}
+                                height={`${size.height}px`}
+                                setSelection={setSelection}
+                                setTotal={setTotal}
+                                refresh={refreshTable}
+                                onRenderRow={showTimeline ? renderRowTimings : undefined}
+                            ></FluentPagedGrid>
+                        </div>
+                    </div>
+                }</SizeMe>
                 <Filter showFilter={showFilter} setShowFilter={setShowFilter} filterFields={filterFields} onApply={pushParams} />
+                <ZAPImport showForm={showZapImport} setShowForm={setShowZapImport} refreshGrid={() => refreshTable.call()} />
+                <DeleteConfirm />
+                <AbortConfirm />
             </>
         }
+        footer={<FluentPagedFooter
+            persistID={"workunits"}
+            pageNum={pageNum}
+            selectionCount={selection.length}
+            setPageNum={setPageNum}
+            setPageSize={setPageSize}
+            total={total}
+        ></FluentPagedFooter >}
     />;
 };

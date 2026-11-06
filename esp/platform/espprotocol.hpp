@@ -32,19 +32,16 @@
 #include <algorithm>
 #include <string>
 #include <map>
-using namespace std;
+#include <atomic>
 
+//A helper class for tracking the number of active requests
 class ActiveRequests
 {
 public:
+    ActiveRequests();
+    ~ActiveRequests();
 
-    ActiveRequests() { inc(); }
-    ~ActiveRequests()  { dec(); }
-
-    void inc();
-    void dec();
-
-    static long getCount();
+    static unsigned getCount();
 };
 
 class CEspBindingEntry : public CInterface, implements IInterface
@@ -101,7 +98,7 @@ class CEspApplicationPort
     HINSTANCE hxsl;
     Owned<IXslProcessor> xslp;
     CEspProtocol* protocol = nullptr;
-    ReadWriteLock rwLock;
+    ReadWriteLock rwLock{SYNC_LOCATION};
 public:
     CEspApplicationPort(bool viewcfg, CEspProtocol* prot);
 
@@ -130,7 +127,7 @@ public:
     CEspBindingEntry* queryBindingItem(int item)
     {
         ReadLockBlock rblock(rwLock);
-        return (item<bindings.length()) ? &bindings.item(item) : nullptr;
+        return bindings.isItem(item) ? &bindings.item(item) : nullptr;
     }
     CEspBindingEntry* getDefaultBinding()
     {
@@ -149,7 +146,7 @@ public:
 #endif
 };
 
-typedef map<int, CEspApplicationPort*> CApplicationPortMap;
+typedef std::map<int, CEspApplicationPort*> CApplicationPortMap;
 
 #define DEFAULT_MAX_REQUEST_ENTITY_LENGTH 8000000
 
@@ -165,7 +162,7 @@ private:
     int m_MaxRequestEntityLength;
     IEspContainer *m_container = nullptr;
     Owned<IPersistentHandler> m_persistentHandler;
-    ReadWriteLock rwLock;
+    ReadWriteLock rwLock{SYNC_LOCATION};
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -180,7 +177,7 @@ public:
     void clear()
     {
         WriteLockBlock wblock(rwLock);
-        map<int, CEspApplicationPort*>::iterator bndi = m_portmap.begin();
+        std::map<int, CEspApplicationPort*>::iterator bndi = m_portmap.begin();
         for(;bndi!=m_portmap.end();bndi++)
             if(bndi->second)
                 delete bndi->second;
@@ -216,5 +213,14 @@ public:
 };
 
 esp_http_decl bool checkEspConnection(IEspContext& ctx);
+
+class CESPAbortRequestCallback : implements IAbortRequestCallback
+{
+    IEspContext* context = nullptr;
+public:
+    CESPAbortRequestCallback(IEspContext* _context) : context(_context){ };
+
+    virtual bool abortRequested() override { return !checkEspConnection(*context); }
+};
 
 #endif

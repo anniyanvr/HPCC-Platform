@@ -57,7 +57,31 @@ EXPORT TestDataPatterns := MODULE
             ASSERT(Basic_String_Profile[1].numeric_lower_quartile = 0),
             ASSERT(Basic_String_Profile[1].numeric_median = 0),
             ASSERT(Basic_String_Profile[1].numeric_upper_quartile = 0),
-            ASSERT(COUNT(Basic_String_Profile[1].correlations) = 0),
+            ASSERT(TRUE)
+        ];
+
+    //--------------------------------------------------------------------------
+    // Cardinality and modes should respect maxPatternLen
+    //--------------------------------------------------------------------------
+
+    SHARED MaxPatternLen_Values := DATASET
+        (
+            [
+                'abcdefghijklmnopqrstuvwxyz1234567A',
+                'abcdefghijklmnopqrstuvwxyz1234567B',
+                'abcdefghijklmnopqrstuvwxyz1234567C'
+            ],
+            {STRING s}
+        );
+
+    SHARED MaxPatternLen_Profile := Std.DataPatterns.Profile(NOFOLD(MaxPatternLen_Values), maxPatternLen := 33, features := 'cardinality,modes');
+
+    EXPORT Test_MaxPatternLen_Profile :=
+        [
+            ASSERT(MaxPatternLen_Profile[1].cardinality = 1),
+            ASSERT(COUNT(MaxPatternLen_Profile[1].modes) = 1),
+            ASSERT(MaxPatternLen_Profile[1].modes[1].value = 'abcdefghijklmnopqrstuvwxyz1234567'),
+            ASSERT(MaxPatternLen_Profile[1].modes[1].rec_count = 3),
             ASSERT(TRUE)
         ];
 
@@ -108,7 +132,38 @@ EXPORT TestDataPatterns := MODULE
             ASSERT(Basic_Numeric_Profile[1].numeric_lower_quartile = -1000),
             ASSERT(Basic_Numeric_Profile[1].numeric_median = 500),
             ASSERT(Basic_Numeric_Profile[1].numeric_upper_quartile = 2000),
-            ASSERT(COUNT(Basic_Numeric_Profile[1].correlations) = 0),
+            ASSERT(TRUE)
+        ];
+
+    //--------------------------------------------------------------------------
+    // Numeric zero handling test
+    //--------------------------------------------------------------------------
+
+    SHARED Numeric_Zero := DATASET
+        (
+            [
+                0, 10
+            ],
+            {INTEGER n}
+        );
+
+    SHARED Numeric_Zero_Profile := Std.DataPatterns.Profile(NOFOLD(Numeric_Zero), features := 'fill_rate,cardinality,min_max,mean');
+    SHARED Numeric_Zero_Allowed_Profile := Std.DataPatterns.Profile(NOFOLD(Numeric_Zero), features := 'fill_rate,cardinality,min_max,mean', allowZero := TRUE);
+
+    EXPORT Test_Numeric_Zero_Profile :=
+        [
+            ASSERT(Numeric_Zero_Profile[1].rec_count = 2),
+            ASSERT(Numeric_Zero_Profile[1].fill_rate = 50),
+            ASSERT(Numeric_Zero_Profile[1].fill_count = 1),
+            ASSERT(Numeric_Zero_Profile[1].cardinality = 1),
+            ASSERT(Numeric_Zero_Profile[1].numeric_min = 10),
+            ASSERT(Numeric_Zero_Profile[1].numeric_mean = 10),
+            ASSERT(Numeric_Zero_Allowed_Profile[1].rec_count = 2),
+            ASSERT(Numeric_Zero_Allowed_Profile[1].fill_rate = 100),
+            ASSERT(Numeric_Zero_Allowed_Profile[1].fill_count = 2),
+            ASSERT(Numeric_Zero_Allowed_Profile[1].cardinality = 2),
+            ASSERT(Numeric_Zero_Allowed_Profile[1].numeric_min = 0),
+            ASSERT(Numeric_Zero_Allowed_Profile[1].numeric_mean = 5),
             ASSERT(TRUE)
         ];
 
@@ -403,7 +458,7 @@ EXPORT TestDataPatterns := MODULE
             {STRING s, {UNSIGNED4 x, UNSIGNED4 y, UNSIGNED4 z} foo}
         );
 
-    SHARED Embedded_Child1_Profile := Std.DataPatterns.Profile(NOFOLD(Embedded_Child1));
+    SHARED Embedded_Child1_Profile := Std.DataPatterns.Profile(NOFOLD(Embedded_Child1), features := 'fill_rate,best_ecl_types,cardinality,cardinality_breakdown,modes,lengths,patterns,min_max,mean,std_dev,quartiles,correlations');
 
     EXPORT Test_Embedded_Child1_Profile :=
         [
@@ -426,7 +481,7 @@ EXPORT TestDataPatterns := MODULE
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.x')[1].numeric_std_dev = 432),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.x')[1].numeric_lower_quartile = 123),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.x')[1].numeric_median = 555),
-            ASSERT(Embedded_Child1_Profile(attribute = 'foo.x')[1].numeric_upper_quartile = 0),
+            ASSERT(Embedded_Child1_Profile(attribute = 'foo.x')[1].numeric_upper_quartile = 987),
             ASSERT(COUNT(Embedded_Child1_Profile(attribute = 'foo.x')[1].correlations) = 2),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.y')[1].attribute = 'foo.y'),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.y')[1].rec_count = 2),
@@ -447,7 +502,7 @@ EXPORT TestDataPatterns := MODULE
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.y')[1].numeric_std_dev = 210),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.y')[1].numeric_lower_quartile = 345),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.y')[1].numeric_median = 555),
-            ASSERT(Embedded_Child1_Profile(attribute = 'foo.y')[1].numeric_upper_quartile = 0),
+            ASSERT(Embedded_Child1_Profile(attribute = 'foo.y')[1].numeric_upper_quartile = 765),
             ASSERT(COUNT(Embedded_Child1_Profile(attribute = 'foo.y')[1].correlations) = 2),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.z')[1].attribute = 'foo.z'),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.z')[1].rec_count = 2),
@@ -468,7 +523,7 @@ EXPORT TestDataPatterns := MODULE
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.z')[1].numeric_std_dev = 12),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.z')[1].numeric_lower_quartile = 543),
             ASSERT(Embedded_Child1_Profile(attribute = 'foo.z')[1].numeric_median = 555),
-            ASSERT(Embedded_Child1_Profile(attribute = 'foo.z')[1].numeric_upper_quartile = 0),
+            ASSERT(Embedded_Child1_Profile(attribute = 'foo.z')[1].numeric_upper_quartile = 567),
             ASSERT(COUNT(Embedded_Child1_Profile(attribute = 'foo.z')[1].correlations) = 2),
             ASSERT(TRUE)
         ];
@@ -577,13 +632,14 @@ EXPORT TestDataPatterns := MODULE
             ASSERT(SetOf_Types_Profile(attribute = 'my_set')[1].numeric_lower_quartile = 0),
             ASSERT(SetOf_Types_Profile(attribute = 'my_set')[1].numeric_median = 0),
             ASSERT(SetOf_Types_Profile(attribute = 'my_set')[1].numeric_upper_quartile = 0),
-            ASSERT(COUNT(SetOf_Types_Profile(attribute = 'my_set')[1].correlations) = 0),
             ASSERT(TRUE)
         ];
 
     EXPORT Main := [
         EVALUATE(Test_Basic_String_Profile), 
+        EVALUATE(Test_MaxPatternLen_Profile),
         EVALUATE(Test_Basic_Numeric_Profile),
+        EVALUATE(Test_Numeric_Zero_Profile),
         EVALUATE(Test_Empty_Data_Profile),
         EVALUATE(Test_Pattern_Unicode_Profile),
         EVALUATE(Test_Pattern_Punctuation_Profile),

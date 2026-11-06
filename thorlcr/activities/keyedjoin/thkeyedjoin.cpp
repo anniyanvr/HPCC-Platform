@@ -39,7 +39,11 @@ class CKeyedJoinMaster : public CMasterActivity
     bool local = false;
     bool remoteKeyedLookup = false;
     bool remoteKeyedFetch = false;
+    bool assumePrimary = false;
+    bool stripeOutOfClusterLookups = false;
     unsigned totalIndexParts = 0;
+    unsigned indexFileStatsTableEntry = NotFound;
+    unsigned dataFileStatsTableEntry = NotFound;
 
     // CMap contains mappings and lists of parts for each slave
     class CMap
@@ -109,20 +113,22 @@ class CKeyedJoinMaster : public CMasterActivity
             unsigned numParts = fileDesc->numParts();
             unsigned nextGroupStartPos = 0;
 
+            const SocketEndpoint localhost("localhost");
+            IDistributedFile *subFile = file;
             for (unsigned p=0; p<numParts; p++)
             {
                 IPartDescriptor *part = fileDesc->queryPart(p);
-                const char *kind = isIndexWithTlk ? part->queryProperties().queryProp("@kind") : nullptr;
-                if (!kind || !strsame("topLevelKey", kind))
+                unsigned partIdx = part->queryPartIndex();
+                unsigned subFileNum = NotFound;
+                unsigned subPartIdx = partIdx;
+                if (superFileDesc)
                 {
-                    unsigned partIdx = part->queryPartIndex();
-                    unsigned subfile = NotFound;
-                    unsigned subPartIdx = partIdx;
-                    if (superFileDesc)
-                    {
-                        superFileDesc->mapSubPart(partIdx, subfile, subPartIdx);
-                        partIdx = superWidth*subfile+subPartIdx;
-                    }
+                    superFileDesc->mapSubPart(partIdx, subFileNum, subPartIdx);
+                    partIdx = superWidth*subFileNum+subPartIdx;
+                    subFile = &super->querySubFile(subFileNum, true);
+                }
+                if (!isIndexWithTlk || (1 == numParts) || (subPartIdx < (subFile->numParts()-1)) || !hasTLK(*subFile, nullptr))
+                {
                     if (activity.local)
                     {
                         if (activity.queryContainer().queryLocalData())
@@ -146,21 +152,60 @@ class CKeyedJoinMaster : public CMasterActivity
                          * Add them to local parts list if found.
                          */
                         unsigned mappedPos = NotFound;
-                        for (unsigned c=0; c<part->numCopies(); c++)
+                        unsigned copies = part->numCopies();
+                        bool filePartExists = false;
+                        if (activity.assumePrimary)
+                        {
+                            /* If the index is big (e.g. large superkey), then it can be expensive
+                             * to walk over all part copies, checking their existence.
+                             * This option provides a workaround in those cases, to avoid that check,
+                             * by assuming the primary copy will exist and be used.
+                             */
+                            copies = 1;
+                            filePartExists = true;
+                        }
+                        for (unsigned c = 0; c < copies; c++)
                         {
                             INode *partNode = part->queryNode(c);
                             unsigned partCopy = p | (c << partBits);
                             unsigned start=nextGroupStartPos;
                             unsigned gn=start;
-                            do
+                            if (!activity.assumePrimary)
                             {
-                                INode &groupNode = dfsGroup.queryNode(gn);
-                                if ((partNode->equals(&groupNode)))
+                                RemoteFilename rfn;
+                                part->getFilename(c, rfn);
+                                Owned<IFile> file = createIFile(rfn);
+                                filePartExists = file->exists(); // skip if copy doesn't exist
+                            }
+                            if (filePartExists)
+                            {
+                                do
                                 {
-                                    RemoteFilename rfn;
-                                    part->getFilename(c, rfn);
-                                    Owned<IFile> file = createIFile(rfn);
-                                    if (file->exists()) // skip if copy doesn't exist
+                                    // NB: all parts are considered 'local' in containerized mode
+                                    // It will cause the parts to be striped across the group (and hence the workers),
+                                    // such that the parts will be partitioned, with each worker dealing with some parts
+                                    // locally via local key lookup handlers and the rest being handled remotely by other
+                                    // workers via remote key lookup handlers.
+                                    // remoteKeyedLookup=false will disabled this default behaviour, causing all parts
+                                    // to be handled locally by each worker.
+
+                                    bool stripeLookups = activity.stripeOutOfClusterLookups; // always stripe, even if out of cluster file parts
+                                    if (!stripeLookups)
+                                    {
+                                        if (isContainerized())
+                                        {
+                                            // stripe if part is local (mounted)
+                                            const SocketEndpoint &partEp = partNode->endpoint();
+                                            if (partEp.equals(localhost))
+                                                stripeLookups = true;
+                                        }
+                                        else
+                                        {
+                                            // stripe if part node is same as cluster node
+                                            stripeLookups = partNode->equals(&dfsGroup.queryNode(gn));
+                                        }
+                                    }
+                                    if (stripeLookups)
                                     {
                                         /* NB: If there's >1 slave per node (e.g. slavesPerNode>1) then there are multiple matching node's in the dfsGroup
                                         * Which means a copy of a part may already be assigned to a cluster slave map. This check avoid handling it again if it has.
@@ -195,12 +240,12 @@ class CKeyedJoinMaster : public CMasterActivity
                                                 slaveParts.push_back(partCopy);
                                         }
                                     }
+                                    gn++;
+                                    if (gn == groupSize)
+                                        gn = 0;
                                 }
-                                gn++;
-                                if (gn == groupSize)
-                                    gn = 0;
+                                while (gn != start);
                             }
-                            while (gn != start);
                         }
                         if (NotFound == mappedPos)
                         {
@@ -209,7 +254,7 @@ class CKeyedJoinMaster : public CMasterActivity
                                 slaveParts.push_back(p);
                         }
                         if (superFileDesc)
-                            partIdx = superWidth*subfile+subPartIdx;
+                            partIdx = superWidth*subFileNum+subPartIdx;
                         partsByPartIdx.push_back(partIdx);
                         assertex(partIdx < totalParts);
                         partToSlave[partIdx] = mappedPos;
@@ -259,6 +304,11 @@ public:
         if (getOptBool(THOROPT_FORCE_REMOTE_KEYED_FETCH))
             remoteKeyedFetch = true;
 
+        assumePrimary = getOptBool(THOROPT_KJ_ASSUME_PRIMARY);
+
+        // NB: defaulting to false for now, meaning all out-of-cluster files will be handled locally by each worker (not striped and via remote handlers)
+        stripeOutOfClusterLookups = remoteKeyedLookup && getOptBool(THOROPT_KJ_STRIPE_OUT_OF_CLUSTER_LOOKUPS);
+
         if (helper->diskAccessRequired())
             numTags += 2;
         for (unsigned t=0; t<numTags; t++)
@@ -283,24 +333,26 @@ public:
         totalIndexParts = 0;
 
         Owned<IDistributedFile> dataFile;
-        Owned<IDistributedFile> indexFile = queryThorFileManager().lookup(container.queryJob(), indexFileName, false, 0 != (helper->getJoinFlags() & JFindexoptional), true, container.activityIsCodeSigned());
+        Owned<IDistributedFile> indexFile = lookupReadFile(indexFileName, AccessMode::readRandom, false, false, 0 != (helper->getJoinFlags() & JFindexoptional), true, indexReadFileStatistics, &indexFileStatsTableEntry);
         if (indexFile)
         {
             if (!isFileKey(indexFile))
-                throw MakeActivityException(this, TE_FileTypeMismatch, "Attempting to read flat file as an index: %s", indexFileName.get());
+                throw MakeActivityException(this, ENGINEERR_FILE_TYPE_MISMATCH, "Attempting to read flat file as an index: %s", indexFileName.get());
             IDistributedSuperFile *superIndex = indexFile->querySuperFile();
+
+            unsigned numSuperIndexSubs = superIndex?superIndex->numSubFiles(true):1;
             if (helper->diskAccessRequired())
             {
                 OwnedRoxieString fetchFilename(helper->getFileName());
                 if (fetchFilename)
                 {
-                    dataFile.setown(queryThorFileManager().lookup(container.queryJob(), fetchFilename, false, 0 != (helper->getFetchFlags() & FFdatafileoptional), true, container.activityIsCodeSigned()));
+                    dataFile.setown(lookupReadFile(fetchFilename, AccessMode::readRandom, false, false, 0 != (helper->getFetchFlags() & FFdatafileoptional), true, diskReadRemoteStatistics, &dataFileStatsTableEntry));
                     if (dataFile)
                     {
                         if (isFileKey(dataFile))
-                            throw MakeActivityException(this, TE_FileTypeMismatch, "Attempting to read index as a flat file: %s", fetchFilename.get());
+                            throw MakeActivityException(this, ENGINEERR_FILE_TYPE_MISMATCH, "Full-Keyed-Join: Attempting to read index as a flat file (fetch file): %s", fetchFilename.get());
                         if (superIndex)
-                            throw MakeActivityException(this, 0, "Superkeys and full keyed joins are not supported");
+                            throw MakeActivityException(this, 0, "Full-Keyed-Join: Superkeys with full keyed joins are not supported");
 
                         dataFileDesc.setown(getConfiguredFileDescriptor(*dataFile));
                         void *ekey;
@@ -313,12 +365,12 @@ public:
                             free(ekey);
                             if (!encrypted)
                             {
-                                Owned<IException> e = MakeActivityWarning(&container, TE_EncryptionMismatch, "Ignoring encryption key provided as file '%s' was not published as encrypted", dataFile->queryLogicalName());
+                                Owned<IException> e = MakeActivityWarning(&container, TE_EncryptionMismatch, "Full-Keyed-Join: Ignoring encryption key provided as file '%s' was not published as encrypted", fetchFilename.get());
                                 queryJobChannel().fireException(e);
                             }
                         }
                         else if (encrypted)
-                            throw MakeActivityException(this, 0, "File '%s' was published as encrypted but no encryption key provided", dataFile->queryLogicalName());
+                            throw MakeActivityException(this, 0, "Full-Keyed-Join: File '%s' was published as encrypted but no encryption key provided", fetchFilename.get());
 
                         /* If fetch file is local to cluster, fetches are sent to the slave the parts are local to.
                          * If fetch file is off cluster, fetches are performed by requesting node directly on fetch part, therefore each nodes
@@ -350,20 +402,15 @@ public:
                 indexFileDesc.setown(indexFile->getFileDescriptor());
 
                 unsigned superIndexWidth = 0;
-                unsigned numSuperIndexSubs = 0;
                 if (superIndex)
                 {
-                    numSuperIndexSubs = superIndex->numSubFiles(true);
                     bool first=true;
                     // consistency check
                     Owned<IDistributedFileIterator> iter = superIndex->getSubFileIterator(true);
                     ForEach(*iter)
                     {
                         IDistributedFile &f = iter->query();
-                        unsigned np = f.numParts()-1;
-                        IDistributedFilePart &part = f.queryPart(np);
-                        const char *kind = part.queryAttributes().queryProp("@kind");
-                        bool hasTlk = NULL != kind && 0 == stricmp("topLevelKey", kind); // if last part not tlk, then deemed local (might be singlePartKey)
+                        bool hasTlk = hasTLK(f, this);
                         if (first)
                         {
                             first = false;
@@ -375,11 +422,11 @@ public:
                         else
                         {
                             if (hasTlk != keyHasTlk)
-                                throw MakeActivityException(this, 0, "Local/Single part keys cannot be mixed with distributed(tlk) keys in keyedjoin");
+                                throw MakeActivityException(this, 0, "Unsupported: Superkey with a mixture of Local/Single and Distributed sub-indexes. (Superkey: '%s', sub-index: '%s')", indexFileName.get(), f.queryLogicalName());
                             if (keyHasTlk && superIndexWidth != f.numParts()-1)
-                                throw MakeActivityException(this, 0, "Super sub keys of different width cannot be mixed with distributed(tlk) keys in keyedjoin");
+                                throw MakeActivityException(this, 0, "Unsupported: sub-indexes of different widths cannot be mixed. (Superkey: '%s', sub-index: '%s')", indexFileName.get(), f.queryLogicalName());
                             if (localKey && superIndexWidth != queryClusterWidth())
-                                throw MakeActivityException(this, 0, "Super keys of local index must be same width as target cluster");
+                                throw MakeActivityException(this, 0, "Unsupported: Superkey of local indexes must be same width as target cluster. (Superkey: '%s', sub-index: '%s')", indexFileName.get(), f.queryLogicalName());
                         }
                     }
                     if (keyHasTlk)
@@ -392,8 +439,7 @@ public:
                     totalIndexParts = indexFile->numParts();
                     if (totalIndexParts)
                     {
-                        const char *kind = indexFile->queryPart(indexFile->numParts()-1).queryAttributes().queryProp("@kind");
-                        keyHasTlk = NULL != kind && 0 == stricmp("topLevelKey", kind);
+                        keyHasTlk = hasTLK(*indexFile, this);
                         if (keyHasTlk)
                             --totalIndexParts;
                     }
@@ -439,10 +485,7 @@ public:
                     initMb.append(keyHasTlk);
                     if (keyHasTlk)
                     {
-                        if (numSuperIndexSubs)
-                            initMb.append(numSuperIndexSubs);
-                        else
-                            initMb.append((unsigned)1);
+                        initMb.append(numSuperIndexSubs);
 
                         Owned<IDistributedFileIterator> iter;
                         IDistributedFile *f;
@@ -486,12 +529,6 @@ public:
         }
         else
             initMb.append(totalIndexParts); // 0
-        if (indexFile)
-        {
-            addReadFile(indexFile);
-            if (dataFile)
-                addReadFile(dataFile);
-        }
     }
     virtual void serializeSlaveData(MemoryBuffer &dst, unsigned slave)
     {
@@ -512,6 +549,7 @@ public:
             }
             if (remoteKeyedLookup)
                 indexMap.serializePartMap(dst);
+            dst.append(indexFileStatsTableEntry);
             unsigned totalDataParts = dataMap.count();
             dst.append(totalDataParts);
             if (totalDataParts)
@@ -530,15 +568,35 @@ public:
                 }
                 if (remoteKeyedFetch)
                     dataMap.serializePartMap(dst);
+                dst.append(dataFileStatsTableEntry);
             }
         }
+    }
+    virtual void deserializeStats(unsigned node, MemoryBuffer &mb) override
+    {
+        CMasterActivity::deserializeStats(node, mb);
+        unsigned numFilesToRead;
+        mb.read(numFilesToRead);
+        assertex(fileStats.size()>=numFilesToRead);
+        for (unsigned i=0; i<numFilesToRead; i++)
+            fileStats[i]->deserialize(node, mb);
+    }
+    virtual void getActivityStats(IStatisticGatherer & stats) override
+    {
+        CMasterActivity::getActivityStats(stats);
+        diskAccessCost = calcFileReadCostStats(false);
+        if (diskAccessCost)
+            stats.addStatistic(StCostFileAccess, diskAccessCost);
+    }
+    virtual void done() override
+    {
+        diskAccessCost = calcFileReadCostStats(true);
+        CMasterActivity::done();
     }
 };
 
 
 CActivityBase *createKeyedJoinActivityMaster(CMasterGraphElement *info)
 {
-    if (info->getOptBool("legacykj"))
-        return LegacyKJ::createKeyedJoinActivityMaster(info);
     return new CKeyedJoinMaster(info);
 }

@@ -50,7 +50,7 @@ private:
     StringBuffer m_StatusMessage;
     
     WsEclClientRequestState m_state;
-    Semaphore m_semSink;
+    Semaphore m_semSink{SYNC_LOCATION};
     Owned<IClientWsEclEvents> m_eventSink;
     
     unsigned long m_client_value;
@@ -60,7 +60,7 @@ public:
     IMPLEMENT_IINTERFACE;
     
     CClientWsEclResponse(unsigned long cv=0, unsigned long reqId=0) : 
-    m_client_value(cv), m_request_id(reqId), m_ResultsXML(nilIgnore)
+    m_ResultsXML(nilIgnore), m_client_value(cv), m_request_id(reqId)
     {
     }
     
@@ -344,7 +344,7 @@ public:
                 ForEach(*piter)
                 {
                     const char *propkey = piter->getPropKey();
-                    rpcMsg.add_value(path, "", propkey, "", m_params->queryProp(propkey), false);
+                    rpcMsg.add_value(path, "", propkey, "", piter->queryPropValue(), false);
                 }       
             }
 
@@ -394,7 +394,7 @@ private:
     unsigned long m_client_value;
     
     Owned<IClientWsEclEvents> m_eventSink;
-    Semaphore m_semWorkerThread;
+    Semaphore m_semWorkerThread{SYNC_LOCATION};
     void *m_hThunk;
     
     PointerArray m_arrays;
@@ -410,9 +410,9 @@ public:
     
     CClientWsEclRequest(const char *method) : 
             m_method(method), 
+            m_nsvar("m"),
             m_noSecurityHeader(false), 
             m_disableKeepAlive(false), 
-            m_nsvar("m"),
             m_itemTag("Item")
     { }
     

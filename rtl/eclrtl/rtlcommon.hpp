@@ -4,6 +4,7 @@
 
 #include "jiface.hpp"
 #include "jfile.hpp"
+#include "jexcept.hpp"
 #include "eclrtl.hpp"
 #include "eclhelper.hpp"
 
@@ -14,9 +15,9 @@ class ECLRTL_API CContiguousRowBuffer
 {
 public:
     CContiguousRowBuffer() = default;
-    CContiguousRowBuffer(ISerialStream * _in);
+    CContiguousRowBuffer(IBufferedSerialInputStream * _in);
 
-    void setStream(ISerialStream *_in);
+    void setStream(IBufferedSerialInputStream *_in);
     const byte * peekBytes(size32_t maxSize);
     const byte * peekFirstByte();
     void skipBytes(size32_t size)
@@ -59,7 +60,7 @@ private:
 protected:
     const byte * cur = nullptr;
 private:
-    ISerialStream* in = nullptr;
+    IBufferedSerialInputStream* in = nullptr;
     const byte * buffer = nullptr;
     size32_t available = 0;
 };
@@ -71,9 +72,9 @@ class ECLRTL_API CThorContiguousRowBuffer : public CContiguousRowBuffer, impleme
 {
 public:
     CThorContiguousRowBuffer() = default;
-    CThorContiguousRowBuffer(ISerialStream * _in);
+    CThorContiguousRowBuffer(IBufferedSerialInputStream * _in);
 
-    inline void setStream(ISerialStream *_in)
+    inline void setStream(IBufferedSerialInputStream *_in)
     {
         CContiguousRowBuffer::setStream(_in);
         readOffset = 0;
@@ -134,7 +135,8 @@ private:
         if (required > maxAvailable())
         {
             peekBytesDirect(required);
-            assertex(required <= maxAvailable());
+            if (unlikely(required > maxAvailable()))
+                throw makeStringExceptionV(0, "Required %u bytes, but only %u available (row offset %u file offset %llu)", required, (unsigned)maxAvailable(), readOffset, tell() + readOffset);
         }
     }
 

@@ -99,6 +99,14 @@ IReferenceSelector * HqlCppTranslator::doBuildRowIf(BuildCtx & ctx, IHqlExpressi
 
     IHqlExpression * trueBranch = expr->queryChild(1);
     IHqlExpression * falseBranch = expr->queryChild(2);
+    HqlExprAssociation * boundCond = ctx.queryMatchExpr(foldedCond);
+    if (boundCond && boundCond->queryExpr()->queryValue())
+    {
+        if (matchesConstValue(boundCond->queryExpr(), true))
+            return buildNewRow(ctx, trueBranch);
+        else
+            return buildNewRow(ctx, falseBranch);
+    }
 
     //Ideally should have a constant modifier on the following row...
     Owned<ITypeInfo> rowType = makeReferenceModifier(expr->getType());
@@ -116,6 +124,7 @@ IReferenceSelector * HqlCppTranslator::doBuildRowIf(BuildCtx & ctx, IHqlExpressi
     doBuildRowIfBranch(ctx, condctx, row, trueBranch);
 
     condctx.selectElse(cond);
+    condctx.associateExpr(foldedCond, queryBoolExpr(false));
 
     condctx.associateExpr(queryConditionalRowMarker(), rowExpr);
     doBuildRowIfBranch(ctx, condctx, row, falseBranch);
@@ -711,13 +720,13 @@ IReferenceSelector * HqlCppTranslator::buildActiveRow(BuildCtx & ctx, IHqlExpres
     StringBuffer tablename;
     getExprIdentifier(tablename, expr);
 
-    traceExpression("Dataset not found", expr);
+    traceExpression("DatasetNotFound", expr);
 
     RowAssociationIterator iter(ctx);
     ForEach(iter)
     {
         BoundRow & cur = iter.get();
-        traceExpression("BoundCursor:", cur.querySelector());
+        traceExpression("BoundCursor", cur.querySelector());
     }
     throwError1(HQLERR_DatasetNotActive, tablename.str());
     return NULL; //remove warning about control paths
@@ -862,13 +871,13 @@ void HqlCppTranslator::doBuildAssignAggregateLoop(BuildCtx & ctx, const CHqlBoun
             CHqlBoundExpr cond;
             buildExpr(ctx, dataset->queryChild(0), cond);
 
-            IHqlExpression * last = queryLastNonAttribute(dataset);
+            unsigned last = numNonAttributes(dataset)-1;
             BuildCtx subctx(ctx);
             IHqlStmt * switchstmt = subctx.addSwitch(cond.expr);
             ForEachChildFrom(i, dataset, 1)
             {
                 IHqlExpression * cur = dataset->queryChild(i);
-                if (cur != last)
+                if (i != last)
                 {
                     OwnedHqlExpr label = getSizetConstant(i);
                     subctx.addCase(switchstmt, label);
@@ -1737,9 +1746,9 @@ unique_id_t ChildGraphBuilder::buildGraphLoopBody(BuildCtx & ctx, bool isParalle
     subctx.addGroup();
 
     IHqlExpression * query = childQuery->queryChild(2);
-    translator.traceExpression("Before Loop resource", query);
+    translator.traceExpression("BeforeLoopResource", query);
     OwnedHqlExpr resourced = translator.getResourcedChildGraph(ctx, childQuery, numResults, no_loop, unlimitedResources);
-    translator.traceExpression("After Loop resource", resourced);
+    translator.traceExpression("AfterLoopResource", resourced);
 
     //Add a flag to indicate multi instance
     if (isParallel)
@@ -1812,6 +1821,9 @@ void HqlCppTranslator::buildAssignChildDataset(BuildCtx & ctx, const CHqlBoundTa
     {
     case no_call:
     case no_externalcall:
+        if (callIsActivity(expr) && !ctx.queryMatchExpr(activityContextMarkerExpr))
+            break;
+        //fallthrough
     case no_libraryinput:
         buildDatasetAssign(ctx, target, expr);
         return;
@@ -1841,7 +1853,7 @@ IHqlExpression * HqlCppTranslator::getResourcedChildGraph(BuildCtx & ctx, IHqlEx
     checkNormalized(ctx, resourced);
 
     unsigned csfFlags = CSFindex|options.optimizeDiskFlag;
-    switch (targetClusterType)
+    switch (getTargetClusterType())
     {
     case HThorCluster:
         csfFlags |= CSFcompoundSpill;
@@ -1868,18 +1880,18 @@ IHqlExpression * HqlCppTranslator::getResourcedChildGraph(BuildCtx & ctx, IHqlEx
         traceExpression("AfterOptimizeSub", resourced);
     }
 
-    traceExpression("BeforeResourcing Child", resourced);
+    traceExpression("BeforeResourcingChild", resourced);
     HqlExprCopyArray activeRows;
     gatherActiveCursors(ctx, activeRows);
     if (graphKind == no_loop)
     {
-        resourced.setown(resourceLoopGraph(*this, activeRows, resourced, targetClusterType, graphIdExpr, numResults, isInsideChildQuery, unlimitedResources));
+        resourced.setown(resourceLoopGraph(*this, activeRows, resourced, getTargetClusterType(), graphIdExpr, numResults, isInsideChildQuery, unlimitedResources));
     }
     else
-        resourced.setown(resourceNewChildGraph(ctx, *this, activeRows, resourced, targetClusterType, graphIdExpr, numResults));
+        resourced.setown(resourceNewChildGraph(ctx, *this, activeRows, resourced, getTargetClusterType(), graphIdExpr, numResults));
 
     checkNormalized(ctx, resourced);
-    traceExpression("AfterResourcing Child", resourced);
+    traceExpression("AfterResourcingChild", resourced);
     
     resourced.setown(optimizeGraphPostResource(resourced, csfFlags, false, isInsideChildQuery));
     if (options.optimizeSpillProject)
@@ -2554,6 +2566,8 @@ void HqlCppTranslator::buildDatasetAssign(BuildCtx & ctx, const CHqlBoundTarget 
         return;
     case no_call:
     case no_externalcall:
+        if (callIsActivity(expr) && !ctx.queryMatchExpr(activityContextMarkerExpr))
+            break;
         doBuildCall(ctx, &target, expr, NULL);
         return;
     case no_getgraphresult:
@@ -3106,6 +3120,7 @@ public:
     virtual IEngineRowAllocator *createChildRowAllocator(const RtlTypeInfo *type) override { throwUnexpected(); }
     virtual void gatherStats(CRuntimeStatisticCollection & stats) override {}
     virtual void releaseAllRows() override { throwUnexpected(); }
+    virtual void emptyCache() override { }
 };
 
 //Use a (constant) transform to map selectors of the form queryActiveTableSelector().field
@@ -3571,13 +3586,13 @@ void HqlCppTranslator::buildDatasetAssignChoose(BuildCtx & ctx, IHqlCppDatasetBu
     CHqlBoundExpr cond;
     buildExpr(ctx, expr->queryChild(0), cond);
 
-    IHqlExpression * last = queryLastNonAttribute(expr);
+    unsigned last = numNonAttributes(expr)-1;
     BuildCtx subctx(ctx);
     IHqlStmt * switchstmt = subctx.addSwitch(cond.expr);
     ForEachChildFrom(i, expr, 1)
     {
         IHqlExpression * cur = expr->queryChild(i);
-        if (cur != last)
+        if (i != last)
         {
             OwnedHqlExpr label = getSizetConstant(i);
             subctx.addCase(switchstmt, label);
@@ -3586,6 +3601,7 @@ void HqlCppTranslator::buildDatasetAssignChoose(BuildCtx & ctx, IHqlCppDatasetBu
             subctx.addDefault(switchstmt);
 
         buildDatasetAssign(subctx, target, cur);
+        subctx.addBreak(); // Ensure that any empty datasets do not fall through to the next case.
     }
 }
 
@@ -3595,13 +3611,13 @@ void HqlCppTranslator::buildDatasetAssignChoose(BuildCtx & ctx, const CHqlBoundT
     CHqlBoundExpr cond;
     buildExpr(ctx, expr->queryChild(0), cond);
 
-    IHqlExpression * last = queryLastNonAttribute(expr);
+    unsigned last = numNonAttributes(expr)-1;
     BuildCtx subctx(ctx);
     IHqlStmt * switchstmt = subctx.addSwitch(cond.expr);
     ForEachChildFrom(i, expr, 1)
     {
         IHqlExpression * cur = expr->queryChild(i);
-        if (cur != last)
+        if (i != last)
         {
             OwnedHqlExpr label = getSizetConstant(i);
             subctx.addCase(switchstmt, label);
@@ -3610,20 +3626,62 @@ void HqlCppTranslator::buildDatasetAssignChoose(BuildCtx & ctx, const CHqlBoundT
             subctx.addDefault(switchstmt);
 
         buildDatasetAssign(subctx, target, cur);
+        subctx.addBreak(); // Ensure that any empty datasets do not fall through to the next case.
     }
 }
 
 
 void HqlCppTranslator::buildDatasetAssignIf(BuildCtx & ctx, const CHqlBoundTarget & target, IHqlExpression * expr)
 {
-    BuildCtx subctx(ctx);
-    IHqlStmt * filter = buildFilterViaExpr(subctx, expr->queryChild(0));
-    buildDatasetAssign(subctx, target, expr->queryChild(1));
+    IHqlExpression * condExpr = expr->queryChild(0);
+    IHqlExpression * trueExpr = expr->queryChild(1);
+    IHqlExpression * falseExpr = expr->queryChild(2);
+    assertex(falseExpr);
 
-    IHqlExpression * elseExpr = expr->queryChild(2);
-    assertex(elseExpr);
+    HqlExprAssociation * boundCond = ctx.queryMatchExpr(condExpr);
+    if (boundCond && boundCond->queryExpr()->queryValue())
+    {
+        if (matchesConstValue(boundCond->queryExpr(), true))
+            buildDatasetAssign(ctx, target, trueExpr);
+        else
+            buildDatasetAssign(ctx, target, falseExpr);
+        return;
+    }
+
+    BuildCtx subctx(ctx);
+    IHqlStmt * filter = buildFilterViaExpr(subctx, condExpr);
+    buildDatasetAssign(subctx, target, trueExpr);
     subctx.selectElse(filter);
-    buildDatasetAssign(subctx, target, elseExpr);
+    subctx.associateExpr(condExpr, queryBoolExpr(false));
+    buildDatasetAssign(subctx, target, falseExpr);
+}
+
+
+void HqlCppTranslator::buildDatasetAssignIf(BuildCtx & ctx, IHqlCppDatasetBuilder * target, IHqlExpression * expr)
+{
+    IHqlExpression * condExpr = expr->queryChild(0);
+    IHqlExpression * trueExpr = expr->queryChild(1);
+    IHqlExpression * falseExpr = expr->queryChild(2);
+
+    HqlExprAssociation * boundCond = ctx.queryMatchExpr(condExpr);
+    if (boundCond && boundCond->queryExpr()->queryValue())
+    {
+        if (matchesConstValue(boundCond->queryExpr(), true))
+            buildDatasetAssign(ctx, target, trueExpr);
+        else if (falseExpr && (falseExpr->getOperator() != no_null))
+            buildDatasetAssign(ctx, target, falseExpr);
+        return;
+    }
+
+    BuildCtx subctx(ctx);
+    IHqlStmt * filter = buildFilterViaExpr(subctx, condExpr);
+    buildDatasetAssign(subctx, target, trueExpr);
+    if (falseExpr && (falseExpr->getOperator() != no_null))
+    {
+        subctx.selectElse(filter);
+        subctx.associateExpr(condExpr, queryBoolExpr(false));
+        buildDatasetAssign(subctx, target, falseExpr);
+    }
 }
 
 
@@ -3662,19 +3720,7 @@ void HqlCppTranslator::buildDatasetAssign(BuildCtx & ctx, IHqlCppDatasetBuilder 
             break;
         }
     case no_if:
-        {
-            CHqlBoundExpr bound;
-            buildExpr(subctx, expr->queryChild(0), bound);
-            IHqlStmt * filter = subctx.addFilter(bound.expr);
-            buildDatasetAssign(subctx, target, expr->queryChild(1));
-
-            IHqlExpression * elseExpr = expr->queryChild(2);
-            if (elseExpr && elseExpr->getOperator() != no_null)
-            {
-                subctx.selectElse(filter);
-                buildDatasetAssign(subctx, target, elseExpr);
-            }
-        }
+        buildDatasetAssignIf(subctx, target, expr);
         return;
     case no_chooseds:
         buildDatasetAssignChoose(subctx, target, expr);
@@ -3716,7 +3762,7 @@ void HqlCppTranslator::buildDatasetAssign(BuildCtx & ctx, IHqlCppDatasetBuilder 
         buildDatasetAssign(subctx, target, expr->queryChild(0));
         return;
     case no_alias_scope:
-//      expandAliasScope(subctx, expr);
+        expandAliasScope(subctx, expr);
         buildDatasetAssign(subctx, target, expr->queryChild(0));
         return;
     case no_filter:
@@ -4031,7 +4077,7 @@ BoundRow * HqlCppTranslator::buildDatasetIterateSpecialTempTable(BuildCtx & ctx,
         requiresTempRow = true;
         break;
     default:
-        if (type->getSize() == UNKNOWN_LENGTH)
+        if (isUnknownLength(type->getSize()))
             requiresTempRow = true;
         break;
     }
@@ -4438,7 +4484,7 @@ void HqlCppTranslator::doBuildRowAssignAggregateNext(BuildCtx & ctx, IReferenceS
             }
             break;
         }
-        if (targetSelect->queryType()->getSize() == UNKNOWN_LENGTH)
+        if (isUnknownLength(targetSelect->queryType()->getSize()))
             isVariableOffset = true;
     }
     if (alreadyDoneExpr)
@@ -4508,7 +4554,7 @@ void HqlCppTranslator::doBuildRowAssignAggregate(BuildCtx & ctx, IReferenceSelec
                 needGuard = true;
             break;
         }
-        if ((tgt->queryType()->getSize() == UNKNOWN_LENGTH) && (idx+1 != numAggregates))
+        if (isUnknownLength(tgt->queryType()->getSize()) && (idx+1 != numAggregates))
             needGuard = true;
     }
 
@@ -4596,15 +4642,27 @@ void HqlCppTranslator::doBuildRowAssignProjectRow(BuildCtx & ctx, IReferenceSele
     IHqlExpression * srcRow = expr->queryChild(0);
     IHqlExpression * transform = expr->queryChild(1);
 
+    //Evaluate the row expression here - otherwise it could be re-evaluated lots of times depending on the context it is used
     Owned<IReferenceSelector> source = buildNewRow(ctx, srcRow);
     BuildCtx subctx(ctx);
 
-    OwnedHqlExpr leftSelect = createSelector(no_left, srcRow, querySelSeq(expr));
-    OwnedHqlExpr newRow = srcRow->getOperator() == no_select ? LINK(srcRow) : createRow(no_newrow, LINK(srcRow));
-    OwnedHqlExpr newTransform = replaceSelector(transform, leftSelect, newRow);
+    if (!source->isRoot())
+    {
+        OwnedHqlExpr leftSelect = createSelector(no_left, srcRow, querySelSeq(expr));
+        OwnedHqlExpr newRow = srcRow->getOperator() == no_select ? LINK(srcRow) : createRow(no_newrow, LINK(srcRow));
+        OwnedHqlExpr newTransform = replaceSelector(transform, leftSelect, newRow);
 
-    Owned<BoundRow> selfCursor = target->getRow(subctx);
-    doTransform(subctx, newTransform, selfCursor);
+        Owned<BoundRow> selfCursor = target->getRow(subctx);
+        doTransform(subctx, newTransform, selfCursor);
+    }
+    else
+    {
+        //Alternative implementation that rebinds the selector and uses that directly
+        BoundRow * bound = source->getRow(subctx);
+        bindTableCursor(subctx, srcRow, bound->queryBound(), no_left, querySelSeq(expr));
+        Owned<BoundRow> selfCursor = target->getRow(subctx);
+        doTransform(subctx, transform, selfCursor);
+    }
 }
         
 void HqlCppTranslator::doBuildRowAssignSerializeRow(BuildCtx & ctx, IReferenceSelector * target, IHqlExpression * expr)
@@ -4741,13 +4799,27 @@ void HqlCppTranslator::buildRowAssign(BuildCtx & ctx, IReferenceSelector * targe
                 }
                 else
                 {
-                    OwnedHqlExpr foldedCond = foldHqlExpression(expr->queryChild(0));
+                    IHqlExpression * condExpr = expr->queryChild(0);
+                    OwnedHqlExpr foldedCond = foldHqlExpression(condExpr);
+                    IHqlExpression * trueExpr = expr->queryChild(1);
+                    IHqlExpression * falseExpr = expr->queryChild(2);
+
+                    HqlExprAssociation * boundCond = ctx.queryMatchExpr(foldedCond);
+                    if (boundCond && boundCond->queryExpr()->queryValue())
+                    {
+                        if (matchesConstValue(boundCond->queryExpr(), true))
+                            buildRowAssign(ctx, target, trueExpr);
+                        else
+                            buildRowAssign(ctx, target, falseExpr);
+                        return;
+                    }
+
                     BuildCtx condctx(ctx);
                     IHqlStmt * cond = buildFilterViaExpr(condctx, foldedCond);
-
-                    buildRowAssign(condctx, target, expr->queryChild(1));
+                    buildRowAssign(condctx, target, trueExpr);
                     condctx.selectElse(cond);
-                    buildRowAssign(condctx, target, expr->queryChild(2));
+                    condctx.associateExpr(foldedCond, queryBoolExpr(false));
+                    buildRowAssign(condctx, target, falseExpr);
                 }
                 return;
             }

@@ -17,6 +17,8 @@
 
 #include <curl/curl.h>
 #include <iostream>
+
+#include <opensslcommon.hpp>
 #include <openssl/sha.h>
 #include <string.h>
 
@@ -105,7 +107,10 @@ static std::string tokenFromEndpoint(const std::string& jwtEndPoint, bool allowS
             curl_easy_setopt(curlHandle, CURLOPT_POST, 1);
             curl_easy_setopt(curlHandle, CURLOPT_POSTFIELDS, credentialsStr.c_str());
             if (allowSelfSignedCert)
+            {
                 curl_easy_setopt(curlHandle, CURLOPT_SSL_VERIFYPEER, 0);
+                curl_easy_setopt(curlHandle, CURLOPT_SSL_VERIFYHOST, 0);
+            }
             curl_easy_setopt(curlHandle, CURLOPT_FOLLOWLOCATION, 1);
             curl_easy_setopt(curlHandle, CURLOPT_NOPROGRESS, 1);
             curl_easy_setopt(curlHandle, CURLOPT_WRITEFUNCTION, captureIncomingCURLReply);
@@ -185,12 +190,10 @@ std::string tokenFromRefresh(const std::string& jwtEndPoint, bool allowSelfSigne
 
 MODULE_INIT(INIT_PRIORITY_STANDARD)
 {
-    curl_global_init(CURL_GLOBAL_ALL);
-
+    // curl_global_init/curl_global_cleanup are centralized in system/jlib/jcurl.cpp.
     return true;
 }
 
 MODULE_EXIT()
 {
-    curl_global_cleanup();
 }

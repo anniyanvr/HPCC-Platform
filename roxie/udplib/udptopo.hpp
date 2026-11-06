@@ -69,6 +69,7 @@
 extern UDPLIB_API unsigned minIbytiDelay;
 extern UDPLIB_API unsigned initIbytiDelay;
 extern UDPLIB_API SocketEndpoint myAgentEP;
+extern UDPLIB_API unsigned numChannels;
 
 class UDPLIB_API ChannelInfo
 {
@@ -109,7 +110,9 @@ interface ITopologyServer : public IInterface
     virtual const ChannelInfo &queryChannelInfo(unsigned channel) const = 0;
     virtual const std::vector<unsigned> &queryChannels() const = 0;
     virtual bool implementsChannel(unsigned channel) const = 0;
-    virtual void report(StringBuffer &ret) const = 0;
+    virtual StringBuffer & report(StringBuffer &ret) const = 0;
+    virtual time_t queryServerInstance(const SocketEndpoint &ep) const = 0;
+    virtual void updateStatus() const = 0;
 };
 
 extern UDPLIB_API unsigned getNumAgents(unsigned channel);
@@ -124,8 +127,8 @@ struct RoxieEndpointInfo
     unsigned replicationLevel;
 };
 
-extern UDPLIB_API void initializeTopology(const StringArray &topoServers, const std::vector<RoxieEndpointInfo> &myRoles);
-extern UDPLIB_API void publishTopology(unsigned traceLevel);
+extern UDPLIB_API void initializeTopology(const StringArray &topoValues, const std::vector<RoxieEndpointInfo> &myRoles);
+extern UDPLIB_API void publishTopology(unsigned traceLevel, const std::vector<RoxieEndpointInfo> &myRoles);
 extern UDPLIB_API void stopTopoThread();
 
 #ifndef _CONTAINERIZED

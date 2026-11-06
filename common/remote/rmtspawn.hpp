@@ -38,7 +38,7 @@ enum SpawnKind
 
 interface IAbortRequestCallback;
 
-extern REMOTE_API ISocket * spawnRemoteChild(SpawnKind kind, const char * exe, const SocketEndpoint & remoteEP, unsigned version, const char *logdir, IAbortRequestCallback * abort = NULL, const char *extra=NULL);
+extern REMOTE_API ISocket *spawnRemoteChild(SpawnKind kind, const char * exe, const SocketEndpoint & remoteEP, unsigned version, const char *logdir, IAbortRequestCallback * abort = nullptr, const char *extra=nullptr, HANDLE *localProcessHandle=nullptr);
 extern REMOTE_API void setRemoteSpawnSSH(
                 const char *identfilename,
                 const char *username, // if NULL then disable SSH
@@ -60,7 +60,7 @@ public:
     CRemoteParentInfo();
 
     ISocket * queryMasterSocket()               { return socket; }
-    bool processCommandLine(int argc, char * argv[], StringBuffer &logdir);
+    bool processCommandLine(int argc, const char * * argv, StringBuffer &logdir);
     void log();
     bool sendReply(unsigned version);
 
@@ -78,7 +78,7 @@ class REMOTE_API CRemoteSlave
 public:
     CRemoteSlave(const char * name, unsigned _tag, unsigned _version, bool _stayAlive);
 
-    void run(int argc, char * argv[]);
+    void run(int argc, const char * * argv);
     virtual bool processCommand(byte action, ISocket * masterSocket, MemoryBuffer & msg, MemoryBuffer & results) = 0;
 
 protected:

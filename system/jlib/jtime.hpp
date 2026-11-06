@@ -61,6 +61,11 @@ interface IJlibDateTime : extends IJlibConstDateTime
     virtual void setLocalTime(unsigned _hour, unsigned _min, unsigned _sec, unsigned _nanosec) = 0;
 };
 
+static constexpr unsigned DTP_Seconds = 0;
+static constexpr unsigned DTP_Millis = 3;
+static constexpr unsigned DTP_Micros = 6;
+static constexpr unsigned DTP_Nanos = 9;
+static constexpr unsigned DTP_MaybeMicros = ~0U; // backwards compatibility, will use micros if there are any non-zero digits in the fractional part, otherwise seconds
 
 class jlib_decl CDateTime
 {
@@ -82,6 +87,7 @@ public:
     void set(time_t simple);
     void setFromFILETIME(__int64 fileTime);
     void setTimeStamp(timestamp_type ts);
+    void setTimeStampNs(timestamp_type ts);
 
     void setString(char const * str, char const * * end = NULL, bool local = false); // Sets to date and time given as yyyy-mm-ddThh:mm:ss[.nnnnnnnnn]
     void setDateString(char const * str, char const * * end = NULL); // Sets to midnight UTC on date given as yyyy-mm-dd
@@ -94,9 +100,11 @@ public:
     void getTime(unsigned & hour, unsigned & minute, unsigned & second, unsigned & nano, bool local = false) const;
     time_t getSimple() const;
     unsigned __int64 getTimeStamp() const;
-    StringBuffer & getString(StringBuffer & str, bool local = false) const;
-    StringBuffer & getDateString(StringBuffer & str, bool local = false) const;
-    StringBuffer & getTimeString(StringBuffer & str, bool local = false) const;
+    unsigned __int64 getTimeStampNs() const;
+    StringBuffer & getString(StringBuffer & str, bool local = false) const { return getDateTimeString(str, true, true, DTP_MaybeMicros, local); }
+    StringBuffer & getDateString(StringBuffer & str, bool local = false) const { return getDateTimeString(str, true, false, DTP_Seconds, local); }
+    StringBuffer & getTimeString(StringBuffer & str, bool local = false) const { return getDateTimeString(str, false, true, DTP_MaybeMicros, local); }
+    StringBuffer & getDateTimeString(StringBuffer & str, bool includeDate, bool includeTime, unsigned precision, bool local) const;
 
     bool isNull() const;
     bool equals(CDateTime const & cdt, bool compareNanosec = true) const;
@@ -112,6 +120,8 @@ public:
     bool operator>=(CDateTime const & cdt) const { return (compare(cdt, false) >= 0); }
 
     int queryUtcToLocalDelta() const;
+
+    unsigned getUtcHour() const { return utc_hour; }
 
 private:
     void setFromUtcTm(struct tm const & ts);
@@ -177,11 +187,11 @@ public:
     CTimeMon(unsigned _timeout) { reset(_timeout); }
     void reset(unsigned _timeout) { timeout=_timeout; t = msTick(); }
 
-    unsigned elapsed()
+    unsigned elapsed() const
     {
         return msTick()-t;
     }
-    bool timedout(unsigned *remaining=NULL)
+    bool timedout(unsigned *remaining=NULL) const
     {
         if ((int)timeout<0) {       
             if (remaining)

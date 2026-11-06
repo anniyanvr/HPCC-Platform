@@ -91,14 +91,34 @@ ldap_compare_ext_s LDAP_P((
 #define AAD_ADMINISTRATORS_GROUP "AAD DC Administrators"
 #define AAD_USERS_GROUPS_OU      "AADDC Users"
 
-// 1 for ActiveDirectory, 2 for iPlanet, 3 for openLdap
 enum LdapServerType
 {
     LDAPSERVER_UNKNOWN = 0,
     ACTIVE_DIRECTORY = 1,
     IPLANET = 2,
-    OPEN_LDAP = 3
+    OPEN_LDAP = 3,
+    LDAP_389DS = 4  // 389 Directory Server (Fedora DS / Red Hat DS) - iPlanet lineage
 };
+
+// The outcome of dispatching CLdapClient::getPasswordExpiration() on an
+// attribute name / server type / never-expires state, decoupled from the
+// actual LDAP attribute retrieval so it can be unit tested in isolation
+// (see selectPasswordExpirationDispatch() below).
+enum class PasswordExpirationDispatch
+{
+    NeverExpires,                   // pwdLastSet, and domain or account never expires: caller clears expiry, returns true
+    RetrieveAdPwdLastSet,           // pwdLastSet: caller must fetch the attribute value and call calcPWExpiry()
+    Retrieve389dsExpirationTime,    // passwordExpirationTime on a 389ds server: caller must fetch/parse it
+    UnsupportedAttribute            // any other attribute name, or passwordExpirationTime on a non-389ds server: caller returns false
+};
+
+// Pure decision logic extracted from CLdapClient::getPasswordExpiration()
+// (ldapconnection.cpp). Deliberately takes only plain values rather than an
+// LDAP*/LDAPMessage*/CLdapClient so it can be exercised by unit tests without
+// a live LDAP connection - unlike CLdapClient's actual attribute retrieval,
+// which requires one, this dispatch decision does not.
+LDAPSECURITY_API PasswordExpirationDispatch selectPasswordExpirationDispatch(const char *attribute, LdapServerType serverType,
+                                                                              bool domainPwdsNeverExpire, bool accountPwdNeverExpires);
 
 enum ACT_TYPE
 {
@@ -201,6 +221,7 @@ interface ILdapConfig : extends IInterface
     virtual const char* getAuthMethod() = 0;
     virtual const char* getUserBasedn() = 0;
     virtual const char* getGroupBasedn() = 0;
+    virtual bool getEnableCreateAdminGroup() const = 0;
     virtual const char* getResourceBasedn(SecResourceType rtype) = 0;
     virtual const char* getTemplateName() = 0;
     virtual const char* getSysUser() = 0;
@@ -213,6 +234,9 @@ interface ILdapConfig : extends IInterface
     virtual void setResourceBasedn(const char* rbasedn, SecResourceType rtype = RT_DEFAULT) = 0;
     virtual int getLdapTimeout() = 0;
     virtual bool isAzureAD() = 0;
+    virtual void setUserBasedn(const char * basedn) = 0;
+    virtual const char* getTLSValidation() = 0;
+    virtual const char* getCACertFile() = 0;
 };
 
 
@@ -269,7 +293,9 @@ interface ILdapClient : extends IInterface
     virtual bool getUserInfo(ISecUser& user, const char* infotype = NULL) = 0;
     virtual ISecUser* lookupUser(unsigned uid) = 0;
     virtual bool lookupAccount(MemoryBuffer& sidbuf, StringBuffer& account_name, ACT_TYPE& act_type) = 0;
-    virtual void lookupSid(const char* act_name, MemoryBuffer& act_sid, ACT_TYPE act_type) = 0;
+    // 'ld', when non-null, is reused for the lookup instead of acquiring a new connection,
+    // keeping the lookup on the same LDAP server as the caller (e.g. behind a load balancer).
+    virtual void lookupSid(const char* act_name, MemoryBuffer& act_sid, ACT_TYPE act_type, LDAP* ld=nullptr) = 0;
     virtual void setPermissionProcessor(IPermissionProcessor* pp) = 0;
     virtual bool retrieveUsers(IUserArray& users) = 0;
     virtual bool retrieveUsers(const char* searchstr, IUserArray& users) = 0;
@@ -286,9 +312,9 @@ interface ILdapClient : extends IInterface
     virtual void setResourceBasedn(const char* rbasedn, SecResourceType rtype = RT_DEFAULT) = 0;
     virtual ILdapConfig* getLdapConfig() = 0;
     virtual bool userInGroup(const char* userdn, const char* groupdn) = 0;
-    virtual bool updateUserPassword(ISecUser& user, const char* newPassword, const char* currPassword = 0) = 0;
+    virtual bool updateUserPassword(ISecUser& user, const char* newPassword, const char* currPassword = 0, LDAP* ld = nullptr) = 0;
     virtual bool updateUser(const char* type, ISecUser& user) = 0;
-    virtual bool updateUserPassword(const char* username, const char* newPassword) = 0;
+    virtual bool updateUserPassword(const char* username, const char* newPassword, LDAP* ld = nullptr) = 0;
     virtual bool getResources(SecResourceType rtype, const char * basedn, const char* prefix, const char* searchstr, IArrayOf<ISecResource>& resources) = 0;
     virtual IPropertyTreeIterator* getResourceIterator(SecResourceType rtype, const char * basedn, const char* prefix,
         const char* resourceName, unsigned extraNameFilter) = 0;
@@ -301,8 +327,10 @@ interface ILdapClient : extends IInterface
         ResourcePermissionField* sortOrder, const unsigned pageStartFrom, const unsigned pageSize, unsigned* total, __int64* cacheHint) = 0;
     virtual bool changePermission(CPermissionAction& action) = 0;
     virtual void changeUserGroup(const char* action, const char* username, const char* groupname, const char * groupDN=nullptr) = 0;
+    virtual void changeGroupMember(const char* action, const char* groupdn, const char* userdn) = 0;
     virtual bool deleteUser(ISecUser* user) = 0;
     virtual void addGroup(const char* groupname, const char * groupOwner, const char * groupDesc) = 0;
+    virtual void addGroup(const char* groupname, const char * groupOwner, const char * groupDesc, const char* basedn) = 0;
     virtual void deleteGroup(const char* groupname, const char * groupsDN=nullptr) = 0;
     virtual void getGroupMembers(const char* groupname, StringArray & users, const char * groupsDN=nullptr) = 0;
     virtual void deleteResource(SecResourceType rtype, const char* name, const char* basedn) = 0;
@@ -315,7 +343,6 @@ interface ILdapClient : extends IInterface
     virtual int countResources(const char* basedn, const char* searchstr, int limit) = 0;
     virtual ILdapConfig* queryConfig() = 0;
     virtual const char* getPasswordStorageScheme() = 0;
-    virtual bool createUserScope(ISecUser& user) = 0;
     virtual aindex_t getManagedScopeTree(LDAP* ld, SecResourceType rtype, const char * basedn, IArrayOf<ISecResource>& scopes) = 0;
     virtual SecAccessFlags queryDefaultPermission(ISecUser& user) = 0;
 
@@ -332,6 +359,9 @@ interface ILdapClient : extends IInterface
     virtual void removeViewMembers(const char * viewName, StringArray & viewUsers, StringArray & viewGroups) = 0;
     virtual void queryViewMembers(const char * viewName, StringArray & viewUsers, StringArray & viewGroups) = 0;
     virtual bool userInView(const char * user, const char* viewName) = 0;
+    virtual void createLdapBasedn(ISecUser* user, const char* basedn, SecPermissionType ptype, const char* description) = 0;
+    virtual bool organizationalUnitExists(const char * ou) const = 0;
+    virtual bool addUser(ISecUser & user, const char* basedn) = 0;
 };
 
 ILdapClient* createLdapClient(IPropertyTree* cfg);

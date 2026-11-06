@@ -30,6 +30,7 @@
 #include "jmisc.hpp"
 #include "jthread.hpp"
 #include "jqueue.tpp"
+#include "jsecrets.hpp"
 
 #include "securesocket.hpp"
 #include "portlist.h"
@@ -42,6 +43,7 @@
 #include "dadfs.hpp"
 
 #include "remoteerr.hpp"
+#include <random>
 #include <atomic>
 #include <string>
 #include <unordered_map>
@@ -69,6 +71,9 @@
 #include "rmtclient_impl.hpp"
 #include "dafsserver.hpp"
 
+#include "ftslavelib.hpp"
+#include "filecopy.hpp"
+
 
 using namespace cryptohelper;
 
@@ -92,8 +97,9 @@ enum OutputFormat:byte { outFmt_Binary, outFmt_Xml, outFmt_Json };
 static unsigned maxConnectTime = 0;
 static unsigned maxReceiveTime = 0;
 
+#ifndef _CONTAINERIZED
 //Security and default port attributes
-static class _securitySettings
+static class _securitySettingsServer
 {
 public:
     DAFSConnectCfg  connectMethod;
@@ -103,46 +109,89 @@ public:
     const char *    privateKey;
     const char *    passPhrase;
 
-    _securitySettings()
+    void init()
     {
         queryDafsSecSettings(&connectMethod, &daFileSrvPort, &daFileSrvSSLPort, &certificate, &privateKey, &passPhrase);
     }
+
+    const IPropertyTree * getSecureConfig()
+    {
+        //Later: return a synced tree...
+        return createSecureSocketConfig(certificate, privateKey, passPhrase, false);
+    }
+
 } securitySettings;
 
+MODULE_INIT(INIT_PRIORITY_STANDARD)
+{
+    // initialize after other dependent (in jlib) objects are initialized.
+    securitySettings.init();
+    return true;
+}
 
-static CriticalSection              secureContextCrit;
+#endif
+
+static CriticalSection              secureContextCrit{SYNC_LOCATION};
 static Owned<ISecureSocketContext>  secureContextServer;
-static Owned<ISecureSocketContext>  secureContextClient;
 
 #ifdef _USE_OPENSSL
-static ISecureSocket *createSecureSocket(ISocket *sock, SecureSocketType type)
+static ISecureSocket *createSecureSocket(ISocket *sock, bool disableClientCertVerification)
 {
     {
         CriticalBlock b(secureContextCrit);
-        if (type == ServerSocket)
+        if (!secureContextServer)
         {
-            if (!secureContextServer)
-                secureContextServer.setown(createSecureSocketContextEx(securitySettings.certificate, securitySettings.privateKey, securitySettings.passPhrase, type));
+#ifdef _CONTAINERIZED
+            /* Connections are expected from 3rd parties via TLS,
+            * we do not expect them to provide a valid certificate for verification.
+            * Currently the server (this dafilesrv), will use either the "public" certificate issuer,
+            * unless it's visibility is "cluster" (meaning internal only)
+            */
+
+            const char *certScope = strsame("cluster", getComponentConfigSP()->queryProp("service/@visibility")) ? "local" : "public";
+            Owned<const ISyncedPropertyTree> info = getIssuerTlsSyncedConfig(certScope, nullptr, disableClientCertVerification);
+            if (!info || !info->isValid())
+                throw makeStringException(-1, "createSecureSocket() : missing MTLS configuration");
+            secureContextServer.setown(createSecureSocketContextSynced(info, ServerSocket));
+#else
+            Owned<IPropertyTree> cert = getComponentConfigSP()->getPropTree("cert");
+            if (cert)
+            {
+                Owned<ISyncedPropertyTree> certSyncedWrapper = createSyncedPropertyTree(cert);
+                secureContextServer.setown(createSecureSocketContextSynced(certSyncedWrapper, ServerSocket));
+            }
+            else
+                secureContextServer.setown(createSecureSocketContextEx2(securitySettings.getSecureConfig(), ServerSocket));
+#endif
         }
-        else if (!secureContextClient)
-            secureContextClient.setown(createSecureSocketContext(type));
     }
     int loglevel = SSLogNormal;
 #ifdef _DEBUG
     loglevel = SSLogMax;
 #endif
-    if (type == ServerSocket)
-        return secureContextServer->createSecureSocket(sock, loglevel);
-    else
-        return secureContextClient->createSecureSocket(sock, loglevel);
+    return secureContextServer->createSecureSocket(sock, loglevel);
 }
 #else
-static ISecureSocket *createSecureSocket(ISocket *sock, SecureSocketType type)
+static ISecureSocket *createSecureSocket(ISocket *sock, bool disableClientCertVerification)
 {
     throwUnexpected();
 }
 #endif
 
+static void reportFailedSecureAccepts(const char *context, IException *exception, unsigned &numFailedConn, unsigned &timeLastLog)
+{
+    numFailedConn++;
+    unsigned timeNow = msTick();
+    if ((timeNow - timeLastLog) >= 60000)
+    {
+        StringBuffer msg("CRemoteFileServer ");
+        if (context)
+            msg.append("(").append(context).append(") ");
+        msg.appendf("[failure count : %u]", numFailedConn);
+        EXCLOG(exception, msg.str());
+        timeLastLog = timeNow;
+    }
+}
 
 struct sRFTM
 {
@@ -210,6 +259,7 @@ const char *RFCStrings[] =
     RFCText(RFCStreamReadTestSocket),
     RFCText(RFCStreamGeneral),
     RFCText(RFCStreamReadJSON),
+    RFCText(RFCFtSlaveCmd),
     RFCText(RFCmaxnormal),
 };
 
@@ -370,9 +420,9 @@ struct CTreeCopyItem: public CInterface
 };
 
 static CIArrayOf<CTreeCopyItem>  treeCopyArray;
-static CriticalSection           treeCopyCrit;
+static CriticalSection           treeCopyCrit{SYNC_LOCATION};
 static unsigned                  treeCopyWaiting=0;
-static Semaphore                 treeCopySem;
+static Semaphore                 treeCopySem{SYNC_LOCATION};
 
 /////////////////////////
 
@@ -433,7 +483,8 @@ class CAsyncCommandManager
         void start()
         {
             parent.wait();
-            thread->start();
+            //These are async jobs - so do not preserve the active thread context because it will go out of scope
+            thread->start(false);
         }
         void join()
         {
@@ -441,7 +492,7 @@ class CAsyncCommandManager
         }
         static unsigned getHash(const char *key)
         {
-            return hashc((const byte *)key,strlen(key),~0U);
+            return hashcz((const byte *)key,~0U);
         }
         static CAsyncJob* create(const char *key) { assertex(!"CAsyncJob::create not implemented"); return NULL; }
         unsigned hash;
@@ -462,10 +513,10 @@ class CAsyncCommandManager
         offset_t fromOfs;
         offset_t size;
         CFPmode mode; // not yet supported
-        CriticalSection sect;
+        CriticalSection sect{SYNC_LOCATION};
         offset_t done;
         offset_t total;
-        Semaphore finished;
+        Semaphore finished{SYNC_LOCATION};
         AsyncCommandStatus status;
         Owned<IException> exc;
     public:
@@ -536,8 +587,8 @@ class CAsyncCommandManager
     };
 
     CMinHashTable<CAsyncJob> jobtable;
-    CriticalSection sect;
-    Semaphore threadsem;
+    CriticalSection sect{SYNC_LOCATION};
+    Semaphore threadsem{SYNC_LOCATION};
     unsigned limit;
 
 public:
@@ -621,14 +672,13 @@ inline void appendErr(MemoryBuffer &reply, unsigned e)
 
 #define MAPCOMMAND(c,p) case c: { this->p(msg, reply) ; break; }
 #define MAPCOMMANDCLIENT(c,p,client) case c: { this->p(msg, reply, client); break; }
-#define MAPCOMMANDCLIENTTESTSOCKET(c,p,client) case c: { testSocketFlag = true; this->p(msg, reply, client); break; }
 #define MAPCOMMANDCLIENTTHROTTLE(c,p,client,throttler) case c: { this->p(msg, reply, client, throttler); break; }
 #define MAPCOMMANDSTATS(c,p,stats) case c: { this->p(msg, reply, stats); break; }
 #define MAPCOMMANDCLIENTSTATS(c,p,client,stats) case c: { this->p(msg, reply, client, stats); break; }
 
 static unsigned ClientCount = 0;
 static unsigned MaxClientCount = 0;
-static CriticalSection ClientCountSect;
+static CriticalSection ClientCountSect{SYNC_LOCATION};
 
 #define DEFAULT_THROTTLOG_LOG_INTERVAL_SECS 60 // log total throttled delay period
 
@@ -661,7 +711,7 @@ public:
 class CClientStatsTable : public OwningStringSuperHashTableOf<CClientStats>
 {
     typedef OwningStringSuperHashTableOf<CClientStats> PARENT;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     unsigned cmdStats[RFCmax];
 
     static int compareElement(void* const *ll, void* const *rr)
@@ -794,16 +844,36 @@ interface IRemoteWriteActivity : extends IRemoteActivity
     virtual void write(size32_t sz, const void *row) = 0;
 };
 
+class AccumulatingTimeScope
+{
+    unsigned __int64 &timeNS;
+    unsigned __int64 startTimeNS;
+public:
+    AccumulatingTimeScope(unsigned __int64 &_timeNS) : timeNS(_timeNS)
+    {
+        startTimeNS = nsTick();
+    }
+
+    ~AccumulatingTimeScope()
+    {
+        timeNS += (nsTick() - startTimeNS);
+    }
+};
+
 class CRemoteRequest : public CSimpleInterfaceOf<IInterface>
 {
     int cursorHandle;
     OutputFormat format;
+    unsigned __int64 processingTimeNS = 0;
     unsigned __int64 replyLimit = defaultDaFSReplyLimitKB * 1024;
     Linked<IRemoteActivity> activity;
     Linked<ICompressor> compressor;
     Linked<IExpander> expander;
     MemoryBuffer expandMb;
     Owned<IXmlWriterExt> responseWriter; // for xml or json response
+
+    OwnedSpanLifetime requestSpan;
+    std::string requestTraceParent;
 
     bool handleFull(MemoryBuffer &inMb, size32_t inPos, MemoryBuffer &compressMb, ICompressor *compressor, size32_t replyLimit, size32_t &totalSz)
     {
@@ -855,7 +925,7 @@ class CRemoteRequest : public CSimpleInterfaceOf<IInterface>
             if (compressor)
             {
                 size32_t initialSz = replyLimit >= 0x10000 ? 0x10000 : replyLimit;
-                compressor->open(compressMb, initialSz);
+                compressor->open(compressMb, initialSz, 0);
             }
 
             outBuilder.setBuffer(responseMb); // write direct to responseMb buffer for efficiency
@@ -1045,9 +1115,18 @@ class CRemoteRequest : public CSimpleInterfaceOf<IInterface>
         writeActivity->write(rowDataSz, rowData);
     }
 
+    void closeRequestSpan()
+    {
+        if (requestSpan != nullptr)
+        {
+            requestSpan->setSpanAttribute("ProcessingTime", processingTimeNS);
+            requestSpan->setSpanStatusSuccess(true);
+        }
+    }
+
 public:
     CRemoteRequest(int _cursorHandle, OutputFormat _format, ICompressor *_compressor, IExpander *_expander, IRemoteActivity *_activity)
-        : cursorHandle(_cursorHandle), format(_format), compressor(_compressor), expander(_expander), activity(_activity)
+        : cursorHandle(_cursorHandle), format(_format), activity(_activity), compressor(_compressor), expander(_expander)
     {
         if (outFmt_Binary != format)
         {
@@ -1058,13 +1137,53 @@ public:
             responseWriter->outputUInt(cursorHandle, sizeof(cursorHandle), "handle");
         }
     }
+
+    ~CRemoteRequest()
+    {
+        closeRequestSpan();
+    }
+
     OutputFormat queryFormat() const { return format; }
     unsigned __int64 queryReplyLimit() const { return replyLimit; }
     IRemoteActivity *queryActivity() const { return activity; }
     ICompressor *queryCompressor() const { return compressor; }
+    ISpan* queryRequestSpan() const { return requestSpan == nullptr ? queryNullSpan() : requestSpan.query(); }
 
     void process(IPropertyTree *requestTree, MemoryBuffer &restMb, MemoryBuffer &responseMb, CClientStats &stats)
     {
+        bool traceParentChanged = false;
+        const char* fullTraceContext = requestTree->queryProp("_trace/traceparent");
+        if (fullTraceContext != nullptr)
+        {
+            // We only want to compare the trace-id & span-id, so ignore the last sampling group after the '-'
+            const char* lastHyphen = strchr(fullTraceContext, '-');
+            if (lastHyphen != nullptr)
+            {
+                size_t lastHyphenIdx = lastHyphen - fullTraceContext;
+                traceParentChanged = strncmp(fullTraceContext, requestTraceParent.c_str(), lastHyphenIdx) != 0;
+            }
+        }
+
+        if (traceParentChanged)
+        {
+            // Close existing span if we have one
+            closeRequestSpan(); 
+
+            Owned<IProperties> traceHeaders = createProperties();
+            traceHeaders->setProp("traceparent", fullTraceContext);
+
+            const char* requestSpanName = nullptr;
+            if (activity->queryIsReadActivity())
+                requestSpanName = "ReadRequest";
+            else
+                requestSpanName = "WriteRequest";
+
+            requestSpan.setown(queryTraceManager().createServerSpan(requestSpanName, traceHeaders));
+            requestTraceParent = fullTraceContext;
+        }
+
+        ActiveSpanScope activeSpan(requestSpan.query());
+
         if (requestTree->hasProp("replyLimit"))
             replyLimit = requestTree->getPropInt64("replyLimit", defaultDaFSReplyLimitKB) * 1024;
 
@@ -1081,10 +1200,15 @@ public:
             activity->restoreCursor(cursorMb);
         }
 
-        if (activity->queryIsReadActivity())
-            processRead(requestTree, responseMb);
-        else if (activity->queryIsWriteActivity())
-            processWrite(requestTree, restMb, responseMb);
+        {
+            AccumulatingTimeScope processTimeScope(processingTimeNS);
+
+            if (activity->queryIsReadActivity())
+                processRead(requestTree, responseMb);
+            else if (activity->queryIsWriteActivity())
+                processWrite(requestTree, restMb, responseMb);
+        }
+
         activity->flushStatistics(stats);
 
         if (outFmt_Binary != format)
@@ -1101,9 +1225,9 @@ enum OpenFileFlag { of_null=0x0, of_key=0x01 };
 struct OpenFileInfo
 {
     OpenFileInfo() { }
-    OpenFileInfo(int _handle, IFileIO *_fileIO, StringAttrItem *_filename) : handle(_handle), fileIO(_fileIO), filename(_filename) { }
+    OpenFileInfo(int _handle, IFileIO *_fileIO, StringAttrItem *_filename) : fileIO(_fileIO), filename(_filename), handle(_handle) { }
     OpenFileInfo(int _handle, CRemoteRequest *_remoteRequest, StringAttrItem *_filename)
-        : handle(_handle), remoteRequest(_remoteRequest), filename(_filename) { }
+        : remoteRequest(_remoteRequest), filename(_filename), handle(_handle) { }
     Linked<IFileIO> fileIO;
     Linked<CRemoteRequest> remoteRequest;
     Linked<StringAttrItem> filename; // for debug
@@ -1142,21 +1266,32 @@ protected:
     bool opened = false;
     bool eofSeen = false;
     const RtlRecord *record = nullptr;
-    RowFilter filters;
+    RowFilter filter;
     RtlDynRow *filterRow = nullptr;
     // virtual field values
     StringAttr logicalFilename;
     unsigned numInputFields = 0;
 
+    bool applySampling = false;
+    std::random_device randomDevice;
+    std::mt19937 randomGenerator;
+    std::bernoulli_distribution recordSamplingDistribution;
+
     inline bool fieldFilterMatch(const void * buffer)
     {
+        bool shouldRead = true;
         if (filterRow)
         {
-            filterRow->setRow(buffer, filters.getNumFieldsRequired());
-            return filters.matches(*filterRow);
+            filterRow->setRow(buffer, filter.getNumFieldsRequired());
+            shouldRead = filter.matches(*filterRow);
         }
-        else
-            return true;
+
+        if (applySampling && shouldRead)
+        {
+            shouldRead = recordSamplingDistribution(randomGenerator);
+        }
+
+        return shouldRead;
     }
 public:
     IMPLEMENT_IINTERFACE_USING(PARENT);
@@ -1172,6 +1307,7 @@ public:
     {
         delete filterRow;
     }
+
     void setupInputMeta(const IPropertyTree &config, IOutputMetaData *_inMeta)
     {
         inMeta.setown(_inMeta);
@@ -1183,7 +1319,35 @@ public:
             filterRow = new RtlDynRow(*record);
             Owned<IPropertyTreeIterator> filterIter = config.getElements("keyFilter");
             ForEach(*filterIter)
-                filters.addFilter(*record, filterIter->query().queryProp(nullptr));
+                filter.addFilter(*record, filterIter->query().queryProp(nullptr));
+        }
+
+        if (config.hasProp("recordSamplingRate"))
+        {
+            // std::bernoulli_distribution may support smaller sampling rates, depending on implementation,
+            // but we limit it to 1e-12 to avoid issues with very small probabilities
+            constexpr double minSamplingRate = 1e-12;
+            constexpr double maxSamplingRate = 1.0;
+
+            double recordSamplingRate = config.getPropReal("recordSamplingRate", maxSamplingRate);
+            if (recordSamplingRate <= minSamplingRate || recordSamplingRate > maxSamplingRate)
+                throw createDafsException(DAFSERR_cmdstream_protocol_failure, "CRemoteDiskBaseActivity: recordSamplingRate must be between (1e-12, 1.0)");
+
+            if (recordSamplingRate < maxSamplingRate)
+            {
+                applySampling = true;
+                recordSamplingDistribution = std::bernoulli_distribution(recordSamplingRate);
+
+                __int64 recordSamplingSeed = config.getPropInt64("recordSamplingSeed", -1);
+                if (recordSamplingSeed >= 0)
+                {
+                    randomGenerator.seed(recordSamplingSeed);
+                }
+                else
+                {
+                    randomGenerator.seed(randomDevice());
+                }
+            }
         }
     }
 // IRemoteReadActivity impl.
@@ -1201,11 +1365,14 @@ public:
     }
     virtual void serializeCursor(MemoryBuffer &tgt) const override
     {
-        throwUnexpected();
+        // we need to serialize something, because the lack of a cursor is used to signify end of stream
+        // NB: the cursor is opaque and only to be consumed by dafilesrv. When used it is simply passed back.
+        tgt.append("UNSUPPORTED");
     }
     virtual void restoreCursor(MemoryBuffer &src) override
     {
-        throwUnexpected();
+        throw makeStringExceptionV(0, "restoreCursor not supported in: %s", typeid(*this).name());
+        throwUnimplemented();
     }
     virtual void flushStatistics(CClientStats &stats) override
     {
@@ -1243,12 +1410,12 @@ public:
 };
 
 
-class CRemoteStreamReadBaseActivity : public CRemoteDiskBaseActivity, implements IFileSerialStreamCallback
+class CRemoteStreamReadBaseActivity : public CRemoteDiskBaseActivity
 {
     typedef CRemoteDiskBaseActivity PARENT;
 
 protected:
-    Owned<ISerialStream> inputStream;
+    Owned<IBufferedSerialInputStream> inputStream;
     Owned<IFileIO> iFileIO;
     unsigned __int64 chooseN = 0;
     unsigned __int64 startPos = 0;
@@ -1256,6 +1423,7 @@ protected:
     bool cursorDirty = false;
     bool fetching = false;
     unsigned __int64 bytesRead = 0;
+    unsigned __int64 lastBytesRead = 0;
     // virtual field values
     unsigned partNum = 0;
     offset_t baseFpos = 0;
@@ -1264,7 +1432,7 @@ protected:
     {
         if (inputStream->tell() != startPos)
         {
-            inputStream->reset(startPos);
+            inputStream->reset(startPos, UnknownOffset);
             return true;
         }
         return false;
@@ -1289,7 +1457,7 @@ protected:
         cursorDirty = false;
         OwnedIFile iFile = createIFile(fileName);
         assertex(iFile);
-        iFileIO.setown(createCompressedFileReader(iFile));
+        iFileIO.setown(createCompressedFileReader(iFile, nullptr, useDefaultIoBufferSize, false, IFEnone));
         if (iFileIO)
         {
             if (!compressed)
@@ -1309,7 +1477,7 @@ protected:
                 compressed = false;
             }
         }
-        inputStream.setown(createFileSerialStream(iFileIO, startPos, (offset_t)-1, (size32_t)-1, this));
+        inputStream.setown(createFileSerialStream(iFileIO, startPos, (offset_t)-1, (size32_t)-1));
 
         opened = true;
         eofSeen = false;
@@ -1317,14 +1485,11 @@ protected:
     }
     void close()
     {
+        if (iFileIO)
+            bytesRead += iFileIO->getStatistic(StSizeDiskRead);
         iFileIO.clear();
         opened = false;
         eofSeen = true;
-    }
-// IFileSerialStreamCallback impl.
-    virtual void process(offset_t ofs, size32_t sz, const void *buf) override
-    {
-        bytesRead += sz;
     }
 public:
     CRemoteStreamReadBaseActivity(IPropertyTree &config, IFileDescriptor *fileDesc) : PARENT(config, fileDesc)
@@ -1338,8 +1503,11 @@ public:
     virtual void flushStatistics(CClientStats &stats) override
     {
         // NB: will be called by same thread that is reading.
-        stats.addRead(bytesRead);
-        bytesRead = 0;
+        offset_t totalBytesRead = bytesRead;
+        if (iFileIO)
+            totalBytesRead += iFileIO->getStatistic(StSizeDiskRead);
+        stats.addRead(totalBytesRead - lastBytesRead);
+        lastBytesRead = totalBytesRead;
     }
 // IRemoteReadActivity impl.
     virtual void seek(offset_t pos) override
@@ -1374,7 +1542,7 @@ class CRemoteDiskReadActivity : public CRemoteStreamReadBaseActivity
     {
         if (prefetchBuffer.tell() != startPos)
         {
-            inputStream->reset(startPos);
+            inputStream->reset(startPos, UnknownOffset);
             prefetchBuffer.clearStream();
             prefetchBuffer.setStream(inputStream);
             return true;
@@ -1687,7 +1855,7 @@ class CRemoteMarkupReadActivity : public CRemoteExternalFormatReadActivity, impl
     typedef CRemoteExternalFormatReadActivity PARENT;
 
     ThorActivityKind kind;
-    IXmlToRowTransformer *xmlTransformer;
+    IXmlToRowTransformer *xmlTransformer = nullptr;
     Linked<IColumnProvider> lastMatch;
     Owned<IXMLParse> xmlParser;
 
@@ -1813,7 +1981,7 @@ class CRemoteMarkupReadActivity : public CRemoteExternalFormatReadActivity, impl
                 Linked<IColumnProvider> parentMatch;
                 const RtlRecord &nestedRecInfo;
             public:
-                CIterator(const RtlRecord &_nestedRecInfo, IColumnProvider *_parentMatch, const char *xpath) : nestedRecInfo(_nestedRecInfo), parentMatch(_parentMatch)
+                CIterator(const RtlRecord &_nestedRecInfo, IColumnProvider *_parentMatch, const char *xpath) : parentMatch(_parentMatch), nestedRecInfo(_nestedRecInfo)
                 {
                     xmlIter.initOwn(parentMatch->getChildIterator(xpath));
                 }
@@ -1864,9 +2032,9 @@ class CRemoteMarkupReadActivity : public CRemoteExternalFormatReadActivity, impl
 
         class CSimpleStream : public CSimpleInterfaceOf<ISimpleReadStream>
         {
-            Linked<ISerialStream> stream;
+            Linked<IBufferedSerialInputStream> stream;
         public:
-            CSimpleStream(ISerialStream *_stream) : stream(_stream)
+            CSimpleStream(IBufferedSerialInputStream *_stream) : stream(_stream)
             {
             }
         // ISimpleReadStream impl.
@@ -1968,11 +2136,13 @@ class CRemoteXmlReadActivity : public CRemoteMarkupReadActivity
 public:
     CRemoteXmlReadActivity(IPropertyTree &config, IFileDescriptor *fileDesc) : PARENT(config, fileDesc, TAKxmlread)
     {
-        xpath.set("/Dataset/");
         if (customRowTag.isEmpty()) // no override
             fileDesc->queryProperties().getProp("@rowTag", xpath);
         else
+        {
+            xpath.set("/Dataset/");
             xpath.append(customRowTag);
+        }
     }
 };
 
@@ -1983,11 +2153,13 @@ class CRemoteJsonReadActivity : public CRemoteMarkupReadActivity
 public:
     CRemoteJsonReadActivity(IPropertyTree &config, IFileDescriptor *fileDesc) : PARENT(config, fileDesc, TAKjsonread)
     {
-        xpath.set("/");
         if (customRowTag.isEmpty()) // no override
             fileDesc->queryProperties().getProp("@rowTag", xpath);
         else
+        {
+            xpath.set("/");
             xpath.append(customRowTag);
+        }
     }
 };
 
@@ -2184,10 +2356,10 @@ class CRemoteIndexBaseActivity : public CRemoteDiskBaseActivity
 
 protected:
     bool isTlk = false;
-    bool allowPreload = false;
     unsigned fileCrc = 0;
     Owned<IKeyIndex> keyIndex;
     Owned<IKeyManager> keyManager;
+    RowFilter keyFilter;
 
     void checkOpen()
     {
@@ -2201,9 +2373,9 @@ protected:
         crc32.tally(sizeof(time_t), &modTimeTT);
         unsigned crc = crc32.get();
 
-        keyIndex.setown(createKeyIndex(fileName, crc, isTlk, allowPreload));
+        keyIndex.setown(createKeyIndex(fileName, crc, isTlk, {}));
         keyManager.setown(createLocalKeyManager(*record, keyIndex, nullptr, true, false));
-        filters.createSegmentMonitors(keyManager);
+        keyFilter.createSegmentMonitors(keyManager);
         keyManager->finishSegmentMonitors();
         keyManager->reset();
 
@@ -2220,9 +2392,9 @@ public:
     CRemoteIndexBaseActivity(IPropertyTree &config, IFileDescriptor *fileDesc) : PARENT(config, fileDesc)
     {
         setupInputMeta(config, getTypeInfoOutputMetaData(config, "input", false));
+        filter.splitIntoKeyFilter(*record, keyFilter);
 
         isTlk = config.getPropBool("isTlk");
-        allowPreload = config.getPropBool("allowPreload");
         fileCrc = config.getPropInt("crc");
     }
     virtual void flushStatistics(CClientStats &stats) override
@@ -2237,6 +2409,7 @@ class CRemoteIndexReadActivity : public CRemoteIndexBaseActivity
 
     Owned<const IDynamicTransform> translator;
     unsigned __int64 chooseN = 0;
+    bool cleanupBlobs = false;
 public:
     CRemoteIndexReadActivity(IPropertyTree &config, IFileDescriptor *fileDesc) : PARENT(config, fileDesc)
     {
@@ -2275,6 +2448,12 @@ public:
                         }
                         dbgassertex(retSz);
 
+                        if (cleanupBlobs)
+                        {
+                            keyManager->releaseBlobs();
+                            cleanupBlobs = false;
+                        }
+
                         const void *ret = outBuilder.getSelf();
                         outBuilder.finishRow(retSz);
                         ++processed;
@@ -2309,6 +2488,13 @@ public:
     {
         return out.appendf("indexread[%s]", fileName.get());
     }
+
+    virtual const byte * lookupBlob(unsigned __int64 id) override
+    {
+        size32_t dummy;
+        cleanupBlobs = true;
+        return (byte *) keyManager->loadBlob(id, dummy, nullptr);
+    }
 };
 
 
@@ -2327,7 +2513,11 @@ protected:
 
     void close()
     {
-        iFileIO.clear();
+        if (iFileIO)
+        {
+            iFileIO->close();
+            iFileIO.clear();
+        }
         opened = false;
         eofSeen = true;
     }
@@ -2358,11 +2548,13 @@ public:
     }
     virtual void serializeCursor(MemoryBuffer &tgt) const override
     {
-        throwUnexpected();
+        // we need to serialize something, because the lack of a cursor is used to signify end of stream
+        // NB: the cursor is opaque and only to be consumed by dafilesrv. When used it is simply passed back.
+        tgt.append("UNSUPPORTED");
     }
     virtual void restoreCursor(MemoryBuffer &src) override
     {
-        throwUnexpected();
+        throw makeStringExceptionV(0, "restoreCursor not supported in: %s", typeid(*this).name());
     }
     virtual StringBuffer &getInfoStr(StringBuffer &out) const override
     {
@@ -2389,10 +2581,9 @@ class CRemoteDiskWriteActivity : public CRemoteWriteBaseActivity
 {
     typedef CRemoteWriteBaseActivity PARENT;
 
-    unsigned compressionFormat = 0;
+    unsigned compressionFormat = COMPRESS_METHOD_NONE;
     bool eogPending = false;
     bool someInGroup = false;
-    size32_t recordSize = 0;
     Owned<IFileIOStream> iFileIOStream;
     bool append = false;
 
@@ -2411,7 +2602,11 @@ class CRemoteDiskWriteActivity : public CRemoteWriteBaseActivity
          * Would need mutex per physical filename active.
          */
         if (compressionFormat)
-            iFileIO.setown(createCompressedFileWriter(iFile, recordSize, append, true, nullptr, compressionFormat));
+        {
+            size32_t compBlockSize = 0; // i.e. default
+            size32_t blockedIoSize = -1; // i.e. default
+            iFileIO.setown(createCompressedFileWriter(iFile, append, true, nullptr, compressionFormat, compBlockSize, blockedIoSize, IFEnone));
+        }
         else
         {
             iFileIO.setown(iFile->open(append ? IFOwrite : IFOcreate));
@@ -2435,7 +2630,7 @@ public:
             if (strieq("true", compressed))
                 compressionFormat = translateToCompMethod(nullptr); // gets default
             else if (strieq("false", compressed))
-                compressionFormat = 0;
+                compressionFormat = COMPRESS_METHOD_NONE;
             else
                 compressionFormat = translateToCompMethod(compressed);
         }
@@ -2558,29 +2753,45 @@ IFileDescriptor *verifyMetaInfo(IPropertyTree &actNode, bool authorizedOnly, con
 
     bool isSigned = metaInfoBlob.length() != 0;
     if (authorizedOnly && !isSigned)
-        throw createDafsException(DAFSERR_cmdstream_unauthorized, "createRemoteActivity: unathorized");
+    {
+        const char *fileGroup = metaInfoEnvelope->queryProp("group");
+        if (!fileGroup)
+            fileGroup = "(undefined)";
+        throw createDafsExceptionV(DAFSERR_cmd_unauthorized, "createRemoteActivity: unauthorized (file group=%s)", fileGroup);
+    }
 
     if (isSigned)
     {
         metaInfo.setown(createPTree(metaInfoBlob));
-
         const char *keyPairName = metaInfo->queryProp("keyPairName");
-
+        dbgassertex(keyPairName); // because it's signed cannot be missing
+        const char *fileGroup = metaInfo->queryProp("group");
+        if (!fileGroup) // conceivably an older esp service constructed this metainfo without this field
+            fileGroup = "(undefined)";
         StringBuffer metaInfoSignature;
-        if (!metaInfoEnvelope->getProp("signature", metaInfoSignature))
-            throw createDafsException(DAFSERR_cmdstream_unauthorized, "createRemoteActivity: missing signature");
+        if (!metaInfoEnvelope->getProp("signature", metaInfoSignature)) // should not be possible (metaInfoBlob and signature are set at same time)
+            throw createDafsExceptionV(DAFSERR_cmd_unauthorized, "createRemoteActivity: missing signature (file group=%s, keyPairName=%s)", fileGroup, keyPairName);
 
+#ifdef _CONTAINERIZED
+        /* This public key that is sent with request will be verified as being issued by same CA
+         * and used to verify the meta info signature.
+         */
+        const char *certificate = metaInfoEnvelope->queryProp("certificate");
+        if (isEmptyString(certificate))
+            throw createDafsExceptionV(DAFSERR_cmd_unauthorized, "createRemoteActivity: missing certificate (file group=%s, keyPairName=%s)", fileGroup, keyPairName);
+        Owned<CLoadedKey> publicKey = loadPublicKeyFromCertMemory(certificate);
+#else
         VStringBuffer keyPairPath("KeyPair[@name=\"%s\"]", keyPairName);
         IPropertyTree *keyPair = keyPairInfo->queryPropTree(keyPairPath);
         if (!keyPair)
-            throw createDafsException(DAFSERR_cmdstream_unauthorized, "createRemoteActivity: missing key pair definition");
+            throw createDafsExceptionV(DAFSERR_cmd_unauthorized, "createRemoteActivity: missing key pair definition (file group=%s, keyPairName=%s)", fileGroup, keyPairName);
         const char *publicKeyFName = keyPair->queryProp("@publicKey");
         if (isEmptyString(publicKeyFName))
-            throw createDafsException(DAFSERR_cmdstream_unauthorized, "createRemoteActivity: missing public key definition");
+            throw createDafsExceptionV(DAFSERR_cmd_unauthorized, "createRemoteActivity: missing public key definition (file group=%s, keyPairName=%s)", fileGroup, keyPairName);
         Owned<CLoadedKey> publicKey = loadPublicKeyFromFile(publicKeyFName); // NB: if cared could cache loaded keys
+#endif
         if (!digiVerify(metaInfoSignature, metaInfoBlob.length(), metaInfoBlob.bytes(), *publicKey))
-            throw createDafsException(DAFSERR_cmdstream_unauthorized, "createRemoteActivity: signature verification failed");
-
+            throw createDafsExceptionV(DAFSERR_cmd_unauthorized, "createRemoteActivity: signature verification failed (file group=%s, keyPairName=%s)", fileGroup, keyPairName);
         checkExpiryTime(*metaInfo);
     }
     else
@@ -2614,6 +2825,7 @@ IFileDescriptor *verifyMetaInfo(IPropertyTree &actNode, bool authorizedOnly, con
             break;
         }
         case 2: // serialized compact IFileDescriptor
+        case 3: // same as v2 with additional 'group' meta info within metaInfo
         {
             IPropertyTree *fileInfo = metaInfo->queryPropTree("FileInfo");
 
@@ -2629,7 +2841,7 @@ IFileDescriptor *verifyMetaInfo(IPropertyTree &actNode, bool authorizedOnly, con
             break;
         }
         default:
-            throwUnexpected();
+            throw createDafsExceptionV(DAFSERR_cmdstream_protocol_failure, "createRemoteActivity: unsupported meta info version %u", metaInfoVersion);
     }
 
     verifyex(actNode.removeProp("metaInfo")); // no longer needed
@@ -2775,30 +2987,49 @@ IRemoteActivity *createOutputActivity(IPropertyTree &requestTree, bool authorize
 
 #define MAX_KEYDATA_SZ 0x10000
 
+enum class FeatureSupport
+{
+    none     = 0x0,
+    stream   = 0x1,
+    directIO = 0x2,
+    spray    = 0x4,
+    all      = stream|directIO|spray
+};
+BITMASK_ENUM(FeatureSupport);
+
+enum class CommandRetFlags
+{
+    none          = 0x0,
+    testSocket    = 0x1,
+    replyHandled  = 0x2
+};
+BITMASK_ENUM(CommandRetFlags);
+
 class CRemoteFileServer : implements IRemoteFileServer, public CInterface
 {
     class CThrottler;
     class CRemoteClientHandler : implements ISocketSelectNotify, public CInterface
     {
         bool calledByRowService;
+        byte *msgWritePtr = nullptr;
     public:
         CRemoteFileServer *parent;
         Owned<ISocket> socket;
         StringAttr peerName;
         MemoryBuffer msg;
-        bool selecthandled;
         size32_t left;
+        bool gotSize = false;
         StructArrayOf<OpenFileInfo> openFiles;
         Owned<IDirectoryIterator> opendir;
         unsigned            lasttick, lastInactiveTick;
-        atomic_t            &globallasttick;
+        std::atomic<unsigned> &globallasttick;
         unsigned            previdx;        // for debug
 
 
         IMPLEMENT_IINTERFACE;
 
-        CRemoteClientHandler(CRemoteFileServer *_parent,ISocket *_socket,atomic_t &_globallasttick, bool _calledByRowService)
-            : socket(_socket), globallasttick(_globallasttick), calledByRowService(_calledByRowService)
+        CRemoteClientHandler(CRemoteFileServer *_parent,ISocket *_socket,std::atomic<unsigned> &_globallasttick, bool _calledByRowService)
+            : calledByRowService(_calledByRowService), socket(_socket), globallasttick(_globallasttick)
         {
             previdx = (unsigned)-1;
             StringBuffer peerBuf;
@@ -2836,7 +3067,6 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
             parent = _parent;
             left = 0;
             msg.setEndian(__BIG_ENDIAN);
-            selecthandled = false;
             touch();
         }
         ~CRemoteClientHandler()
@@ -2858,92 +3088,114 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
             }
         }
         bool isRowServiceClient() const { return calledByRowService; }
-        bool notifySelected(ISocket *sock,unsigned selected)
+        bool notifySelected(ISocket *sock, unsigned selected)
         {
             if (TF_TRACE_FULL)
                 PROGLOG("notifySelected(%p)",this);
             if (sock!=socket)
                 WARNLOG("notifySelected - invalid socket passed");
-            size32_t avail = (size32_t)socket->avail_read();
-            if (avail)
-                touch();
-            else if (left)
+            touch();
+            try
             {
-                WARNLOG("notifySelected: Closing mid packet, %d remaining", left);
-                msg.clear();
-                parent->notify(this, msg); // notifying of graceful close
-                return false;
-            }
-            if (left==0)
-            {
-                try
+                while (true)
                 {
-                    left = avail?receiveDaFsBufferSize(socket):0;
-                }
-                catch (IException *e)
-                {
-                    EXCLOG(e,"notifySelected(1)");
-                    e->Release();
-                    left = 0;
-                }
-                if (left)
-                {
-                    avail = (size32_t)socket->avail_read();
-                    try
+                    if (!gotSize)
                     {
-                        msg.ensureCapacity(left);
-                    }
-                    catch (IException *e)
-                    {
-                        EXCLOG(e,"notifySelected(2)");
-                        e->Release();
-                        left = 0;
-                        // if too big then corrupted packet so read avail to try and consume
-                        char fbuf[1024];
-                        while (avail)
+                        // left represents amount we have read of leading size32_t (normally expect to be read in 1 go)
+                        if (0 == msg.length()) // 1st time
+                            msgWritePtr = (byte *)msg.reserveTruncate(sizeof(size32_t));
+                        size32_t szRead;
+                        sock->read(msgWritePtr, 0, sizeof(size32_t)-left, szRead, WAIT_FOREVER, false);
+
+                        left += szRead;
+                        msgWritePtr += szRead;
+                        if (left == sizeof(size32_t)) // if not, we exit, and rely on next notifySelected
                         {
-                            size32_t rd = avail>sizeof(fbuf)?sizeof(fbuf):avail;
+                            gotSize = true;
+                            msg.read(left);
+                            msg.clear();
                             try
                             {
-                                socket->read(fbuf, rd); // don't need timeout here
-                                avail -= rd;
+                                msgWritePtr = (byte *)msg.reserveTruncate(left);
                             }
                             catch (IException *e)
                             {
-                                EXCLOG(e,"notifySelected(2) flush");
+                                EXCLOG(e,"notifySelected(1)");
                                 e->Release();
-                                break;
+                                left = 0;
+                                // if too big then suggest corrupted packet, try to consume
+                                // JCSMORE this seems a bit pointless, and it used to only read last 'avail',
+                                // which is not necessarily everything that was sent
+                                char fbuf[1024];
+                                while (true)
+                                {
+                                    try
+                                    {
+                                        size32_t szRead;
+                                        sock->read(fbuf, 0, 1024, szRead, WAIT_FOREVER, true);
+                                    }
+                                    catch (IException *e)
+                                    {
+                                        EXCLOG(e,"notifySelected(2)");
+                                        e->Release();
+                                        break;
+                                    }
+                                }
+                            }
+                            if (0 == left)
+                            {
+                                gotSize = false;
+                                msg.clear();
+                                parent->onCloseSocket(this, 5);
+                                return true;
                             }
                         }
-                        avail = 0;
-                        left = 0;
+                        else
+                            break; // wait for rest via subsequent notifySelected's
                     }
+                    bool gc = false;
+                    if (gotSize) // left represents length of message remaining to receive
+                    {
+                        size32_t szRead;
+                        gc = readtmsAllowClose(sock, msgWritePtr, 0, left, szRead, WAIT_FOREVER);
+                        msgWritePtr += szRead;
+                        left -= szRead;
+                        if (0 == left) // NB: only ever here if original size was >0
+                        {
+                            gotSize = false; // reset for next packet
+                            parent->handleCompleteMessage(this, msg); // consumes msg
+                            if (gc)
+                                THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
+                        }
+                        else
+                        {
+                            if (gc)
+                                THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
+                            break; // wait for rest via subsequent notifySelected's
+                        }
+                    }
+                    else if (gc)
+                        THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
+                    // to be here, implies handled full message, loop around to see if more on the wire.
+                    // will break out if nothing/partial.
                 }
             }
-            size32_t toread = left>avail?avail:left;
-            if (toread)
+            catch (IJSOCK_Exception *e)
             {
-                try
+                if (JSOCKERR_graceful_close == e->errorCode())
                 {
-                    socket->read(msg.reserve(toread), toread);  // don't need timeout here
+                    if (gotSize)
+                        WARNLOG("notifySelected: Closing mid packet, %u remaining", left);
                 }
-                catch (IException *e)
-                {
-                    EXCLOG(e,"notifySelected(3)");
-                    e->Release();
-                    toread = left;
-                    msg.clear();
-                }
+                else
+                    EXCLOG(e, "notifySelected(3)");
+                e->Release();
+                parent->onCloseSocket(this, 5);
+                left = 0;
+                gotSize = false;
+                msg.clear();
             }
-            if (TF_TRACE_FULL)
-                PROGLOG("notifySelected %d,%d",toread,left);
-            left -= toread;
-            if (left==0)
-            {
-                // DEBUG
-                parent->notify(this, msg); // consumes msg
-            }
-            return false;
+            return true;
         }
 
         void logPrevHandle()
@@ -2983,77 +3235,11 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
         void processCommand(RemoteFileCommandType cmd, MemoryBuffer &msg, CThrottler *throttler)
         {
             MemoryBuffer reply;
-            bool testSocketFlag = parent->processCommand(cmd, msg, initSendBuffer(reply), this, throttler);
-            sendDaFsBuffer(socket, reply, testSocketFlag);
-        }
+            CommandRetFlags cmdFlags = parent->processCommand(cmd, msg, initSendBuffer(reply), this, throttler);
 
-        bool immediateCommand() // returns false if socket closed or failure
-        {
-            MemoryBuffer msg;
-            msg.setEndian(__BIG_ENDIAN);
-            touch();
-            size32_t avail = (size32_t)socket->avail_read();
-            if (avail==0)
-                return false;
-            receiveDaFsBuffer(socket, msg, 5);   // shouldn't timeout as data is available
-            touch();
-            if (msg.length()==0)
-                return false;
-            return throttleCommand(msg);
-        }
-
-        void process(MemoryBuffer &msg)
-        {
-            if (selecthandled)
-                throttleCommand(msg);
-            else
-            {
-                // msg only used/filled if process() has been triggered by notify()
-                while (parent->threadRunningCount()<=parent->targetActiveThreads) // if too many threads add to select handler
-                {
-                    int w;
-                    try
-                    {
-                        w = socket->wait_read(1000);
-                    }
-                    catch (IException *e)
-                    {
-                        EXCLOG(e, "CRemoteClientHandler::main wait_read error");
-                        e->Release();
-                        parent->onCloseSocket(this,1);
-                        return;
-                    }
-                    if (w==0)
-                        break;
-                    if ((w<0)||!immediateCommand())
-                    {
-                        if (w<0)
-                            WARNLOG("CRemoteClientHandler::main wait_read error");
-                        parent->onCloseSocket(this,1);
-                        return;
-                    }
-                }
-
-                /* This is a bit confusing..
-                 * The addClient below, adds this request to a selecthandler handled by another thread
-                 * and passes ownership of 'this' (CRemoteClientHandler)
-                 *
-                 * When notified, the selecthandler will launch a new pool thread to handle the request
-                 * If the pool thread limit is hit, the selecthandler will be blocked [ see comment in CRemoteFileServer::notify() ]
-                 *
-                 * Either way, a thread pool slot is occupied when processing a request.
-                 * Blocked threads, will be blocked for up to 1 minute (as defined by createThreadPool call)
-                 * IOW, if there are lots of incoming clients that can't be serviced by the CThrottler limit,
-                 * a large number of pool threads will build up after a while.
-                 *
-                 * The CThrottler mechanism, imposes a further hard limit on how many concurrent request threads can be active.
-                 * If the thread pool had an absolute limit (instead of just introducing a delay), then I don't see the point
-                 * in this additional layer of throttling..
-                 */
-                selecthandled = true;
-                parent->addClient(this);    // add to select handler
-                // NB: this (CRemoteClientHandler) is now linked by the selecthandler and owned by the 'clients' list
-            }
+            // some commands (i.e. RFCFtSlaveCmd), reply early, so should not reply again here.
+            if (!hasMask(cmdFlags, CommandRetFlags::replyHandled))
+                sendDaFsBuffer(socket, reply, hasMask(cmdFlags, CommandRetFlags::testSocket));
         }
 
         bool timedOut()
@@ -3075,7 +3261,7 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
         void touch()
         {
             lastInactiveTick = lasttick = msTick();
-            atomic_set(&globallasttick,lasttick);
+            globallasttick = lasttick;
         }
 
         const char *queryPeerName()
@@ -3122,8 +3308,9 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
 
     class CThrottler
     {
-        Semaphore sem;
-        CriticalSection crit, configureCrit;
+        Semaphore sem{SYNC_LOCATION};
+        CriticalSection crit{SYNC_LOCATION};
+        CriticalSection configureCrit{SYNC_LOCATION};
         StringAttr title;
         unsigned limit, delayMs, cpuThreshold, queueLimit;
         unsigned disabledLimit;
@@ -3296,7 +3483,7 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
                          */
                         unsigned ms = timer.elapsedMs();
                         totalThrottleDelay += ms;
-                        PROGLOG("Throttler(%s): transaction delayed [cmd=%s] for : %u milliseconds, proceeding as cpu(%u)<throttleCPULimit(%u)", title.get(), getRFCText(cmd), cpu, ms, cpuThreshold);
+                        PROGLOG("Throttler(%s): transaction delayed [cmd=%s] for : %u milliseconds, proceeding as cpu(%u)<throttleCPULimit(%u)", title.get(), getRFCText(cmd), ms, cpu, cpuThreshold);
                         hadSem = false;
                     }
                     else
@@ -3401,30 +3588,39 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
     };
 
     int                 lasthandle;
-    CriticalSection     sect;
+    CriticalSection sect{SYNC_LOCATION};
     Owned<ISocket>      acceptsock;
     Owned<ISocket>      securesock;
     Owned<ISocket>      rowServiceSock;
-
+    Linked<IPropertyTree> componentConfig;
+    FeatureSupport featureSupport = FeatureSupport::all; // NB: will be overridden in run()
+#ifdef _WIN32
+    unsigned retryOpenMs = 0;
+#endif
     bool rowServiceOnStdPort = true; // should row service commands be processed on std. service port
     bool rowServiceSSL = false;
 
     Owned<ISocketSelectHandler> selecthandler;
     Owned<IThreadPool>  threads;    // for commands
     bool stopping;
-    unsigned clientcounttick;
-    unsigned closedclients;
+    unsigned clientcounttick;   // is only touched/read by checkTimeout() that is not contended itself.
+    unsigned closedclients;   // is only touched/read by checkTimeout() that is not contended itself.
     CAsyncCommandManager asyncCommandManager;
     CThrottler stdCmdThrottler, slowCmdThrottler;
     CClientStatsTable clientStatsTable;
-    atomic_t globallasttick;
+    std::atomic<unsigned> globallasttick;
     unsigned targetActiveThreads;
     Linked<IPropertyTree> keyPairInfo;
+    enum class StreamCmd:byte { NEWSTREAM, CONTINUE, CLOSE, VERSION };
+    std::unordered_map<std::string, StreamCmd> streamCmdMap = {
+        {"newstream", StreamCmd::NEWSTREAM}, {"continue", StreamCmd::CONTINUE},
+        {"close", StreamCmd::CLOSE}, {"version", StreamCmd::VERSION}
+    };
 
     class CHandleTracer
     {
         CTimeMon timer;
-        CriticalSection crit;
+        CriticalSection crit{SYNC_LOCATION};
         Owned<IFile> stdIOIFile;
         std::vector<Owned<IFileIO>> reservedHandles;
         unsigned handlesToReserve = 3; // need a few for pipe process to succeed
@@ -3558,7 +3754,7 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
         virtual void init(void *_params) override
         {
             cCommandProcessorParams &params = *(cCommandProcessorParams *)_params;
-            client.setown(params.client);
+            client.set(params.client);
             msg.swapWith(params.msg);
         }
 
@@ -3567,7 +3763,7 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
             // idea is that initially we process commands inline then pass over to select handler
             try
             {
-                client->process(msg);
+                client->throttleCommand(msg);
             }
             catch (IException *e)
             {
@@ -3598,6 +3794,7 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
 
     IArrayOf<CRemoteClientHandler> clients;
 
+#ifndef _CONTAINERIZED
     void validateSSLSetup()
     {
         if (!securitySettings.certificate)
@@ -3609,12 +3806,13 @@ class CRemoteFileServer : implements IRemoteFileServer, public CInterface
         if (!checkFileExists(securitySettings.privateKey))
             throw createDafsException(DAFSERR_serverinit_failed, "SSL Key File not found in environment.conf");
     }
+#endif
 public:
 
     IMPLEMENT_IINTERFACE
 
     CRemoteFileServer(unsigned maxThreads, unsigned maxThreadsDelayMs, unsigned maxAsyncCopy, IPropertyTree *_keyPairInfo)
-        : asyncCommandManager(maxAsyncCopy), stdCmdThrottler("stdCmdThrotlter"), slowCmdThrottler("slowCmdThrotlter"), keyPairInfo(_keyPairInfo)
+        : asyncCommandManager(maxAsyncCopy), stdCmdThrottler("stdCmdThrottler"), slowCmdThrottler("slowCmdThrottler"), keyPairInfo(_keyPairInfo)
     {
         lasthandle = 0;
         selecthandler.setown(createSocketSelectHandler(NULL));
@@ -3638,7 +3836,7 @@ public:
             }
         };
         Owned<IThreadFactory> factory = new CCommandFactory(*this); // NB: pool links factory, so takes ownership
-        threads.setown(createThreadPool("CRemoteFileServerPool", factory, NULL, maxThreads, maxThreadsDelayMs,
+        threads.setown(createThreadPool("CRemoteFileServerPool", factory, false, nullptr, maxThreads, maxThreadsDelayMs,
 #ifdef __64BIT__
             0, // Unlimited stack size
 #else
@@ -3652,7 +3850,7 @@ public:
         stopping = false;
         clientcounttick = msTick();
         closedclients = 0;
-        atomic_set(&globallasttick,msTick());
+        globallasttick = msTick();
     }
 
     ~CRemoteFileServer()
@@ -3685,9 +3883,9 @@ public:
 
     //MORE: The file handles should timeout after a while, and accessing an old (invalid handle)
     // should throw a different exception
-    bool checkFileIOHandle(int handle, IFileIO *&fileio, bool del=false)
+    bool checkFileIOHandle(int handle, Owned<IFileIO> & fileio, bool del=false)
     {
-        fileio = NULL;
+        fileio.clear();
         if (handle<=0)
             return false;
         CriticalBlock block(sect);
@@ -3706,7 +3904,7 @@ public:
             }
             else
             {
-               fileio = client.openFiles.item(handleidx).fileIO;
+               fileio.set(client.openFiles.item(handleidx).fileIO);
                client.previdx = handleidx;
             }
             return true;
@@ -3714,7 +3912,7 @@ public:
         return false;
     }
 
-    void checkFileIOHandle(MemoryBuffer &reply, int handle, IFileIO *&fileio, bool del=false)
+    void checkFileIOHandle(MemoryBuffer &reply, int handle, Owned<IFileIO> & fileio, bool del=false)
     {
         if (!checkFileIOHandle(handle, fileio, del))
             throw createDafsException(RFSERR_InvalidFileIOHandle, nullptr);
@@ -3773,13 +3971,17 @@ public:
         }
         IFEflags extraFlags = (IFEflags)extra;
         // none => nocache for remote (hint)
-        // can revert to previous behavior with conf file setting "allow_pgcache_flush=false"
+        // can change this default setting with:
+        //  bare-metal legacy - conf file setting: allow_pgcache_flush=false
+        //  bare-metal - environment.xml dafilesrv expert setting: disableIFileMask=0x1 (IFEnocache)
+        //  containerized - values.yaml dafilesrv expert setting: disableIFileMask: 0x1 (IFEnocache)
         if (extraFlags == IFEnone)
             extraFlags = IFEnocache;
         Owned<IFile> file = createIFile(name->text);
         switch ((compatIFSHmode)share) {
         case compatIFSHnone:
-            file->setCreateFlags(S_IRUSR|S_IWUSR);
+            if (mode != IFOread)
+                file->setCreateFlags(S_IRUSR|S_IWUSR);
             file->setShareMode(IFSHnone);
             break;
         case compatIFSHread:
@@ -3789,10 +3991,12 @@ public:
             file->setShareMode(IFSHfull);
             break;
         case compatIFSHexec:
-            file->setCreateFlags(S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH);
+            if (mode != IFOread)
+                file->setCreateFlags(S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH);
             break;
         case compatIFSHall:
-            file->setCreateFlags(S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH); // bit excessive
+            if (mode != IFOread)
+                file->setCreateFlags(S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH); // bit excessive
             file->setShareMode(IFSHfull);
             break;
         }
@@ -3803,8 +4007,53 @@ public:
             file->setShareMode((IFSHmode)sMode);
         }
         if (TF_TRACE_PRE_IO)
-            PROGLOG("before open file '%s',  (%d,%d,%d,%d,0%o)",name->text.get(),(int)mode,(int)share,extraFlags,sMode,cFlags);
-        Owned<IFileIO> fileio = file->open((IFOmode)mode,extraFlags);
+            PROGLOG("before open file '%s', (%d,%d,%d,%d,0%o)",name->text.get(),(int)mode,(int)share,extraFlags,sMode,cFlags);
+
+        Owned<IFileIO> fileio;
+#ifndef _WIN32
+        fileio.setown(file->open((IFOmode)mode,extraFlags));
+#else
+        // This is an attempt to deal this issue raised after MS update KB5025229 was applied.
+        // retry to open if file in use by another process (MS process suspected to be holding file for a short time)
+        unsigned retries = 0;
+        CCycleTimer timer;
+        if (0 == retryOpenMs) // disabled
+            fileio.setown(file->open((IFOmode)mode,extraFlags));
+        else
+        {
+            while (true)
+            {
+                unsigned elapsedMs = 0;
+                try
+                {
+                    fileio.setown(file->open((IFOmode)mode,extraFlags));
+                    break;
+                }
+                catch (IOSException *e)
+                {
+                    // abort unless "The process cannot access the file because it is being used by another process."
+                    if (ERROR_SHARING_VIOLATION != e->errorCode())
+                        throw;
+
+                    elapsedMs = timer.elapsedMs();
+                    if (elapsedMs >= retryOpenMs)
+                    {
+                        StringBuffer msg;
+                        e->errorMessage(msg);
+                        msg.appendf(" - retries = %u", retries);
+                        e->Release();
+                        throw makeOsException(ERROR_SHARING_VIOLATION, msg.str());
+                    }
+                }
+                unsigned delayMs = 10 + (getRandom() % 90); // 10-100 ms
+                unsigned remainingMs = retryOpenMs-elapsedMs;
+                if (delayMs > remainingMs)
+                    delayMs = remainingMs;
+                MilliSleep(delayMs);
+                ++retries;
+            }
+        }
+#endif
         int handle;
         if (fileio)
         {
@@ -3818,7 +4067,13 @@ public:
         reply.append(RFEnoerror);
         reply.append(handle);
         if (TF_TRACE)
-            PROGLOG("open file '%s',  (%d,%d) handle = %d",name->text.get(),(int)mode,(int)share,handle);
+        {
+#ifndef _WIN32
+            PROGLOG("open file '%s', (%d,%d) handle = %d",name->text.get(),(int)mode,(int)share,handle);
+#else
+            PROGLOG("open file '%s', (%d,%d) handle = %d, retries = %u, time(ms) = %u",name->text.get(),(int)mode,(int)share,handle,retries,timer.elapsedMs());
+#endif
+        }
         return true;
     }
 
@@ -3826,10 +4081,10 @@ public:
     {
         int handle;
         msg.read(handle);
-        IFileIO *fileio;
+        Owned<IFileIO> fileio;
         checkFileIOHandle(reply, handle, fileio, true);
         if (TF_TRACE)
-            PROGLOG("close file,  handle = %d",handle);
+            PROGLOG("close file, handle = %d",handle);
         reply.append(RFEnoerror);
         return true;
     }
@@ -3840,7 +4095,7 @@ public:
         __int64 pos;
         size32_t len;
         msg.read(handle).read(pos).read(len);
-        IFileIO *fileio;
+        Owned<IFileIO> fileio;
         checkFileIOHandle(reply, handle, fileio);
 
         //arrange it so we read directly into the reply buffer...
@@ -3849,13 +4104,13 @@ public:
         size32_t numRead;
         unsigned posOfLength = reply.length();
         if (TF_TRACE_PRE_IO)
-            PROGLOG("before read file,  handle = %d, toread = %d",handle,len);
+            PROGLOG("before read file, handle = %d, toread = %d",handle,len);
         reply.reserve(sizeof(numRead));
         void *data = reply.reserve(len);
         numRead = fileio->read(pos,len,data);
         stats.addRead(len);
         if (TF_TRACE)
-            PROGLOG("read file,  handle = %d, pos = %" I64F "d, toread = %d, read = %d",handle,pos,len,numRead);
+            PROGLOG("read file, handle = %d, pos = %" I64F "d, toread = %d, read = %d",handle,pos,len,numRead);
         reply.setLength(posOfLength + sizeof(numRead) + numRead);
         reply.writeEndianDirect(posOfLength,sizeof(numRead),&numRead);
     }
@@ -3864,12 +4119,12 @@ public:
     {
         int handle;
         msg.read(handle);
-        IFileIO *fileio;
+        Owned<IFileIO> fileio;
         checkFileIOHandle(reply, handle, fileio);
         __int64 size = fileio->size();
         reply.append((unsigned)RFEnoerror).append(size);
         if (TF_TRACE)
-            PROGLOG("size file,  handle = %d, size = %" I64F "d",handle,size);
+            PROGLOG("size file, handle = %d, size = %" I64F "d",handle,size);
     }
 
     void cmdSetSize(MemoryBuffer & msg, MemoryBuffer & reply)
@@ -3877,9 +4132,9 @@ public:
         int handle;
         offset_t size;
         msg.read(handle).read(size);
-        IFileIO *fileio;
         if (TF_TRACE)
-            PROGLOG("set size file,  handle = %d, size = %" I64F "d",handle,size);
+            PROGLOG("set size file, handle = %d, size = %" I64F "d",handle,size);
+        Owned<IFileIO> fileio;
         checkFileIOHandle(reply, handle, fileio);
         fileio->setSize(size);
         reply.append((unsigned)RFEnoerror);
@@ -3891,15 +4146,15 @@ public:
         __int64 pos;
         size32_t len;
         msg.read(handle).read(pos).read(len);
-        IFileIO *fileio;
+        Owned<IFileIO> fileio;
         checkFileIOHandle(reply, handle, fileio);
         const byte *data = (const byte *)msg.readDirect(len);
         if (TF_TRACE_PRE_IO)
-            PROGLOG("before write file,  handle = %d, towrite = %d",handle,len);
+            PROGLOG("before write file, handle = %d, towrite = %d",handle,len);
         size32_t numWritten = fileio->write(pos,len,data);
         stats.addWrite(numWritten);
         if (TF_TRACE)
-            PROGLOG("write file,  handle = %d, towrite = %d, written = %d",handle,len,numWritten);
+            PROGLOG("write file, handle = %d, towrite = %d, written = %d",handle,len,numWritten);
         reply.append((unsigned)RFEnoerror).append(numWritten);
     }
 
@@ -3908,7 +4163,7 @@ public:
         StringAttr name;
         msg.read(name);
         if (TF_TRACE)
-            PROGLOG("exists,  '%s'",name.get());
+            PROGLOG("exists, '%s'",name.get());
         Owned<IFile> file=createIFile(name);
         bool e = file->exists();
         reply.append((unsigned)RFEnoerror).append(e);
@@ -3919,7 +4174,7 @@ public:
         StringAttr name;
         msg.read(name);
         if (TF_TRACE)
-            PROGLOG("remove,  '%s'",name.get());
+            PROGLOG("remove, '%s'",name.get());
         Owned<IFile> file=createIFile(name);
         bool e = file->remove();
         reply.append((unsigned)RFEnoerror).append(e);
@@ -3948,7 +4203,7 @@ public:
         StringAttr toname;
         msg.read(toname);
         if (TF_TRACE)
-            PROGLOG("rename,  '%s' to '%s'",fromname.get(),toname.get());
+            PROGLOG("rename, '%s' to '%s'",fromname.get(),toname.get());
         Owned<IFile> file=createIFile(fromname);
         file->rename(toname);
         reply.append((unsigned)RFEnoerror);
@@ -3961,7 +4216,7 @@ public:
         StringAttr toname;
         msg.read(toname);
         if (TF_TRACE)
-            PROGLOG("move,  '%s' to '%s'",fromname.get(),toname.get());
+            PROGLOG("move, '%s' to '%s'",fromname.get(),toname.get());
         Owned<IFile> file=createIFile(fromname);
         file->move(toname);
         reply.append((unsigned)RFEnoerror);
@@ -3974,7 +4229,7 @@ public:
         StringAttr toname;
         msg.read(toname);
         if (TF_TRACE)
-            PROGLOG("copy,  '%s' to '%s'",fromname.get(),toname.get());
+            PROGLOG("copy, '%s' to '%s'",fromname.get(),toname.get());
         copyFile(toname, fromname);
         reply.append((unsigned)RFEnoerror);
     }
@@ -3986,14 +4241,14 @@ public:
         __int64 len;
         StringAttr srcname;
         msg.read(handle).read(srcname).read(pos).read(len);
-        IFileIO *fileio;
+        Owned<IFileIO> fileio;
         checkFileIOHandle(reply, handle, fileio);
 
         Owned<IFile> file = createIFile(srcname.get());
-        __int64 written = fileio->appendFile(file,pos,len);
+        __int64 written = appendFile(fileio, file,pos,len);
         stats.addWrite(written);
         if (TF_TRACE)
-            PROGLOG("append file,  handle = %d, file=%s, pos = %" I64F "d len = %" I64F "d written = %" I64F "d",handle,srcname.get(),pos,len,written);
+            PROGLOG("append file, handle = %d, file=%s, pos = %" I64F "d len = %" I64F "d written = %" I64F "d",handle,srcname.get(),pos,len,written);
         reply.append((unsigned)RFEnoerror).append(written);
     }
 
@@ -4002,7 +4257,7 @@ public:
         StringAttr name;
         msg.read(name);
         if (TF_TRACE)
-            PROGLOG("isFile,  '%s'",name.get());
+            PROGLOG("isFile, '%s'",name.get());
         Owned<IFile> file=createIFile(name);
         unsigned ret = (unsigned)file->isFile();
         reply.append((unsigned)RFEnoerror).append(ret);
@@ -4013,7 +4268,7 @@ public:
         StringAttr name;
         msg.read(name);
         if (TF_TRACE)
-            PROGLOG("isDir,  '%s'",name.get());
+            PROGLOG("isDir, '%s'",name.get());
         Owned<IFile> file=createIFile(name);
         unsigned ret = (unsigned)file->isDirectory();
         reply.append((unsigned)RFEnoerror).append(ret);
@@ -4024,7 +4279,7 @@ public:
         StringAttr name;
         msg.read(name);
         if (TF_TRACE)
-            PROGLOG("isReadOnly,  '%s'",name.get());
+            PROGLOG("isReadOnly, '%s'",name.get());
         Owned<IFile> file=createIFile(name);
         unsigned ret = (unsigned)file->isReadOnly();
         reply.append((unsigned)RFEnoerror).append(ret);
@@ -4037,7 +4292,7 @@ public:
         msg.read(name).read(set);
 
         if (TF_TRACE)
-            PROGLOG("setReadOnly,  '%s' %d",name.get(),(int)set);
+            PROGLOG("setReadOnly, '%s' %d",name.get(),(int)set);
         Owned<IFile> file=createIFile(name);
         file->setReadOnly(set);
         reply.append((unsigned)RFEnoerror);
@@ -4049,7 +4304,7 @@ public:
         unsigned fPerms;
         msg.read(name).read(fPerms);
         if (TF_TRACE)
-            PROGLOG("setFilePerms,  '%s' 0%o",name.get(),fPerms);
+            PROGLOG("setFilePerms, '%s' 0%o",name.get(),fPerms);
         Owned<IFile> file=createIFile(name);
         file->setFilePermissions(fPerms);
         reply.append((unsigned)RFEnoerror);
@@ -4060,7 +4315,7 @@ public:
         StringAttr name;
         msg.read(name);
         if (TF_TRACE)
-            PROGLOG("getTime,  '%s'",name.get());
+            PROGLOG("getTime, '%s'",name.get());
         Owned<IFile> file=createIFile(name);
         CDateTime createTime;
         CDateTime modifiedTime;
@@ -4096,7 +4351,7 @@ public:
             accessedTime.deserialize(msg);
 
         if (TF_TRACE)
-            PROGLOG("setTime,  '%s'",name.get());
+            PROGLOG("setTime, '%s'",name.get());
         Owned<IFile> file=createIFile(name);
 
         bool ret = file->setTime(creategot?&createTime:NULL,modifiedgot?&modifiedTime:NULL,accessedgot?&accessedTime:NULL);
@@ -4108,7 +4363,7 @@ public:
         StringAttr name;
         msg.read(name);
         if (TF_TRACE)
-            PROGLOG("CreateDir,  '%s'",name.get());
+            PROGLOG("CreateDir, '%s'",name.get());
         Owned<IFile> dir=createIFile(name);
         bool ret = dir->createDirectory();
         reply.append((unsigned)RFEnoerror).append(ret);
@@ -4129,7 +4384,7 @@ public:
                 client.opendir.clear();
         }
         if (TF_TRACE)
-            PROGLOG("GetDir,  '%s', '%s', stream='%u'",name.get(),mask.get(),stream);
+            PROGLOG("GetDir, '%s', '%s', stream='%u'",name.get(),mask.get(),stream);
         if (!stream && !containsFileWildcard(mask))
         {
             // if no streaming, and mask contains no wildcard, it is much more efficient to get the info without a directory iterator!
@@ -4204,7 +4459,7 @@ public:
             prev.setown(createRemoteDirectorIterator(ep, name, msg));
         }
         if (TF_TRACE)
-            PROGLOG("MonitorDir,  '%s' '%s'",name.get(),mask.get());
+            PROGLOG("MonitorDir, '%s' '%s'",name.get(),mask.get());
         Owned<IFile> dir=createIFile(name);
         Owned<IDirectoryDifferenceIterator> iter=dir->monitorDirectory(prev,mask.length()?mask.get():NULL,sub,includedir,checkinterval,timeout);
         reply.append((unsigned)RFEnoerror);
@@ -4397,7 +4652,7 @@ public:
         StringAttr name;
         msg.read(name);
         if (TF_TRACE)
-            PROGLOG("getCRC,  '%s'",name.get());
+            PROGLOG("getCRC, '%s'",name.get());
         Owned<IFile> file=createIFile(name);
         unsigned ret = file->getCRC();
         reply.append((unsigned)RFEnoerror).append(ret);
@@ -4502,6 +4757,10 @@ public:
      * "action" - supported actions = "count" (used if "kind" is auto-detected to specify count should be performed instead of read)
      *
      * "keyFilter" - filter the results by this expression (See: HPCC-18474 for more details).
+     * 
+     * "recordSamplingRate" - sampling the dataset at this rate (e.g. 0.1 for 10% sampling)
+     * 
+     * "recordSamplingSeed" - seed for random sampling [0,UINT32_MAX]
      *
      * "chooseN" - maximum # of results to return
      *
@@ -4520,7 +4779,7 @@ public:
          *
          * {
          *  "format" : "binary",
-         *  "handle" : "1234",
+         *  "command": "newstream"
          *  "replyLimit" : "64",
          *  "commCompression" : "LZ4",
          *  "node" : {
@@ -4530,6 +4789,8 @@ public:
          *   "kind" : "diskread",
          *   "fileName": "examplefilename",
          *   "keyFilter" : "f1='1    '",
+         *   "recordSamplingRate" : 0.1,
+         *   "recordSamplingSeed" : 123456789,
          *   "chooseN" : 5,
          *   "compressed" : "false"
          *   "input" : {
@@ -4545,7 +4806,7 @@ public:
          * OR
          * {
          *  "format" : "binary",
-         *  "handle" : "1234",
+         *  "command": "newstream"
          *  "replyLimit" : "64",
          *  "commCompression" : "LZ4",
          *  "node" : {
@@ -4567,7 +4828,7 @@ public:
          * OR
          * {
          *  "format" : "xml",
-         *  "handle" : "1234",
+         *  "command": "newstream"
          *  "replyLimit" : "64",
          *  "node" : {
          *   "kind" : "diskread",
@@ -4588,7 +4849,7 @@ public:
          * OR
          * {
          *  "format" : "xml",
-         *  "handle" : "1234",
+         *  "command": "newstream"
          *  "node" : {
          *   "kind" : "indexread",
          *   "fileName": "examplefilename",
@@ -4605,6 +4866,7 @@ public:
          * OR
          * {
          *  "format" : "xml",
+         *  "command": "newstream"
          *  "node" : {
          *   "kind" : "xmlread",
          *   "fileName": "examplefilename",
@@ -4624,6 +4886,7 @@ public:
          * OR
          * {
          *  "format" : "xml",
+         *  "command": "newstream"
          *  "node" : {
          *   "kind" : "csvread",
          *   "fileName": "examplefilename",
@@ -4645,6 +4908,7 @@ public:
          * OR
          * {
          *  "format" : "xml",
+         *  "command": "newstream"
          *  "node" : {
          *   "action" : "count",            // if present performs count with/without filter and returns count
          *   "fileName": "examplefilename", // can be either index or flat file
@@ -4658,7 +4922,7 @@ public:
          * OR
          * {
          *  "format" : "binary",
-         *  "handle" : "1234",
+         *  "command": "newstream"
          *  "replyLimit" : "64",
          *  "commCompression" : "LZ4",
          *  "node" : {
@@ -4674,7 +4938,7 @@ public:
          * OR
          * {
          *  "format" : "binary",
-         *  "handle" : "1234",
+         *  "command": "newstream"
          *  "replyLimit" : "64",
          *  "node" : {
          *   "kind" : "indexwrite",
@@ -4689,6 +4953,7 @@ public:
          * Fetch fpos stream example:
          * {
          *  "format" : "binary",
+         *  "command": "newstream"
          *  "replyLimit" : "64",
          *  "fetch" : {
          *   "fpos" : "30",
@@ -4703,10 +4968,11 @@ public:
          *   }
          *  }
          * }
-         * 
+         *
          * fetch continuation:
          * {
          *  "format" : "binary",
+         *  "command": "continue"
          *  "handle" : "1234",
          *  "replyLimit" : "64",
          *  "fetch" : {
@@ -4714,6 +4980,12 @@ public:
          *   "fpos" : "135",
          *   "fpos" : "150"
          *  }
+         *
+         * Close an open file:
+         * {
+         *  "format" : "binary",
+         *  "command": "close"
+         *  "handle" : "1234",
          * }
          */
 
@@ -4724,105 +4996,211 @@ public:
         Owned<CRemoteRequest> remoteRequest;
         Owned<IRemoteActivity> outputActivity;
         OpenFileInfo fileInfo;
-        if (!cursorHandle)
+
+        StreamCmd cmd;
+        const char *qCommand = requestTree->queryProp("command");
+        if (!qCommand)
         {
-            const char *outputFmtStr = requestTree->queryProp("format");
-            if (nullptr == outputFmtStr)
-                outputFormat = outFmt_Xml; // default
-            else if (strieq("xml", outputFmtStr))
-                outputFormat = outFmt_Xml;
-            else if (strieq("json", outputFmtStr))
-                outputFormat = outFmt_Json;
-            else if (strieq("binary", outputFmtStr))
-                outputFormat = outFmt_Binary;
+            // legacy handling
+            // If cursor sent - meant continuation of existing stream, handle should correspond to existing request
+            // No cursor - meant request would contain info to build a new stream
+            if (cursorHandle)
+                cmd = StreamCmd::CONTINUE;
             else
-                throw MakeStringException(0, "Unrecognised output format: %s", outputFmtStr);
-
-            /* pre-version 2.4, "outputCompression" denoted data was compressed in communication protocol and only applied to reply row data
-             * Since 2.5 "commCompression" replaces "outputCompression", and applies to both incoming row data (write) and outgoing row data (read).
-             * But "outputCompression" is checked for backward compatibility.
-             */
-            if (requestTree->hasProp("outputCompression") || requestTree->hasProp("commCompression"))
-            {
-                const char *commCompressionType = requestTree->queryProp("commCompression");
-                if (isEmptyString(commCompressionType))
-                    commCompressionType = requestTree->queryProp("outputCompression");
-
-                if (isEmptyString(commCompressionType))
-                {
-                    compressor.setown(queryDefaultCompressHandler()->getCompressor());
-                    expander.setown(queryDefaultCompressHandler()->getExpander());
-                }
-                else if (outFmt_Binary == outputFormat)
-                {
-                    compressor.setown(getCompressor(commCompressionType));
-                    expander.setown(getExpander(commCompressionType));
-                    if (!compressor)
-                        WARNLOG("Unknown compressor type specified: %s", commCompressionType);
-                }
-                else
-                    WARNLOG("Communication protocol compression not supported for format: %s", outputFmtStr);
-            }
-
-            /* NB: unless client call is on dedicated service, allow non-authorized requests through, e.g. from engines talking to unsecured port
-             * In a secure setup, this service will be configured on a dedicated port, and the std. insecure dafilesrv will be unreachable.
-             */
-            bool authorizedOnly = rowServiceSock && client.isRowServiceClient();
-
-            // In future this may be passed the request and build a chain of activities and return sink.
-            outputActivity.setown(createOutputActivity(*requestTree, authorizedOnly, keyPairInfo));
-
-            {
-                CriticalBlock block(sect);
-                cursorHandle = getNextHandle();
-            }
-            remoteRequest.setown(new CRemoteRequest(cursorHandle, outputFormat, compressor, expander, outputActivity));
-
-            StringBuffer requestStr("jsonrequest:");
-            outputActivity->getInfoStr(requestStr);
-            Owned<StringAttrItem> name = new StringAttrItem(requestStr);
-
-            CriticalBlock block(sect);
-            client.previdx = client.openFiles.ordinality();
-            client.openFiles.append(OpenFileInfo(cursorHandle, remoteRequest, name));
+                cmd = StreamCmd::NEWSTREAM;
         }
-        else if (!lookupFileIOHandle(cursorHandle, fileInfo))
-            cursorHandle = 0; // challenge response ..
-        else // known handle, continuation
-        {
-            remoteRequest.set(fileInfo.remoteRequest);
-            outputFormat = fileInfo.remoteRequest->queryFormat();
-        }
-
-        if (cursorHandle)
-            remoteRequest->process(requestTree, rest, reply, stats);
         else
         {
-            const char *outputFmtStr = requestTree->queryProp("format");
-            if (nullptr == outputFmtStr)
-                outputFormat = outFmt_Xml; // default
-            else if (strieq("xml", outputFmtStr))
-                outputFormat = outFmt_Xml;
-            else if (strieq("json", outputFmtStr))
-                outputFormat = outFmt_Json;
-            else if (strieq("binary", outputFmtStr))
-                outputFormat = outFmt_Binary;
-            else
-                throw MakeStringException(0, "Unrecognised output format: %s", outputFmtStr);
+            auto it = streamCmdMap.find(qCommand);
+            if (it == streamCmdMap.end())
+                throw makeStringExceptionV(0, "Unrecognised stream command: %s", qCommand);
+            cmd = it->second;
+        }
 
-            if (outFmt_Binary == outputFormat)
-                reply.append(cursorHandle);
-            else // outFmt_Xml || outFmt_Json
+        const char *outputFmtStr = requestTree->queryProp("format");
+        if (nullptr == outputFmtStr)
+            outputFormat = outFmt_Xml; // default
+        else if (strieq("binary", outputFmtStr))
+            outputFormat = outFmt_Binary;
+        else if (strieq("xml", outputFmtStr))
+            outputFormat = outFmt_Xml;
+        else if (strieq("json", outputFmtStr))
+            outputFormat = outFmt_Json;
+        else
+            throw MakeStringException(0, "Unrecognised output format: %s", outputFmtStr);
+
+        switch (cmd)
+        {
+            case StreamCmd::NEWSTREAM:
             {
-                Owned<IXmlWriterExt> responseWriter = createIXmlWriterExt(0, 0, nullptr, outFmt_Xml == outputFormat ? WTStandard : WTJSONObject);
-                responseWriter->outputBeginNested("Response", true);
-                if (outFmt_Xml == outputFormat)
-                    responseWriter->outputCString("urn:hpcc:dfs", "@xmlns:dfs");
-                responseWriter->outputUInt(cursorHandle, sizeof(cursorHandle), "handle");
-                responseWriter->outputEndNested("Response");
-                responseWriter->finalize();
-                reply.append(responseWriter->length(), responseWriter->str());
+                if (cursorHandle)
+                    throw createDafsException(DAFSERR_cmdstream_protocol_failure, "unexpected cursor handle supplied to 'newstream' command");
+
+                /* pre-version 2.4, "outputCompression" denoted data was compressed in communication protocol and only applied to reply row data
+                * Since 2.5 "commCompression" replaces "outputCompression", and applies to both incoming row data (write) and outgoing row data (read).
+                * But "outputCompression" is checked for backward compatibility.
+                */
+                if (requestTree->hasProp("outputCompression") || requestTree->hasProp("commCompression"))
+                {
+                    const char *commCompressionType = requestTree->queryProp("commCompression");
+                    if (isEmptyString(commCompressionType))
+                        commCompressionType = requestTree->queryProp("outputCompression");
+
+                    if (isEmptyString(commCompressionType))
+                    {
+                        compressor.setown(queryDefaultCompressHandler()->getCompressor());
+                        expander.setown(queryDefaultCompressHandler()->getExpander());
+                    }
+                    else if (outFmt_Binary == outputFormat)
+                    {
+                        compressor.setown(getCompressor(commCompressionType));
+                        expander.setown(getExpander(commCompressionType));
+                        if (!compressor)
+                            WARNLOG("Unknown compressor type specified: %s", commCompressionType);
+                    }
+                    else
+                        WARNLOG("Communication protocol compression not supported for format: %s", outputFmtStr);
+                }
+
+#ifdef _CONTAINERIZED
+                bool authorizedOnly = hasMask(featureSupport, FeatureSupport::stream) && !hasMask(featureSupport, FeatureSupport::directIO);
+#else
+                /* NB: In bare-metal, unless client call is on dedicated service, allow non-authorized requests through, e.g. from engines talking to unsecured port
+                * In a locked down secure setup, this service will be configured on a dedicated port, and the std. insecure dafilesrv will be unreachable.
+                */
+                bool authorizedOnly = rowServiceSock && client.isRowServiceClient();
+#endif
+
+                // In future this may be passed the request and build a chain of activities and return sink.
+                outputActivity.setown(createOutputActivity(*requestTree, authorizedOnly, keyPairInfo));
+
+                {
+                    CriticalBlock block(sect);
+                    cursorHandle = getNextHandle();
+                }
+                remoteRequest.setown(new CRemoteRequest(cursorHandle, outputFormat, compressor, expander, outputActivity));
+
+                StringBuffer requestStr("jsonrequest:");
+                outputActivity->getInfoStr(requestStr);
+                Owned<StringAttrItem> name = new StringAttrItem(requestStr);
+
+                CriticalBlock block(sect);
+                client.previdx = client.openFiles.ordinality();
+                client.openFiles.append(OpenFileInfo(cursorHandle, remoteRequest, name));
+
+                remoteRequest->process(requestTree, rest, reply, stats);
+                return;
             }
+            case StreamCmd::CONTINUE:
+            {
+                ISpan* requestSpan = queryNullSpan();
+                if (fileInfo.remoteRequest)
+                    requestSpan = fileInfo.remoteRequest->queryRequestSpan();
+
+                if (0 == cursorHandle)
+                {
+                    IException* except = createDafsException(DAFSERR_cmdstream_protocol_failure, "cursor handle not supplied to 'continue' command");
+                    requestSpan->recordException(except);
+                    throw except;
+                }
+
+                if (lookupFileIOHandle(cursorHandle, fileInfo)) // known handle, continuation
+                {
+                    remoteRequest.set(fileInfo.remoteRequest);
+                    outputFormat = fileInfo.remoteRequest->queryFormat();
+
+                    try
+                    {
+                        remoteRequest->process(requestTree, rest, reply, stats);
+                    }
+                    catch (IException* e)
+                    {
+                        requestSpan->recordException(e);
+                        throw e;
+                    }
+
+                    return;
+                }
+                else
+                {
+                    requestSpan->recordError("Unable to find cursor handle");
+                }
+
+                cursorHandle = 0; // challenge response ..
+                break;
+            }
+            case StreamCmd::CLOSE:
+            {
+                OwnedActiveSpanScope closeSpan;
+                const char* traceParent = requestTree->queryProp("_trace/traceparent");
+                if (traceParent != nullptr)
+                {
+                    Owned<IProperties> traceHeaders = createProperties();
+                    traceHeaders->setProp("traceparent", traceParent);
+
+                    closeSpan.setown(queryTraceManager().createServerSpan("CloseRequest", traceHeaders));
+                }
+
+                if (0 == cursorHandle)
+                {
+                    IDAFS_Exception* exception = createDafsException(DAFSERR_cmdstream_protocol_failure, "cursor handle not supplied to 'close' command");
+                    if (closeSpan)
+                        closeSpan->recordException(exception);
+                    throw exception;
+                }
+
+                Owned<IFileIO> dummy;
+                checkFileIOHandle(cursorHandle, dummy, true);
+                break;
+            }
+            case StreamCmd::VERSION:
+            {
+                // handled in final response, see below
+                break;
+            }
+            default: // should not get here, see streamCmdMap lookup before switch statement
+                throwUnexpected();
+        }
+
+        Owned<IXmlWriterExt> responseWriter;
+        if (outFmt_Binary == outputFormat)
+            reply.append(cursorHandle);
+        else // outFmt_Xml || outFmt_Json
+        {
+            responseWriter.setown(createIXmlWriterExt(0, 0, nullptr, outFmt_Xml == outputFormat ? WTStandard : WTJSONObject));
+            responseWriter->outputBeginNested("Response", true);
+            if (outFmt_Xml == outputFormat)
+                responseWriter->outputCString("urn:hpcc:dfs", "@xmlns:dfs");
+            responseWriter->outputUInt(cursorHandle, sizeof(cursorHandle), "handle");
+        }
+        switch (cmd)
+        {
+            case StreamCmd::VERSION:
+            {
+                OwnedActiveSpanScope versionSpan;
+                const char* traceParent = requestTree->queryProp("_trace/traceparent");
+                if (traceParent != nullptr)
+                {
+                    Owned<IProperties> traceHeaders = createProperties();
+                    traceHeaders->setProp("traceparent", traceParent);
+
+                    versionSpan.setown(queryTraceManager().createServerSpan("VersionRequest", traceHeaders));
+                }
+
+                if (outFmt_Binary == outputFormat)
+                    reply.append(DAFILESRV_VERSIONSTRING);
+                else
+                    responseWriter->outputString(strlen(DAFILESRV_VERSIONSTRING), DAFILESRV_VERSIONSTRING, "version");
+                break;
+            }
+            default:
+                break;
+        }
+        if (outFmt_Binary != outputFormat)
+        {
+            responseWriter->outputEndNested("Response");
+            responseWriter->finalize();
+            reply.append(responseWriter->length(), responseWriter->str());
         }
     }
 
@@ -4882,6 +5260,33 @@ public:
         reply.append((unsigned)RFEnoerror);
     }
 
+    void cmdFtSlaveCmd(MemoryBuffer & msg, MemoryBuffer & reply, CRemoteClientHandler &client)
+    {
+        byte action;
+        msg.read(action);
+
+        MemoryBuffer results;
+        results.setEndian(__BIG_ENDIAN);
+        Owned<IException> exception;
+        bool ok=false;
+        try
+        {
+            // NB: will run continuously and write progress back to client.socket
+            ok = processFtCommand(action, client.socket, msg, results);
+        }
+        catch (IException *e)
+        {
+            EXCLOG(e);
+            exception.setown(e);
+        }
+        msg.clear().append(true).append(ok);
+        serializeException(exception, msg);
+        msg.append(results);
+        catchWriteBuffer(client.socket, msg);
+
+        LOG(MCdebugProgress, "Results sent from slave: %s", client.peerName.str());
+    }
+
     void formatException(MemoryBuffer &reply, IException *e, RemoteFileCommandType cmd, bool testSocketFlag, unsigned _dfsErrorCode, CRemoteClientHandler *client)
     {
         unsigned dfsErrorCode = _dfsErrorCode;
@@ -4932,6 +5337,7 @@ public:
             case RFCtreecopytmp:
             case RFCremove:
             case RFCcopysection:
+            case RFCFtSlaveCmd:
                 slowCmdThrottler.addCommand(cmd, msg, client);
                 return;
             case RFCcloseIO:
@@ -4982,17 +5388,43 @@ public:
     void checkAuthorizedStreamCommand(CRemoteClientHandler &client)
     {
         if (!rowServiceOnStdPort && !client.isRowServiceClient())
-            throw createDafsException(DAFSERR_cmdstream_unauthorized, "Unauthorized command");
+            throw createDafsException(DAFSERR_cmd_unauthorized, "Unauthorized command");
     }
 
-    bool processCommand(RemoteFileCommandType cmd, MemoryBuffer & msg, MemoryBuffer & reply, CRemoteClientHandler *client, CThrottler *throttler)
+    CommandRetFlags processCommand(RemoteFileCommandType cmd, MemoryBuffer & msg, MemoryBuffer & reply, CRemoteClientHandler *client, CThrottler *throttler)
     {
         Owned<CClientStats> stats = clientStatsTable.getClientReference(cmd, client->queryPeerName());
-        bool testSocketFlag = false;
+        CommandRetFlags retFlags = CommandRetFlags::none;
         unsigned posOfErr = reply.length();
         try
         {
-            switch(cmd)
+            FeatureSupport featureSupportCheck = featureSupport;
+
+            /* isRowServiceClient only set for bare-metal clients
+             * If set, only support streaming commands
+             */
+            if (client->isRowServiceClient())
+                featureSupportCheck = FeatureSupport::stream;
+
+            switch (cmd)
+            {
+                case RFCStreamGeneral:
+                case RFCStreamRead:
+                case RFCStreamReadJSON:
+                    if (!hasMask(featureSupportCheck, FeatureSupport::stream))
+                        throw createDafsException(DAFSERR_cmd_unauthorized, "Unauthorized command");
+                    break;
+                case RFCFtSlaveCmd:
+                    if (!hasMask(featureSupportCheck, FeatureSupport::spray))
+                        throw createDafsException(DAFSERR_cmd_unauthorized, "Unauthorized command");
+                    break;
+                default: // all other commands are considered 'directIO'
+                    if (!hasMask(featureSupportCheck, FeatureSupport::directIO))
+                        throw createDafsException(DAFSERR_cmd_unauthorized, "Unauthorized command");
+                    break;
+            }
+
+            switch (cmd)
             {
                 MAPCOMMANDSTATS(RFCread, cmdRead, *stats);
                 MAPCOMMANDSTATS(RFCwrite, cmdWrite, *stats);
@@ -5029,6 +5461,13 @@ public:
                 MAPCOMMANDCLIENTTHROTTLE(RFCtreecopytmp, cmdTreeCopyTmp, *client, &slowCmdThrottler);
                 MAPCOMMAND(RFCsetthrottle, cmdSetThrottle); // legacy version
                 MAPCOMMAND(RFCsetthrottle2, cmdSetThrottle2);
+                case RFCStreamReadTestSocket:
+                {
+                    retFlags |= CommandRetFlags::testSocket;
+                    checkAuthorizedStreamCommand(*client);
+                    cmdStreamReadTestSocket(msg, reply, *client, *stats);
+                    break;
+                }
                 // row service commands
                 case RFCStreamGeneral:
                 {
@@ -5049,11 +5488,14 @@ public:
                     cmdStreamReadJSON(msg, reply, *client, *stats);
                     break;
                 }
-                case RFCStreamReadTestSocket:
+                case RFCFtSlaveCmd:
                 {
-                    testSocketFlag = true;
-                    checkAuthorizedStreamCommand(*client);
-                    cmdStreamReadTestSocket(msg, reply, *client, *stats);
+                    reply.append((unsigned)RFEnoerror);
+                    sendDaFsBuffer(client->socket, reply, false);
+                    // NB: command replied to.
+                    // This command uses/takes over use of the socket for progress updates
+                    retFlags |= CommandRetFlags::replyHandled;
+                    cmdFtSlaveCmd(msg, reply, *client);
                     break;
                 }
             default:
@@ -5065,10 +5507,10 @@ public:
         {
             checkOutOfHandles(e);
             reply.setWritePos(posOfErr);
-            formatException(reply, e, cmd, testSocketFlag, 0, client);
+            formatException(reply, e, cmd, hasMask(retFlags, CommandRetFlags::testSocket), 0, client);
             e->Release();
         }
-        return testSocketFlag;
+        return retFlags;
     }
 
     IPooledThread *createCommandProcessor()
@@ -5082,13 +5524,15 @@ public:
             handleTracer.traceIfReady();
     }
 
-    virtual void run(DAFSConnectCfg _connectMethod, const SocketEndpoint &listenep, unsigned sslPort, const SocketEndpoint *rowServiceEp, bool _rowServiceSSL, bool _rowServiceOnStdPort) override
+    virtual void run(IPropertyTree *componentConfig, DAFSConnectCfg _connectMethod, const SocketEndpoint &listenep, unsigned sslPort, unsigned listenQueueLimit, const SocketEndpoint *rowServiceEp, bool _rowServiceSSL, bool _rowServiceOnStdPort) override
     {
         SocketEndpoint sslep(listenep);
+#ifndef _CONTAINERIZED
         if (sslPort)
             sslep.port = sslPort;
         else
             sslep.port = securitySettings.daFileSrvSSLPort;
+#endif
 
         Owned<ISocket> acceptSock, secureSock, rowServiceSock;
         if (_connectMethod != SSLOnly)
@@ -5097,20 +5541,20 @@ public:
                 throw createDafsException(DAFSERR_serverinit_failed, "dafilesrv port not specified");
 
             if (listenep.isNull())
-                acceptSock.setown(ISocket::create(listenep.port));
+                acceptSock.setown(ISocket::create(listenep.port, listenQueueLimit));
             else
             {
                 StringBuffer ips;
-                listenep.getIpText(ips);
-                acceptSock.setown(ISocket::create_ip(listenep.port,ips.str()));
+                listenep.getHostText(ips);
+                acceptSock.setown(ISocket::create_ip(listenep.port, ips.str(), listenQueueLimit));
             }
         }
 
-        if (_connectMethod == SSLOnly || _connectMethod == SSLFirst || _connectMethod == UnsecureFirst)
+        if (_connectMethod != SSLNone)
         {
             if (sslep.port == 0)
                 throw createDafsException(DAFSERR_serverinit_failed, "Secure dafilesrv port not specified");
-
+#ifndef _CONTAINERIZED
             if (_connectMethod == UnsecureFirst)
             {
                 // don't fail, but warn - this allows for fast SSL client rejections
@@ -5129,16 +5573,21 @@ public:
                     securitySettings.privateKey = nullptr;
                 }
             }
-            else
+            else if (!isContainerized() && getComponentConfigSP()->hasProp("cert"))
+            {
+                // validated when context is created in createSecureSocket
+            }
+            else // using environment.conf HPCCCertificateFile etc.
                 validateSSLSetup();
+#endif
 
             if (sslep.isNull())
-                secureSock.setown(ISocket::create(sslep.port));
+                secureSock.setown(ISocket::create(sslep.port, listenQueueLimit));
             else
             {
                 StringBuffer ips;
-                sslep.getIpText(ips);
-                secureSock.setown(ISocket::create_ip(sslep.port,ips.str()));
+                sslep.getHostText(ips);
+                secureSock.setown(ISocket::create_ip(sslep.port, ips.str(), listenQueueLimit));
             }
         }
 
@@ -5148,44 +5597,70 @@ public:
             rowServiceOnStdPort = _rowServiceOnStdPort;
 
             if (rowServiceEp->isNull())
-                rowServiceSock.setown(ISocket::create(rowServiceEp->port));
+                rowServiceSock.setown(ISocket::create(rowServiceEp->port, listenQueueLimit));
             else
             {
                 StringBuffer ips;
-                rowServiceEp->getIpText(ips);
-                rowServiceSock.setown(ISocket::create_ip(rowServiceEp->port, ips.str()));
+                rowServiceEp->getHostText(ips);
+                rowServiceSock.setown(ISocket::create_ip(rowServiceEp->port, ips.str(), listenQueueLimit));
             }
 
-#ifdef _USE_OPENSSL
+#ifndef _CONTAINERIZED
+# ifdef _USE_OPENSSL
             if (rowServiceSSL)
                 validateSSLSetup();
-#else
+# else
             rowServiceSSL = false;
+# endif
 #endif
         }
 
-        run(_connectMethod, acceptSock.getClear(), secureSock.getClear(), rowServiceSock.getClear());
+        run(componentConfig, _connectMethod, acceptSock.getClear(), secureSock.getClear(), rowServiceSock.getClear());
     }
 
-    virtual void run(DAFSConnectCfg _connectMethod, ISocket *_acceptSock, ISocket *_secureSock, ISocket *_rowServiceSock) override
+    virtual void run(IPropertyTree *_componentConfig, DAFSConnectCfg _connectMethod, ISocket *_acceptSock, ISocket *_secureSock, ISocket *_rowServiceSock) override
     {
         acceptsock.setown(_acceptSock);
         securesock.setown(_secureSock);
         rowServiceSock.setown(_rowServiceSock);
+        componentConfig.set(_componentConfig);
+#ifdef _CONTAINERIZED
+        if (componentConfig) // will be null in some scenarios (test cases)
+        {
+            // In K8s the application type determines what features this dafilesrv supports
+            const char *appType = componentConfig->queryProp("@application");
+            if (strsame("stream", appType))
+                featureSupport = FeatureSupport::stream;
+            else if (strsame("spray", appType))
+                featureSupport = FeatureSupport::spray;
+            else if (strsame("directio", appType))
+                featureSupport = FeatureSupport::directIO|FeatureSupport::stream;
+        }
+#endif
         if (_connectMethod != SSLOnly)
         {
             if (!acceptsock)
                 throw createDafsException(DAFSERR_serverinit_failed, "Invalid non-secure socket");
         }
 
-        if (_connectMethod == SSLOnly || _connectMethod == SSLFirst || _connectMethod == UnsecureFirst)
+        if (_connectMethod != SSLNone)
         {
             if (!securesock)
                 throw createDafsException(DAFSERR_serverinit_failed, "Invalid secure socket");
         }
 
+#ifdef _WIN32
+        if (componentConfig)
+        {
+            constexpr unsigned defaultRetryOpenMs = 5000;
+            retryOpenMs = componentConfig->getPropInt("@retryOpenMs", defaultRetryOpenMs);
+        }
+#endif
+
         selecthandler->start();
 
+        unsigned timeLastLog = 0;
+        unsigned numFailedConn = 0;
         Owned<IException> exception;
         for (;;)
         {
@@ -5270,6 +5745,7 @@ public:
                         if (!sockSSL||stopping)
                             break;
 
+#ifndef _CONTAINERIZED
                         if ( (_connectMethod == UnsecureFirst) && (!securitySettings.certificate || !securitySettings.privateKey) )
                         {
                             // for client secure_connect() to fail quickly ...
@@ -5278,11 +5754,21 @@ public:
                             securesockavail = false;
                         }
                         else
+#endif
                         {
-                            ssock.setown(createSecureSocket(sockSSL.getClear(), ServerSocket));
+                            // NB: if this is a dedicated stream service (e.g. in containerized mode)
+                            // disabled cert verification, because stream requests will authenticate via signed opaque blob
+                            bool disableClientCertVerification = (featureSupport == FeatureSupport::stream);
+
+                            ssock.setown(createSecureSocket(sockSSL.getLink(), disableClientCertVerification));
                             int status = ssock->secure_accept();
                             if (status < 0)
-                                throw createDafsException(DAFSERR_serveraccept_failed,"Failure to establish secure connection");
+                            {
+                                if (status == PORT_CHECK_SSL_ACCEPT_ERROR)
+                                    throw createDafsException(DAFSERR_serveraccept_fail_portcheck, "secure connection failure - port check");
+                                else
+                                    throw createDafsException(DAFSERR_serveraccept_failed, "Failure to establish secure connection");
+                            }
                             sockSSL.setown(ssock.getLink());
                         }
                     }
@@ -5292,7 +5778,10 @@ public:
                     }
                     if (exception)
                     {
-                        EXCLOG(exception, "CRemoteFileServer (secure)");
+                        if (exception->errorCode() != DAFSERR_serveraccept_fail_portcheck)
+                            EXCLOG(exception, "CRemoteFileServer (secure)");
+                        else
+                            reportFailedSecureAccepts("secure", exception, numFailedConn, timeLastLog);
                         cleanupDaFsSocket(sockSSL);
                         sockSSL.clear();
                         cleanupDaFsSocket(ssock);
@@ -5314,10 +5803,16 @@ public:
 
                         if (rowServiceSSL) // NB: will be disabled if !_USE_OPENSLL
                         {
-                            ssock.setown(createSecureSocket(acceptedRSSock.getClear(), ServerSocket));
+                            // disabled cert verification, because stream requests will authenticate via signed opaque blob
+                            ssock.setown(createSecureSocket(acceptedRSSock.getClear(), true));
                             int status = ssock->secure_accept();
                             if (status < 0)
-                                throw createDafsException(DAFSERR_serveraccept_failed,"Failure to establish SSL row service connection");
+                            {
+                                if (status == PORT_CHECK_SSL_ACCEPT_ERROR)
+                                    throw createDafsException(DAFSERR_serveraccept_fail_portcheck, "secure connection failure - port check");
+                                else
+                                    throw createDafsException(DAFSERR_serveraccept_failed, "Failure to establish SSL row service connection");
+                            }
                             acceptedRSSock.setown(ssock.getLink());
                         }
                     }
@@ -5327,7 +5822,10 @@ public:
                     }
                     if (exception)
                     {
-                        EXCLOG(exception, "CRemoteFileServer (row service)");
+                        if (exception->errorCode() != DAFSERR_serveraccept_fail_portcheck)
+                            EXCLOG(exception, "CRemoteFileServer (row service)");
+                        else
+                            reportFailedSecureAccepts("row service", exception, numFailedConn, timeLastLog);
                         cleanupDaFsSocket(acceptedRSSock);
                         acceptedRSSock.clear();
                         cleanupDaFsSocket(ssock);
@@ -5346,30 +5844,30 @@ public:
                 {
 #ifdef _DEBUG
                     sock->getPeerEndpoint(eps);
-                    eps.getUrlStr(peerURL);
+                    eps.getEndpointHostText(peerURL);
                     PROGLOG("Server accepting from %s", peerURL.str());
 #endif
-                    runClient(sock.getClear(), false);
+                    addClient(sock.getClear(), false, false);
                 }
 
                 if (securesockavail)
                 {
 #ifdef _DEBUG
                     sockSSL->getPeerEndpoint(eps);
-                    eps.getUrlStr(peerURL.clear());
+                    eps.getEndpointHostText(peerURL.clear());
                     PROGLOG("Server accepting SECURE from %s", peerURL.str());
 #endif
-                    runClient(sockSSL.getClear(), false);
+                    addClient(sockSSL.getClear(), true, false);
                 }
 
-                if (rowServiceSockAvail)
+                if (!isContainerized() && rowServiceSockAvail) // in contaierized each service is on a single dedicated port, the below 2 cases are for BM only
                 {
 #ifdef _DEBUG
                     acceptedRSSock->getPeerEndpoint(eps);
-                    eps.getUrlStr(peerURL.clear());
+                    eps.getEndpointHostText(peerURL.clear());
                     PROGLOG("Server accepting row service socket from %s", peerURL.str());
 #endif
-                    runClient(acceptedRSSock.getClear(), true);
+                    addClient(acceptedRSSock.getClear(), rowServiceSSL, true);
                 }
             }
             else
@@ -5386,20 +5884,22 @@ public:
         if (cmd != RFCgetver)
             cmd = RFCinvalid;
         MemoryBuffer reply;
-        bool testSocketFlag = processCommand(cmd, msg, initSendBuffer(reply), NULL, NULL);
-        sendDaFsBuffer(socket, reply, testSocketFlag);
+        CommandRetFlags cmdFlags = processCommand(cmd, msg, initSendBuffer(reply), NULL, NULL);
+
+        // some commands (i.e. RFCFtSlaveCmd), reply early, so should not reply again here.
+        if (!hasMask(cmdFlags, CommandRetFlags::replyHandled))
+            sendDaFsBuffer(socket, reply, hasMask(cmdFlags, CommandRetFlags::testSocket));
     }
 
-    void runClient(ISocket *sock, bool rowService) // rowService used to distinguish client calls
+    void addClient(ISocket *sock, bool secure, bool rowService) // rowService used to distinguish client calls
     {
-        cCommandProcessor::cCommandProcessorParams params;
-        params.client = new CRemoteClientHandler(this, sock, globallasttick, rowService);
+        Owned<CRemoteClientHandler> client = new CRemoteClientHandler(this, sock, globallasttick, rowService);
         {
             CriticalBlock block(sect);
-            clients.append(*LINK(params.client));
+            clients.append(*client.getLink());
         }
-        // NB: This could be blocked, by thread pool limit
-        threads->start(&params);
+        // JCSMORE - perhaps cap # added here... ?
+        selecthandler->add(sock, SELECTMODE_READ, client);
     }
 
     void stop()
@@ -5415,74 +5915,62 @@ public:
         threads->joinAll(true,60*1000);
     }
 
-    bool notify(CRemoteClientHandler *_client, MemoryBuffer &msg)
+    bool handleCompleteMessage(CRemoteClientHandler *client, MemoryBuffer &msg)
     {
-        Linked<CRemoteClientHandler> client;
-        client.set(_client);
         if (TF_TRACE_FULL)
-            PROGLOG("notify %d", msg.length());
-        if (msg.length())
-        {
-            if (TF_TRACE_FULL)
-                PROGLOG("notify CRemoteClientHandler(%p), msg length=%u", _client, msg.length());
-            cCommandProcessor::cCommandProcessorParams params;
-            params.client = client.getClear();
-            params.msg.swapWith(msg);
+            PROGLOG("notify CRemoteClientHandler(%p), msg length=%u", client, msg.length());
+        cCommandProcessor::cCommandProcessorParams params;
+        params.client = client; // NB: IPooledThread::init will link 'client' (called before this function exits)
+        params.msg.swapWith(msg);
 
-            /* This can block because the thread pool is full and therefore block the selecthandler
-             * This is akin to the main server blocking post accept() for the same reason.
-             */
-            threads->start(&params);
-        }
-        else
-            onCloseSocket(client,3);    // removes owned handles
+        /* NB: if it hits the thread pool limit, it will start throttling (introducing delays),
+         * whilst it is blocked/delaying here, the accept loop will not be listening for new
+         * connections.
+         */
+        threads->start(&params);
 
         return false;
     }
 
-    void addClient(CRemoteClientHandler *client)
-    {
-        if (client&&client->socket)
-            selecthandler->add(client->socket,SELECTMODE_READ,client);
-    }
-
     void checkTimeout()
     {
-        if (msTick()-clientcounttick>1000*60*60)
+        if (msTick() - clientcounttick > 1000 * 60 * 60)
         {
-            CriticalBlock block(ClientCountSect);
-            if (TF_TRACE_CLIENT_STATS && (ClientCount || MaxClientCount))
-                PROGLOG("Client count = %d, max = %d", ClientCount, MaxClientCount);
-            clientcounttick = msTick();
-            MaxClientCount = ClientCount;
+            {
+                CriticalBlock block(ClientCountSect);
+                if (TF_TRACE_CLIENT_STATS && (ClientCount || MaxClientCount))
+                    PROGLOG("Client count = %d, max = %d", ClientCount, MaxClientCount);
+                MaxClientCount = ClientCount;
+            }
             if (closedclients)
             {
                 if (TF_TRACE_CLIENT_STATS)
-                    PROGLOG("Closed client count = %d",closedclients);
+                    PROGLOG("Closed client count = %d", closedclients);
                 closedclients = 0;
             }
+            clientcounttick = msTick();
         }
         CriticalBlock block(sect);
-        ForEachItemInRev(i,clients)
+        ForEachItemInRev(i, clients)
         {
             CRemoteClientHandler &client = clients.item(i);
             if (client.timedOut())
             {
                 StringBuffer s;
-                bool ok = client.getInfo(s);    // will spot duff sockets
-                if (ok&&(client.openFiles.ordinality()!=0))
+                bool ok = client.getInfo(s); // will spot duff sockets
+                if (ok && (client.openFiles.ordinality() != 0))
                 {
                     if (TF_TRACE_CLIENT_CONN && client.inactiveTimedOut())
-                        WARNLOG("Inactive %s",s.str());
+                        WARNLOG("Inactive %s", s.str());
                 }
                 else
                 {
 #ifndef _DEBUG
                     if (TF_TRACE_CLIENT_CONN)
 #endif
-                        PROGLOG("Timing out %s",s.str());
+                        PROGLOG("Timing out %s", s.str());
                     closedclients++;
-                    onCloseSocket(&client,4);   // removes owned handles
+                    onCloseSocket(&client, 4); // removes owned handles
                 }
             }
         }
@@ -5519,7 +6007,7 @@ public:
 
     unsigned idleTime()
     {
-        unsigned t = (unsigned)atomic_read(&globallasttick);
+        unsigned t = globallasttick;
         return msTick()-t;
     }
 
@@ -5664,7 +6152,7 @@ protected:
 
         basePath.append("//");
         SocketEndpoint ep(serverPort);
-        ep.getUrlStr(basePath);
+        ep.getEndpointHostText(basePath);
 
         char cpath[_MAX_DIR];
         if (!GetCurrentDirectory(_MAX_DIR, cpath))
@@ -5681,9 +6169,9 @@ protected:
             Owned<CRemoteFileServer> server;
             Linked<ISocket> socket;
         public:
-            CServerThread(CRemoteFileServer *_server, ISocket *_socket) : server(_server), socket(_socket), threaded("CServerThread")
+            CServerThread(CRemoteFileServer *_server, ISocket *_socket) : threaded("CServerThread"), server(_server), socket(_socket)
             {
-                threaded.init(this);
+                threaded.init(this, false);
             }
             ~CServerThread()
             {
@@ -5693,7 +6181,7 @@ protected:
             virtual void threadmain() override
             {
                 DAFSConnectCfg sslCfg = SSLNone;
-                server->run(sslCfg, socket, nullptr, nullptr);
+                server->run(nullptr, sslCfg, socket, nullptr, nullptr);
             }
         };
         Owned<IRemoteFileServer> server = createRemoteFileServer();
@@ -5765,7 +6253,7 @@ protected:
         CPPUNIT_ASSERT(iFile->getCRC() == crc.get());
 
         // check appendFile functionality. NB after this "file1copy" should be 2*testLen
-        CPPUNIT_ASSERT(testLen == iFileIO->appendFile(iFile));
+        CPPUNIT_ASSERT(testLen == appendFile(iFileIO, iFile));
         iFileIO.clear();
 
         // validate new size
@@ -5876,11 +6364,11 @@ protected:
         {
             CThreaded threaded;
             StringAttr filePath;
-            Semaphore doneSem;
+            Semaphore doneSem{SYNC_LOCATION};
         public:
-            CDelayedFileCreate(const char *_filePath) : filePath(_filePath), threaded("CDelayedFileCreate")
+            CDelayedFileCreate(const char *_filePath) : threaded("CDelayedFileCreate"), filePath(_filePath)
             {
-                threaded.init(this);
+                threaded.init(this, false);
             }
             ~CDelayedFileCreate()
             {

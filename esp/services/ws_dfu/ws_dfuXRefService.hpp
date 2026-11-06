@@ -30,9 +30,9 @@ class CXRefExBuilderThread : public Thread
 {
     bool stopThread = false;
     bool xRefRunning = false;
-    CriticalSection critRunningStatus;
-    CriticalSection critQueue;
-    Semaphore m_sem;
+    CriticalSection critRunningStatus{SYNC_LOCATION};
+    CriticalSection critQueue{SYNC_LOCATION};
+    Semaphore m_sem{SYNC_LOCATION};
     SafeQueueOf<IXRefNode, false> nodeQueue;
     StringBuffer currentClusterName;
 
@@ -65,9 +65,7 @@ class CXRefExBuilderThread : public Thread
         nodeQueue.enqueue(LINK(xRefNode));
     }
 public:
-    IMPLEMENT_IINTERFACE;
-
-    CXRefExBuilderThread() { };
+    CXRefExBuilderThread() : Thread("CXRefExBuilderThread") { };
     ~CXRefExBuilderThread(){DBGLOG("Destroyed XRef thread");};
 
     virtual void queueRequest(IXRefNode* xRefNode, const char* cluster)
@@ -103,16 +101,22 @@ public:
                 if (!xRefNode)
                     break;
 
-                if (xRefNode->useSasha()) // if sasha processing just set submitted
+                bool useSasha = xRefNode->useSasha();
+
+                // MORE: Containerized should only be using saxref and dfuXRefLib should probably be removed
+                if (isContainerized())
+                    assertex(useSasha);
+                if (useSasha) // if sasha processing just set submitted
                     xRefNode->setStatus("Submitted");
                 else
                 {
                     setRunningStatus(true);
                     Owned<IPropertyTree> tree = runXRefCluster(currentClusterName.str(), xRefNode);
                     DBGLOG("finished run XRef for %s", currentClusterName.str());
-                    clearCurrentClusterName();
                     setRunningStatus(false);
                 }
+
+                clearCurrentClusterName();
             }
         }
         catch(IException* e)
@@ -176,7 +180,7 @@ public:
 
     virtual void getNavigationData(IEspContext &context, IPropertyTree & data)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
         {
             CHttpSoapBinding::getNavigationData(context, data);
             return;
@@ -189,6 +193,7 @@ class CWsDfuXRefEx : public CWsDFUXRef
 {
     Owned<IXRefNodeManager> XRefNodeManager;
     Owned<CXRefExBuilderThread> m_XRefbuilder;
+    MapStringToMyClass<ISmartSocketFactory> roxieConnMap;
 
     IXRefFilesNode* getFileNodeInterface(IXRefNode& XRefNode,const char* nodeType);
     void addXRefNode(const char* name, IPropertyTree* pXRefNodeTree);
@@ -197,8 +202,14 @@ class CWsDfuXRefEx : public CWsDFUXRef
     IXRefNode* getXRefNodeByCluster(const char* cluster);
     IUserDescriptor* getUserDescriptor(IEspContext& context);
     void updateSkew(IPropertyTree &node);
-    IDFAttributesIterator* getAllLogicalFilesInCluster(IEspContext &context, const char *cluster, bool &allMatchingFilesReceived);
+    IPropertyTreeIterator* getAllLogicalFilesInCluster(IEspContext &context, const char *cluster, bool &allMatchingFilesReceived);
     void findUnusedFilesWithDetailsInDFS(IEspContext &context, const char *process, const MapStringTo<bool> &usedFileMap, IArrayOf<IEspDFULogicalFile> &unusedFiles);
+    const char* formatResult(IEspContext& context, IPropertyTree* result, StringBuffer& formatedResult);
+    const char* formatResult(IEspContext& context, StringBuffer& result, StringBuffer& encodedResult);
+    void getRoxieFiles(const char *process, bool checkPackageMaps, MapStringTo<bool> &usedFileMap);
+    bool canRemoveLogicalFile(const char *logicalFile, IUserDescriptor *userDesc, bool removeFromSuperfiles, StringBuffer &errStr);
+    bool removeLogicalFileFromSuperfiles(const char *logicalFile, IDistributedSuperFileIterator *superOwners, StringBuffer &errStr);
+
 public:
    IMPLEMENT_IINTERFACE;
 

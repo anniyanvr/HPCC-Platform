@@ -1,120 +1,851 @@
 import * as React from "react";
-import { Routes } from "universal-router";
-import { initialize, parseSearch } from "./util/history";
+import { Route, RouterContext } from "universal-router";
+import { initialize, parsePage, parseSearch, parseSort, parseFullscreen, pushUrl, replaceUrl } from "./util/history";
+import nlsHPCC from "src/nlsHPCC";
 
-export interface ToDoProps {
+declare const dojoConfig;
+
+export type MainNav = "activities" | "workunits" | "files" | "queries" | "topology" | "operations";
+
+export interface RouteEx<R = any, C extends RouterContext = RouterContext> extends Route<R, C> {
+    mainNav: MainNav[];
 }
 
-const ToDo: React.FunctionComponent<ToDoProps> = () => {
-    return <h1>TODO</h1>;
-};
+type RoutesEx<R = any, C extends RouterContext = RouterContext> = Array<RouteEx<R, C>>;
 
-const routes: Routes = [
-    { path: "/", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="ActivityWidget" />) },
+function isCompareWuid(wuid: string): boolean {
+    return typeof wuid === "string" && wuid.indexOf(",") >= 0;
+}
+
+function splitCompareWuids(wuid: string): string[] {
+    return wuid.split(",").map(s => s.trim()).filter(s => s.length > 0);
+}
+
+function parseWorkunitTabState(tab: string, state: string) {
+    switch (tab) {
+        case "metrics":
+            {
+                const selection = state.split(",");
+                if (selection.length === 1) {
+                    return { [tab]: { lineageSelection: selection[0] } };
+                }
+                return { [tab]: { selection } };
+            }
+        case "logicalgraph":
+            return { [tab]: { selection: state.split(",") } };
+        case "eclsummary":
+            return { [tab]: state };
+        default:
+            return { [tab]: state };
+    }
+}
+
+function renderWorkunit(wuid: string, parentUrl: string, fullscreen: boolean, queryParams: object, tab?: string, state?: object) {
+    return import("./components/WorkunitDetails").then(_ => {
+        return <_.WorkunitDetails wuid={wuid} parentUrl={parentUrl} fullscreen={fullscreen} tab={tab} state={state} queryParams={queryParams} />;
+    });
+}
+
+function renderWorkunitCompare(wuid: string, parentUrl: string, fullscreen: boolean, queryParams: object, tab?: string, state?: object) {
+    return import("./components/WorkunitCompare").then(_ => {
+        return <_.WorkunitCompare wuids={splitCompareWuids(wuid)} parentUrl={parentUrl} fullscreen={fullscreen} tab={tab} state={state} queryParams={queryParams} />;
+    });
+}
+
+function redirectToCompare(params: Record<string, unknown>, search?: string): false {
+    const segments = [params.Wuid, params.Tab, params.State, params.State2, params.State3]
+        .filter(Boolean)
+        .join("/");
+    replaceUrl(`/compare/${segments}${search ?? ""}`);
+    return false;
+}
+
+function redirectToWorkunits(params: Record<string, unknown>, search?: string): false {
+    const segments = [params.Wuid, params.Tab, params.State, params.State2, params.State3]
+        .filter(Boolean)
+        .join("/");
+    replaceUrl(`/workunits/${segments}${search ?? ""}`);
+    return false;
+}
+
+function redirectToWUSummary(search?: string): false {
+    replaceUrl(`/workunits/errors${search ?? ""}`);
+    return false;
+}
+
+const workunitsChildren: Route[] = [
     {
+        path: "", action: (ctx) => import("./components/Workunits").then(_ => {
+            return <_.Workunits filter={parseSearch(ctx.search) as any} sort={parseSort(ctx.search)} page={parsePage(ctx.search)} />;
+        })
+    },
+    {
+        path: "/dashboard", action: (ctx) => import("./components/WorkunitsDashboard").then(_ => {
+            return <_.WorkunitsDashboard filterProps={parseSearch(ctx.search) as any} />;
+        })
+    },
+    {
+        path: "/:Wuid", action: (ctx, params) => {
+            const wuid = params.Wuid as string;
+            if (isCompareWuid(wuid)) {
+                return redirectToCompare(params, ctx.search);
+            }
+            return renderWorkunit(wuid, params.parentUrl as string, parseFullscreen(ctx.search), { summary: parseSearch(ctx.search) as any });
+        }
+    },
+    {
+        path: "/:Wuid/:Tab", action: (ctx, params) => {
+            const wuid = params.Wuid as string;
+            if (isCompareWuid(wuid)) {
+                return redirectToCompare(params, ctx.search);
+            }
+            return renderWorkunit(wuid, params.parentUrl as string, parseFullscreen(ctx.search), { [params.Tab as string]: parseSearch(ctx.search) as any }, params.Tab as string);
+        }
+    },
+    {
+        path: "/:Wuid/:Tab/:State", action: (ctx, params) => {
+            const wuid = params.Wuid as string;
+            if (isCompareWuid(wuid)) {
+                return redirectToCompare(params, ctx.search);
+            }
+            const state = parseWorkunitTabState(params.Tab as string, params.State as string);
+            return renderWorkunit(wuid, params.parentUrl as string, parseFullscreen(ctx.search), { [params.Tab as string]: parseSearch(ctx.search) as any }, params.Tab as string, state);
+        }
+    },
+    {
+        path: "/:Wuid/:Tab/:State/:State2", action: (ctx, params) => {
+            const wuid = params.Wuid as string;
+            if (isCompareWuid(wuid)) {
+                return redirectToCompare(params, ctx.search);
+            }
+            const state = { [params.Tab as string]: { lineageSelection: params.State, selection: (params.State2 as string).split(",") } };
+            return renderWorkunit(wuid, params.parentUrl as string, parseFullscreen(ctx.search), { [params.Tab as string]: parseSearch(ctx.search) as any }, params.Tab as string, state);
+        }
+    },
+    {
+        path: "/:Wuid/:Tab/:State/:State2/:State3", action: (ctx, params) => {
+            const wuid = params.Wuid as string;
+            if (isCompareWuid(wuid)) {
+                return redirectToCompare(params, ctx.search);
+            }
+            const state = { [params.Tab as string]: { view: params.State, lineageSelection: params.State2, selection: (params.State3 as string).split(",") } };
+            return renderWorkunit(wuid, params.parentUrl as string, parseFullscreen(ctx.search), { [params.Tab as string]: parseSearch(ctx.search) as any }, params.Tab as string, state);
+        }
+    },
+];
+
+const compareWorkunitsChildren: Route[] = [
+    {
+        path: "", action: () => import("./components/WorkunitCompare").then(_ => {
+            return <_.WorkunitCompare wuids={[]} parentUrl="/compare" />;
+        })
+    },
+    {
+        path: "/:Wuid", action: (ctx, params) => {
+            if (!isCompareWuid(params.Wuid as string)) {
+                return redirectToWorkunits(params, ctx.search);
+            }
+            return renderWorkunitCompare(params.Wuid as string, "/compare", parseFullscreen(ctx.search), { summary: parseSearch(ctx.search) as any });
+        }
+    },
+    {
+        path: "/:Wuid/:Tab", action: (ctx, params) => {
+            if (!isCompareWuid(params.Wuid as string)) {
+                return redirectToWorkunits(params, ctx.search);
+            }
+            return renderWorkunitCompare(params.Wuid as string, "/compare", parseFullscreen(ctx.search), { [params.Tab as string]: parseSearch(ctx.search) as any }, params.Tab as string);
+        }
+    },
+    {
+        path: "/:Wuid/:Tab/:State", action: (ctx, params) => {
+            if (!isCompareWuid(params.Wuid as string)) {
+                return redirectToWorkunits(params, ctx.search);
+            }
+            const state = parseWorkunitTabState(params.Tab as string, params.State as string);
+            return renderWorkunitCompare(params.Wuid as string, "/compare", parseFullscreen(ctx.search), { [params.Tab as string]: parseSearch(ctx.search) as any }, params.Tab as string, state);
+        }
+    },
+    {
+        path: "/:Wuid/:Tab/:State/:State2", action: (ctx, params) => {
+            if (!isCompareWuid(params.Wuid as string)) {
+                return redirectToWorkunits(params, ctx.search);
+            }
+            const state = { [params.Tab as string]: { lineageSelection: params.State, selection: (params.State2 as string).split(",") } };
+            return renderWorkunitCompare(params.Wuid as string, "/compare", parseFullscreen(ctx.search), { [params.Tab as string]: parseSearch(ctx.search) as any }, params.Tab as string, state);
+        }
+    },
+    {
+        path: "/:Wuid/:Tab/:State/:State2/:State3", action: (ctx, params) => {
+            if (!isCompareWuid(params.Wuid as string)) {
+                return redirectToWorkunits(params, ctx.search);
+            }
+            const state = { [params.Tab as string]: { view: params.State, lineageSelection: params.State2, selection: (params.State3 as string).split(",") } };
+            return renderWorkunitCompare(params.Wuid as string, "/compare", parseFullscreen(ctx.search), { [params.Tab as string]: parseSearch(ctx.search) as any }, params.Tab as string, state);
+        }
+    },
+];
+
+export const routes: RoutesEx = [
+    {
+        mainNav: [],
         name: "login",
         path: "/login",
-        children: [
-            { path: "", action: (context) => <ToDo /> }
-        ]
+        action: (ctx) => import("./components/forms/Login").then(_ => <_.Login />)
+    },
+    {
+        mainNav: [],
+        name: "reset",
+        path: "/reset",
+        action: (ctx) => import("./components/Reset").then(_ => <_.ResetDialog />)
     },
     //  Main  ---
     {
-        name: "activities",
+        mainNav: ["activities"],
+        path: "",
+        action: (context) => pushUrl("/activities")
+    },
+    {
+        mainNav: ["activities"],
         path: "/activities",
         children: [
-            { path: "", action: (context) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="ActivityWidget" />) }
+            { path: "", action: (context) => import("./components/ActivitiesCards").then(_ => <_.Activities />) },
         ]
-    },
-    {
-        name: "clusters",
-        path: "/clusters",
+    }, {
+        mainNav: ["activities"],
+        path: "/activities-legacy",
         children: [
-            { path: "/:ClusterName", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="TpClusterInfoWidget" params={params} />) }
+            { path: "", action: (context) => import("./components/Activities").then(_ => <_.Activities />) },
         ]
     },
     {
+        mainNav: ["activities"],
         name: "events",
         path: "/events",
         children: [
-            { path: "", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="EventScheduleWorkunitWidget" />) },
-            { path: "/:Event", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="WUDetailsWidget" params={params} />) }
+            { path: "", action: (ctx) => import("./components/EventScheduler").then(_ => <_.EventScheduler filter={parseSearch(ctx.search) as any} sort={parseSort(ctx.search)} page={parsePage(ctx.search)} />) },
         ]
     },
     {
+        mainNav: [],
         name: "search",
         path: "/search",
         children: [
             { path: "", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="SearchResultsWidget" />) },
-            { path: "/:Wuid(W\\d\\d\\d\\d\\d\\d\\d\\d-\\d\\d\\d\\d\\d\\d(?:-\\d+)?)", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="WUDetailsWidget" params={params} />) },
-            { path: "/:Wuid(D\\d\\d\\d\\d\\d\\d\\d\\d-\\d\\d\\d\\d\\d\\d(?:-\\d+)?)", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="DFUWUDetailsWidget" params={params} />) },
-            { path: "/:searchText", action: (ctx, { searchText }) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="SearchResultsWidget" />) }
+            { path: "/:Wuid(W\\d\\d\\d\\d\\d\\d\\d\\d-\\d\\d\\d\\d\\d\\d(?:-\\d+)?)", action: (ctx, params) => { replaceUrl(`/workunits/${params.Wuid}`); return false; } },
+            { path: "/:Wuid(D\\d\\d\\d\\d\\d\\d\\d\\d-\\d\\d\\d\\d\\d\\d(?:-\\d+)?)", action: (ctx, params) => { replaceUrl(`/dfuworkunits/${params.Wuid}`); return false; } },
+            { path: "/:searchText", action: (ctx, { searchText }) => import("./components/Search").then(_ => <_.Search searchText={searchText as string} />) }
         ]
     },
     //  ECL  ---
     {
+        mainNav: ["workunits"],
+        path: "/workunits/wu-summary", action: (ctx) => redirectToWUSummary(ctx.search)
+    },
+    {
+        mainNav: ["workunits"],
+        path: "/workunits/errors", action: (ctx) => import("./components/WUSSummary").then(_ => {
+            const filter = parseSearch(ctx.search) as any;
+            return <_.WUSSummary from={filter?.from} to={filter?.to} filter={String(filter?.filter ?? "")} />;
+        })
+    },
+    {
+        mainNav: ["workunits"],
         path: "/workunits",
+        children: workunitsChildren
+    },
+    {
+        mainNav: ["workunits"],
+        path: "/workunits!:context",
+        action: (ctx, params) => {
+            params.parentUrl = `/workunits!${params.context}`;
+        },
+        children: workunitsChildren
+    },
+    {
+        mainNav: ["workunits"],
+        path: ["/play", "/playground"],
         children: [
-            { path: "", action: (context) => import("./components/Workunits").then(_ => <_.Workunits filter={parseSearch(context.search) as any} />) },
-            { path: "/legacy", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="WUQueryWidget" />) },
-            { path: "/:Wuid", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="WUDetailsWidget" params={params} />) }
+            {
+                path: "", action: (ctx, params) => import("./components/ECLPlayground").then(_ => {
+                    return <_.ECLPlayground ecl={parseSearch(ctx.search)?.ecl as string} />;
+                })
+            },
+            {
+                path: "/:Wuid", action: (ctx, params) => import("./components/ECLPlayground").then(_ => {
+                    return <_.ECLPlayground wuid={params.Wuid as string} filter={parseSearch(ctx.search) as any} />;
+                })
+            },
         ]
     },
-    { path: "/play", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="ECLPlaygroundWidget" />) },
-    { path: "/playground", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="ECLPlaygroundWidget" />) },
+    {
+        mainNav: ["workunits"],
+        path: "/compare",
+        children: compareWorkunitsChildren
+    },
     //  Files  ---
     {
+        mainNav: ["files"],
         path: "/files",
         children: [
-            { path: "", action: (context) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="DFUQueryWidget" />) },
-            { path: "/legacy", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="DFUQueryWidget" />) },
-            { path: "/:Name", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="LFDetailsWidget" params={params} />) }
+            {
+                path: "", action: (ctx) => import("./components/Files").then(_ => {
+                    let filter = parseSearch(ctx.search);
+                    if (Object.keys(filter).length === 0) {
+                        filter = { LogicalFiles: true, SuperFiles: true, Indexes: true };
+                    }
+                    return <_.Files filter={filter as any} sort={parseSort(ctx.search)} page={parsePage(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:Name", action: (ctx, params) => import("./components/FileDetails").then(_ => {
+                    return <_.FileDetails cluster={undefined} logicalFile={params.Name as string} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:NodeGroup/:Name", action: (ctx, params) => import("./components/FileDetails").then(_ => {
+                    return <_.FileDetails cluster={params.NodeGroup as string} logicalFile={params.Name as string} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:NodeGroup/:Name/:Tab", action: (ctx, params) => import("./components/FileDetails").then(_ => {
+                    return <_.FileDetails cluster={params.NodeGroup as string} logicalFile={params.Name as string} tab={params.Tab as string} sort={{ [params.Tab as string]: parseSort(ctx.search) }} queryParams={{ [params.Tab as string]: parseSearch(ctx.search) as any }} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
         ]
     },
-    { path: "/landingzone", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="LZBrowseWidget" />) },
     {
+        mainNav: ["files"],
+        path: "/scopes",
+        children: [
+            {
+                path: "", action: (ctx) => import("./components/Scopes").then(_ => {
+                    return <_.Scopes filter={parseSearch(ctx.search) as any} scope={"."} />;
+                })
+            },
+            {
+                path: "/:Scope", action: (ctx, params) => import("./components/Scopes").then(_ => {
+                    return <_.Scopes filter={parseSearch(ctx.search) as any} scope={params.Scope as string} />;
+                })
+            },
+        ]
+    },
+    {
+        mainNav: ["files"],
+        path: "/landingzone",
+        children: [
+            {
+                path: "", action: (ctx) => import("./components/LandingZone").then(_ => {
+                    return <_.LandingZone filter={parseSearch(ctx.search) as any} />;
+                })
+            },
+            {
+                path: "/preview/:logicalFile", action: (ctx, params) => import("./components/HexView").then(_ => {
+                    return <_.HexView logicalFile={params.logicalFile as string} />;
+                })
+            },
+        ],
+    },
+    {
+        mainNav: ["files"],
         path: "/dfuworkunits",
         children: [
-            { path: "", action: (context) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="GetDFUWorkunitsWidget" />) },
-            { path: "/legacy", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="GetDFUWorkunitsWidget" />) },
-            { path: "/:Wuid", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="DFUWUDetailsWidget" params={params} />) }
+            {
+                path: "", action: (ctx) => import("./components/DFUWorkunits").then(_ => {
+                    return <_.DFUWorkunits filter={parseSearch(ctx.search)} sort={parseSort(ctx.search)} page={parsePage(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:Wuid", action: (ctx, params) => import("./components/DFUWorkunitDetails").then(_ => {
+                    return <_.DFUWorkunitDetails wuid={params.Wuid as string} />;
+                })
+            },
+            {
+                path: "/:Wuid/:Tab", action: (ctx, params) => import("./components/DFUWorkunitDetails").then(_ => {
+                    return <_.DFUWorkunitDetails wuid={params.Wuid as string} tab={params.Tab as string} />;
+                })
+            }
         ]
     },
     {
+        mainNav: ["files"],
         path: "/xref",
         children: [
-            { path: "", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="XrefQueryWidget" />) },
-            { path: "/:XrefTarget", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="XrefDetailsWidget" params={params} />) }
+            { path: "", action: () => import("./components/Xrefs").then(_ => <_.Xrefs />) },
+            {
+                path: "/:Name", action: (ctx, params) => import("./components/XrefDetails").then(_ => {
+                    return <_.XrefDetails name={params.Name as string} />;
+                })
+            },
+            {
+                path: "/:Name/:Tab", action: (ctx, params) => import("./components/XrefDetails").then(_ => {
+                    return <_.XrefDetails name={params.Name as string} tab={params.Tab as string} />;
+                })
+            }
         ]
     },
     //  Roxie  ---
     {
+        mainNav: ["queries"],
         path: "/queries",
         children: [
-            { path: "", action: (context) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="QuerySetQueryWidget" />) },
-            { path: "/legacy", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="QuerySetQueryWidget" />) },
-            { path: "/:QuerySetId/:Id", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="QuerySetDetailsWidget" params={params} />) }
+            {
+                path: "", action: (ctx) => import("./components/Queries").then(_ => {
+                    return <_.Queries filter={parseSearch(ctx.search) as any} sort={parseSort(ctx.search)} page={parsePage(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:QuerySetId/:Id", action: (ctx, params) => import("./components/QueryDetails").then(_ => {
+                    return <_.QueryDetails querySet={params.QuerySetId as string} queryId={params.Id as string} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:QuerySetId/:Id/:Tab", action: (ctx, params) => import("./components/QueryDetails").then(_ => {
+                    return <_.QueryDetails querySet={params.QuerySetId as string} queryId={params.Id as string} tab={params.Tab as string} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:QuerySetId/:Id/metrics/:MetricsTab", action: (ctx, params) => import("./components/QueryDetails").then(_ => {
+                    return <_.QueryDetails querySet={params.QuerySetId as string} queryId={params.Id as string} tab="metrics" state={{ metricsTab: params.MetricsTab as string }} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:QuerySetId/:Id/metrics/:MetricsTab/:View", action: (ctx, params) => import("./components/QueryDetails").then(_ => {
+                    return <_.QueryDetails querySet={params.QuerySetId as string} queryId={params.Id as string} tab="metrics" state={{ metricsTab: params.MetricsTab as string }} queryParams={{ view: params.View as string }} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:QuerySetId/:Id/metrics/:MetricsTab/:View/:Selection", action: (ctx, params) => import("./components/QueryDetails").then(_ => {
+                    return <_.QueryDetails querySet={params.QuerySetId as string} queryId={params.Id as string} tab="metrics" state={{ metricsTab: params.MetricsTab as string }} queryParams={{ view: params.View as string, metricsSelection: params.Selection as string }} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:QuerySetId/:Id/metrics/:MetricsTab/:View/:Lineage/:Selection", action: (ctx, params) => import("./components/QueryDetails").then(_ => {
+                    return <_.QueryDetails querySet={params.QuerySetId as string} queryId={params.Id as string} tab="metrics" state={{ metricsTab: params.MetricsTab as string }} queryParams={{ view: params.View as string, lineageSelection: params.Lineage as string, metricsSelection: params.Selection as string }} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
+            {
+                path: "/:QuerySetId/:QueryId/graphs/:Wuid/:GraphName", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => {
+                    return <_.DojoAdapter widgetClassID="GraphTree7Widget" params={params} />;
+                })
+            },
+            {
+                path: "/:QuerySetId/:Id/testPages/:Tab", action: (ctx, params) => import("./components/QueryDetails").then(_ => {
+                    return <_.QueryDetails querySet={params.QuerySetId as string} queryId={params.Id as string} tab="testPages" state={{ testTab: params.Tab as string }} queryParams={{ [params.Tab as string]: parseSearch(ctx.search) as any }} fullscreen={parseFullscreen(ctx.search)} />;
+                })
+            },
         ]
     },
-    { path: "/packagemaps", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="PackageMapQueryWidget" />) },
-    //  Ops  ---
-    { path: "/topology", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="TopologyWidget" />) },
-    { path: "/diskusage", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="DiskUsageWidget" />) },
-    { path: "/clusters2", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="TargetClustersQueryWidget" />) },
-    { path: "/processes", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="ClusterProcessesQueryWidget" />) },
-    { path: "/servers", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="SystemServersQueryWidget" />) },
     {
-        path: "/security",
+        mainNav: ["queries"],
+        path: "/packagemaps",
         children: [
-            { path: "", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="UserQueryWidget" />) },
-            { path: "/:Users", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="UserDetailsWidget" params={params} />) }
+            {
+                path: "", action: (ctx, params) => import("./components/PackageMaps").then(_ => {
+                    return <_.PackageMaps filter={parseSearch(ctx.search) as any} />;
+                })
+            },
+            {
+                path: "/validate/:Tab", action: (ctx, params) => import("./components/PackageMaps").then(_ => {
+                    return <_.PackageMaps filter={parseSearch(ctx.search) as any} tab={params.Tab as string} />;
+                })
+            },
+            {
+                path: "/:Name", action: (ctx, params) => import("./components/PackageMapDetails").then(_ => {
+                    return <_.PackageMapDetails name={params.Name as string} />;
+                })
+            },
+            {
+                path: "/:Name/:Tab", action: (ctx, params) => import("./components/PackageMapDetails").then(_ => {
+                    return <_.PackageMapDetails name={params.Name as string} tab={params.Tab as string} />;
+                })
+            },
+            {
+                path: "/:Name/parts/:Part", action: (ctx, params) => import("./components/PackageMapPartDetails").then(_ => {
+                    return <_.PackageMapPartDetails name={params.Name as string} part={params.Part as string} />;
+                })
+            },
+
         ]
     },
-    { path: "/monitoring", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="MonitoringWidget" />) },
-    { path: "/esdl", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="DynamicESDLQueryWidget" />) },
-    { path: "/elk", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="IFrameWidget&src=http%3A%2F%2F10.240.61.210%3A5601%2Fapp%2Fkibana%23%2Fdashboard%2FMetricbeat-system-overview-ecs%3F_g%3D(refreshInterval%253A(pause%253A!t%252Cvalue%253A300000)%252Ctime%253A(from%253Anow%252Fd%252Cto%253Anow%252Fd))&__filter=isTrusted%3Dfalse%26screenX%3D0%26screenY%3D0%26clientX%3D0%26clientY%3D0%26ctrlKey%3Dfalse%26shiftKey%3Dfalse%26altKey%3Dfalse%26metaKey%3Dfalse%26button%3D0%26buttons%3D0%26pageX%3D0%26pageY%3D0%26x%3D0%26y%3D0%26offsetX%3D0%26offsetY%3D0%26movementX%3D0%26movementY%3D0%26toElement%3D%255Bobject%2520HTMLInputElement%255D%26layerX%3D-1280%26layerY%3D9994%26getModifierState%3Dfunction%2520getModifierState()%2520%257B%2520%255Bnative%2520code%255D%2520%257D%26initMouseEvent%3Dfunction%2520initMouseEvent()%2520%257B%2520%255Bnative%2520code%255D%2520%257D%26view%3D%255Bobject%2520Window%255D%26detail%3D0%26which%3D1%26initUIEvent%3Dfunction%2520initUIEvent()%2520%257B%2520%255Bnative%2520code%255D%2520%257D%26NONE%3D0%26CAPTURING_PHASE%3D1%26AT_TARGET%3D2%26BUBBLING_PHASE%3D3%26type%3Dclick%26target%3D%255Bobject%2520HTMLInputElement%255D%26currentTarget%3D%255Bobject%2520HTMLInputElement%255D%26eventPhase%3D2%26bubbles%3Dtrue%26cancelable%3Dtrue%26defaultPrevented%3Dfalse%26composed%3Dtrue%26timeStamp%3D265185.10500000045%26srcElement%3D%255Bobject%2520HTMLInputElement%255D%26returnValue%3Dtrue%26cancelBubble%3Dfalse%26path%3D%255Bobject%2520HTMLInputElement%255D%26path%3D%255Bobject%2520HTMLSpanElement%255D%26path%3D%255Bobject%2520HTMLDivElement%255D%26path%3D%255Bobject%2520HTMLDivElement%255D%26path%3D%255Bobject%2520HTMLDivElement%255D%26path%3D%255Bobject%2520HTMLBodyElement%255D%26path%3D%255Bobject%2520HTMLHtmlElement%255D%26path%3D%255Bobject%2520HTMLDocument%255D%26path%3D%255Bobject%2520Window%255D%26composedPath%3Dfunction%2520composedPath()%2520%257B%2520%255Bnative%2520code%255D%2520%257D%26stopPropagation%3Dfunction%2520stopPropagation()%2520%257B%2520%255Bnative%2520code%255D%2520%257D%26stopImmediatePropagation%3Dfunction%2520stopImmediatePropagation()%2520%257B%2520%255Bnative%2520code%255D%2520%257D%26preventDefault%3Dfunction%2520preventDefault()%2520%257B%2520%255Bnative%2520code%255D%2520%257D%26initEvent%3Dfunction%2520initEvent()%2520%257B%2520%255Bnative%2520code%255D%2520%257D" />) },
+    //  Ops  ---
+    {
+        mainNav: ["topology"],
+        path: "/topology",
+        children: [
+            {
+                path: "", action: (ctx, params) => import("./components/Configuration").then(_ => {
+                    return <_.Configuration />;
+                })
+            },
+            {
+                path: "/configuration", action: (ctx, params) => import("./components/Configuration").then(_ => {
+                    return <_.Configuration />;
+                })
+            },
+            {
+                path: "/pods", action: (ctx, params) => import("./components/Pods").then(_ => {
+                    return <_.Pods />;
+                })
+            },
+            {
+                path: "/pods-json", action: (ctx, params) => import("./components/Pods").then(_ => {
+                    return <_.PodsJSON />;
+                })
+            },
+            {
+                path: "/services", action: (ctx, params) => import("./components/Services").then(_ => {
+                    return <_.Services />;
+                })
+            },
+            {
+                path: "/logs", action: (ctx) => import("./components/Logs").then(_ => {
+                    let filter = parseSearch(ctx.search) as any;
+                    filter = Object.keys(filter).length < 1 ? _.defaultFilter : filter;
+                    return <_.Logs filter={filter} />;
+                })
+            },
+            {
+                path: "/wu-summary", action: (ctx) => redirectToWUSummary(ctx.search)
+            },
+            {
+                path: "/global-stats", action: (ctx) => import("./components/GlobalMetrics").then(_ => {
+                    const filter = parseSearch(ctx.search) as any;
+                    return <_.GlobalMetrics from={filter?.from} to={filter?.to} />;
+                })
+            },
+            {
+                path: "/security",
+                action: () => { if (!dojoConfig.isAdmin) { replaceUrl("/topology"); return false; } },
+                children: [
+                    {
+                        path: "", action: (ctx, params) => import("./components/Security").then(_ => {
+                            return <_.Security filter={parseSearch(ctx.search) as any} page={parsePage(ctx.search)} />;
+                        })
+                    },
+                    {
+                        path: "/:Tab", action: (ctx, params) => import("./components/Security").then(_ => {
+                            return <_.Security filter={parseSearch(ctx.search) as any} tab={params.Tab as string} page={parsePage(ctx.search)} />;
+                        })
+                    },
+                    {
+                        path: "/users/:username", action: (ctx, params) => import("./components/UserDetails").then(_ => {
+                            return <_.UserDetails username={params.username as string} />;
+                        })
+                    },
+                    {
+                        path: "/users/:username/:Tab", action: (ctx, params) => import("./components/UserDetails").then(_ => {
+                            return <_.UserDetails username={params.username as string} tab={params.Tab as string} />;
+                        })
+                    },
+                    {
+                        path: "/groups/:name", action: (ctx, params) => import("./components/GroupDetails").then(_ => {
+                            return <_.GroupDetails name={params.name as string} />;
+                        })
+                    },
+                    {
+                        path: "/groups/:name/:Tab", action: (ctx, params) => import("./components/GroupDetails").then(_ => {
+                            return <_.GroupDetails name={params.name as string} tab={params.Tab as string} />;
+                        })
+                    },
+                    {
+                        path: "/permissions/:Name/:BaseDn", action: (ctx, params) => import("./components/Security").then(_ => {
+                            return <_.Security tab="permissions" name={params.Name as string} baseDn={params.BaseDn as string} />;
+                        })
+                    },
+                ]
+            },
+            {
+                path: "/desdl",
+                children: [
+                    {
+                        path: "", action: (ctx, params) => import("./components/DynamicESDL").then(_ => {
+                            return <_.DynamicESDL />;
+                        })
+                    },
+                    {
+                        path: "/:Tab", action: (ctx, params) => import("./components/DynamicESDL").then(_ => {
+                            return <_.DynamicESDL tab={params.Tab as string} />;
+                        })
+                    },
+                    {
+                        path: "/bindings/:Name", action: (ctx, params) => import("./components/DESDLBindingDetails").then(_ => {
+                            return <_.DESDLBindingDetails name={params.Name as string} />;
+                        })
+                    },
+                    {
+                        path: "/bindings/:Name/:Tab", action: (ctx, params) => import("./components/DESDLBindingDetails").then(_ => {
+                            return <_.DESDLBindingDetails name={params.Name as string} tab={params.Tab as string} />;
+                        })
+                    },
+                ]
+            },
+            {
+                path: "/daliadmin",
+                children: [
+                    {
+                        path: "", action: (ctx, params) => import("./components/DaliAdmin").then(_ => {
+                            return <_.DaliAdmin />;
+                        })
+                    },
+                    {
+                        path: "/:Tab", action: (ctx, params) => import("./components/DaliAdmin").then(_ => {
+                            return <_.DaliAdmin tab={params.Tab as string} />;
+                        })
+                    },
+                ]
+            },
+            {
+                path: "/sasha",
+                children: [
+                    {
+                        path: "", action: (ctx, params) => import("./components/Sasha").then(_ => {
+                            return <_.Sasha />;
+                        })
+                    },
+                ]
+            },
+        ]
+    },
+    {
+        mainNav: ["operations"],
+        path: "/operations",
+        children: [
+            { path: "", action: () => { replaceUrl("/operations/topology/clusters"); return false; } },
+            {
+                path: "/topology",
+                children: [
+                    {
+                        path: "", action: (ctx) => import("./components/Topology").then(_ => {
+                            return <_.Topology />;
+                        }),
+                    },
+                    {
+                        path: "/:Tab", action: (ctx, params) => import("./components/Topology").then(_ => {
+                            return <_.Topology tab={params.Tab as string} />;
+                        })
+                    },
+                    {
+                        path: "/:Tab/:Node", action: (ctx, params) => import("./components/Topology").then(_ => {
+                            return <_.Topology tab={params.Tab as string} node={params.Node as string} />;
+                        })
+                    },
+                    {
+                        path: "/:Tab/:Node/preflight", action: (ctx, params) => import("./components/Topology").then(_ => {
+                            return <_.Topology tab={params.Tab as string} node={params.Node as string} preflightDrawerParams={parseSearch(ctx.search) as any} />;
+                        })
+                    },
+                    {
+                        path: "/:Tab/:Node/:DetailTab", action: (ctx, params) => import("./components/Topology").then(_ => {
+                            return <_.Topology tab={params.Tab as string} node={params.Node as string} detailTab={params.DetailTab as string} />;
+                        })
+                    }
+                ]
+            },
+            {
+                path: "/diskusage", action: (ctx) => import("./components/DiskUsage").then(_ => {
+                    return <_.DiskUsage filter={parseSearch(ctx.search) as any} />;
+                })
+            },
+            {
+                path: "/clusters",
+                children: [
+                    {
+                        path: "", action: (ctx) => import("./components/controls/TargetClustersQueryTable").then(_ => {
+                            return <_.TargetClustersQueryTable />;
+                        })
+                    },
+                    {
+                        path: "/preflight", action: (ctx) => import("./components/controls/TargetClustersQueryTable").then(_ => {
+                            return <_.TargetClustersQueryTable preflightDrawerParams={parseSearch(ctx.search) as any} />;
+                        })
+                    },
+                    {
+                        path: "/:ClusterName", action: (ctx, params) => import("./layouts/DojoAdapter").then(_ => {
+                            return <_.DojoAdapter widgetClassID="TpClusterInfoWidget" params={params} />;
+                        })
+                    },
+                    {
+                        path: "/:ClusterName/config", action: (ctx, params) => import("./components/controls/TargetClustersQueryTable").then(_ => {
+                            const qs = parseSearch(ctx.search);
+                            return <_.TargetClustersQueryTable configDrawerParams={qs as any} configDrawerTitle={`${params.ClusterName}: ${qs.CompName} ${nlsHPCC.Configuration}`} />;
+                        })
+                    },
+                    {
+                        path: "/:ClusterName/logs", action: (ctx, params) => import("./components/controls/TargetClustersQueryTable").then(_ => {
+                            const qs = parseSearch(ctx.search);
+                            return <_.TargetClustersQueryTable logsDrawerParams={qs as any} logsDrawerTitle={`${params.ClusterName}: ${qs.CompName} ${nlsHPCC.Logs}`} />;
+                        })
+                    },
+                    {
+                        path: "/:Cluster/usage", action: (ctx, params) => import("./components/DiskUsage").then(_ => {
+                            return <_.ClusterUsage cluster={params.Cluster as string} />;
+                        })
+                    },
+                ]
+            },
+            {
+                path: "/processes",
+                children: [
+                    {
+                        path: "", action: () => import("./components/controls/ClusterProcessesQueryTable").then(_ => {
+                            return <_.ClusterProcessesQueryTable />;
+                        })
+                    },
+                    {
+                        path: "/preflight", action: (ctx) => import("./components/controls/ClusterProcessesQueryTable").then(_ => {
+                            return <_.ClusterProcessesQueryTable preflightDrawerParams={parseSearch(ctx.search) as any} />;
+                        })
+                    },
+                    {
+                        path: "/:ProcessName/config", action: (ctx, params) => import("./components/controls/ClusterProcessesQueryTable").then(_ => {
+                            const qs = parseSearch(ctx.search);
+                            return <_.ClusterProcessesQueryTable configDrawerParams={qs as any} configDrawerTitle={`${params.ProcessName}: ${qs.CompName} ${nlsHPCC.Configuration}`} />;
+                        })
+                    },
+                    {
+                        path: "/:ProcessName/logs", action: (ctx, params) => import("./components/controls/ClusterProcessesQueryTable").then(_ => {
+                            const qs = parseSearch(ctx.search);
+                            return <_.ClusterProcessesQueryTable logsDrawerParams={qs as any} logsDrawerTitle={`${params.ProcessName}: ${qs.CompName} ${nlsHPCC.Logs}`} />;
+                        })
+                    },
+                ],
+            },
+            {
+                path: "/servers",
+                children: [
+                    {
+                        path: "", action: () => import("./components/controls/SystemServersQueryTable").then(_ => {
+                            return <_.SystemServersQueryTable />;
+                        })
+                    },
+                    {
+                        path: "/preflight", action: (ctx) => import("./components/controls/SystemServersQueryTable").then(_ => {
+                            return <_.SystemServersQueryTable preflightDrawerParams={parseSearch(ctx.search) as any} />;
+                        })
+                    },
+                    {
+                        path: "/:ServerName/config", action: (ctx, params) => import("./components/controls/SystemServersQueryTable").then(_ => {
+                            const qs = parseSearch(ctx.search);
+                            return <_.SystemServersQueryTable configDrawerParams={qs as any} configDrawerTitle={`${params.ServerName}: ${qs.CompName} ${nlsHPCC.Configuration}`} />;
+                        })
+                    },
+                    {
+                        path: "/:ServerName/logs", action: (ctx, params) => import("./components/controls/SystemServersQueryTable").then(_ => {
+                            const qs = parseSearch(ctx.search);
+                            return <_.SystemServersQueryTable logsDrawerParams={qs as any} logsDrawerTitle={`${params.ServerName}: ${nlsHPCC.Logs}`} />;
+                        })
+                    },
+                ]
+            },
+            {
+                path: "/machines",
+                children: [{
+                    path: "/:Machine/usage", action: (ctx, params) => import("./components/DiskUsage").then(_ => {
+                        return <_.MachineUsage machine={params.Machine as string} />;
+                    })
+                }]
+            },
+            {
+                path: "/wu-summary", action: (ctx) => redirectToWUSummary(ctx.search)
+            },
+            {
+                path: "/global-stats", action: (ctx) => import("./components/GlobalMetrics").then(_ => {
+                    const filter = parseSearch(ctx.search) as any;
+                    return <_.GlobalMetrics from={filter?.from} to={filter?.to} />;
+                })
+            },
+            {
+                path: "/security",
+                action: () => { if (!dojoConfig.isAdmin) { replaceUrl("/operations"); return false; } },
+                children: [
+                    {
+                        path: "", action: (ctx, params) => import("./components/Security").then(_ => {
+                            return <_.Security filter={parseSearch(ctx.search) as any} page={parsePage(ctx.search)} />;
+                        })
+                    },
+                    {
+                        path: "/:Tab", action: (ctx, params) => import("./components/Security").then(_ => {
+                            return <_.Security filter={parseSearch(ctx.search) as any} tab={params.Tab as string} page={parsePage(ctx.search)} />;
+                        })
+                    },
+                    {
+                        path: "/users/:username", action: (ctx, params) => import("./components/UserDetails").then(_ => {
+                            return <_.UserDetails username={params.username as string} />;
+                        })
+                    },
+                    {
+                        path: "/users/:username/:Tab", action: (ctx, params) => import("./components/UserDetails").then(_ => {
+                            return <_.UserDetails username={params.username as string} tab={params.Tab as string} />;
+                        })
+                    },
+                    {
+                        path: "/groups/:name", action: (ctx, params) => import("./components/GroupDetails").then(_ => {
+                            return <_.GroupDetails name={params.name as string} />;
+                        })
+                    },
+                    {
+                        path: "/groups/:name/:Tab", action: (ctx, params) => import("./components/GroupDetails").then(_ => {
+                            return <_.GroupDetails name={params.name as string} tab={params.Tab as string} />;
+                        })
+                    },
+                    {
+                        path: "/permissions/:Name/:BaseDn", action: (ctx, params) => import("./components/Security").then(_ => {
+                            return <_.Security tab="permissions" name={params.Name as string} baseDn={params.BaseDn as string} />;
+                        })
+                    },
+                ]
+            },
+            {
+                path: "/desdl",
+                children: [
+                    {
+                        path: "", action: (ctx, params) => import("./components/DynamicESDL").then(_ => {
+                            return <_.DynamicESDL />;
+                        })
+                    },
+                    {
+                        path: "/:Tab", action: (ctx, params) => import("./components/DynamicESDL").then(_ => {
+                            return <_.DynamicESDL tab={params.Tab as string} />;
+                        })
+                    },
+                    {
+                        path: "/bindings/:Name", action: (ctx, params) => import("./components/DESDLBindingDetails").then(_ => {
+                            return <_.DESDLBindingDetails name={params.Name as string} />;
+                        })
+                    },
+                    {
+                        path: "/bindings/:Name/:Tab", action: (ctx, params) => import("./components/DESDLBindingDetails").then(_ => {
+                            return <_.DESDLBindingDetails name={params.Name as string} tab={params.Tab as string} />;
+                        })
+                    },
+                ]
+            }
+        ]
+    },
+    {
+        mainNav: [],
+        path: "/errors", action: () => import("./layouts/DojoAdapter").then(_ => <_.DojoAdapter widgetClassID="InfoGridWidget" />)
+    },
+    {
+        mainNav: [],
+        path: "/log", action: (ctx) => import("./components/LogViewer").then(_ => <_.LogViewer sort={parseSort(ctx.search)} />)
+    },
     //  Other
-    { path: "(.*)", action: () => <h1>Not Found</h1> }
+    {
+        mainNav: [],
+        path: "/iframe", action: (ctx) => import("./components/IFrame").then(_ => <_.IFrame src={parseSearch(ctx.search).src as string} />)
+    },
+    {
+        mainNav: [],
+        path: "/text", action: (ctx) => {
+            const params = parseSearch(ctx.search);
+            return import("./components/SourceEditor").then(_ => <_.FetchEditor mode={params.mode as any} url={params.src as string} />);
+        }
+    },
+    {
+        mainNav: [],
+        path: "(.*)", action: () => <h1>Not Found</h1>
+    }
 ];
 
 export const router = initialize(routes);

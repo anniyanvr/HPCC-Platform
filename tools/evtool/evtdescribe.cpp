@@ -1,0 +1,167 @@
+/*##############################################################################
+
+    Copyright (C) 2026 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#include "evtool.hpp"
+#include "eventdescribe.h"
+
+class CEvtDescribeCommand : public TEventConsumingCommand<CDescribeEventsOp>
+{
+public:
+    CEvtDescribeCommand()
+    {
+        op.setFormat(DescribeOutputFormat::yaml);
+        op.setSectionOverrides(DescribeSection::none);
+        op.setOutput(consoleOut());
+    }
+
+protected:
+    virtual unsigned acceptLongOption(const char* key, const char* nextArg) override
+    {
+        if (streq(key, "named"))
+        {
+            if (!nextArg || nextArg[0] == '-')
+                throw makeStringExceptionV(-1, "missing value for --named");
+
+            op.setNamedEntity(nextArg);
+            return 2;
+        }
+        return CEvToolCommand::acceptLongOption(key, nextArg);
+    }
+
+    virtual bool acceptKVOption(const char* key, const char* value) override
+    {
+        if (streq(key, "named"))
+        {
+            if (isEmptyString(value))
+                return false;
+            op.setNamedEntity(value);
+            return true;
+        }
+        return TEventConsumingCommand<CDescribeEventsOp>::acceptKVOption(key, value);
+    }
+
+    virtual bool acceptTerseOption(char opt) override
+    {
+        switch (opt)
+        {
+        case 'x':
+            op.setFormat(DescribeOutputFormat::xml);
+            break;
+        case 'j':
+            op.setFormat(DescribeOutputFormat::json);
+            break;
+        case 'y':
+            op.setFormat(DescribeOutputFormat::yaml);
+            break;
+        case 'c':
+            op.addSectionOverride(DescribeSection::contexts);
+            break;
+        case 'e':
+            op.addSectionOverride(DescribeSection::events);
+            break;
+        case 'a':
+            op.addSectionOverride(DescribeSection::attributes);
+            break;
+        default:
+            return TEvtCLIConnector<CDescribeEventsOp>::acceptTerseOption(opt);
+        }
+        return true;
+    }
+
+    virtual const char* getVerboseDescription() const override
+    {
+        return R"!!!(Describe known event contexts, events, and attributes.
+Derived meta.* names are included in the attribute section. Output can be
+narrowed to one or more sections and emitted as XML, JSON, or YAML.
+)!!!";
+    }
+
+    virtual const char* getBriefDescription() const override
+    {
+        return "describe event names and sections";
+    }
+
+    virtual void usageSyntax(StringBuffer& helpText) override
+    {
+        helpText.append(R"!!!([options] [<filename> ...]
+)!!!");
+    }
+
+    virtual void usageOptions(IBufferedSerialOutputStream& out) override
+    {
+        TEventConsumingCommand<CDescribeEventsOp>::usageOptions(out);
+        constexpr const char* usageStr =
+R"!!!(    -x, -j, -y                Output format: XML, JSON, or YAML.
+                              If more than one output option is supplied,
+                              the last one wins.
+    --named ( '=' | ' ' ) <entity>
+                              Limit output to entries whose name matches
+                              the supplied entity text. Accepted
+                              values: event names (e.g. IndexLoad), context
+                              names (e.g. Index), attribute names (e.g.
+                              ServiceName), and meta-derived names with the
+                              meta. prefix (e.g. meta.Path). Matching is
+                              case-insensitive and can match more than one
+                              entity kind.
+                              When -c, -e, or -a are also given, the entity
+                              type must fall within a selected section.
+    -c                        Include contexts section.
+    -e                        Include events section.
+    -a                        Include attributes section.
+)!!!";
+        out.put(size32_t(strlen(usageStr)), usageStr);
+    }
+
+    virtual void usageParameters(IBufferedSerialOutputStream& out) override
+    {
+        constexpr const char* usageStr = R"!!!(
+Parameters:
+    <filename>                Optional input event file. Multiple may be
+                              supplied.
+)!!!";
+        out.put(size32_t(strlen(usageStr)), usageStr);
+    }
+
+    virtual void usageDetails(IBufferedSerialOutputStream& out) override
+    {
+        constexpr const char* usageStr = R"!!!(
+Used without input event files, all observable events, contexts, and
+attributes are described. When input files are provided, the output is limited
+to names observed in those inputs.
+
+If none of -x, -j, or -y are provided, YAML output is used.
+
+If none of -c, -e, or -a are provided, all sections are emitted. If one
+or more section options are provided, output is limited to the selected
+sections.
+
+When input files are provided, observed output is derived from the stream after
+all processing options are applied. In particular, --model=<filename> and any
+filters (for example --events=... and --attribute:<attr>=<val>) can change
+which names are observed and therefore shown.
+
+When --named is provided, output is limited to entries whose name matches
+the supplied text.
+)!!!";
+        out.put(size32_t(strlen(usageStr)), usageStr);
+    }
+};
+
+IEvToolCommand* createDescribeCommand()
+{
+    return new CEvtDescribeCommand();
+}

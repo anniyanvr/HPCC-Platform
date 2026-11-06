@@ -35,6 +35,10 @@
 #include <assert.h>
 #include "jarray.hpp"
 
+static constexpr size32_t oneKB = 1024;
+static constexpr size32_t oneMB = 1024 * 1024;
+static constexpr size32_t oneGB = 1024 * 1024 * 1024;
+
 #define _elements_in(a) (sizeof(a)/sizeof((a)[0]))
 #define _memclr(s, n)      memset(s, 0, n)
 #define _clear(a)          memset(&a, 0, sizeof(a))
@@ -42,12 +46,12 @@
 
 
 class jlib_decl ICopyArray : public CopyReferenceArrayOf<IInterface> {};
-class jlib_decl IArray : public OwnedReferenceArrayOf<IInterface> {};
+class jlib_decl IArray : public OwnedReferenceArrayOf<IInterface> { inline void clear(bool) = delete; };
 class jlib_decl IPointerArray : public OwnedPointerArrayOf<IInterface> {};
-class jlib_decl IConstPointerArray : public OwnedConstPointerArrayOf<IInterface> {};
+class jlib_decl IConstPointerArray : public OwnedConstPointerArrayOf<IInterface> { inline void clear(bool) = delete; };
 
 class jlib_decl CICopyArray : public CopyReferenceArrayOf<CInterface> {};
-class jlib_decl CIArray : public OwnedReferenceArrayOf<CInterface> {};
+class jlib_decl CIArray : public OwnedReferenceArrayOf<CInterface> { inline void clear(bool) = delete; };
 
 class jlib_decl CharArray : public ArrayOf<char> { };
 class jlib_decl IntArray : public ArrayOf<int> { };
@@ -55,6 +59,7 @@ class jlib_decl ShortArray : public ArrayOf<short> { };
 class jlib_decl FloatArray : public ArrayOf<float> { };
 class jlib_decl DoubleArray : public ArrayOf<double> { };
 class jlib_decl UnsignedArray : public ArrayOf<unsigned> { };
+class jlib_decl Unsigned64Array : public ArrayOf<unsigned __int64> { };
 class jlib_decl UnsignedShortArray : public ArrayOf<unsigned short> { };
 class jlib_decl PointerArray : public ArrayOf<void *> { };
 class jlib_decl ConstPointerArray : public ArrayOf<const void *> { };
@@ -270,12 +275,10 @@ public:
     inline bool zap(TYPE * x)                   { return ConstPointerArray::zap(x); }
 };
 
-enum DAFSConnectCfg { SSLNone = 0, SSLOnly, SSLFirst, UnsecureFirst };
+enum DAFSConnectCfg { SSLNone = 0, SSLOnly, SSLFirst, UnsecureFirst, UnsecureAndSSL };
 
 #include "jstring.hpp"
 #include "jarray.hpp"
-#include "jhash.hpp"
-#include "jstream.hpp"
 #include "jutil.hpp"
 
 template <class ARRAY>
@@ -284,7 +287,7 @@ inline void appendArray(ARRAY & target, const ARRAY & source)
     unsigned max = source.ordinality();
     if (max)
     {
-        target.ensure(target.ordinality() + max);
+        target.ensureSpace(max);
         for (unsigned i=0; i < max; ++i)
             target.append(OLINK(source.item(i)));
     }
@@ -295,7 +298,7 @@ inline void appendArray(IArray & target, const IArray & source)
     unsigned max = source.ordinality();
     if (max)
     {
-        target.ensure(target.ordinality() + max);
+        target.ensureSpace(max);
         for (unsigned i=0; i < max; ++i)
             target.append(OLINK(source.item(i)));
     }
@@ -335,6 +338,7 @@ public:
     void add(InitializerType &iT);
     void add(boolFunc func, unsigned int priority, unsigned int modpriority, byte state=ITS_Uninitialized);
     count_t items() { return initializers.ordinality(); }
+    void clear();
 
     InitializerType & element(aindex_t i) { return initializers.element(i); }
 };
@@ -373,6 +377,7 @@ public:
     
 
 extern jlib_decl void _InitModuleObjects();
+extern jlib_decl void ClearModuleObjects();
 extern jlib_decl void ExitModuleObjects();
 extern jlib_decl void ExitModuleObjects(SoContext soCtx);
 
@@ -393,8 +398,9 @@ typedef CIArrayOf<StringBufferItem> StringBufferArray;
 //These could be template definitions, but that would potentially affect too many classes.
 #define BITMASK_ENUM(X) \
 inline constexpr X operator | (X l, X r) { return (X)((unsigned)l | (unsigned)r); } \
+inline constexpr X operator & (X l, X r) { return (X)((unsigned)l & (unsigned)r); } \
 inline constexpr X operator ~ (X l) { return (X)(~(unsigned)l); } \
 inline X & operator |= (X & l, X r) { l = l | r; return l; } \
-inline X & operator &= (X & l, X r) { l = (X)(l & r); return l; }
-
+inline X & operator &= (X & l, X r) { l = (X)(l & r); return l; } \
+inline bool hasMask(X l, X r) { return (l & r) != (X)0; }
 #endif

@@ -22,20 +22,19 @@
 
 project(ws_sql)
 
-if(WSSQL_SERVICE AND USE_JAVA)
+if(WSSQL_SERVICE)
     find_package(Java REQUIRED)
     find_package(ANTLR REQUIRED)
 
     include(${HPCC_SOURCE_DIR}/esp/scm/additional.cmake)
     include(${HPCC_SOURCE_DIR}/esp/scm/smcscm.cmake)
-
-    include(antlr3c.cmake)
+    include(${HPCC_SOURCE_DIR}/esp/scm/espscm.cmake)
 
     antlr_target(sql2ecl
         GRAMMAR_PREFIX HPCCSQL
         DESTINATION "${CMAKE_CURRENT_BINARY_DIR}"
         GRAMMAR_FILES "${CMAKE_CURRENT_SOURCE_DIR}/SQL2ECL/ANTLR3c/HPCCSQL.g"
-        )
+    )
 
     set(SRCS
         ${CMAKE_CURRENT_SOURCE_DIR}/ws_sqlPlugin.cpp
@@ -43,6 +42,8 @@ if(WSSQL_SERVICE AND USE_JAVA)
         ${ESPSCM_GENERATED_DIR}/common_esp.cpp
         ${ESPSCM_GENERATED_DIR}/ws_sql_esp.cpp
         ${ESPSCM_GENERATED_DIR}/ws_workunits_struct_esp.cpp
+        ${ESPSCM_GENERATED_DIR}/ws_workunits_req_resp_esp.cpp
+        ${ESPSCM_GENERATED_DIR}/ws_logaccess_esp.cpp
         ${ESPSCM_GENERATED_DIR}/ws_topology_esp.cpp
         ${HPCC_SOURCE_DIR}/esp/services/ws_ecl/ws_ecl_wuinfo.cpp
         ${HPCC_SOURCE_DIR}/esp/services/ws_workunits/ws_workunitsHelpers.cpp
@@ -92,42 +93,59 @@ if(WSSQL_SERVICE AND USE_JAVA)
         ${HPCC_SOURCE_DIR}/common/dllserver
         ${HPCC_SOURCE_DIR}/common/deftype
         ${HPCC_SOURCE_DIR}/ecl/hql
-        ${libantlr3c_includes}
         ${ESPSCM_GENERATED_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/SQL2ECL
         ${HPCC_SOURCE_DIR}/common/thorhelper
+        ${HPCC_SOURCE_DIR}/esp/bindings/http/platform
+        ${HPCC_SOURCE_DIR}/rtl/eclrtl
+        ${HPCC_SOURCE_DIR}/rtl/include
+        ${HPCC_SOURCE_DIR}/esp/espcommon
         )
+
+    if (VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
+        include_directories(${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include)
+    endif()
 
     if (CMAKE_COMPILER_IS_CLANG)
       set_source_files_properties(${ANTLR_sql2ecl_SOURCES} PROPERTIES COMPILE_FLAGS -Wno-parentheses-equality)
     endif()
-    
-    add_definitions(-D_USRDLL)
+
+    add_definitions(-D_USRDLL -Dwssql_API_LOCAL -DESP_SERVICE_wssql)
     HPCC_ADD_LIBRARY(ws_sql SHARED ${SRCS})
     add_dependencies(ws_sql espscm sql2ecl)
     target_link_libraries(
-        ws_sql
+        ws_sql PRIVATE
         ws_workunits
         ws_dfu
         jlib
+        hql
+        fileview2
+        remote
         xmllib
         esphttp
         dalibase
-        libantlr3c
+        ${ANTLR_LIB}
         wuwebview
+        SMCLib
+        ${COMMON_ESP_SERVICE_LIBS}
         )
+
+    if (NOT CONTAINERIZED)
+        target_link_libraries ( ws_sql PRIVATE environment )
+    endif()
 
     SET_DIRECTORY_PROPERTIES(PROPERTIES ADDITIONAL_MAKE_CLEAN_FILES "antlr3c")
 
 IF (USE_OPENSSL)
-    target_link_libraries ( ws_sql
+    target_link_libraries ( ws_sql PRIVATE
     	securesocket
     )
 ENDIF()
-         
+
     install(TARGETS ws_sql
         RUNTIME DESTINATION ${EXEC_DIR}
         LIBRARY DESTINATION ${LIB_DIR}
         COMPONENT Runtime
-        )
+        CALC_DEPS
+    )
 endif()

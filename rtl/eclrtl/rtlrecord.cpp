@@ -292,6 +292,12 @@ RtlRecord::RtlRecord(const RtlFieldInfo * const *_fields, bool expandFields) : f
         const RtlTypeInfo *curType = queryType(i);
         if (!curType->isFixedSize() || (fields[i]->flags & RFTMinifblock))
             numVarFields++;
+        if (curType->isBlob())
+        {
+            curType = curType->queryChildType();
+            if (unlikely(!curType))
+                throwUnexpectedX("Blob type has no child type");
+        }
         if (curType->getType()==type_table || curType->getType()==type_record || curType->getType()==type_dictionary)
             numTables++;
     }
@@ -331,6 +337,8 @@ RtlRecord::RtlRecord(const RtlFieldInfo * const *_fields, bool expandFields) : f
             curVariable++;
             fixedOffset = 0;
         }
+        if (curType->isBlob())
+            curType = curType->queryChildType();
         switch (curType->getType())
         {
         case type_table:
@@ -375,7 +383,12 @@ RtlRecord::~RtlRecord()
         {
             const RtlFieldInfo *thisField = *finger;
             if (thisField->flags & RFTMdynamic)
-                delete thisField;
+            {
+                if (thisField->flags & RFTMinifblock)
+                    delete (RtlCondFieldStrInfo *)thisField;
+                else
+                    delete thisField;
+            }
         }
         delete [] fields;
     }
@@ -412,6 +425,18 @@ unsigned RtlRecord::getNumKeyedFields() const
         ret++;
     }
     return ret;
+}
+
+size32_t RtlRecord::getKeyedSize() const
+{
+    unsigned fieldIndex = 0;
+    for (const RtlFieldInfo * const * finger = originalFields; *finger; finger++)
+    {
+        if ((*finger)->flags & RFTMispayloadfield)
+            break;
+        fieldIndex++;
+    }
+    return fixedOffsets[fieldIndex];
 }
 
 void RtlRecord::calcRowOffsets(size_t * variableOffsets, const void * _row, unsigned numFieldsUsed) const

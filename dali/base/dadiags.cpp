@@ -15,7 +15,6 @@
     limitations under the License.
 ############################################################################## */
 
-#define da_decl DECL_EXPORT
 #include "platform.h"
 #include "jlib.hpp"
 #include "dacoven.hpp"
@@ -29,6 +28,7 @@
 #include "dasubs.ipp"
 #include "dautils.hpp"
 #include "dadiags.hpp"
+#include "jprotrace.hpp"
 
 #ifdef _MSC_VER
 #pragma warning (disable : 4355)
@@ -45,7 +45,7 @@ class CDaliDiagnosticsServer: public IDaliServer, public Thread
     bool stopped;
 public:
 
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
 
     CDaliDiagnosticsServer()
         : Thread("CDaliDiagnosticsServer")
@@ -59,7 +59,7 @@ public:
 
     void start()
     {
-        Thread::start();
+        Thread::start(false);
     }
 
     void ready()
@@ -116,10 +116,7 @@ public:
                 StringAttr id;
                 StringBuffer buf;
                 params.read(id);
-                if (0 == stricmp(id,"threads")) {
-                    mb.append(getThreadList(buf).str());
-                }
-                else if (0 == stricmp(id, "mpqueue")) {
+                if (0 == stricmp(id, "mpqueue")) {
                     mb.append(getReceiveQueueDetails(buf).str());
                 }
                 else if (0 == stricmp(id, "locks")) { // Legacy - newer diag clients should use querySDS().getLocks() directly
@@ -199,9 +196,52 @@ public:
                     if (success)
                         mb.append(connectionInfo);
                 }
-                else if (0 == stricmp(id, "save")) {
+                else if (0 == stricmp(id, "protraceResume"))
+                {
+                    bool success = protraceResumeRecording();
+                    mb.append(success);
+                }
+                else if (0 == stricmp(id, "protraceSuspend"))
+                {
+                    bool success = protraceSuspendRecording();
+                    mb.append(success);
+                }
+                else if (0 == stricmp(id, "protraceClear"))
+                {
+                    bool clearMetadata = false;
+                    params.read(clearMetadata);
+                    bool success = protraceClearRecording(clearMetadata);
+                    mb.append(success);
+                }
+                else if (0 == stricmp(id, "protraceSave"))
+                {
+                    StringAttr requestedFilename;
+                    params.read(requestedFilename);
+                    StringBuffer outputFilename;
+                    try
+                    {
+                        protraceSaveRecording(outputFilename, requestedFilename.get(), true);
+                        serializeException(NULL, mb);  // writes 0x01 to indicate success
+                        mb.append(outputFilename);
+                    }
+                    catch (IException *e)
+                    {
+                        serializeException(e, mb);  // writes 0x00, errorCode, errorMessage
+                        e->Release();
+                    }
+                }
+                else if (0 == stricmp(id, "save"))
+                {
                     PROGLOG("Dalidiag requests SDS save");
-                    querySDSServer().saveRequest();
+                    try
+                    {
+                        querySDSServer().saveRequest();
+                    }
+                    catch (IException *e)
+                    {
+                        serializeException(e, mb);
+                        e->Release();
+                    }
                 }
                 else if (0 == stricmp(id, "settracetransactions")) {
                     PROGLOG("Dalidiag requests Trace Transactions");

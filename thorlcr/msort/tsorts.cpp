@@ -23,6 +23,7 @@
 #include <mpcomm.hpp>
 #include "thorport.hpp"
 #include "jsocket.hpp"
+#include "jsecrets.hpp"
 #include "jthread.hpp"
 #include "thormisc.hpp"
 #include "jisem.hpp"
@@ -32,6 +33,7 @@
 #include "tsortm.hpp"
 #include "tsortmp.hpp"
 #include "thbuf.hpp"
+#include "thbufdef.hpp"
 #include "thgraph.hpp"
 
 #ifdef _DEBUG
@@ -49,7 +51,7 @@ template <class T>
 inline void traceWait(const char *name, T &sem,unsigned interval=60*1000)
 {
     while (!sem.wait(interval))
-        PROGLOG("Waiting for %s",name);
+        DBGLOG("Waiting for %s",name);
 }
 
 
@@ -65,11 +67,11 @@ class CWriteIntercept : public CSimpleInterface
     // sampling adapter
 
     CActivityBase &activity;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     IThorRowInterfaces *rowIf;
-    Owned<IFile> dataFile, idxFile;
+    Owned<CFileOwner> dataFile, idxFile;
     Owned<IFileIO> dataFileIO, idxFileIO;
-    Owned<ISerialStream> dataFileStream;
+    Owned<IBufferedSerialInputStream> dataFileStream;
     Linked<IFileIOStream> idxFileStream;
     CThorStreamDeserializerSource dataFileDeserializerSource;
     unsigned interval;
@@ -78,6 +80,7 @@ class CWriteIntercept : public CSimpleInterface
     offset_t overflowsize;
     size32_t fixedsize;
     offset_t lastofs;
+    bool compressedOverflowFile = false;
 
     // JCSMORE - writeidxofs is a NOP for fixed size records by the looks of it (at least if serializer writes fixed sizes)
     // bit weird if always true, would look a lot clearer if explictly tested for var length case.
@@ -96,14 +99,14 @@ class CWriteIntercept : public CSimpleInterface
             {
                 // right create idx
                 StringBuffer tempname;
-                GetTempName(tempname.clear(),"srtidx",false);
-                idxFile.setown(createIFile(tempname.str()));
-                idxFileIO.setown(idxFile->open(IFOcreaterw));
+                GetTempFilePath(tempname.clear(),"srtidx");
+                idxFile.setown(activity.createOwnedTempFile(tempname.str()));
+                idxFileIO.setown(idxFile->queryIFile().open(IFOcreaterw));
                 if (!idxFileIO.get())
                 {
                     StringBuffer err;
-                    err.append("Cannot create ").append(idxFile->queryFilename());
-                    LOG(MCerror, thorJob, "%s", err.str());
+                    err.append("Cannot create ").append(idxFile->queryIFile().queryFilename());
+                    IERRLOG("%s", err.str());
                     throw MakeActivityException(&activity, -1, "%s", err.str());
                 }
                 idxFileStream.setown(createBufferedIOStream(idxFileIO,0x100000));
@@ -138,7 +141,7 @@ class CWriteIntercept : public CSimpleInterface
         if (!idxFileIO.get())
         {
             assertex(idxFile);
-            idxFileIO.setown(idxFile->open(IFOread));
+            idxFileIO.setown(idxFile->queryIFile().open(IFOread));
         }
         size32_t rd = idxFileIO->read((offset_t)pos*(offset_t)sizeof(offset_t),sizeof(*ofs)*n,ofs);
         if (closeIO)
@@ -156,11 +159,22 @@ class CWriteIntercept : public CSimpleInterface
         IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
         CFileOwningStream(CWriteIntercept *_parent, offset_t _startOffset, rowcount_t _max) : parent(_parent), startOffset(_startOffset), max(_max)
         {
-            stream.setown(createRowStreamEx(parent->dataFile, parent->rowIf, startOffset, (offset_t)-1, max));
+            FileRowStreamOptions options;
+            options.offset = startOffset;
+            options.maxRows = max;
+            if (parent->compressedOverflowFile)
+            {
+                Owned<IFileIO> iFileIO = createCompressedFileReader(&(parent->dataFile->queryIFile()), nullptr, useDefaultIoBufferSize, false, IFEnone);
+                assertex(iFileIO);
+                stream.setown(createRowStream(iFileIO, parent->rowIf, options));
+            }
+            else
+                stream.setown(createRowStream(&(parent->dataFile->queryIFile()), parent->rowIf, options));
         }
         virtual const void *nextRow() { return stream->nextRow(); }
         virtual void stop() { stream->stop(); }
     };
+
 public:
     IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
 
@@ -176,27 +190,51 @@ public:
     ~CWriteIntercept()
     {
         closeFiles();
-        if (dataFile)
-            dataFile->remove();
-        if (idxFile)
-            idxFile->remove();
     }
     offset_t write(IRowStream *input)
     {
         StringBuffer tempname;
-        GetTempName(tempname,"srtmrg",false);
-        dataFile.setown(createIFile(tempname.str()));
-        Owned<IExtRowWriter> output = createRowWriter(dataFile, rowIf);
+        GetTempFilePath(tempname,"srtmrg");
+        dataFile.setown(activity.createOwnedTempFile(tempname.str()));
+
+        unsigned rwFlags = DEFAULT_RWFLAGS;
+        size32_t compBlkSz = 0;
+        if (activity.getOptBool(THOROPT_COMPRESS_SPILLS, true) && activity.getOptBool(THOROPT_COMPRESS_SORTOVERFLOW, true))
+        {
+            StringBuffer compType;
+            activity.getOpt(THOROPT_COMPRESS_SPILL_TYPE, compType);
+            unsigned spillCompInfo = 0x0;
+            setCompFlag(compType, spillCompInfo);
+            if (spillCompInfo)
+            {
+                rwFlags |= rw_compress;
+                rwFlags |= spillCompInfo;
+                compressedOverflowFile = true;
+
+                /*
+                * NB: HPCC-29385 Changed the way that compressed files are decompressed, so they are only decompressed one
+                * compression buffer at a time.  For LZ4 this means they can only ever expand to the compressed block size (typically 1MB)
+                * rather than 10s of times that space.
+                * LZW could still expand many times its block size, but the default for LZW is already 64K which is low enough.
+                * Therefore we default to 0 here, which causes createRowWriter to use the default block size for the compressor type.
+                */
+                compBlkSz = activity.getOptUInt(THOROPT_SORT_COMPBLKSZ, 0);
+                if (compBlkSz)
+                    ActPrintLog(&activity, "Creating compressed merged overflow file (block size = %u)", compBlkSz);
+                else
+                    ActPrintLog(&activity, "Creating compressed merged overflow file");
+            }
+        }
+
+        Owned<ILogicalRowWriter> output = createRowWriter(&(dataFile->queryIFile()), rowIf, rwFlags, nullptr, compBlkSz);
 
         bool overflowed = false;
         ActPrintLog(&activity, "Local Overflow Merge start");
-        unsigned ret=0;
         for (;;)
         {
             const void *_row = input->nextRow();
             if (!_row)
                 break;
-            ret++;
 
             OwnedConstThorRow row = _row;
             offset_t start = output->getPosition();
@@ -222,17 +260,19 @@ public:
         }
         output->flush();
         offset_t end = output->getPosition();
+        dataFile->noteSize(output->getStatistic(StSizeDiskWrite));
         output.clear();
         writeidxofs(end);
         if (idxFileIO)
         {
             idxFileStream->flush();
             idxFileStream.clear();
+            idxFile->noteSize(idxFileIO->getStatistic(StSizeDiskWrite));
             idxFileIO.clear();
         }
         if (overflowed)
             IWARNLOG("Overflowed by %" I64F "d", overflowsize);
-        ActPrintLog(&activity, "Local Overflow Merge done: overflow file '%s', size = %" I64F "d", dataFile->queryFilename(), dataFile->size());
+        ActPrintLog(&activity, "Local Overflow Merge done: overflow file '%s', size = %" I64F "d", dataFile->queryIFile().queryFilename(), dataFile->queryIFile().size());
         return end;
     }
     IRowStream *getStream(offset_t startOffset, rowcount_t max)
@@ -260,7 +300,12 @@ public:
         size32_t idxSz = (size32_t)(ofs[1]-ofs[0]);
         if (!dataFileIO)
         {
-            dataFileIO.setown(dataFile->open(IFOread));
+            dataFileIO.setown(dataFile->queryIFile().open(IFOread));
+            if (compressedOverflowFile)
+            {
+                dataFileIO.setown(createCompressedFileReader(dataFileIO, nullptr, useDefaultIoBufferSize));
+                assertex(dataFileIO);
+            }
             dataFileStream.setown(createFileSerialStream(dataFileIO));
             dataFileDeserializerSource.setStream(dataFileStream);
         }
@@ -277,6 +322,12 @@ public:
 
 class CMiniSort
 {
+    class MiniSortSemaphore : public Semaphore
+    {
+    public:
+        MiniSortSemaphore(unsigned initialCount=0) : Semaphore(SYNC_LOCATION, initialCount) {}
+    };
+
     CActivityBase &activity;
     IThorRowInterfaces &rowIf;
     IOutputRowDeserializer *deserializer;
@@ -485,12 +536,12 @@ public:
             class casyncfor: public CAsyncFor
             {
                 CMiniSort &base;
-                Semaphore *nextsem;
+                MiniSortSemaphore *nextsem;
             public:
                 casyncfor(CMiniSort &_base, unsigned numNodes)
-                    : base(_base)
+                    : CAsyncFor(SYNC_LOCATION), base(_base)
                 {
-                    nextsem = new Semaphore[numNodes];  // 1 extra
+                    nextsem = new MiniSortSemaphore[numNodes];  // 1 extra
                     nextsem[0].signal();
                 }
                 ~casyncfor()
@@ -540,7 +591,7 @@ public:
                 size32_t blksize;
             public:
                 casyncfor2(CMiniSort &_base, CThorExpandingRowArray &_globalRows, unsigned *_points, size32_t _blksize)
-                    : base(_base), globalRows(_globalRows)
+                    : CAsyncFor(SYNC_LOCATION), base(_base), globalRows(_globalRows)
                 {
                     points = _points;
                     blksize = _blksize;
@@ -595,11 +646,15 @@ class CThorSorter : public CSimpleInterface, implements IThorSorter, implements 
     Owned<IThorRowInterfaces> keyIf;
     Owned<IOutputRowSerializer> rowToKeySerializer;
     void *midkeybuf;
-    Semaphore startgathersem, finishedmergesem, closedownsem;
-    InterruptableSemaphore startmergesem;
+    Semaphore startgathersem{SYNC_LOCATION};
+    Semaphore finishedmergesem{SYNC_LOCATION};
+    Semaphore closedownsem{SYNC_LOCATION};
+    InterruptableSemaphore startmergesem{SYNC_LOCATION};
     size32_t transferblocksize, midkeybufsize;
     CRuntimeStatisticCollection spillStats;
     rowcount_t globalCount = 0;
+    bool useTLS = false;
+    unsigned traceLevel = 0;
 
     class CRowToKeySerializer : public CSimpleInterfaceOf<IOutputRowSerializer>
     {
@@ -772,7 +827,7 @@ class CThorSorter : public CSimpleInterface, implements IThorSorter, implements 
 public:
     IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
 
-    CThorSorter(CActivityBase *_activity, SocketEndpoint &ep, IDiskUsage *_iDiskUsage, ICommunicator *_clusterComm, mptag_t _mpTagRPC)
+    CThorSorter(CActivityBase *_activity, SocketEndpoint &ep, ICommunicator *_clusterComm, mptag_t _mpTagRPC)
         : activity(_activity), myendpoint(ep), clusterComm(_clusterComm), mpTagRPC(_mpTagRPC),
           rowArray(*_activity, _activity), threaded("CThorSorter", this), spillStats(spillStatistics)
     {
@@ -787,7 +842,31 @@ public:
         transferblocksize = TRANSFERBLOCKSIZE;
         isstable = true;
         stopping = false;
-        threaded.start();
+        useTLS = queryMtls();
+#ifdef _CONTAINERIZED
+        traceLevel = getComponentConfigSP()->getPropInt("logging/@detail", InfoMsgThreshold);
+#else
+        if (globals)
+        {
+            traceLevel = globals->getPropInt("@traceLevel", 0);
+            switch (traceLevel)
+            {
+                case 0:
+                    traceLevel = InfoMsgThreshold;
+                    break;
+                case 1:
+                    traceLevel = DebugMsgThreshold;
+                    break;
+                case 2:
+                    traceLevel = ExtraneousMsgThreshold;
+                    break;
+                default:
+                    traceLevel = ExtraneousMsgThreshold + 10;
+                    break;
+            }
+        }
+#endif
+        threaded.start(true);
     }
     ~CThorSorter()
     {
@@ -814,7 +893,8 @@ public:
         numnodes = _numnodes;
         partno = _partno;
         transferserver.clear();
-        transferserver.setown(createMergeTransferServer(this));
+        size32_t totalBufSize = (size32_t)activity->getOptInt(THOROPT_SORT_MERGE_TOTAL_BUFFER_MB, SORT_MERGE_TOTAL_BUFFER_SIZE / 0x100000) * 0x100000;
+        transferserver.setown(createMergeTransferServer(this, numnodes, totalBufSize));
         transferserver->start();
         return true; // used to establish link
     }
@@ -827,7 +907,7 @@ public:
     virtual void GetGatherInfo(rowcount_t &numlocal, offset_t &totalsize, unsigned &_overflowscale, bool haskeyserializer)
     {
         if (!gatherdone)
-            ERRLOG("GetGatherInfo:***Error called before gather complete");
+            IERRLOG("GetGatherInfo:***Error called before gather complete");
         if (haskeyserializer != (NULL != keyserializer))
             throwUnexpected();
         numlocal = rowArray.ordinality(); // JCSMORE - this is sample total, why not return actual spill total?
@@ -1087,17 +1167,19 @@ public:
         }
         catch (IException *e)
         {
-            startmergesem.interrupt(LINK(e));
-            throw e;
+            Owned<IThorException> e2 = MakeActivityException(activity, e, "CThorSorter::StartMiniSort");
+            e->Release();
+            startmergesem.interrupt(e2.getLink());
+            throw e2.getClear();
         }
         merger.setown(sortedStream.getClear());
         startmergesem.signal();
         ActPrintLog(activity, "StartMiniSort output started");
         traceWait("finishedmergesem(2)",finishedmergesem);
-        LOG(MCthorDetailedDebugInfo, thorJob, "StartMiniSort output done");
+        LOG(MCthorDetailedDebugInfo, "StartMiniSort output done");
         merger.clear();
         intercept.clear();
-        LOG(MCthorDetailedDebugInfo, thorJob, "StartMiniSort exit");
+        LOG(MCthorDetailedDebugInfo, "StartMiniSort exit");
     }
     virtual void Close()
     {
@@ -1106,8 +1188,9 @@ public:
             if (transferserver)
                 transferserver->subjoin(); // need to have finished merge threads 
         }
-        catch (IException *e) {
-            EXCLOG(e,"CThorSorter");
+        catch (IException *e)
+        {
+            IERRLOG(e,"CThorSorter");
             if (closeexc.get())
                 e->Release();
             else
@@ -1270,7 +1353,7 @@ public:
             throw;
         }
 
-        mergeStats(spillStats, sortedloader);
+        mergeRemappedStats(spillStats, sortedloader, diskToTempStatsMap);
 
         if (!abort)
         {
@@ -1321,6 +1404,14 @@ public:
         return spillStats.getStatisticValue(kind);
     }
     virtual rowcount_t getGlobalCount() const { return globalCount; }
+    virtual bool queryTLS() const override
+    {
+        return useTLS;
+    }
+    virtual unsigned queryTraceLevel() const override
+    {
+        return traceLevel;
+    }
 };
 
 
@@ -1328,8 +1419,8 @@ public:
 
 //==============================================================================
 
-THORSORT_API IThorSorter *CreateThorSorter(CActivityBase *activity, SocketEndpoint &ep,IDiskUsage *iDiskUsage,ICommunicator *clusterComm, mptag_t _mpTagRPC)
+THORSORT_API IThorSorter *CreateThorSorter(CActivityBase *activity, SocketEndpoint &ep, ICommunicator *clusterComm, mptag_t _mpTagRPC)
 {
-    return new CThorSorter(activity, ep, iDiskUsage, clusterComm, _mpTagRPC);
+    return new CThorSorter(activity, ep, clusterComm, _mpTagRPC);
 }
 

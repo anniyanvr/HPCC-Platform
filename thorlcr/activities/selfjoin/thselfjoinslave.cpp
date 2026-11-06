@@ -46,7 +46,7 @@ private:
     ISortKeySerializer * keyserializer;
     mptag_t mpTagRPC;
     Owned<IJoinHelper> joinhelper;
-    CriticalSection joinHelperCrit;
+    mutable CriticalSection joinHelperCrit{SYNC_LOCATION};
     Owned<IBarrier> barrier;
     SocketEndpoint server;
 
@@ -61,7 +61,7 @@ private:
         ::ActPrintLog(this, thorDetailedLogLevel, "SELFJOIN: Performing local self-join");
         Owned<IThorRowLoader> iLoader = createThorRowLoader(*this, ::queryRowInterfaces(input), compare, isUnstable() ? stableSort_none : stableSort_earlyAlloc, rc_mixed, SPILL_PRIORITY_SELFJOIN);
         Owned<IRowStream> rs = iLoader->load(inputStream, abortSoon);
-        mergeStats(stats, iLoader, spillStatistics);  // Not sure of the best policy if rs spills later on.
+        mergeRemappedStats(inactiveStats, iLoader, diskToTempStatsMap);  // Not sure of the best policy if rs spills later on.
         PARENT::stopInput(0);
         return rs.getClear();
     }
@@ -117,7 +117,7 @@ public:
             barrier.setown(container.queryJobChannel().createBarrier(barrierTag));
             portbase = queryJobChannel().allocPort(NUMSLAVEPORTS);
             server.setLocalHost(portbase);
-            sorter.setown(CreateThorSorter(this, server,&container.queryJob().queryIDiskUsage(),&queryJobChannel().queryJobComm(),mpTagRPC));
+            sorter.setown(CreateThorSorter(this, server, &queryJobChannel().queryJobComm(), mpTagRPC));
             server.serialize(slaveData);
         }
         compare = helper->queryCompareLeft();                   // NB not CompareLeftRight
@@ -134,7 +134,7 @@ public:
         PARENT::reset();
         if (sorter) return; // JCSMORE loop - shouldn't have to recreate sorter between loop iterations
         if (!isLocal && TAG_NULL != mpTagRPC)
-            sorter.setown(CreateThorSorter(this, server,&container.queryJob().queryIDiskUsage(),&queryJobChannel().queryJobComm(),mpTagRPC));
+            sorter.setown(CreateThorSorter(this, server, &queryJobChannel().queryJobComm(), mpTagRPC));
     }
     virtual void kill() override
     {
@@ -152,19 +152,20 @@ public:
     {
         ActivityTimer s(slaveTimerStats, timeActivities);
         PARENT::start();
-        bool hintunsortedoutput = getOptBool(THOROPT_UNSORTED_OUTPUT, (JFreorderable & helper->getJoinFlags()) != 0);
-        bool hintparallelmatch = getOptBool(THOROPT_PARALLEL_MATCH, hintunsortedoutput); // i.e. unsorted, implies use parallel by default, otherwise no point
+        // unsorted_output hint removed: the compiler tracks sort order and isn't aware of it, so reordering can only be driven by JFreorderable
+        bool unsortedOutput = (JFreorderable & helper->getJoinFlags()) != 0;
+        bool hintParallelMatch = getOptBool(THOROPT_PARALLEL_MATCH, unsortedOutput); // i.e. unsorted, implies use parallel by default, otherwise no point
 
         if (helper->getJoinFlags()&JFlimitedprefixjoin)
         {
             CriticalBlock b(joinHelperCrit);
             // use std join helper (less efficient but implements limited prefix)
-            joinhelper.setown(createJoinHelper(*this, helper, this, hintparallelmatch, hintunsortedoutput));
+            joinhelper.setown(createJoinHelper(*this, helper, this, hintParallelMatch, unsortedOutput));
         }
         else
         {
             CriticalBlock b(joinHelperCrit);
-            joinhelper.setown(createSelfJoinHelper(*this, helper, this, hintparallelmatch, hintunsortedoutput));
+            joinhelper.setown(createSelfJoinHelper(*this, helper, this, hintParallelMatch, unsortedOutput));
         }
         if (isLightweight)
             strm.set(inputStream);
@@ -195,6 +196,7 @@ public:
             }
             {
                 CriticalBlock b(joinHelperCrit);
+                joinhelper->gatherStats(inactiveStats);
                 joinhelper.clear();
             }
             if (strm)
@@ -224,18 +226,20 @@ public:
     virtual void getMetaInfo(ThorDataLinkMetaInfo &info) const override
     {
         initMetaInfo(info);
-        info.buffersInput = true; 
+        info.canBufferInput = true;
         info.unknownRowsOutput = true;
     }
-    virtual void serializeStats(MemoryBuffer &mb) override
+    virtual void gatherActiveStats(CRuntimeStatisticCollection &activeStats) const
     {
+        PARENT::gatherActiveStats(activeStats);
+        CriticalBlock b(joinHelperCrit);
+        if (joinhelper)
         {
-            CriticalBlock b(joinHelperCrit);
-            rowcount_t p = joinhelper?joinhelper->getLhsProgress():0;
-            stats.setStatistic(StNumLeftRows, p);
-            mergeStats(stats, sorter, spillStatistics);    // No danger of a race with reset() because that never replaces a valid sorter
+            joinhelper->gatherStats(activeStats);
+            rowcount_t p = joinhelper->getLhsProgress();
+            activeStats.setStatistic(StNumLeftRows, p);
         }
-        CSlaveActivity::serializeStats(mb);
+        mergeStats(activeStats, sorter, spillStatistics);    // No danger of a race with reset() because that never replaces a valid sorter
     }
 };
 

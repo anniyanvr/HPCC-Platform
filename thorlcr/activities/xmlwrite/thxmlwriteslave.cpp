@@ -65,10 +65,11 @@ public:
             else
                 out.set(DEFAULTXMLHEADER).newline();
             outraw->write(out.length(), out.str());
-            if (calcFileCrc)
-                fileCRC.tally(out.length(), out.str());
         }
-        Owned<IXmlWriterExt> writer = createIXmlWriterExt(helper->getXmlFlags(), 0, NULL, (kind==TAKjsonwrite) ? WTJSONRootless : WTStandard);
+        unsigned xwflags = helper->getXmlFlags();
+        if (kind==TAKjsonwrite)
+            xwflags |= XWFonlyindentroot;
+        Owned<IXmlWriterExt> writer = createIXmlWriterExt(xwflags, 0, NULL, (kind==TAKjsonwrite) ? WTJSONRootless : WTStandard);
         writer->outputBeginArray(rowTag); //need this to format rows, even if not outputting it below
         while(!abortSoon)
         {
@@ -79,8 +80,6 @@ public:
             helper->toXML((const byte *)row.get(), *writer);
             writer->outputEndNested(rowTag);
             outraw->write(writer->length(), writer->str());
-            if (calcFileCrc)
-                fileCRC.tally(writer->length(), writer->str());
             processed++;
         }
         if (!dlfn.isExternal() || lastNode()) // if external, 1 header,footer
@@ -93,8 +92,6 @@ public:
             else
                 out.set(DEFAULTXMLFOOTER).newline();
             outraw->write(out.length(), out.str());
-            if (calcFileCrc)
-                fileCRC.tally(out.length(), out.str());
         }
     }
     virtual bool wantRaw() { return true; }

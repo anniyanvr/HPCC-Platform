@@ -36,22 +36,23 @@
 
 extern ECLRTL_API RecordTranslationMode getTranslationMode(const char *val, bool isLocal)
 {
-    if (isEmptyString(val) || strToBool(val) || strieq(val, "payload"))
+    if (isEmptyString(val) || strToBool(val) || strieq(val, "payloadRemoveOnly"))
+        return RecordTranslationMode::PayloadRemoveOnly;
+    else if (strieq(val, "payload"))
         return RecordTranslationMode::Payload;
     else if (strieq(val, "alwaysDisk") || strieq(val, "disk"))
     {
         if (!isLocal)
-            throw makeStringException(0, "alwaysDisk translation mode can only be set via HINT");
+            WARNLOG("alwaysDisk translation mode should only ever be used via a HINT");
         return RecordTranslationMode::AlwaysDisk;
     }
     else if (strieq(val, "alwaysECL") || strieq(val, "ecl"))
     {
-        if (!isLocal)
-            throw makeStringException(0, "alwaysECL translation mode can only be set via HINT");
-        return RecordTranslationMode::AlwaysECL;
+        if (isLocal)
+            return RecordTranslationMode::AlwaysECL;
+        WARNLOG("Unsupported alwaysECL translation mode used globally, translation disabled - use with HINT to set locally.");
     }
-    else
-        return RecordTranslationMode::None;
+    return RecordTranslationMode::None;
 }
 
 extern ECLRTL_API const char *getTranslationModeText(RecordTranslationMode val)
@@ -61,6 +62,7 @@ extern ECLRTL_API const char *getTranslationModeText(RecordTranslationMode val)
     case RecordTranslationMode::AlwaysDisk: return "alwaysDisk";
     case RecordTranslationMode::AlwaysECL: return "alwaysECL";
     case RecordTranslationMode::Payload: return "payload";
+    case RecordTranslationMode::PayloadRemoveOnly: return "payloadRemoveOnly";
     case RecordTranslationMode::None: return "off";
     }
     throwUnexpected();
@@ -983,7 +985,10 @@ extern ECLRTL_API int getFieldNum(const char *fieldName, IOutputMetaData &  meta
     const RtlRecord r = metaVal.queryRecordAccessor(true);
     return r.getFieldNum(fieldName);
 }
-enum FieldMatchType {
+
+//The values in this enumeration are never persisted, so they can
+enum FieldMatchType : unsigned
+{
     // On a field, exactly one of the below is set, but translator returns a bitmap indicating
     // which were required (and we can restrict translation to allow some types but not others)
     match_perfect     = 0x00,    // exact type match - use memcpy
@@ -996,14 +1001,17 @@ enum FieldMatchType {
     match_none        = 0x40,    // No matching field in source - use null value
     match_recurse     = 0x80,    // Use recursive translator for child records/datasets
     match_fail        = 0x100,   // no translation possible
-    match_keychange   = 0x200,   // at least one affected field not marked as payload (set on translator)
-    match_virtual     = 0x800,   // at least one affected field is a virtual field (set on translator)
+    match_payloadaskeyed = 0x200,  // A source payload field is used as a keyed field in the destination
+    match_keyedaspayload= 0x400,   // A source keyed field is used as a payload field in the destination (should be safe)
+    match_keyedchange = 0x800,   // A keyed field has changed type, or moved location
+    match_virtual     = 0x1000,  // at least one affected field is a virtual field (set on translator)
 
     // This flag may be set in conjunction with the others
-    match_inifblock   = 0x400,   // matching to a field in an ifblock - may not be present
-    match_deblob      = 0x1000,  // source needs fetching from a blob prior to translation
-    match_dynamic     = 0x2000,  // source needs fetching from dynamic source (callback)
-    match_filepos     = 0x4000,  // type moving in or out of filepos field - cast required
+    match_reblob      = 0x0800000,  // target needs to create a blob before assigning
+    match_inifblock   = 0x1000000,  // matching to a field in an ifblock - may not be present
+    match_deblob      = 0x2000000,  // source needs fetching from a blob prior to translation
+    match_dynamic     = 0x4000000,  // source needs fetching from dynamic source (callback)
+    match_filepos     = 0x8000000,  // type moving in or out of filepos field - cast required
 };
 
 StringBuffer &describeFlags(StringBuffer &out, FieldMatchType flags)
@@ -1020,10 +1028,13 @@ StringBuffer &describeFlags(StringBuffer &out, FieldMatchType flags)
     if (flags & match_none) out.append("|none");
     if (flags & match_recurse) out.append("|recurse");
     if (flags & match_inifblock) out.append("|ifblock");
-    if (flags & match_keychange) out.append("|keychange");
+    if (flags & match_payloadaskeyed) out.append("|payloadaskeyed");
+    if (flags & match_keyedaspayload) out.append("|keyedaspayload");
+    if (flags & match_keyedchange) out.append("|keyedchange");
     if (flags & match_fail) out.append("|fail");
     if (flags & match_virtual) out.append("|virtual");
-    if (flags & match_deblob) out.append("|blob");
+    if (flags & match_deblob) out.append("|deblob");
+    if (flags & match_reblob) out.append("|reblob");
     if (flags & match_dynamic) out.append("|dynamic");
     if (flags & match_filepos) out.append("|filepos");
     assertex(out.length() > origlen);
@@ -1036,8 +1047,8 @@ inline FieldMatchType &operator|=(FieldMatchType &a, FieldMatchType b) { return 
 class GeneralRecordTranslator : public CInterfaceOf<IDynamicTransform>
 {
 public:
-    GeneralRecordTranslator(const RtlRecord &_destRecInfo, const RtlRecord &_srcRecInfo, bool _binarySource, type_vals _callbackRawType = type_any)
-        : destRecInfo(_destRecInfo), sourceRecInfo(_srcRecInfo), binarySource(_binarySource), callbackRawType(_callbackRawType)
+    GeneralRecordTranslator(const RtlRecord &_destRecInfo, const RtlRecord &_srcRecInfo, bool _binarySource, IBlobCreator * _blobCreator, type_vals _callbackRawType)
+        : destRecInfo(_destRecInfo), sourceRecInfo(_srcRecInfo), binarySource(_binarySource), blobCreator(_blobCreator), callbackRawType(_callbackRawType)
     {
         matchInfo = new MatchInfo[destRecInfo.getNumFields()];
         createMatchInfo();
@@ -1080,11 +1091,19 @@ public:
     }
     virtual bool needsNonVirtualTranslate() const override
     {
-        return (matchFlags & ~(match_link|match_virtual|match_keychange|match_inifblock)) != 0;
+        return (matchFlags & ~(match_link|match_virtual|match_payloadaskeyed|match_keyedchange|match_inifblock)) != 0;
     }
     virtual bool keyedTranslated() const override
     {
-        return (matchFlags & match_keychange) != 0;
+        return (matchFlags & match_payloadaskeyed) != 0;
+    }
+    virtual bool hasNewFields() const override
+    {
+        return (matchFlags & match_none) != 0;
+    }
+    virtual const RtlRecord & querySourceMeta() const override
+    {
+        return sourceRecInfo;
     }
 private:
     void doDescribe(unsigned indent) const
@@ -1151,8 +1170,11 @@ private:
     size32_t doTranslateOpaqueType(ARowBuilder &builder, IVirtualFieldCallback & callback, size32_t offset, const void *sourceRow) const
     {
         dbgassertex(canTranslate());
-        byte * destConditions = (byte *)alloca(destRecInfo.getNumIfBlocks() * sizeof(byte));
-        memset(destConditions, 2, destRecInfo.getNumIfBlocks() * sizeof(byte));
+        size_t ifAllocSize = destRecInfo.getNumIfBlocks() * sizeof(byte);
+        byte * destConditions = (byte *)alloca(ifAllocSize);
+        if (unlikely(ifAllocSize))
+            memset(destConditions, 2, ifAllocSize);
+
         size32_t estimate = destRecInfo.getFixedSize();
         bool hasBlobs = false;
         if (!estimate)
@@ -1210,14 +1232,15 @@ private:
                     source = rtlRow.queryRow() + sourceOffset;
                     copySize = rtlRow.getSize(matchField);
                 }
-                if (match.matchType & match_deblob)
+                if (match.matchType & (match_deblob|match_reblob))
                 {
                     offset_t blobId = sourceType->getInt(source);
                     sourceType = sourceType->queryChildType();
                     sourceOffset = 0;
                     source = callback.lookupBlob(blobId);
                     copySize = sourceType->size(source, source);
-                    hasBlobs = true;
+                    if (match.matchType & match_deblob)
+                        hasBlobs = true;
                 }
                 if (copySize == 0 && (match.matchType & match_inifblock))  // Field is missing because of an ifblock - use default value
                 {
@@ -1225,12 +1248,12 @@ private:
                 }
                 else
                 {
-                    switch (match.matchType & ~(match_inifblock|match_deblob))
+                    switch (match.matchType & ~(match_inifblock|match_deblob|match_reblob))
                     {
                     case match_perfect:
                     {
                         // Look ahead for other perfect matches and combine the copies
-                        if (!(match.matchType & match_deblob))
+                        if (!(match.matchType & (match_deblob|match_reblob)))
                         {
                             while (idx < destRecInfo.getNumFields()-1)
                             {
@@ -1245,9 +1268,19 @@ private:
                             }
                             copySize = ((const RtlRow *)sourceRow)->getOffset(matchField+1) - sourceOffset;
                         }
-                        builder.ensureCapacity(offset+copySize, field->name);
-                        memcpy(builder.getSelf()+offset, source, copySize);
-                        offset += copySize;
+                        if (match.matchType & match_reblob)
+                        {
+                            offset_t blobId = blobCreator->createBlob(copySize, source);
+                            assertex(type->getMinSize() == sizeof(offset_t));
+                            type->buildInt(builder, offset, field, blobId);
+                            offset += type->getMinSize();
+                        }
+                        else
+                        {
+                            builder.ensureCapacity(offset+copySize, field->name);
+                            memcpy(builder.getSelf()+offset, source, copySize);
+                            offset += copySize;
+                        }
                         break;
                     }
                     case match_truncate:
@@ -1470,6 +1503,7 @@ private:
     const RtlRecord &destRecInfo;
     const RtlRecord &sourceRecInfo;
     bool binarySource = true;
+    IBlobCreator * blobCreator = nullptr;
     type_vals callbackRawType;
     int fixedDelta = 0;  // total size difference from all fixed size mappings
     UnsignedArray allUnmatched;  // List of all source fields that are unmatched (so that we can trace them)
@@ -1614,7 +1648,7 @@ private:
 #endif
                 }
                 if ((field->flags & RFTMispayloadfield) == 0)
-                    matchFlags |= match_keychange;
+                    matchFlags |= match_keyedchange;    // A field that is expected to be keyed is not in the source
                 defaulted++;
                 // If dest field is in a nested record, we need to check that there's no "non-record" field in source matching current nested record name
                 if (name)
@@ -1641,6 +1675,7 @@ private:
             else
             {
                 bool deblob = false;
+                bool reblob = false;
                 const RtlTypeInfo *sourceType = sourceRecInfo.queryType(info.matchIdx);
                 unsigned sourceFlags = sourceRecInfo.queryField(info.matchIdx)->flags;
                 unsigned destFlags = field->flags;
@@ -1648,6 +1683,8 @@ private:
                 {
                     if (type->isBlob())
                     {
+                        if (blobCreator)
+                            reblob = true;
                     }
                     else
                     {
@@ -1684,7 +1721,8 @@ private:
                         {
                             const RtlRecord *subDest = destRecInfo.queryNested(idx);
                             const RtlRecord *subSrc = sourceRecInfo.queryNested(info.matchIdx);
-                            info.subTrans = new GeneralRecordTranslator(*subDest, *subSrc, binarySource);
+                            assertex(subSrc);
+                            info.subTrans = new GeneralRecordTranslator(*subDest, *subSrc, binarySource, nullptr, type_any);
                             if (!info.subTrans->needsTranslate())
                             {
                                 if (!binarySource)
@@ -1718,7 +1756,7 @@ private:
                                 info.matchType = binarySource ? match_recurse : (match_recurse|match_dynamic);
                                 unsigned childFlags = info.subTrans->matchFlags;
                                 //Ignore differences in the keyed flag for child structures (it will be set later if this field is keyed)
-                                matchFlags |= (FieldMatchType)(childFlags & ~match_keychange);
+                                matchFlags |= (FieldMatchType)(childFlags & ~(match_keyedchange|match_payloadaskeyed|match_keyedaspayload));
                             }
                             else
                                 info.matchType = match_fail;
@@ -1783,6 +1821,8 @@ private:
                     info.matchType = match_typecast;
                 if (deblob)
                     info.matchType |= match_deblob;
+                if (reblob)
+                    info.matchType |= match_reblob;
                 if (sourceFlags & RFTMinifblock || field->flags & RFTMinifblock)
                     info.matchType |= match_inifblock;  // Avoids incorrect commoning up of adjacent matches
                 // MORE - could note the highest interesting fieldnumber in the source and not bother filling in offsets after that
@@ -1792,10 +1832,16 @@ private:
 
                 //Whether this field is in an ifblock, or needs to be copied by linking it do not count as changes
                 FieldMatchType maskedType = (FieldMatchType)(info.matchType & ~(match_link|match_inifblock));
-                if (((maskedType != match_perfect) || (idx != info.matchIdx)) && ((field->flags & RFTMispayloadfield) == 0 || (sourceFlags & RFTMispayloadfield) == 0))
-                    matchFlags |= match_keychange;
-                else if ((field->flags & RFTMispayloadfield) != (sourceFlags & RFTMispayloadfield))
-                    matchFlags |= match_keychange;
+                if (((maskedType != match_perfect) || (idx != info.matchIdx)) && ((field->flags & RFTMispayloadfield) == 0))
+                    matchFlags |= match_keyedchange;    // The destination treats this field as keyed, and the type or position of this field is different
+
+                if ((field->flags & RFTMispayloadfield) != (sourceFlags & RFTMispayloadfield))
+                {
+                    if (sourceFlags & RFTMispayloadfield)
+                        matchFlags |= match_payloadaskeyed;   // Source is not keyed, but the ecl is expecting it to be
+                    else
+                        matchFlags |= match_keyedaspayload;   // Source is keyed but ecl is not expecting it to be
+                }
             }
             matchFlags |= info.matchType;
         }
@@ -1810,7 +1856,7 @@ private:
                 {
                     // unmatched field
                     if ((field->flags & RFTMispayloadfield) == 0)
-                        matchFlags |= match_keychange;
+                        matchFlags |= match_keyedaspayload;   // A keyed field is treated as non keyed (and ignored)
                     if (!destRecInfo.getFixedSize())
                     {
                         const RtlTypeInfo *type = field->type;
@@ -1893,16 +1939,169 @@ private:
     }
 };
 
+extern ECLRTL_API const IDynamicTransform *createRecordBlobTranslator(const RtlRecord &_destRecInfo, const RtlRecord &_srcRecInfo, IBlobCreator * blobCreator)
+{
+    return new GeneralRecordTranslator(_destRecInfo, _srcRecInfo, true, blobCreator, type_any);
+}
+
 extern ECLRTL_API const IDynamicTransform *createRecordTranslator(const RtlRecord &destRecInfo, const RtlRecord &srcRecInfo)
 {
-    return new GeneralRecordTranslator(destRecInfo, srcRecInfo, true);
+    return new GeneralRecordTranslator(destRecInfo, srcRecInfo, true, nullptr, type_any);
 }
 
 extern ECLRTL_API const IDynamicTransform *createRecordTranslatorViaCallback(const RtlRecord &destRecInfo, const RtlRecord &srcRecInfo, type_vals rawType)
 {
-    return new GeneralRecordTranslator(destRecInfo, srcRecInfo, false, rawType);
+    return new GeneralRecordTranslator(destRecInfo, srcRecInfo, false, nullptr, rawType);
 }
 
+//---------------------------------------------------------------------------------------------------------------------
+
+class CloneVirtualRecordTranslator : public CInterfaceOf<IDynamicTransform>
+{
+public:
+    CloneVirtualRecordTranslator(const RtlRecord &_destRecInfo, IOutputMetaData & _sourceMeta)
+        : destRecInfo(_destRecInfo), sourceMeta(_sourceMeta)
+    {
+        init();
+    }
+// IDynamicTransform impl.
+    virtual void describe() const override
+    {
+        doDescribe(0);
+    }
+    virtual size32_t translate(ARowBuilder &builder, IVirtualFieldCallback & callback, const byte *sourceRec) const override
+    {
+        size32_t sourceSize = sourceMeta.getRecordSize(sourceRec);
+        return doAppendVirtuals(builder, callback, 0, sourceSize, sourceRec);
+    }
+    virtual size32_t translate(ARowBuilder &builder, IVirtualFieldCallback & callback, const RtlRow &sourceRow) const override
+    {
+        const byte * source = sourceRow.queryRow();
+        size32_t sourceSize = sourceMeta.getRecordSize(source);
+        return doAppendVirtuals(builder, callback, 0, sourceSize, source);
+    }
+    virtual size32_t translate(ARowBuilder &builder, IVirtualFieldCallback & callback, const IDynamicFieldValueFetcher & fetcher) const override
+    {
+        throwUnexpected();
+    }
+    virtual bool canTranslate() const override
+    {
+        return true;
+    }
+    virtual bool needsTranslate() const override
+    {
+        return true;
+    }
+    virtual bool needsNonVirtualTranslate() const override
+    {
+        return false;
+    }
+    virtual bool keyedTranslated() const override
+    {
+        return false;
+    }
+    virtual bool hasNewFields() const override
+    {
+        return false;
+    }
+    virtual const RtlRecord & querySourceMeta() const override
+    {
+        return sourceMeta.queryRecordAccessor(true);
+    }
+private:
+    void doDescribe(unsigned indent) const
+    {
+        for (unsigned idx = firstVirtual; idx < destRecInfo.getNumFields(); idx++)
+        {
+            const RtlFieldInfo *field = destRecInfo.queryField(idx);
+            const char * dest = destRecInfo.queryName(idx);
+            const char * result = "";
+            switch (getVirtualInitializer(field->initializer))
+            {
+            case FVirtualFilePosition:
+                result = "FILEPOSITION";
+                break;
+            case FVirtualLocalFilePosition:
+                result = "LOCALFILEPOSITION";
+                break;
+            case FVirtualFilename:
+                result = "LOGICALFILENAME";
+                break;
+            }
+            DBGLOG("Use virtual(%s) for field %s", result, dest);
+        }
+    }
+    size32_t doAppendVirtuals(ARowBuilder &builder, IVirtualFieldCallback & callback, size32_t offset, size32_t sourceSize, const void *sourceRow) const
+    {
+        size32_t estimate = sourceSize + fixedVirtualSize;
+        builder.ensureCapacity(offset+estimate, "record");
+        memcpy(builder.getSelf() + offset, sourceRow, sourceSize);
+
+        unsigned destOffset = offset + sourceSize;
+        for (unsigned idx = firstVirtual; idx < destRecInfo.getNumFields(); idx++)
+        {
+            const RtlFieldInfo *field = destRecInfo.queryField(idx);
+            const RtlTypeInfo *type = field->type;
+            switch (getVirtualInitializer(field->initializer))
+            {
+            case FVirtualFilePosition:
+                destOffset = type->buildInt(builder, destOffset, field, callback.getFilePosition(sourceRow));
+                break;
+            case FVirtualLocalFilePosition:
+                destOffset = type->buildInt(builder, destOffset, field, callback.getLocalFilePosition(sourceRow));
+                break;
+            case FVirtualFilename:
+                {
+                    const char * filename = callback.queryLogicalFilename(sourceRow);
+                    destOffset = type->buildString(builder, destOffset, field, strlen(filename), filename);
+                    break;
+                }
+            default:
+                throwUnexpected();
+            }
+        }
+        return destOffset;
+    }
+
+    void init()
+    {
+        unsigned idx = 0;
+        for (; idx < destRecInfo.getNumFields(); idx++)
+        {
+            const RtlFieldInfo *field = destRecInfo.queryField(idx);
+            const byte * initializer = (const byte *) field->initializer;
+            if (isVirtualInitializer(initializer))
+                break;
+        }
+        firstVirtual = idx;
+
+        size32_t size = 0;
+        for (; idx < destRecInfo.getNumFields(); idx++)
+        {
+            const RtlFieldInfo *field = destRecInfo.queryField(idx);
+            const RtlTypeInfo *type = field->type;
+            const byte * initializer = (const byte *) field->initializer;
+            assertex(isVirtualInitializer(initializer));
+            size += type->getMinSize();
+        }
+
+        fixedVirtualSize = size;
+    }
+
+protected:
+    const RtlRecord &destRecInfo;
+    IOutputMetaData & sourceMeta;
+    unsigned firstVirtual = 0;
+    size32_t fixedVirtualSize = 0;
+};
+
+
+extern ECLRTL_API const IDynamicTransform *createCloneVirtualRecordTranslator(const RtlRecord &_destRecInfo, IOutputMetaData & _source)
+{
+    return new CloneVirtualRecordTranslator(_destRecInfo, _source);
+}
+
+//---------------------------------------------------------------------------------------------------------------------
 extern ECLRTL_API void throwTranslationError(const RtlRecord & destRecInfo, const RtlRecord & srcRecInfo, const char * filename)
 {
     Owned<const IDynamicTransform> translator = createRecordTranslator(destRecInfo, srcRecInfo);

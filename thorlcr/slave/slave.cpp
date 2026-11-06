@@ -70,7 +70,7 @@ void ProcessSlaveActivity::beforeDispose()
 void ProcessSlaveActivity::startProcess(bool async)
 {
     if (async)
-        threaded.start();
+        threaded.start(true);
     else
         threadmain();
 }
@@ -276,7 +276,7 @@ class CGenericSlaveGraphElement : public CSlaveGraphElement
     bool wuidread2diskread; // master decides after interrogating result and sneaks in info before slave creates
     StringAttr wuidreadFilename;
     Owned<CActivityBase> nullActivity;
-    CriticalSection nullActivityCs;
+    CriticalSection nullActivityCs{SYNC_LOCATION};
 public:
     CGenericSlaveGraphElement(CGraphBase &_owner, IPropertyTree &xgmml, CGraphBase *resultsGraph) : CSlaveGraphElement(_owner, xgmml, resultsGraph)
     {
@@ -503,6 +503,9 @@ public:
             case TAKcombine:
                 ret = createCombineSlave(this);
                 break;
+            case TAKcombinegroup:
+                ret = createCombineGroupSlave(this);
+                break;
             case TAKregroup:
                 ret = createRegroupSlave(this);
                 break;
@@ -669,6 +672,9 @@ public:
                 break;
             case TAKsimpleaction:
                 ret = createNullSlave(this);
+                break;
+            case TAKemptyaction:
+                ret = createNullSinkSlave(this);
                 break;
             case TAKtopn:
                 if (queryGrouped())

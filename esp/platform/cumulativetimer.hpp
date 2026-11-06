@@ -47,6 +47,8 @@ public:
 
     inline void setLogLevel(const LogLevel _logLevel) { logLevel = _logLevel; };
     inline LogLevel getLogLevel() const { return logLevel; }
+    inline void setGroup(const unsigned int _group) { group = _group; }
+    inline unsigned int getGroup() const { return group; }
     inline unsigned __int64 getTotalMillis() const { return mTotalTime; }
     inline void reset() { mTotalTime = 0; }
 
@@ -58,7 +60,7 @@ public:
     struct Scope
     {
         Scope(CumulativeTimer* t)
-            : mTimer(t), mStart(0)
+            : mStart(0), mTimer(t)
         {
             if (mTimer)
                 mTimer->incNesting();
@@ -101,6 +103,7 @@ private:
     unsigned __int64 mNestingDepth;
     unsigned __int64 mTotalTime;
     LogLevel logLevel = 0;
+    unsigned int group = TXSUMMARY_GRP_CORE;
 
 private:
     CumulativeTimer& operator =(const CumulativeTimer&) = delete;

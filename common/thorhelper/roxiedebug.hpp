@@ -220,7 +220,7 @@ protected:
         WatchStateContinue
     };
 
-    CriticalSection breakCrit;
+    CriticalSection breakCrit{SYNC_LOCATION};
 
     mutable MapStringToMyClass<IGlobalEdgeRecord> globalCounts;
 
@@ -251,11 +251,11 @@ protected:
     Linked<IActivityDebugContext> currentActivity;
     Linked<IActivityDebugContext> nextActivity; // Hmmm - needs to be cleared on slave when cleared on server though...
     Linked<IException> currentException; // ditto
-    mutable CriticalSection debugCrit;
+    mutable CriticalSection debugCrit{SYNC_LOCATION};
     const IContextLogger &logctx;
     DebugState currentState; // What program was doing when it was interrupted
     unsigned debuggerActive;
-    Semaphore debuggerSem;
+    Semaphore debuggerSem{SYNC_LOCATION};
     cycle_t debugCyclesAdjust;
 
     static const char * queryStateString(DebugState state);
@@ -303,7 +303,7 @@ protected:
     StringAttr debugId;
 
     Owned<IPropertyTree> queryXGMML;
-    Semaphore debugeeSem;
+    Semaphore debugeeSem{SYNC_LOCATION};
 
     StringAttr queryName;
     unsigned previousSequence;
@@ -318,40 +318,45 @@ protected:
                                    unsigned hitCount=0, const char *hitCountMode=NULL);
     virtual void waitForDebugger(DebugState state, IActivityDebugContext *probe);
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(CBaseDebugContext);
     CBaseServerDebugContext(const IContextLogger &_logctx, IPropertyTree *_queryXGMML) ;
+
+//Avoid complaints about mismatched prototypes for virtuals
+    using CBaseDebugContext::addBreakpoint;
+    using CBaseDebugContext::removeBreakpoint;
+
     void serializeBreakpoints(MemoryBuffer &to);
-    virtual void debugInitialize(const char *id, const char *_queryName, bool _breakAtStart);
-    virtual void debugTerminate();
+    virtual void debugInitialize(const char *id, const char *_queryName, bool _breakAtStart) override;
+    virtual void debugTerminate() override;
     virtual void addBreakpoint(IXmlWriter *output, const char *modeString, const char *id, const char *action, 
                                const char *fieldName, const char *condition, const char *value, bool caseSensitive,
-                               unsigned hitCount, const char *hitCountMode);
-    virtual void removeBreakpoint(IXmlWriter *output, unsigned removeIdx);
-    virtual void removeAllBreakpoints(IXmlWriter *output);
-    virtual void listBreakpoint(IXmlWriter *output, unsigned listIdx) const;
-    virtual void listAllBreakpoints(IXmlWriter *output) const;
-    virtual void debugInterrupt(IXmlWriter *output);
-    virtual void debugContinue(IXmlWriter *output, const char *modeString, const char *id);
-    virtual void debugRun(IXmlWriter *output) ;
-    virtual void debugQuit(IXmlWriter *output) ;
-    virtual void debugSkip(IXmlWriter *output);
-    virtual void debugStatus(IXmlWriter *output) const;
-    virtual void debugStep(IXmlWriter *output, const char *modeString);
-    virtual void debugNext(IXmlWriter *output);
-    virtual void debugOver(IXmlWriter *output);
-    virtual void debugChanges(IXmlWriter *output, unsigned sinceSequence) const;
-    virtual void debugCounts(IXmlWriter *output, unsigned sinceSequence, bool reset);
-    virtual void debugWhere(IXmlWriter *output) const;
-    virtual void debugSearch(IXmlWriter *output, const char *fieldName, const char *condition, const char *value, bool caseSensitive, bool fullRows) const;
-    virtual void debugPrint(IXmlWriter *output, const char *edgeId, unsigned startRow, unsigned numRows) const;
-    virtual void debugGetConfig(IXmlWriter *output, const char *name, const char *id) const;
-    virtual void debugSetConfig(IXmlWriter *output, const char *name, const char *value, const char *id);
-    virtual void getCurrentGraphXGMML(IXmlWriter *output, bool original) const;
-    virtual void getQueryXGMML(IXmlWriter *output) const;
-    virtual void getGraphXGMML(IXmlWriter *output, const char *graphName) const;
-    virtual const char *queryQueryName() const;
-    virtual const char *queryDebugId() const;
-    virtual void debugPrintVariable(IXmlWriter *output, const char *name, const char *type) const;
+                               unsigned hitCount, const char *hitCountMode) override;
+    virtual void removeBreakpoint(IXmlWriter *output, unsigned removeIdx) override;
+    virtual void removeAllBreakpoints(IXmlWriter *output) override;
+    virtual void listBreakpoint(IXmlWriter *output, unsigned listIdx) const override;
+    virtual void listAllBreakpoints(IXmlWriter *output) const override;
+    virtual void debugInterrupt(IXmlWriter *output) override;
+    virtual void debugContinue(IXmlWriter *output, const char *modeString, const char *id) override;
+    virtual void debugRun(IXmlWriter *output)  override;
+    virtual void debugQuit(IXmlWriter *output)  override;
+    virtual void debugSkip(IXmlWriter *output) override;
+    virtual void debugStatus(IXmlWriter *output) const override;
+    virtual void debugStep(IXmlWriter *output, const char *modeString) override;
+    virtual void debugNext(IXmlWriter *output) override;
+    virtual void debugOver(IXmlWriter *output) override;
+    virtual void debugChanges(IXmlWriter *output, unsigned sinceSequence) const override;
+    virtual void debugCounts(IXmlWriter *output, unsigned sinceSequence, bool reset) override;
+    virtual void debugWhere(IXmlWriter *output) const override;
+    virtual void debugSearch(IXmlWriter *output, const char *fieldName, const char *condition, const char *value, bool caseSensitive, bool fullRows) const override;
+    virtual void debugPrint(IXmlWriter *output, const char *edgeId, unsigned startRow, unsigned numRows) const override;
+    virtual void debugGetConfig(IXmlWriter *output, const char *name, const char *id) const override;
+    virtual void debugSetConfig(IXmlWriter *output, const char *name, const char *value, const char *id) override;
+    virtual void getCurrentGraphXGMML(IXmlWriter *output, bool original) const override;
+    virtual void getQueryXGMML(IXmlWriter *output) const override;
+    virtual void getGraphXGMML(IXmlWriter *output, const char *graphName) const override;
+    virtual const char *queryQueryName() const override;
+    virtual const char *queryDebugId() const override;
+    virtual void debugPrintVariable(IXmlWriter *output, const char *name, const char *type) const override;
 };
 
 //=======================================================================================
@@ -388,7 +393,7 @@ protected:
 
     IDebuggableContext *debugContext;
     StringAttr graphName;
-    mutable CriticalSection crit;
+    mutable CriticalSection crit{SYNC_LOCATION};
     unsigned id;
     StringBuffer idString;
     mutable memsize_t proxyId; // MORE - does it need to be threadsafe?

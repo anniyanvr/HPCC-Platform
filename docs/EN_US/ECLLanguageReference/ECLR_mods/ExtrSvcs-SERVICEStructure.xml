@@ -8,7 +8,8 @@
 
   <para><emphasis>servicename </emphasis><emphasis role="bold">:= SERVICE [ :
   </emphasis><emphasis>defaultkeywords</emphasis><emphasis role="bold">
-  ]</emphasis><emphasis role="bold"> </emphasis><emphasis></emphasis></para>
+  [,TIME[(</emphasis><emphasis>label<emphasis
+  role="bold">)]]]</emphasis></emphasis></para>
 
   <para><emphasis> prototype </emphasis>:
   <emphasis>keywordlist</emphasis>;<emphasis role="bold"> </emphasis></para>
@@ -17,9 +18,9 @@
 
   <para><informaltable colsep="1" frame="all" rowsep="1">
       <tgroup cols="2">
-        <colspec colwidth="85.30pt" />
+        <colspec colwidth="85.30pt"/>
 
-        <colspec />
+        <colspec/>
 
         <tbody>
           <row>
@@ -35,6 +36,20 @@
             <entry>Optional. A comma-delimited list of default keywords and
             their values shared by all prototypes in the external
             service.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis role="bold">TIME</emphasis></entry>
+
+            <entry>Tracks timing of all function calls in the SERVICE
+            structure and reports them back as metrics to the user.</entry>
+          </row>
+
+          <row>
+            <entry><emphasis>label</emphasis></entry>
+
+            <entry>Optional. A string constant containing the name to
+            associate with the timer. If omitted, the default is used.</entry>
           </row>
 
           <row>
@@ -62,13 +77,19 @@
 
   <para>Example:</para>
 
-  <programlisting>  email := SERVICE
+  <programlisting>  email := SERVICE :TIME('MyTime')
     simpleSend( STRING address,
             STRING template,
             STRING subject) : LIBRARY='ecl2cw',
                  INITFUNCTION='initEcl2Cw';
     END;
-  MyAttr := COUNT(Trades): FAILURE(email.simpleSend('help@ln_risk.com',
+
+  display := SERVICE
+    echo(CONST STRING src)
+      : entrypoint='rtlEcho',DEPRECATED('Use function echoecho instead.');
+  END;
+<!--#synthpii-->
+  MyAttr := COUNT(Trades): FAILURE(email.simpleSend('help@example.com',
                           'FailTemplate',
                           'COUNT failure'));
   //An example of a SERVICE function returning a structured record
@@ -122,5 +143,6 @@
   END;
 </programlisting>
 
-  <para>See Also: <link linkend="External_Service_Implementation">External Service Implementation</link>, <link linkend="CONST">CONST</link></para>
+  <para>See Also: <link linkend="External_Service_Implementation">External
+  Service Implementation</link>, <link linkend="CONST">CONST</link></para>
 </sect1>

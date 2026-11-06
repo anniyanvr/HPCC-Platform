@@ -27,6 +27,7 @@ interface IWorkUnit;
 
 extern HQLCPP_API double getECLcomplexity(IHqlExpression * exprs, IErrorReceiver * errs, IWorkUnit *wu, ClusterType targetClusterType);
 extern HQLCPP_API void dumpActivityCounts();
+extern HQLCPP_API CompilerType queryCompilerType(IConstWorkUnit * wu, CompilerType defaultCompiler);
 
 enum EclGenerateTarget { 
     EclGenerateNone, 
@@ -48,11 +49,11 @@ public:
     virtual void addManifest(const char *filename) = 0;
     virtual void addManifestsFromArchive(IPropertyTree *archive) = 0;
     virtual void addWebServiceInfo(IPropertyTree *wsinfo) = 0;
-    virtual void setSaveGeneratedFiles(bool value) = 0;
+    virtual void setSaveGeneratedFiles(bool save, bool publish) = 0;
     virtual void addArchiveAsResource(StringBuffer &buf) = 0;
 };
 
-extern HQLCPP_API IHqlExprDllGenerator * createDllGenerator(IErrorReceiver * errs, const char *wuname, const char * targetdir, IWorkUnit *wu, ClusterType targetClusterType, ICodegenContextCallback * ctxCallback, bool checkForLocalFileUploads, bool okToAbort);
+extern HQLCPP_API IHqlExprDllGenerator * createDllGenerator(IErrorReceiver * errs, const char *wuname, const char * targetdir, IWorkUnit *wu, ClusterType targetClusterType, ICodegenContextCallback * ctxCallback, bool checkForLocalFileUploads, bool okToAbort, CompilerType compilerType);
 
 
 //Extract a single level of external libraries.

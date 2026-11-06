@@ -25,7 +25,7 @@ import traceback
 
 from ...common.shell import Shell
 from ...common.error import Error
-from ...util.util import queryWuid, getConfig, clearOSCache
+from ...util.util import queryWuid, getConfig, clearOSCache, printException
 
 import xml.etree.ElementTree as ET
 
@@ -50,9 +50,9 @@ class ECLcmd(Shell):
         args.append('--port=' + self.config.espSocket)
         if self.config.useSsl.lower() == 'true':
             args.append('--ssl')
-        
+
         retryCount = int(kwargs.pop('retryCount',  1))
-        args.append('--wait='+str(retryCount * eclfile.getTimeout() * 1000))  # ms
+        args.append('--wait='+str( ( retryCount * eclfile.getTimeout() + 5 * 60  )* 1000 ))  # + 5 minutes/300 sec to avoid ecl command and RTE timeout clash (ms)
 
         server = kwargs.pop('server', False)
         if server:
@@ -67,6 +67,11 @@ class ECLcmd(Shell):
             args.append("--password=" + password)
 
         args = args + eclfile.getFParameters() + eclfile.getExtraDParameters()
+
+        if eclfile.isEclXml:
+            # Ignore archive major-version mismatch warning when submitting
+            # eclxml created by a different release.
+            args.append('-feclcc-w3118=ignore')
 
         if cmd == 'publish':
             args.append(eclfile.getArchiveName())
@@ -83,6 +88,9 @@ class ECLcmd(Shell):
             args.append('--exception-level=warning')
             args.append('--noroot')
 
+            if self.config.usePoll.lower() == 'true':
+                args.append('--poll')
+                
             name = kwargs.pop('name', False)
             if not name:
                 name = eclfile.getJobname()
@@ -100,6 +108,7 @@ class ECLcmd(Shell):
         wuid = "N/A"
         state = ""
         results=''
+        test = False
         try:
             if eclfile.flushDiskCache():
                 # At the moment it is not a critical problem if the clearOSCache()
@@ -115,6 +124,7 @@ class ECLcmd(Shell):
             logger.debug("%3d. stderr :'%s'", eclfile.getTaskId(),  stderr)
             data = '\n'.join(line for line in
                              results.split('\n') if line) + "\n"
+
             ret = data.split('\n')
             result = ""
             cnt = 0
@@ -130,28 +140,38 @@ class ECLcmd(Shell):
                 if "aborted" in i:
                     state = "aborted"
                 if cnt > 4:
-                    if i.startswith('<Warning>') or i.startswith('<Exception>'):
+                    if (i.startswith('<Warning>') or i.startswith('<Exception>')) and ('Filename' in i ):
                         # Remove absolute path from filename to 
                         # enable to compare it with same part of keyfile
-                        xml = ET.fromstring(i)
                         try:
+                            xml = ET.fromstring(i)
                             path = xml.find('.//Filename').text
                             logger.debug("%3d. path:'%s'", eclfile.getTaskId(),  path )
                             filename = os.path.basename(path)
                             xml.find('.//Filename').text = filename
-                        except:
-                            logger.debug("%3d. Unexpected error: %s (line: %s) ", eclfile.getTaskId(), str(sys.exc_info()[0]), str(inspect.stack()[0][2]))
+                        except Exception as e: 
+                            logger.debug("%3d. Unexpected error: %s - %s (line: %s) ", eclfile.getTaskId(), str(sys.exc_info()[0]), str(e), str(inspect.stack()[0][2]))
+                            printException(repr(e) + " runCmd()",  debug=False)
+                            
                         finally:
-                            i = ET.tostring(xml).decode("utf-8")
+                            i = ET.tostring(xml, short_empty_elements=False).decode("utf-8")
                         logger.debug("%3d. ret:'%s'", eclfile.getTaskId(),  i )
                         pass
-                    try:    
-                        result += i + "\n"
+
+                    try:
+                        # "ecl run .... --poll" inserts 2 or 3 more lines and <Result> and </Result> tags into the result, filter them out
+                        if not ( i.startswith("Polling for") or i.startswith("Getting Workunit") or i.startswith("Getting Results") or i.startswith("Retrieving Results") or i.startswith("<Result>") or i.startswith("</Result>")):
+                            result += i + "\n"
                     except:
                         logger.error("%3d. type of i: '%s', i: '%s'", eclfile.getTaskId(), type(i), i )
                 cnt += 1
             data = '\n'.join(line for line in
-                             result.split('\n') if line) + "\n"
+                             result.split('\n') if line) 
+
+            if len(stderr) > 0 and stderr.startswith('eclcc') :  
+                data += '\n'.join(line for line in stderr.split('\n') if line and (' Warning ' not in line) and (' Info ' not in line) and ('0 error(s)' not in line)  ) 
+                
+            data += '\n'
 
         except Error as err:
             data = str(err)
@@ -164,6 +184,15 @@ class ECLcmd(Shell):
             raise err
         finally:
             res = queryWuid(eclfile.getJobname(), eclfile.getTaskId())
+            if not res['wuid'].strip().startswith('W'):
+                tryCount = 5
+                while  tryCount > 0:
+                    tryCount -= 1
+                    res = queryWuid(eclfile.getJobname(), eclfile.getTaskId())
+                    if res['wuid'].strip().startswith('W'):
+                        break
+                    logger.debug("%3d. in finally -> 'wuid':'%s', 'state':'%s', attempt: %d, ", eclfile.getTaskId(), res['wuid'], res['state'],  tryCount)
+
             logger.debug("%3d. in finally -> 'wuid':'%s', 'state':'%s', data':'%s', ", eclfile.getTaskId(), res['wuid'], res['state'], data)
             if wuid ==  'N/A':
                 logger.debug("%3d. in finally queryWuid() -> 'result':'%s', 'wuid':'%s', 'state':'%s'", eclfile.getTaskId(),  res['result'],  res['wuid'],  res['state'])
@@ -222,18 +251,32 @@ class ECLcmd(Shell):
                 elif (res['state'] == 'failed'):
                     logger.debug("%3d. in state == failed 'wuid':'%s', 'state':'%s', data':'%s', ", eclfile.getTaskId(), res['wuid'], res['state'], data)
                     resultLines = data.strip().split('\n')
+                    resultLinesLen = len(resultLines)
                     resultLineIndex = 0;
-                    while resultLineIndex < len(resultLines) and not resultLines[resultLineIndex].startswith('<'):
+                    #                                                 It has some output but not an '<Exceptin>' only what should compare
+                    while resultLineIndex <resultLinesLen and  resultLines[resultLineIndex].startswith('<Exception'):
+                        logger.debug("%3d. resultLineIndex:%d, resultLinesLen:%d, resultLines[%s]:'%s' )", eclfile.getTaskId(), resultLineIndex, resultLinesLen, resultLineIndex,  resultLines[resultLineIndex])
                         resultLineIndex += 1
-                    logger.debug("%3d. State is fail (resultLineIndex:%d, resultLines:'%s' )", eclfile.getTaskId(), resultLineIndex,  resultLines)
-                    data = '\n'.join(resultLines[resultLineIndex:])+ "\n"
-                    eclfile.addResults(data, wuid)
+                    logger.debug("%3d. State is fail (resultLineIndex:%d, resultLinesLen:%d, resultLines:'%s' )", eclfile.getTaskId(), resultLineIndex, resultLinesLen, resultLines)
                     logger.debug("%3d. State is fail (resultLineIndex:%d, data:'%s' )", eclfile.getTaskId(), resultLineIndex,  data)
-                    test = eclfile.testResults()
+                    if ( resultLinesLen > 0 ):
+                        # We have some output
+                        if ( resultLineIndex < resultLinesLen ) and ( not resultLines[resultLineIndex].startswith('Error (') ) and not resultLines[resultLineIndex].startswith('<Exception') and not resultLines[resultLineIndex].startswith('eclcc'):
+                            # The output contains some '<Result>' like workflow_contingency_*.ecl compare it and report
+                            eclfile.addResults(data, wuid)
+                            test = eclfile.testResults()
+                        else:
+                            # The output contains '<Exception>' don't compare the output with the key file, but report the error
+                            test = False
+                            eclfile.diff = ("%3d. Test: %s\n") % (eclfile.taskId, eclfile.getBaseEclRealName())
+                            eclfile.diff += data
+                    else:
+                        # We have no output (happens in Cloud) report it and avoid to compare with key file. 
+                        test = False
+                        eclfile.diff = ("%3d. Test: %s\n") % (eclfile.taskId, eclfile.getBaseEclRealName())
+                        eclfile.diff += '\tNo output\n'
                 else:
                     test = eclfile.testResults()
             report.addResult(eclfile)
-            if not test:
-                return False
-            else:
-                return True
+
+        return test

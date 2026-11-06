@@ -1,25 +1,92 @@
-﻿import * as declare from "dojo/_base/declare";
-import * as lang from "dojo/_base/lang";
-import * as Observable from "dojo/store/Observable";
-import * as topic from "dojo/topic";
+﻿import { declare, lang, Observable, topic } from "src-dojo/index";
 import * as ESPRequest from "./ESPRequest";
 import * as ESPUtil from "./ESPUtil";
 import * as FileSpray from "./FileSpray";
 import nlsHPCC from "./nlsHPCC";
 import * as Utility from "./Utility";
 
+import { FileSprayService, FileSpray as FileSprayNS } from "@hpcc-js/comms";
+import { scopedLogger } from "@hpcc-js/util";
+
+import { Paged } from "./store/Paged";
+import { BaseStore } from "./store/Store";
+
+const logger = scopedLogger("src/ESPDFUWorkunit.ts");
+
 const i18n = nlsHPCC;
 
-const Store = declare([ESPRequest.Store], {
-    service: "FileSpray",
-    action: "GetDFUWorkunits",
-    responseQualifier: "GetDFUWorkunitsResponse.results.DFUWorkunit",
-    responseTotalQualifier: "GetDFUWorkunitsResponse.NumWUs",
-    idProperty: "ID",
-    startProperty: "PageStartFrom",
-    countProperty: "PageSize",
+export function getProtectedImage(isProtected: boolean) {
+    if (isProtected) {
+        return Utility.getImageURL("locked.png");
+    }
+    return Utility.getImageURL("unlocked.png");
+}
 
-    _watched: [],
+export function getStateIconClass(state: number) {
+    switch (state) {
+        case 1:
+            return "iconWarning";
+        case 2:
+            return "iconSubmitted";
+        case 3:
+            return "iconRunning";
+        case 4:
+            return "iconFailed";
+        case 5:
+            return "iconFailed";
+        case 6:
+            return "iconCompleted";
+        case 7:
+            return "iconRunning";
+        case 8:
+            return "iconAborting";
+        case 9:
+            return "iconWarning";
+        case 999:
+            return "iconDeleted";
+    }
+    return "iconWorkunit";
+}
+
+export function getStateImage(state: number) {
+    switch (state) {
+        case 1:
+            return Utility.getImageURL("workunit_warning.png");
+        case 2:
+            return Utility.getImageURL("workunit_submitted.png");
+        case 3:
+            return Utility.getImageURL("workunit_running.png");
+        case 4:
+            return Utility.getImageURL("workunit_failed.png");
+        case 5:
+            return Utility.getImageURL("workunit_failed.png");
+        case 6:
+            return Utility.getImageURL("workunit_completed.png");
+        case 7:
+            return Utility.getImageURL("workunit_running.png");
+        case 8:
+            return Utility.getImageURL("workunit_aborting.png");
+        case 9:
+            return Utility.getImageURL("workunit_warning.png");
+        case 999:
+            return Utility.getImageURL("workunit_deleted.png");
+    }
+    return Utility.getImageURL("workunit.png");
+}
+
+class Store extends ESPRequest.Store {
+
+    service = "FileSpray";
+    action = "GetDFUWorkunits";
+    responseQualifier = "GetDFUWorkunitsResponse.results.DFUWorkunit";
+    responseTotalQualifier = "GetDFUWorkunitsResponse.NumWUs";
+    idProperty = "ID";
+
+    startProperty = "PageStartFrom";
+    countProperty = "PageSize";
+
+    _watched = [];
+
     preRequest(request) {
         switch (request.Sortby) {
             case "ClusterName":
@@ -35,13 +102,15 @@ const Store = declare([ESPRequest.Store], {
                 request.Sortby = "State";
                 break;
         }
-    },
+    }
+
     create(id) {
         return new Workunit({
             ID: id,
             Wuid: id
         });
-    },
+    }
+
     update(id, item) {
         const storeItem = this.get(id);
         storeItem.updateData(item);
@@ -54,7 +123,7 @@ const Store = declare([ESPRequest.Store], {
             });
         }
     }
-});
+}
 
 const Workunit = declare([ESPUtil.Singleton, ESPUtil.Monitor], { // jshint ignore:line
     //  Asserts  ---
@@ -166,22 +235,22 @@ const Workunit = declare([ESPUtil.Singleton, ESPUtil.Monitor], { // jshint ignor
             "JobNameOrig": this.JobName
         };
 
-        const context = this;
-        FileSpray.UpdateDFUWorkunit({
+        return FileSpray.UpdateDFUWorkunit({
             request: outerRequest
-        }).then(function (response) {
-            context.refresh();
         });
     },
     submit(target) {
     },
-    fetchXML(onFetchXML) {
-        FileSpray.DFUWUFile({
+    fetchXML(onFetchXML?) {
+        return FileSpray.DFUWUFile({
             request: {
                 Wuid: this.Wuid
             }
         }).then(function (response) {
-            onFetchXML(response);
+            if (onFetchXML) {
+                onFetchXML(response);
+            }
+            return response;
         });
     },
     _resubmit(clone, resetWorkflow, callback) {
@@ -232,56 +301,13 @@ const Workunit = declare([ESPUtil.Singleton, ESPUtil.Monitor], { // jshint ignor
         return this.State;
     },
     getProtectedImage() {
-        if (this.isProtected) {
-            return Utility.getImageURL("locked.png");
-        }
-        return Utility.getImageURL("unlocked.png");
+        return getProtectedImage(this.isProtected);
     },
     getStateIconClass() {
-        switch (this.State) {
-            case 1:
-                return "iconWarning";
-            case 2:
-                return "iconSubmitted";
-            case 3:
-                return "iconRunning";
-            case 4:
-                return "iconFailed";
-            case 5:
-                return "iconFailed";
-            case 6:
-                return "iconCompleted";
-            case 7:
-                return "iconRunning";
-            case 8:
-                return "iconAborting";
-            case 999:
-                return "iconDeleted";
-        }
-        return "iconWorkunit";
+        return getStateIconClass(this.State);
     },
     getStateImage() {
-        switch (this.State) {
-            case 1:
-                return Utility.getImageURL("workunit_warning.png");
-            case 2:
-                return Utility.getImageURL("workunit_submitted.png");
-            case 3:
-                return Utility.getImageURL("workunit_running.png");
-            case 4:
-                return Utility.getImageURL("workunit_failed.png");
-            case 5:
-                return Utility.getImageURL("workunit_failed.png");
-            case 6:
-                return Utility.getImageURL("workunit_completed.png");
-            case 7:
-                return Utility.getImageURL("workunit_running.png");
-            case 8:
-                return Utility.getImageURL("workunit_aborting.png");
-            case 999:
-                return Utility.getImageURL("workunit_deleted.png");
-        }
-        return Utility.getImageURL("workunit.png");
+        return getStateImage(this.State);
     }
 });
 
@@ -292,14 +318,43 @@ export function isInstanceOfWorkunit(obj) {
 export function Get(wuid, data?) {
     const store = new Store();
     const retVal = store.get(wuid);
-    if (data) {
+    if (data && !retVal.__hpcc_id) {
         retVal.updateData(data);
     }
     return retVal;
 }
 
-export function CreateWUQueryStore(options) {
-    let store = new Store(options);
-    store = Observable(store);
+export function CreateWUQueryStoreLegacy() {
+    let store = new Store();
+    store = new Observable(store);
     return store;
+}
+
+const service = new FileSprayService({ baseUrl: "" });
+
+export type WUQueryStore = BaseStore<FileSprayNS.GetDFUWorkunits, typeof Workunit>;
+
+export function CreateWUQueryStore(): BaseStore<FileSprayNS.GetDFUWorkunits, typeof Workunit> {
+    const store = new Paged<FileSprayNS.GetDFUWorkunits, typeof Workunit>({
+        start: "PageStartFrom",
+        count: "PageSize",
+        sortBy: "Sortby",
+        descending: "Descending"
+    }, "ID", request => {
+        request.includeTimings = true;
+        request.includeTransferRate = true;
+        return service.GetDFUWorkunits(request).then(response => {
+            return {
+                data: response?.results?.DFUWorkunit?.map(wu => Get(wu.ID, wu)) ?? [],
+                total: response.NumWUs
+            };
+        }).catch(err => {
+            logger.error(err);
+            return {
+                data: [],
+                total: 0
+            };
+        });
+    });
+    return new Observable(store);
 }

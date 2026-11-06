@@ -129,8 +129,10 @@ bool CWsWuResultOutHelper::getWUResultStreaming(CHttpRequest* request, CHttpResp
         zipFileNameWithPath.append((outFormat == WUResultOutGZIP) ? ".gz" : ".zip");
         zipResultFile(zipFileNameWithPath);
 
-        CWsWuFileHelper helper(nullptr);
-        response->setContent(helper.createIOStreamWithFileName(zipFileNameWithPath, IFOread));
+        auto stream = createIOStreamFromFile(zipFileNameWithPath, IFOread);
+        if (stream == nullptr)
+            throw makeStringExceptionV(ECLWATCH_INTERNAL_ERROR, "Cannot open stream for zip file %s", zipFileNameWithPath.str());
+        response->setContent(stream);
         if (outFormat == WUResultOutGZIP)
             response->setContentType("application/x-gzip");
         else
@@ -221,7 +223,7 @@ void CWsWuResultOutHelper::readFilterByReq()
     ForEach(*iter)
     {
         const char* keyname = iter->getPropKey();
-        const char* keyValue = reqParams->queryProp(iter->getPropKey());
+        const char* keyValue = iter->queryPropValue();
         if (isEmptyString(keyname) || isEmptyString(keyValue) || strncmp(keyname, "FilterBys", 9))
             continue;
 
@@ -240,7 +242,7 @@ void CWsWuResultOutHelper::createResultIOS()
     recursiveCreateDirectoryForFile(resultFileNameWithPath);
 
     OwnedIFile resultIFile = createIFile(resultFileNameWithPath);
-    OwnedIFileIO resultIOW = resultIFile->open(IFOcreaterw);
+    OwnedIFileIO resultIOW = resultIFile->open(IFOcreate);
     if (!resultIOW)
         throw makeStringExceptionV(ECLWATCH_CANNOT_OPEN_FILE, "Failed to open %s.", resultFileNameWithPath.str());
     resultIOS.setown(createIOStream(resultIOW));
@@ -416,8 +418,9 @@ unsigned CWsWuResultOutHelper::getResultCSVStreaming(INewResultSet* result, cons
     writer->finishCSVHeaders();
     writer->flushContent(false);
 
+    CESPAbortRequestCallback abortCallback(context);
     Owned<IResultSetCursor> cursor = result->createCursor();
-    return writeResultCursorXml(*writer, cursor, resultName, start, count, nullptr, nullptr, true);
+    return writeResultCursorXml(*writer, cursor, resultName, start, count, nullptr, nullptr, true, &abortCallback);
 }
 
 //Similar to the getResultJSON in fileview2
@@ -427,17 +430,17 @@ unsigned CWsWuResultOutHelper::getResultJSONStreaming(INewResultSet* result, con
     writer->outputBeginRoot();
     writer->flushContent(false);
 
+    CESPAbortRequestCallback abortCallback(context);
     Owned<IResultSetCursor> cursor = result->createCursor();
-    unsigned rc = writeResultCursorXml(*writer, cursor, resultName, start, count, schemaName, nullptr, true);
+    unsigned rc = writeResultCursorXml(*writer, cursor, resultName, start, count, schemaName, nullptr, true, &abortCallback);
     writer->outputEndRoot();
     return rc;
 }
 
 unsigned CWsWuResultOutHelper::getResultXmlStreaming(INewResultSet* result, const char* resultName, const char* schemaName, const IProperties* xmlns, IXmlStreamFlusher* flusher)
 {
+    CESPAbortRequestCallback abortCallback(context);
     Owned<IResultSetCursor> cursor = result->createCursor();
     Owned<CommonXmlWriter> writer = CreateCommonXmlWriter(XWFexpandempty, 0, flusher);
-    return writeResultCursorXml(*writer, cursor, resultName, start, count, schemaName, xmlns, true);
+    return writeResultCursorXml(*writer, cursor, resultName, start, count, schemaName, xmlns, true, &abortCallback);
 }
-
-

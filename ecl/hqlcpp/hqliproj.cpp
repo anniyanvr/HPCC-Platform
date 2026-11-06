@@ -1000,7 +1000,7 @@ void ImplicitProjectInfo::addActiveSelects(const SelectUsedArray & src)
     if (selectsUsed.ordinality() == 0)
     {
         //No need to check for pre-existence, can be significant
-        selectsUsed.ensure(numSrc);
+        selectsUsed.ensureCapacity(numSrc);
         for (unsigned i=0; i < numSrc; i++)
             selectsUsed.append(src.item(i));
     }
@@ -1927,6 +1927,7 @@ void ImplicitProjectTransformer::gatherFieldsUsed(IHqlExpression * expr, Implici
                 {
                 case no_csv:
                 case no_xml:
+                case no_json:
                     break;
                 default:
                     {
@@ -2728,7 +2729,8 @@ void ImplicitProjectTransformer::logChange(const char * message, IHqlExpression 
 
 
     const char * const format = "ImplicitProject: %s %s now %s";
-    DBGLOG(format, message, name.str(), fieldText.str());
+    if (doTrace(traceOptimizations))
+        DBGLOG(format, message, name.str(), fieldText.str());
     if (options.notifyOptimizedProjects)
     {
         if (options.notifyOptimizedProjects >= 2 || exprName)
@@ -2868,7 +2870,7 @@ IHqlExpression * ImplicitProjectTransformer::createTransformed(IHqlExpression * 
                 {
                 case no_inlinetable:
                     {
-                        IHqlExpression * transforms = expr->queryChild(0);
+                        OwnedHqlExpr transforms = transform(expr->queryChild(0));
                         HqlExprArray newTransforms;
                         ForEachChild(i, transforms)
                         {
@@ -2880,9 +2882,9 @@ IHqlExpression * ImplicitProjectTransformer::createTransformed(IHqlExpression * 
                     }
                 case no_dataset_from_transform:
                     {
-                        IHqlExpression * transform = expr->queryChild(1);
-                        args.append(*LINK(expr->queryChild(0)));
-                        args.append(*complexExtra->outputFields.createFilteredTransform(transform, NULL));
+                        OwnedHqlExpr transformExpr = transform(expr->queryChild(1));
+                        args.append(*transform(expr->queryChild(0)));
+                        args.append(*complexExtra->outputFields.createFilteredTransform(transformExpr, NULL));
                         break;
                     }
                 }
@@ -3031,7 +3033,7 @@ IHqlExpression * ImplicitProjectTransformer::createTransformed(IHqlExpression * 
     default:
         throwUnexpected();
     }
-    
+
     return transformed.getClear();
 }
 
@@ -3100,10 +3102,13 @@ void ImplicitProjectTransformer::finalizeFields(IHqlExpression * expr)
             extra->fieldsToBlank.optimizeFieldsToBlank(extra->outputFields, queryNewColumnProvider(expr));
             if (!extra->fieldsToBlank.isEmpty())
             {
-                const char * opString = getOpString(expr->getOperator());
-                StringBuffer fieldText;
-                extra->fieldsToBlank.getText(fieldText);
-                DBGLOG("ImplicitProject: Fields %s for %s not required by outputs - so blank in transform", fieldText.str(), opString);
+                if (doTrace(traceOptimizations))
+                {
+                    const char * opString = getOpString(expr->getOperator());
+                    StringBuffer fieldText;
+                    extra->fieldsToBlank.getText(fieldText);
+                    DBGLOG("ImplicitProject: Fields %s for %s not required by outputs - so blank in transform", fieldText.str(), opString);
+                }
             }
             extra->finalizeOutputRecord(false);
             break;
@@ -3253,6 +3258,7 @@ IHqlExpression * ImplicitProjectTransformer::process(IHqlExpression * expr)
     OwnedHqlExpr ret = transformRoot(expr);
     //cycle_t time6 = msTick();
     //DEBUG_TIMERX(translator.queryTimeReporter(), "EclServer: implicit.transform", time6-time5);
+    sanityCheckTransformation("ImplicitProjectTransformer", expr, ret);
     return ret.getClear();
 }
 

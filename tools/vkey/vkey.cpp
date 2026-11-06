@@ -67,7 +67,7 @@ inline void SwapBigEndian(KeyHdr &hdr)
     _WINREV(hdr.xflmod);
     _WINREV(hdr.defrel);
     _WINREV(hdr.hghtrn);
-    _WINREV(hdr.hdrseq);
+    _WINREV(hdr.branchDepth);
     _WINREV(hdr.tstamp);
     _WINREV(hdr.rs3[0]);
     _WINREV(hdr.rs3[1]);
@@ -78,6 +78,17 @@ inline void SwapBigEndian(KeyHdr &hdr)
     _WINREV(hdr.version);
     _WINREV(hdr.blobHead);
     _WINREV(hdr.metadataHead);
+    _WINREV(hdr.bloomHead);
+    _WINREV(hdr.partitionFieldMask);
+    _WINREV(hdr.firstLeaf);
+    _WINREV(hdr.firstBranch[0]);
+    _WINREV(hdr.firstBranch[1]);
+    _WINREV(hdr.firstBranch[2]);
+    _WINREV(hdr.firstBranch[3]);
+    _WINREV(hdr.maxBranch);
+    _WINREV(hdr.leafCount);
+    _WINREV(hdr.blobCount);
+    _WINREV(hdr.minRowsPerLeafExceptLast);
 }
 
 
@@ -156,16 +167,16 @@ unsigned long mcrc32(const char *buf, unsigned len, unsigned long crc)
 
     switch (len)
     {
-    case 11: c = *buf++; crc = UPDC32(c,crc);
-    case 10: c = *buf++; crc = UPDC32(c,crc);
-    case 9: c = *buf++; crc = UPDC32(c,crc);
-    case 8: c = *buf++; crc = UPDC32(c,crc);
-    case 7: c = *buf++; crc = UPDC32(c,crc);
-    case 6: c = *buf++; crc = UPDC32(c,crc);
-    case 5: c = *buf++; crc = UPDC32(c,crc);
-    case 4: c = *buf++; crc = UPDC32(c,crc);
-    case 3: c = *buf++; crc = UPDC32(c,crc);
-    case 2: c = *buf++; crc = UPDC32(c,crc);
+    case 11: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
+    case 10: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
+    case 9: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
+    case 8: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
+    case 7: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
+    case 6: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
+    case 5: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
+    case 4: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
+    case 3: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
+    case 2: c = *buf++; crc = UPDC32(c,crc); [[fallthrough]];
     case 1: c = *buf++; crc = UPDC32(c,crc);
     }
 
@@ -234,7 +245,7 @@ unsigned countLevels(int f, KeyHdr &h, offset_t firstnode)
     {
         NodeHdr &nodeHdr = *(NodeHdr *) nodeData;
         swap(nodeHdr);
-        if (!nodeHdr.leafFlag)
+        if (nodeHdr.nodeType==NodeBranch)
         {
             unsigned __int64 fpos = *(unsigned __int64 *) (nodeData + sizeof(nodeHdr));
             _WINREV(fpos);
@@ -286,7 +297,7 @@ void checkLevel(int f, KeyHdr &h, unsigned &level, offset_t firstnode)
                 noteError(thisnode, "CRC error on key node (keyBytes==%x)\n", nodeHdr.keyBytes );
             }
         }
-        if (nodeHdr.leafFlag)
+        if (nodeHdr.nodeType==NodeLeaf)
         {
             if (skipLeafLevel)
             {
@@ -306,6 +317,7 @@ void checkLevel(int f, KeyHdr &h, unsigned &level, offset_t firstnode)
         }
         else 
         {
+            assertex(nodeHdr.nodeType==NodeBranch);
             unsigned nodeKeyLength = h.nodeKeyLength;
             if (nodeKeyLength==(unsigned)-1)
                 nodeKeyLength = h.length;

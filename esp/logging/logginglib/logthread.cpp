@@ -23,6 +23,9 @@
 #include "logthread.hpp"
 #include "compressutil.hpp"
 
+#include "logconfigptree.hpp"
+using namespace LogConfigPTree;
+
 const char* const PropMaxLogQueueLength = "MaxLogQueueLength";
 const char* const PropQueueSizeSignal = "QueueSizeSignal";
 const char* const PropMaxTriesRS = "MaxTriesRS";
@@ -55,7 +58,7 @@ extern LOGGINGCOMMON_API IUpdateLogThread* createUpdateLogThread(IPropertyTree* 
 }
 
 CLogThread::CLogThread(IPropertyTree* _cfg , const char* _service, const char* _agentName, IEspLogAgent* _logAgent, const char* _tankFileDir)
-    : stopping(false), agentName(_agentName), tankFileDir(_tankFileDir)
+    : Thread("CLogThread"), stopping(false), agentName(_agentName), tankFileDir(_tankFileDir)
 {
     if(!_agentName || !*_agentName)
         throw MakeStringException(-1,"No Logging agent name defined");
@@ -71,12 +74,12 @@ CLogThread::CLogThread(IPropertyTree* _cfg , const char* _service, const char* _
 
     logAgent.setown(_logAgent);
 
-    maxLogQueueLength = _cfg->getPropInt(PropMaxLogQueueLength, MaxLogQueueLength);
-    signalGrowingQueueAt = _cfg->getPropInt(PropQueueSizeSignal, QueueSizeSignal);
-    maxLogRetries = _cfg->getPropInt(PropMaxTriesRS, DefaultMaxTriesRS);
+    maxLogQueueLength = getConfigValue<int>(_cfg, PropMaxLogQueueLength, MaxLogQueueLength);
+    signalGrowingQueueAt = getConfigValue<int>(_cfg, PropQueueSizeSignal, QueueSizeSignal);
+    maxLogRetries = getConfigValue<int>(_cfg, PropMaxTriesRS, DefaultMaxTriesRS);
     //For decoupled logging, the fail safe is not needed because the logging agent always
     //picks up the logging requests from tank file.
-    ensureFailSafe = _cfg->getPropBool(PropFailSafe) && !_cfg->getPropBool(PropDisableFailSafe, false);
+    ensureFailSafe = getConfigValue<bool>(_cfg, PropFailSafe) && !getConfigValue<bool>(_cfg, PropDisableFailSafe, false);
     if(ensureFailSafe)
     {
         logFailSafe.setown(createFailSafeLogger(_cfg, _service, _agentName));
@@ -92,16 +95,16 @@ CLogThread::CLogThread(IPropertyTree* _cfg , const char* _service, const char* _
         Owned<CLogRequestReaderSettings> settings = new CLogRequestReaderSettings();
         settings->tankFileDir.set(tankFileDir.get());
 
-        const char* ackedFiles = _cfg->queryProp(PropAckedFiles);
+        const char* ackedFiles = queryConfigValue(_cfg, PropAckedFiles);
         settings->ackedFileList.set(isEmptyString(ackedFiles) ? PropDefaultAckedFiles : ackedFiles);
-        const char* ackedLogRequestFile = _cfg->queryProp(PropAckedLogRequests);
+        const char* ackedLogRequestFile = queryConfigValue(_cfg, PropAckedLogRequests);
         settings->ackedLogRequestFile.set(isEmptyString(ackedLogRequestFile) ? PropDefaultAckedLogRequests : ackedLogRequestFile);
-        int pendingLogBufferSize = _cfg->getPropInt(PropPendingLogBufferSize, DEFAULTPENDINGLOGBUFFERSIZE);
+        int pendingLogBufferSize = getConfigValue<int>(_cfg, PropPendingLogBufferSize, DEFAULTPENDINGLOGBUFFERSIZE);
         if (pendingLogBufferSize <= 0)
             throw MakeStringException(-1, "The %s (%d) should be greater than 0.", PropPendingLogBufferSize, pendingLogBufferSize);
 
         settings->pendingLogBufferSize = pendingLogBufferSize;
-        int waitSeconds = _cfg->getPropInt(PropReadRequestWaitingSeconds, DEFAULTREADLOGREQUESTWAITSECOND);
+        int waitSeconds = getConfigValue<int>(_cfg, PropReadRequestWaitingSeconds, DEFAULTREADLOGREQUESTWAITSECOND);
         if (waitSeconds <= 0)
             throw MakeStringException(-1, "The %s (%d) should be greater than 0.", PropReadRequestWaitingSeconds, waitSeconds);
 
@@ -125,7 +128,7 @@ CLogThread::~CLogThread()
 
 void CLogThread::start()
 {
-    Thread::start();
+    Thread::start(false);
 }
 
 int CLogThread::run()
@@ -320,8 +323,13 @@ void CLogThread::sendLog()
 //IEspUpdateLogRequestWrap which contains original log Request.
 IEspUpdateLogRequestWrap* CLogThread::checkAndReadLogRequestFromSharedTankFile(IEspUpdateLogRequestWrap* logRequest)
 {
+    StringBuffer logRequestInFile;
+    appendXMLOpenTag(logRequestInFile, LOGCONTENTINFILE);
+    logRequestInFile.append(logRequest->getUpdateLogRequest());
+    appendXMLCloseTag(logRequestInFile, LOGCONTENTINFILE);
+
     //Read LogRequestInFile info if exists.
-    Owned<IPropertyTree> logInFle = createPTreeFromXMLString(logRequest->getUpdateLogRequest());
+    Owned<IPropertyTree> logInFle = createPTreeFromXMLString(logRequestInFile);
     if (!logInFle)
         return nullptr;
 
@@ -519,7 +527,7 @@ void CLogThread::checkPendingLogs(bool bOneRecOnly)
 //checkAndReadLogRequestFromSharedTankFile().
 IEspUpdateLogRequestWrap* CLogThread::unserializeLogRequestContent(const char* logData, bool decompress)
 {
-    if (!logData && *logData)
+    if (isEmptyString(logData))
         return NULL;
 
     Owned<IPropertyTree> pLogTree = createPTreeFromXMLString(logData);
@@ -640,7 +648,7 @@ void CLogRequestReader::threadmain()
 void CLogRequestReader::reportAckedLogFiles(StringArray& ackedLogFiles)
 {
     CriticalBlock b(crit);
-    for (auto r : ackedLogFileCheckList)
+    for (auto& r : ackedLogFileCheckList)
         ackedLogFiles.append(r.c_str());
     ESPLOG(LogMax, "#### The reportAckedLogFiles() done.");
 }
@@ -696,7 +704,7 @@ void CLogRequestReader::cleanAckedLogFiles(StringArray& fileNames)
 
     //Find which file should not be removed from ackedLogFileCheckList.
     StringArray fileNamesToKeep;
-    for (auto r : ackedLogFileCheckList)
+    for (auto& r : ackedLogFileCheckList)
     {
         if (!fileNames.contains(r.c_str()))
             fileNamesToKeep.append(r.c_str());
@@ -729,7 +737,7 @@ void CLogRequestReader::readAcked(const char* fileName, std::set<std::string>& a
         if (io)
         {
             StringBuffer line;
-            OwnedIFileIOStream ios = createIOStream(io);
+            OwnedIFileIOStream ios = createBufferedIOStream(io);
             Owned<IStreamLineReader> lineReader = createLineReader(ios, true);
             while(!lineReader->readLine(line.clear()))
             {
@@ -830,7 +838,7 @@ StringBuffer& CLogRequestReader::getTankFileTimeString(const char* fileName, Str
         return timeString;
 
     ptr += sendLogKeywordLen;
-    if (!ptr)
+    if (!*ptr)
         return timeString;
 
     ptr = strchr(ptr, '.');
@@ -1040,7 +1048,7 @@ void CLogRequestReader::updateAckedFileList()
         CLogSerializer ackedLog(fileNameWithPath);
         ackedLog.loadAckedLogs(logRequestsToRemove);
 
-        for (auto r : logRequestsToRemove)
+        for (auto& r : logRequestsToRemove)
             ackedLogRequests.erase(r.c_str());
 
         fileName.append("\r\n");
@@ -1050,7 +1058,7 @@ void CLogRequestReader::updateAckedFileList()
         pos += len;
     }
 
-    newAckedLogFiles.clear();
+    newAckedLogFiles.kill();
 
     ESPLOG(LogMax, "#### Leave updateAckedFileList()");
 }
@@ -1071,7 +1079,7 @@ void CLogRequestReader::updateAckedLogRequestList()
         return; //Should never happen
 
     offset_t pos = 0;
-    for (auto r : ackedLogRequests)
+    for (auto& r : ackedLogRequests)
     {
         StringBuffer line(r.c_str());
         line.append("\r\n");

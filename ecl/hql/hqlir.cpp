@@ -291,7 +291,6 @@ const char * getOperatorIRText(node_operator op)
     EXPAND_CASE(no,unlikely);
     EXPAND_CASE(no,inline);
     EXPAND_CASE(no,nwaydistribute);
-    EXPAND_CASE(no,unused34);
     EXPAND_CASE(no,unused35);
     EXPAND_CASE(no,unused36);
     EXPAND_CASE(no,unused37);
@@ -505,7 +504,7 @@ const char * getOperatorIRText(node_operator op)
     EXPAND_CASE(no,temprow);
     EXPAND_CASE(no,activerow);
     EXPAND_CASE(no,catch);
-    EXPAND_CASE(no,unused80);
+    EXPAND_CASE(no,regex_extract);
     EXPAND_CASE(no,reference);
     EXPAND_CASE(no,callback);
     EXPAND_CASE(no,keyedlimit);
@@ -644,7 +643,7 @@ const char * getOperatorIRText(node_operator op)
     EXPAND_CASE(no,sectioninput);
     EXPAND_CASE(no,forcegraph);
     EXPAND_CASE(no,eventextra);
-    EXPAND_CASE(no,unused81);
+    EXPAND_CASE(no,getsecret);
     EXPAND_CASE(no,related);
     EXPAND_CASE(no,executewhen);
     EXPAND_CASE(no,definesideeffect);
@@ -662,6 +661,7 @@ const char * getOperatorIRText(node_operator op)
     EXPAND_CASE(no,getenv);
     EXPAND_CASE(no,json);
     EXPAND_CASE(no,matched_injoin);
+    EXPAND_CASE(no,filetype);
     }
 
     return "<unknown>";
@@ -823,15 +823,14 @@ public:
 class ExprBuilderInfo
 {
 public:
-    ExprBuilderInfo() : type(0), name(NULL), id(NULL), sequence(0) {}
-
     inline void addOperand(exprid_t id) { args.append((unsigned)id); }
 
 public:
-    typeid_t type;
-    IAtom * name;
-    IIdAtom * id;
-    unsigned __int64 sequence;
+    typeid_t type = type_none;
+    IAtom * name = nullptr;
+    IIdAtom * id = nullptr;
+    unsigned __int64 sequence = 0;
+    unsigned __int64 uid = 0;
     IdArray args;
     IdArray special;
     IdArray comment;
@@ -851,6 +850,7 @@ public:
     unsigned line = 0;
     unsigned col = 0;
     IdArray args;
+    unsigned __int64 uid;
 };
 
 
@@ -1118,12 +1118,6 @@ IAtom * BinaryIRPlayer::readName()
 //- Text
 //--------------------------------------------------------------------------------------------------------------------
 
-enum
-{
-    TIRexpandSimpleTypes    = 0x00000001,
-    TIRexpandAttributes     = 0x00000002,
-    TIRstripAnnotatations   = 0x00000004,
-};
 class TextIRBuilder : public CInterfaceOf<IEclBuilder>
 {
     class Definition
@@ -1377,6 +1371,8 @@ public:
             break;
         }
         line.append("}");
+        if (info.uid && !(options & TIRstripDebugId))
+            line.append(" #").append(info.uid);
         finishDefinition(def);
 
         return def.id;
@@ -1407,6 +1403,14 @@ protected:
         id_t nextId = ids.ordinality()+1;
         ids.append(text);
         return nextId;
+    }
+
+    void appendTypeLength(const SimpleTypeBuilderInfo & info)
+    {
+        if (!isUnknownLength(info.length))
+            line.append(info.length);
+        else if (getLengthSizeBytes(info.length) != 4)
+            line.append("{").append(getLengthSizeBytes(info.length)).append("}");
     }
 
     void appendTypeText(type_t tc, const SimpleTypeBuilderInfo & info)
@@ -1443,8 +1447,7 @@ protected:
         case type_data:
         case type_qstring:
             line.append(irText);
-            if (info.length != UNKNOWN_LENGTH)
-                line.append(info.length);
+            appendTypeLength(info);
             return;
         case type_decimal:
         case type_bitfield:
@@ -1454,14 +1457,12 @@ protected:
         case type_unicode:
         case type_varstring:
             line.append(irText);
-            if (info.length != UNKNOWN_LENGTH)
-                line.append(info.length);
+            appendTypeLength(info);
             line.append("(").append(info.locale).append(")");
             return;
         case type_utf8:
             line.append(irText);
-            if (info.length != UNKNOWN_LENGTH)
-                line.append("_").append(info.length);
+            appendTypeLength(info);
             line.append("(").append(info.locale).append(")");
             return;
         }
@@ -1516,7 +1517,8 @@ protected:
                 appendId(info.comment.item(i));
             }
         }
-
+        if (info.uid && !(options & TIRstripDebugId))
+            line.append(" #").append(info.uid);
     }
 
     void appendConstantText(const ConstantBuilderInfo & info)
@@ -1548,6 +1550,8 @@ protected:
         case type_varstring:
         case type_data:
         case type_qstring:
+        case type_utf8:
+        case type_unicode:
             {
                 line.append("D");
                 appendStringAsQuotedCPP(line, info.dataValue.size, (const char *)info.dataValue.data, false);
@@ -2024,6 +2028,7 @@ id_t ExpressionIRPlayer::doProcessExpr(IHqlExpression * expr)
         info.comment.append(processExpr(cur));
     }
 #endif
+    info.uid = querySeqId(expr);
 
     switch (op)
     {
@@ -2094,6 +2099,8 @@ id_t ExpressionIRPlayer::doProcessConstant(IHqlExpression * expr)
     case type_varstring:
     case type_data:
     case type_qstring:
+    case type_utf8:
+    case type_unicode:
         info.dataValue.size = value->getSize();
         info.dataValue.data = value->queryValue();
         break;
@@ -2110,6 +2117,7 @@ id_t ExpressionIRPlayer::doProcessAnnotation(IHqlExpression * expr)
     ExprAnnotationBuilderInfo info;
     Owned<IPropertyTree> javadoc;
     info.expr = processExpr(body);
+    info.uid = querySeqId(expr);
     switch (kind)
     {
     case annotate_symbol:
@@ -2206,6 +2214,12 @@ extern HQL_API void dump_ir(ITypeInfo * type)
     dump_ir(NULL, NULL, type);
 }
 
+void dump_ir_external(const HqlExprArray & exprs, unsigned options)
+{
+    FileIRBuilder output(options, stdout);
+    playIR(output, nullptr, &exprs, nullptr);
+}
+
 extern HQL_API void dump_ir(ITypeInfo * type1, ITypeInfo * type2)
 {
     FileIRBuilder output(defaultDumpOptions, stdout);
@@ -2241,11 +2255,29 @@ extern HQL_API void dump_irn(unsigned n, ...)
     va_end(args);
 }
 
+extern HQL_API void dump_ir(IHqlExpression * expr1, IHqlExpression * expr2, IHqlExpression * expr3, IHqlExpression * expr4, IHqlExpression * expr5, IHqlExpression * expr6)
+{
+    FileIRBuilder output(defaultDumpOptions, stdout);
+    ExpressionIRPlayer reader(&output);
+    reader.play(expr1);
+    reader.play(expr2);
+    reader.play(expr3);
+    reader.play(expr4);
+    reader.play(expr5);
+    reader.play(expr6);
+}
+
 //-- Dump the IR for the expression(s)/type to DBGLOG ----------------------------------------------------------------
 
 extern HQL_API void dbglogIR(IHqlExpression * expr)
 {
     DblgLogIRBuilder output(defaultDumpOptions);
+    playIR(output, expr, NULL, NULL);
+}
+
+extern HQL_API void dbglogIR(IHqlExpression * expr, unsigned options)
+{
+    DblgLogIRBuilder output(options);
     playIR(output, expr, NULL, NULL);
 }
 
@@ -2434,7 +2466,7 @@ public:
     {
         OwnedHqlExpr query = parseQuery(testQuery1, NULL);
         StringArray ir;
-        getIRText(ir, 0, query);
+        getIRText(ir, TIRstripDebugId, query);
         compareStringArrays(ir, expectedIR1, __LINE__);
     }
 };

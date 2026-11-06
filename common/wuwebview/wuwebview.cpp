@@ -19,6 +19,7 @@
 #include "jexcept.hpp"
 #include "jptree.hpp"
 #include "junicode.hpp"
+#include "codesigner.hpp"
 #include "workunit.hpp"
 #include "dllserver.hpp"
 #include "thorplugin.hpp"
@@ -36,7 +37,7 @@ public:
     IMPLEMENT_IINTERFACE;
 
     WuExpandedResultBuffer(const char *queryname, unsigned _flags=0) :
-        name(queryname), resultlevel(0), finalized(false), flags(_flags), hasXmlns(false)
+        name(queryname), hasXmlns(false), finalized(false), flags(_flags), resultlevel(0)
     {
         if (flags & (WWV_INCL_NAMESPACES | WWV_INCL_GENERATED_NAMESPACES))
         {
@@ -80,6 +81,8 @@ public:
         resultChildTags.setValue("Warning", true);
         resultChildTags.setValue("Alert", true);
         resultChildTags.setValue("Info", true);
+        resultChildTags.setValue("StatsWorkUnit", true);
+        resultChildTags.setValue("SummaryStats", true);
     }
 
     void appendResults(IConstWorkUnit *wu, const char *username, const char *pw)
@@ -293,14 +296,14 @@ public:
     IMPLEMENT_IINTERFACE
 
     WuWebView(IConstWorkUnit &wu, const char *_target, const char *queryname, const char *wdir, bool mapEspDir, bool delay, IPropertyTree *xsltcfg) :
-        manifestIncludePathsSet(false), dir(wdir), mapEspDirectories(mapEspDir), delayedDll(delay), target(_target), xsltConfig(xsltcfg)
+        xsltConfig(xsltcfg), target(_target), dir(wdir), mapEspDirectories(mapEspDir), manifestIncludePathsSet(false), delayedDll(delay)
     {
         name.set(queryname);
         setWorkunit(wu);
     }
 
     WuWebView(const char *wuid, const char *_target, const char *queryname, const char *wdir, bool mapEspDir, bool delay, IPropertyTree *xsltcfg) :
-        manifestIncludePathsSet(false), dir(wdir), mapEspDirectories(mapEspDir), delayedDll(delay), target(_target), xsltConfig(xsltcfg)
+        xsltConfig(xsltcfg), target(_target), dir(wdir), mapEspDirectories(mapEspDir), manifestIncludePathsSet(false), delayedDll(delay)
     {
         name.set(queryname);
         setWorkunit(wuid);
@@ -478,17 +481,21 @@ bool WuWebView::getResourceByPath(const char *path, MemoryBuffer &mb)
 {
     calculateResourceIncludePaths();
 
-    StringBuffer xpath;
-    if (!manifestDir.length())
-        xpath.setf("Resource[@filename='%s'][1]", path);
-    else
+    VStringBuffer xpath("Resource[@resourcePath='%s'][1]", path);
+    IPropertyTree *res = ensureManifest()->queryPropTree(xpath.str());
+    if (!res)
     {
-        StringBuffer respath;
-        makeResourcePath(path, manifestDir.str(), respath);
-        xpath.setf("Resource[@resourcePath='%s'][1]", respath.str());
+        if (!manifestDir.length())
+            xpath.setf("Resource[@filename='%s'][1]", path);
+        else
+        {
+            StringBuffer respath;
+            makeResourcePath(path, manifestDir.str(), respath);
+            xpath.setf("Resource[@resourcePath='%s'][1]", respath.str());
+        }
+        res = ensureManifest()->queryPropTree(xpath.str());
     }
 
-    IPropertyTree *res = ensureManifest()->queryPropTree(xpath.str());
     if (!res)
         return false;
     return getResource(res, mb);
@@ -928,22 +935,203 @@ void WuWebView::addInputsFromXml(const char *xml)
 
 bool WuWebView::getEmbeddedArchive(StringBuffer &ret)
 {
+    if (cw->getDebugValueBool("obfuscateOutput", false))
+        return false;
     if (!loadDll())
         return false;
     if (getEmbeddedArchiveXML(dll, ret))
         return true;
-    // Try the old way, in case it's an older dll
-    StringBuffer dllXML;
-    if (!getEmbeddedWorkUnitXML(dll, dllXML))
+
+    Owned<ILocalWorkUnit> embeddedWU = createLocalWorkUnit(dll);
+    if (!embeddedWU)
         return false;
 
-    Owned<ILocalWorkUnit> embeddedWU = createLocalWorkUnit(dllXML.str());
     Owned<IConstWUQuery> embeddedQuery = embeddedWU->getQuery();
     if (!embeddedQuery)
         return false;
     StringBufferAdaptor iret(ret);
     embeddedQuery->getQueryText(iret);
     return true;
+}
+
+static bool manifestResourcesMatch(const IPropertyTree &left, const IPropertyTree &right)
+{
+    const char *leftResourcePath = left.queryProp("@resourcePath");
+    const char *rightResourcePath = right.queryProp("@resourcePath");
+    if (!isEmptyString(leftResourcePath) || !isEmptyString(rightResourcePath))
+        return strsame(leftResourcePath, rightResourcePath);
+
+    const char *leftOriginalFilename = left.queryProp("@originalFilename");
+    const char *rightOriginalFilename = right.queryProp("@originalFilename");
+    if (!isEmptyString(leftOriginalFilename) && !isEmptyString(rightOriginalFilename))
+        return streq(leftOriginalFilename, rightOriginalFilename);
+
+    const char *leftJfrogUser = left.queryProp("@jfrogUser");
+    const char *rightJfrogUser = right.queryProp("@jfrogUser");
+    const char *leftFilename = left.queryProp("@filename");
+    const char *rightFilename = right.queryProp("@filename");
+    return !isEmptyString(leftJfrogUser) && !isEmptyString(rightJfrogUser) &&
+           !isEmptyString(leftFilename) && !isEmptyString(rightFilename) &&
+           streq(leftJfrogUser, rightJfrogUser) && streq(leftFilename, rightFilename);
+}
+
+static IPropertyTree *createArchiveManifestResources(IPropertyTree *additionalFiles)
+{
+    Owned<IPropertyTree> archiveManifestResources = createPTree("Resources");
+    if (!additionalFiles)
+        return archiveManifestResources.getClear();
+
+    Owned<IPropertyTreeIterator> manifests = additionalFiles->getElements("Manifest");
+    ForEach(*manifests)
+    {
+        const char *manifestXml = manifests->query().queryProp(nullptr);
+        if (isEmptyString(manifestXml))
+            continue;
+        try
+        {
+            StringBuffer unsignedManifest;
+            const char *manifestBody = queryCodeSigner().hasSignature(manifestXml) ? queryCodeSigner().stripSignature(manifestXml, unsignedManifest).str() : manifestXml;
+            Owned<IPropertyTree> manifest = createPTreeFromXMLString(manifestBody);
+            Owned<IPropertyTreeIterator> resources = manifest->getElements("Resource");
+            ForEach(*resources)
+                archiveManifestResources->addPropTree("Resource", createPTreeFromIPT(&resources->query()));
+        }
+        catch (IException *e)
+        {
+            e->Release();
+        }
+    }
+    return archiveManifestResources.getClear();
+}
+
+static bool archiveContainsManifestResource(IPropertyTree &archiveManifestResources, const IPropertyTree &resource)
+{
+    Owned<IPropertyTreeIterator> resources = archiveManifestResources.getElements("Resource");
+    ForEach(*resources)
+    {
+        if (manifestResourcesMatch(resources->query(), resource))
+            return true;
+    }
+    return false;
+}
+
+static IPropertyTree *queryArchiveResource(IPropertyTree *additionalFiles, const IPropertyTree &resource)
+{
+    if (!additionalFiles)
+        return nullptr;
+
+    Owned<IPropertyTreeIterator> resources = additionalFiles->getElements("Resource");
+    ForEach(*resources)
+    {
+        if (manifestResourcesMatch(resources->query(), resource))
+            return &resources->query();
+    }
+    return nullptr;
+}
+
+extern WUWEBVIEW_API void addManifestResourcesToArchive(IManifestResourceReader &resourceReader, IPropertyTree &archive)
+{
+    IPropertyTree *additionalFiles = archive.queryPropTree("AdditionalFiles");
+    Owned<IPropertyTree> restoredManifest = createPTree("Manifest");
+    unsigned restored = 0;
+    StringBuffer manifestXml;
+    resourceReader.getManifest(manifestXml);
+    if (!manifestXml.length())
+        return;
+    Owned<IPropertyTree> sourceManifest;
+    try
+    {
+        sourceManifest.setown(createPTreeFromXMLString(manifestXml.str()));
+    }
+    catch (IException *e)
+    {
+        e->Release();
+        return;
+    }
+    Owned<IPropertyTree> archiveManifestResources = createArchiveManifestResources(additionalFiles);
+    Owned<IPropertyTreeIterator> resources = sourceManifest->getElements("Resource");
+    ForEach(*resources)
+    {
+        IPropertyTree &resource = resources->query();
+        const char *originalFilename = resource.queryProp("@originalFilename");
+        const char *resourcePath = resource.queryProp("@resourcePath");
+        bool isJfrogResource = resource.hasProp("@jfrogUser");
+        if (isEmptyString(originalFilename) && !isJfrogResource)
+            continue;
+        bool archiveContainsManifest = archiveContainsManifestResource(*archiveManifestResources, resource);
+        IPropertyTree *archiveResource = queryArchiveResource(additionalFiles, resource);
+        if (archiveContainsManifest && (isJfrogResource || (archiveResource && archiveResource->isBinary(nullptr))))
+            continue;
+
+        if (!additionalFiles)
+        {
+            additionalFiles = ensurePTree(&archive, "AdditionalFiles");
+            additionalFiles->setProp("@xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance");
+        }
+
+        if (!archiveContainsManifest)
+        {
+            Owned<IPropertyTree> manifestResource = createPTreeFromIPT(&resource);
+            manifestResource->removeProp("@id");
+            manifestResource->removeProp("@compressed");
+            manifestResource->removeProp("@header");
+            restoredManifest->addPropTree("Resource", manifestResource.getClear());
+            restored++;
+        }
+
+        if (!isJfrogResource && (!archiveResource || !archiveResource->isBinary(nullptr)))
+        {
+            MemoryBuffer content;
+            const char *resourceLookupPath = !isEmptyString(resourcePath) ? resourcePath : resource.queryProp("@filename");
+            if (isEmptyString(resourceLookupPath))
+                throwStringExceptionV(WUWEBERR_ViewResourceNotFound, "Missing lookup path for manifest resource %s", originalFilename);
+            if (!resourceReader.getResourceByPath(resourceLookupPath, content))
+                throwStringExceptionV(WUWEBERR_ViewResourceNotFound, "Failed to extract manifest resource %s from query DLL", originalFilename);
+            if (!archiveResource)
+                archiveResource = additionalFiles->addPropTree("Resource", createPTree("Resource"));
+            archiveResource->setProp("@originalFilename", originalFilename);
+            if (!isEmptyString(resourcePath))
+                archiveResource->setProp("@resourcePath", resourcePath);
+            const char *md5 = resource.queryProp("@md5");
+            if (!isEmptyString(md5))
+                archiveResource->setProp("@md5", md5);
+            archiveResource->setPropBin(nullptr, content.length(), content.toByteArray());
+        }
+    }
+
+    if (restored)
+    {
+        manifestXml.clear();
+        toXML(restoredManifest, manifestXml);
+        IPropertyTree *manifest = additionalFiles->addPropTree("Manifest", createPTree("Manifest", ipt_none));
+        manifest->setProp("@originalFilename", "embedded-query-resources.manifest");
+        manifest->setProp(nullptr, manifestXml);
+    }
+}
+
+class CWuWebViewManifestResourceReader : public IManifestResourceReader
+{
+public:
+    CWuWebViewManifestResourceReader(IWuWebView &_webView) : webView(_webView) {}
+
+    virtual bool getResourceByPath(const char *path, MemoryBuffer &content) override
+    {
+        return webView.getResourceByPath(path, content);
+    }
+
+    virtual StringBuffer &getManifest(StringBuffer &manifest) override
+    {
+        return webView.getManifest(manifest);
+    }
+
+private:
+    IWuWebView &webView;
+};
+
+extern WUWEBVIEW_API void addManifestResourcesToArchive(IWuWebView &webView, IPropertyTree &archive)
+{
+    CWuWebViewManifestResourceReader resourceReader(webView);
+    addManifestResourcesToArchive(resourceReader, archive);
 }
 
 

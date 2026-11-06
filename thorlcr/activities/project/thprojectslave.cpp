@@ -151,8 +151,9 @@ class CPrefetchProjectSlaveActivity : public CSlaveActivity
         bool eoi = true;
         bool eoq = true;
         QueueOf<PrefetchInfo, true> prefetchQueue;
-        CriticalSection crit;
-        Semaphore blockedSem, fullSem;
+        CriticalSection crit{SYNC_LOCATION};
+        Semaphore blockedSem{SYNC_LOCATION};
+        Semaphore fullSem{SYNC_LOCATION};
 
     public:
         CPrefetcher(CPrefetchProjectSlaveActivity &_parent) : threaded("CPrefetcher", this), parent(_parent)
@@ -176,7 +177,7 @@ class CPrefetchProjectSlaveActivity : public CSlaveActivity
             eoi = true;
             return NULL;
         }
-        void start() { recordCount = 0; full = blocked = eoq = eoi = stopped = false; eog = true; threaded.start(); }
+        void start() { recordCount = 0; full = blocked = eoq = eoi = stopped = false; eog = true; threaded.start(true); }
         void stop()
         {
             stopped = true;

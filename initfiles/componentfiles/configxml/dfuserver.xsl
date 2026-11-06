@@ -47,7 +47,7 @@
                <xsl:value-of select="@name"/>
             </xsl:attribute> 
 
-            <xsl:attribute name="daliservers"> <xsl:call-template name="getDaliServers">
+            <xsl:attribute name="daliServers"> <xsl:call-template name="getDaliServers">
                     <xsl:with-param name="daliServer" select="@daliServers"/>
                 </xsl:call-template>            
             </xsl:attribute>
@@ -68,19 +68,53 @@
                <xsl:value-of select="@queue"/>
             </xsl:attribute> 
             
-            <xsl:attribute name="monitorqueue">
+            <xsl:attribute name="monitorQueue">
                <xsl:value-of select="@monitorqueue"/>
             </xsl:attribute> 
             
-            <xsl:attribute name="monitorinterval">
+            <xsl:attribute name="monitorInterval">
                <xsl:value-of select="@monitorinterval"/>
             </xsl:attribute> 
             
             <xsl:attribute name="transferBufferSize">
                <xsl:value-of select="@transferBufferSize"/>
             </xsl:attribute> 
-            
+
+            <xsl:attribute name="useNewCsvPartitioner">
+               <xsl:value-of select="@useNewCsvPartitioner"/>
+            </xsl:attribute>
+
+            <xsl:attribute name="useFtSlave">
+               <xsl:value-of select="@useFtSlave"/>
+            </xsl:attribute>
+
+            <xsl:copy-of select="@*[string(.) != '' and substring(name(), 1, 5) = 'trace']"/>
+
             <xsl:copy-of select="/Environment/Software/Directories"/>  
+            <xsl:copy-of select="./protrace"/>
+            <xsl:choose>
+                <xsl:when test="tracing">
+                    <xsl:copy-of select="./tracing"/>
+                </xsl:when>
+                <xsl:otherwise>
+                    <xsl:copy-of select="/Environment/Software/tracing"/>
+                </xsl:otherwise>
+            </xsl:choose>
+
+            <!--
+            # Generated for configuration info. accessed by getGlobalConfig()
+            -->
+            <global>
+              <storage>
+                <xsl:copy-of select="/Environment/Software/RemoteStorage/*"/>
+                <xsl:copy-of select="/Environment/Software/Globals/storage/*"/>
+                <xsl:copy-of select="/Environment/Software/Storage/*"/>
+              </storage>
+              <expert>
+                <xsl:copy-of select="/Environment/Software/Globals/@* | /Environment/Software/Globals/*"/>
+              </expert>
+              <xsl:copy-of select="/Environment/Hardware/cost"/>
+            </global>
 
             <SSH>
               <xsl:for-each select="SSH/@*">

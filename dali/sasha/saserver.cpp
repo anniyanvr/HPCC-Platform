@@ -15,11 +15,11 @@
     limitations under the License.
 ############################################################################## */
 
-#include "build-config.h"
 #include "platform.h"
 #include "thirdparty.h"
 #include "portlist.h"
 #include "jlib.hpp"
+#include "jfile.hpp"
 #include "jlog.hpp"
 #include "jptree.hpp"
 #include "jmisc.hpp"
@@ -30,37 +30,70 @@
 #include "mplog.hpp"
 #include "dasess.hpp"
 #include "dasds.hpp"
+#include "dafdesc.hpp"
 #include "daclient.hpp"
 #include "environment.hpp"
 #include "dllserver.hpp"
 #include "rmtfile.hpp"
 
-#include "saserver.hpp"
 #include "saarch.hpp"
 #include "saverify.hpp"
 #include "saxref.hpp"
+#include "sadbghk.hpp"
 #include "saqmon.hpp"
 #include "sacoalescer.hpp"
+#include "sautil.hpp"
+#include "saglobalmsg.hpp"
 #include "sacmd.hpp"
 
 extern void LDStest();
 
-#define SASHAVERSION "1.4"
+#define SASHAVERSION "1.5"
 
 #define DEFAULT_PERF_REPORT_DELAY (60*5)
 
-Owned<IPropertyTree> serverConfig;
 static IArrayOf<ISashaServer> servers;
-static CSDSServerStatus * SashaServerStatus=NULL;
-static atomic_t StopSuspendCount = ATOMIC_INIT(0);
-static bool stopped = false;
-static Semaphore stopSem;
+static std::atomic<unsigned> StopSuspendCount{0};
+static bool stopped{false};
+static Semaphore stopSem{SYNC_LOCATION};
+static bool isDaliClient{false};
 
-const char *sashaProgramName;
+static void requestStop(IException *e); // forward declaration
 
-CSuspendAutoStop::CSuspendAutoStop() { atomic_inc(&StopSuspendCount); }
-CSuspendAutoStop::~CSuspendAutoStop() { atomic_dec(&StopSuspendCount); }
+class CSashaServerContext : public CInterfaceOf<ISashaServerContext>
+{
+    StringAttr progName;
 
+    class CSuspendAutoStop : public CInterfaceOf<IInterface>
+    {
+    public:
+        CSuspendAutoStop() { StopSuspendCount++; }
+        ~CSuspendAutoStop() { StopSuspendCount--; }
+    };
+
+public:
+    CSashaServerContext(const char *_progName) : progName(_progName)
+    {
+    }
+    virtual void requestStop(IException *e) override
+    {
+        ::requestStop(e);
+    }
+    virtual const char * getSashaProgramName() const override
+    {
+        return progName;
+    }
+    virtual IInterface * createAutoStopSuspender() override
+    {
+        return new CSuspendAutoStop();
+    }
+};
+
+#ifdef _CONTAINERIZED
+const char *service = nullptr;
+#else
+
+// In non-containerized mode, add all servers
 static void AddServers()
 {
     // order significant
@@ -71,15 +104,17 @@ static void AddServers()
     servers.append(*createSashaDaFSMonitorServer());
     servers.append(*createSashaQMonitorServer());
     servers.append(*createSashaFileExpiryServer()); 
+    servers.append(*createSashaGlobalMessageServer());
     // add new servers here
 }
+#endif
 
 static void stopServer()
 {
     ForEachItemInRev(i,servers)
     {
         ISashaServer &server=servers.item(i);
-        LOG(MCprogress, unknownJob, "Stopping %d",i);
+        LOG(MCprogress, "Stopping %d",i);
         server.stop();
     }
     ForEachItemInRev(j,servers)
@@ -91,10 +126,10 @@ static void stopServer()
 
 static bool actionOnAbort()
 {
-    LOG(MCprogress, unknownJob, "Stop signalled");
+    LOG(MCprogress, "Stop signalled");
     if (stopped)
     {
-        LOG(MCprogress, unknownJob, "Previously marked stopped. Killing process..");
+        LOG(MCprogress, "Previously marked stopped. Killing process..");
         queryLogMsgManager()->flushQueue(10*1000);
 #ifdef _WIN32
         TerminateProcess(GetCurrentProcess(), 1);
@@ -110,11 +145,11 @@ static bool actionOnAbort()
     return true;
 }
 
-void requestStop(IException *e)
+static void requestStop(IException *e)
 {
     if (e)
-        LOG(MCoperatorError, unknownJob, e, "SASERVER: Unexpected exception, saserver terminating");
-    LOG(MCprogress, unknownJob, "Stop requested");
+        LOG(MCoperatorError, e, "SASERVER: Unexpected exception, saserver terminating");
+    LOG(MCprogress, "Stop requested");
     stopSem.signal();
 }
 
@@ -144,8 +179,9 @@ void stopSashaServer(const char *eps,unsigned short port)
 
 void usage()
 {
-    printf("Usage: SASERVER     -- (all configuration parameters in sashaconf.xml)\n"
-           "or:    SASERVER STOP\n");
+    printf("Usage: SASERVER   (all configuration parameters in sashaconf.xml)\n"
+           "or:    SASERVER --coalesce [--force]\n"
+           "or:    SASERVER --stop\n");
 }
 
 class CSashaCmdThread : public CInterface, implements IPooledThread
@@ -161,8 +197,10 @@ public:
     {
         StringAttrArray out;
         StringAttrArray outres;
-        if (cmd->getAction()==SCA_STOP) {
-            if (!stopped) {
+        if (cmd->getAction()==SCA_STOP)
+        {
+            if (!stopped)
+            {
                 stopped = true;
                 cmd->cancelaccept();
                 PROGLOG("Request to stop received");
@@ -170,14 +208,48 @@ public:
         }
         else if (cmd->getAction()==SCA_GETVERSION) 
             cmd->addId(SASHAVERSION); // should be a result probably but keep bwd compatible
-        else if (cmd->getAction()==SCA_COALESCE_SUSPEND)
-            suspendCoalescingServer();
-        else if (cmd->getAction()==SCA_COALESCE_RESUME)
-            resumeCoalescingServer();
-        else if (cmd->getAction()==SCA_XREF) 
-            processXRefRequest(cmd);
-        else if (!processArchiverCommand(cmd)) 
-            OWARNLOG("Command %d not handled",cmd->getAction());
+        else 
+        {
+#ifdef _CONTAINERIZED
+                if (strieq(service, "coalescer"))
+                {
+                    if (cmd->getAction()==SCA_COALESCE_SUSPEND)
+                        suspendCoalescingServer();
+                    else if (cmd->getAction()==SCA_COALESCE_RESUME)
+                        resumeCoalescingServer();
+                }
+                else if (strieq(service, "wu-archiver") || strieq(service, "dfuwu-archiver"))
+                {
+                    switch (cmd->getAction())
+                    {
+                        case SCA_ARCHIVE:
+                        case SCA_BACKUP:
+                        case SCA_RESTORE:
+                        case SCA_LIST: 
+                        case SCA_GET: 
+                        case SCA_WORKUNIT_SERVICES_GET: 
+                        case SCA_LISTDT:
+                        {
+                            if (!processArchiverCommand(cmd)) 
+                                OWARNLOG("Command %d not handled",cmd->getAction());
+                            break;
+                        }
+                        default:
+                            OWARNLOG("Unrecognised command: %d", cmd->getAction());
+                            break;
+                    }
+                }
+#else
+            if (cmd->getAction()==SCA_COALESCE_SUSPEND)
+                suspendCoalescingServer();
+            else if (cmd->getAction()==SCA_COALESCE_RESUME)
+                resumeCoalescingServer();
+            else if (cmd->getAction()==SCA_XREF) 
+                processXRefRequest(cmd);
+            else if (!processArchiverCommand(cmd)) 
+                OWARNLOG("Command %d not handled",cmd->getAction());
+#endif
+        }
         if (cmd->getAction()==SCA_WORKUNIT_SERVICES_GET)
             cmd->WUSreply();
         else
@@ -196,9 +268,16 @@ public:
 
 void SashaMain()
 {
+    if (!isDaliClient) // If a Dali client, SashaMain will be listening to MP and cancelled by CStopThread
+    {
+        // NB: requestStop signals stopSem
+        stopSem.wait();
+        return;
+    }
+
     IInterCommunicator & comm=queryWorldCommunicator();
     unsigned start = msTick();
-    unsigned timeout = serverConfig->getPropInt("@autoRestartInterval")*1000*60*60;
+    unsigned timeout = getComponentConfigSP()->getPropInt("@autoRestartInterval")*1000*60*60;
     class cCmdPoolFactory : public CInterface, implements IThreadFactory
     {
     public:
@@ -208,7 +287,7 @@ void SashaMain()
             return new CSashaCmdThread;
         }
     } factory;
-    Owned<IThreadPool> threadpool = createThreadPool("sachaCmdPool",&factory);
+    Owned<IThreadPool> threadpool = createThreadPool("sashaCmdPool",&factory, false, nullptr);
     CMessageBuffer mb;
     while (!stopped) {
         try {
@@ -225,7 +304,7 @@ void SashaMain()
                 stopped = true;
             }
             else if (timeout&&(timeout<msTick()-start)) {
-                if (atomic_read(&StopSuspendCount)==0) {
+                if (StopSuspendCount==0) {
                     PROGLOG("Auto Restart");
                     stopped = true;
                 }
@@ -254,23 +333,19 @@ static struct CRequestStop : implements IExceptionHandler
 } exceptionStopHandler;
 
 
-
+static constexpr const char * defaultYaml = R"!!(
+version: 1.0
+sasha:
+  name: sasha
+)!!";
 
 int main(int argc, const char* argv[])
 {
-    for (unsigned i=0;i<(unsigned)argc;i++) {
-        if (streq(argv[i],"--daemon") || streq(argv[i],"-d")) {
-            if (daemon(1,0) || write_pidfile(argv[++i])) {
-                perror("Failed to daemonize");
-                return EXIT_FAILURE;
-            }
-            break;
-        }
-    }
+    if (!checkCreateDaemon(argc, argv))
+        return EXIT_FAILURE;
+
     InitModuleObjects();
     EnableSEHtoExceptionMapping();
-
-    sashaProgramName = argv[0];
 
 #ifndef __64BIT__
     // Restrict stack sizes on 32-bit systems
@@ -280,94 +355,153 @@ int main(int argc, const char* argv[])
     bool stop = false;
     bool coalescer = false;
     bool force = false;
-    if (argc>1) {
-        if (stricmp(argv[1],"STOP")==0)
-            stop = true;
-        else if (stricmp(argv[1],"COALESCE")==0) {
-            coalescer = true;
-            force = (argc>2)&&(stricmp(argv[2],"FORCE")==0);
-        }
-        else if (!streq(argv[1],"--daemon") || !streq(argv[1],"-d")) {
-            usage();
-            return 1;
-        }
-    }
 #ifndef _DEBUG
     NoQuickEditSection x;
 #endif
 
-    Owned<IFile> sentinelFile;
-    if (!coalescer)
-    {
-        sentinelFile.setown(createSentinelTarget());
-        removeSentinelFile(sentinelFile);
-    }
-
-    OwnedIFile ifile = createIFile("sashaconf.xml");
-    serverConfig.setown(ifile->exists()?createPTreeFromXMLFile("sashaconf.xml"):createPTree());
-    StringBuffer daliServer;
-    if (!serverConfig->getProp("@DALISERVERS", daliServer)||(daliServer.length()==0)) {
-        printf("DALISERVERS not specified in sashaconf.xml");
-        return 1;
-    }
-
-#ifndef _CONTAINERIZED
-    StringBuffer logname;
-    StringBuffer logdir;
-    if (!stop)
-    {
-        Owned<IComponentLogFileCreator> lf = createComponentLogFileCreator(serverConfig, "sasha");
-        lf->setName("saserver");//override default filename
-        if (coalescer)
-            lf->setPostfix("coalesce");
-        lf->setMaxDetail(TopDetail);
-        lf->beginLogging();
-    }
-#else
-    setupContainerizedLogMsgHandler();
-#endif
-    DBGLOG("Build %s", BUILD_TAG);
-
     bool enableSNMP = false;
 
-    try {
+    CSashaServerContext sashaServerContext(argv[0]);
+    setServerContext(sashaServerContext);
+    try
+    {
+        Owned<IPropertyTree> serverConfig = loadConfiguration(defaultYaml, argv, "sasha", "SASHA", "sashaconf.xml", nullptr);
+        isDaliClient = isContainerized() ? serverConfig->hasProp("[access='dali']") : true;
 
+        Owned<IFile> sentinelFile;
 
-        unsigned short port = (stop||coalescer)?0:DEFAULT_SASHA_PORT;
-        Owned<IGroup> serverGroup = createIGroupRetry(daliServer.str(),DALI_SERVER_PORT);
-        initClientProcess(serverGroup, DCR_SashaServer, port, nullptr, nullptr, MP_WAIT_FOREVER, true);
-        if (!stop&!coalescer) {
+        stop = serverConfig->hasProp("@stop");
+        if (!stop)
+        {
+            coalescer = serverConfig->hasProp("@coalesce");
+            if (coalescer)
+                force = serverConfig->hasProp("@force");
+            else
+            {
+                sentinelFile.setown(createSentinelTarget());
+                removeSentinelFile(sentinelFile);
+            }
+        }
+
+    #ifndef _CONTAINERIZED
+        StringBuffer logname;
+        StringBuffer logdir;
+        if (!stop)
+        {
+            Owned<IComponentLogFileCreator> lf = createComponentLogFileCreator(serverConfig, "sasha");
+            lf->setName("saserver");//override default filename
+            if (coalescer)
+                lf->setPostfix("coalesce");
+            lf->setMaxDetail(TopDetail);
+            lf->beginLogging();
+        }
+    #else
+        setupContainerizedLogMsgHandler();
+    #endif
+        DBGLOG("Build %s", hpccBuildInfo.buildTag);
+
+        unsigned short port = serverConfig->getPropInt("service/@port", serverConfig->getPropInt("@port"));
+        if (!port)
+        {
+            if (!stop && !coalescer)
+                port = DEFAULT_SASHA_PORT;
+        }
+
+#ifdef _CONTAINERIZED
+        if (!stop && !coalescer)
+        {
+            // NB: if this service is within the Dali pod, then must write sentinal before trying to connect to Dali,
+            // because Dali will not receive any traffic until all containers are ready
+            if (serverConfig->getPropBool("@inDaliPod"))
+                writeSentinelFile(sentinelFile);
+        }
+#endif
+        // This option is intended to pick up the command line option --runExpiry, e.g. saserver --daliServers=. --runExpiry,
+        // and run the file expiry service directly.
+        bool runExpiry = serverConfig->hasProp("@runExpiry");
+
+        if (isDaliClient)
+        {
+            PROGLOG("Connecting to DALISERVERS.");
+            StringBuffer daliServer;
+            if (!serverConfig->getProp("@daliServers", daliServer))
+                serverConfig->getProp("@DALISERVERS", daliServer); // @DALISERVERS legacy/bare-metal
+            if (0 == daliServer.length())
+            {
+                PROGLOG("DALISERVERS not specified in sashaconf.xml");
+                return 1;
+            }
+            Owned<IGroup> serverGroup = createIGroupRetry(daliServer.str(), DALI_SERVER_PORT);
+            initClientProcess(serverGroup, DCR_SashaServer, runExpiry ? 0 : port, nullptr, nullptr, MP_WAIT_FOREVER, true);
+        }
+
+        if (runExpiry)
+            runExpiryCLI();
+        else if (stop)
+            stopSashaServer((argc>2)?argv[2]:"", DEFAULT_SASHA_PORT);
+        else
+        {
             startLogMsgParentReceiver();    // for auditing
             connectLogMsgManagerToDali();
-        }
-            
-        if (stop) {
-            stopSashaServer((argc>2)?argv[2]:"",DEFAULT_SASHA_PORT);
-        }
-        else {
+
             if (serverConfig->getPropInt("@enableSysLog"),true)
                 UseSysLogForOperatorMessages();
-            if (coalescer) {
-                coalesceDatastore(force);
-            }
-            else {
-#ifndef _CONTAINERIZED
-                startPerformanceMonitor(serverConfig->getPropInt("@perfReportDelay", DEFAULT_PERF_REPORT_DELAY)*1000);
+            if (coalescer)
+            {
+#ifdef _CONTAINERIZED
+                coalesceDatastore(serverConfig, force);
+#else
+                coalesceDatastore(serverConfig->queryPropTree("Coalescer"), force);
 #endif
-                AddServers();
+            }
+            else
+            {
                 addAbortHandler(actionOnAbort);
+                initializeStoragePlanes(true, true);
+                installDefaultFileHooks(serverConfig);
+#ifdef _CONTAINERIZED
+                service = serverConfig->queryProp("@service");
+                if (isEmptyString(service))
+                    throw makeStringException(0, "'service' undefined");
 
-                StringBuffer eps;
-                PROGLOG("SASERVER starting on %s",queryMyNode()->endpoint().getUrlStr(eps).str());
+                /*
+                 * NB: for the time being both wu-archiver and dfuwu-archive can handle
+                 * requests for either standard workunits or dfuworkunits
+                 * 
+                 */
+
+                if (strieq(service, "coalescer"))
+                    servers.append(*createSashaSDSCoalescingServer());
+                else if (strieq(service, "wu-archiver"))
+                    servers.append(*createSashaWUArchiverServer());
+                else if (strieq(service, "dfuwu-archiver"))
+                    servers.append(*createSashaDFUWUArchiverServer());
+                else if (strieq(service, "dfurecovery-archiver"))
+                    servers.append(*createSashaDFURecoveryArchiverServer());
+                else if (strieq(service, "cachedwu-remover"))
+                    servers.append(*createSashaCachedWURemoverServer());
+                else if (strieq(service, "file-expiry"))
+                    servers.append(*createSashaFileExpiryServer());
+                else if (strieq(service, "thor-qmon"))
+                    servers.append(*createSashaQMonitorServer());
+                else if (strieq(service, "debugplane-housekeeping"))
+                    servers.append(*createSashaDebugPlaneHousekeepingServer());
+                else if (strieq(service, "xref"))
+                   servers.append(*createSashaXrefServer());
+                else if (strieq(service, "global-message-housekeeping"))
+                   servers.append(*createSashaGlobalMessageServer());
+                else
+                    throw makeStringExceptionV(0, "Unrecognised 'service': %s", service);
+#else
+                startPerformanceMonitor(serverConfig->getPropInt("@perfReportDelay", DEFAULT_PERF_REPORT_DELAY)*1000);
+                AddServers();
+#endif
 
                 ForEachItemIn(i1,servers)
                 {
                     ISashaServer &server=servers.item(i1);
                     server.start();
                 }
-
-                SashaServerStatus = new CSDSServerStatus("SashaServer");
-
                 ForEachItemIn(i2,servers)
                 {
                     ISashaServer &server=servers.item(i2);
@@ -377,7 +511,7 @@ int main(int argc, const char* argv[])
                 {
                     CThreaded threaded;
                 public:
-                    CStopThread() : threaded("CStopThread") { threaded.init(this); } 
+                    CStopThread() : threaded("CStopThread") { threaded.init(this, false); }
                     ~CStopThread() { threaded.join(); }
                     virtual void threadmain() override
                     {
@@ -385,26 +519,35 @@ int main(int argc, const char* argv[])
                         if (!stopped)
                         {
                             stopped = true;
-                            IInterCommunicator &comm=queryWorldCommunicator();
+                            IInterCommunicator &comm = queryWorldCommunicator();
                             comm.cancel(NULL, MPTAG_SASHA_REQUEST);
                         }
                     }
-                } *stopThread = new CStopThread;
+                } *stopThread{};
+                if (isDaliClient)
+                    stopThread = new CStopThread;
+                // else, SashaMain waits directly on stopSem
                 addThreadExceptionHandler(&exceptionStopHandler);
+#ifdef _CONTAINERIZED
+                if (!serverConfig->getPropBool("@inDaliPod"))
+                    writeSentinelFile(sentinelFile);
+#else
                 writeSentinelFile(sentinelFile);
+#endif
                 SashaMain();
                 removeThreadExceptionHandler(&exceptionStopHandler);
 
-                stopSem.signal();
-                delete stopThread;
+                if (isDaliClient)
+                {
+                    stopSem.signal();
+                    delete stopThread;
+                }
 
                 PROGLOG("SASERVER exiting");
 #ifndef _CONTAINERIZED
                 stopPerformanceMonitor();
 #endif
             }
-            delete SashaServerStatus;
-            SashaServerStatus = NULL;
         }
     }
     catch(IException *e){ 
@@ -418,17 +561,20 @@ int main(int argc, const char* argv[])
         OWARNLOG("Sasha: %s",s);
     }
 
-    if (!stop)
+    if (!stop && !coalescer)
     {
         stopServer();
     }
     else if (stop)
         Sleep(2000);    // give time to stop
-    serverConfig.clear();
-    try {
-        closeDllServer();
+    try
+    {
         closeEnvironment();
-        closedownClientProcess();
+        if (isDaliClient)
+        {
+            closeDllServer();
+            closedownClientProcess();
+        }
     }
     catch (IException *) {  // dali may be down
     }

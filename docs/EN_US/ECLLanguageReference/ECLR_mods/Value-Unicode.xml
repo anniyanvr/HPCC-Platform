@@ -26,14 +26,24 @@
 
   <para>The upper size limit for any UNICODE value is 4GB.</para>
 
+  <para>Fields can optionally have a <emphasis role="bold">LENGTHSIZE</emphasis><indexterm>
+      <primary>LENGTHSIZE</primary>
+    </indexterm> attribute to specify the number of bytes (1, 2, or 4) used to store a variable-length field's length prefix. The default is 4 bytes. This is useful for reducing memory usage for small variable-length UNICODE strings. If a longer string is assigned, it will be truncated.</para>
+
   <para>Example:</para>
 
-  <programlisting>UNICODE16 MyUNIString := U'1234567890ABCDEF';
+  <programlisting lang="ECL_Runnable">UNICODE16 MyUNIString := U'1234567890ABCDEF';
         // utf-16-encoded string
 UNICODE4 MyUnicodeString := U'abcd';
         // same as: (UNICODE)'abcd'
-UNICODE_de5 MyUnicodeString := U'abcd\353';
+UNICODE_de5 MyUnicodeString_de := U'abcd\353';
         // becomes 'abcdë' with a German locale
-UNICODE_de5 MyUnicodeString := U'abcdë';
-        // same as previous example</programlisting>
+UNICODE_de5 MyUnicodeString_de5 := U'abcdë';
+        // same as previous example
+
+OUTPUT(MyUNIString);
+OUTPUT(MyUnicodeString);
+OUTPUT(MyUnicodeString_de);
+OUTPUT(MyUnicodeString_de5);
+</programlisting>
 </sect1>

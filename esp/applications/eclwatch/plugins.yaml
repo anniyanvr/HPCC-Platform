@@ -12,7 +12,6 @@ service_plugins:
   ws_elk: ws_elk
   ws_esdlconfig: ws_esdlconfig
   WsFileIO: ws_fileio
-  ws_machine: ws_machine
   WsPackageProcess: ws_packageprocess
   ws_store: ws_store
   WSESPControl: wsespcontrol
@@ -20,6 +19,11 @@ service_plugins:
   WsTopology: ws_topology
   WsWorkunits: ws_workunits
   ws_codesign: ws_codesign
+  ws_resources: ws_resources
+  WSDali: ws_dali
+  WSSasha: ws_sasha
+  WsCloud: ws_cloud
+  ws_logaccess: ws_logaccess
 
 binding_plugins:
   FileSpray: ws_fs
@@ -31,7 +35,6 @@ binding_plugins:
   ws_elk: ws_elk
   ws_esdlconfig: ws_esdlconfig
   WsFileIO: ws_fileio
-  ws_machine: ws_machine
   WsPackageProcess: ws_packageprocess
   ws_store: ws_store
   WsTopology: ws_topology
@@ -39,4 +42,8 @@ binding_plugins:
   WsSMC: ws_smc
   WSESPControl: wsespcontrol
   ws_codesign: ws_codesign
-
+  ws_resources: ws_resources
+  WSDali: ws_dali
+  WSSasha: ws_sasha
+  WsCloud: ws_cloud
+  ws_logaccess: ws_logaccess

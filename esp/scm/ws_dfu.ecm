@@ -97,6 +97,23 @@ ESPStruct DFUFileBloom
     string Probability;
 };
 
+ESPStruct DFUIndexInfo
+{
+    bool IsLeafCountEstimated;
+    int64 NumLeafNodes;
+    int64 NumBlobNodes;
+    int64 NumBranchNodes;
+    int64 SizeDiskLeaves;
+    int64 SizeDiskBlobs;
+    int64 SizeDiskBranches;
+    int64 SizeOriginalData;
+    int64 SizeOriginalBranches;
+    int64 SizeMemoryLeaves;
+    int64 SizeMemoryBranches;
+    double BranchCompressionPercent;
+    double DataCompressionPercent;
+};
+
 ESPStruct DFUPart
 {
     int Id;
@@ -105,6 +122,7 @@ ESPStruct DFUPart
     string Ip;
     string Partsize;
     [min_ver("1.38")] int64 PartSizeInt64;
+    [min_ver("1.58")] int64 CompressedSize;
 };
 
 ESPStruct DFUFileStat
@@ -190,6 +208,12 @@ ESPStruct [nil_remove] DFUFileDetail
     [min_ver("1.39")] ESParray<ESPstruct DFUFileBloom> Blooms;
     [min_ver("1.40")] int ExpireDays;
     [min_ver("1.41")] string KeyType;
+    [min_ver("1.60"), max_ver("1.61")] double Cost;
+    [min_ver("1.62")] double AtRestCost;
+    [min_ver("1.62")] double AccessCost;
+    [min_ver("1.63")] string ExpirationDate;
+    [min_ver("1.65")] ESPstruct DFUIndexInfo ExtendedIndexInfo;
+    [min_ver("1.67")] string CompressionType;
 };
 
 ESPStruct DFUSpaceItem
@@ -223,6 +247,7 @@ ESPrequest [nil_remove] DFUQueryRequest
     [depr_ver("1.26")] string ClusterName;
     [min_ver("1.26")] string NodeGroup;
     [min_ver("1.30")] string ContentType;
+    [min_ver("1.64")] bool InvertContent;
     string LogicalName;
     string Owner;
     string StartDate;
@@ -237,6 +262,7 @@ ESPrequest [nil_remove] DFUQueryRequest
     int PageStartFrom;
     //int CurrentPage;
     string Sortby;
+    [min_ver("1.66")] string Fields;
     bool Descending(false);
 
     bool OneLevelDirFileReturn(false);
@@ -245,6 +271,10 @@ ESPrequest [nil_remove] DFUQueryRequest
     [min_ver("1.30")] bool IncludeSuperOwner;
     [min_ver("1.55")] string StartAccessedTime;
     [min_ver("1.55")] string EndAccessedTime;
+    [min_ver("1.63")] int64 MaxSkewFrom;
+    [min_ver("1.63")] int64 MaxSkewTo;
+    [min_ver("1.63")] int64 MinSkewFrom;
+    [min_ver("1.63")] int64 MinSkewTo;
 };
 
 ESPresponse
@@ -350,6 +380,7 @@ DFUInfoRequest
     [min_ver("1.37")] bool IncludeBinTypeInfo(false);
     [min_ver("1.39")] ESPenum DFUChangeProtection Protect(0);
     [min_ver("1.53")] ESPenum DFUChangeRestriction Restrict(0);
+    [min_ver("1.65")] bool ForceIndexInfo(false);
 };
 
 ESPresponse
@@ -473,6 +504,7 @@ ESPrequest AddRequest
 {
     string dstname;
     [http_content("text/xml")] binary xmlmap;
+    [min_ver("1.57")] string dstcluster;
 };
 
 ESPresponse [exceptions_inline, nil_remove] AddResponse
@@ -872,6 +904,7 @@ ESPStruct DFUFilePart
     int PartIndex;
     ESParray<EspStruct DFUFileCopy> Copies;
     [min_ver("1.56")] bool TopLevelKey(false);
+    [min_ver("1.69")] int64 RecordCount(-1);
 };
 
 ESPStruct DFUFileAccessInfo
@@ -962,17 +995,59 @@ ESPresponse [exceptions_inline, nil_remove] DFUFilePublishResponse
 {
 };
 
+ESPrequest [nil_remove] DFUMetaInquiryRequest
+{
+};
+
+ESPStruct DFUMetaFieldInfo
+{
+    string Name;
+    string Type;
+};
+
+ESPresponse [exceptions_inline, nil_remove] DFUMetaInquiryResponse
+{
+    ESParray<ESPstruct DFUMetaFieldInfo> Fields;
+};
+
+ESPStruct [version("1.68")] DFUFileRenameItem
+{
+    string OldName;
+    string NewName;
+};
+
+ESPrequest [version("1.68")] DFUFileRenameRequest
+{
+    ESParray<ESPstruct DFUFileRenameItem> FileRenames;
+};
+
+ESPStruct [version("1.68")] DFUFileRenameResult
+{
+    string OldName;
+    string NewName;
+    bool Success;
+    string Message;
+};
+
+ESPresponse [version("1.68"), exceptions_inline, nil_remove] DFUFileRenameResponse
+{
+    [min_ver("1.68")] ESParray<ESPstruct DFUFileRenameResult> Results;
+};
+
+
 //  ===========================================================================
 ESPservice [
     auth_feature("DEFERRED"),
-    version("1.56"),
-    default_client_version("1.56"),
+    version("1.69"),
+    default_client_version("1.69"),
     noforms,
     exceptions_inline("./smc_xslt/exceptions.xslt")] WsDfu
 {
     ESPmethod [resp_xsl_default("/esp/xslt/dfu_fileview.xslt")] DFUFileView(DFUFileViewRequest, DFUFileViewResponse);
     ESPmethod [resp_xsl_default("/esp/xslt/dfu_search.xslt")] DFUSearch(DFUSearchRequest, DFUSearchResponse);
     ESPmethod [resp_xsl_default("/esp/xslt/dfu.xslt")] DFUQuery(DFUQueryRequest, DFUQueryResponse);
+    ESPmethod [resp_xsl_default("/esp/xslt/dfu_metainquiry.xslt")] DFUGetMetaInquiry(DFUMetaInquiryRequest, DFUMetaInquiryResponse);
+
     ESPmethod [resp_xsl_default("/esp/xslt/action.xslt")] DFUArrayAction(DFUArrayActionRequest, DFUArrayActionResponse);
     ESPmethod [resp_xsl_default("/esp/xslt/dfu_file.xslt")] DFUInfo(DFUInfoRequest, DFUInfoResponse);
     ESPmethod [resp_xsl_default("/esp/xslt/dfu_file_space.xslt")] DFUSpace(DFUSpaceRequest, DFUSpaceResponse);
@@ -989,6 +1064,8 @@ ESPservice [
     ESPmethod [auth_feature("DfuAccess:READ")] Savexml(SavexmlRequest, SavexmlResponse);
     ESPmethod [auth_feature("DfuAccess:WRITE")] Add(AddRequest, AddResponse);
     ESPmethod [auth_feature("DfuAccess:WRITE")] AddRemote(AddRemoteRequest, AddRemoteResponse);
+
+    ESPmethod [auth_feature("DfuAccess:WRITE"), min_ver("1.68")] DFUFileRename(DFUFileRenameRequest, DFUFileRenameResponse);
 
     ESPmethod ListHistory(ListHistoryRequest, ListHistoryResponse);
     ESPmethod EraseHistory(EraseHistoryRequest, EraseHistoryResponse);

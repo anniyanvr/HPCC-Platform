@@ -25,6 +25,10 @@
 
 project( thorhelper ) 
 
+if (USE_TBB)
+    find_package(TBB CONFIG REQUIRED)
+endif ()
+
 set (    SRCS 
 
          commonext.cpp
@@ -43,6 +47,7 @@ set (    SRCS
          thortalgo.cpp 
          thortlex.cpp 
          thortparse.cpp 
+         thorwrite.cpp
          thorxmlread.cpp 
          thorxmlwrite.cpp
          roxierow.cpp
@@ -66,6 +71,7 @@ set (    SRCS
          roxierow.hpp
          thorralgo.ipp
          thorrparse.ipp
+         thorwrite.hpp
          thorsort.cpp
          thorsort.hpp
          persistent.cpp
@@ -77,6 +83,8 @@ set (    SRCS
          roxiehelper.ipp
          roxielmj.hpp
                  
+         hpccconfig.cpp
+         hpccconfig.hpp
     )
 
 include_directories ( 
@@ -98,43 +106,65 @@ include_directories (
          ${HPCC_SOURCE_DIR}/ecl/hql
          ${HPCC_SOURCE_DIR}/roxie/roxiemem
          ${HPCC_SOURCE_DIR}/testing/unittests
-         ${HPCC_SOURCE_DIR}/system/tbb_sm/tbb/include
          ${HPCC_SOURCE_DIR}/system/security/shared
          ${HPCC_SOURCE_DIR}/fs/dafsclient
     )
 
+if (USE_PARQUET)
+    include_directories (
+         ${HPCC_SOURCE_DIR}/esp/platform
+         ${HPCC_SOURCE_DIR}/plugins/parquet
+    )
+endif()
+
 ADD_DEFINITIONS( -DTHORHELPER_EXPORTS -D_USRDLL )
 
 HPCC_ADD_LIBRARY( thorhelper SHARED ${SRCS} )
-install ( TARGETS thorhelper RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( thorhelper 
-         jlib 
-         nbcd 
-         hql
-         eclrtl 
-         roxiemem
-         deftype 
-         dalibase 
+install ( TARGETS thorhelper RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} CALC_DEPS )
+target_link_libraries ( thorhelper PRIVATE
+        jlib 
+        nbcd 
+        hql
+        eclrtl 
+        roxiemem
+        deftype 
+        dalibase
+        dafsclient
+        jhtree
+        ${CppUnit_LIBRARIES}
     )
 
+if (USE_PARQUET)
+    find_package(Arrow CONFIG REQUIRED)
+    find_package(Parquet CONFIG REQUIRED)
+    target_link_libraries( thorhelper PRIVATE
+         parquetembed
+         "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,Arrow::arrow_static,Arrow::arrow_shared>"
+         "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,Parquet::parquet_static,Parquet::parquet_shared>"
+    )
+endif()
+
+if (USE_ICU)
+    target_link_libraries (thorhelper PRIVATE ${ICU_LIBRARIES})
+endif()
+
 if (USE_NUMA)
- target_link_libraries ( thorhelper numa )
+    target_link_libraries ( thorhelper PRIVATE ${NUMA_LIBRARIES} )
 endif ()
 
 if (USE_TBB)
-   add_dependencies ( thorhelper tbb )
-   target_link_libraries ( thorhelper libtbb )
+    target_link_libraries ( thorhelper PRIVATE TBB::tbb )
 endif()
 
 
 IF (USE_OPENSSL)
-    target_link_libraries ( thorhelper 
-    	securesocket
+    target_link_libraries ( thorhelper PRIVATE
+        securesocket
     )
 ENDIF()
 
 IF (USE_ZLIB)
-    target_link_libraries ( thorhelper
+    target_link_libraries ( thorhelper PRIVATE
         ${ZLIB_LIBRARIES}
         zcrypt
     )

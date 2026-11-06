@@ -41,6 +41,9 @@
 #include "hqlgraph.ipp"
 #include "thorcommon.hpp"
 
+#include "hqlexprtak.hpp"
+#include "wuattr.hpp"
+
 //---------------------------------------------------------------------------
 
 IPropertyTree * addGraphAttribute(IPropertyTree * node, const char * name)
@@ -55,15 +58,31 @@ void addGraphAttribute(IPropertyTree * node, const char * name, const char * val
     addGraphAttribute(node, name)->setProp("@value", value);
 }
 
+void addGraphAttribute(IPropertyTree * node, WuAttr kind, const char * value)
+{
+    setAttributeValue(*node, kind, value);
+}
+
 void addGraphAttributeInt(IPropertyTree * node, const char * name, __int64 value)
 {
     addGraphAttribute(node, name)->setPropInt64("@value", value);
+}
+
+void addGraphAttributeInt(IPropertyTree * node, WuAttr kind, __int64 value)
+{
+    setAttributeValueInt(*node, kind, value);
 }
 
 void addGraphAttributeBool(IPropertyTree * node, const char * name, bool value, bool alwaysAdd)
 {
     if (value || alwaysAdd)
         addGraphAttribute(node, name)->setPropBool("@value", value);
+}
+
+void addGraphAttributeBool(IPropertyTree * node, WuAttr kind, bool value, bool alwaysAdd)
+{
+    if (value || alwaysAdd)
+        setAttributeValueBool(*node, kind, value);
 }
 
 IPropertyTree * addIntraGraphEdge(IPropertyTree * subGraph, unsigned __int64 source, unsigned __int64 target, unsigned outputIndex)
@@ -127,7 +146,6 @@ void removeGraphAttribute(IPropertyTree * node, const char * name)
     node->removeProp(xpath.str());
 }
 
-
 static void queryExpandFilename(StringBuffer & out, IHqlExpression * expr)
 {
     if (expr)
@@ -138,6 +156,15 @@ static void queryExpandFilename(StringBuffer & out, IHqlExpression * expr)
     }
 }
 
+static void queryFilenameOnly(StringBuffer & out, IHqlExpression * expr)
+{
+    if (expr)
+    {
+        OwnedHqlExpr folded = foldHqlExpression(expr);
+        if (folded->queryValue())
+            getStringValue(out, folded);
+    }
+}
 
 //---------------------------------------------------------------------------
 
@@ -173,10 +200,22 @@ void LogicalGraphCreator::addAttribute(const char * name, const char * value)
         addGraphAttribute(activityNode, name, value);
 }
 
+void LogicalGraphCreator::addAttribute(WuAttr kind, const char * value)
+{
+    if (value)
+        addGraphAttribute(activityNode, kind, value);
+}
+
 void LogicalGraphCreator::addAttribute(const char * name, IAtom * value)
 {
     if (value)
         addGraphAttribute(activityNode, name, str(value));
+}
+
+void LogicalGraphCreator::addAttribute(WuAttr kind, IAtom * value)
+{
+    if (value)
+        addGraphAttribute(activityNode, kind, str(value));
 }
 
 void LogicalGraphCreator::addAttributeInt(const char * name, __int64 value)
@@ -184,9 +223,19 @@ void LogicalGraphCreator::addAttributeInt(const char * name, __int64 value)
     addGraphAttributeInt(activityNode, name, value);
 }
 
+void LogicalGraphCreator::addAttributeInt(WuAttr kind, __int64 value)
+{
+    addGraphAttributeInt(activityNode, kind, value);
+}
+
 void LogicalGraphCreator::addAttributeBool(const char * name, bool value)
 {
     addGraphAttributeBool(activityNode, name, value);
+}
+
+void LogicalGraphCreator::addAttributeBool(WuAttr kind, bool value)
+{
+    addGraphAttributeBool(activityNode, kind, value);
 }
 
 void LogicalGraphCreator::beginActivity(const char * label, unique_id_t id)
@@ -236,12 +285,6 @@ void LogicalGraphCreator::connectActivities(IHqlExpression * fromExpr, IHqlExpre
     }
     LogicalGraphInfo * from = queryExtra(fromExpr);
     LogicalGraphInfo * to = queryExtra(toExpr);
-    if (kind == dependencyAtom)
-    {
-        LogicalGraphInfo * temp = from;
-        from = to;
-        to = temp;
-    }
 
     if (from->subGraphId == to->subGraphId)
         addSimpleGraphEdge(curSubGraph(), from->id, to->id, from->outputCount++, 0, kind, label, nWay);
@@ -259,7 +302,7 @@ void LogicalGraphCreator::createLogicalGraph(HqlExprArray & exprs)
     ForEachItemIn(i, exprs)
         createRootGraphActivity(&exprs.item(i));
 //  endSubGraph();
-    wu->createGraph("Logical", NULL, GraphTypeEcl, graph.getClear(), 0);
+    wu->createGraph("graph0", NULL, GraphTypeEcl, graph.getClear(), 0);
 }
 
 
@@ -310,6 +353,7 @@ void LogicalGraphCreator::createGraphActivity(IHqlExpression * expr)
     node_operator op = expr->getOperator();
     HqlExprArray inputs, dependents;
     bool defaultInputs = true;
+    StringBuffer filename;
     switch (op)
     {
     case no_setresult:
@@ -348,6 +392,17 @@ void LogicalGraphCreator::createGraphActivity(IHqlExpression * expr)
             defaultInputs = false;
             break;
         }
+    case no_table:
+        {
+            queryFilenameOnly(filename, expr->queryChild(0));
+            break;
+        }
+    case no_buildindex:
+    case no_output:
+        {
+            queryFilenameOnly(filename, expr->queryChild(1));
+            break;
+        }
     }
     if (defaultInputs)
     {
@@ -373,17 +428,23 @@ void LogicalGraphCreator::createGraphActivity(IHqlExpression * expr)
     beginActivity(getActivityText(expr, tempText), id);
     StringBuffer eclText;
     toECL(expr->queryBody(), eclText, false, true);
-    addAttribute("ecl", eclText.str());
-    addAttributeBool("grouped", isGrouped);
-    addAttributeBool("local", isLocal);
+    addAttribute(WaEclText, eclText.str());
+    addAttributeBool(WaIsGrouped, isGrouped);
+    addAttributeBool(WaIsLocal, isLocal);
+    if (!filename.isEmpty())
+        addAttribute(WaFilename, filename.str());
+
+    IHqlExpression * location = queryLocation(expr);
+    if (location)
+        addLocationAttribute(*activityNode, location);
+
     IHqlExpression * symbol = queryNamedSymbol(expr);
     if (symbol)
-    {
-        addAttribute("name", str(symbol->queryId()));
-        addAttribute("module", str(symbol->queryFullContainerId()));
-        addAttributeInt("line", symbol->getStartLine());
-        addAttributeInt("column", symbol->getStartColumn());
-    }
+        addAttribute(WaEclName, str(symbol->queryId()));
+
+    ThorActivityKind actKind = mapExpressionToActivityKind(expr);
+    if (actKind != TAKnone)
+        addAttributeInt(WaKind, actKind);
 
     endActivity();
 
@@ -626,11 +687,11 @@ const char * LogicalGraphCreator::getActivityText(IHqlExpression * expr, StringB
             IHqlExpression * mode = expr->queryChild(2);
             switch (mode->getOperator())
             {
-            case no_csv:
-            case no_xml:
-            case no_json:
-                temp.append(getOpString(expr->getOperator())).append(" ");
-                break;
+                case no_csv:
+                case no_xml:
+                case no_json:
+                    temp.append(getOpString(expr->getOperator())).append(" ");
+                    break;
             }
             temp.append("Dataset");
             queryExpandFilename(temp, expr->queryChild(0));
@@ -760,16 +821,16 @@ bool LogicalGraphCreator::isWorkflowExpanded(IHqlExpression * expr) const
         IHqlExpression * cur = actions->queryChild(i);
         switch (cur->getOperator())
         {
-        case no_persist:
-            if (!expandPersist)
-                return false;
-            break;
-        case no_stored:
-            if (!expandStored)
-                return false;
-            break;
-        default:
-            return true;
+            case no_persist:
+                if (!expandPersist)
+                    return false;
+                break;
+            case no_stored:
+                if (!expandStored)
+                    return false;
+                break;
+            default:
+                return true;
         }
     }
     return true;

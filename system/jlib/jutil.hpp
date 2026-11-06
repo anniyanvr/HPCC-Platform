@@ -24,9 +24,11 @@
 #include "jarray.hpp"
 #include "jbuff.hpp"
 
-#include <algorithm> 
+#include <algorithm>
 #include <iterator>
 #include <functional>
+#include <vector>
+#include <string>
 
 #if defined (__APPLE__)
 #include <mach/mach_time.h>
@@ -35,10 +37,14 @@ extern mach_timebase_info_data_t timebase_info;   // Calibration for nanosecond 
 
 //#define NAMEDCOUNTS
 
+bool jlib_decl getEnvVar(const char * varName, StringBuffer & varValue);
+
 interface IPropertyTree;
 interface IProperties;
 
-void jlib_decl MilliSleep(unsigned milli);
+extern jlib_decl void MilliSleep(unsigned milli);
+extern jlib_decl void NanoSleep(__uint64 ns);
+
 long jlib_decl atolong_l(const char * s,int l);
 int  jlib_decl atoi_l(const char * s,int l);
 __int64 jlib_decl atoi64_l(const char * s,int l);
@@ -69,6 +75,14 @@ int jlib_decl numtostr(char *dst, unsigned __int64 _value);
 // Translate "human readable" size strings like 4G to numbers
 extern jlib_decl offset_t friendlyStringToSize(const char *in);
 
+// Translate "human readable" time strings like 1m or 500ms to nanoseconds
+extern jlib_decl offset_t friendlyStringToDuration(const char *in);
+
+// Translate "human readable" cpu amounts that can either be a decimal (e.g. 2.5), or a number of milli-cores (e.g. 1500m)
+extern jlib_decl double friendlyCPUToDecimal(const char *in);
+
+extern jlib_decl double getResourcedCpus(const char *resourceName);
+
 // Write a string as file contents, atomically
 extern void jlib_decl atomicWriteFile(const char *fileName, const char *output);
 
@@ -91,7 +105,7 @@ class jlib_decl SharedObject : public CInterfaceOf<IInterface>
 public:
     SharedObject()      { h = 0; bRefCounted = false; }
     ~SharedObject()     { unload(); }
-    
+
     bool load(const char * dllName, bool isGlobal, bool raiseOnError=false);
     bool loadCurrentExecutable();
     bool loadResources(const char * dllName);
@@ -127,7 +141,7 @@ extern jlib_decl unique_id_t    getUniqueId();
 extern jlib_decl StringBuffer & getUniqueId(StringBuffer & target);
 extern jlib_decl void           resetUniqueId();
 
-extern jlib_decl unsigned getRandom();              // global 
+extern jlib_decl unsigned getRandom();              // global
 extern jlib_decl void seedRandom(unsigned seed);
 
 interface IRandomNumberGenerator: public IInterface
@@ -151,7 +165,7 @@ extern jlib_decl void fillRandomData(size32_t writeSz, MemoryBuffer &mb);
 jlib_decl int rand_r(unsigned int *seed);
 #define RAND_R_MAX  INT_MAX
 
-#else 
+#else
 
 #define RAND_R_MAX  RAND_MAX
 
@@ -168,12 +182,11 @@ inline int fastRand()
 
 interface IShuffledIterator: extends IInterface
 {
-    virtual void seed(unsigned seedval)=0;  // ony required for repeatability
     virtual bool first()=0;
-    virtual bool isValid() = 0;
+    virtual bool isValid() const = 0;
     virtual bool next() = 0;
-    virtual unsigned get() = 0;
-    virtual unsigned lookup(unsigned idx) = 0;  // looks up idx'th entry
+    virtual unsigned get() const = 0;
+    virtual unsigned lookup(unsigned idx) const = 0;  // looks up idx'th entry
 };
 
 extern jlib_decl IShuffledIterator *createShuffledIterator(unsigned n); // returns iterator that returns 0..n-1 in shuffled order
@@ -202,12 +215,12 @@ extern jlib_decl MemoryBuffer &JBASE64_Decode(ISimpleReadStream &in, MemoryBuffe
 extern jlib_decl bool JBASE64_Decode(size32_t length, const char *in, StringBuffer &out);
 
 extern jlib_decl void JBASE32_Encode(const char *in,StringBuffer &out);  // result all lower
-extern jlib_decl void JBASE32_Decode(const char *in,StringBuffer &out);  
+extern jlib_decl void JBASE32_Decode(const char *in,StringBuffer &out);
 
 /* URL: http://user:passwd@host:port/path */
 extern jlib_decl StringBuffer& encodeUrlUseridPassword(StringBuffer& out, const char* in);
 extern jlib_decl StringBuffer& decodeUrlUseridPassword(StringBuffer& out, const char* in);
-
+extern jlib_decl StringBuffer& encodeURL(StringBuffer& out, const char* in);
 //--------------------------------------------------------------------------------------------------------------------
 
 class StringPointerArrayMapper : public SimpleArrayMapper<const char *>
@@ -240,14 +253,18 @@ class jlib_decl StringArray : public ArrayOf<const char *, const char *, StringP
     };
     typedef ArrayOf<const char *, const char *, StringPointerArrayMapper> PARENT;
 public:
+    using PARENT::contains;
+    void appendArray(const StringArray & other);
     // Appends a list in a string delimited by 'delim'
     void appendList(const char *list, const char *delim, bool trimSpaces = true);
     // Appends a list in a string delimited by 'delim' without duplicates
     void appendListUniq(const char *list, const char *delim, bool trimSpaces = true);
-    StringBuffer &getString(StringBuffer &ret, const char *delim); // get CSV string of array contents
+    bool contains(const char * search, bool nocase) const;
+    StringBuffer &getString(StringBuffer &ret, const char *delim) const; // get CSV string of array contents
     void sortAscii(bool nocase=false);
     void sortAsciiReverse(bool nocase=false);
     void sortCompare(int (*compare)(const char * const * l, const char * const * r));
+    void clear(bool) = delete;
 private:
     using PARENT::sort; // prevent access to this function - to avoid ambiguity
 };
@@ -293,16 +310,32 @@ public:
 
 extern jlib_decl unsigned msTick();
 extern jlib_decl unsigned usTick();
+extern jlib_decl unsigned __int64 nsTick();
 extern jlib_decl int write_pidfile(const char * instance);
 extern jlib_decl void doStackProbe();
-extern jlib_decl bool isContainerized();
+
+//isContainerized() allows a constant-folded check for defined(_CONTAINERIZED) in a general expression
+#ifdef _CONTAINERIZED
+inline constexpr bool isContainerized() { return true; }
+#else
+inline constexpr bool isContainerized() { return false; }
+#endif
+
+//Same for isDebugBuild() rather than requiring #ifdef _DEBUG
+#ifdef _DEBUG
+inline constexpr bool isDebugBuild() { return true; }
+#else
+inline constexpr bool isDebugBuild() { return false; }
+#endif
 
 #ifndef arraysize
 #define arraysize(T) (sizeof(T)/sizeof(*T))
 #endif
 
+using StringPairVector = std::vector<std::pair<std::string, std::string>>;
+using EnvironmentVector = StringPairVector;
 extern jlib_decl unsigned runExternalCommand(StringBuffer &output, StringBuffer &error, const char *cmd, const char *input);
-extern jlib_decl unsigned runExternalCommand(const char *title, StringBuffer &output, StringBuffer &error, const char *cmd, const char *input);
+extern jlib_decl unsigned runExternalCommand(const char *title, StringBuffer &output, StringBuffer &error, const char *cmd, const char *input, const char * cwd, const EnvironmentVector * optEnvironment);
 
 extern jlib_decl unsigned __int64 greatestCommonDivisor(unsigned __int64 left, unsigned __int64 right);
 
@@ -317,15 +350,12 @@ inline unsigned hex2num(char next)
     return 0;
 }
 
-extern jlib_decl void initThreadLocal(int len, void* val);
-extern jlib_decl void* getThreadLocalVal();
-extern jlib_decl void clearThreadLocal();
 
 
 extern jlib_decl bool matchesMask(const char *fn, const char *mask, unsigned p, unsigned n);
 extern jlib_decl StringBuffer &expandMask(StringBuffer &buf, const char *mask, unsigned p, unsigned n);
 extern jlib_decl bool constructMask(StringAttr &attr, const char *fn, unsigned p, unsigned n);
-extern jlib_decl bool deduceMask(const char *fn, bool expandN, StringAttr &mask, unsigned &p, unsigned &n); // p is 0 based in these routines
+extern jlib_decl bool deduceMask(const char *fn, bool expandN, StringAttr &mask, unsigned &p, unsigned &n, unsigned &filenameLen); // p is 0 based in these routines
 
 class HashKeyElement;
 class jlib_decl NamedCount
@@ -347,17 +377,7 @@ public:
 
 extern jlib_decl StringBuffer &dumpNamedCounts(StringBuffer &str);
 
-
-interface IAuthenticatedUser: extends IInterface
-{
-    virtual bool login(const char *user, const char *passwd) = 0;
-    virtual void impersonate()=0;
-    virtual void revert()=0;
-    virtual const char *username()=0;
-};
-
 interface IAtom;
-extern jlib_decl IAuthenticatedUser *createAuthenticatedUser();
 extern jlib_decl void serializeAtom(MemoryBuffer & target, IAtom * name);
 extern jlib_decl IAtom * deserializeAtom(MemoryBuffer & source);
 
@@ -417,9 +437,9 @@ extern jlib_decl const IProperties &queryEnvironmentConf();
  */
 extern jlib_decl IPropertyTree *getHPCCEnvironment();
 extern jlib_decl bool getConfigurationDirectory(const IPropertyTree *dirtree, // NULL to use HPCC config
-                                                const char *category, 
+                                                const char *category,
                                                 const char *component,
-                                                const char *instance, 
+                                                const char *instance,
                                                 StringBuffer &dirout);
 
 extern jlib_decl bool querySecuritySettings(DAFSConnectCfg *_connectMethod,
@@ -441,8 +461,13 @@ extern jlib_decl bool queryHPCCPKIKeyFiles(const char * *  _certificate,//HPCCCe
                                            const char * *  _privateKey, //HPCCPrivateKeyFile
                                            const char * *  _passPhrase);//HPCCPassPhrase, encrypted
 
+#ifndef _CONTAINERIZED
+extern jlib_decl bool queryMtlsBareMetalConfig();
+#endif
+
 extern jlib_decl const char * matchConfigurationDirectoryEntry(const char *path,const char *mask,StringBuffer &name, StringBuffer &component, StringBuffer &instance);
 extern jlib_decl bool replaceConfigurationDirectoryEntry(const char *path,const char *frommask,const char *tomask,StringBuffer &out);
+extern jlib_decl bool validateConfigurationDirectory(const IPropertyTree* useTree, const char* category, const char* component, const char* instance, const char* dirToValidate);
 
 extern jlib_decl const char *queryCurrentProcessPath();
 
@@ -461,6 +486,10 @@ extern jlib_decl int parseCommandLine(const char * cmdline, MemoryBuffer &mb, co
 extern jlib_decl bool safe_ecvt(size_t len, char * buffer, double value, int numDigits, int * decimal, int * sign);
 extern jlib_decl bool safe_fcvt(size_t len, char * buffer, double value, int numPlaces, int * decimal, int * sign);
 extern jlib_decl StringBuffer &getTempFilePath(StringBuffer & target, const char * component, IPropertyTree * pTree);
+extern jlib_decl StringBuffer &getSpillFilePath(StringBuffer & target, const char * component, IPropertyTree * pTree);
+extern jlib_decl StringBuffer &createUniqueTempDirectoryName(StringBuffer & ret);
+extern jlib_decl IFile *createUniqueTempDirectory();
+extern jlib_decl StringBuffer &getSystemTempDir(StringBuffer &ret);
 
 interface jlib_thrown_decl ICorruptDllException: extends IException
 {
@@ -584,6 +613,56 @@ public:
         exitFunc();
     }
 };
+
+struct HPCCBuildInfo
+{
+    const char *buildTag;
+
+    const char *dirName;
+    const char *prefix;
+    const char *execPrefix;
+    const char *configPrefix;
+    const char *installDir;
+    const char *libDir;
+    const char *execDir;
+    const char *componentDir;
+    const char *configDir;
+    const char *configSourceDir;
+    const char *adminDir;
+    const char *pluginsDir;
+    const char *runtimeDir;
+    const char *lockDir;
+    const char *pidDir;
+    const char *logDir;
+
+    const char *envXmlFile;
+    const char *envConfFile;
+
+    unsigned buildVersionMajor;
+    unsigned buildVersionMinor;
+    unsigned buildVersionPoint;
+    const char *buildVersion;
+    const char *buildMaturity;
+    const char *buildTagTimestamp;
+};
+
+extern jlib_decl HPCCBuildInfo hpccBuildInfo;
+extern jlib_decl bool checkCreateDaemon(unsigned argc, const char * * argv);
+
+extern jlib_decl unsigned readDigits(const char *name);
+extern jlib_decl unsigned readDigits(char const * & str, unsigned numDigits, bool throwOnFailure = true);
+
+//Createpassword of specified length, containing UpperCaseAlphas, LowercaseAlphas, numerics and symbols
+extern jlib_decl const char * generatePassword(StringBuffer &pwd, int pwdLen);
+
+extern jlib_decl bool getDefaultPlane(StringBuffer &ret, const char * componentOption, const char * category);
+
+extern jlib_decl void getResourceFromJfrog(StringBuffer &localPath, IPropertyTree &item);
+
+extern jlib_decl void hold(const char *msg);
+
+template <typename T>
+inline bool isPowerOf2(T x) { return (x & (x-1)) == 0; }
 
 #endif
 

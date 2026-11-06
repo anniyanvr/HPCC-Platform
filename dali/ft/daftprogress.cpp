@@ -36,7 +36,6 @@
 #include "fttransform.hpp"
 #include "daft.hpp"
 #include "daftmc.hpp"
-#include "dalienv.hpp"
 
 #include "jprop.hpp"
 #include "jptree.hpp"
@@ -64,7 +63,7 @@ void DaftProgress::formatTime(char * buffer, unsigned secs)
         sprintf(buffer, "%d secs", secs);
 }
 
-void DaftProgress::onProgress(unsigned __int64 sizeDone, unsigned __int64 totalSize, unsigned numNodes)
+void DaftProgress::onProgress(unsigned __int64 sizeDone, unsigned __int64 totalSize, unsigned numNodes, unsigned __int64 numReads, unsigned __int64 numWrites)
 {
     cycle_t nowTime = get_cycles_now();
     savedTime[nextSample] = nowTime;
@@ -88,15 +87,22 @@ void DaftProgress::onProgress(unsigned __int64 sizeDone, unsigned __int64 totalS
         unsigned secsLeft = (unsigned)(timeLeft * cycleToNanoScale /1000000000);
         char temp[20];
         formatTime(temp, secsLeft);
-        displayProgress((unsigned)(sizeDone*100/totalSize), secsLeft, temp, 
-                        sizeDone/scale,totalSize/scale,scaleUnit, 
-                        (unsigned)(msGone ? (sizeDone-startSize)/msGone : 0),
-                        (unsigned)(recentTimeDelta ? recentSizeDelta / recentTimeDelta : 0), numNodes);
+
+        unsigned percentDone = (unsigned)(totalSize ? (sizeDone*100/totalSize) : 100);
+
+        unsigned __int64 kbPerSecond = (sizeDone-startSize) / 1024;
+        if (msGone) // if took no time, leave as max total kb.
+            kbPerSecond = (kbPerSecond * 1000) / msGone;
+
+        displayProgress(percentDone, secsLeft, temp,
+                        sizeDone/scale, totalSize/scale, scaleUnit,
+                        (unsigned)kbPerSecond,
+                        (unsigned)(recentTimeDelta ? recentSizeDelta / recentTimeDelta : 0), numNodes, numReads, numWrites);
 
         if (sizeDone == totalSize)
         {
             formatTime(temp, (unsigned)(msGone/1000));
-            displaySummary(temp, (unsigned)((totalSize - startSize)/msGone));
+            displaySummary(temp, (unsigned)kbPerSecond);
         }
     }
 }
@@ -136,11 +142,11 @@ void DemoProgress::displayProgress(unsigned percentDone, unsigned secsLeft, cons
                             unsigned kbPerSecondAve, unsigned kbPerSecondRate, unsigned numNodes)
 {
 
-    LOG(MCdebugProgress, unknownJob, "Progress: %d%% done, %s left.  (%" I64F "d/%" I64F "d%s @Ave(%dKB/s) Rate(%dKB/s) [%d/%d]",
+    LOG(MCdebugProgress, "Progress: %d%% done, %s left.  (%" I64F "d/%" I64F "d%s @Ave(%dKB/s) Rate(%dKB/s) [%d/%d]",
             percentDone, timeLeft, scaledDone, scaledTotal, scale, kbPerSecondAve, kbPerSecondRate, numNodes, totalNodes);
 }
 
 void DemoProgress::displaySummary(const char * timeTaken, unsigned kbPerSecond)
 {
-    LOG(MCdebugProgress, unknownJob, "Summary: Total time taken %s, Average transfer %dKB/sec", timeTaken, kbPerSecond);
+    LOG(MCdebugProgress, "Summary: Total time taken %s, Average transfer %dKB/sec", timeTaken, kbPerSecond);
 }

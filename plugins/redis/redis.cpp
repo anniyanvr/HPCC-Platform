@@ -57,7 +57,7 @@ static __thread Connection * cachedSubscriptionConnection = nullptr;
 #define DUMMY_IP 0
 #define DUMMY_PORT 0
 
-static CriticalSection critsec;
+static CriticalSection critsec{SYNC_LOCATION};
 static __thread bool threadHooked = false;
 static int connectionCachingLevel = ALLOW_CONNECTION_CACHING;
 static std::atomic<bool> connectionCachingLevelChecked(false);
@@ -388,7 +388,7 @@ bool Connection::isSameConnection(ICodeContext * ctx, const char * _options, con
 }
 unsigned Connection::hashServerIpPortPassword(ICodeContext * ctx, const char * _options, const char * password)
 {
-    return hashc((const unsigned char*)_options, strlen(_options), hashc((const unsigned char*)password, strlen(password), 0));
+    return hashcz((const unsigned char*)_options, hashcz((const unsigned char*)password, 0));
 }
 void Connection::reset(ICodeContext * ctx, unsigned _database, const char * password, unsigned _timeout, bool selectDB)
 {

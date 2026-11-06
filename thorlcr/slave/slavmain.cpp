@@ -21,12 +21,14 @@
 #include <unordered_map>
 
 #include "jlib.hpp"
+#include "jcontainerized.hpp"
 #include "jexcept.hpp"
 #include "jthread.hpp"
 #include "jprop.hpp"
 #include "jiter.ipp"
 #include "jlzw.hpp"
 #include "jflz.hpp"
+#include "jdebug.hpp"
 
 #include "jhtree.hpp"
 #include "mpcomm.hpp"
@@ -52,6 +54,9 @@
 #include "eclhelper_dyn.hpp"
 #include "rtlcommon.hpp"
 #include "../activities/keyedjoin/thkeyedjoincommon.hpp"
+#include "jprotrace.hpp"
+
+bool recvShutdown = false;
 
 //---------------------------------------------------------------------------
 
@@ -71,7 +76,7 @@ void enableThorSlaveAsDaliClient()
     {
         try
         {
-            LOG(MCdebugProgress, thorJob, "calling initClientProcess");
+            DBGLOG("calling initClientProcess");
             initClientProcess(serverGroup,DCR_ThorSlave, getFixedPort(TPORT_mp));
             break;
         }
@@ -79,11 +84,11 @@ void enableThorSlaveAsDaliClient()
         {
             if ((e->errorCode()!=JSOCKERR_port_in_use))
                 throw;
-            FLLOG(MCexception(e), thorJob, e,"InitClientProcess");
+            FLLOG(MCexception(e), e,"InitClientProcess");
             if (retry++>10)
                 throw;
             e->Release();
-            LOG(MCdebugProgress, thorJob, "Retrying");
+            DBGLOG("Retrying");
             Sleep(retry*2000);
         }
     }
@@ -115,7 +120,6 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
     unsigned maxCachedKJManagers = defaultMaxCachedKJManagers;
     unsigned maxCachedFetchContexts = defaultMaxCachedFetchContexts;
     unsigned keyLookupMaxProcessThreads = defaultKeyLookupMaxProcessThreads;
-
     class CLookupKey
     {
         unsigned hashv = 0;
@@ -124,12 +128,15 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         activity_id id = 0;
         StringAttr fname;
         unsigned crc = 0;
+        IndexReadOptions readOptions;
 
         CLookupKey(MemoryBuffer &mb)
         {
             mb.read(id);
             mb.read(fname);
             mb.read(crc);
+            mb.read(readOptions.randomReadSize);
+            mb.read(readOptions.sequentialReadSize);
             unsigned h = hashvalue(id, crc);
             hashv = hashc((const unsigned char *)&id, sizeof(unsigned), h);
         }
@@ -192,12 +199,9 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         Owned<IOutputRowDeserializer> fetchInputDeserializer;
         Owned<IOutputRowSerializer> fetchOutputSerializer;
 
-        Owned<IEngineRowAllocator> fetchDiskAllocator;
-        Owned<IOutputRowDeserializer> fetchDiskDeserializer;
-
         ICodeContext *codeCtx;
 
-        CriticalSection crit;
+        CriticalSection crit{SYNC_LOCATION};
         StringArray fetchFilenames;
         IPointerArrayOf<IFileIO> openFetchFiles;
         size32_t fetchInMinSz = 0;
@@ -210,22 +214,20 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         {
             Owned<IOutputMetaData> lookupInputMeta = new CPrefixedOutputMeta(sizeof(KeyLookupHeader), helper->queryIndexReadInputRecordSize());
             lookupInputDeserializer.setown(lookupInputMeta->createDiskDeserializer(codeCtx, id));
-            lookupInputAllocator.setown(codeCtx->getRowAllocatorEx(lookupInputMeta,id, (roxiemem::RoxieHeapFlags)roxiemem::RHFpacked|roxiemem::RHFunique));
-            joinFieldsAllocator.setown(codeCtx->getRowAllocatorEx(helper->queryJoinFieldsRecordSize(), id, roxiemem::RHFnone));
+            lookupInputAllocator.setown(codeCtx->getRowAllocatorEx(lookupInputMeta, createCompoundActSeqId(id, AT_LookupWithJG), (roxiemem::RoxieHeapFlags)roxiemem::RHFpacked|roxiemem::RHFunique));
+            joinFieldsAllocator.setown(codeCtx->getRowAllocatorEx(helper->queryJoinFieldsRecordSize(), createCompoundActSeqId(id, AT_JoinFields), roxiemem::RHFnone));
             joinFieldsSerializer.setown(helper->queryJoinFieldsRecordSize()->createDiskSerializer(codeCtx, id));
 
             if (helper->diskAccessRequired())
             {
                 Owned<IOutputMetaData> fetchInputMeta = new CPrefixedOutputMeta(sizeof(FetchRequestHeader), helper->queryFetchInputRecordSize());
-                fetchInputAllocator.setown(codeCtx->getRowAllocatorEx(fetchInputMeta, id, (roxiemem::RoxieHeapFlags)roxiemem::RHFpacked|roxiemem::RHFunique));
+                fetchInputAllocator.setown(codeCtx->getRowAllocatorEx(fetchInputMeta, createCompoundActSeqId(id, AT_FetchRequest), (roxiemem::RoxieHeapFlags)roxiemem::RHFpacked|roxiemem::RHFunique));
                 fetchInputDeserializer.setown(fetchInputMeta->createDiskDeserializer(codeCtx, id));
 
                 Owned<IOutputMetaData> fetchOutputMeta = createOutputMetaDataWithChildRow(joinFieldsAllocator, sizeof(FetchReplyHeader));
-                fetchOutputAllocator.setown(codeCtx->getRowAllocatorEx(fetchOutputMeta, id, (roxiemem::RoxieHeapFlags)roxiemem::RHFpacked|roxiemem::RHFunique));
+                fetchOutputAllocator.setown(codeCtx->getRowAllocatorEx(fetchOutputMeta, createCompoundActSeqId(id, AT_FetchResponse), (roxiemem::RoxieHeapFlags)roxiemem::RHFpacked|roxiemem::RHFunique));
                 fetchOutputSerializer.setown(fetchOutputMeta->createDiskSerializer(codeCtx, id));
 
-                fetchDiskAllocator.setown(codeCtx->getRowAllocatorEx(helper->queryDiskRecordSize(), id, (roxiemem::RoxieHeapFlags)roxiemem::RHFpacked|roxiemem::RHFunique));
-                fetchDiskDeserializer.setown(helper->queryDiskRecordSize()->createDiskDeserializer(codeCtx, id));
                 fetchInMinSz = helper->queryFetchInputRecordSize()->getMinRecordSize();
             }
         }
@@ -245,9 +247,6 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         IOutputRowDeserializer *queryFetchInputDeserializer() const { return fetchInputDeserializer; }
         IEngineRowAllocator *queryFetchOutputAllocator() const { return fetchOutputAllocator; }
         IOutputRowSerializer *queryFetchOutputSerializer() const { return fetchOutputSerializer; }
-
-        IEngineRowAllocator *queryFetchDiskAllocator() const { return fetchDiskAllocator; }
-        IOutputRowDeserializer *queryFetchDiskDeserializer() const { return fetchDiskDeserializer; }
 
         inline IHThorKeyedJoinArg *queryHelper() const { return helper; }
 
@@ -296,10 +295,8 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
                 free(encryptedKey);
             }
             IFileIO *fileIO;
-            if (nullptr != eexp.get())
-                fileIO = createCompressedFileReader(iFile, eexp);
-            else if (compressed)
-                fileIO = createCompressedFileReader(iFile);
+            if (nullptr != eexp.get() || compressed)
+                fileIO = createCompressedFileReader(iFile, eexp, useDefaultIoBufferSize, false, IFEnone);
             else
                 fileIO = iFile->open(IFOread);
             if (!fileIO)
@@ -362,6 +359,8 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
                     translator.setown(createRecordTranslator(projectedFormat->queryRecordAccessor(true), publishedFormat->queryRecordAccessor(true)));
                     if (!translator->canTranslate())
                         throw MakeStringException(0, "Untranslatable record layout mismatch detected for: %s", tracing);
+                    if (RecordTranslationMode::PayloadRemoveOnly == translationMode && translator->hasNewFields())
+                        throw MakeStringException(0, "Translatable file layout mismatch reading file %s but translation disabled when expected fields are missing from source.", tracing);
                 }
                 DBGLOG("Record layout translator created for %s", tracing);
                 translator->describe();
@@ -393,7 +392,7 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         CKeyLookupContext(CKJService &_service, CActivityContext *_activityCtx, const CLookupKey &_key)
             : CContext(_service, _activityCtx), key(_key)
         {
-            keyIndex.setown(createKeyIndex(key.fname, key.crc, false, false));
+            keyIndex.setown(createKeyIndex(key.fname, key.crc, false, key.readOptions));
             expectedFormat.set(activityCtx->queryHelper()->queryIndexRecordSize());
             expectedFormatCrc = activityCtx->queryHelper()->getIndexFormatCrc();
         }
@@ -411,12 +410,9 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         IEngineRowAllocator *queryFetchOutputAllocator() const { return activityCtx->queryFetchOutputAllocator(); }
         IOutputRowSerializer *queryFetchOutputSerializer() const { return activityCtx->queryFetchOutputSerializer(); }
 
-        IEngineRowAllocator *queryFetchDiskAllocator() const { return activityCtx->queryFetchDiskAllocator(); }
-        IOutputRowDeserializer *queryFetchDiskDeserializer() const { return activityCtx->queryFetchDiskDeserializer(); }
-
-        IKeyManager *createKeyManager()
+        IKeyManager *createKeyManager(IContextLogger *ctxLogger)
         {
-            return createLocalKeyManager(queryHelper()->queryIndexRecordSize()->queryRecordAccessor(true), keyIndex, nullptr, queryHelper()->hasNewSegmentMonitors(), false);
+            return createLocalKeyManager(queryHelper()->queryIndexRecordSize()->queryRecordAccessor(true), keyIndex, ctxLogger, queryHelper()->hasNewSegmentMonitors(), false);
         }
         inline IHThorKeyedJoinArg *queryHelper() const { return activityCtx->queryHelper(); }
     };
@@ -426,7 +422,7 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         unsigned handle = 0;
         Owned<const IDynamicTransform> translator;
         Owned<ISourceRowPrefetcher> prefetcher;
-        Owned<ISerialStream> ioStream;
+        Owned<IBufferedSerialInputStream> ioStream;
         CThorContiguousRowBuffer prefetchSource;
         bool initialized = false;
 
@@ -445,7 +441,7 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
             {
                 initialized = true;
                 Owned<IFileIO> iFileIO = activityCtx->getFetchFileIO(key.partNo);
-                ioStream.setown(createFileSerialStream(iFileIO, 0, (offset_t)-1, 0));
+                ioStream.setown(createFileSerialStream(iFileIO, 0, (offset_t)-1, 0)); // bufsize=0, no buffering
                 prefetchSource.setStream(ioStream);
             }
             return prefetchSource;
@@ -458,11 +454,13 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         Owned<IKeyManager> keyManager;
         unsigned handle = 0;
         Owned<IHThorKeyedJoinArg> helper;
+        CStatsContextLogger contextLogger;
+
     public:
         CKMContainer(CKJService &_service, CKeyLookupContext *_ctx)
-            : service(_service), ctx(_ctx)
+            : service(_service), ctx(_ctx), contextLogger(jhtreeCacheStatistics)
         {
-            keyManager.setown(ctx->createKeyManager());
+            keyManager.setown(ctx->createKeyManager(&contextLogger));
             StringBuffer tracing;
             const IDynamicTransform *translator = ctx->queryTranslator(ctx->queryKey().getTracing(tracing));
             if (translator)
@@ -485,6 +483,8 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
             helper->onStart((const byte *)parentCtxMb.toByteArray(), startCtxMb.length() ? &startCtxMb : nullptr);
         }
         inline IHThorKeyedJoinArg *queryHelper() const { return helper; }
+        inline CKJService & queryService() const { return service; }
+        inline CStatsContextLogger & queryContextLogger() { return contextLogger; }
     };
     template<class KEY, class ITEM>
     class CKeyedCacheEntry : public CInterface
@@ -573,7 +573,7 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         }
         void replyError(IException *e)
         {
-            EXCLOG(e, "CLookupRequest");
+            IERRLOG(e, "CLookupRequest");
             if (replyAttempt)
                 return;
             byte errorCode = kjse_exception;
@@ -606,6 +606,7 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         {
             clearRows();
         }
+        unsigned getRowCount() const { return rows.size(); }
         void serializeRows(MemoryBuffer &mb) const
         {
             if (rows.size()) // will be 0 if fetch needed
@@ -703,7 +704,8 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
                     reply.setFlag(gf_limitatmost);
                     break;
                 }
-                KLBlobProviderAdapter adapter(keyManager);
+                IContextLogger * ctxLogger = nullptr;
+                KLBlobProviderAdapter adapter(keyManager, ctxLogger);
                 byte const * keyRow = keyManager->queryKeyBuffer();
                 size_t fposOffset = keyManager->queryRowSize() - sizeof(offset_t);
                 offset_t fpos = rtlReadBigUInt8(keyRow + fposOffset);
@@ -749,9 +751,9 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         virtual void process(bool &abortSoon) override
         {
             Owned<IException> exception;
+            CKeyLookupResult lookupResult(*activityCtx); // reply for 1 request row
             try
             {
-                CKeyLookupResult lookupResult(*activityCtx); // reply for 1 request row
 
                 byte errorCode = kjse_nop;
                 CMessageBuffer replyMsg;
@@ -765,9 +767,8 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
                 unsigned rowCount = getRowCount();
                 unsigned rowNum = 0;
                 unsigned rowStart = 0;
-                unsigned __int64 startSeeks = kmc->queryKeyManager()->querySeeks();
-                unsigned __int64 startScans = kmc->queryKeyManager()->queryScans();
-                unsigned __int64 startWildSeeks = kmc->queryKeyManager()->queryWildSeeks();
+                CStatsContextLogger & contextLogger = kmc->queryContextLogger();
+                CRuntimeStatisticCollection startStats(contextLogger.queryStats());
                 while (!abortSoon)
                 {
                     OwnedConstThorRow row = getRowClear(rowNum++);
@@ -777,9 +778,10 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
                     if (last || (replyMb.length() >= DEFAULT_KEYLOOKUP_MAXREPLYSZ))
                     {
                         countMarker.write(rowNum-rowStart);
-                        replyMb.append(kmc->queryKeyManager()->querySeeks()-startSeeks);
-                        replyMb.append(kmc->queryKeyManager()->queryScans()-startScans);
-                        replyMb.append(kmc->queryKeyManager()->queryWildSeeks()-startWildSeeks);
+
+                        CRuntimeStatisticCollection statsDelta(startStats.queryMapping());
+                        contextLogger.updateStatsDeltaTo(statsDelta, startStats);
+                        statsDelta.serialize(replyMb);
                         if (activityCtx->useMessageCompression())
                         {
                             fastLZCompressToBuffer(replyMsg, tmpMB.length(), tmpMB.toByteArray());
@@ -798,7 +800,10 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
             }
             catch (IException *e)
             {
-                exception.setown(e);
+                VStringBuffer msg("CKeyLookupRequest pending result [fetchRequired=%s, rows: %u] - ", boolToStr(fetchRequired), fetchRequired ? lookupResult.getCount() : lookupResult.getRowCount());
+                e->errorMessage(msg);
+                exception.setown(makeStringException(e->errorCode(), msg));
+                e->Release();
             }
             if (exception)
                 replyError(exception);
@@ -902,10 +907,9 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
         virtual void process(bool &abortSoon) override
         {
             Owned<IException> exception;
+            CFetchLookupResult fetchLookupResult(*activityCtx);
             try
             {
-                CFetchLookupResult fetchLookupResult(*activityCtx);
-
                 byte errorCode = kjse_nop;
                 CMessageBuffer replyMsg;
                 replyMsg.append(errorCode);
@@ -942,7 +946,10 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
             }
             catch (IException *e)
             {
-                exception.setown(e);
+                VStringBuffer msg("CFetchLookupRequest [pending result rows: %u] - ", fetchLookupResult.getRowCount());
+                e->errorMessage(msg);
+                exception.setown(makeStringException(e->errorCode(), msg));
+                e->Release();
             }
             if (exception)
                 replyError(exception);
@@ -995,7 +1002,8 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
     std::unordered_map<unsigned, Owned<CFetchContext>> activeFetchContextsByHandle;
     CICopyArrayOf<CKMContainer> cachedKMsMRU;
     CICopyArrayOf<CFetchContext> cachedFCsMRU;
-    CriticalSection kMCrit, lCCrit;
+    CriticalSection kMCrit{SYNC_LOCATION};
+    CriticalSection lCCrit{SYNC_LOCATION};
     Owned<IThreadPool> processorPool;
 
     IHThorKeyedJoinArg *createHelper(CJobBase &job, activity_id id, MemoryBuffer &createCtxMb)
@@ -1185,8 +1193,8 @@ class CKJService : public CSimpleInterfaceOf<IKJService>, implements IThreaded, 
     void setupProcessorPool()
     {
         Owned<CProcessorFactory> factory = new CProcessorFactory(*this);
-        processorPool.setown(createThreadPool("KJService processor pool", factory, this, keyLookupMaxProcessThreads, 10000));
-        processorPool->setStartDelayTracing(60000);
+        processorPool.setown(createThreadPool("KJService processor pool", factory, true, this, keyLookupMaxProcessThreads, 10000));
+        processorPool->setStartDelayTracing(60);
     }
 public:
     IMPLEMENT_IINTERFACE_USING(CSimpleInterfaceOf<IKJService>);
@@ -1496,20 +1504,21 @@ public:
             }
             catch (IMP_Exception *e)
             {
-                EXCLOG(e, nullptr);
+                if (!recvShutdown)
+                    IERRLOG(e);
                 e->Release();
                 break;
             }
             catch (IJSOCK_Exception *e)
             {
-                EXCLOG(e, nullptr);
+                IERRLOG(e);
                 e->Release();
                 break;
             }
             catch (IException *e)
             {
                 if (replyAttempt)
-                    EXCLOG(e, "CKJService: failed to send reply");
+                    IERRLOG(e, "CKJService: failed to send reply");
                 else if (TAG_NULL == replyTag)
                 {
                     StringBuffer msg("CKJService: Exception without reply tag. Received from slave: ");
@@ -1517,7 +1526,7 @@ public:
                         msg.append("<unknown>");
                     else
                         msg.append(sender-1);
-                    EXCLOG(e, msg.str());
+                    IERRLOG(e, msg.str());
                     msg.clear();
                 }
                 else
@@ -1533,7 +1542,7 @@ public:
             {
                 if (!queryNodeComm().send(msg, sender, replyTag, LONGTIMEOUT))
                 {
-                    OERRLOG("CKJService: Failed to send error response");
+                    IERRLOG("CKJService: Failed to send error response");
                     break;
                 }
             }
@@ -1558,27 +1567,27 @@ public:
     }
     virtual void reset() override
     {
-        LOG(MCthorDetailedDebugInfo, thorJob, "KJService reset()");
+        LOG(MCthorDetailedDebugInfo, "KJService reset()");
         processorPool->stopAll(true);
         processorPool->joinAll(false);
         clearAll();
-        LOG(MCthorDetailedDebugInfo, thorJob, "KJService reset() done");
+        LOG(MCthorDetailedDebugInfo, "KJService reset() done");
     }
     virtual void start() override
     {
         aborted = false;
-        threaded.start();
+        threaded.start(false);
     }
     virtual void stop() override
     {
         if (aborted)
             return;
-        LOG(MCthorDetailedDebugInfo, thorJob, "KJService stop()");
+        LOG(MCthorDetailedDebugInfo, "KJService stop()");
         queryNodeComm().cancel(RANK_ALL, keyLookupMpTag);
         processorPool->stopAll(true);
         processorPool->joinAll(true);
         while (!threaded.join(60000, false))
-            PROGLOG("Receiver waiting on remote handlers to signal completion");
+            DBGLOG("Receiver waiting on remote handlers to signal completion");
         if (aborted)
             return;
         aborted = true;
@@ -1588,7 +1597,7 @@ public:
     virtual bool fireException(IException *e) override
     {
         // exceptions should always be handled by processor
-        EXCLOG(e, nullptr);
+        IERRLOG(e);
         e->Release();
         return true;
     }
@@ -1599,7 +1608,7 @@ public:
 class CJobListener : public CSimpleInterface
 {
     bool &stopped;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     OwningStringSuperHashTableOf<CJobSlave> jobs;
     CFifoFileCache querySoCache; // used to mirror master cache
     IArrayOf<IMPServer> mpServers;
@@ -1624,7 +1633,7 @@ class CJobListener : public CSimpleInterface
                 CriticalBlock b(jobListener.crit);
                 if (0 == jobListener.jobs.count())
                 {
-                    EXCLOG(e, "No job active exception: ");
+                    IERRLOG(e, "No job active exception: ");
                     return true;
                 }
                 IThorException *te = QUERYINTERFACE(e, IThorException);
@@ -1646,14 +1655,14 @@ class CJobListener : public CSimpleInterface
             try
             {
                 if (!queryNodeComm().sendRecv(msg, 0, mptag, LONGTIMEOUT))
-                    EXCLOG(e, "Failed to send exception to master");
+                    IERRLOG(e, "Failed to send exception to master");
             }
             catch (IException *e2)
             {
                 StringBuffer str("Error whilst sending exception '");
                 e->errorMessage(str);
                 str.append("' to master");
-                EXCLOG(e2, str.str());
+                IERRLOG(e2, str.str());
                 e2->Release();
             }
             return true;
@@ -1665,7 +1674,7 @@ public:
     {
         stopped = true;
         channelsPerSlave = globals->getPropInt("@channelsPerSlave", 1);
-        unsigned localThorPortInc = globals->getPropInt("@localThorPortInc", DEFAULT_SLAVEPORTINC);
+        unsigned localThorPortInc = globals->getPropInt("@localThorPortInc", DEFAULT_WORKERPORTINC);
         mpServers.append(* getMPServer());
         bool reconnect = globals->getPropBool("@MPChannelReconnect");
         for (unsigned sc=1; sc<channelsPerSlave; sc++)
@@ -1695,7 +1704,7 @@ public:
     }
     void stop()
     {
-        queryNodeComm().cancel(0, masterSlaveMpTag);
+        queryNodeComm().cancel(0, managerWorkerMpTag);
     }
     void slaveMain(ILogMsgHandler *logHandler)
     {
@@ -1731,7 +1740,7 @@ public:
                     start();
                 }
                 ~CVerifyThread() { join(); }
-                void start() { threaded.start(); }
+                void start() { threaded.start(false); }
                 void join() { threaded.join(); }
                 virtual void threadmain() override
                 {
@@ -1748,24 +1757,44 @@ public:
                 verifyThreads.append(*new CVerifyThread(*this, c));
         }
 
-        StringBuffer soPath;
-        globals->getProp("@query_so_dir", soPath);
-        StringBuffer soPattern("*.");
+        if (getExpertOptBool("dllsToSlaves", true))
+        {
+            StringBuffer soPath;
+            globals->getProp("@query_so_dir", soPath);
+            StringBuffer soPattern("*.");
 #ifdef _WIN32
-        soPattern.append("dll");
+            soPattern.append("dll");
 #else
-        soPattern.append("so");
+            soPattern.append("so");
 #endif
-        if (globals->getPropBool("Debug/@dllsToSlaves",true))
             querySoCache.init(soPath.str(), DEFAULT_QUERYSO_LIMIT, soPattern);
+        }
+
         Owned<ISlaveWatchdog> watchdog;
         if (globals->getPropBool("@watchdogEnabled"))
             watchdog.setown(createProgressHandler(globals->getPropBool("@useUDPWatchdog")));
 
+        // JCSMORE consider moving this somewhere to make generic/available to other processes
+        Owned<IMemoryMonitor> memoryMonitor;
+        const IPropertyTree *mcdSettings = globals->queryPropTree("expert/memoryCoreDump");
+        if (mcdSettings)
+        {
+            StringBuffer coreDumpPath;
+            getConfigurationDirectory(globals->queryPropTree("Directories"), "debug", "thor", globals->queryProp("@name"), coreDumpPath);
+            k8s::addInstanceContextPaths(coreDumpPath);
+            addPathSepChar(coreDumpPath).append("coredumps");
+            unsigned workerTotalMemMB = globals->getPropInt("workerMemory/@total"); assertex(workerTotalMemMB);
+            memoryMonitor.setown(createMemoryMonitor(coreDumpPath, workerTotalMemMB, mcdSettings));
+        }
+
         CMessageBuffer msg;
         stopped = false;
         bool doReply;
-        while (!stopped && queryNodeComm().recv(msg, 0, masterSlaveMpTag))
+
+        OwnedPtr<CThorPerfTracer> perf;
+        JobNameScope activeJobName;
+        TraceFlags startTraceFlags = queryTraceFlags();
+        while (!stopped && queryNodeComm().recv(msg, 0, managerWorkerMpTag))
         {
             doReply = true;
             try
@@ -1782,99 +1811,122 @@ public:
                         mptag_t slaveMsgTag;
                         deserializeMPtag(msg, slaveMsgTag);
                         queryNodeComm().flush(slaveMsgTag);
-                        StringBuffer soPath, soPathTail;
-                        StringAttr wuid, graphName, remoteSoPath;
+                        StringAttr wuid, graphName;
+                        StringBuffer soPath;
                         msg.read(wuid);
+                        saveWuidToFile(wuid);
                         msg.read(graphName);
-                        msg.read(remoteSoPath);
-                        bool sendSo;
-                        msg.read(sendSo);
 
-                        RemoteFilename rfn;
-                        SocketEndpoint masterEp = queryMyNode()->endpoint();
-                        masterEp.port = 0;
-                        rfn.setPath(masterEp, remoteSoPath);
-                        rfn.getTail(soPathTail);
-                        if (sendSo)
+                        Owned<ILoadedDllEntry> querySo;
+                        if (!getExpertOptBool("saveQueryDlls"))
                         {
-                            size32_t size;
-                            msg.read(size);
-                            globals->getProp("@query_so_dir", soPath);
-                            if (soPath.length())
-                                addPathSepChar(soPath);
-                            soPath.append(soPathTail);
-                            const byte *queryPtr = msg.readDirect(size);
-                            Owned<IFile> iFile = createIFile(soPath.str());
-                            try
-                            {
-                                iFile->setCreateFlags(S_IRWXU);
-                                Owned<IFileIO> iFileIO = iFile->open(IFOwrite);
-                                iFileIO->write(0, size, queryPtr);
-                            }
-                            catch (IException *e)
-                            {
-                                IException *e2 = ThorWrapException(e, "Failed to save dll: %s", soPath.str());
-                                e->Release();
-                                throw e2;
-                            }
-                            assertex(globals->getPropBool("Debug/@dllsToSlaves", true));
-                            querySoCache.add(soPath.str());
+                            StringAttr soName;
+                            msg.read(soName);
+                            querySo.setown(createDllEntry(soName.str(), false, NULL, false));
+                            soPath.append(soName);
                         }
                         else
                         {
-                            if (!rfn.isLocal())
+                            StringBuffer soPathTail;
+                            StringAttr remoteSoPath;
+                            msg.read(remoteSoPath);
+                            bool sendSo;
+                            msg.read(sendSo);
+
+                            RemoteFilename rfn;
+                            SocketEndpoint masterEp = queryMyNode()->endpoint();
+                            masterEp.port = 0;
+                            rfn.setPath(masterEp, remoteSoPath);
+                            rfn.getTail(soPathTail);
+                            if (sendSo)
                             {
-                                StringBuffer _remoteSoPath;
-                                rfn.getRemotePath(_remoteSoPath);
-                                remoteSoPath.set(_remoteSoPath);
-                            }
-                            if (globals->getPropBool("Debug/@dllsToSlaves", true))
-                            {
+                                size32_t size;
+                                msg.read(size);
                                 globals->getProp("@query_so_dir", soPath);
                                 if (soPath.length())
                                     addPathSepChar(soPath);
                                 soPath.append(soPathTail);
-                                OwnedIFile iFile = createIFile(soPath.str());
-                                if (!iFile->exists())
+                                const byte *queryPtr = msg.readDirect(size);
+                                Owned<IFile> iFile = createIFile(soPath.str());
+                                try
                                 {
-                                    IWARNLOG("Slave cached query dll missing: %s, will attempt to fetch from master", soPath.str());
-                                    copyFile(soPath.str(), remoteSoPath);
+                                    iFile->setCreateFlags(S_IRWXU);
+                                    Owned<IFileIO> iFileIO = iFile->open(IFOwrite);
+                                    iFileIO->write(0, size, queryPtr);
+                                    iFileIO->close();
                                 }
+                                catch (IException *e)
+                                {
+                                    IException *e2 = ThorWrapException(e, "Failed to save dll: %s", soPath.str());
+                                    e->Release();
+                                    throw e2;
+                                }
+                                assertex(getExpertOptBool("dllsToSlaves", true));
                                 querySoCache.add(soPath.str());
                             }
                             else
-                                soPath.append(remoteSoPath);
+                            {
+                                if (!rfn.isLocal())
+                                {
+                                    StringBuffer _remoteSoPath;
+                                    rfn.getRemotePath(_remoteSoPath);
+                                    remoteSoPath.set(_remoteSoPath);
+                                }
+                                if (getExpertOptBool("dllsToSlaves", true))
+                                {
+                                    globals->getProp("@query_so_dir", soPath);
+                                    if (soPath.length())
+                                        addPathSepChar(soPath);
+                                    soPath.append(soPathTail);
+                                    OwnedIFile iFile = createIFile(soPath.str());
+                                    if (!iFile->exists())
+                                    {
+                                        IWARNLOG("Slave cached query dll missing: %s, will attempt to fetch from master", soPath.str());
+                                        copyFile(soPath.str(), remoteSoPath);
+                                    }
+                                    querySoCache.add(soPath.str());
+                                }
+                                else
+                                    soPath.append(remoteSoPath);
+                            }
+    #ifdef __linux__
+                        // only relevant if dllsToSlaves=false and query_so_dir was fully qualified remote path (e.g. //<ip>/path/file
+                            rfn.setRemotePath(soPath.str());
+                            StringBuffer tempSo;
+                            if (!rfn.isLocal())
+                            {
+                                IWARNLOG("Cannot load shared object directly from remote path, creating temporary local copy: %s", soPath.str());
+                                GetTempFilePath(tempSo,"so");
+                                copyFile(tempSo.str(), soPath.str());
+                                soPath.clear().append(tempSo.str());
+                            }
+    #endif
+                            querySo.setown(createDllEntry(soPath.str(), false, NULL, false));
                         }
-#ifdef __linux__
-                    // only relevant if dllsToSlaves=false and query_so_dir was fully qualified remote path (e.g. //<ip>/path/file
-                        rfn.setRemotePath(soPath.str());
-                        StringBuffer tempSo;
-                        if (!rfn.isLocal())
-                        {
-                            IWARNLOG("Cannot load shared object directly from remote path, creating temporary local copy: %s", soPath.str());
-                            GetTempName(tempSo,"so",true);
-                            copyFile(tempSo.str(), soPath.str());
-                            soPath.clear().append(tempSo.str());
-                        }
-#endif
-                        Owned<ILoadedDllEntry> querySo = createDllEntry(soPath.str(), false, NULL, false);
 
                         Owned<IPropertyTree> workUnitInfo = createPTree(msg);
                         StringBuffer user;
                         workUnitInfo->getProp("user", user);
 
-                        unsigned maxLogDetail = workUnitInfo->getPropInt("Debug/maxlogdetail", DefaultDetail);
-                        ILogMsgFilter *existingLogHandler = queryLogMsgManager()->queryMonitorFilter(logHandler);
-                        dbgassertex(existingLogHandler);
-                        verifyex(queryLogMsgManager()->changeMonitorFilterOwn(logHandler, getCategoryLogMsgFilter(existingLogHandler->queryAudienceMask(), existingLogHandler->queryClassMask(), maxLogDetail)));
-                        setDefaultJobId(wuid.str());
+                        updateTraceFlags(wuLoadTraceFlags(workUnitInfo, thorTraceOptions, startTraceFlags), true);
 
-                        PROGLOG("Started wuid=%s, user=%s, graph=%s [log detail level=%u]\n", wuid.get(), user.str(), graphName.get(), maxLogDetail);
-                        PROGLOG("Using query: %s", soPath.str());
+                        unsigned defaultConfigLogLevel = getComponentConfigSP()->getPropInt("logging/@detail", DefaultDetail);
+                        unsigned maxLogDetail = workUnitInfo->getPropInt("Debug/maxlogdetail", defaultConfigLogLevel);
+                        ILogMsgFilter *existingLogFilter = queryLogMsgManager()->queryMonitorFilter(logHandler);
+                        dbgassertex(existingLogFilter);
+                        if (existingLogFilter->queryMaxDetail() != maxLogDetail)
+                            verifyex(queryLogMsgManager()->changeMonitorFilterOwn(logHandler, getCategoryLogMsgFilter(existingLogFilter->queryAudienceMask(), existingLogFilter->queryClassMask(), maxLogDetail)));
 
-                        if (!globals->getPropBool("Debug/@slaveDaliClient") && workUnitInfo->getPropBool("Debug/slavedaliclient", false))
+                        activeJobName.set(wuid);
+
+                        PROGLOG("Started wuid=%s, user=%s, graph=%s [log detail level=%u]", wuid.get(), user.str(), graphName.get(), maxLogDetail);
+                        DBGLOG("Using query: %s", soPath.str());
+
+                        // slaveDaliClient option deprecated, but maintained for compatibility
+                        if (!getExpertOptBool("allowDaliAccess") && !getExpertOptBool("slaveDaliClient") &&
+                            (workUnitInfo->getPropBool("Debug/allowdaliaccess", false) || workUnitInfo->getPropBool("Debug/slavedaliclient", false)))
                         {
-                            PROGLOG("Workunit option 'slaveDaliClient' enabled");
+                            PROGLOG("Workunit option 'allowDaliAccess' enabled");
                             enableThorSlaveAsDaliClient();
                         }
 
@@ -1899,15 +1951,19 @@ public:
                         StringAttr key;
                         msg.read(key);
                         CJobSlave *job = jobs.find(key.get());
+                        if (!job)
+                            throw makeStringException(0, "QueryDone: job not found"); // can happen if job failed during initialization on some slaves
                         StringAttr wuid = job->queryWuid();
                         StringAttr graphName = job->queryGraphName();
 
                         PROGLOG("Finished wuid=%s, graph=%s", wuid.get(), graphName.get());
 
-                        if (!globals->getPropBool("Debug/@slaveDaliClient") && job->getWorkUnitValueBool("slaveDaliClient", false))
+                        // slaveDaliClient option deprecated, but maintained for compatibility
+                        if (!getExpertOptBool("allowDaliAccess") && !getExpertOptBool("slaveDaliClient") &&
+                            (job->getWorkUnitValueBool("Debug/allowdaliaccess", false) || job->getWorkUnitValueBool("Debug/slavedaliclient", false)))
                             disableThorSlaveAsDaliClient();
 
-                        PROGLOG("QueryDone, removing %s from jobs", key.get());
+                        DBGLOG("QueryDone, removing %s from jobs", key.get());
                         Owned<IException> exception;
                         try
                         {
@@ -1918,10 +1974,13 @@ public:
                             exception.setown(e);
                         }
                         jobs.removeExact(job);
-                        PROGLOG("QueryDone, removed %s from jobs", key.get());
+                        DBGLOG("QueryDone, removed %s from jobs", key.get());
+                        updateTraceFlags(startTraceFlags, true);
 
                         // reset for next job
                         setProcessAborted(false);
+
+                        saveWuidToFile(""); // clear wuid file. Signifies that no wuid is running.
 
                         if (exception)
                             throw exception.getClear(); // NB: this will cause exception to be part of the reply to master
@@ -1948,9 +2007,26 @@ public:
                         msg.read(subGraphId);
                         unsigned graphInitDataPos = msg.getPos();
 
+                        double perfInterval = job->getOptReal("perfInterval");
+                        if (perfInterval)
+                        {
+                            perf.setown(new CThorPerfTracer);
+                            perf->start(job->queryWuid(), subGraphId, perfInterval);
+                        }
+
+                        if (memoryMonitor)
+                            memoryMonitor->start();
+
                         VStringBuffer xpath("node[@id='%" GIDPF "u']", subGraphId);
                         Owned<IPropertyTree> graphNode = job->queryGraphXGMML()->getPropTree(xpath.str());
                         job->addSubGraph(*graphNode);
+
+                        graph_id protraceSubgraph = (graph_id) job->getWorkUnitValueInt("protraceSubgraph", 0);
+                        if (protraceSubgraph == subGraphId)
+                        {
+                            protraceClearRecording(false);
+                            protraceResumeRecording();
+                        }
 
                         /* JCSMORE - should improve, create 1st graph with create context/init data and clone
                          * Should perhaps do this initialization in parallel..
@@ -1985,6 +2061,9 @@ public:
                     }
                     case GraphEnd:
                     {
+                        if (memoryMonitor)
+                            memoryMonitor->stop();
+
                         StringAttr jobKey;
                         msg.read(jobKey);
                         CJobSlave *job = jobs.find(jobKey.get());
@@ -1992,6 +2071,13 @@ public:
                         {
                             graph_id gid;
                             msg.read(gid);
+
+                            if (perf)
+                            {
+                                perf->stop();
+                                perf.clear();
+                            }
+
                             msg.clear();
                             msg.append(false);
                             for (unsigned c=0; c<job->queryJobChannels(); c++)
@@ -2005,7 +2091,9 @@ public:
                                 }
                                 else
                                 {
-                                    msg.append((rank_t)0); // JCSMORE - not sure why this would ever happen
+                                    // implies graph started on master, but aborted, wound-up and was removed from channel
+                                    // before GraphEnd/getFinalProgress was issued to this worker.
+                                    msg.append(RANK_NULL); // signal to manager there is no info.
                                 }
                             }
                             job->reportGraphEnd(gid);
@@ -2052,6 +2140,7 @@ public:
                     case Shutdown:
                     {
                         stopped = true;
+                        recvShutdown = true;
                         PROGLOG("Shutdown received");
                         if (watchdog)
                             watchdog->stop();
@@ -2066,7 +2155,7 @@ public:
                     {
                         StringAttr jobKey;
                         msg.read(jobKey);
-                        PROGLOG("GraphGetResult: %s", jobKey.get());
+                        DBGLOG("GraphGetResult: %s", jobKey.get());
                         CJobSlave *job = jobs.find(jobKey.get());
                         if (job)
                         {
@@ -2116,7 +2205,7 @@ public:
             }
             catch (IException *e)
             {
-                EXCLOG(e, NULL);
+                IERRLOG(e);
                 if (doReply && TAG_NULL != msg.getReplyTag())
                 {
                     doReply = false;
@@ -2146,7 +2235,7 @@ public:
 };
 class CFileInProgressHandler : public CSimpleInterface, implements IFileInProgressHandler
 {
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     StringSuperHashTableOf<CStringAttr> lookup;
     QueueOf<CStringAttr, false> fipList;
     OwnedIFileIO iFileIO;
@@ -2180,7 +2269,7 @@ class CFileInProgressHandler : public CSimpleInterface, implements IFileInProgre
         catch (IException *e)
         {
             StringBuffer errStr("FileInProgressHandler, failed to remove: ");
-            EXCLOG(e, errStr.append(fip).str());
+            IERRLOG(e, errStr.append(fip).str());
             e->Release();
         }
     }
@@ -2237,7 +2326,7 @@ public:
         iFileIO.setown(iFile->open(IFOreadwrite));
         if (!iFileIO)
         {
-            PROGLOG("Failed to open/create backup file: %s", path.str());
+            IWARNLOG("Failed to open/create backup file: %s", path.str());
             return;
         }
         MemoryBuffer mb;
@@ -2272,7 +2361,7 @@ public:
         }
         write();
     }
-    
+
 // IFileInProgressHandler
     virtual void add(const char *fip)
     {
@@ -2336,28 +2425,12 @@ public:
 
 void slaveMain(bool &jobListenerStopped, ILogMsgHandler *logHandler)
 {
-    unsigned masterMemMB = globals->getPropInt("@masterTotalMem");
-    HardwareInfo hdwInfo;
-    getHardwareInfo(hdwInfo);
-    if (hdwInfo.totalMemory < masterMemMB)
-        OWARNLOG("Slave has less memory than master node");
-    unsigned gmemSize = globals->getPropInt("@globalMemorySize");
-    bool gmemAllowHugePages = globals->getPropBool("@heapUseHugePages", false);
-    bool gmemAllowTransparentHugePages = globals->getPropBool("@heapUseTransparentHugePages", true);
-    bool gmemRetainMemory = globals->getPropBool("@heapRetainMemory", false);
-
-    if (gmemSize >= hdwInfo.totalMemory)
-    {
-        // should prob. error here
-    }
-    roxiemem::setTotalMemoryLimit(gmemAllowHugePages, gmemAllowTransparentHugePages, gmemRetainMemory, ((memsize_t)gmemSize) * 0x100000, 0, thorAllocSizes, NULL);
-
     CThorResourceSlave slaveResource;
     CJobListener jobListener(jobListenerStopped);
     setIThorResource(slaveResource);
 
 #ifdef __linux__
-    bool useMirrorMount = globals->getPropBool("Debug/@useMirrorMount", false);
+    bool useMirrorMount = getExpertOptBool("useMirrorMount", false);
 
     if (useMirrorMount && queryNodeGroup().ordinality() > 2)
     {
@@ -2365,9 +2438,9 @@ void slaveMain(bool &jobListenerStopped, ILogMsgHandler *logHandler)
         rank_t next = queryNodeGroup().rank()%slaves;  // note 0 = master
         const IpAddress &ip = queryNodeGroup().queryNode(next+1).endpoint();
         StringBuffer ipStr;
-        ip.getIpText(ipStr);
+        ip.getHostText(ipStr);
         PROGLOG("Redirecting local mount to %s", ipStr.str());
-        const char *replicateDirectory = queryBaseDirectory(grp_unknown, 1); // default directories configured at start up (see thslavemain.cpp)
+        const char *replicateDirectory = queryUnknownBaseDirectory(1); // default directories configured at start up (see thslavemain.cpp)
         setLocalMountRedirect(ip, replicateDirectory, "/mnt/mirror");
     }
 
@@ -2379,6 +2452,6 @@ void slaveMain(bool &jobListenerStopped, ILogMsgHandler *logHandler)
 void abortSlave()
 {
     if (clusterInitialized())
-        queryNodeComm().cancel(0, masterSlaveMpTag);
+        queryNodeComm().cancel(0, managerWorkerMpTag);
 }
 

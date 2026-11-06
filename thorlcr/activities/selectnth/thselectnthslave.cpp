@@ -27,7 +27,7 @@ class CSelectNthSlaveActivity : public CSlaveActivity, implements ILookAheadStop
     rowcount_t lookaheadN, N, startN;
     bool createDefaultIfFail;
     IHThorSelectNArg *helper;
-    SpinLock spin; // MORE: Remove this and use an atomic variable for lookaheadN
+    SpinLock spin{SYNC_LOCATION}; // MORE: Remove this and use an atomic variable for lookaheadN
 
     void initN()
     {
@@ -101,7 +101,7 @@ public:
         if (!isLocal && rowN)
         {
             if (ensureStartFTLookAhead(0))
-                setLookAhead(0, createRowStreamLookAhead(this, inputStream, queryRowInterfaces(input), SELECTN_SMART_BUFFER_SIZE, ::canStall(input), false, rowN, this, &container.queryJob().queryIDiskUsage()), false);
+                setLookAhead(0, createRowStreamLookAhead(this, inputStream, queryRowInterfaces(input), SELECTN_SMART_BUFFER_SIZE, ::canStall(input), false, rowN, this), false);
         }
 
         seenNth = false;

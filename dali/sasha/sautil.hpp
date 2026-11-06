@@ -1,7 +1,22 @@
 #ifndef SAUTIL_HPP
 #define SAUTIL_HPP
 
+#ifdef SASHALIB_EXPORTS
+#define sashalib_decl DECL_EXPORT
+#else
+#define sashalib_decl DECL_IMPORT
+#endif
+
+#include "jlog.hpp"
+#include "jptree.hpp"
 #include "jtime.hpp"
+
+interface ISashaServer: extends IInterface  // for all coven based servers
+{
+    virtual void start() = 0;
+    virtual void ready() = 0; // called after all servers started
+    virtual void stop() = 0;
+};
 
 class CSashaSchedule
 {
@@ -10,8 +25,6 @@ class CSashaSchedule
     bool atenabled;
     unsigned mininterval;
     unsigned last;
-    CriticalSection sect;
-    bool triggered;
     unsigned maxduration;
     unsigned throttle;
 public:
@@ -21,14 +34,12 @@ public:
         mininterval = 0;
         last = 0;
         atenabled = false;
-        triggered = false;
         maxduration = 0;
         throttle = 0;
     }
 
     void init(IPropertyTree *props, unsigned definterval, unsigned initinterval=0)
     {
-        CriticalBlock block(sect);
         StringBuffer ats;
         atenabled = false;
         if (props->getProp("@at",ats)) {
@@ -57,27 +68,21 @@ public:
 
     bool ready()
     {
-        CriticalBlock block(sect);
-        if (triggered) 
-            triggered = false;
-        else {
-            if (!mininterval)
-                return false;
-            if (last&&((msTick()-last)/(60*60*1000)<mininterval))
-                return false;
-            if (atenabled) {
-                CDateTime atnow;
-                atnow.setNow();
-                time_t now = atnow.getSimple();
-                time_t next = atnext.getSimple();
-                if (now<next) {
-                    if (next-now>30) 
-                        return false;
-                    // 
-                    Sleep((unsigned)(next-now)*1000);
-                }
-                at.next(atnow,atnext,true);
+        if (!mininterval)
+            return false;
+        if (last&&((msTick()-last)/(60*60*1000)<mininterval))
+            return false;
+        if (atenabled) {
+            CDateTime atnow;
+            atnow.setNow();
+            time_t now = atnow.getSimple();
+            time_t next = atnext.getSimple();
+            if (now<next) {
+                if (next-now>30)
+                    return false;
+                Sleep((unsigned)(next-now)*1000);
             }
+            at.next(atnow,atnext,true);
         }
         last = msTick();
         if (last==0)
@@ -85,13 +90,7 @@ public:
         return true;
     }
 
-    void triggerNow()
-    {
-        CriticalBlock block(sect);
-        triggered = true;
-    }
-
-    bool checkDurationAndThrottle(unsigned start,unsigned start1, bool &stopped)
+    bool checkDurationAndThrottle(unsigned start,unsigned start1, std::atomic<bool> &stopped)
     {
         unsigned tt = 0;
         if (throttle) {
@@ -121,10 +120,18 @@ public:
     }
 };
 
-extern void operationStarted(const char *msg);
-extern void operationFinished(const char *msg);
-
 extern unsigned clustersToGroups(IPropertyTree *envroot,const StringArray &cmplst,StringArray &cnames,StringArray &groups,bool *done);
 extern unsigned clustersToGroups(IPropertyTree *envroot,const StringArray &cmplst,StringArray &groups,bool *done);
+
+interface IException;
+interface ISashaServerContext : extends IInterface
+{
+    virtual void requestStop(IException *e) = 0;
+    virtual const char * getSashaProgramName() const = 0;
+    virtual IInterface * createAutoStopSuspender() = 0;  // returns object whose lifetime suspends auto-stop
+};
+
+extern sashalib_decl void setServerContext(ISashaServerContext &ctx);
+extern sashalib_decl ISashaServerContext &queryServerContext();
 
 #endif

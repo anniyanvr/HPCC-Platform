@@ -61,7 +61,6 @@ protected:
     bool hasMatchFilter = false;
     size32_t diskRowMinSz;
     unsigned numSegFieldsUsed = 0;
-    rowcount_t totalProgress = 0;
     rowcount_t stopAfter = 0;
     rowcount_t remoteLimit = 0;
     rowcount_t limit = 0;
@@ -88,7 +87,7 @@ protected:
 
         unsigned projectedFormatCrc = helper->getProjectedFormatCrc();
         IOutputMetaData *projectedFormat = helper->queryProjectedDiskRecordSize();
-        return ::getTranslators("rowstream", expectedFormatCrc, expectedFormat, publishedFormatCrc, publishedFormat, projectedFormatCrc, projectedFormat, translationMode);
+        return ::getTranslators(logicalFilename, expectedFormatCrc, expectedFormat, publishedFormatCrc, publishedFormat, projectedFormatCrc, projectedFormat, translationMode);
     }
 public:
     CDiskReadSlaveActivityRecord(CGraphElementBase *_container, IHThorArg *_helper=NULL) 
@@ -133,13 +132,6 @@ public:
         segMonitors.kill();
         helper->createSegmentMonitors(this);
     }
-
-    virtual void serializeStats(MemoryBuffer &mb) override
-    {
-        if (partHandler)
-            diskProgress = totalProgress + partHandler->queryProgress();
-        CDiskReadSlaveActivityBase::serializeStats(mb);
-    }
 friend class CDiskRecordPartHandler;
 };
 
@@ -177,9 +169,10 @@ public:
     {
         return in->nextRow();
     }
-    inline const byte *prefetchRow()
+    inline const void *prefetchRow()
     {
-        return in->prefetchRow();
+        size32_t size;
+        return in->prefetchRow(size);
     }
     inline void prefetchDone()
     {
@@ -190,14 +183,8 @@ public:
         CriticalBlock block(inputCs); // Ensure iFileIO remains valid for the duration of mergeStats()
         CDiskPartHandlerBase::gatherStats(merged);
         mergeStats(merged, in);
-    }
-    virtual unsigned __int64 queryProgress() override
-    {
-        CriticalBlock block(inputCs);
         if (in)
-            return in->queryProgress();
-        else
-            return 0;
+            merged.mergeStatistic(StNumDiskRowsRead, in->getStatistic(StNumRowsRead));
     }
 };
 
@@ -253,13 +240,9 @@ void CDiskRecordPartHandler::open()
         CriticalBlock block(inputCs);
         partStream.swap(in);
     }
-    if (partStream)
-        activity.totalProgress += partStream->queryProgress();
     partStream.clear();
 
     unsigned rwFlags = 0;
-    if (checkFileCrc) // NB: if compressed, this will be turned off by base class
-        rwFlags |= rw_crc;
     if (activity.grouped)
         rwFlags |= rw_grouped;
 
@@ -333,7 +316,6 @@ void CDiskRecordPartHandler::open()
                 iRemoteFileIO->addVirtualFieldMapping("partNum", tmp.clear().append(partDesc->queryPartIndex()).str());
                 rfn.getPath(path.clear());
                 filename.set(path);
-                checkFileCrc = false;
 
                 try
                 {
@@ -342,7 +324,7 @@ void CDiskRecordPartHandler::open()
                 catch (IException *e)
                 {
 #ifdef _DEBUG
-                    EXCLOG(e, nullptr);
+                    DBGLOG(e);
 #endif
                     if (remoteReadException)
                         e->Release(); // only record 1st
@@ -353,7 +335,10 @@ void CDiskRecordPartHandler::open()
                     }
                     continue; // try next copy and ultimately failover to local when no more copies
                 }
-                partStream.setown(createRowStreamEx(iRemoteFileIO, activity.queryProjectedDiskRowInterfaces(), 0, (offset_t)-1, (unsigned __int64)-1, rwFlags, nullptr, this));
+                RowStreamOptions options;
+                options.rwFlags = rwFlags;
+                options.fieldCallback = this;
+                partStream.setown(createRowStream(iRemoteFileIO, activity.queryProjectedDiskRowInterfaces(), options));
                 ActPrintLog(&activity, "%s[part=%d]: reading remote dafilesrv file '%s' (logical file = %s)", kindStr, which, filename.get(), activity.logicalFilename.get());
                 break;
             }
@@ -374,10 +359,17 @@ void CDiskRecordPartHandler::open()
 
         rwFlags |= DEFAULT_RWFLAGS;
 
+        FileRowStreamOptions options;
+        options.translatorContainer = translator;
+        options.fieldCallback = this;
+        getPlaneReadAheadSizing(activity, iFile->queryFilename(), options.numThreads, options.chunkSize);
+
         if (compressed)
         {
             rwFlags |= rw_compress;
-            partStream.setown(createRowStream(iFile, activity.queryProjectedDiskRowInterfaces(), rwFlags, activity.eexp, translator, this));
+            options.rwFlags = rwFlags;
+            options.eexp = activity.eexp;
+            partStream.setown(createRowStream(iFile, activity.queryProjectedDiskRowInterfaces(), options));
             if (!partStream.get())
             {
                 if (!blockCompressed)
@@ -387,7 +379,10 @@ void CDiskRecordPartHandler::open()
             }
         }
         else
-            partStream.setown(createRowStream(iFile, activity.queryProjectedDiskRowInterfaces(), rwFlags, nullptr, translator, this));
+        {
+            options.rwFlags = rwFlags;
+            partStream.setown(createRowStream(iFile, activity.queryProjectedDiskRowInterfaces(), options));
+        }
 
         if (!partStream)
             throw MakeActivityException(&activity, 0, "Failed to open file '%s'", filename.get());
@@ -407,11 +402,14 @@ void CDiskRecordPartHandler::close(CRC32 &fileCRC)
     {
         CriticalBlock block(inputCs);
         partStream.setown(in.getClear());
+        mergeStats(closedPartFileStats, partStream);
     }
     if (partStream)
     {
-        partStream->stop(&fileCRC);
-        mergeStats(fileStats, partStream);
+        closedPartFileStats.mergeStatistic(StNumDiskRowsRead, partStream->getStatistic(StNumRowsRead));
+        activity.mergeFileStats(partDesc, partStream);
+        partStream->stop();
+        fileCRC = partStream->queryCRC();
     }
 }
 
@@ -439,7 +437,7 @@ public:
                     {
                         for (;;)
                         {
-                            const byte *row = CDiskRecordPartHandler::prefetchRow();
+                            const void *row = CDiskRecordPartHandler::prefetchRow();
                             if (!row)
                             {
                                 if (!activity.grouped)
@@ -498,8 +496,7 @@ public:
                 {
                     eoi = true;
                     StringBuffer s;
-                    e->errorMessage(s);
-                    s.append(" - handling file: ").append(filename.get());
+                    s.append("handling file: ").append(filename.get());
                     IException *e2 = MakeActivityException(&activity, e, "%s", s.str());
                     e->Release();
                     throw e2;
@@ -523,34 +520,9 @@ public:
         }
     };
 
-    class PgRecordSize : implements IRecordSize, public CSimpleInterface
-    {
-    public:
-        IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
-
-        PgRecordSize(IRecordSize *_rcSz)
-        {
-            rcSz = LINK(_rcSz);
-        }
-        ~PgRecordSize()
-        {
-            rcSz->Release();
-        }
-        virtual size32_t getRecordSize(const void *rec)
-        {
-            return rcSz->getRecordSize(rec) + 1;
-        }
-        virtual size32_t getFixedSize() const 
-        {
-            return rcSz->getFixedSize()?(rcSz->getFixedSize()+1):0;
-        }
-    private:
-        IRecordSize *rcSz;
-    };
-
 public:
     bool unsorted = false, countSent = false;
-    IRowStream *out = nullptr;
+    Owned<CSeqPartHandler> partSequencer;
 
     IHThorDiskReadArg *helper;
 
@@ -565,7 +537,6 @@ public:
     }
     ~CDiskReadSlaveActivity()
     {
-        ::Release(out);
     }
 
 // IThorSlaveActivity
@@ -595,11 +566,7 @@ public:
     }
     virtual void kill()
     {
-        if (out)
-        {
-            out->Release();
-            out = NULL;
-        }
+        partSequencer.clear();
         CDiskReadSlaveActivityRecord::kill();
     }
 
@@ -634,28 +601,27 @@ public:
             if (limit && (limit < remoteLimit))
                 remoteLimit = limit+1; // 1 more to ensure triggered when received back. // JCSMORE remote side could handle skip too..
         }
-        out = createSequentialPartHandler(partHandler, partDescs, grouped); // **
+        partSequencer.setown(createSequentialPartHandler(partHandler, partDescs, grouped));
     }
     virtual bool isGrouped() const override { return grouped; }
 
 // IRowStream
     virtual void stop()
     {
-        if (out)
+        if (partSequencer)
         {
-            out->stop();
-            out->Release();
-            out = NULL;
+            partSequencer->stop();
+            partSequencer.clear();
         }
         PARENT::stop();
     }
     CATCH_NEXTROW()
     {
         ActivityTimer t(slaveTimerStats, timeActivities);
-        if (NULL == out) // guard against, but shouldn't happen
+        if (unlikely(NULL == partSequencer)) // guard against, but shouldn't happen
             return NULL;
-        OwnedConstThorRow ret = out->nextRow();
-        if (!ret)
+        OwnedConstThorRow ret = partSequencer->nextRow();
+        if (unlikely(!ret))
             return NULL;
         rowcount_t c = getDataLinkCount();
         if (stopAfter && (c >= stopAfter))  // NB: only slave limiter, global performed in chained choosen activity
@@ -746,7 +712,7 @@ class CDiskNormalizeSlave : public CDiskReadSlaveActivityRecord
     };
 
     IHThorDiskNormalizeArg *helper;
-    IRowStream *out = nullptr;
+    Owned<CSeqPartHandler> partSequencer;
 
 public:
     CDiskNormalizeSlave(CGraphElementBase *_container) 
@@ -757,7 +723,6 @@ public:
     }
     ~CDiskNormalizeSlave()
     {
-        ::Release(out);
     }
 
 // IThorSlaveActivity
@@ -789,28 +754,27 @@ public:
         else
             limit = (rowcount_t)helper->getRowLimit();
         stopAfter = (rowcount_t)helper->getChooseNLimit();
-        out = createSequentialPartHandler(partHandler, partDescs, false);
+        partSequencer.setown(createSequentialPartHandler(partHandler, partDescs, false));
     }
     virtual bool isGrouped() const override { return false; }
 
 // IRowStream
     virtual void stop()
     {
-        if (out)
+        if (partSequencer)
         {
-            out->stop();
-            out->Release();
-            out = NULL;
+            partSequencer->stop();
+            partSequencer.clear();
         }
         PARENT::stop();
     }
     CATCH_NEXTROW()
     {
         ActivityTimer t(slaveTimerStats, timeActivities);
-        if (!out)
+        if (unlikely(!partSequencer))
             return NULL;
-        OwnedConstThorRow ret = out->nextRow();
-        if (!ret)
+        OwnedConstThorRow ret = partSequencer->nextRow();
+        if (unlikely(!ret))
             return NULL;
         rowcount_t c = getDataLinkCount();
         if (stopAfter && (c >= stopAfter)) // NB: only slave limiter, global performed in chained choosen activity
@@ -857,8 +821,7 @@ public:
             catch (IException *e)
             {
                 StringBuffer s;
-                e->errorMessage(s);
-                s.append(" - handling file: ").append(filename.get());
+                s.append("handling file: ").append(filename.get());
                 IException *e2 = MakeActivityException(&activity, e, "%s", s.str());
                 e->Release();
                 eoi = true;
@@ -1127,7 +1090,14 @@ public:
         merging = false;
         appendOutputLinked(this);
     }
-
+// CSlaveActivity overloaded methods
+    virtual unsigned __int64 queryLookAheadCycles() const override
+    {
+        cycle_t lookAheadCycles = PARENT::queryLookAheadCycles();
+        if (distributor)
+            lookAheadCycles += distributor->queryLookAheadCycles();
+        return lookAheadCycles;
+    }
 // IHThorGroupAggregateCallback
     virtual void processRow(const void *next)
     {

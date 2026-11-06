@@ -21,23 +21,13 @@
 #include "jsort.hpp"
 #include "jmisc.hpp"
 #include "jlib.hpp"
+#include "jerror.hpp"
 
 #include <assert.h>
 
-#define FIRST_CHUNK_SIZE  8
-#define DOUBLE_LIMIT      0x100000          // must be a power of 2
-#define ALLOCA_LIMIT      64
-
-inline unsigned ensurePowerOfTwo(unsigned value)
-{
-    value--;
-    value |= (value >> 1);
-    value |= (value >> 2);
-    value |= (value >> 4);
-    value |= (value >> 8);
-    value |= (value >> 16);
-    return value+1;
-}
+constexpr unsigned ARRAY_FIRST_CHUNK_SIZE=8;
+constexpr unsigned ARRAY_CHUNK_DOUBLE_LIMIT=0x100000;          // must be a power of 2
+constexpr unsigned ARRAY_ALLOCA_LIMIT=64;
 
 void Allocator::_space(size32_t iSize)
 {
@@ -46,15 +36,10 @@ void Allocator::_space(size32_t iSize)
     used++;
 }
 
-void Allocator::_ensure(aindex_t next, size32_t iSize)
+void Allocator::_ensure(aindex_t req, size32_t iSize)
 {
-    aindex_t req = used + next;
     if (req > max )
-    {
-        if ((max == 0) && (req < DOUBLE_LIMIT))
-            max = ensurePowerOfTwo(req);
-        _reallocate(req, iSize);
-    }
+        _reallocateExact(req, iSize);
 }
 
 
@@ -71,14 +56,14 @@ void Allocator::_reallocate(aindex_t newLen, size32_t itemSize)
 {
     size32_t newMax = max;
     if (newMax == 0)
-        newMax = FIRST_CHUNK_SIZE;
-    if (newLen > DOUBLE_LIMIT)
+        newMax = ARRAY_FIRST_CHUNK_SIZE;
+    if (newLen > ARRAY_CHUNK_DOUBLE_LIMIT)
     {
-        newMax = (newLen + DOUBLE_LIMIT) & ~(DOUBLE_LIMIT-1);
+        newMax = (newLen + ARRAY_CHUNK_DOUBLE_LIMIT) & ~(ARRAY_CHUNK_DOUBLE_LIMIT-1);
         if (newLen >= newMax) // wraparound
         {
-            IERRLOG("Out of memory (overflow) in Array allocator: itemSize = %d, trying to allocate %d items", itemSize, newLen);
-            throw MakeStringException(0, "Out of memory (overflow) in Array allocator: itemSize = %d, trying to allocate %d items",itemSize, newLen);
+            IERRLOG("Out of memory (overflow) in Array allocator: itemSize = %u, trying to allocate %u items", itemSize, newLen);
+            throw MakeStringException(JLIBERR_ArrayOverflow, "Out of memory (overflow) in Array allocator: itemSize = %u, trying to allocate %u items",itemSize, newLen);
         }
     }
     else
@@ -89,16 +74,36 @@ void Allocator::_reallocate(aindex_t newLen, size32_t itemSize)
     size_t allocSize = (size_t)itemSize * newMax;
     if (allocSize < newMax)
     {
-        IERRLOG("Out of memory (overflow) in Array allocator: itemSize = %d, trying to allocate %d items", itemSize, newLen);
-        throw MakeStringException(0, "Out of memory (overflow) in Array allocator: itemSize = %u, trying to allocate %u items",itemSize, newLen);
+        IERRLOG("Out of memory (overflow) in Array allocator: itemSize = %u, trying to allocate %u items", itemSize, newLen);
+        throw MakeStringException(JLIBERR_ArrayOverflow, "Out of memory (overflow) in Array allocator: itemSize = %u, trying to allocate %u items",itemSize, newLen);
     }
     void *newhead = realloc(_head, allocSize);
     if (!newhead) 
     {
-        IERRLOG("Out of memory in Array allocator: itemSize = %d, trying to allocate %d items", itemSize, max);
-        throw MakeStringException(0, "Out of memory in Array allocator: itemSize = %d, trying to allocate %d items",itemSize, max);
+        IERRLOG("Out of memory in Array allocator: itemSize = %u, trying to allocate %u items", itemSize, max);
+        throw MakeStringException(JLIBERR_ArrayAllocationFailed, "Out of memory in Array allocator: itemSize = %u, trying to allocate %u items",itemSize, max);
     }
     max = newMax;
+    _head = newhead;
+};
+
+
+void Allocator::_reallocateExact(aindex_t newLen, size32_t itemSize)
+{
+    if (max == newLen)
+        return;
+
+    if (used > newLen)
+        throw MakeStringException(JLIBERR_ArrayTooFewItems, "Reallocate an array would contain too few items: itemSize = %u, trying to allocate %u items contains %u",itemSize, newLen, used);
+
+    size_t allocSize = (size_t)itemSize * newLen;
+    void *newhead = realloc(_head, allocSize);
+    if (!newhead)
+    {
+        IERRLOG("Out of memory in Array allocator: itemSize = %u, trying to allocate %u items", itemSize, max);
+        throw MakeStringException(JLIBERR_ArrayAllocationFailed, "Out of memory in Array allocator: itemSize = %u, trying to allocate %u items",itemSize, max);
+    }
+    max = newLen;
     _head = newhead;
 };
 
@@ -114,13 +119,13 @@ void Allocator::_doRotateR(aindex_t pos1, aindex_t pos2, size32_t iSize, aindex_
     char * head= (char *)_head;
     char * lower = head + pos1 * iSize;
     char * upper = lower + (blockSize - saveSize);
-    char * temp = (char *)((saveSize <= ALLOCA_LIMIT) ? alloca(saveSize) : malloc(saveSize));
+    char * temp = (char *)((saveSize <= ARRAY_ALLOCA_LIMIT) ? alloca(saveSize) : malloc(saveSize));
 
     memcpy(temp, upper, saveSize);
     memmove(lower + saveSize, lower, blockSize-saveSize);
     memcpy(lower, temp, saveSize);
 
-    if (saveSize > ALLOCA_LIMIT)
+    if (saveSize > ARRAY_ALLOCA_LIMIT)
         free(temp);
 }
 
@@ -135,13 +140,13 @@ void Allocator::_doRotateL(aindex_t pos1, aindex_t pos2, size32_t iSize, size32_
     char * head= (char *)_head;
     char * lower = head + pos1 * iSize;
     char * upper = lower + (blockSize - saveSize);
-    char * temp = (char *)((saveSize <= ALLOCA_LIMIT) ? alloca(saveSize) : malloc(saveSize));
+    char * temp = (char *)((saveSize <= ARRAY_ALLOCA_LIMIT) ? alloca(saveSize) : malloc(saveSize));
 
     memcpy(temp, lower, saveSize);
     memmove(lower, lower + saveSize, blockSize - saveSize);
     memcpy(upper, temp, saveSize);
 
-    if (saveSize > ALLOCA_LIMIT)
+    if (saveSize > ARRAY_ALLOCA_LIMIT)
         free(temp);
 }
 

@@ -71,6 +71,7 @@ public:
     virtual ICompare * queryCompare() override;
     virtual const IBloomBuilderInfo * const *queryBloomInfo() const override;
     virtual __uint64 getPartitionFieldMask() const override;
+    virtual const char * queryCompression() override;
 };
 
 class ECLRTL_API CBloomBuilderInfo : public IBloomBuilderInfo
@@ -95,7 +96,7 @@ class ECLRTL_API CThorChooseSetsExArg : public CThorArgOf<IHThorChooseSetsExArg>
 {
 };
 
-class ECLRTL_API CThorDiskWriteArg : public CThorSinkArgOf<IHThorDiskWriteArg>
+class ECLRTL_API CThorDiskWriteArg : public CThorSinkArgOf<IHThorGenericDiskWriteArg>
 {
     virtual int getSequence() override;
     virtual unsigned getFlags() override;
@@ -104,6 +105,11 @@ class ECLRTL_API CThorDiskWriteArg : public CThorSinkArgOf<IHThorDiskWriteArg>
     virtual void getUpdateCRCs(unsigned & eclCRC, unsigned __int64 & totalCRC) override;
     virtual void getEncryptKey(size32_t & keyLen, void * & key) override;
     virtual const char * getCluster(unsigned idx) override;
+    virtual unsigned getWidth() override;
+    virtual const char * queryFormat() override;
+    virtual void getFormatOptions(IXmlWriter & options) override;
+    virtual const char * queryProvider() override;
+    virtual void getProviderOptions(IXmlWriter & options) override;
 };
 
 class ECLRTL_API CThorPipeReadArg : public CThorArgOf<IHThorPipeReadArg>
@@ -283,6 +289,11 @@ class ECLRTL_API CThorSpillArg : public CThorArgOf<IHThorSpillArg>
     virtual void getUpdateCRCs(unsigned & eclCRC, unsigned __int64 & totalCRC) override;
     virtual void getEncryptKey(size32_t & keyLen, void * & key) override;
     virtual const char * getCluster(unsigned idx) override;
+    virtual unsigned getWidth() override;
+    virtual const char * queryFormat() override;
+    virtual void getFormatOptions(IXmlWriter & options) override;
+    virtual const char * queryProvider() override;
+    virtual void getProviderOptions(IXmlWriter & options) override;
 };
 
 class ECLRTL_API CThorNormalizeChildArg : public CThorArgOf<IHThorNormalizeChildArg>
@@ -659,6 +670,7 @@ class ECLRTL_API CThorNWayDistributeArg : public CThorArgOf<IHThorNWayDistribute
 {
     virtual unsigned getFlags() override;
     virtual bool     include(const byte * left, unsigned targetNode) override;
+    virtual unsigned getWidth() override;
 };
 
 class ECLRTL_API CThorHashDedupArg : public CThorArgOf<IHThorHashDedupArg>
@@ -739,6 +751,7 @@ class ECLRTL_API CThorCsvWriteArg : public CThorSinkArgOf<IHThorCsvWriteArg>
     virtual void getUpdateCRCs(unsigned & eclCRC, unsigned __int64 & totalCRC) override;
     virtual void getEncryptKey(size32_t & keyLen, void * & key) override;
     virtual const char * getCluster(unsigned idx) override;
+    virtual unsigned getWidth() override;
 };
 
 class ECLRTL_API CThorCsvFetchArg: public CThorArgOf<IHThorCsvFetchArg>
@@ -790,6 +803,7 @@ class ECLRTL_API CThorXmlWriteArg : public CThorSinkArgOf<IHThorXmlWriteArg>
     virtual void getUpdateCRCs(unsigned & eclCRC, unsigned __int64 & totalCRC) override;
     virtual void getEncryptKey(size32_t & keyLen, void * & key) override;
     virtual const char * getCluster(unsigned idx) override;
+    virtual unsigned getWidth() override;
 };
 
 //-- SOAP --
@@ -817,9 +831,12 @@ class ECLRTL_API CThorSoapActionArg : public CThorSinkArgOf<IHThorSoapActionArg>
     virtual const char * getInputIteratorPath() override;
     virtual size32_t onFailTransform(ARowBuilder & rowBuilder, const void * left, IException * e) override;
     virtual void getLogText(size32_t & lenText, char * & text, const void * left) override;
+    virtual void getLogTailText(size32_t & lenText, char * & text, const void * left) override;
     virtual const char * getXpathHintsXml() override;
     virtual const char * getRequestHeader() override;
     virtual const char * getRequestFooter() override;
+    virtual unsigned getPersistMaxRequests() override;
+    unsigned getPersistPoolSize(); // Included for backward compatibility to prevent linking problems
 };
 
 class ECLRTL_API CThorSoapCallArg : public CThorArgOf<IHThorSoapCallArg>
@@ -846,9 +863,12 @@ class ECLRTL_API CThorSoapCallArg : public CThorArgOf<IHThorSoapCallArg>
     virtual const char * getInputIteratorPath() override;
     virtual size32_t onFailTransform(ARowBuilder & rowBuilder, const void * left, IException * e) override;
     virtual void getLogText(size32_t & lenText, char * & text, const void * left) override;
+    virtual void getLogTailText(size32_t & lenText, char * & text, const void * left) override;
     virtual const char * getXpathHintsXml() override;
     virtual const char * getRequestHeader() override;
     virtual const char * getRequestFooter() override;
+    virtual unsigned getPersistMaxRequests() override;
+    unsigned getPersistPoolSize(); // Included for backward compatibility to prevent linking problems
 };
 
 typedef CThorSoapCallArg CThorHttpCallArg;
@@ -1169,7 +1189,8 @@ class ECLRTL_API CThorNewDiskReadArg : public CThorArgOf<IHThorNewDiskReadArg>
     virtual size32_t transformOnKeyedLimitExceeded(ARowBuilder & rowBuilder) override;
     virtual const char * queryFormat() override;
     virtual void getFormatOptions(IXmlWriter & options) override;
-    virtual void getFormatDynOptions(IXmlWriter & options) override;
+    virtual const char * queryProvider() override;
+    virtual void getProviderOptions(IXmlWriter & options) override;
 
 public:
     IThorDiskCallback * fpp;

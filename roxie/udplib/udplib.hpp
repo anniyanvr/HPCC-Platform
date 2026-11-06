@@ -33,7 +33,8 @@ typedef unsigned ruid_t;   // at 1000/sec recycle every 49 days
 #define RUIDF   "0x%.8x"
 #define RUID_PING 0
 #define RUID_DISCARD 1
-#define RUID_FIRST 2
+#define RUID_NONE 2
+#define RUID_FIRST 3
 
 typedef unsigned RecordLengthType;
 #define MAX_RECORD_LENGTH 0xffffffff
@@ -75,12 +76,13 @@ public:
     {
         IpAddress serverIp;
         serverIp.setIP4(netAddress);
-        return serverIp.getIpText(s);
+        return serverIp.getHostText(s);
     }
     bool isMe() const;
 };
 
 extern UDPLIB_API ServerIdentifier myNode;
+extern UDPLIB_API roxiemem::IDataBufferManager *bufferManager; // now only used for sending
 
 interface IMessagePacker : extends IInterface
 {
@@ -101,10 +103,12 @@ interface IMessagePacker : extends IInterface
 };
 
 interface IException;
+class RoxiePacketHeader;
 
 interface IMessageUnpackCursor : extends IInterface
 {
     virtual const void *getNext(int length) = 0;
+    virtual RecordLengthType *getNextLength() = 0;
     virtual bool atEOF() const = 0;
     virtual bool isSerialized() const = 0;
     //    if one tries to read past the last record then NULL will be returned, 
@@ -114,7 +118,7 @@ interface IMessageUnpackCursor : extends IInterface
 interface IMessageResult : extends IInterface
 {
     virtual IMessageUnpackCursor *getCursor(roxiemem::IRowManager *rowMgr) const = 0;
-    virtual const void *getMessageHeader(unsigned &length) const = 0;
+    virtual const RoxiePacketHeader *getMessageHeader(unsigned &length) const = 0;
     virtual const void *getMessageMetadata(unsigned &length) const = 0;
     virtual void discard() const = 0;
 };
@@ -125,6 +129,8 @@ interface IMessageCollator : extends IInterface
     virtual void interrupt(IException *E = NULL) = 0;
     virtual ruid_t queryRUID() const = 0;
     virtual unsigned queryBytesReceived() const = 0;
+    virtual unsigned queryDuplicates() const = 0;
+    virtual unsigned queryResends() const = 0;
 };
 
 interface IReceiveManager : extends IInterface 
@@ -144,40 +150,98 @@ interface ISendManager : extends IInterface
     virtual void writeOwn(IUdpReceiverEntry &receiver, roxiemem::DataBuffer *buffer, unsigned len, unsigned queue) = 0;
     virtual bool dataQueued(ruid_t ruid, unsigned sequence, const ServerIdentifier &destNode) = 0;
     virtual bool abortData(ruid_t ruid, unsigned sequence, const ServerIdentifier &destNode) = 0;
+    virtual void abortAll(const ServerIdentifier &destNode) = 0;
     virtual bool allDone() = 0;
 };
 
-extern UDPLIB_API IReceiveManager *createReceiveManager(int server_flow_port, int data_port, int client_flow_port, int sniffer_port, const IpAddress &sniffer_multicast_ip, int queue_size, unsigned maxSlotsPerSender);
-extern UDPLIB_API ISendManager *createSendManager(int server_flow_port, int data_port, int client_flow_port, int sniffer_port, const IpAddress &sniffer_multicast_ip, int queue_size_pr_server, int queues_pr_server, TokenBucket *rateLimiter);
+extern UDPLIB_API IReceiveManager *createReceiveManager(int server_flow_port, int data_port, int client_flow_port, int queue_size, bool encrypted);
+extern UDPLIB_API ISendManager *createSendManager(int server_flow_port, int data_port, int client_flow_port, int queue_size_pr_server, int queues_pr_server, const IpAddress &myIP, TokenBucket *rateLimiter, bool encryptionInTransit, bool useIOUring);
 
-extern UDPLIB_API void setAeronProperties(const IPropertyTree *config);
-extern UDPLIB_API IReceiveManager *createAeronReceiveManager(const SocketEndpoint &ep);
-extern UDPLIB_API ISendManager *createAeronSendManager(unsigned dataPort, unsigned numQueues, const IpAddress &myIP);
-
-extern UDPLIB_API RelaxedAtomic<unsigned> unwantedDiscarded;
-
-extern UDPLIB_API unsigned udpTraceLevel;
-extern UDPLIB_API unsigned udpTraceCategories;
-extern UDPLIB_API unsigned udpOutQsPriority;
-extern UDPLIB_API void queryMemoryPoolStats(StringBuffer &memStats);
-
-extern UDPLIB_API unsigned multicastTTL;
-
-#if defined( __linux__) || defined(__APPLE__)
+#if defined( __linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
 extern UDPLIB_API void setLinuxThreadPriority(int level);
 #endif
+extern UDPLIB_API void queryMemoryPoolStats(StringBuffer &memStats);
+
+interface IRoxieQueryPacket;
+class RoxiePacketHeader;
+interface IPendingCallback;
+interface IRoxieContextLogger;
+
+interface IRoxieOutputQueueManager : public IInterface
+{
+    virtual void sendPacket(IRoxieQueryPacket *x, const IRoxieContextLogger &logctx) = 0;
+    virtual void sendIbyti(RoxiePacketHeader &header, const IRoxieContextLogger &logctx, unsigned subChannel) = 0;
+    virtual void sendAbort(RoxiePacketHeader &header, const IRoxieContextLogger &logctx) = 0;
+    virtual void sendAbortCallback(const RoxiePacketHeader &header, const char *lfn, const IRoxieContextLogger &logctx) = 0;
+    virtual IMessagePacker *createOutputStream(RoxiePacketHeader &x, bool outOfBand, const IRoxieContextLogger &logctx) = 0;
+    virtual bool replyPending(RoxiePacketHeader &x) = 0;
+    virtual bool abortCompleted(RoxiePacketHeader &x) = 0;
+
+    virtual void start() = 0;
+    virtual void stop() = 0;
+    virtual void join() = 0;
+    virtual IReceiveManager *queryReceiveManager() = 0;
+
+    virtual IPendingCallback *notePendingCallback(const RoxiePacketHeader &header, const char *lfn) = 0;
+    virtual void removePendingCallback(IPendingCallback *x) = 0;
+    virtual void abortPendingData(const SocketEndpoint &ep) = 0;
+};
+
+extern UDPLIB_API IRoxieOutputQueueManager *ROQ;
+
+//This following might be clearer if they were grouped into an options structure and a metrics structure
+
+// -- Options for controlling the UDP layer --------------------------------------------------------------------------
+// These are documented in detail at the head of udptrr.cpp
+
+extern UDPLIB_API bool udpTraceFlow;
+extern UDPLIB_API bool udpTraceTimeouts;
+extern UDPLIB_API unsigned udpTraceLevel;
+extern UDPLIB_API unsigned udpOutQsPriority;
+extern UDPLIB_API unsigned udpSendTraceThresholdMs;
 
 extern UDPLIB_API unsigned udpFlowSocketsSize;
 extern UDPLIB_API unsigned udpLocalWriteSocketSize;
-extern UDPLIB_API unsigned udpMaxRetryTimedoutReqs;
-extern UDPLIB_API unsigned udpRequestToSendTimeout;
-extern UDPLIB_API unsigned udpRequestToSendAckTimeout;
+extern UDPLIB_API unsigned tcpServerWorkerSendBufferSize;
+extern UDPLIB_API unsigned tcpServerWorkerRecvBufferSize;
 
-extern UDPLIB_API unsigned udpRetryBusySenders;
-extern UDPLIB_API bool udpSnifferEnabled;
-extern UDPLIB_API unsigned udpSnifferReadThreadPriority;
-extern UDPLIB_API unsigned udpSnifferSendThreadPriority;
+extern UDPLIB_API unsigned udpMaxPermitDeadTimeouts;    // How many permit grants are allowed to expire (with no flow message) until sender is assumed down
+extern UDPLIB_API unsigned udpRequestDeadTimeout;       // Timeout for sender getting no response to request to send before assuming that the receiver is dead
 
-extern UDPLIB_API void stopAeronDriver();
+// All in milliseconds
+extern UDPLIB_API unsigned udpFlowAckTimeout;
+extern UDPLIB_API unsigned updDataSendTimeout;
+extern UDPLIB_API unsigned udpRequestTimeout;
+extern UDPLIB_API unsigned udpPermitTimeout;
+extern UDPLIB_API unsigned udpResendDelay;
+
+extern UDPLIB_API bool udpResendLostPackets;
+extern UDPLIB_API unsigned udpMaxPendingPermits;
+extern UDPLIB_API unsigned udpMaxClientPercent;
+extern UDPLIB_API unsigned udpMinSlotsPerSender;
+
+extern UDPLIB_API bool udpAssumeSequential;
+extern UDPLIB_API bool udpResendAllMissingPackets;
+extern UDPLIB_API unsigned udpStatsReportInterval;
+extern UDPLIB_API bool udpAdjustThreadPriorities;
+extern UDPLIB_API bool udpAllowAsyncPermits;
+extern UDPLIB_API bool udpRemoveDuplicatePermits;
+extern UDPLIB_API bool udpEncryptOnSendThread;
+
+//Should be in ccd
+extern UDPLIB_API unsigned multicastTTL;
+extern UDPLIB_API bool useTcpTransport;
+
+// -- Reported metrics --------------------------------------------------------------------------
+
+extern UDPLIB_API RelaxedAtomic<unsigned> unwantedDiscarded;
+extern UDPLIB_API RelaxedAtomic<unsigned> packetsResent;
+extern UDPLIB_API RelaxedAtomic<unsigned> packetsOOO;
+extern UDPLIB_API RelaxedAtomic<unsigned> flowPermitsSent;
+extern UDPLIB_API RelaxedAtomic<unsigned> flowRequestsReceived;
+extern UDPLIB_API RelaxedAtomic<unsigned> dataPacketsReceived;
+extern UDPLIB_API RelaxedAtomic<unsigned> flowRequestsSent;
+extern UDPLIB_API RelaxedAtomic<unsigned> flowPermitsReceived;
+extern UDPLIB_API RelaxedAtomic<unsigned> dataPacketsSent;
 
 #endif

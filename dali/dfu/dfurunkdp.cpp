@@ -42,7 +42,15 @@ class CDKDPitem : public CInterface
     StringBuffer &getExePath(const char *tail,StringBuffer &ret,StringBuffer &workdir)
     {
         StringBuffer p;
+#ifdef _CONTAINERIZED
+        UNIMPLEMENTED_X("CONTAINERIZED(dkc)");
+#else
         querySlaveExecutable("DKCSlaveProcess", "dkcslave", NULL, ep, p, workdir);
+#endif
+        // This code is being used to execute run_keypatch and run_keydiff.  I suspect it does not work, because it
+        // is using the dkcslave entry to find the execution directory, which is unlikely to be configured since it is no
+        // longer part of the source.  Retain the code for the moment.
+        // If we did want to support this again it would be better to move the keydiff/keypatch functionality into dafilesrv.
         splitDirTail(p.str(),ret);
         addPathSepChar(ret).append(tail);
         if (getPathSepChar(ret.str())=='\\') {
@@ -206,7 +214,7 @@ static void runKDPNodes(const char *title,CIArrayOf<CDKDPitem> &nodes)
                     if (msTick()-start>15*60*1000) {
                         StringBuffer err;
                         err.append(title).append(" failed to start on node ");
-                        it.queryEP().getUrlStr(err);
+                        it.queryEP().getEndpointHostText(err);
                         throw MakeStringException(-1, "%s", err.str());
                     }
                     Sleep(5000); // no point in rushing when some left
@@ -227,7 +235,7 @@ static void runKDPNodes(const char *title,CIArrayOf<CDKDPitem> &nodes)
                     if (msTick()-start>6*60*60*1000) {
                         StringBuffer err;
                         err.append(title).append(" failed to finish on node ");
-                        it.queryEP().getUrlStr(err);
+                        it.queryEP().getEndpointHostText(err);
                         throw MakeStringException(-1, "%s", err.str());
                     }
                     Sleep(5000); // no point in rushing when some left

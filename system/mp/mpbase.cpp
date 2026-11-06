@@ -61,7 +61,7 @@ public:
 
 class MPNodeCache: public SuperHashTableOf<MPNode,SocketEndpoint>
 {
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
 public:
     ~MPNodeCache()
     {
@@ -217,14 +217,12 @@ public:
             }
             if (r2==0)
                 return GRdisjoint;
-            bool somematch=false;
             if (r1==r2) { // check for identical
                 r=r1;
                 for (;;) {
                     r--;
                     if (!nodes[r]->equals(&grp->queryNode(r)))
                         break;
-                    somematch = true;
                     if (r==0)
                         return GRidentical;
                 }
@@ -542,7 +540,7 @@ public:
         if (!count)
             return text;
         if (count==1)
-            return nodes[0]->endpoint().getUrlStr(text);
+            return nodes[0]->endpoint().getEndpointHostText(text);
         // following is rather slow maybe could do with more direct method with pointers TBD
         SocketEndpointArray epa;
         for(unsigned i=0;i<count;i++) {

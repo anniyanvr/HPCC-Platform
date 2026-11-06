@@ -49,7 +49,23 @@ public:
     virtual void stop() = 0;
 };
 
-IRowStream *createSequentialPartHandler(CPartHandler *partHandler, IArrayOf<IPartDescriptor> &partDescs, bool grouped);
+class CSeqPartHandler : public CInterface
+{
+    IArrayOf<IPartDescriptor> &partDescs;
+    Linked<CPartHandler> partHandler;
+    unsigned part;
+    bool eof, grouped, someInGroup;
+
+public:
+    CSeqPartHandler(CPartHandler *_partHandler, IArrayOf<IPartDescriptor> &_partDescs, bool _grouped);
+
+    void stop();
+    const void *nextRow();
+
+    inline unsigned numParts() const { return partDescs.ordinality(); }
+};
+
+CSeqPartHandler * createSequentialPartHandler(CPartHandler *partHandler, IArrayOf<IPartDescriptor> &partDescs, bool grouped);
 
 #define CATCH_NEXTROWX_CATCH \
         catch (IException *_e) \
@@ -77,8 +93,7 @@ interface ILookAheadStopNotify
 {
     virtual void onInputFinished(rowcount_t count) = 0;
 };
-interface IDiskUsage;
-IStartableEngineRowStream *createRowStreamLookAhead(CSlaveActivity *activity, IEngineRowStream *inputStream, IThorRowInterfaces *rowIf, size32_t bufsize, bool spillenabled, bool preserveGrouping=true, rowcount_t maxcount=RCUNBOUND, ILookAheadStopNotify *notify=NULL, IDiskUsage *_diskUsage=NULL); //maxcount is maximum rows to read set to RCUNBOUND for all
+IStartableEngineRowStream *createRowStreamLookAhead(CSlaveActivity *activity, IEngineRowStream *inputStream, IThorRowInterfaces *rowIf, size32_t bufsize, bool spillenabled, bool preserveGrouping=true, rowcount_t maxcount=RCUNBOUND, ILookAheadStopNotify *notify=NULL); //maxcount is maximum rows to read set to RCUNBOUND for all
 
 
 StringBuffer &locateFilePartPath(CActivityBase *activity, const char *logicalFilename, IPartDescriptor &partDesc, StringBuffer &filePath);
@@ -90,8 +105,11 @@ void cancelReplicates(CActivityBase *activity, IPartDescriptor &partDesc);
 #define TW_External 0x04
 #define TW_RenameToPrimary 0x08
 #define TW_Temporary 0x10
+#define TW_JobTemp 0x20
+#define TW_Persist 0x40
+
 interface IPartDescriptor;
-IFileIO *createMultipleWrite(CActivityBase *activity, IPartDescriptor &partDesc, unsigned recordSize, unsigned twFlags, bool &compress, ICompressor *ecomp, ICopyFileProgress *iProgress, bool *aborted, StringBuffer *_locationName=NULL);
+IFileIO *createMultipleWrite(CActivityBase *activity, IPartDescriptor &partDesc, unsigned twFlags, bool &compress, ICompressor *ecomp, ICopyFileProgress *iProgress, bool *aborted, StringBuffer *_locationName=NULL, CompressionMethod *compMethod=NULL);
 
 class CAsyncCall : implements IThreaded
 {
@@ -99,7 +117,7 @@ class CAsyncCall : implements IThreaded
     std::function<void()> func;
 public:
     CAsyncCall(std::function<void()> _func) : threaded("CAsyncCall", this), func(_func) { }
-    void start() { threaded.start(); }
+    void start() { threaded.start(true); }
     void wait() { threaded.join(); }
 // IThreaded
     virtual void threadmain() override { func(); }
@@ -113,5 +131,8 @@ public:
         start();
     }
 };
+
+void getPlaneReadAheadSizing(CActivityBase &activity, const char *filename, unsigned &numThreads, size32_t &chunkSize);
+
 
 #endif

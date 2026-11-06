@@ -36,14 +36,18 @@ include_directories (
          ./../include 
          .
          ./../jlib
+         ./../security/securesocket
     )
 
-ADD_DEFINITIONS( -DLOGMSGCOMPONENT=2 -D_USRDLL -DMP_EXPORTS )
+ADD_DEFINITIONS( -D_USRDLL -DMP_EXPORTS )
 
 HPCC_ADD_LIBRARY( mp SHARED ${SRCS} )
 install ( TARGETS mp RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( mp 
+target_link_libraries ( mp PRIVATE
          jlib
     )
+    if (USE_OPENSSL)
+        target_link_libraries(mp PRIVATE securesocket)
+    endif()
 
 HPCC_ADD_SUBDIRECTORY(test "PLATFORM")

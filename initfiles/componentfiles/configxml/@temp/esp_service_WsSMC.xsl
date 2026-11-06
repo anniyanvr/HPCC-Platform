@@ -133,6 +133,22 @@ This is required by its binding with ESP service '<xsl:value-of select="$espServ
             <xsl:with-param name="bindingNode" select="$bindingNode"/>
             <xsl:with-param name="authNode" select="$authNode"/>
         </xsl:apply-templates>
+        <xsl:apply-templates select="." mode="ws_dali">
+            <xsl:with-param name="bindingNode" select="$bindingNode"/>
+            <xsl:with-param name="authNode" select="$authNode"/>
+        </xsl:apply-templates>
+        <xsl:apply-templates select="." mode="ws_logaccess">
+            <xsl:with-param name="bindingNode" select="$bindingNode"/>
+            <xsl:with-param name="authNode" select="$authNode"/>
+        </xsl:apply-templates>
+        <xsl:apply-templates select="." mode="ws_dfsservice">
+            <xsl:with-param name="bindingNode" select="$bindingNode"/>
+            <xsl:with-param name="authNode" select="$authNode"/>
+        </xsl:apply-templates>
+        <xsl:apply-templates select="." mode="ws_resources">
+            <xsl:with-param name="bindingNode" select="$bindingNode"/>
+            <xsl:with-param name="authNode" select="$authNode"/>
+        </xsl:apply-templates>
     </xsl:template>
 
     <!-- WS-SMC -->
@@ -240,6 +256,21 @@ This is required by its binding with ESP service '<xsl:value-of select="$espServ
             </xsl:if>
             <xsl:if test="string(@clusterQueryStateThreadPoolSize) != ''">
                 <ClusterQueryStateThreadPoolSize><xsl:value-of select="@clusterQueryStateThreadPoolSize"/></ClusterQueryStateThreadPoolSize>
+            </xsl:if>
+            <xsl:if test="string(@queryCopyPreparationThreadPoolSize) != ''">
+                <QueryCopyPreparationThreadPoolSize><xsl:value-of select="@queryCopyPreparationThreadPoolSize"/></QueryCopyPreparationThreadPoolSize>
+            </xsl:if>
+            <xsl:if test="string(@queryCopyMaxActiveRecompiles) != ''">
+                <QueryCopyMaxActiveRecompiles><xsl:value-of select="@queryCopyMaxActiveRecompiles"/></QueryCopyMaxActiveRecompiles>
+            </xsl:if>
+            <xsl:if test="string(@queryCopyRecompileQueueTimeout) != ''">
+                <QueryCopyRecompileQueueTimeout><xsl:value-of select="@queryCopyRecompileQueueTimeout"/></QueryCopyRecompileQueueTimeout>
+            </xsl:if>
+            <xsl:if test="string(@queryCopyRecompileTimeout) != ''">
+                <QueryCopyRecompileTimeout><xsl:value-of select="@queryCopyRecompileTimeout"/></QueryCopyRecompileTimeout>
+            </xsl:if>
+            <xsl:if test="string(@queryCopyProgressInterval) != ''">
+                <QueryCopyProgressInterval><xsl:value-of select="@queryCopyProgressInterval"/></QueryCopyProgressInterval>
             </xsl:if>
             <xsl:if test="string(@ThorSlaveLogThreadPoolSize) != ''">
                 <ThorSlaveLogThreadPoolSize><xsl:value-of select="@ThorSlaveLogThreadPoolSize"/></ThorSlaveLogThreadPoolSize>
@@ -601,6 +632,9 @@ This is required by its binding with ESP service '<xsl:value-of select="$espServ
                 <xsl:for-each select="../EspProcess[Authentication/@ldapServer=$ldapservername]/EspBinding">
                     <Binding name="{@name}" service="{@service}" port="{@port}" basedn="{@resourcesBasedn}" workunitsBasedn="{@workunitsBasedn}"/>
                 </xsl:for-each>
+                <xsl:for-each select="../EspProcess[Authentication/@ldapServer=$ldapservername]/EspControlBinding">
+                    <Binding name="{@name}" service="{@service}" port="{@port}" basedn="{@resourcesBasedn}" workunitsBasedn="{@workunitsBasedn}"/>
+                </xsl:for-each>
             </Resources>
         </EspService>
         
@@ -728,6 +762,120 @@ This is required by its binding with ESP service '<xsl:value-of select="$espServ
          <xsl:apply-templates select="@*[string(.) != '']|node()" mode="copy"/>
       </xsl:copy>
    </xsl:template>
+
+<!-- ws_dali -->
+    <xsl:template match="EspService" mode="ws_dali">
+        <xsl:param name="bindingNode"/>
+        <xsl:param name="authNode"/>
+
+        <xsl:variable name="serviceType" select="'WSDali'"/>
+        <xsl:variable name="serviceName" select="concat($serviceType, '_', @name, '_', $process)"/>
+        <xsl:variable name="bindName" select="concat($serviceType, '_', $bindingNode/@name, '_', $process)"/>
+        <xsl:variable name="bindType" select="'ws_daliSoapBinding'"/>
+        <xsl:variable name="servicePlugin">
+            <xsl:call-template name="defineServicePlugin">
+                <xsl:with-param name="plugin" select="'ws_dali'"/>
+            </xsl:call-template>
+        </xsl:variable>
+        <EspService name="{$serviceName}" type="{$serviceType}" plugin="{$servicePlugin}">
+        </EspService>
+        <EspBinding name="{$bindName}" service="{$serviceName}" protocol="{$bindingNode/@protocol}" type="{$bindType}"
+            plugin="{$servicePlugin}" netAddress="0.0.0.0" port="{$bindingNode/@port}">
+            <xsl:call-template name="bindAuthentication">
+                <xsl:with-param name="bindingNode" select="$bindingNode"/>
+                <xsl:with-param name="authMethod" select="$authNode/@method"/>
+                <xsl:with-param name="service" select="'ws_dali'"/>
+            </xsl:call-template>
+        </EspBinding>
+    </xsl:template>
+   <xsl:template match="*" mode="copy">
+      <xsl:copy>
+         <xsl:apply-templates select="@*[string(.) != '']|node()" mode="copy"/>
+      </xsl:copy>
+   </xsl:template>
+
+    <!-- ws_dfsservice -->
+    <xsl:template match="EspService" mode="ws_dfsservice">
+        <xsl:param name="bindingNode"/>
+        <xsl:param name="authNode"/>
+
+        <xsl:variable name="serviceType" select="'ws_dfsservice'"/>
+        <xsl:variable name="serviceName" select="concat($serviceType, '_', @name, '_', $process)"/>
+        <xsl:variable name="bindName" select="concat($serviceType, '_', $bindingNode/@name, '_', $process)"/>
+        <xsl:variable name="bindType" select="'ws_dfsservice_binding'"/>
+        <xsl:variable name="servicePlugin">
+            <xsl:call-template name="defineServicePlugin">
+                <xsl:with-param name="plugin" select="'ws_dfsservice'"/>
+            </xsl:call-template>
+        </xsl:variable>
+        <EspService name="{$serviceName}" type="{$serviceType}" plugin="{$servicePlugin}">
+        </EspService>
+        <EspBinding name="{$bindName}" service="{$serviceName}" protocol="{$bindingNode/@protocol}" type="{$bindType}"
+            plugin="{$servicePlugin}" netAddress="0.0.0.0" port="{$bindingNode/@port}">
+            <xsl:call-template name="bindAuthentication">
+                <xsl:with-param name="bindingNode" select="$bindingNode"/>
+                <xsl:with-param name="authMethod" select="$authNode/@method"/>
+                <xsl:with-param name="service" select="'ws_dfsservice'"/>
+            </xsl:call-template>
+        </EspBinding>
+    </xsl:template>
+
+    <!-- ws_resources -->
+    <xsl:template match="EspService" mode="ws_resources">
+        <xsl:param name="bindingNode"/>
+        <xsl:param name="authNode"/>
+
+        <xsl:variable name="serviceType" select="'ws_resources'"/>
+        <xsl:variable name="serviceName" select="concat($serviceType, '_', @name, '_', $process)"/>
+        <xsl:variable name="bindName" select="concat($serviceType, '_', $bindingNode/@name, '_', $process)"/>
+        <xsl:variable name="bindType" select="'ws_resourcesSoapBinding'"/>
+        <xsl:variable name="servicePlugin">
+            <xsl:call-template name="defineServicePlugin">
+                <xsl:with-param name="plugin" select="'ws_resources'"/>
+            </xsl:call-template>
+        </xsl:variable>
+        <EspService name="{$serviceName}" type="{$serviceType}" plugin="{$servicePlugin}">
+        </EspService>
+        <EspBinding name="{$bindName}" service="{$serviceName}" protocol="{$bindingNode/@protocol}" type="{$bindType}"
+            plugin="{$servicePlugin}" netAddress="0.0.0.0" port="{$bindingNode/@port}">
+            <xsl:call-template name="bindAuthentication">
+                <xsl:with-param name="bindingNode" select="$bindingNode"/>
+                <xsl:with-param name="authMethod" select="$authNode/@method"/>
+                <xsl:with-param name="service" select="'ws_resources'"/>
+            </xsl:call-template>
+        </EspBinding>
+    </xsl:template>
+
+    <!-- ws_logAccess -->
+    <xsl:template match="EspService" mode="ws_logaccess">
+        <xsl:param name="bindingNode"/>
+        <xsl:param name="authNode"/>
+
+        <xsl:variable name="serviceType" select="'ws_logaccess'"/>
+        <xsl:variable name="serviceName" select="concat($serviceType, '_', @name, '_', $process)"/>
+        <xsl:variable name="bindName" select="concat($serviceType, '_', $bindingNode/@name, '_', $process)"/>
+        <xsl:variable name="bindType" select="'ws_logaccessSoapBinding'"/>
+        <xsl:variable name="servicePlugin">
+            <xsl:call-template name="defineServicePlugin">
+                <xsl:with-param name="plugin" select="'ws_logaccess'"/>
+            </xsl:call-template>
+        </xsl:variable>
+        <EspService name="{$serviceName}" type="{$serviceType}" plugin="{$servicePlugin}">
+        </EspService>
+        <EspBinding name="{$bindName}" service="{$serviceName}" protocol="{$bindingNode/@protocol}" type="{$bindType}"
+            plugin="{$servicePlugin}" netAddress="0.0.0.0" port="{$bindingNode/@port}">
+            <xsl:call-template name="bindAuthentication">
+                <xsl:with-param name="bindingNode" select="$bindingNode"/>
+                <xsl:with-param name="authMethod" select="$authNode/@method"/>
+                <xsl:with-param name="service" select="'ws_logaccess'"/>
+            </xsl:call-template>
+        </EspBinding>
+    </xsl:template>
+   <xsl:template match="*" mode="copy">
+      <xsl:copy>
+         <xsl:apply-templates select="@*[string(.) != '']|node()" mode="copy"/>
+      </xsl:copy>
+   </xsl:template>
    
    <xsl:template match="@*" mode="copy">
       <xsl:if test="string(.) != ''">
@@ -756,7 +904,7 @@ This is required by its binding with ESP service '<xsl:value-of select="$espServ
         <xsl:param name="bindingNode"/>
         <xsl:param name="authMethod"/>
         <xsl:param name="service"/>
-
+        <xsl:copy-of select="$bindingNode/cors"/>
         <xsl:choose>
       <xsl:when test="$authMethod='basic'">
          <Authenticate type="Basic" method="UserDefined">

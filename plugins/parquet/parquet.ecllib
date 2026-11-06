@@ -1,0 +1,98 @@
+/*##############################################################################
+
+    HPCC SYSTEMS software Copyright (C) 2023 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+SHARED ParquetService := SERVICE : plugin('parquetembed')
+  BOOLEAN getEmbedContext():cpp, pure, namespace='parquetembed', entrypoint='getEmbedContext', prototype='IEmbedContext* getEmbedContext()';
+  STRING getParquetRecordStructure(VARSTRING readType, VARSTRING filePath):cpp, once, fold, namespace='parquetembed', entrypoint='getParquetRecordStructure';
+END;
+
+EXPORT ParquetIO := MODULE
+
+    EXPORT HivePartition := MODULE
+        EXPORT Write(outDS, outRows = 100000, basePath, overwriteOption = false, partitionFieldList) := FUNCTIONMACRO
+            LOCAL _DoParquetWritePartition(STREAMED DATASET(RECORDOF(outDS)) _ds) := EMBED(parquet : activity, option('writehivepartition'), destination(basePath), MaxRowSize(outRows), overwriteOpt(overwriteOption), partitionFields(partitionFieldList))
+            ENDEMBED;
+            RETURN _DoParquetWritePartition(outDS);
+        ENDMACRO;
+
+        EXPORT Read(resultLayout, basePath) := FUNCTIONMACRO
+            LOCAL STREAMED DATASET(resultLayout) _DoParquetReadPartition() := EMBED(parquet: activity, option('readhivepartition'), location(basePath))
+            ENDEMBED;
+            RETURN _DoParquetReadPartition();
+        ENDMACRO;
+
+        /**
+        * Returns the ECL record structure for the given Parquet file. The structure
+        * that is returned will contain XPATH for Parquet fields that have field names
+        * that are not ECL compatible.
+        *
+        * @param filePath The full path to the Parquet file.
+        * @return STRING The ECL record structure as a string.
+        */
+        EXPORT getParquetRecordStructure(VARSTRING filePath) := ParquetService.getParquetRecordStructure('readhivepartition', filePath);
+    END;
+
+    EXPORT DirectoryPartition := MODULE
+        EXPORT Write(outDS, outRows = 100000, basePath, overwriteOption = false, partitionFieldList) := FUNCTIONMACRO
+            LOCAL _DoParquetWritePartition(STREAMED DATASET(RECORDOF(outDS)) _ds) := EMBED(parquet : activity, option('writedirectorypartition'), destination(basePath), MaxRowSize(outRows), overwriteOpt(overwriteOption), partitionFields(partitionFieldList))
+            ENDEMBED;
+            RETURN _DoParquetWritePartition(outDS);
+        ENDMACRO;
+
+        EXPORT Read(resultLayout, basePath, partitionFieldList) := FUNCTIONMACRO
+            LOCAL STREAMED DATASET(resultLayout) _DoParquetReadPartition() := EMBED(parquet: activity, option('readdirectorypartition'), location(basePath), partitionFields(partitionFieldList))
+            ENDEMBED;
+            RETURN _DoParquetReadPartition();
+        ENDMACRO;
+
+        /**
+        * Returns the ECL record structure for the given Parquet file. The structure
+        * that is returned will contain XPATH for Parquet fields that have field names
+        * that are not ECL compatible.
+        *
+        * @param filePath The full path to the Parquet file.
+        * @return STRING The ECL record structure as a string.
+        */
+        EXPORT getParquetRecordStructure(VARSTRING filePath) := ParquetService.getParquetRecordStructure('readdirectorypartition', filePath);
+    END;
+
+    EXPORT Read(resultLayout, filePath) := FUNCTIONMACRO
+        LOCAL STREAMED DATASET(resultLayout) _DoParquetRead() := EMBED(parquet : activity, option('read'), location(filePath))
+        ENDEMBED;
+        RETURN _DoParquetRead();
+    ENDMACRO;
+
+    EXPORT Write(outDS, filePath, overwriteOption = false, compressionOption = '\'UNCOMPRESSED\'') := FUNCTIONMACRO
+        LOCAL _DoParquetWrite(STREAMED DATASET(RECORDOF(outDS)) _ds) := EMBED(parquet : activity, option('write'), destination(filePath), overwriteOpt(overwriteOption), compression(compressionOption))
+        ENDEMBED;
+        RETURN _doParquetWrite(outDS);
+    ENDMACRO;
+
+    /**
+    * Returns the ECL record structure for the given Parquet file. The structure
+    * that is returned will contain XPATH for Parquet fields that have fields names
+    * that are not ECL compatible.
+    *
+    * @param filePath The full path to the Parquet file.
+    * @return STRING The ECL record structure as a string.
+    */
+    EXPORT getParquetRecordStructure(VARSTRING filePath) := ParquetService.getParquetRecordStructure('read', filePath);
+END;
+
+EXPORT getEmbedContext := ParquetService.getEmbedContext;
+EXPORT BOOLEAN supportsImport := FALSE;
+EXPORT BOOLEAN supportsScript := TRUE;

@@ -47,7 +47,7 @@ class CASSANDRAEMBED_API CassandraPrepared : public CInterfaceOf<IInterface>
 {
 public:
     inline CassandraPrepared(const CassPrepared *_prepared, const char *_queryString)
-    : prepared(_prepared), queryString(_queryString)
+    : queryString(_queryString), prepared(_prepared)
     {
     }
     inline ~CassandraPrepared()
@@ -141,7 +141,7 @@ private:
     CassCluster *cluster;
     Owned<CassandraSession> session;
     mutable MapStringToMyClass<CassandraPrepared> preparedCache;
-    mutable CriticalSection cacheCrit;
+    mutable CriticalSection cacheCrit{SYNC_LOCATION};
     Semaphore *semaphore;
     unsigned maxFutures;
     unsigned maxRetries;

@@ -22,7 +22,7 @@
 #include "daft.hpp"
 #include "ftbase.ipp"
 
-#define DEFAULT_STD_BUFFER_SIZE         0x10000
+#define DEFAULT_STD_BUFFER_SIZE         0x100000
 #define EFX_BLOCK_HEADER_TYPE   unsigned
 #define EFX_BLOCK_HEADER_SIZE   sizeof(EFX_BLOCK_HEADER_TYPE)
 #define VARIABLE_LENGTH_TYPE    unsigned
@@ -99,6 +99,7 @@ typedef IArrayOf<IFormatPartitioner> FormatPartitionerArray;
 extern DALIFT_API IFormatProcessor * createFormatProcessor(const FileFormat & srcFormat, const FileFormat & tgtFormat, bool calcOutput);
 extern DALIFT_API IOutputProcessor * createOutputProcessor(const FileFormat & format);
 
-extern DALIFT_API IFormatPartitioner * createFormatPartitioner(const SocketEndpoint & ep, const FileFormat & srcFormat, const FileFormat & tgtFormat, bool calcOutput, const char * slave, const char *wuid);
+class FileSprayer;
+extern DALIFT_API IFormatPartitioner * createFormatPartitioner(FileSprayer &sprayer, const SocketEndpoint & ep, const FileFormat & srcFormat, const FileFormat & tgtFormat, bool calcOutput, const char * slave, const char *wuid, bool newCsvPartitioner);
 
 #endif

@@ -43,26 +43,28 @@ if(REMBED)
             ./../../system/mp
             ./../../system/jlib)
 
-        set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Wno-error=format-nonliteral")
-        set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=format-nonliteral")
-        set_property (SOURCE Rembed.cpp APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-format-nonliteral")
+        set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Wno-error=format-nonliteral -Wno-error=format-security -Wno-error=format=")
+        set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=format-nonliteral -Wno-error=format-security -Wno-error=format=")
+        set_property (SOURCE Rembed.cpp APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-format-nonliteral -Wno-format-security -Wno-error-format=")
         add_definitions(-D_USRDLL -DREMBED_EXPORTS)
         if(RCPP_LIBRARY STREQUAL "")
             add_definitions(-DRCPP_HEADER_ONLY)
         endif()
 
         HPCC_ADD_LIBRARY(Rembed SHARED ${SRCS})
-        SET_DEPENDENCIES(CPACK_DEBIAN_PACKAGE_DEPENDS R-base-core r-cran-rcpp r-cran-inline)
+        SET_DEPENDENCIES(CPACK_DEBIAN_PACKAGE_DEPENDS r-base-core r-cran-rcpp r-cran-inline)
         SET_DEPENDENCIES(CPACK_RPM_PACKAGE_REQUIRES R-Rcpp)
         target_link_libraries(
-            Rembed
+            Rembed PRIVATE
             ${R_LIBRARIES}
             eclrtl
+            nbcd
             jlib)
 
         install(
             TARGETS Rembed
-            DESTINATION plugins)
+            DESTINATION plugins
+            CALC_DEPS)
         install(
             FILES ${RINSIDE_LIBRARY}
             DESTINATION ${LIB_DIR}

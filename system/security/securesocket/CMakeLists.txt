@@ -26,22 +26,29 @@
 project( securesocket ) 
 
 set (    SRCS 
-         securesocket.cpp 
+         securesocket.cpp
+         socketutils.cpp
     )
 
 include_directories ( 
          ./../../include 
          ./../../jlib 
+         ./../cryptohelper
+         ./../../security/shared
          ${OPENSSL_INCLUDE_DIR}
     )
 
 ADD_DEFINITIONS( -D_USRDLL -DSECURESOCKET_EXPORTS )
 
 HPCC_ADD_LIBRARY( securesocket SHARED ${SRCS} )
-install ( TARGETS securesocket RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( securesocket
+install ( TARGETS securesocket RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} CALC_DEPS)
+target_link_libraries ( securesocket PRIVATE
          jlib
          ${OPENSSL_LIBRARIES} 
     )
+
+if (WIN32)
+     target_link_libraries ( securesocket PRIVATE ws2_32 )
+endif()
 
 

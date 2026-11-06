@@ -191,6 +191,8 @@ void ECLEngine::generateSelectECL(HPCCSQLTreeWalker * selectsqlobj, StringBuffer
     out.clear();
     out.append("import std;\n"); /* ALL Generated ECL will import std, even if std lib not used */
 
+    out.append("NormalizeToXMLString(cds) := FUNCTIONMACRO\n\tP := PROJECT(cds, TRANSFORM({UTF8 x}, SELF.x := TOXML(LEFT)));\n\tR := ROLLUP(P,TRUE,TRANSFORM({UTF8 x}, SELF.x := LEFT.x + RIGHT.x));\n\tRETURN R[1].x;\nENDMACRO;\n");
+
     //Prepared statement parameters are handled by ECL STORED service workflow statements
     if (selectsqlobj->hasWhereClause())
         selectsqlobj->getWhereClause()->eclDeclarePlaceHolders(out, 0,0);
@@ -202,7 +204,7 @@ void ECLEngine::generateSelectECL(HPCCSQLTreeWalker * selectsqlobj, StringBuffer
 
     ForEachItemIn(tableidx, *tables)
     {
-        SQLTable table = tables->item(tableidx);
+        SQLTable & table = tables->item(tableidx);
         const char * tname = table.getName();
 
         HPCCFilePtr file = selectsqlobj->queryHPCCFileCache()->getHpccFileByName(tname);
@@ -597,7 +599,7 @@ void ECLEngine::generateSelectStruct(HPCCSQLTreeWalker * selectsqlobj, IProperti
 
             //AS OF community_3.8.6-4 this is causing error:
             // (0,0): error C3000: assert(!cond) failed - file: /var/jenkins/workspace/<build number>/HPCC-Platform/ecl/hqlcpp/hqlhtcpp.cpp, line XXXXX
-            //Bug reported: https://track.hpccsystems.com/browse/HPCC-8268
+            //Bug reported: https://hpccsystems.atlassian.net/browse/HPCC-8268
             //Leaving this code out until fix is produced.
             //UPDATE: Issue has been resolved as of 3.10.0
 
@@ -613,7 +615,10 @@ void ECLEngine::generateSelectStruct(HPCCSQLTreeWalker * selectsqlobj, IProperti
         else
         {
             eclEntities->setProp("NONSCALAREXPECTED", "TRUE");
-            selectStructSB.appendf("%s %s := %s.%s;", col->getECLType(), col->getNameOrAlias(), datasource, col->getName());
+            if (strncmp(col->getECLType(), "DATASET", 7)==0)
+                selectStructSB.appendf("UTF8 %s := NormalizeToXMLString(%s.%s);", col->getNameOrAlias(), datasource, col->getName());
+            else
+                selectStructSB.appendf("%s %s := %s.%s;", col->getECLType(), col->getNameOrAlias(), datasource, col->getName());
         }
 
         selectStructSB.append("\n");
@@ -685,7 +690,7 @@ bool ECLEngine::processIndex(HPCCFile * indexfiletouse, StringBuffer & keyedandw
         bool currfilterfieldexistsinindexfile = false;
         for (int indexfilecolumnindex = 0; indexfilecolumnindex < indexfilecolumns->length(); indexfilecolumnindex++)
         {
-            HPCCColumnMetaData currcol = indexfilecolumns->item(indexfilecolumnindex);
+            HPCCColumnMetaData & currcol = indexfilecolumns->item(indexfilecolumnindex);
             const char * currindexfilecolname = currcol.getColumnName();
             if(stricmp( filterclauseuniquenames.item(uniquenamesidx), currindexfilecolname)==0)
             {
@@ -705,7 +710,7 @@ bool ECLEngine::processIndex(HPCCFile * indexfiletouse, StringBuffer & keyedandw
     {
         for (int indexfilecolumnindex = 0; indexfilecolumnindex < indexfilecolumns->length(); indexfilecolumnindex++)
         {
-            HPCCColumnMetaData currcol = indexfilecolumns->item(indexfilecolumnindex);
+            HPCCColumnMetaData & currcol = indexfilecolumns->item(indexfilecolumnindex);
             const char * currindexfilecolname = currcol.getColumnName();
             if (currcol.isKeyedField())
             {
@@ -848,7 +853,7 @@ void ECLEngine::findAppropriateIndex(StringArray * relindexes, HPCCSQLTreeWalker
                 IArrayOf<HPCCColumnMetaData> * columns = indexfile->getColumns();
                 ForEachItemIn(colidx, *columns)
                 {
-                    HPCCColumnMetaData currcol = columns->item(colidx);
+                    HPCCColumnMetaData & currcol = columns->item(colidx);
                     if (currcol.isKeyedField())
                     {
                         ForEachItemIn(uniqueidx, uniquenames)
@@ -922,7 +927,7 @@ bool ECLEngine::appendTranslatedHavingClause(HPCCSQLTreeWalker * sqlobj, StringB
             const IArrayOf<SQLTable> * tables = sqlobj->getTableList();
             ForEachItemIn(tableidx, *tables)
             {
-                SQLTable table = tables->item(tableidx);
+                SQLTable & table = tables->item(tableidx);
                 translator->appendProp(table.getName(), "LEFT");
             }
 

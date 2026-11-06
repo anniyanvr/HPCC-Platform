@@ -59,7 +59,7 @@ define([
             // 2. Let len be ? ToLength(? Get(O, "length")).
             var len = o.length >>> 0;
 
-            // Steps 3, 4, 5, 6, 7      
+            // Steps 3, 4, 5, 6, 7
             var k = 0;
             var value;
 
@@ -88,7 +88,7 @@ define([
                     value = callback(value, o[k], k, o);
                 }
 
-                // d. Increase k by 1.      
+                // d. Increase k by 1.
                 k++;
             }
 
@@ -130,13 +130,13 @@ define([
             return retVal;
         },
 
-        getURL: function () {
-            var baseUrl = document.URL.split("#")[0];
+        getURL: function (componentFilterParams) {
+            var baseUrl = document.URL.split("#")[0].replace("index.html", "stub.html");
             var baseUrlParts = baseUrl.split("?");
             baseUrl = baseUrlParts[0];
             var args = baseUrlParts[1];
             delete this.params.__filter;
-            var filterParams = this.getFilterParams();
+            var filterParams = componentFilterParams ? componentFilterParams : this.getFilterParams();
             if (filterParams) {
                 this.params.__filter = ioQuery.objectToQuery(filterParams);
             }
@@ -144,8 +144,8 @@ define([
             return baseUrl + "?" + paramsString;
         },
 
-        _onNewPage: function (event) {
-            var win = window.open(this.getURL(), "_blank");
+        _onNewPage: function (_event, componentFilterParams) {
+            var win = window.open(this.getURL(componentFilterParams), "_blank");
             if (win) {
                 win.focus();
             }
@@ -310,7 +310,7 @@ define([
             var lines = xml.split("\n");
             var indent = 0;
             var lastType = "other";
-            // 4 types of tags - single, closing, opening, other (text, doctype, comment) - 4*4 = 16 transitions 
+            // 4 types of tags - single, closing, opening, other (text, doctype, comment) - 4*4 = 16 transitions
             var transitions = {
                 "single->single": 0,
                 "single->closing": -1,

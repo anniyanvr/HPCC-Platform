@@ -16,6 +16,11 @@
 ############################################################################## */
 #include "platform.h"
 
+#include <atomic>
+#include <functional>
+#include <unordered_set>
+#include <unordered_map>
+
 #ifdef _WIN32
 #include <errno.h>
 //#include <winsock.h>  // for TransmitFile
@@ -25,7 +30,7 @@
 #include <sys/stat.h>
 #include <algorithm>
 
-#if defined (__linux__) || defined (__APPLE__)
+#if defined (__linux__) || defined (__APPLE__) || defined (__EMSCRIPTEN__)
 #include <time.h>
 #include <dirent.h>
 #include <utime.h>
@@ -34,8 +39,10 @@
 #endif
 
 #if defined (__linux__)
+#include <poll.h>
 #include <sys/vfs.h>
 #include <sys/sendfile.h>
+#include <sys/inotify.h>
 #endif
 #if defined (__APPLE__)
 #include <sys/mount.h>
@@ -53,6 +60,9 @@
 #include "jmutex.hpp"
 #include "jfile.hpp"
 #include "jfile.ipp"
+#include "jevent.hpp"
+#include "jplane.hpp"
+#include "jutil.hpp"
 
 #include <limits.h>
 #include "jexcept.hpp"
@@ -60,18 +70,21 @@
 #include "jregexp.hpp"
 #include "portlist.h"
 
-#include "build-config.h"
 #include "jprop.hpp"
 
 // #define REMOTE_DISCONNECT_ON_DESTRUCTOR  // enable to disconnect on IFile destructor
                                             // this should not be enabled in WindowRemoteDirectory used
+//#define CHECK_FILE_IO           // If enabled, reads and writes are checked for sensible parameters
 
 #ifdef _DEBUG
-#define ASSERTEX(e) assertex(e); 
+//#define CHECK_FILE_CLOSED_BEFORE_DELETE
+#endif
+
+#ifdef _DEBUG
+#define ASSERTEX(e) assertex(e);
 #else
 #define ASSERTEX(e)
 #endif
-
 
 #ifdef __64BIT__
 #define DEFAULT_STREAM_BUFFER_SIZE 0x100000
@@ -93,6 +106,10 @@ static IFile *createContainedIFileByHook(const char *filename);
 static inline bool isPCFlushAllowed();
 
 static char ShareChar='$';
+
+// defaults
+static IFEflags expertEnableIFileFlagsMask = IFEnone;
+static IFEflags expertDisableIFileFlagsMask = IFEnone;
 
 bool isShareChar(char c)
 {
@@ -170,6 +187,18 @@ StringBuffer &getStandardPosixPath(StringBuffer &result, const char *path)
     return result;
 }
 
+bool isRootDirectory(const char * path)
+{
+    char c = path[0];
+    //Check for linux root directory
+    if (isPathSepChar(c))
+        return path[1] == '\0';
+    //Also check for windows drive:
+    if (c && (path[1] == ':') && isPathSepChar(path[2]))
+        return path[3] == '\0';
+    return false;
+}
+
 const char *pathTail(const char *path)
 {
     if (!path)
@@ -190,11 +219,174 @@ const char * pathExtension(const char * path)
     return NULL;
 }
 
+enum class SafeStatBehaviour : unsigned {
+    Standard      = 0, // Fire error on anything except ENOENT and ENOTDIR
+    IgnoreEaccess = 1, // Ignore EACCES
+    IgnoreAll     = 2, // Ignore all errors (legacy behaviour)
+    Count              // count/end marker
+};
+static constexpr SafeStatBehaviour defaultSafeStatBehaviour{SafeStatBehaviour::Standard};
+static std::atomic<SafeStatBehaviour> safeStatBehaviour{defaultSafeStatBehaviour};
+
+#ifndef _WIN32
+// If a physical file access fails because the file is not yet visible, and the file was recently published
+// on a storage plane that has a write-sync margin configured (e.g. cross-AZ blobnfs propagation lag), retry
+// the access until the file's write-sync deadline. This is a no-op (returns false immediately) when the file
+// is not being tracked as recently published, so genuinely missing files still fail fast.
+static bool waitForWriteSync(const char *filename, unsigned remainingMs, const std::function<bool()> &tryOp)
+{
+    int unusedMarginDeltaMs;
+    // Only used as a logging gate here
+    bool hasMarginDelta = getWriteSyncMarginDeltaMs(unusedMarginDeltaMs);
+    if (hasMarginDelta)
+        WARNLOG("'%s' not yet visible/settled, waiting up to %ums for write sync", filename, remainingMs);
+    unsigned start = msTick();
+    unsigned totalMs = remainingMs;
+    for (;;)
+    {
+        unsigned napMs = remainingMs < 200 ? remainingMs : 200;
+        MilliSleep(napMs);
+        if (tryOp())
+            return true;
+        unsigned elapsed = msTick() - start; // unsigned subtraction is robust across msTick() wrap
+        if (elapsed >= totalMs)
+            return false;
+        remainingMs = totalMs - elapsed;
+    }
+}
+
+static bool safeStatOnce(const char *filename, struct stat &info)
+{
+    if (stat(filename, &info) == 0)
+        return true;
+    else if ((ENOENT == errno) || (ENOTDIR == errno)) // always also consider a missing directory as a missing file/dir
+        return false;
+    SafeStatBehaviour behaviour = safeStatBehaviour.load();
+    switch (behaviour)
+    {
+        case SafeStatBehaviour::Standard:
+            break; // fall through and fire error
+        case SafeStatBehaviour::IgnoreEaccess:
+            if (EACCES == errno)
+                return false;
+            break;
+        case SafeStatBehaviour::IgnoreAll:
+            return false;
+        default:
+            throwUnexpected();
+    }
+    throw makeErrnoExceptionV(errno, "CFile::checkFileExists %s", filename);
+}
+
+// Size of an empty compressed file written pre-9.10: a header with no payload (later empty compressed files
+// may legitimately be 0 bytes). Mirrors the value used by doesPhysicalMatchMeta (see HPCC-33064/HPCC-33113).
+static constexpr offset_t emptyCompressedFileSize = 56;
+
+// Does the physical size in 'info' satisfy the published size for a tracked write-sync part?
+//   expectedSize == (offset_t)-1 : published size unknown, so existence alone is sufficient.
+//   compressed && expectedSize == 0 : an empty compressed part - its @compressedSize may be a buggy 0, so
+//                                     accept either a 0-byte file or the empty-compressed header size.
+//   otherwise : the physical size must match the published size exactly.
+static inline bool physicalSizeMatchesMeta(const struct stat &info, offset_t expectedSize, bool compressed)
+{
+    if ((offset_t)-1 == expectedSize)
+        return true;
+    if (compressed && (0 == expectedSize))
+        return (0 == (offset_t)info.st_size) || (emptyCompressedFileSize == (offset_t)info.st_size);
+    return (offset_t)info.st_size == expectedSize;
+}
+
+// For a part tracked for write-sync visibility, wait for it to appear and (if checkSize) to reach its published
+// size - cross-AZ propagation can briefly expose a file before its size has fully propagated.
+// exists/info hold the caller's first attempt; probe refreshes the supplied stat and returns existence.
+// NB: metadata-only callers (checkSize=false) only wait for existence, and must never see a size mismatch.
+// Returns the final verdict: false with exists true means the size never matched within the margin.
+static bool settleWriteSync(const char *context, const char *filename, const WriteSyncDetails &writeSync, bool checkSize, const std::function<bool(struct stat &)> &probe, struct stat &info, bool &exists)
+{
+    int marginDeltaMs;
+    bool trace = getWriteSyncMarginDeltaMs(marginDeltaMs);
+    CCycleTimer timer(trace); // only read the cycle counter when tracing is enabled
+    auto settled = [&]() { return exists && (!checkSize || physicalSizeMatchesMeta(info, writeSync.expectedSize, writeSync.compressed)); };
+    auto reprobe = [&]()
+    {
+        exists = probe(info);
+        return settled();
+    };
+    unsigned remainingMs = writeSync.queryRemainingMs();
+    bool isSettled = settled() || (remainingMs && waitForWriteSync(filename, remainingMs, reprobe));
+
+    if (trace)
+    {
+        unsigned forcedWaitMs = 0;
+        if (checkSize && (forceWriteSyncWaitDeltaMs == marginDeltaMs)) // metadata-only callers cannot read truncated content
+        {
+            forcedWaitMs = writeSync.queryRemainingMs();
+            if (forcedWaitMs)
+            {
+                MilliSleep(forcedWaitMs);
+                // refresh so callers and trace see post-wait metadata (isSettled kept as the pre-wait verdict)
+                exists = probe(info);
+            }
+        }
+
+        // size is only checked/waited on when checkSize was requested, otherwise report a mismatch as not-applicable
+        const char *sizeMismatchStr = checkSize ? ((exists && !settled()) ? "true" : "false") : "n/a";
+        const char *sizeValidationStr = !checkSize ? "not-requested" : ((offset_t)-1 == writeSync.expectedSize) ? "unknown" : "enabled";
+        WARNLOG("%s: '%s' write-sync check: remainingMs=%u, exists=%s, size=%lld, expectedSize=%lld, compressed=%s, sizeValidation=%s, sizeMismatch=%s, checkSize=%s, settled=%s, forcedWaitMs=%u, elapsed=%.3fms"
+#if defined(__linux__)
+            ", mtime=%lld.%09ld, ctime=%lld.%09ld"
+#endif
+            ,
+            context, filename, remainingMs, boolToStr(exists), exists ? (long long)info.st_size : -1LL, (long long)writeSync.expectedSize,
+            boolToStr(writeSync.compressed), sizeValidationStr, sizeMismatchStr, boolToStr(checkSize), boolToStr(isSettled), forcedWaitMs, (double)timer.elapsedNs() / 1000000.0
+#if defined(__linux__)
+            , exists ? (long long)info.st_mtim.tv_sec : -1LL, exists ? info.st_mtim.tv_nsec : 0L,
+            exists ? (long long)info.st_ctim.tv_sec : -1LL, exists ? info.st_ctim.tv_nsec : 0L
+#endif
+            );
+    }
+    return settled();
+}
+
+static void throwWriteSyncSizeMismatch(const char *filename, const struct stat &info, offset_t expectedSize)
+{
+    throw makeStringExceptionV(JLIBERR_FileWriteSyncPhysicalSizeMismatch, "File '%s' physical size (%" I64F "u) does not match the published size (%" I64F "u) after waiting for write sync", filename, (offset_t)info.st_size, expectedSize);
+}
+
+// checkSize: if true, also validate physical size against the published size for write-sync tracked
+//            parts - needed by callers that will read file content (size(), getInfo(), etc.).
+//            if false, skip size validation; the write-sync cache is still consulted when the file does not
+//            exist (so callers that only need metadata still wait for a part to appear), but if the file
+//            already exists the cache lookup is skipped entirely, avoiding the lock on the hot path.
+static bool safeStat(const char *filename, struct stat &info, bool checkSize)
+{
+    bool exists = safeStatOnce(filename, info); // a single stat establishes both existence and size
+    int marginDeltaMs;
+    if (exists && !checkSize && !getWriteSyncMarginDeltaMs(marginDeltaMs)) // getWriteSyncMarginDeltaMs used as a log gate only here
+        return true; // file exists and caller only needs metadata - skip write-sync cache check entirely
+
+    // Lock-free fast path when nothing is being tracked, so this adds negligible cost to the common stat.
+    // Untracked means the path was either never mapped (not a recently published part) or its mapping has expired.
+    WriteSyncDetails writeSync;
+    getFileWriteSyncDetails(filename, writeSync);
+    if (!writeSync.isTracked())
+        return exists;
+
+    // A part that is simply still missing is reported as not-found (return false), never as a size mismatch.
+    if (!settleWriteSync("safeStat", filename, writeSync, checkSize, [&](struct stat &st) { return safeStatOnce(filename, st); }, info, exists) && exists)
+        throwWriteSyncSizeMismatch(filename, info, writeSync.expectedSize);
+
+    // Report the true current existence regardless: a missing file must remain not-found, and size() and
+    // friends must still return the real size at/after the deadline.
+    return exists;
+}
+#endif
+
 bool checkFileExists(const char * filename)
 {
 #ifdef _WIN32
     for (unsigned i=0;i<10;i++) {
-        DWORD ret = (DWORD)GetFileAttributes(filename); 
+        DWORD ret = (DWORD)GetFileAttributes(filename);
         if (ret!=(DWORD)-1)
             return true;
         DWORD err = GetLastError();
@@ -205,7 +397,7 @@ bool checkFileExists(const char * filename)
     return false;
 #else
     struct stat info;
-    return (stat(filename, &info) == 0);
+    return safeStat(filename, info, false);
 #endif
 }
 
@@ -216,21 +408,9 @@ bool checkDirExists(const char * filename)
     return (attr != (DWORD)-1)&&(attr & FILE_ATTRIBUTE_DIRECTORY);
 #else
     struct stat info;
-    if (stat(filename, &info) != 0)
+    if (!safeStat(filename, info, false))
         return false;
     return S_ISDIR(info.st_mode);
-#endif
-}
-
-static void set_inherit(HANDLE handle, bool inherit)
-{
-#ifndef _WIN32
-    long flag = fcntl(handle, F_GETFD);
-    if(inherit)
-        flag &= ~FD_CLOEXEC;
-    else
-        flag |= FD_CLOEXEC;
-    fcntl(handle, F_SETFD, flag);
 #endif
 }
 
@@ -258,7 +438,7 @@ static StringBuffer &getLocalOrRemoteName(StringBuffer &name,const RemoteFilenam
         }
 #endif
     }
-    else  
+    else
         filename.getRemotePath(name);
     return name;
 }
@@ -309,10 +489,10 @@ bool WindowsCreateDirectory(const char * path)
         }
         if ((retry++==10)||  // some or all of the following can occur when the domain controller gets busy
                              // retrying improves chance of success
-            ((err!=ERROR_NETNAME_DELETED)&&(err!=ERROR_DEV_NOT_EXIST)&&(err!=ERROR_GEN_FAILURE)&&(err!=ERROR_NETWORK_BUSY)&&(err!=ERROR_BAD_NET_NAME))) 
+            ((err!=ERROR_NETNAME_DELETED)&&(err!=ERROR_DEV_NOT_EXIST)&&(err!=ERROR_GEN_FAILURE)&&(err!=ERROR_NETWORK_BUSY)&&(err!=ERROR_BAD_NET_NAME)))
             return false;
         //PROGLOG("Retrying(%d) WindowsCreateDirectory %s, err=%d",retry,filename,err);
-        Sleep(retry*100); 
+        Sleep(retry*100);
     }
     return false;
 }
@@ -331,7 +511,7 @@ bool LinuxCreateDirectory(const char * path)
         if (EEXIST == errno)
         {
             struct stat info;
-            if (stat(path, &info) != 0)
+            if (stat(path, &info) != 0) // unlikely to fail given EEXIST
                 return false;
             return S_ISDIR(info.st_mode);
         }
@@ -454,7 +634,7 @@ bool CFile::getTime(CDateTime * createTime, CDateTime * modifiedTime, CDateTime 
     FILETIMEtoIDateTime(accessedTime, timeAccessed);
 #else
     struct stat info;
-    if (stat(filename, &info) != 0)
+    if (!safeStat(filename, info, false))
         return false;
     timetToIDateTime(accessedTime,  info.st_atime);
     timetToIDateTime(createTime,    info.st_ctime);
@@ -462,6 +642,10 @@ bool CFile::getTime(CDateTime * createTime, CDateTime * modifiedTime, CDateTime 
 #endif
     return true;
 }
+
+#if defined (__EMSCRIPTEN__)
+#define _utimbuf utimbuf
+#endif
 
 bool CFile::setTime(const CDateTime * createTime, const CDateTime * modifiedTime, const CDateTime * accessedTime)
 {
@@ -483,7 +667,7 @@ bool CFile::setTime(const CDateTime * createTime, const CDateTime * modifiedTime
     struct utimbuf am;
     if (!accessedTime||!modifiedTime) {
         struct stat info;
-        if (stat(filename, &info) != 0)
+        if (!safeStat(filename, info, false))
             return false;
         am.actime = info.st_atime;
         am.modtime = info.st_mtime;
@@ -507,7 +691,7 @@ fileBool CFile::isDirectory()
     return ( attr & FILE_ATTRIBUTE_DIRECTORY) ? fileBool::foundYes : fileBool::foundNo;
 #else
     struct stat info;
-    if (stat(filename, &info) != 0)
+    if (!safeStat(filename, info, false))
         return fileBool::notFound;
     return S_ISDIR(info.st_mode) ? fileBool::foundYes : fileBool::foundNo;
 #endif
@@ -524,7 +708,7 @@ fileBool CFile::isFile()
     return ( attr & FILE_ATTRIBUTE_DIRECTORY) ? fileBool::foundNo : fileBool::foundYes;
 #else
     struct stat info;
-    if (stat(filename, &info) != 0)
+    if (!safeStat(filename, info, false))
         return fileBool::notFound;
     return S_ISREG(info.st_mode) ? fileBool::foundYes : fileBool::foundNo;
 #endif
@@ -539,7 +723,7 @@ fileBool CFile::isReadOnly()
     return ( attr & FILE_ATTRIBUTE_READONLY) ? fileBool::foundYes : fileBool::foundNo;
 #else
     struct stat info;
-    if (stat(filename, &info) != 0)
+    if (!safeStat(filename, info, false))
         return fileBool::notFound;
     //MORE: I think this is correct, but someone with better unix knowledge should check!
     return (info.st_mode & (S_IWUSR|S_IWGRP|S_IWOTH)) ? fileBool::foundNo : fileBool::foundYes;
@@ -560,7 +744,7 @@ static bool setShareLock(int fd,IFSHmode share)
         else
             fl.l_type = F_UNLCK;
         fl.l_whence = SEEK_SET;
-        fl.l_pid    = getpid(); 
+        fl.l_pid    = getpid();
         if (fcntl(fd, F_SETLK, &fl) != -1)
             return true;
     } while (errno==EINTR);
@@ -572,13 +756,34 @@ static bool setShareLock(int fd,IFSHmode share)
 
 #endif
 
-HANDLE CFile::openHandle(IFOmode mode, IFSHmode sharemode, bool async, int stdh)
+HANDLE CFile::openHandle(IFOmode mode, IFSHmode sharemode, bool async)
+{
+    WriteSyncDetails writeSync;
+    return openHandle(mode, sharemode, async, -1, writeSync);
+}
+
+HANDLE CFile::openHandle(IFOmode mode, IFSHmode sharemode, bool async, int stdh, WriteSyncDetails &writeSync)
+{
+    // For a read open of a part that is being tracked for write-sync visibility, wait for the part both to
+    // appear and to reach its published on-disk size. Otherwise a part that is still propagating (e.g. cross-AZ
+    // blobnfs lag) could be opened while truncated and the reader would consume a partial part - retrying only
+    // on a missing file (NULLFILE) does not guard against this. openHandleOnce() performs the bounded retry and
+    // throws if the size never settles within the margin. The getFileWriteSyncDetails() gate is a
+    // lock-free atomic check, so a normal open of an untracked file pays only that.
+    if ((IFOread == mode) && (stdh < 0))
+        getFileWriteSyncDetails(filename, writeSync);
+    return openHandleOnce(mode, sharemode, async, stdh, writeSync);
+}
+
+HANDLE CFile::openHandleOnce(IFOmode mode, IFSHmode sharemode, bool async, int stdh, [[maybe_unused]] const WriteSyncDetails &writeSync)
 {
     HANDLE handle = NULLFILE;
 #ifdef _WIN32
-    if (stdh>=0) {
+    if (stdh>=0)
+    {
         DWORD mode;
-        switch (stdh) {
+        switch (stdh)
+        {
         case 0: mode = STD_INPUT_HANDLE; break;
         case 1: mode = STD_OUTPUT_HANDLE; break;
         case 2: mode = STD_ERROR_HANDLE; break;
@@ -590,18 +795,20 @@ HANDLE CFile::openHandle(IFOmode mode, IFSHmode sharemode, bool async, int stdh)
     }
 
     DWORD share = 0;
-    switch (sharemode) {
+    switch (sharemode)
+    {
     case (IFSHfull|IFSHread):
     case IFSHfull:
-        share |= FILE_SHARE_WRITE; 
+        share |= FILE_SHARE_WRITE;
         // fall through
     case IFSHread:
         share |= FILE_SHARE_READ;
     }
     DWORD fflags = async?FILE_FLAG_OVERLAPPED:0;
     if (async&&(mode==IFOread))
-        fflags |= FILE_FLAG_SEQUENTIAL_SCAN; 
-    switch (mode) {
+        fflags |= FILE_FLAG_SEQUENTIAL_SCAN;
+    switch (mode)
+    {
     case IFOcreate:
         handle = CreateFile(filename, GENERIC_WRITE, share, NULL, CREATE_ALWAYS, fflags, NULL);
         break;
@@ -619,7 +826,7 @@ HANDLE CFile::openHandle(IFOmode mode, IFSHmode sharemode, bool async, int stdh)
         break;
     }
     if (handle == NULLFILE)
-    {   
+    {
         DWORD err = GetLastError();
         if ((IFOread!=mode) || ((err!=ERROR_FILE_NOT_FOUND) && (err!=ERROR_PATH_NOT_FOUND)))
             throw makeOsExceptionV(err,"CFile::open %s (%x, %x)", filename.get(), mode, share);
@@ -631,7 +838,8 @@ HANDLE CFile::openHandle(IFOmode mode, IFSHmode sharemode, bool async, int stdh)
 
     unsigned fileflags = (flags>>16) &  (S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH|S_IWOTH|S_IXOTH);
     unsigned openflags;
-    switch (mode) {
+    switch (mode)
+    {
     case IFOcreate:
         openflags = O_WRONLY | O_CREAT | O_TRUNC;
         break;
@@ -650,23 +858,55 @@ HANDLE CFile::openHandle(IFOmode mode, IFSHmode sharemode, bool async, int stdh)
     default:
         return NULLFILE;
     }
-    handle = _lopen(filename.get(), openflags, fileflags);
-    if (handle == -1)
-    {
-        if ((IFOread!=mode) || (errno != ENOENT))
-            throw makeErrnoExceptionV(errno, "CFile::open %s", filename.get());
-        return NULLFILE;
-    }
-    // check not a directory (compatible with windows)
+    // MCK - if (extraFlags & IFEsync) should we add O_SYNC or O_DSYNC to openflags
+    //       and then not have to fdatasync() at close(), flush(), write() ?
+    //Prevent the file from being inherited by a child process;
+    openflags |= O_CLOEXEC;
 
     struct stat info;
-    if (fstat(handle, &info) == -1) {
-        int err = errno;
-        close(handle);
-        handle = NULLFILE;
-        throw makeErrnoExceptionV(err, "CFile::open fstat %s", filename.get());
+    auto refresh = [&](struct stat &st)
+    {
+        if (fstat(handle, &st) == -1)
+        {
+            int err = errno;
+            close(handle);
+            handle = NULLFILE;
+            throw makeErrnoExceptionV(err, "CFile::open fstat %s", filename.get());
+        }
+        return true;
+    };
+    // reopen on each attempt - open() revalidates NFS attributes, whereas fstat() on a held handle may be cached
+    auto probe = [&](struct stat &st)
+    {
+        if (handle != NULLFILE)
+        {
+            close(handle);
+            handle = NULLFILE;
+        }
+        handle = _lopen(filename.get(), openflags, fileflags);
+        if (handle == -1)
+        {
+            if ((IFOread!=mode) || (errno != ENOENT))
+                throw makeErrnoExceptionV(errno, "CFile::open %s", filename.get());
+            return false;
+        }
+        return refresh(st);
+    };
+    bool exists = probe(info);
+    if ((IFOread == mode) && writeSync.isTracked())
+    {
+        if (!settleWriteSync("CFile::openHandleOnce", filename, writeSync, true, probe, info, exists) && exists)
+        {
+            close(handle);
+            handle = NULLFILE;
+            throwWriteSyncSizeMismatch(filename, info, writeSync.expectedSize);
+        }
     }
-    if (S_ISDIR(info.st_mode)) {
+    if (!exists)
+        return NULLFILE;
+    // check not a directory (compatible with windows)
+    if (S_ISDIR(info.st_mode))
+    {
         close(handle);
         handle = NULLFILE;
         throw makeErrnoExceptionV(EISDIR, "CFile::open %s", filename.get());
@@ -682,7 +922,7 @@ HANDLE CFile::openHandle(IFOmode mode, IFSHmode sharemode, bool async, int stdh)
 
 IFileIO * CFile::open(IFOmode mode,IFEflags extraFlags)
 {
-    // we may want mode dependant defaults later 
+    // we may want mode dependant defaults later
     return openShared(mode,(IFSHmode)(flags&(IFSHfull|IFSHread)),extraFlags);
 }
 
@@ -690,9 +930,6 @@ IFileIO * CFile::open(IFOmode mode,IFEflags extraFlags)
 IFileAsyncIO * CFile::openAsync(IFOmode mode)
 {
     HANDLE handle = openHandle(mode,IFSHread,true);     // I don't think we want shared write to an async file
-#ifndef _WIN32
-    set_inherit(handle, false);
-#endif
     return new CFileAsyncIO(handle,IFSHread);
 }
 
@@ -720,10 +957,10 @@ bool CFile::remove()
             break;
         if ((retry++==10)||  // some or all of the following can occur when the domain controller gets busy
                              // retrying improves chance of success
-            ((err!=ERROR_NETNAME_DELETED)&&(err!=ERROR_DEV_NOT_EXIST)&&(err!=ERROR_GEN_FAILURE)&&(err!=ERROR_NETWORK_BUSY)&&(err!=ERROR_BAD_NET_NAME))) 
+            ((err!=ERROR_NETNAME_DELETED)&&(err!=ERROR_DEV_NOT_EXIST)&&(err!=ERROR_GEN_FAILURE)&&(err!=ERROR_NETWORK_BUSY)&&(err!=ERROR_BAD_NET_NAME)))
             throw makeOsExceptionV(err, "CFile::remove %s", filename.get());
         //PROGLOG("Retrying(%d) DeleteFile %s, err=%d",retry,filename,err);
-        Sleep(retry*100); 
+        Sleep(retry*100);
     }
     return false;
 #else
@@ -741,16 +978,122 @@ bool CFile::remove()
 #endif
 }
 
+static std::atomic<unsigned> renameRetries = (unsigned)-1; // initially uninitialized, set on 1st use (in rename)
+static std::atomic<bool> manualRenameChk = false;
+static constexpr bool defaultManualRenameChk = true;
+static constexpr unsigned defaultNumRetries = 4;
+
+void setRenameRetries(unsigned _renameRetries, bool _manualRenameChk)
+{
+    manualRenameChk = _manualRenameChk;
+    renameRetries = _renameRetries;
+}
+
+static void initRenameRetrySettings()
+{
+    if ((unsigned)-1 != renameRetries)
+        return;
+    // NB: potentially could be >1 thread here, but that's ok.
+    try
+    {
+        Owned<IPropertyTree> globalConfig = getGlobalConfigSP();
+        Owned<IPropertyTree> config = getComponentConfigSP();
+        manualRenameChk = config->getPropBool("expert/@manualRenameChk", globalConfig->getPropBool("expert/@manualRenameChk", defaultManualRenameChk));
+        renameRetries = config->getPropInt("expert/@numRenameRetries", globalConfig->getPropInt("expert/@numRenameRetries", defaultNumRetries));
+    }
+    catch (IException *e) // handle cases where config. not available
+    {
+        EXCLOG(e, "initRenameRetrySettings");
+        e->Release();
+        renameRetries = 0;
+        manualRenameChk = false;
+    }
+}
+
+static void doRename(const char *src, const char *dst, const char *callerName)
+{
+    initRenameRetrySettings();
+
+    unsigned retriesLeft = renameRetries;
+    unsigned retry = 0;
+    while (true)
+    {
+        // NB: if 'manualRenameChk' is on, since we don't explicitly check the existence of 'src' and 'dst' before rename
+        // it's theoretically possible the rename failure is legitimate because src does not exist and dst does.
+        // In this situation, we continue and return success below.
+        if (-1 != ::rename(src, dst))
+            return; // success
+
+        int err = errno; // preserve to use after tracing if exhausted retry attempts
+
+#ifndef _WIN32 // NB: this is primarily here to help track down the issues reported in HPCC-28454 and HPCC-29812
+        /*
+         * In testing 2 [rare] issues have been seen after rename returned -1:
+         * 1) The file was renamed (dst exists and src does not).
+         *    If 'manualRenameChk' is on, we check for this and return success.
+         * 2) Neither src nor dst exist, however, after a short time, dst appears.
+         *    Assuming 'numRenameRetries'is >0, this case is covered below by looping and trying again.
+         */
+
+        CDateTime modTime;
+        struct stat statInfo;
+        StringBuffer srcModTimeStr, dstModTimeStr;
+        int srcStatErr = stat(src, &statInfo);
+        if (0 == srcStatErr)
+        {
+            timetToIDateTime(&modTime, statInfo.st_mtime);
+            modTime.getString(srcModTimeStr);
+        }
+        int dstStatErr = stat(dst, &statInfo);
+        if (0 == dstStatErr)
+        {
+            timetToIDateTime(&modTime, statInfo.st_mtime);
+            modTime.getString(dstModTimeStr);
+        }
+
+        if (0 != srcStatErr) // probably means src does now not exist
+        {
+            if (manualRenameChk) // manually validate if rename() actually succeeded
+            {
+                if (0 == dstStatErr) // dst now exists
+                {
+                    DBGLOG("%s-doRename(%s, %s) FAILED BUT DID RENAME (dst modtime=%s)", callerName, src, dst, dstModTimeStr.str());
+                    return;
+                }
+            }
+        }
+        VStringBuffer errMsg("%s-doRename(%s, %s) FAILED [err=%d] ", callerName, src, dst, err);
+        errMsg.appendf("src stat:[err=%d", srcStatErr);
+        if (0 == srcStatErr)
+            errMsg.appendf(",modTime=%s", srcModTimeStr.str());
+        errMsg.append("]");
+        errMsg.appendf(", dst stat:[err=%d", dstStatErr);
+        if (0 == dstStatErr)
+            errMsg.appendf(",modTime=%s", dstModTimeStr.str());
+        errMsg.append("]");
+        DBGLOG("%s", errMsg.str());
+#endif
+
+        if (0 == retriesLeft)
+            throw makeErrnoExceptionV(err, "%s(%s, %s)", callerName, src, dst);
+
+        MilliSleep(retry>5 ? 5000 : (100 << retry)); // start at 100ms and double each retry, but cap at 5 seconds
+
+        --retriesLeft;
+        ++retry;
+    }
+}
+
 void CFile::rename(const char *newname)
 {
-    // now hopefully newname is just file tail 
-    // however we do allow full paths and extract tail, warning if the directory appears to mismatch 
+    // now hopefully newname is just file tail
+    // however we do allow full paths and extract tail, warning if the directory appears to mismatch
     StringBuffer path;
     splitDirTail(filename,path);
     StringBuffer newdir;
     const char *tail = splitDirTail(newname,newdir);
     if (path.length()&&newdir.length()) {
-        if (strcmp(newdir.str(),path.str())!=0) 
+        if (strcmp(newdir.str(),path.str())!=0)
             IWARNLOG("CFile::rename '%s' to '%s' : directory mismatch",filename.get(),newname);
     }
     const char *dst = path.append(tail);
@@ -760,8 +1103,7 @@ void CFile::rename(const char *newname)
         if (rfn.isLocal())
             dst = rfn.getLocalPath(path.clear()).str();
     }
-    if (-1 == ::rename(filename, dst)) 
-        throw makeErrnoExceptionV("CFile::rename(%s, %s)", filename.get(),dst);
+    doRename(filename, dst, "CFile::rename");
     filename.set(path);
 }
 
@@ -784,29 +1126,27 @@ void CFile::move(const char *newname)
         DWORD err = GetLastError();
         if ((retry++==10)||  // some or all of the following can occur when the domain controller gets busy
                              // retrying improves chance of success
-            ((err!=ERROR_NETNAME_DELETED)&&(err!=ERROR_DEV_NOT_EXIST)&&(err!=ERROR_GEN_FAILURE)&&(err!=ERROR_NETWORK_BUSY)&&(err!=ERROR_BAD_NET_NAME))) 
+            ((err!=ERROR_NETNAME_DELETED)&&(err!=ERROR_DEV_NOT_EXIST)&&(err!=ERROR_GEN_FAILURE)&&(err!=ERROR_NETWORK_BUSY)&&(err!=ERROR_BAD_NET_NAME)))
             throw makeOsExceptionV(err, "CFile::move(%s, %s)", filename.get(), newname);
-        Sleep(retry*100); 
+        Sleep(retry*100);
     }
 #else
-    int ret=::rename(filename.get(),newname);
-    if (ret==-1)
-        throw makeErrnoExceptionV("CFile::move(%s, %s)", filename.get(), newname);
+    doRename(filename, newname, "CFile::move");
 #endif
     filename.set(newname);
 }
 
 #ifdef _WIN32
 DWORD CALLBACK fastCopyProgressRoutine(
-  LARGE_INTEGER TotalFileSize,          
-  LARGE_INTEGER TotalBytesTransferred,  
-  LARGE_INTEGER StreamSize,             
-  LARGE_INTEGER StreamBytesTransferred, 
-  DWORD dwStreamNumber,                 
-  DWORD dwCallbackReason,               
-  HANDLE hSourceFile,                  
-  HANDLE hDestinationFile,              
-  LPVOID lpData                        
+  LARGE_INTEGER TotalFileSize,
+  LARGE_INTEGER TotalBytesTransferred,
+  LARGE_INTEGER StreamSize,
+  LARGE_INTEGER StreamBytesTransferred,
+  DWORD dwStreamNumber,
+  DWORD dwCallbackReason,
+  HANDLE hSourceFile,
+  HANDLE hDestinationFile,
+  LPVOID lpData
 )
 {
     if (TotalBytesTransferred.QuadPart<=TotalFileSize.QuadPart)
@@ -840,9 +1180,9 @@ bool CFile::fastCopyFile(CFile &target, size32_t buffersize, ICopyFileProgress *
             return false;
         if ((retry++==10)||  // some or all of the following can occur when the domain controller gets busy
                              // retrying improves chance of success
-            ((err!=ERROR_NETNAME_DELETED)&&(err!=ERROR_DEV_NOT_EXIST)&&(err!=ERROR_GEN_FAILURE)&&(err!=ERROR_NETWORK_BUSY)&&(err!=ERROR_BAD_NET_NAME))) 
+            ((err!=ERROR_NETNAME_DELETED)&&(err!=ERROR_DEV_NOT_EXIST)&&(err!=ERROR_GEN_FAILURE)&&(err!=ERROR_NETWORK_BUSY)&&(err!=ERROR_BAD_NET_NAME)))
             return false;
-        Sleep(retry*100); 
+        Sleep(retry*100);
     }
     return true;
 #else
@@ -851,16 +1191,15 @@ bool CFile::fastCopyFile(CFile &target, size32_t buffersize, ICopyFileProgress *
 }
 
 
-void CFile::copySection(const RemoteFilename &dest, offset_t toOfs, offset_t fromOfs, offset_t size, ICopyFileProgress *progress, CFflags copyFlags)
+void copyFileSection(IFile * src, IFile * target, offset_t toOfs, offset_t fromOfs, offset_t size, ICopyFileProgress *progress, CFflags copyFlags)
 {
     // check to see if src and target are remote
 
-    Owned<IFile> target = createIFile(dest);
     const size32_t buffersize = DEFAULT_COPY_BLKSIZE;
     IFOmode omode = IFOwrite;
     if (toOfs==(offset_t)-1) {
         if (fromOfs==0) {
-            copyFile(target,this,buffersize,progress,copyFlags);
+            copyFile(target,src,buffersize,progress,copyFlags);
             return;
         }
         omode = IFOcreate;
@@ -871,16 +1210,16 @@ void CFile::copySection(const RemoteFilename &dest, offset_t toOfs, offset_t fro
         tgtFlags = IFEnocache;
     OwnedIFileIO targetIO = target->open(omode, tgtFlags);
     if (!targetIO)
-        throw MakeStringException(-1, "copyFile: target path '%s' could not be created", target->queryFilename());
+        throw MakeStringException(JLIBERR_FileCopyTargetCreateFailed, "copyFile: target path '%s' could not be created", target->queryFilename());
     MemoryAttr mb;
     void * buffer = mb.allocate(buffersize);
     IFEflags srcFlags = IFEnone;
     if (copyFlags & CFflush_read)
         srcFlags = IFEnocache;
-    OwnedIFileIO sourceIO = open(IFOread, srcFlags);
+    OwnedIFileIO sourceIO = src->open(IFOread, srcFlags);
     if (!sourceIO)
-        throw MakeStringException(-1, "copySection: source '%s' not found", queryFilename());
-    
+        throw MakeStringException(JLIBERR_FileCopySourceNotFound, "copySection: source '%s' not found", src->queryFilename());
+
     offset_t offset = 0;
     offset_t total;
     try
@@ -906,12 +1245,18 @@ void CFile::copySection(const RemoteFilename &dest, offset_t toOfs, offset_t fro
     catch (IException *e)
     {
         StringBuffer s;
-        s.append("copyFile target=").append(target->queryFilename()).append(" source=").append(queryFilename()).append("; read/write failure").append(": ");
+        s.append("copyFile target=").append(target->queryFilename()).append(" source=").append(src->queryFilename()).append("; read/write failure").append(": ");
         e->errorMessage(s);
         IException *e2 = makeOsExceptionV(e->errorCode(), "%s", s.str());
         e->Release();
         throw e2;
     }
+}
+
+void CFile::copySection(const RemoteFilename &dest, offset_t toOfs, offset_t fromOfs, offset_t size, ICopyFileProgress *progress, CFflags copyFlags)
+{
+    Owned<IFile> target = createIFile(dest);
+    copyFileSection(this, target, toOfs, fromOfs, size, progress, copyFlags);
 }
 
 void CFile::copyTo(IFile *dest, size32_t buffersize, ICopyFileProgress *progress,bool usetmp,CFflags copyFlags)
@@ -969,7 +1314,7 @@ offset_t CFile::size()
     }
 #else
     struct stat info;
-    if (stat(filename, &info) == 0)
+    if (safeStat(filename, info, true))
         return info.st_size;
 #endif
 #if 0
@@ -1066,7 +1411,7 @@ public:
         if (cfileio)
             handle = cfileio->queryHandle();
         if (handle==NULLFILE)
-            throw makeStringException(-1, "CDiscretionaryFileLock - invalid parameter");
+            throw makeStringException(JLIBERR_FileLockInvalidParameter, "CDiscretionaryFileLock - invalid parameter");
     }
     ~CDiscretionaryFileLock()
     {
@@ -1108,9 +1453,9 @@ public:
                 (exclusive?LOCKFILE_EXCLUSIVE_LOCK:0)|((timeout==INFINITE)?0:LOCKFILE_FAIL_IMMEDIATELY),
                           0,1,0,&overlapped))
                 break;
-            
+
             DWORD err = ::GetLastError();
-            if (err!=ERROR_LOCK_VIOLATION) 
+            if (err!=ERROR_LOCK_VIOLATION)
                 throw makeOsException(err, "CDiscretionaryFileLock::lock");
 #else
             if (setShareLock(handle,exclusive?IFSHnone:IFSHread))
@@ -1118,8 +1463,8 @@ public:
 #endif
 
             unsigned now = msTick();
-            if (now-start>=timeout) 
-                return false; 
+            if (now-start>=timeout)
+                return false;
             if (interval>timeout-now+start)
                 interval = timeout-now+start;
             Sleep(interval);
@@ -1139,7 +1484,7 @@ public:
 #ifdef _WIN32
             OVERLAPPED overlapped;
             memset(&overlapped,0,sizeof(overlapped));
-            if (!UnlockFileEx(handle,0,1,0,&overlapped)) 
+            if (!UnlockFileEx(handle,0,1,0,&overlapped))
                 throw makeOsException(::GetLastError(), "CDiscretionaryFileLock::unlockhandle");
 #else
             setShareLock(handle,IFSHfull);
@@ -1167,12 +1512,12 @@ unsigned CFile::getCRC()
         return 0;   // dummy value
     unsigned crc=~0;
     MemoryAttr ma;
-    void *buf = ma.allocate(0x10000);
+    void *buf = ma.allocate(DEFAULT_STREAM_BUFFER_SIZE);
     Owned<IFileIO> fileio = open(IFOread);
     if (fileio) {
         offset_t pos=0;
         for (;;) {
-            size32_t rd = fileio->read(pos,0x10000,buf);
+            size32_t rd = fileio->read(pos,DEFAULT_STREAM_BUFFER_SIZE,buf);
             if (!rd)
                 break;
             crc=crc32((const char *)buf,rd,crc);
@@ -1199,21 +1544,21 @@ static bool parseShare(const char *filename,IpAddress &machine,StringBuffer &sha
         return false;
     StringBuffer ipText(end-start, start);
     machine.ipset(ipText.str());
-    end++;  
+    end++;
     while (*end && !isPathSepChar(*end))
         end++;
     start = filename;
     while (start!=end) {
         if (*start=='/')
             share.append('\\');
-        else 
+        else
             share.append(*start);
         start++;
     }
     return true;
 }
 
-static CriticalSection connectcrit;
+static CriticalSection connectcrit(SYNC_LOCATION);
 
 static bool connectToExternalDrive(const char * const filename)
 {
@@ -1238,7 +1583,7 @@ static bool connectToExternalDrive(const char * const filename)
     if ((err==0)&&(stricmp(username.str(),buf)==0)) {
         // check can access share as well
         for (unsigned i=0;i<10;i++) {
-            DWORD ret = (DWORD)GetFileAttributes(share.str()); 
+            DWORD ret = (DWORD)GetFileAttributes(share.str());
             DWORD err = (ret==(DWORD)-1)?GetLastError():0;
             if (err!=ERROR_IO_INCOMPLETE)
                 break;
@@ -1258,7 +1603,7 @@ static bool connectToExternalDrive(const char * const filename)
                 WNetCancelConnection2(res.lpRemoteName, 0, false);
                 err = WNetAddConnection2(&res, password.str(), username.str(), 0);
             }
-            if (err) 
+            if (err)
                 IERRLOG("WNetAddConnection2(%d): connecting to %s, User: %s",err,res.lpRemoteName,username.str());
         }
         if (err==0)
@@ -1277,7 +1622,7 @@ static void disconnectFromExternalDrive(const char * const filename)
     IpAddress ip;
     if (!parseShare(filename,ip,share))
         return;
-    if (share.length()&&isShareChar(share.charAt(share.length()))) 
+    if (share.length()&&isShareChar(share.charAt(share.length())))
         WNetCancelConnection2((char *)share.str(), 0, 0);
 }
 
@@ -1393,7 +1738,7 @@ public:
         const char *tail = splitDirTail(newname,newdir);
         if ((newname[0]=='\\')&&(newname[1]=='\\')) { // rename to remote
             if (path.length()&&newdir.length()) {
-                if (strcmp(newdir.str(),path.str())!=0) 
+                if (strcmp(newdir.str(),path.str())!=0)
                     IWARNLOG("CWindowsRemoteFile '%s' to '%s' : directory mismatch",filename.get(),newname);
             }
             newname = tail; // just rename using tail
@@ -1544,7 +1889,7 @@ public:
 
     IMemoryMappedFile *openMemoryMapped(offset_t ofs, memsize_t len, bool write)
     {
-        throw MakeStringException(-1,"Remote file cannot be memory mapped");
+        throw MakeStringException(JLIBERR_MemoryMapRemoteFileError, "Remote file cannot be memory mapped");
         return NULL;
     }
 };
@@ -1572,7 +1917,7 @@ IFileIO *_createIFileIO(const void *buffer, unsigned sz, bool readOnly)
         virtual size32_t read(offset_t pos, size32_t len, void * data)
         {
             if (pos>sz)
-                throw MakeStringException(-1, "CMemoryBufferIO: read beyond end of buffer pos=%" I64F "d, len=%d, buffer length=%d", pos, len, mb.length());
+                throw MakeStringException(JLIBERR_MemoryBufferReadBeyondEnd, "CMemoryBufferIO: read beyond end of buffer pos=%" I64F "d, len=%d, buffer length=%d", pos, len, mb.length());
             if (pos+len > sz)
                 len = (size32_t)(sz-pos);
             memcpy(data, (byte *)buffer+pos, len);
@@ -1584,7 +1929,7 @@ IFileIO *_createIFileIO(const void *buffer, unsigned sz, bool readOnly)
         {
             assertex(!readOnly);
             if (pos+len>sz)
-                throw MakeStringException(-1, "CMemoryBufferIO: UNIMPLEMENTED, writing beyond buffer, pos=%" I64F "d, len=%d, buffer length=%d", pos, len, mb.length());
+                throw MakeStringException(JLIBERR_MemoryBufferWriteBeyondEndUnimplemented, "CMemoryBufferIO: UNIMPLEMENTED, writing beyond buffer, pos=%" I64F "d, len=%d, buffer length=%d", pos, len, mb.length());
             memcpy((byte *)buffer+pos, data, len);
             return len;
         }
@@ -1597,30 +1942,12 @@ IFileIO *_createIFileIO(const void *buffer, unsigned sz, bool readOnly)
         virtual void setSize(offset_t size)
         {
             if (size > mb.length())
-                throw MakeStringException(-1, "CMemoryBufferIO: UNIMPLEMENTED, setting size %" I64F "d beyond end of buffer, buffer length=%d", size, mb.length());
+                throw MakeStringException(JLIBERR_MemoryBufferSetSizeBeyondEndUnimplemented, "CMemoryBufferIO: UNIMPLEMENTED, setting size %" I64F "d beyond end of buffer, buffer length=%d", size, mb.length());
             mb.setLength((size32_t)size);
         }
-
-        offset_t appendFile(IFile *file,offset_t pos,offset_t len)
+        virtual IFile * queryFile() const override
         {
-            if (!file)
-                return 0;
-            const size32_t buffsize = 0x10000;
-            void * buffer = mb.reserve(buffsize);
-            Owned<IFileIO> fileio = file->open(IFOread);
-            offset_t ret=0;
-            while (len) {
-                size32_t toread = (len>=buffsize)?buffsize:(size32_t)len;
-                size32_t read = fileio->read(pos,toread,buffer);
-                if (read<buffsize) 
-                    mb.setLength(mb.length()+read-buffsize);
-                if (read==0)
-                    break;
-                pos += read;
-                len -= read;
-                ret += read;
-            }
-            return ret;
+            return nullptr;
         }
 
     };
@@ -1633,36 +1960,21 @@ IFileIO * createIFileI(unsigned len, const void * buffer)
     return _createIFileIO((void *)buffer, len, true);
 }
 
-IFileIO * createIFileIO(unsigned len, void * buffer)
-{
-    return _createIFileIO(buffer, len, false);
-}
-
-IFileIO * createIFileIO(StringBuffer & buffer)
-{
-    return _createIFileIO((void *)buffer.str(), buffer.length(), true);
-}
-
-IFileIO * createIFileIO(MemoryBuffer & buffer)
-{
-    return _createIFileIO(buffer.toByteArray(), buffer.length(), false);
-}
-
 //---------------------------------------------------------------------------
 
 class jlib_decl CSequentialFileIO : public CFileIO
 {
     offset_t pos;
-    
+
     void checkPos(const char *fn,offset_t _pos)
     {
         if (_pos!=pos)
-            throw MakeStringException(-1, "CSequentialFileIO %s out of sequence (%" I64F "d,%" I64F "d)",fn,pos,_pos);
+            throw MakeStringException(JLIBERR_SequentialFileOutOfSequence, "CSequentialFileIO %s out of sequence (%" I64F "d,%" I64F "d)",fn,pos,_pos);
     }
 
 public:
-    CSequentialFileIO(HANDLE h,IFOmode _openmode,IFSHmode _sharemode,IFEflags _extraFlags)
-        : CFileIO(h,_openmode,_sharemode,_extraFlags)
+    CSequentialFileIO(IFile * _creator, HANDLE h,IFOmode _openmode,IFSHmode _sharemode,IFEflags _extraFlags)
+        : CFileIO(_creator, h,_openmode,_sharemode,_extraFlags)
     {
         pos = 0;
     }
@@ -1672,6 +1984,8 @@ public:
 
     size32_t read(offset_t _pos, size32_t len, void * data)
     {
+        ProTraceTaskScopeTracker scope(EventTask::Reading, len);
+
         checkPos("read",_pos);
 #ifdef _WIN32
         // Can't use checked_read because don't have the c fileno for it
@@ -1684,14 +1998,16 @@ public:
         }
         size32_t ret = (size32_t)numRead;
 #else
-        size32_t ret = checked_read(file, data, len);
+        size32_t ret = checked_read(querySafeFilename(), file, data, len);
 #endif
         pos += ret;
         return ret;
     }
-    
+
     virtual size32_t write(offset_t _pos, size32_t len, const void * data)
     {
+        ProTraceTaskScopeTracker scope(EventTask::Writing, len);
+
         checkPos("write",_pos);
 
         size32_t ret;
@@ -1723,44 +2039,52 @@ public:
 IFileIO * CFile::openShared(IFOmode mode,IFSHmode share,IFEflags extraFlags)
 {
     int stdh = stdIoHandle(filename);
-    HANDLE handle = openHandle(mode,share,false, stdh);
+    WriteSyncDetails writeSync;
+    HANDLE handle = openHandle(mode,share,false, stdh, writeSync);
     if (handle==NULLFILE)
         return NULL;
-#ifndef _WIN32
-    set_inherit(handle, false);
-#endif
+    // MCK - if (extraFlags & IFEnocache) and mode is not WRONLY perhaps turn off read-ahead ?
+    //       No - while read-ahead can put more into page-cache, IFEnocache is a hint and
+    //       disabling readahead might affect performance negatively too much ...
     if (stdh>=0)
-        return new CSequentialFileIO(handle,mode,share,extraFlags);
-    return new CFileIO(handle,mode,share,extraFlags);
+        return new CSequentialFileIO(this, handle,mode,share,extraFlags);
+
+    Owned<IFileIO> io = new CFileIO(this,handle,mode,share,extraFlags,writeSync);
+#ifdef CHECK_FILE_IO
+    return new CCheckingFileIO(filename, io);
+#else
+    return io.getClear();
+#endif
 }
 
 
 
 //---------------------------------------------------------------------------
 
+static std::atomic<bool> defaultFileSyncWriteCloseEnabled = false; // NB: set/updated by config updateFunc
 
-extern jlib_decl IFileIO *createIFileIO(HANDLE handle,IFOmode openmode,IFEflags extraFlags)
+extern jlib_decl IFileIO *createIFileIO(IFile * creator,HANDLE handle,IFOmode openmode,IFEflags extraFlags)
 {
-    return new CFileIO(handle,openmode,IFSHfull,extraFlags);
+    return new CFileIO(creator, handle,openmode,IFSHfull,extraFlags);
 }
 
-offset_t CFileIO::appendFile(IFile *file,offset_t pos,offset_t len)
+offset_t appendFile(IFileIO * target, IFile *file,offset_t pos,offset_t len)
 {
     if (!file)
         return 0;
-    CriticalBlock procedure(cs);
     MemoryAttr mb;
-    const size32_t buffsize = 0x10000;
+    const size32_t buffsize = DEFAULT_STREAM_BUFFER_SIZE;
     void * buffer = mb.allocate(buffsize);
     Owned<IFileIO> fileio = file->open(IFOread);
     offset_t ret=0;
-    offset_t outp = size();
-    while (len) {
+    offset_t outp = target->size();
+    while (len)
+    {
         size32_t toread = (len>=buffsize) ? buffsize : (size32_t)len;
         size32_t read = fileio->read(pos,toread,buffer);
         if (read==0)
             break;
-        size32_t wr = write(outp,read,buffer);
+        size32_t wr = target->write(outp,read,buffer);
         pos += read;
         outp += wr;
         len -= read;
@@ -1771,17 +2095,23 @@ offset_t CFileIO::appendFile(IFile *file,offset_t pos,offset_t len)
     return ret;
 }
 
+
 unsigned __int64 CFileIO::getStatistic(StatisticKind kind)
 {
     return stats.getStatistic(kind);
+}
+
+CFileIO::CFileIO(IFile * _creator, HANDLE handle, IFOmode _openmode, IFSHmode _sharemode, IFEflags _extraFlags)
+    : CFileIO(_creator, handle, _openmode, _sharemode, _extraFlags, WriteSyncDetails())
+{
 }
 
 #ifdef _WIN32
 
 //-- Windows implementation -------------------------------------------------
 
-CFileIO::CFileIO(HANDLE handle, IFOmode _openmode, IFSHmode _sharemode, IFEflags _extraFlags)
-    : unflushedReadBytes(0), unflushedWriteBytes(0)
+CFileIO::CFileIO(IFile * _creator, HANDLE handle, IFOmode _openmode, IFSHmode _sharemode, IFEflags _extraFlags, const WriteSyncDetails &_writeSync)
+    : creator(_creator), unflushedReadBytes(0), unflushedWriteBytes(0)
 {
     assertex(handle != NULLFILE);
     throwOnError = false;
@@ -1789,6 +2119,7 @@ CFileIO::CFileIO(HANDLE handle, IFOmode _openmode, IFSHmode _sharemode, IFEflags
     sharemode = _sharemode;
     openmode = _openmode;
     extraFlags = _extraFlags; // page cache flush option silently ignored on Windows for now
+    writeSync = _writeSync;
     if (extraFlags & IFEnocache)
         if (!isPCFlushAllowed())
             extraFlags = static_cast<IFEflags>(extraFlags & ~IFEnocache);
@@ -1813,16 +2144,19 @@ void CFileIO::close()
 {
     if (file != NULLFILE)
     {
-        if (!CloseHandle(file))
-            throw makeOsException(GetLastError(),"CFileIO::close");
+        // ensure file handle is cleared before throwing exception, to avoid dtor recalling close() as stack unwinds.
+        HANDLE tmpHandle = NULLFILE;
+        std::swap(tmpHandle, file);
+
+        if (!CloseHandle(tmpHandle))
+            throw makeOsExceptionV(GetLastError(),"CFileIO::close for file '%s'", querySafeFilename());
     }
-    file = NULLFILE;
 }
 
 void CFileIO::flush()
 {
     if (!FlushFileBuffers(file))
-        throw makeOsException(GetLastError(),"CFileIO::flush");
+        throw makeOsExceptionV(GetLastError(),"CFileIO::flush for file '%s'", querySafeFilename());
 }
 
 offset_t CFileIO::size()
@@ -1831,7 +2165,7 @@ offset_t CFileIO::size()
     pos.LowPart = GetFileSize(file, (unsigned long *)&pos.HighPart);
     if (pos.LowPart==-1) {
         DWORD err = GetLastError();
-        if (err!=0)     
+        if (err!=0)
             throw makeOsException(err,"CFileIO::size");
     }
     return pos.QuadPart;
@@ -1840,13 +2174,15 @@ offset_t CFileIO::size()
 
 size32_t CFileIO::read(offset_t pos, size32_t len, void * data)
 {
+    ProTraceTaskScopeTracker scope(EventTask::Reading, len);
+
     CriticalBlock procedure(cs);
 
     CCycleTimer timer;
     DWORD numRead;
     setPos(pos);
     if (ReadFile(file,data,len,&numRead,NULL) == 0)
-        throw makeOsException(GetLastError(),"CFileIO::read");
+        throw makeOsExceptionV(GetLastError(),"CFileIO::read for file '%s'", querySafeFilename());
     stats.ioReadCycles.fetch_add(timer.elapsedCycles());
     stats.ioReadBytes.fetch_add(numRead);
     ++stats.ioReads;
@@ -1856,21 +2192,23 @@ size32_t CFileIO::read(offset_t pos, size32_t len, void * data)
 void CFileIO::setPos(offset_t newPos)
 {
     LARGE_INTEGER tempPos;
-    tempPos.QuadPart = newPos; 
+    tempPos.QuadPart = newPos;
     tempPos.LowPart = SetFilePointer(file, tempPos.LowPart, &tempPos.HighPart, FILE_BEGIN);
 }
 
 size32_t CFileIO::write(offset_t pos, size32_t len, const void * data)
 {
+    ProTraceTaskScopeTracker scope(EventTask::Writing, len);
+
     CriticalBlock procedure(cs);
 
     CCycleTimer timer;
     DWORD numWritten;
     setPos(pos);
     if (!WriteFile(file,data,len,&numWritten,NULL))
-        throw makeOsException(GetLastError(),"CFileIO::write");
+        throw makeOsExceptionV(GetLastError(),"CFileIO::write for file '%s'", querySafeFilename());
     if (numWritten != len)
-        throw makeOsException(DISK_FULL_EXCEPTION_CODE,"CFileIO::write");
+        throw makeOsExceptionV(DISK_FULL_EXCEPTION_CODE,"CFileIO::write for file '%s'", querySafeFilename());
     stats.ioWriteCycles.fetch_add(timer.elapsedCycles());
     stats.ioWriteBytes.fetch_add(numWritten);
     ++stats.ioWrites;
@@ -1883,16 +2221,64 @@ void CFileIO::setSize(offset_t pos)
     CriticalBlock procedure(cs);
     setPos(pos);
     if (!SetEndOfFile(file))
-        throw makeOsException(GetLastError(), "CFileIO::setSize");
+        throw makeOsExceptionV(GetLastError(), "CFileIO::setSize for file '%s'", querySafeFilename());
 }
 
 #else
 
 //-- Unix implementation ----------------------------------------------------
 
+static void doSync(const CFileIO &fileIO, int fd, bool dataOnly)
+{
+#ifdef F_FULLFSYNC
+    // No EIO type retry available
+    fcntl(fd, F_FULLFSYNC);
+#else
+    CCycleTimer timer;
+    int ret = dataOnly ? fdatasync(fd) : fsync(fd);
+    if (ret == 0)
+    {
+        if (timer.elapsedMs() >= 10000)
+            IWARNLOG("doSync(%s): slow success: took %u ms", fileIO.querySafeFilename(), timer.elapsedMs());
+    }
+    else
+    {
+        int err = errno;
+        printStackReport();
+        Owned<IException> e = makeErrnoExceptionV(err, "doSync(%s): failed after %u ms", fileIO.querySafeFilename(), timer.elapsedMs());
+        OWARNLOG(e);
+        throw e.getClear();
+    }
+#endif
+}
+
+static void syncFileData(const CFileIO &fileIO, int fd, bool notReadOnly, IFEflags extraFlags, bool wait_previous=false)
+{
+    if (notReadOnly)
+    {
+        if (extraFlags & IFEsync)
+            doSync(fileIO, fd, true);
+#if defined(__linux__)
+        else if (extraFlags & IFEnocache)
+        {
+            unsigned flags = SYNC_FILE_RANGE_WRITE;
+            if (wait_previous)
+                flags |= SYNC_FILE_RANGE_WAIT_BEFORE;
+            sync_file_range(fd, 0, 0, flags);
+        }
+#endif
+    }
+
+#ifdef POSIX_FADV_DONTNEED
+    if (extraFlags & IFEnocache)
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+}
+
+
 // More errorno checking TBD
-CFileIO::CFileIO(HANDLE handle, IFOmode _openmode, IFSHmode _sharemode, IFEflags _extraFlags)
-    : unflushedReadBytes(0), unflushedWriteBytes(0)
+CFileIO::CFileIO(IFile * _creator, HANDLE handle, IFOmode _openmode, IFSHmode _sharemode, IFEflags _extraFlags, const WriteSyncDetails &_writeSync)
+    : creator(_creator), unflushedReadBytes(0), unflushedWriteBytes(0)
 {
     assertex(handle != NULLFILE);
     throwOnError = false;
@@ -1900,23 +2286,54 @@ CFileIO::CFileIO(HANDLE handle, IFOmode _openmode, IFSHmode _sharemode, IFEflags
     sharemode = _sharemode;
     openmode = _openmode;
     extraFlags = _extraFlags;
+    writeSync = _writeSync;
+
+    // leave for compatibility
     if (extraFlags & IFEnocache)
         if (!isPCFlushAllowed())
             extraFlags = static_cast<IFEflags>(extraFlags & ~IFEnocache);
+
+    extraFlags = static_cast<IFEflags>(extraFlags | expertEnableIFileFlagsMask);
+    extraFlags = static_cast<IFEflags>(extraFlags & ~expertDisableIFileFlagsMask);
+
+    if (isContainerized() && (openmode!=IFOread)) // only containerized (with planes writing to storage types like blob for now)
+    {
+        const char *filePath = querySafeFilename();
+        if ('/' == filePath[0]) // only for absolute paths
+        {
+            unsigned __int64 value;
+            if (findPlaneAttrFromPath(filePath, FileSyncWriteClose, defaultFileSyncWriteCloseEnabled ? 1 : 0, value)) // NB: returns only if plane found
+            {
+                if (value) // true or false
+                    extraFlags = static_cast<IFEflags>(extraFlags | IFEsyncAtClose);
+            }
+        }
+    }
+
 #ifdef CFILEIOTRACE
-    DBGLOG("CFileIO::CfileIO(%d,%d,%d,%d)", handle, _openmode, _sharemode, _extraFlags);
+    DBGLOG("CFileIO::CfileIO(%d,%d,%d,%d)", handle, _openmode, _sharemode, extraFlags);
 #endif
 }
 
 CFileIO::~CFileIO()
 {
+#ifdef CHECK_FILE_CLOSED_BEFORE_DELETE
+    //Any file that is being written to, should be closed before the object is destroyed, otherwise errors from failing to commit will be lost
+    if ((file != NULLFILE) && (openmode!=IFOread))
+    {
+        OERRLOG("CFileIO::~CFileIO - file '%s' object destroyed without being closed first", querySafeFilename()); // A programmer problem, but the operator should know about it.
+        PrintStackReport();
+    }
+#endif
     try
     {
         close();
     }
     catch (IException * e)
     {
-        EXCLOG(e, "CFileIO::~CFileIO");
+        //An error closing a file cannot throw an exception, but should be logged as a very severe error in the logs.
+        DISLOG(e, "CFileIO::~CFileIO");
+        PrintStackReport();
         e->Release();
     }
 }
@@ -1925,72 +2342,100 @@ void CFileIO::close()
 {
     if (file != NULLFILE)
     {
+        // ensure file handle is cleared before throwing exception, to avoid dtor recalling close() as stack unwinds.
+        HANDLE tmpHandle = NULLFILE;
+        std::swap(tmpHandle, file);
+
 #ifdef CFILEIOTRACE
-        DBGLOG("CFileIO::close(%d), extraFlags = %d", file, extraFlags);
+        DBGLOG("CFileIO::close(%d), extraFlags = %d", tmpHandle, extraFlags);
 #endif
-        if (extraFlags & IFEnocache)
-        {
-            if (openmode != IFOread)
-            {
-#ifdef F_FULLFSYNC
-                fcntl(file, F_FULLFSYNC);
-#else
-                fdatasync(file);
-#endif
-            }
-#ifdef POSIX_FADV_DONTNEED
-            posix_fadvise(file, 0, 0, POSIX_FADV_DONTNEED);
-#endif
-        }
-        if (::close(file) < 0)
-            throw makeErrnoException(errno, "CFileIO::close");
-        file=NULLFILE;
+        if (extraFlags & (IFEnocache | IFEsync))
+            syncFileData(*this, tmpHandle, openmode!=IFOread, extraFlags, false);
+        else if (extraFlags & IFEsyncAtClose)
+            doSync(*this, tmpHandle, false);
+
+        if (::close(tmpHandle) < 0)
+            throw makeErrnoExceptionV(errno, "CFileIO::close for file '%s'", querySafeFilename());
     }
 }
 
 void CFileIO::flush()
 {
+    if (0 == (extraFlags & (IFEnocache | IFEsync)))
+        return;
+
     CriticalBlock procedure(cs);
-#ifdef F_FULLFSYNC
-    if (fcntl(file, F_FULLFSYNC) != 0)
-#else
-    if (fdatasync(file) != 0)
-#endif
-        throw makeOsException(DISK_FULL_EXCEPTION_CODE, "CFileIO::flush");
-#ifdef POSIX_FADV_DONTNEED
-    if (extraFlags & IFEnocache)
-        posix_fadvise(file, 0, 0, POSIX_FADV_DONTNEED);
-#endif
+
+    syncFileData(*this, file, true, extraFlags, false);
 }
 
 
 offset_t CFileIO::size()
 {
-    CriticalBlock procedure(cs);
-    offset_t savedPos = lseek(file,0,SEEK_CUR);
-    offset_t length = lseek(file,0,SEEK_END);
-    setPos(savedPos);
-    return length;
+    //MORE: The current implementation of openHandle() calls fstat() to check the file is not a directory
+    //If the file hasn't been modified since open() the size could be cached and returned.
+    struct stat info;
+    auto refresh = [&](struct stat &st)
+    {
+        if (fstat(file, &st) < 0)
+            throw makeErrnoExceptionV(errno, "CFileIO::size fstat %s", querySafeFilename());
+        return true;
+    };
+
+    refresh(info);
+
+    // Retries fstat() on the held handle (it may be shared, so cannot be reopened); NFS may serve cached attributes.
+    // Once the deadline has passed the real size is returned, even if it does not match the published size.
+    if ((IFOread == openmode) && ((offset_t)-1 != writeSync.expectedSize) && writeSync.queryRemainingMs())
+    {
+        bool exists = true;
+        if (!settleWriteSync("CFileIO::size", querySafeFilename(), writeSync, true, refresh, info, exists))
+            throwWriteSyncSizeMismatch(querySafeFilename(), info, writeSync.expectedSize);
+    }
+    return info.st_size;
 }
 
 size32_t CFileIO::read(offset_t pos, size32_t len, void * data)
 {
     if (0==len) return 0;
 
+    ProTraceTaskScopeTracker scope(EventTask::Reading, len);
+
     CCycleTimer timer;
-    size32_t ret = checked_pread(file, data, len, pos);
+    size32_t ret = checked_pread(querySafeFilename(), file, data, len, pos);
     stats.ioReadCycles.fetch_add(timer.elapsedCycles());
     stats.ioReadBytes.fetch_add(ret);
     ++stats.ioReads;
+
+    // checked_pread only returns short at EOF; within the write-sync deadline (as size()) a short read before the
+    // published size is a premature EOF. Once the deadline has passed, short reads are returned as-is.
+    if (((offset_t)-1 != writeSync.expectedSize) &&
+        (ret < len) && (pos + ret < writeSync.expectedSize) && writeSync.queryRemainingMs())
+    {
+        StringBuffer statDetails;
+        struct stat info;
+        if (fstat(file, &info) == 0)
+            statDetails.appendf("fstat: size=%" I64F "d, device=%" I64F "u, inode=%" I64F "u, mode=%o, nlink=%" I64F "u, uid=%u, gid=%u, atime=%" I64F "d, mtime=%" I64F "d, ctime=%" I64F "d",
+                (__int64)info.st_size, (unsigned __int64)info.st_dev, (unsigned __int64)info.st_ino,
+                (unsigned)info.st_mode, (unsigned __int64)info.st_nlink, (unsigned)info.st_uid, (unsigned)info.st_gid,
+                (__int64)info.st_atime, (__int64)info.st_mtime, (__int64)info.st_ctime);
+        else
+        {
+            int statError = errno;
+            statDetails.appendf("fstat failed: errno=%d (%s)", statError, strerror(statError));
+        }
+        throwStringExceptionV(JLIBERR_FileWriteSyncPrematureEOF,
+            "CFileIO::read premature EOF: file='%s', handle=%d, offset=%" I64F "u, requested=%u, returned=%u, expectedSize=%" I64F "u, missingBeforeExpectedEOF=%" I64F "u, openMode=%u, compressed=%s, remainingMs=%u, elapsedMs=%" I64F "d, %s",
+            querySafeFilename(), file, pos, len, ret, writeSync.expectedSize, writeSync.expectedSize - pos - ret,
+            (unsigned)openmode, boolToStr(writeSync.compressed), writeSync.queryRemainingMs(), cycle_to_millisec(timer.elapsedCycles()), statDetails.str());
+    }
 
     if ( (extraFlags & IFEnocache) && (ret > 0) )
     {
         if (unflushedReadBytes.add_fetch(ret) >= PGCFLUSH_BLKSIZE)
         {
             unflushedReadBytes.store(0);
-#ifdef POSIX_FADV_DONTNEED
-            posix_fadvise(file, 0, 0, POSIX_FADV_DONTNEED);
-#endif
+            syncFileData(*this, file, false, extraFlags, false);
         }
     }
     return ret;
@@ -2002,20 +2447,10 @@ void CFileIO::setPos(offset_t newPos)
         _llseek(file,newPos,SEEK_SET);
 }
 
-static void sync_file_region(int fd, offset_t offset, offset_t nbytes)
-{
-#if defined(__linux__) && defined(__NR_sync_file_range)
-    (void)syscall(__NR_sync_file_range, fd, offset,
-                    nbytes, SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE);
-#elif defined(F_FULLFSYNC)
-    fcntl(fd, F_FULLFSYNC);
-#else
-    fdatasync(fd);
-#endif
-}
-
 size32_t CFileIO::write(offset_t pos, size32_t len, const void * data)
 {
+    ProTraceTaskScopeTracker scope(EventTask::Writing, len);
+
     CCycleTimer timer;
     size32_t ret = pwrite(file,data,len,pos);
     stats.ioWriteCycles.fetch_add(timer.elapsedCycles());
@@ -2023,20 +2458,16 @@ size32_t CFileIO::write(offset_t pos, size32_t len, const void * data)
     ++stats.ioWrites;
 
     if (ret==(size32_t)-1)
-        throw makeErrnoException(errno, "CFileIO::write");
+        throw makeErrnoExceptionV(errno, "CFileIO::write for file '%s'", querySafeFilename());
     if (ret<len)
-        throw makeOsException(DISK_FULL_EXCEPTION_CODE, "CFileIO::write");
-    if ( (extraFlags & IFEnocache) && (ret > 0) )
+        throw makeOsExceptionV(DISK_FULL_EXCEPTION_CODE, "CFileIO::write for file '%s'", querySafeFilename());
+    if ( (extraFlags & (IFEnocache | IFEsync)) && (ret > 0) )
     {
         if (unflushedWriteBytes.add_fetch(ret) >= PGCFLUSH_BLKSIZE)
         {
             unflushedWriteBytes.store(0);
-            // [possibly] non-blocking request to write-out dirty pages
-            sync_file_region(file, 0, 0);
-#ifdef POSIX_FADV_DONTNEED
-            // flush written-out pages
-            posix_fadvise(file, 0, 0, POSIX_FADV_DONTNEED);
-#endif
+            // request to write-out dirty pages
+            syncFileData(*this, file, true, extraFlags, true);
         }
     }
     return ret;
@@ -2045,15 +2476,127 @@ size32_t CFileIO::write(offset_t pos, size32_t len, const void * data)
 void CFileIO::setSize(offset_t pos)
 {
     if (0 != ftruncate(file, pos))
-        throw makeErrnoException(errno, "CFileIO::setSize");
+        throw makeErrnoExceptionV(errno, "CFileIO::setSize for file '%s'", querySafeFilename());
 }
 #endif
 
 //---------------------------------------------------------------------------
 
-CFileRangeIO::CFileRangeIO(IFileIO * _io, offset_t _headerSize, offset_t _maxLength)
+size32_t CNullFileIO::read(offset_t pos, size32_t len, void * data)
 {
-    io.set(_io);
+    return 0;
+}
+
+offset_t CNullFileIO::size()
+{
+    return 0;
+}
+
+size32_t CNullFileIO::write(offset_t pos, size32_t len, const void * data)
+{
+    return len;
+}
+
+void CNullFileIO::setSize(offset_t size)
+{
+}
+
+void CNullFileIO::flush()
+{
+}
+
+void CNullFileIO::close()
+{
+}
+
+unsigned __int64 CNullFileIO::getStatistic(StatisticKind kind)
+{
+    return 0;
+}
+IFile * CNullFileIO::queryFile() const
+{
+    return nullptr;
+}
+
+IFileIO * createNullFileIO()
+{
+    return new CNullFileIO();
+}
+
+//---------------------------------------------------------------------------
+
+CIndirectFileIO::CIndirectFileIO(IFileIO * _io) : io(_io)
+{
+}
+
+size32_t CIndirectFileIO::read(offset_t pos, size32_t len, void * data)
+{
+    return io->read(pos, len, data);
+}
+
+offset_t CIndirectFileIO::size()
+{
+    return io->size();
+}
+
+size32_t CIndirectFileIO::write(offset_t pos, size32_t len, const void * data)
+{
+    return io->write(pos, len, data);
+}
+
+void CIndirectFileIO::setSize(offset_t size)
+{
+    io->setSize(size);
+}
+
+void CIndirectFileIO::flush()
+{
+    io->flush();
+}
+
+void CIndirectFileIO::close()
+{
+    io->close();
+}
+
+unsigned __int64 CIndirectFileIO::getStatistic(StatisticKind kind)
+{
+    return io->getStatistic(kind);
+}
+
+IFile * CIndirectFileIO::queryFile() const
+{
+    return io->queryFile();
+}
+
+//---------------------------------------------------------------------------
+
+CDelayedFileIO::CDelayedFileIO(IFileIO * _io, unsigned _delayNs)
+    : CIndirectFileIO(_io), delayNs(_delayNs)
+{
+}
+
+size32_t CDelayedFileIO::read(offset_t pos, size32_t len, void * data)
+{
+    NanoSleep(delayNs);
+    return CIndirectFileIO::read(pos, len, data);
+}
+size32_t CDelayedFileIO::write(offset_t pos, size32_t len, const void * data)
+{
+    NanoSleep(delayNs);
+    return CIndirectFileIO::write(pos, len, data);
+}
+
+IFileIO * createDelayedFileIO(IFileIO * io, unsigned delayNs)
+{
+    return new CDelayedFileIO(io, delayNs);
+}
+
+
+//---------------------------------------------------------------------------
+
+CFileRangeIO::CFileRangeIO(IFileIO * _io, offset_t _headerSize, offset_t _maxLength) : CIndirectFileIO(_io)
+{
     headerSize = _headerSize;
     maxLength = _maxLength;
 }
@@ -2066,7 +2609,7 @@ size32_t CFileRangeIO::read(offset_t pos, size32_t len, void * data)
             pos = maxLength;
         len = (size32_t)(maxLength - pos);
     }
-    return io->read(pos+headerSize, len, data);
+    return CIndirectFileIO::read(pos+headerSize, len, data);
 }
 
 offset_t CFileRangeIO::size()
@@ -2082,8 +2625,63 @@ size32_t CFileRangeIO::write(offset_t pos, size32_t len, const void * data)
             pos = maxLength;
         len = (size32_t)(maxLength - pos);
     }
-    return io->write(pos+headerSize, len, data);
+    return CIndirectFileIO::write(pos+headerSize, len, data);
 }
+
+//--------------------------------------------------------------------------
+
+CCheckingFileIO::~CCheckingFileIO()
+{
+    if (lastWriteSize && !closed)
+        report("FileCheck: IO for File %s destroyed before closing", filename.str());
+}
+
+size32_t CCheckingFileIO::read(offset_t pos, size32_t len, void * data)
+{
+    CriticalBlock block(cs);
+    if ((pos == lastReadPos) && (len < minSeqReadSize) && (pos + len != size()))
+        report("FileCheck: Sequential read [%s] of %u is < %u", filename.str(), len, minSeqReadSize);
+
+    size32_t numRead = io->read(pos, len, data);
+    lastReadPos = pos + numRead;
+    return numRead;
+}
+
+size32_t CCheckingFileIO::write(offset_t pos, size32_t len, const void * data)
+{
+    CriticalBlock block(cs);
+    if (len != 0)
+    {
+        if ((lastWriteSize != 0) && (lastWriteSize < minWriteSize))
+            report("FileCheck: Sequential write to [%s] of size %u before offset %" I64F "u of %u is < %u", filename.str(), lastWriteSize, pos, len, minWriteSize);
+        lastWriteSize = len;
+    }
+    else
+        report("FileCheck: Unexpected zero byte write on %s at offset %" I64F "u", filename.str(), pos);
+
+    return io->write(pos, len, data);
+}
+
+void CCheckingFileIO::close()
+{
+    io->close();
+    closed = true;
+}
+
+void CCheckingFileIO::report(const char * format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    VALOG(MCdebugError, format, args);
+    va_end(args);
+    if (!traced)
+    {
+        printStackReport();
+        traced = true;
+    }
+}
+
+
 
 //--------------------------------------------------------------------------
 
@@ -2108,12 +2706,6 @@ void CFileAsyncIO::flush()
         size32_t dummy;
         results.item(i).getResult(dummy,true);
     }
-}
-
-offset_t CFileAsyncIO::appendFile(IFile *file,offset_t pos,offset_t len)
-{
-    // will implemented if needed
-    UNIMPLEMENTED; 
 }
 
 unsigned __int64 CFileAsyncIO::getStatistic(StatisticKind kind)
@@ -2158,7 +2750,7 @@ public:
             if (parent) {
                 if (GetOverlappedResult(parent->file,&overlapped,&value,wait)==0) {
                     int err = GetLastError();
-                    if (err==ERROR_IO_INCOMPLETE) 
+                    if (err==ERROR_IO_INCOMPLETE)
                         return false;
                     if (err!=ERROR_HANDLE_EOF) {
                         CriticalBlock block(parent->cs);
@@ -2196,10 +2788,13 @@ void CFileAsyncIO::close()
     // wait for all outstanding results
     if (file != NULLFILE)
     {
-        if (!CloseHandle(file))
+        // ensure file handle is cleared before throwing exception, to avoid dtor recalling close() as stack unwinds.
+        HANDLE tmpHandle = NULLFILE;
+        std::swap(tmpHandle, file);
+
+        if (!CloseHandle(tmpHandle))
             throw makeOsException(GetLastError(),"CFileAsyncIO::close");
     }
-    file = NULLFILE;
 }
 
 offset_t CFileAsyncIO::size()
@@ -2208,7 +2803,7 @@ offset_t CFileAsyncIO::size()
     pos.LowPart = GetFileSize(file, (unsigned long *)&pos.HighPart);
     if (pos.LowPart==-1) {
         DWORD err = GetLastError();
-        if (err!=0)     
+        if (err!=0)
             throw makeOsException(GetLastError(),"CFileAsyncIO::size");
     }
     return pos.QuadPart;
@@ -2233,7 +2828,7 @@ size32_t CFileAsyncIO::write(offset_t pos, size32_t len, const void * data)
 void CFileAsyncIO::setSize(offset_t size)
 {
     LARGE_INTEGER tempPos;
-    tempPos.QuadPart = size; 
+    tempPos.QuadPart = size;
     tempPos.LowPart = SetFilePointer(file, tempPos.LowPart, &tempPos.HighPart, FILE_BEGIN);
     if (!SetEndOfFile(file))
         throw makeOsException(GetLastError(), "CFileIO::setSize");
@@ -2256,7 +2851,7 @@ IFileAsyncResult *CFileAsyncIO::readAsync(offset_t pos, size32_t len, void * dat
         }
         else
             throw makeOsException(GetLastError(),"CFileIO::readAsync");
-    }   
+    }
     else {
         res->value = val; // won't need to wait
     }
@@ -2274,7 +2869,7 @@ IFileAsyncResult *CFileAsyncIO::writeAsync(offset_t pos, size32_t len, const voi
         CriticalBlock block(cs);
         res->parent = this;
         results.append(*res);
-    }   
+    }
     else {
         res->value = val; // wont need to wait
     }
@@ -2289,7 +2884,7 @@ IFileAsyncResult *CFileAsyncIO::writeAsync(offset_t pos, size32_t len, const voi
 
 class CFileAsyncResult: implements IFileAsyncResult, public CInterface
 {
-protected: 
+protected:
     friend class CFileAsyncIO;
 
     DWORD value;
@@ -2315,6 +2910,9 @@ public:
 
     bool getResult(size32_t &ret,bool wait)
     {
+#if defined(__EMSCRIPTEN__)
+        throw makeErrnoException(ECANCELED, "TODO:  Add EMSCRIPTEN support");
+#else
         if (value==(size32_t)-1) {
             for (;;) {
                 int aio_errno = aio_error(&cb);
@@ -2346,6 +2944,7 @@ public:
             }
         }
         ret = value;
+#endif
         return true;
     }
 };
@@ -2364,11 +2963,18 @@ void CFileAsyncIO::close()
 {
     if (file != NULLFILE)
     {
-        aio_cancel(file,NULL);
-        if (_lclose(file) < 0)
+        // ensure file handle is cleared before throwing exception, to avoid dtor recalling close() as stack unwinds.
+        HANDLE tmpHandle = NULLFILE;
+        std::swap(tmpHandle, file);
+
+#if defined(__EMSCRIPTEN__)
+        throw makeErrnoException(ECANCELED, "TODO:  Add EMSCRIPTEN support");
+#else
+        aio_cancel(tmpHandle, NULL);
+#endif
+        if (_lclose(tmpHandle) < 0)
             throw makeErrnoException(errno, "CFileAsyncIO::close");
     }
-    file=NULLFILE;
 }
 
 offset_t CFileAsyncIO::size()
@@ -2411,7 +3017,7 @@ void CFileAsyncIO::setSize(offset_t pos)
 IFileAsyncResult *CFileAsyncIO::readAsync(offset_t pos, size32_t len, void * data)
 {
     CFileAsyncResult *res = new CFileAsyncResult(pos,0);
-    
+
     bzero( &(res->cb), sizeof (struct aiocb));
     res->cb.aio_fildes = file;
     res->cb.aio_offset = pos;
@@ -2419,9 +3025,14 @@ IFileAsyncResult *CFileAsyncIO::readAsync(offset_t pos, size32_t len, void * dat
     res->cb.aio_nbytes = len;
     res->cb.aio_sigevent.sigev_notify = SIGEV_NONE;
 
+#if defined(__EMSCRIPTEN__)
+    throw makeErrnoException(ECANCELED, "TODO:  Add EMSCRIPTEN support");
+#else
+
     int retval = aio_read(&(res->cb));
     if (retval==-1)
         throw makeErrnoException(errno, "CFileAsyncIO::readAsync");
+#endif
     return res;
 }
 
@@ -2438,9 +3049,14 @@ IFileAsyncResult *CFileAsyncIO::writeAsync(offset_t pos, size32_t len, const voi
     res->cb.aio_sigevent.sigev_notify = SIGEV_NONE;
     res->cb.aio_sigevent.sigev_value.sival_ptr = (void*)res;
 
+#if defined(__EMSCRIPTEN__)
+    throw makeErrnoException(ECANCELED, "TODO:  Add EMSCRIPTEN support");
+#else
+
     int retval = aio_write(&(res->cb));
     if (retval==-1)
         throw makeErrnoException(errno, "CFileAsyncIO::writeAsync");
+#endif
     return res;
 }
 
@@ -2458,6 +3074,7 @@ CFileIOStream::CFileIOStream(IFileIO * _io)
 
 void CFileIOStream::flush()
 {
+    io->flush();
 }
 
 
@@ -2538,7 +3155,7 @@ void CNoSeekFileIOStream::seek(offset_t pos, IFSmode origin)
         break;
     }
     if (prevOffset != nextOffset)
-        throw makeStringExceptionV(0, "Seek on non-seekable CFileIOStream (from %" I64F "u to %" I64F "u)", prevOffset, nextOffset);
+        throw makeStringExceptionV(JLIBERR_FileStreamSeekNotSeekable, "Seek on non-seekable CFileIOStream (from %" I64F "u to %" I64F "u)", prevOffset, nextOffset);
 
     //No need to call stream->seek since it will have no effect
 }
@@ -2706,7 +3323,15 @@ protected:
         return sz;
     }
     virtual offset_t directSize() { return io->size(); }
-
+    virtual unsigned __int64 getStatistic(StatisticKind kind)
+    {
+        return io->getStatistic(kind);
+    }
+    virtual void close() override
+    {
+        flush();
+        io->close();
+    }
 protected:
     IFileIOAttr             io;
 };
@@ -2816,6 +3441,14 @@ public:
     virtual size32_t directRead(size32_t len, void * data) { assertex(false); return 0; }           // shouldn't get called
     virtual size32_t directWrite(size32_t len, const void * data) { assertex(false); return 0; }    // shouldn't get called
     virtual offset_t directSize() { waitAsyncWrite(); return io->size(); }
+    virtual unsigned __int64 getStatistic(StatisticKind kind) { return io->getStatistic(kind); }
+    virtual void close() override
+    {
+        flush();
+        waitAsyncWrite();
+        waitAsyncRead();
+        io->close();
+    }
 };
 
 
@@ -2823,91 +3456,34 @@ public:
 
 enum GblFlushEnum { FLUSH_INIT, FLUSH_DISALLOWED, FLUSH_ALLOWED };
 static GblFlushEnum gbl_flush_allowed = FLUSH_INIT;
-static CriticalSection flushsect;
+static CriticalSection flushsect(SYNC_LOCATION);
 
 static inline bool isPCFlushAllowed()
 {
     CriticalBlock block(flushsect);
     if (gbl_flush_allowed == FLUSH_INIT)
     {
-        if (queryEnvironmentConf().getPropBool("allow_pgcache_flush", true))
+        gbl_flush_allowed = FLUSH_DISALLOWED;
+        if (isContainerized())
+        {
+            if (getConfigBool("expert/@allowPGCacheFlush", true))
+                gbl_flush_allowed = FLUSH_ALLOWED;
+        }
+        else if (queryEnvironmentConf().getPropBool("allow_pgcache_flush", true))
             gbl_flush_allowed = FLUSH_ALLOWED;
-        else
-            gbl_flush_allowed = FLUSH_DISALLOWED;
     }
     if (gbl_flush_allowed == FLUSH_ALLOWED)
         return true;
     return false;
 }
 
-static inline size32_t doread(IFileIOStream * stream,void *dst, size32_t size)
-{
-    size32_t toread=size;
-    while (toread)
-    {
-        int read = stream->read(toread, dst);
-        if (!read) 
-            return size-toread;
-        toread -= read;
-        dst = (char *) dst + read;
-    }
-    return size;
-}
-
-
-
-CIOStreamReadWriteSeq::CIOStreamReadWriteSeq(IFileIOStream * _stream, offset_t _offset, size32_t _size)
-{
-    stream.set(_stream);
-//  stream->setThrowOnError(true);
-    size = _size;
-    offset = _offset;  // assumption that stream at correct location already
-}
-
-void CIOStreamReadWriteSeq::put(const void *src)
-{
-    stream->write(size, src);
-}
-
-void CIOStreamReadWriteSeq::putn(const void *src, unsigned n)
-{
-    stream->write(size*n, src);
-}
-
-void CIOStreamReadWriteSeq::flush()
-{
-    stream->flush();
-}
-
-offset_t CIOStreamReadWriteSeq::getPosition()
-{
-    return stream->tell();
-}
-
-bool CIOStreamReadWriteSeq::get(void *dst)
-{
-    return doread(stream,dst,size)==size;
-}
-
-unsigned CIOStreamReadWriteSeq::getn(void *dst, unsigned n)
-{
-    return doread(stream,dst,size*n)/size;
-}
-
-void CIOStreamReadWriteSeq::reset()
-{
-    stream->seek(offset, IFSbegin);
-}
-
-
-
-
 //-- Helper routines --------------------------------------------------------
 
 size32_t read(IFileIO * in, offset_t pos, size32_t len, MemoryBuffer & buffer)
 {
-    const size32_t checkLengthLimit = 0x1000;
-    if (len >= checkLengthLimit)
+    // it's assumed if len is specified the caller knows what they're doing,
+    // and we don't want to wastefully call size() to check otherwise.
+    if ((size32_t)-1 == len)
     {
         //Don't allocate a stupid amount of memory....
         offset_t fileLength = in->size();
@@ -2927,17 +3503,17 @@ void renameFile(const char *target, const char *source, bool overwritetarget)
 {
     OwnedIFile src = createIFile(source);
     if (!src)
-        throw MakeStringException(-1, "renameFile: source '%s' not found", source);
+        throw MakeStringException(JLIBERR_FileRenameSourceNotFound, "renameFile: source '%s' not found", source);
     if (src->isFile()!=fileBool::foundYes)
-        throw MakeStringException(-1, "renameFile: source '%s' is not a valid file", source);
+        throw MakeStringException(JLIBERR_FileRenameSourceInvalid, "renameFile: source '%s' is not a valid file", source);
     if (src->isReadOnly()!=fileBool::foundNo)
-        throw MakeStringException(-1, "renameFile: source '%s' is readonly", source);
+        throw MakeStringException(JLIBERR_FileRenameSourceReadOnly, "renameFile: source '%s' is readonly", source);
 
     OwnedIFile tgt = createIFile(target);
     if (!tgt)
-        throw MakeStringException(-1, "renameFile: target path '%s' could not be created", target);
+        throw MakeStringException(JLIBERR_FileRenameTargetCreateFailed, "renameFile: target path '%s' could not be created", target);
     if (tgt->exists() && !overwritetarget)
-        throw MakeStringException(-1, "renameFile: target file already exists: '%s' will not overwrite", target);
+        throw MakeStringException(JLIBERR_FileRenameTargetExists, "renameFile: target file already exists: '%s' will not overwrite", target);
 
     src->rename(target);
 }
@@ -2946,10 +3522,10 @@ void copyFile(const char *target, const char *source, size32_t buffersize, ICopy
 {
     OwnedIFile src = createIFile(source);
     if (!src)
-        throw MakeStringException(-1, "copyFile: source '%s' not found", source);
+        throw MakeStringException(JLIBERR_FileCopySourceNotFound, "copyFile: source '%s' not found", source);
     OwnedIFile tgt = createIFile(target);
     if (!tgt)
-        throw MakeStringException(-1, "copyFile: target path '%s' could not be created", target);
+        throw MakeStringException(JLIBERR_FileCopyTargetCreateFailed, "copyFile: target path '%s' could not be created", target);
     copyFile(tgt, src, buffersize, progress, copyFlags);
 }
 
@@ -2963,7 +3539,7 @@ void doCopyFile(IFile * target, IFile * source, size32_t buffersize, ICopyFilePr
     if (!buffersize)
         buffersize = DEFAULT_COPY_BLKSIZE;
 #ifdef _WIN32
-    if (!usetmp) { 
+    if (!usetmp) {
         CFile *src = QUERYINTERFACE(source,CFile);
         CFile *dst = QUERYINTERFACE(target,CFile);
         if (src) {
@@ -2996,13 +3572,13 @@ void doCopyFile(IFile * target, IFile * source, size32_t buffersize, ICopyFilePr
         srcFlags = IFEnocache;
     OwnedIFileIO sourceIO = source->open(IFOread, srcFlags);
     if (!sourceIO)
-        throw MakeStringException(-1, "copyFile: source '%s' not found", source->queryFilename());
+        throw MakeStringException(JLIBERR_FileCopySourceNotFound, "copyFile: source '%s' not found", source->queryFilename());
 
 #ifdef __linux__
 
     // this is not really needed in windows - if it is we will have to
     // test the file extenstion - .exe, .bat
-    
+
     struct stat info;
     if (stat(source->queryFilename(), &info) == 0)  // cannot fail - exception would have been thrown above
         target->setCreateFlags(info.st_mode&(S_IRUSR|S_IRGRP|S_IROTH|S_IWUSR|S_IWGRP|S_IWOTH|S_IXUSR|S_IXGRP|S_IXOTH));
@@ -3023,10 +3599,10 @@ void doCopyFile(IFile * target, IFile * source, size32_t buffersize, ICopyFilePr
         tgtFlags = IFEnocache;
     targetIO.setown(dest->open(IFOcreate, tgtFlags));
     if (!targetIO)
-        throw MakeStringException(-1, "copyFile: target path '%s' could not be created", dest->queryFilename());
+        throw MakeStringException(JLIBERR_FileCopyTargetCreateFailed, "copyFile: target path '%s' could not be created", dest->queryFilename());
     MemoryAttr mb;
     void * buffer = copyintercept?NULL:mb.allocate(buffersize);
-    
+
     offset_t offset = 0;
     offset_t total = 0;
     Owned<IException> exc;
@@ -3052,6 +3628,7 @@ void doCopyFile(IFile * target, IFile * source, size32_t buffersize, ICopyFilePr
             if (progress && progress->onProgress(offset, total) != CFPcontinue)
                 break;
         }
+        targetIO->close(); // Ensure errors are reported.
         targetIO.clear();
         if (usetmp) {
             StringAttr tail(pathTail(target->queryFilename()));
@@ -3064,7 +3641,8 @@ void doCopyFile(IFile * target, IFile * source, size32_t buffersize, ICopyFilePr
         // try to delete partial copy
         StringBuffer s;
         s.append("copyFile target=").append(dest->queryFilename()).append(" source=").append(source->queryFilename()).appendf("; read/write failure (%d): ",e->errorCode());
-        exc.setown(MakeStringException(e->errorCode(), "%s", s.str()));
+        e->errorMessage(s);
+        exc.setown(makeStringException(e->errorCode(), s.str()));
         e->Release();
         EXCLOG(exc, "doCopyFile");
     }
@@ -3072,23 +3650,23 @@ void doCopyFile(IFile * target, IFile * source, size32_t buffersize, ICopyFilePr
         try {
             sourceIO.clear();
         }
-        catch (IException *e) { 
-            EXCLOG(e, "doCopyFile closing source"); 
+        catch (IException *e) {
+            EXCLOG(e, "doCopyFile closing source");
             e->Release();
         }
         try {
             targetIO.clear();
         }
-        catch (IException *e) { 
-            EXCLOG(e, "doCopyFile closing dest"); 
+        catch (IException *e) {
+            EXCLOG(e, "doCopyFile closing dest");
             e->Release();
         }
-        try { 
-            dest->remove(); 
-        } 
-        catch (IException *e) { 
+        try {
+            dest->remove();
+        }
+        catch (IException *e) {
             StringBuffer s;
-            EXCLOG(e, s.clear().append("Removing partial copy file: ").append(dest->queryFilename()).str()); 
+            EXCLOG(e, s.clear().append("Removing partial copy file: ").append(dest->queryFilename()).str());
             e->Release();
         }
         throw exc.getClear();
@@ -3196,10 +3774,10 @@ StringBuffer &createUNCFilename(const char * filename, StringBuffer &UNC, bool u
         if (useHostNames)
             UNC.append(GetCachedHostName());
         else
-            queryHostIP().getIpText(UNC);
+            queryHostIP().getHostText(UNC);
         UNC.append("\\").append((char)tolower(buf[0])).append(getShareChar()).append(buf+2);
     }
-    else 
+    else
     {
         assertex(buf[0]=='\\' && buf[1]=='\\');
         UNC.append(buf);
@@ -3214,7 +3792,7 @@ StringBuffer &createUNCFilename(const char * filename, StringBuffer &UNC, bool u
         if (useHostNames)
             UNC.append(GetCachedHostName());
         else
-            queryHostIP().getIpText(UNC);
+            queryHostIP().getHostText(UNC);
 
         if (*filename != '/')
         {
@@ -3275,7 +3853,7 @@ bool splitUNCFilename(const char * filename, StringBuffer * machine, StringBuffe
     return true;
 }
 
-/** 
+/**
  *  Ensure the filename has desired extension.
  *  If it has no extension, add the desired extension, return true.
  *  If it has an extension different from the desiredExtension, return false.
@@ -3287,7 +3865,7 @@ bool ensureFileExtension(StringBuffer& filename, const char* desiredExtension)
     char dir[_MAX_DIR];
     char fname[_MAX_FNAME];
     char ext[_MAX_EXT];
-    
+
     _splitpath(filename.str(), drive, dir, fname, ext);
     if (ext[0]==0)
     {
@@ -3308,9 +3886,9 @@ StringBuffer& getFullFileName(StringBuffer& filename, bool noExtension)
     char dir[_MAX_DIR];
     char fname[_MAX_FNAME];
     char ext[_MAX_EXT];
-    
+
     _splitpath(filename.str(), drive, dir, fname, ext);
-    
+
     filename.clear();
     filename.append(drive).append(dir).append(fname);
     if (!noExtension)
@@ -3319,16 +3897,16 @@ StringBuffer& getFullFileName(StringBuffer& filename, bool noExtension)
     return filename;
 }
 
-/* Get the file name only. If noExtension is true, the extension (if any) will be trimmed */ 
+/* Get the file name only. If noExtension is true, the extension (if any) will be trimmed */
 StringBuffer& getFileNameOnly(StringBuffer& filename, bool noExtension)
 {
     char drive[_MAX_DRIVE];
     char dir[_MAX_DIR];
     char fname[_MAX_FNAME];
     char ext[_MAX_EXT];
-    
+
     _splitpath(filename.str(), drive, dir, fname, ext);
-    
+
     filename.clear();
     filename.append(fname);
     if (!noExtension)
@@ -3388,7 +3966,7 @@ public:
     CDirectoryIterator(const char * _path, const char * _mask, bool _sub, bool _includedir)
     {
         StringBuffer tmp;
-        if (!_path || !*_path) 
+        if (!_path || !*_path)
             _path = "." PATHSEPSTR;
         else if (_path[strlen(_path)-1] != PATHSEPCHAR)
             _path = tmp.append(_path).append(PATHSEPCHAR);
@@ -3408,7 +3986,7 @@ public:
     virtual IFile & query() { return *cur; }
     virtual StringBuffer &getName(StringBuffer &buf)=0;
     virtual bool isDir() {  return curisdir; }
-protected:  
+protected:
     Owned<IFile>    cur;
     bool            curisdir;
     StringAttr      path;
@@ -3436,7 +4014,7 @@ class CWindowsDirectoryIterator : public CDirectoryIterator
         if (!match&&!curisdir)
             return false;
         StringBuffer f(path);
-        if (subidx) 
+        if (subidx)
             f.append(subpaths.item(subidx-1).text).append('\\');
         f.append(info.cFileName);
         if (curisdir) {
@@ -3602,16 +4180,16 @@ class CLinuxDirectoryIterator : public CDirectoryIterator
     DIR *           handle;
     struct stat     st;
     bool            gotst;
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
 
     bool loadst()
     {
         if (!gotst&&cur)
-            gotst = (stat(cur->queryFilename(), &st) == 0);
+            gotst = (stat(cur->queryFilename(), &st) == 0); // prob should use safeStat, but leaving/being conservative for now
         return gotst;
     }
-    
-    
+
+
 public:
     CLinuxDirectoryIterator(const char * _path, const char * _mask, bool _sub,bool _includedir)
         : CDirectoryIterator(_path,_mask,_sub,_includedir)
@@ -3632,7 +4210,7 @@ public:
             StringBuffer location(path);
             if (subidx)
                 location.append(subpaths.item(subidx-1).text);
-            // not sure if should remove trailing '/'  
+            // not sure if should remove trailing '/'
             handle = ::opendir(location.str());
             // better error handling here?
             if (handle)
@@ -3655,7 +4233,7 @@ public:
     {
         subpaths.kill();
         subidx = 0;
-        if (open()) 
+        if (open())
             return next();
         return false;
     }
@@ -3671,7 +4249,7 @@ public:
                 // need better checking here?
                 if (!entry)
                     break;
-                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) 
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
                     continue;
 
                 bool match = (!mask.length() || WildMatch(entry->d_name, mask, false));
@@ -3680,12 +4258,12 @@ public:
                 bool isunknown = (entry->d_type==DT_UNKNOWN); // to work around xfs bug
                 if (match||curisdir||islnk||isunknown) {
                     StringBuffer f(path);
-                    if (subidx) 
+                    if (subidx)
                         f.append(subpaths.item(subidx-1).text).append('/');
                     f.append(entry->d_name);
                     if (islnk||isunknown) {
                         struct stat info;
-                        if (stat(f.str(), &info) == 0)  // will follow link
+                        if (stat(f.str(), &info) == 0)  // will follow link. Prob should use safeStat, but leaving/being conservative for now
                             curisdir = S_ISDIR(info.st_mode);
                         else
                             curisdir = false;
@@ -3768,7 +4346,7 @@ IDirectoryIterator *CFile::directoryFiles(const char *mask,bool sub,bool include
 bool CFile::getInfo(bool &isdir,offset_t &size,CDateTime &modtime)
 {
     struct stat info;
-    if (stat(filename, &info) == 0) {
+    if (safeStat(filename, info, true)) {
         size = (offset_t)info.st_size;
         isdir = S_ISDIR(info.st_mode);
         timetToIDateTime(&modtime,  info.st_mtime);
@@ -3805,7 +4383,7 @@ public:
         isdir = iter->isDir();
     }
 
-    bool match(byte f) 
+    bool match(byte f)
     {
         return (flags==0)||((f&flags)!=0);
     }
@@ -3833,8 +4411,8 @@ public:
 class CDirectoryDifferenceIterator : public CIArrayOf<CDirEntry>, extends CInterface, implements IDirectoryDifferenceIterator
 {
 
-    
-    
+
+
     static int compare(CInterface * const *_a, CInterface * const *_b)
     {
         CDirEntry *a = *(CDirEntry **)_a;
@@ -3850,7 +4428,7 @@ public:
     {
         mask = IDDIstandard;
         idx = 0;
-        ForEach(*iter) 
+        ForEach(*iter)
             append(*new CDirEntry(iter));
         CIArrayOf<CDirEntry>::sort(compare);
         if (cmp) {  // assumes cmp sorted
@@ -3883,7 +4461,7 @@ public:
                         j++;
                     }
                     else if (c<0) {
-                        b = NULL; 
+                        b = NULL;
                         i++;
                     }
                     else {
@@ -3904,7 +4482,7 @@ public:
                     i++;
                     ni++;
                 }
-            }                   
+            }
         }
     }
     virtual bool first()
@@ -3927,11 +4505,11 @@ public:
         }
         return false;
     }
-    virtual bool isValid()  
+    virtual bool isValid()
     {
         return (idx<ordinality());
     }
-    virtual IFile & query() 
+    virtual IFile & query()
     {
         if (isValid())
             return *item(idx).file;
@@ -3943,7 +4521,7 @@ public:
             buf.append(item(idx).name);
         return buf;
     }
-    virtual bool isDir() 
+    virtual bool isDir()
     {
         if (isValid())
             return item(idx).isdir;
@@ -3968,7 +4546,7 @@ public:
         mask = (byte)_mask;
     }
 
-    virtual unsigned getFlags() 
+    virtual unsigned getFlags()
     {
         if (isValid())
             return item(idx).flags;
@@ -4056,8 +4634,20 @@ void recursiveRemoveDirectory(IFile *dir)
             recursiveRemoveDirectory(thisFile);
         else
         {
+            try
+            {
+                thisFile->remove();
+                continue; // i.e. continue if returns true (removed), or false (file no longer exists)
+            }
+            catch(IException *e)
+            {
+                e->Release();
+            }
+
+            // NB: not sure this is worth it. In linux the file can be read-only and still be deleted if the directory is writable
+            // Perhaps should ensure that the parent directory is writable, but that would require extra file ops. or interface changes
             thisFile->setReadOnly(false);
-            thisFile->remove();
+            thisFile->remove(); // if gets here, the file should exist (ignore return false if doesn't), throws an exception if fails for other reason
         }
     }
     dir->remove();
@@ -4118,7 +4708,7 @@ IFile * createIFile(const char * filename)
     rfn.setRemotePath(filename);
 
     if (rfn.isNull())
-        throw MakeStringException(-1, "CreateIFile cannot resolve %s", filename);
+        throw MakeStringException(JLIBERR_CreateIFileCannotResolve, "CreateIFile cannot resolve %s", filename);
 
     ret = createIFileByHook(rfn);           // use daliservix in preference
     if (ret)
@@ -4182,8 +4772,22 @@ IFile * createIFile(const char * filename)
     if (memcmp(filename,"smb://",6)==0)  // don't support samba - try remote
         return createIFile(filename+4);
 #endif
-    throw MakeStringException(-1, "createIFile: cannot attach to %s", filename);
+    throw MakeStringException(JLIBERR_CreateIFileCannotAttach, "createIFile: cannot attach to %s", filename);
 #endif
+}
+
+void touchFile(IFile *iFile)
+{
+    Owned<IFileIO> iFileIO = iFile->open(IFOcreate);
+    if (!iFileIO)
+        throw makeStringExceptionV(JLIBERR_TouchFileFailedToCreate, "touchFile: failed to create file %s", iFile->queryFilename());
+    iFileIO->close();
+}
+
+void touchFile(const char *filename)
+{
+    Owned<IFile> iFile = createIFile(filename);
+    touchFile(iFile);
 }
 
 
@@ -4216,16 +4820,91 @@ IFileIOStream * createBufferedAsyncIOStream(IFileAsyncIO * io, unsigned bufsize)
     return new CBufferedAsyncIOStream(io, bufsize);
 }
 
-IReadSeq *createReadSeq(IFileIOStream * stream, offset_t offset, size32_t size)
+IFileIOStream * createIOStreamFromFile(const char *fileNameWithPath, IFOmode mode)
 {
-    return new CIOStreamReadWriteSeq(stream, offset, size);
+    Owned<IFile> iFile = createIFile(fileNameWithPath);
+    Owned<IFileIO> iFileIO = iFile->open(mode);
+    if (!iFileIO)
+        return nullptr;
+    return createIOStream(iFileIO);
 }
 
-IWriteSeq *createWriteSeq(IFileIOStream * stream, size32_t size)
+IFileIOStream * createBufferedIOStreamFromFile(const char *fileNameWithPath, IFOmode mode, unsigned bufsize)
 {
-    return new CIOStreamReadWriteSeq(stream, 0, size);
+    Owned<IFile> iFile = createIFile(fileNameWithPath);
+    Owned<IFileIO> iFileIO = iFile->open(mode);
+    if (!iFileIO)
+        return nullptr;
+    return createBufferedIOStream(iFileIO, bufsize);
 }
 
+IFileIOStream *createProgressIFileIOStream(IFileIOStream *iFileIOStream, offset_t totalSize, const char *msg, unsigned periodSecs)
+{
+    class CProgressIFileIOStream : public CSimpleInterfaceOf<IFileIOStream>
+    {
+        Linked<IFileIOStream> iFileIOStream;
+        offset_t totalSize = 0;
+        StringAttr msg;
+        void log(double pct)
+        {
+            PROGLOG("%s - %.2f%% complete", msg.get(), pct);
+        }
+        PeriodicTimer periodTimer;
+    public:
+        CProgressIFileIOStream(IFileIOStream *_iFileIOStream, offset_t _totalSize, const char *_msg, unsigned periodSecs)
+            : iFileIOStream(_iFileIOStream), totalSize(_totalSize), msg(_msg), periodTimer(periodSecs*1000, true)
+        {
+        }
+        ~CProgressIFileIOStream()
+        {
+            offset_t pos = iFileIOStream->tell();
+            if (pos == totalSize)
+                log(100.0);
+        }
+        // implements ISimpleReadStream
+        virtual size32_t read(size32_t max_len, void * data) override
+        {
+            if (periodTimer.hasElapsed())
+            {
+                offset_t pos = iFileIOStream->tell();
+                double pct = ((double)pos) / totalSize * 100;
+                log(pct);
+            }
+            return iFileIOStream->read(max_len, data);
+        }
+        // implements IIOStream
+        virtual void flush() override
+        {
+            throwUnexpected();
+        }
+        virtual size32_t write(size32_t len, const void * data) override
+        {
+            throwUnexpected();
+        }
+        // implements IFileIOStream
+        virtual void seek(offset_t pos, IFSmode origin) override
+        {
+            return iFileIOStream->seek(pos, origin);
+        }
+        virtual offset_t size() override
+        {
+            return iFileIOStream->size();
+        }
+        virtual offset_t tell() override
+        {
+            return iFileIOStream->tell();
+        }
+        virtual unsigned __int64 getStatistic(StatisticKind kind) override
+        {
+            return iFileIOStream->getStatistic(kind);
+        }
+        virtual void close() override
+        {
+            iFileIOStream->close();
+        }
+    };
+    return new CProgressIFileIOStream(iFileIOStream, totalSize, msg, periodSecs);
+}
 
 
 extern jlib_decl offset_t filesize(const char *name)
@@ -4265,13 +4944,13 @@ extern jlib_decl offset_t getFreeSpace(const char* name)
 
     // from "man statfs the def of f_bavail and f_bsize...
     // mult "free blocks avail to non-superuser" by "optimal transfer block size" to get the available size
-    
+
     freeBytesToCaller = (offset_t)buf.f_bavail * buf.f_bsize;
 #else
     UNIMPLEMENTED;
 #endif
 
-    
+
     return freeBytesToCaller;
 }
 
@@ -4283,27 +4962,27 @@ extern jlib_decl void createHardLink(const char* fileName, const char* existingF
     if (!CreateHardLink(fileName, existingFileName, NULL))
     {
         LPVOID lpMsgBuf;
-        FormatMessage( 
-            FORMAT_MESSAGE_ALLOCATE_BUFFER | 
-            FORMAT_MESSAGE_FROM_SYSTEM | 
+        FormatMessage(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER |
+            FORMAT_MESSAGE_FROM_SYSTEM |
             FORMAT_MESSAGE_IGNORE_INSERTS,
             NULL,
             GetLastError(),
             MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
             (LPTSTR) &lpMsgBuf,
             0,
-            NULL 
+            NULL
         );
         StringBuffer err;
         err.appendf("Failed to create log alias %s for %s: %s", fileName, existingFileName, lpMsgBuf);
         LocalFree( lpMsgBuf );
 
-        throw MakeStringException(-1, "createHardLink:: %s.",err.str());
+        throw MakeStringException(JLIBERR_CreateHardLinkFailed, "createHardLink:: %s.",err.str());
 
     }
 #else
     if (link(existingFileName, fileName) != 0) // error
-        throw MakeStringException(-1, "Failed to create log alias %s for %s: error code = %d", fileName, existingFileName, errno);
+        throw MakeStringException(JLIBERR_CreateLogAliasFailed, "Failed to create log alias %s for %s: error code = %d", fileName, existingFileName, errno);
 #endif
 
 }
@@ -4343,11 +5022,11 @@ void testDirectory()
 
 void RemoteFilename::badFilename(const char * filename)
 {
-    throw MakeStringException(-1, "Badly formatted file entry %s", filename);
+    throw MakeStringException(JLIBERR_BadlyFormattedFileEntry, "Badly formatted file entry %s", filename);
 }
 
 bool RemoteFilename::equals(const RemoteFilename & other) const
-{   
+{
     if (isNull())
         return other.isNull();
     if (other.isNull())
@@ -4435,18 +5114,18 @@ bool RemoteFilename::isUnixPath() const // bit arbitrary
         char c = tailpath[0];
         if (c=='/')
             return true;
-        if (c=='\\') 
+        if (c=='\\')
             return false;
     }
     if (sharehead.length()!=0) {
         char c = sharehead[0];
         if (c=='/')
             return true;
-        if (c=='\\') 
+        if (c=='\\')
             return false;
     }
     if (localhead.length()!=0) {
-        const char *s=localhead;   
+        const char *s=localhead;
         if (*s=='/')
             return true;
         if ((s[1]==':')&&(s[2]=='/'))
@@ -4466,6 +5145,12 @@ bool RemoteFilename::isUnixPath() const // bit arbitrary
     return true;
 #endif
 }
+
+bool RemoteFilename::isUrl() const
+{
+    return ::isUrl(tailpath);
+}
+
 
 char RemoteFilename::getPathSeparator() const
 {
@@ -4488,17 +5173,17 @@ StringBuffer & RemoteFilename::getRemotePath(StringBuffer & out) const
 {   // this creates a name that can be used by windows or linux
 
     // Any filenames in the format protocol:// should not be converted to //ip:....
-    if (isUrl(tailpath))
+    if (isUrl())
         return getLocalPath(out);
 
     char c=getPathSeparator();
     out.append(c).append(c);
-    ep.getUrlStr(out);
+    ep.getEndpointHostText(out);
     const char *fn;
     StringBuffer loc;
-    if (sharehead.length()) 
+    if (sharehead.length())
         fn = loc.append(sharehead).append(tailpath).str();
-    else // try and guess from just tail (may likely fail other than for windows) 
+    else // try and guess from just tail (may likely fail other than for windows)
         fn=getLocalPath(loc).str();
     if ((fn[1]==':') && (fn[2]=='/' || fn[2]=='\\')) {  // windows \\d$
         out.append((char)tolower(c)).append(*fn).append(getShareChar());
@@ -4512,6 +5197,10 @@ StringBuffer & RemoteFilename::getRemotePath(StringBuffer & out) const
     return out;
 }
 
+const FileSystemProperties & RemoteFilename::queryFileSystemProperties() const
+{
+    return ::queryFileSystemProperties(tailpath);
+}
 
 bool RemoteFilename::isLocal() const
 {
@@ -4581,7 +5270,7 @@ void RemoteFilename::setPath(const SocketEndpoint & _ep, const char * _filename)
             }
             if (*filename==PATHSEPCHAR) {
 #ifdef _WIN32
-                if (*dir && (dir[1]==':')) 
+                if (*dir && (dir[1]==':'))
                     dir[2] = 0;
 #endif
                 filename++;
@@ -4608,7 +5297,7 @@ void RemoteFilename::setPath(const SocketEndpoint & _ep, const char * _filename)
         StringBuffer tmpxlat;
         char sepchar = isunix?'/':'\\';
         char altchar = isunix?'\\':'/';
-        // fix mixed separator path 
+        // fix mixed separator path
         if (strchr(filename,altchar)) {
             while (*filename) {
                 if (*filename==altchar)
@@ -4625,7 +5314,7 @@ void RemoteFilename::setPath(const SocketEndpoint & _ep, const char * _filename)
                 tail=strchr(filename+1,'/');
                 if (tail) {
                     sharehead.set(filename,tail-filename); // we don't know share so guess same as leading dir
-                    localhead.set(filename,tail-filename); 
+                    localhead.set(filename,tail-filename);
                     filename = tail;
                 }
             }
@@ -4649,8 +5338,8 @@ void RemoteFilename::setPath(const SocketEndpoint & _ep, const char * _filename)
                     localhead.set("c:");
                     sharestr.append("\\c").append(getShareChar());
                 }
-            }   
-                        
+            }
+
             sharehead.set(sharestr);
         }
         tailpath.set(filename);
@@ -4659,7 +5348,7 @@ void RemoteFilename::setPath(const SocketEndpoint & _ep, const char * _filename)
         tailpath.clear();
 #ifdef _TRACERFN
     StringBuffer eps;
-    PROGLOG("setPath (%s,%s) -> '%s' '%s' '%s'",ep.getUrlStr(eps).str(),_filename?_filename:"NULL",sharehead.get()?sharehead.get():"NULL",localhead.get()?localhead.get():"NULL",tailpath.get()?tailpath.get():"NULL");
+    PROGLOG("setPath (%s,%s) -> '%s' '%s' '%s'",ep.getEndpointHostText(eps).str(),_filename?_filename:"NULL",sharehead.get()?sharehead.get():"NULL",localhead.get()?localhead.get():"NULL",tailpath.get()?tailpath.get():"NULL");
 #endif
 }
 
@@ -4686,7 +5375,7 @@ void RemoteFilename::setRemotePath(const char * _url,const char *localpath)
     }
     else
         ep.setLocalHost(0);
-    if (localpath&&*localpath) 
+    if (localpath&&*localpath)
         setPath(ep,localpath);
     else {
         localhead.clear();
@@ -4695,7 +5384,7 @@ void RemoteFilename::setRemotePath(const char * _url,const char *localpath)
     }
     if (sep&&*url) {
         // url should point to the share now
-        const char *tail=findPathSepChar(url+1); 
+        const char *tail=findPathSepChar(url+1);
         if (tail) { // hopefully must be!
             sharehead.set(url,tail-url);
             url = tail;
@@ -4804,7 +5493,7 @@ void RemoteMultiFilename::append(const char *mpath,const char *defaultdir)
         if (isPathSepChar(*filename)&&isPathSepChar(filename[1]))  // full URL
             rfn.setRemotePath(filename);
         else {
-            if (defaultdir&&!isAbsolutePath(filename)) 
+            if (defaultdir&&!isAbsolutePath(filename))
                 filename = addPathSepChar(fullpath.clear().append(defaultdir)).append(filename).str();
             rfn.setPath(ep,filename);
         }
@@ -4824,9 +5513,9 @@ void RemoteMultiFilename::append(const RemoteFilename &inrfn)
     else if (!rfn.queryIP().ipequals(ep)) {
         StringBuffer path;
         rfn.getRemotePath(path);
-        throw MakeStringException(-1, "Component file IP does not match: %s", path.str());          
+        throw MakeStringException(JLIBERR_ComponentFileIPMismatch, "Component file IP does not match: %s", path.str());
     }
-    RemoteFilenameArray::append(rfn);           
+    RemoteFilenameArray::append(rfn);
 }
 
 void RemoteMultiFilename::deserialize(MemoryBuffer & in)
@@ -4842,13 +5531,13 @@ void RemoteMultiFilename::deserialize(MemoryBuffer & in)
         byte l;
         in.read(l);
         filename.clear();
-        if (l) 
+        if (l)
             filename.append((size32_t)l,last.str());
         StringAttr s;
         in.read(s);
         filename.append(s);
         rfn.setPath(ep,filename.str());
-        RemoteFilenameArray::append(rfn);           
+        RemoteFilenameArray::append(rfn);
         last.swapWith(filename);
     }
 }
@@ -4893,10 +5582,10 @@ bool RemoteMultiFilename::isWild(unsigned idx) const
     return false;
 }
 
-void RemoteMultiFilename::expandWild() 
+void RemoteMultiFilename::expandWild()
 {
     bool anywild = false;
-    BoolArray iswild; 
+    BoolArray iswild;
     ForEachItem(i1) {
         if (isWild(i1)) {
             anywild = true;
@@ -4918,7 +5607,7 @@ void RemoteMultiFilename::expandWild()
         else
             tmpsz.append(-1);
     }
-    RemoteFilenameArray::kill(); 
+    RemoteFilenameArray::kill();
     sizescache.kill();
     ForEachItemIn(i3,tmpa) {
         RemoteFilename rfn(tmpa.item(i3));
@@ -5001,7 +5690,7 @@ bool RemoteMultiFilename::equals(const RemoteMultiFilename & other)
         return false;
     if (ordinality()!=other.ordinality())
         return false;
-    ForEachItem(i) 
+    ForEachItem(i)
         if (!item(i).equals(other.item(i)))
             return false;
     return true;
@@ -5072,7 +5761,7 @@ void RemoteMultiFilename::tostr(StringArray &array,StringBuffer &out)
 //===================================================================================================
 
 static IArrayOf<IContainedFileHook> containedFileHooks;
-static ReadWriteLock containedFileHookLock;
+static ReadWriteLock containedFileHookLock{SYNC_LOCATION};
 
 void addContainedFileHook(IContainedFileHook *hook)
 {
@@ -5103,7 +5792,7 @@ static IFile *createContainedIFileByHook(const char *filename)
 }
 
 static IArrayOf<IRemoteFileCreateHook> remoteFileHooks;
-static ReadWriteLock remoteFileHookLock;
+static ReadWriteLock remoteFileHookLock{SYNC_LOCATION};
 
 void addIFileCreateHook(IRemoteFileCreateHook *hook)
 {
@@ -5238,6 +5927,46 @@ bool isRemotePath(const char *path)
     }
 }
 
+bool containsRelPaths(const char *path)
+{
+    if (isEmptyString(path))
+        return false;
+    if (*path == '~')
+        return true;
+
+    const char *cur = path;
+    char sepChar = getPathSepCharEx(path);
+    char previousChar = sepChar;
+    for (;;)
+    {
+        switch (*cur)
+        {
+        case '.':
+        {
+            if (previousChar == sepChar)
+            {
+                cur++;
+                if ((*cur == sepChar) || (*cur == '\0')) // '.'
+                    return true;
+
+                if ('.' == *cur)
+                {
+                    cur++;
+                    if ((*cur == sepChar) || (*cur == '\0')) // '..'
+                        return true;
+                }
+            }
+            break;
+        }
+        case '\0':
+            return false;
+        }
+
+        previousChar = *cur;
+        cur++;
+    }
+}
+
 StringBuffer &makeAbsolutePath(const char *relpath,StringBuffer &out, bool mustExist)
 {
     // NOTE - this function also normalizes the supplied path to remove . and .. references
@@ -5247,7 +5976,7 @@ StringBuffer &makeAbsolutePath(const char *relpath,StringBuffer &out, bool mustE
         {
             OwnedIFile iFile = createIFile(relpath);
             if (!iFile->exists())
-                throw makeStringExceptionV(-1, "makeAbsolutePath: could not resolve absolute path for %s", relpath);
+                throw makeStringExceptionV(JLIBERR_MakeAbsolutePathResolveFailed, "makeAbsolutePath: could not resolve absolute path for %s", relpath);
         }
         return out.append(relpath); // if remote then already should be absolute
     }
@@ -5264,7 +5993,7 @@ StringBuffer &makeAbsolutePath(const char *relpath,StringBuffer &out, bool mustE
     {
         OwnedIFile iFile = createIFile(rPath);
         if (!iFile->exists())
-            throw makeStringExceptionV(-1, "makeAbsolutePath: could not resolve absolute path for %s", rPath);
+            throw makeStringExceptionV(JLIBERR_MakeAbsolutePathResolveFailed, "makeAbsolutePath: could not resolve absolute path for %s", rPath);
     }
     out.append(rPath);
 #else
@@ -5359,13 +6088,31 @@ const char *splitRelativePath(const char *full,const char *basedir,StringBuffer 
     const char *t = full;
     for (;;) {
         const char *n = findPathSepChar(t);
-        if (!n) 
+        if (!n)
             break;
         t = n+1;
     }
-    if (t!=full) 
+    if (t!=full)
         reldir.append(t-full,full);
     return t;
+}
+
+const char *getRelativePath(const char *path,const char *leadingPath)
+{
+    size_t pathLen = strlen(path);
+    size_t leadingLen = strlen(leadingPath);
+    if ((pathLen==leadingLen-1)&&isPathSepChar(leadingPath[leadingLen-1]))
+        --leadingLen;
+    if (0 == strncmp(path,leadingPath,leadingLen))
+    {
+        const char *rel = path + leadingLen;
+        if ('\0' == *rel)
+            return rel;
+        if (isPathSepChar(*rel))
+            return rel+1;
+        return rel;
+    }
+    return nullptr;
 }
 
 const char *splitDirMultiTail(const char *multipath,StringBuffer &dir,StringBuffer &tail)
@@ -5427,7 +6174,7 @@ StringBuffer &removeRelativeMultiPath(const char *full,const char *reldir,String
     ForEachItemIn(i,files) {
         const char *s = files.item(i);
         if (isAbsolutePath(s)) {
-            if (!dir.length()) 
+            if (!dir.length())
                 splitDirTail(s,dir);
         }
         else if (dir.length()) {
@@ -5486,7 +6233,7 @@ void extractBlobElements(const char * prefix, const RemoteFilename &filename, Ex
     Owned<IFile> file = createIFile(filename);
     Owned<IFileIO> inIO = file->open(IFOread);
     if (!inIO)
-        throw MakeStringException(-1, "extractBlobElements: file '%s' not found", filenameText.str());
+        throw MakeStringException(JLIBERR_ExtractBlobElementsFileNotFound, "extractBlobElements: file '%s' not found", filenameText.str());
     Owned<IFileIOStream> in = createIOStream(inIO);
 
     MemoryBuffer buffer;
@@ -5599,7 +6346,7 @@ bool mountDrive(const char *drv,const RemoteFilename &rfn)
     for (unsigned vtry=0;vtry<2;vtry++) {
         StringBuffer cmd;
         cmd.append("mount ");
-        rfn.queryIP().getIpText(cmd);
+        rfn.queryIP().getHostText(cmd);
         cmd.append(':');
         rfn.getLocalPath(cmd);
         cmd.append(' ').append(drv).append(" -t nfs ");
@@ -5628,7 +6375,7 @@ bool unmountDrive(const char *drv)
 
 }
 
-IFileIO *createUniqueFile(const char *dir, const char *prefix, const char *ext, StringBuffer &filename)
+IFileIO *createUniqueFile(const char *dir, const char *prefix, const char *ext, StringBuffer &filename, IFOmode mode)
 {
     CDateTime dt;
     dt.setNow();
@@ -5652,7 +6399,7 @@ IFileIO *createUniqueFile(const char *dir, const char *prefix, const char *ext, 
         OwnedIFile iFile = createIFile(filename.str());
         if (!iFile->exists())
         {
-            try { return iFile->openShared(IFOcreate, IFSHnone); } // NB: could be null if path not found
+            try { return iFile->openShared(mode, IFSHnone); } // NB: could be null if path not found
             catch (IException *e)
             {
                 EXCLOG(e, "createUniqueFile");
@@ -5665,17 +6412,35 @@ IFileIO *createUniqueFile(const char *dir, const char *prefix, const char *ext, 
     }
 }
 
+IFile * writeToProtectedTempFile(const char * component, const char * prefix, size_t len, const void * data)
+{
+    Owned<IFile> protectedFile;
+    StringBuffer tempDir;
+    getTempFilePath(tempDir, component, nullptr);
+
+    StringBuffer tempFilename;
+    OwnedIFileIO io = createUniqueFile(tempDir, prefix, NULL, tempFilename);
+    io->write(0, len, data);
+    io->close();
+
+    //Prevent any other users from accessing the file
+    protectedFile.setown(createIFile(tempFilename));
+    protectedFile->setFilePermissions(0700);
+
+    return protectedFile.getClear();
+}
+
 unsigned sortDirectory( CIArrayOf<CDirectoryEntry> &sortedfiles,
-                        IDirectoryIterator &iter, 
+                        IDirectoryIterator &iter,
                         SortDirectoryMode mode,
                         bool rev,
                         bool includedirs
-                      ) 
+                      )
 {
     sortedfiles.kill();
     StringBuffer name;
     ForEach(iter) {
-        if (!iter.isDir()||includedirs) 
+        if (!iter.isDir()||includedirs)
             sortedfiles.append(*new CDirectoryEntry(iter));
     }
     if (mode!=SD_nosort) {
@@ -5726,7 +6491,7 @@ public:
         return copies;
     }
 
-    
+
     IFile *open()
     {
         StringBuffer locations;
@@ -5751,7 +6516,7 @@ public:
         }
         if (exc.get())
             throw exc.getClear();
-        throw MakeStringException(0, "%s: Failed to open part file at any of the following locations: ", locations.str());
+        throw MakeStringException(JLIBERR_FailedToOpenPartFileAnyLocation, "%s: Failed to open part file at any of the following locations: ", locations.str());
     }
 };
 
@@ -5763,358 +6528,156 @@ IReplicatedFile *createReplicatedFile()
 
 // ---------------------------------------------------------------------------------
 
-class CSerialStreamBase : implements ISerialStream, public CInterface
+class CSimpleInputStream : public CInterfaceOf<ISerialInputStream>
 {
-private:
-    size32_t bufsize;
-    size32_t bufpos;
-    size32_t bufmax;
-    offset_t bufbase;
-    offset_t endpos; // -1 if not known
-    MemoryAttr ma;
-    byte *buf;
-    bool eoinput;
-    IFileSerialStreamCallback *tally;
-
-    inline size32_t doread(offset_t pos, size32_t max_size, void *ptr)
-    {
-        if (endpos!=(offset_t)-1) {
-            if (pos>=endpos)
-                return 0;
-            if (endpos-pos<max_size)
-                max_size = (size32_t)(endpos-pos);
-        }
-        size32_t size_read = rawread(pos, max_size, ptr);
-        if (tally)
-            tally->process(pos,size_read,ptr);
-        return size_read;
-    }
-
-    const void * dopeek(size32_t sz, size32_t &got) __attribute__((noinline))
-    {
-        for (;;)
-        {
-            size32_t left = bufmax-bufpos;
-            got = left;
-            if (left>=sz) 
-                return buf+bufpos;
-            if (eoinput) 
-                return left?(buf+bufpos):NULL;
-            size32_t reqsz = sz+bufsize;  // NB not sz-left as want some slack
-            if (ma.length()<reqsz) {
-                MemoryAttr ma2;
-                void *nb = ma2.allocate(reqsz);
-                memcpy(nb,buf+bufpos,left);
-                ma.setOwn(reqsz,ma2.detach());
-                buf = (byte *)nb;
-            }
-            else 
-                memmove(buf,buf+bufpos,left);
-            bufbase += bufpos;
-            size32_t rd = doread(bufbase+left,bufsize,buf+left);
-            if (!rd) 
-                eoinput = true;
-            bufmax = rd+left;
-            bufpos = 0;
-        }
-    }
-
-    void getreadnext(size32_t len, void * ptr) __attribute__((noinline))
-    {
-        bufbase += bufmax;
-        bufpos = 0;
-        bufmax = 0;
-        size32_t rd = 0;
-        if (!eoinput) {
-            //If reading >= bufsize, read any complete blocks directly into the target
-            if (len>=bufsize) {
-                size32_t tord = (len/bufsize)*bufsize;
-                rd =  doread(bufbase,tord,ptr);
-                bufbase += rd;
-                if (rd!=tord) {
-                    eoinput = true;
-                    PrintStackReport();
-                    IERRLOG("CFileSerialStream::get read past end of stream.1 (%u,%u) %s",rd,tord,eoinput?"eoinput":"");
-                    throw MakeStringException(-1,"CFileSerialStream::get read past end of stream");
-                }
-                len -= rd;
-                if (!len)
-                    return;
-                ptr = (byte *)ptr+rd;
-            }
-            const void *p = dopeek(len,rd);
-            if (len<=rd) {
-                memcpy(ptr,p,len);
-                bufpos += len;
-                return;
-            }
-        }
-        PrintStackReport();
-        IERRLOG("CFileSerialStream::get read past end of stream.2 (%u,%u) %s",len,rd,eoinput?"eoinput":"");
-        throw MakeStringException(-1,"CFileSerialStream::get read past end of stream");
-    }
-
-protected:
-    virtual size32_t rawread(offset_t pos, size32_t max_size, void *ptr) = 0;
-
 public:
-    IMPLEMENT_IINTERFACE;
-    CSerialStreamBase(offset_t _offset, offset_t _len, size32_t _bufsize, IFileSerialStreamCallback *_tally)
+    virtual void reset(offset_t _offset, offset_t _flen)
     {
-        tally = _tally;
-        bufsize = _bufsize;
-        if (bufsize==(size32_t)-1)
-            bufsize = DEFAULT_STREAM_BUFFER_SIZE; 
-        if (bufsize<4096)
-            bufsize = 4096;
-        else
-            bufsize = ((bufsize+4095)/4096)*4096;
-        buf = (byte *)ma.allocate(bufsize+4096); // 4K initial slack
-        bufpos = 0;
-        bufmax = 0;
-        bufbase = _offset;
-        if (_len==(offset_t)-1)
-            endpos = (offset_t)-1;
-        else
-            endpos = _offset+_len;
-        eoinput = (_len==0);
+        throwUnimplementedX("reset() not supported by this input stream");
     }
 
-    virtual void reset(offset_t _offset, offset_t _len) override
-    {
-        bufpos = 0;
-        bufmax = 0;
-        bufbase = _offset;
-        if (_len==(offset_t)-1)
-            endpos = (offset_t)-1;
-        else
-            endpos = _offset+_len;
-        eoinput = (_len==0);
-    }
-
-    virtual const void *peek(size32_t sz,size32_t &got) override
-    {
-        return dopeek(sz, got);
-    }
-
+    //MORE: This should possibly be a global helper function instead of a member - the logic should be the same for all stream instances.
     virtual void get(size32_t len, void * ptr) override
     {
-        size32_t cpy = bufmax-bufpos;
-        if (cpy>len)
-            cpy = len;
-        memcpy(ptr,(const byte *)buf+bufpos,cpy);
-        len -= cpy;
-        if (len==0) {
-            bufpos += cpy;
-            return;
-        }
-        return getreadnext(len, (byte *)ptr+cpy);
-    }
-
-    virtual bool eos() override
-    {
-        if (bufmax-bufpos)
-            return false;
-        size32_t rd;
-        return dopeek(1,rd)==NULL;
-    }
-
-    virtual void skip(size32_t len) override
-    {
-        size32_t left = bufmax-bufpos;
-        if (left>=len) {
-            bufpos += len;
-            return;
-        }
-        len -= left;
-        bufbase += bufmax;
-        bufpos = 0;
-        bufmax = 0;
-        if (!eoinput) {
-            while (len>=bufsize) {
-                size32_t rd;
-                if (tally) {
-                    rd = doread(bufbase,bufsize,buf);
-                    if (rd!=bufsize) {
-                        eoinput = true;
-                        throw MakeStringException(-1,"CFileSerialStream::skip read past end of stream");
-                    }
-                }
-                else {
-                    rd = (len/bufsize)*bufsize;
-                    //rd=doskip(bufbase,bufsize,buf); to cope with reading from sockets etc?
-                }
-                bufbase += rd;
-                len -= bufsize;
-            }
-            if (len==0)
+        assertex(len);
+        size32_t totalRead = 0;
+        //Keep reading until either the whole requested size is returned, or 0 is return from read() i.e. no more data.
+        for (;;)
+        {
+            size32_t sizeRead = read(len - totalRead, (byte *)ptr + totalRead);
+            if (sizeRead == 0)
+                break;
+            totalRead += sizeRead;
+            if (totalRead == len)
                 return;
-            size32_t got;
-            dopeek(len,got);
-            if (len<=got) {
-                bufpos += got;
-                return;
-            }
         }
-        throw MakeStringException(-1,"CFileSerialStream::skip read past end of stream");
+
+        Owned<IException> e = makeStringExceptionV(JLIBERR_InputStreamReadPastEnd, "InputStream::get read past end of stream (%u,%u) @offset %llu", (unsigned)len, (unsigned)totalRead, tell()-totalRead);
+        ERRLOG(e);
+        throw e.getClear();
     }
 
-    virtual offset_t tell() const override
+    // A very poor base implementation - suitable for small data streams that reads and discards data
+    virtual void skip(size32_t sz)
     {
-        return bufbase+bufpos;
-    }
+        constexpr size_t tempSkipSize = 0x4000;
+        byte tempSkipBuffer[tempSkipSize];
+        while (sz > tempSkipSize)
+        {
+            read(tempSkipSize, tempSkipBuffer);
+            sz -= tempSkipSize;
+        }
 
-};
-
-
-
-class CFileSerialStream: public CSerialStreamBase
-{
-    Linked<IFileIO> fileio;
-
-    virtual size32_t rawread(offset_t pos, size32_t max_size, void *ptr)  
-    {
-        return fileio->read(pos,max_size,ptr);
-    }
-
-public:
-    CFileSerialStream(IFileIO *_fileio,offset_t _offset, offset_t _len, size32_t _bufsize, IFileSerialStreamCallback *_tally)
-      : CSerialStreamBase(_offset, _len, _bufsize, _tally), fileio(_fileio)
-    {
+        if (sz)
+            read(sz, tempSkipBuffer);
     }
 };
 
+// ---------------------------------------------------------------------------------
 
-ISerialStream *createFileSerialStream(IFileIO *fileio,offset_t ofs, offset_t flen, size32_t bufsize,IFileSerialStreamCallback *callback)
+IBufferedSerialInputStream *createFileSerialStream(IFileIO *fileio,offset_t ofs, offset_t flen, size32_t bufsize)
 {
     if (!fileio)
         return NULL;
-    return new CFileSerialStream(fileio,ofs,flen,bufsize,callback);
+
+    if ((size32_t)-1 == bufsize)
+        bufsize = getBlockedSequentialIO(fileio, bufsize);
+    Owned<ISerialInputStream> fileStream = createSerialInputStream(fileio, ofs, flen);
+    return createBufferedInputStream(fileStream, bufsize);
 }
 
+//---------------------------------------------------------------------------------------------------------------------
 
-class CIoSerialStream: public CSerialStreamBase
+class CSimpleSocketInputStream final : public CSimpleInputStream
 {
-    Linked<IFileIOStream> io;
-    offset_t lastpos;
-
-
-    virtual size32_t rawread(offset_t pos, size32_t max_size, void *ptr)  
-    {
-        if (lastpos!=pos)
-            throw MakeStringException(-1,"CIoSerialStream: non-sequential read (%" I64F "d,%" I64F "d)",lastpos,pos);
-        size32_t rd = io->read(max_size,ptr);
-        lastpos = pos+rd;
-        return rd;
-    }
-
 public:
-    CIoSerialStream(IFileIOStream * _io,offset_t _offset, size32_t _bufsize, IFileSerialStreamCallback *_tally)
-      : CSerialStreamBase(_offset, (offset_t)-1, _bufsize, _tally), io(_io)
+    CSimpleSocketInputStream(ISocket * _socket, unsigned _timeout)
+    : socket(_socket), timeout(_timeout)
     {
-        lastpos = _offset;
     }
-};
 
-
-ISerialStream *createFileSerialStream(IFileIOStream *io,size32_t bufsize,IFileSerialStreamCallback *callback)
-{
-    if (!io)
-        return NULL;
-    return new CIoSerialStream(io,0,bufsize,callback);
-}
-
-
-class CSocketSerialStream: public CSerialStreamBase
-{
-    Linked<ISocket> socket;
-    unsigned timeout;
-    offset_t lastpos;
-
-    virtual size32_t rawread(offset_t pos, size32_t max_size, void *ptr)  
+    virtual size32_t read(size32_t len, void * ptr) override
     {
-        if (lastpos!=pos)
-            throw MakeStringException(-1,"CSocketSerialStream: non-sequential read (%" I64F "d,%" I64F "d)",lastpos,pos);
+        if (closed)
+            return 0;
         size32_t size_read;
-        socket->readtms(ptr, 0, max_size, size_read, timeout); 
-        lastpos = pos+size_read;
+        closed = readtmsAllowClose(socket, ptr, 1, len, size_read, timeout);
+        lastpos += size_read;
         return size_read;
     }
-
-public:
-    CSocketSerialStream(ISocket * _socket, unsigned _timeout, offset_t _offset, size32_t _bufsize, IFileSerialStreamCallback *_tally)
-      : CSerialStreamBase(_offset, (offset_t)-1, _bufsize, _tally), socket(_socket), timeout(_timeout)
+    virtual offset_t tell() const override
     {
-        lastpos = _offset;
+        return lastpos;
     }
+protected:
+    Linked<ISocket> socket;
+    offset_t lastpos = 0;
+    unsigned timeout;
+    bool closed = false;
 };
 
 
-ISerialStream *createSocketSerialStream(ISocket * socket, unsigned timeoutms, size32_t bufsize, IFileSerialStreamCallback *callback)
+//NOTE: This class/factory method is not currently used.  It is here as an example.
+ISerialInputStream *createSocketSerialStream(ISocket * socket, unsigned timeoutms, size32_t bufsize)
 {
     if (!socket)
         return NULL;
-    return new CSocketSerialStream(socket,timeoutms,0,bufsize,callback);
+    //MORE: This should probably be wrapped in a buffer if it was actually used.
+    return new CSimpleSocketInputStream(socket,timeoutms);
 }
 
+//---------------------------------------------------------------------------------------------------------------------
 
-class CSimpleReadSerialStream: public CSerialStreamBase
+class CSimpleReadInputStream final : public CSimpleInputStream
 {
-    Linked<ISimpleReadStream> input;
-    offset_t lastpos;
-
-    virtual size32_t rawread(offset_t pos, size32_t max_size, void *ptr)  
+public:
+    CSimpleReadInputStream(ISimpleReadStream * _input)
+    : input(_input)
     {
-        if (lastpos!=pos)
-            throw MakeStringException(-1,"CSimpleReadSerialStream: non-sequential read (%" I64F "d,%" I64F "d)",lastpos,pos);
-        size32_t rd = input->read(max_size, ptr);
+    }
+
+    virtual size32_t read(size32_t len, void * ptr) override
+    {
+        size32_t rd = input->read(len, ptr);
         lastpos += rd;
         return rd;
     }
-
-public:
-    CSimpleReadSerialStream(ISimpleReadStream * _input, offset_t _offset, size32_t _bufsize, IFileSerialStreamCallback *_tally)
-      : CSerialStreamBase(_offset, (offset_t)-1, _bufsize, _tally), input(_input)
+    virtual offset_t tell() const override
     {
-        lastpos = _offset;
+        return lastpos;
     }
-
-    void reset(offset_t _ofs, offset_t _len)
-    {
-        // assume knows what doing
-        lastpos = _ofs;
-        CSerialStreamBase::reset(_ofs,_len);
-    }
-
+protected:
+    Linked<ISimpleReadStream> input;
+    offset_t lastpos = 0;
 };
 
 
-ISerialStream *createSimpleSerialStream(ISimpleReadStream * input, size32_t bufsize, IFileSerialStreamCallback *callback)
+//NOTE: This class/factory method is not currently used.  It is here as an example.
+IBufferedSerialInputStream * createSimpleSerialStream(ISimpleReadStream * input, size32_t bufsize)
 {
     if (!input)
         return NULL;
-    return new CSimpleReadSerialStream(input,0,bufsize,callback);
+    Owned<ISerialInputStream> stream = new CSimpleReadInputStream(input);
+    return createBufferedInputStream(stream, bufsize);
 }
 
-
-class CMemoryMappedSerialStream: implements ISerialStream, public CInterface
+//---------------------------------------------------------------------------------------------------------------------
+class CMemoryMappedSerialStream: implements IBufferedSerialInputStream, public CInterface
 {
     Linked<IMemoryMappedFile> mmfile;
     const byte *mmbase;
     memsize_t mmsize;
     memsize_t mmofs;
     bool eoinput;
-    IFileSerialStreamCallback *tally;
 
 public:
     IMPLEMENT_IINTERFACE;
-    CMemoryMappedSerialStream(IMemoryMappedFile *_mmfile, offset_t ofs, offset_t flen, IFileSerialStreamCallback *_tally)
+    CMemoryMappedSerialStream(IMemoryMappedFile *_mmfile, offset_t ofs, offset_t flen)
         : mmfile(_mmfile)
     {
-        tally = _tally;
         offset_t fs = mmfile->fileSize();
         if ((memsize_t)fs!=fs)
-            throw MakeStringException(-1,"CMemoryMappedSerialStream file too big to be mapped");
+            throw MakeStringException(JLIBERR_StreamFileTooBigToMap, "CMemoryMappedSerialStream file too big to be mapped");
         if ((flen!=(offset_t)-1)&&(fs>flen))
             fs = flen;
         mmsize = (memsize_t)fs;
@@ -6134,11 +6697,11 @@ public:
         eoinput = false;
     }
 
-    CMemoryMappedSerialStream(const void *buf, memsize_t len, IFileSerialStreamCallback *_tally)
+    CMemoryMappedSerialStream(const void *buf, memsize_t len)
     {
-        tally = _tally;
         mmsize = len;
         mmofs = 0;
+
         mmbase = (const byte *)buf;
         eoinput = false;
     }
@@ -6148,7 +6711,7 @@ public:
         memsize_t left = mmsize-mmofs;
         if (sz>left)
             sz = (size32_t)left;
-        else if (left>=UINT_MAX) 
+        else if (left>=UINT_MAX)
             got = UINT_MAX-1;
         else
             got = (size32_t)left;
@@ -6161,12 +6724,20 @@ public:
         if (len>left) {
             PrintStackReport();
             IERRLOG("CFileSerialStream::get read past end of stream.3 (%u,%u)",(unsigned)len,(unsigned)left);
-            throw MakeStringException(-1,"CMemoryMappedSerialStream::get read past end of stream (%u,%u)",(unsigned)len,(unsigned)left);
+            throw MakeStringException(JLIBERR_MappedStreamReadPastEnd, "CMemoryMappedSerialStream::get read past end of stream (%u,%u)",(unsigned)len,(unsigned)left);
         }
-        if (tally)
-            tally->process(mmofs,len,mmbase+mmofs);
         memcpy(ptr,mmbase+mmofs,len);
         mmofs += len;
+    }
+
+    virtual size32_t read(size32_t len, void * ptr) override
+    {
+        memsize_t left = mmsize-mmofs;
+        if (len>left)
+            len = left;
+        memcpy(ptr,mmbase+mmofs,len);
+        mmofs += len;
+        return len;
     }
 
     virtual bool eos() override
@@ -6178,9 +6749,7 @@ public:
     {
         memsize_t left = mmsize-mmofs;
         if (len>left)
-            throw MakeStringException(-1,"CMemoryMappedSerialStream::skip read past end of stream (%u,%u)",(unsigned)len,(unsigned)left);
-        if (tally)
-            tally->process(mmofs,len,mmbase+mmofs);
+            throw MakeStringException(JLIBERR_MappedStreamSkipPastEnd, "CMemoryMappedSerialStream::skip read past end of stream (%u,%u)",(unsigned)len,(unsigned)left);
         mmofs += len;
     }
 
@@ -6191,25 +6760,24 @@ public:
 
 };
 
-ISerialStream *createFileSerialStream(IMemoryMappedFile *mmfile, offset_t ofs, offset_t flen, IFileSerialStreamCallback *callback)
+IBufferedSerialInputStream *createFileSerialStream(IMemoryMappedFile *mmfile, offset_t ofs, offset_t flen)
 {
-    return new CMemoryMappedSerialStream(mmfile,ofs,flen,callback);
+    return new CMemoryMappedSerialStream(mmfile,ofs,flen);
 }
 
-ISerialStream *createMemorySerialStream(const void *buffer, memsize_t len, IFileSerialStreamCallback *callback)
+IBufferedSerialInputStream *createMemorySerialStream(const void *buffer, memsize_t len)
 {
-    return new CMemoryMappedSerialStream(buffer,len,callback);
+    return new CMemoryMappedSerialStream(buffer,len);
 }
 
-class CMemoryBufferSerialStream: implements ISerialStream, public CInterface
+class CMemoryBufferSerialStream: implements IBufferedSerialInputStream, public CInterface
 {
     MemoryBuffer & buffer;
-    IFileSerialStreamCallback *tally;
 
 public:
     IMPLEMENT_IINTERFACE;
-    CMemoryBufferSerialStream(MemoryBuffer & _buffer, IFileSerialStreamCallback * _tally)
-        : buffer(_buffer), tally(_tally)
+    CMemoryBufferSerialStream(MemoryBuffer & _buffer)
+        : buffer(_buffer)
     {
     }
 
@@ -6223,12 +6791,19 @@ public:
     {
         if (len>buffer.remaining()) {
             IERRLOG("CMemoryBufferSerialStream::get read past end of stream.4(%u,%u)",(unsigned)len,(unsigned)buffer.remaining());
-            throw MakeStringException(-1,"CMemoryBufferSerialStream::get read past end of stream (%u,%u)",(unsigned)len,(unsigned)buffer.remaining());
+            throw MakeStringException(JLIBERR_BufferStreamReadPastEnd, "CMemoryBufferSerialStream::get read past end of stream (%u,%u)",(unsigned)len,(unsigned)buffer.remaining());
         }
         const void * data = buffer.readDirect(len);
-        if (tally)
-            tally->process(buffer.getPos()-len,len,data);
         memcpy(ptr,data,len);
+    }
+
+    virtual size32_t read(size32_t len, void * ptr) override
+    {
+        if (len>buffer.remaining())
+            len = buffer.remaining();
+        const void * data = buffer.readDirect(len);
+        memcpy(ptr,data,len);
+        return len;
     }
 
     virtual bool eos() override
@@ -6239,11 +6814,9 @@ public:
     virtual void skip(size32_t len) override
     {
         if (len>buffer.remaining())
-            throw MakeStringException(-1,"CMemoryBufferSerialStream::skip read past end of stream (%u,%u)",(unsigned)len,(unsigned)buffer.remaining());
+            throw MakeStringException(JLIBERR_BufferStreamSkipPastEnd, "CMemoryBufferSerialStream::skip read past end of stream (%u,%u)",(unsigned)len,(unsigned)buffer.remaining());
 
-        const void * data = buffer.readDirect(len);
-        if (tally)
-            tally->process(buffer.getPos()-len,len,data);
+        buffer.skip(len);
     }
 
     virtual offset_t tell() const override
@@ -6260,9 +6833,9 @@ public:
     }
 };
 
-ISerialStream *createMemoryBufferSerialStream(MemoryBuffer & buffer, IFileSerialStreamCallback *callback)
+IBufferedSerialInputStream *createMemoryBufferSerialStream(MemoryBuffer & buffer)
 {
-    return new CMemoryBufferSerialStream(buffer,callback);
+    return new CMemoryBufferSerialStream(buffer);
 }
 
 
@@ -6274,18 +6847,18 @@ ISerialStream *createMemoryBufferSerialStream(MemoryBuffer & buffer, IFileSerial
 class CMemoryMappedFile: implements IMemoryMappedFile, public CInterface
 {
     byte *ptr;            // base
-    offset_t ofs;       
+    offset_t ofs;
     offset_t realofs;    // rounded down to page size
     offset_t filesize;
     memsize_t size;
-    bool writeaccess;          
+    bool writeaccess;
     memsize_t windowsize;
-    
+
     HANDLE hfile;
 #ifdef _WIN32
     static size32_t pagesize;
     HANDLE hmap;
-#endif  
+#endif
 
     Linked<IFile> file;
 
@@ -6371,14 +6944,14 @@ public:
 #endif
         }
     }
-    
+
     byte *nextPtr(const void *p,offset_t skip, memsize_t req, memsize_t &got)
     {
         // for scanning in sequence
-        if (p==NULL) 
+        if (p==NULL)
             p = ptr;
         else if ((p<ptr)||(p>ptr+size))
-            throw MakeStringException(-1,"CMemoryMappedFile::nextPtr - outside map");           
+            throw MakeStringException(JLIBERR_MemoryMappedFileOutsideMap, "CMemoryMappedFile::nextPtr - outside map");
         memsize_t d = (byte *)p-ptr;
         offset_t o = ofs+d+skip;
         if (o>=filesize) {
@@ -6401,7 +6974,7 @@ public:
             got = (memsize_t)left;
         return (byte *)p+skip;
     }
-        
+
     virtual void reinit(offset_t _ofs, memsize_t _size, bool _writeaccess)
     {
         writeaccess = _writeaccess;
@@ -6427,8 +7000,8 @@ public:
         realofs = pageround(ofs);
         if (_size==(memsize_t)-1) {
             size = (memsize_t)(filesize-_ofs);
-            if (size!=(filesize-_ofs)) 
-                throw MakeStringException(-1,"CMemoryMappedFile::reinit file too big");         
+            if (size!=(filesize-_ofs))
+                throw MakeStringException(JLIBERR_MemoryMappedFileReinitTooBig, "CMemoryMappedFile::reinit file too big");
         }
         else
             size = _size;
@@ -6444,7 +7017,7 @@ public:
                 throw makeOsException(err,"CMemoryMappedFile::reinit");
             }
         }
-        li.QuadPart = realofs; 
+        li.QuadPart = realofs;
         ptr = (byte *) MapViewOfFile(hmap, writeaccess?(FILE_MAP_READ|FILE_MAP_WRITE):FILE_MAP_READ, li.HighPart, li.LowPart, mapsz);
         if (!ptr) {
             DWORD err = GetLastError();
@@ -6475,7 +7048,7 @@ size32_t CMemoryMappedFile::pagesize=0;
 IMemoryMappedFile *CFile::openMemoryMapped(offset_t ofs, memsize_t len, bool write)
 {
     HANDLE hfile = openHandle(write?IFOcreaterw:IFOread, IFSHread, false);
-    if (hfile == NULLFILE) 
+    if (hfile == NULLFILE)
         return NULL;
     return new CMemoryMappedFile(hfile,size(),ofs,len,write);
 }
@@ -6489,7 +7062,7 @@ bool isSpecialPath(const char *path)
     if (isPathSepChar(path[0])&&(path[0]==path[1])) {
         path += 2;
         for (;;) {
-            if (*path=='/') 
+            if (*path=='/')
                 return (path[1]=='>');
             if (!*path||(*path=='\\'))
                 return false;
@@ -6523,7 +7096,7 @@ size32_t SendFile(ISocket *target, IFileIO *fileio,offset_t start,size32_t len)
                 // TransmitFile not in std DLLs so don't bother with
                 off_t ofs = start;
                 ssize_t sent = ::sendfile(sh,fh,&ofs,len);
-                if (sent!=(ssize_t)-1) 
+                if (sent!=(ssize_t)-1)
                     return (size32_t)sent;
                 int err = errno;
                 if ((err!=EINVAL)&&(err!=ENOSYS))
@@ -6555,12 +7128,12 @@ void asyncClose(IFileIO *io)
 {
     if (!io)
         return;
-    static CriticalSection ADsect;
+    static CriticalSection ADsect(SYNC_LOCATION);
     CriticalBlock block(ADsect);
     static Owned<IWorkQueueThread> adwp = createWorkQueueThread();
     class cWQI: public CInterface,implements IWorkQueueItem
     {
-        Owned<IFileIO> io; 
+        Owned<IFileIO> io;
     public:
         IMPLEMENT_IINTERFACE;
         cWQI(IFileIO *_io)
@@ -6607,6 +7180,7 @@ class CLazyFileIOCache;
 class CCachedFileIO: implements IFileIO, public CInterface
 {
     CLazyFileIOCache &owner;
+    Owned<IFile> inFile;
     RemoteFilename filename;
     CriticalSection &sect;
     CRuntimeStatisticCollection fileStats;
@@ -6616,7 +7190,7 @@ class CCachedFileIO: implements IFileIO, public CInterface
     {
         StringBuffer tmp;
         filename.getRemotePath(tmp);
-        throw MakeStringException(-1, "CCachedFileIO(%s) %s not supported", tmp.str(), s);
+        throw MakeStringException(JLIBERR_CachedFileIONotSupported, "CCachedFileIO(%s) %s not supported", tmp.str(), s);
     }
 public:
     unsigned accesst;
@@ -6629,13 +7203,14 @@ public:
         filename.set(_filename);
         mode = _mode;
         accesst = 0;
+        inFile.setown(createIFile(filename));
     }
 
     virtual void Link(void) const       { CInterface::Link(); }                     \
 
     virtual bool Release(void) const;
-    
-    unsigned __int64 getStatistic(StatisticKind kind)
+
+    unsigned __int64 getStatistic(StatisticKind kind) override
     {
         CriticalBlock block(sect);
         unsigned __int64 openValue = cachedio ? cachedio->getStatistic(kind) : 0;
@@ -6644,43 +7219,41 @@ public:
 
     IFileIO *open();
 
-    size32_t read(offset_t pos, size32_t len, void * data)
+    virtual size32_t read(offset_t pos, size32_t len, void * data)
     {
         CriticalBlock block(sect);
         Owned<IFileIO> io = open();
         return io->read(pos,len,data);
     }
-    offset_t size() 
+    virtual offset_t size() override
     {
         CriticalBlock block(sect);
         Owned<IFileIO> io = open();
         return io->size();
     }
-    size32_t write(offset_t pos, size32_t len, const void * data) 
+    virtual size32_t write(offset_t pos, size32_t len, const void * data) override
     {
         CriticalBlock block(sect);
         Owned<IFileIO> io = open();
         return io->write(pos,len,data);
     }
-    virtual void flush()
+    virtual void flush() override
     {
         CriticalBlock block(sect);
         if (cachedio)
             cachedio->flush();
     }
-    virtual void close()
+    virtual void close() override
     {
         CriticalBlock block(sect);
         if (cachedio)
             forceClose();
     }
-    offset_t appendFile(IFile *file,offset_t pos,offset_t len)
+    virtual IFile * queryFile() const override
     {
-        CriticalBlock block(sect);
-        Owned<IFileIO> io = open();
-        return io->appendFile(file,pos,len);
+        return inFile;
     }
-    void setSize(offset_t size) 
+    void setSize(offset_t size)
     {
         CriticalBlock block(sect);
         Owned<IFileIO> io = open();
@@ -6697,7 +7270,7 @@ public:
 
 class CLazyFileIOCache: implements IFileIOCache, public CInterface
 {
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     unsigned max;
     IPointerArrayOf<CCachedFileIO> cache;
 public:
@@ -6754,7 +7327,7 @@ public:
         }
     }
 
-    const CCachedFileIO *removeFile(const CCachedFileIO *io) 
+    const CCachedFileIO *removeFile(const CCachedFileIO *io)
     {
         CriticalBlock block(sect);
         ForEachItemIn(idx, cache)
@@ -6770,11 +7343,11 @@ public:
 };
 
 
-bool CCachedFileIO::Release(void) const 
-{ 
+bool CCachedFileIO::Release(void) const
+{
     if (CInterface::Release())
         return true;
-    if (!CInterface::IsShared()) 
+    if (!CInterface::IsShared())
         return owner.removeFile(this)->Release();
     return false;
 }
@@ -6784,12 +7357,11 @@ IFileIO *CCachedFileIO::open()
     // called in sect
     if (!cachedio) {
         owner.checkCache();
-        Owned<IFile> inFile = createIFile(filename);
         cachedio.setown(inFile->open(mode));
         if (!cachedio.get()) {
             StringBuffer tmp;
             filename.getRemotePath(tmp);
-            throw MakeStringException(-1, "CCachedFileIO::open(%d) '%s' failed", (int)mode, tmp.str());
+            throw MakeStringException(JLIBERR_CachedFileIOOpenFailed, "CCachedFileIO::open(%d) '%s' failed", (int)mode, tmp.str());
         }
     }
     accesst = msTick();
@@ -6803,11 +7375,14 @@ IFileIOCache* createFileIOCache(unsigned max)
 }
 
 
-extern jlib_decl IFile * createSentinelTarget()
+extern jlib_decl IFile * createSentinelTarget(const char *suffix)
 {
     const char * sentinelFilename = getenv("SENTINEL");
-    if (sentinelFilename)
-        return createIFile(sentinelFilename);
+    if (sentinelFilename && *sentinelFilename)
+    {
+        VStringBuffer usename("%s%s", sentinelFilename, suffix ? suffix : "");
+        return createIFile(usename);
+    }
     else
         return NULL;
 }
@@ -6838,16 +7413,17 @@ extern jlib_decl void writeSentinelFile(IFile * sentinelFile)
 {
     if ( sentinelFile )
     {
-        DBGLOG("Creating sentinel file %s for rerun from script", sentinelFile->queryFilename());
+        DBGLOG("Creating sentinel file %s", sentinelFile->queryFilename());
         try
         {
             Owned<IFileIO> sentinel = sentinelFile->open(IFOcreate);
             sentinel->write(0, 5, "rerun");
+            sentinel->close();
         }
         catch(IException *E)
         {
             StringBuffer s;
-            EXCLOG(E, s.appendf("Failed to create sentinel file %s for rerun from script", sentinelFile->queryFilename()).str());
+            EXCLOG(E, s.appendf("Failed to create sentinel file %s", sentinelFile->queryFilename()).str());
             E->Release();
             throw makeOsException(errno, "writeSentinelFile - file not created.");
         }
@@ -6945,7 +7521,7 @@ public:
 IDirectoryIterator *getSortedDirectoryIterator(IFile *directory, SortDirectoryMode mode, bool rev, const char *mask, bool sub, bool includedirs)
 {
     if (!directory || directory->isDirectory()!=fileBool::foundYes)
-        throw MakeStringException(-1, "Invalid IFile input in getSortedDirectoryIterator()");
+        throw MakeStringException(JLIBERR_InvalidIFileInputSortedDirIterator, "Invalid IFile input in getSortedDirectoryIterator()");
 
     Owned<IDirectoryIterator> files = directory->directoryFiles(mask, sub, includedirs);
     if (SD_nosort == mode)
@@ -6956,9 +7532,9 @@ IDirectoryIterator *getSortedDirectoryIterator(IFile *directory, SortDirectoryMo
 IDirectoryIterator *getSortedDirectoryIterator(const char *dirName, SortDirectoryMode mode, bool rev, const char *mask, bool sub, bool includedirs)
 {
     if (isEmptyString(dirName))
-        throw MakeStringException(-1, "Invalid dirName input in getSortedDirectoryIterator()");
+        throw MakeStringException(JLIBERR_InvalidDirNameInputSortedDirIterator, "Invalid dirName input in getSortedDirectoryIterator()");
 
-    Owned<IFile> dir = createIFile(dirName); 
+    Owned<IFile> dir = createIFile(dirName);
     return getSortedDirectoryIterator(dir, mode, rev, mask, sub, includedirs);
 }
 
@@ -6996,3 +7572,478 @@ void FileIOStats::trace()
         printf("Writes: %u  Bytes: %u  TimeMs: %u\n", (unsigned)ioWrites, (unsigned)ioWriteBytes, (unsigned)cycle_to_millisec(ioWriteCycles));
 }
 
+//--------------------------------------------------------------------------------------------------------------------
+
+static constexpr FileSystemProperties linuxFileSystemProperties     {true, false};
+static constexpr FileSystemProperties defaultUrlFileSystemProperties{false, false};
+
+//This implementation should eventually make use of the file hook.
+const FileSystemProperties & queryFileSystemProperties(const char * filename)
+{
+    if (isUrl(filename))
+        return defaultUrlFileSystemProperties;
+    else
+        return linuxFileSystemProperties;
+}
+
+
+#if defined(__linux__)
+class CFileEventWatcher : public CInterfaceOf<IFileEventWatcher>, implements IThreaded
+{
+    class CMonitoredItem : public CInterface
+    {
+    public:
+        CMonitoredItem(const char *_filename, int _watchFd, FileWatchEvents _events) : filename(_filename), watchFd(_watchFd), events(_events)
+        {
+        }
+        std::string filename;
+        int watchFd = -1;
+        FileWatchEvents events = FileWatchEvents::none;
+        bool pendingRemoval = false;
+    };
+    int inotifyFd = -1;
+    int pipefd[2] = {-1, -1};
+    pollfd toPoll[2];
+    std::unordered_map<int, Linked<CMonitoredItem>> monitoredFilesByFd;
+    std::unordered_map<std::string, Linked<CMonitoredItem>> monitoredFiles;
+    std::unordered_set<int> pendingRemovals;
+    CriticalSection crit{SYNC_LOCATION};
+    FileWatchFunc callback;
+    CThreaded threaded;
+    std::atomic<bool> stopped{true};
+
+    void handleEvents(int fd)
+    {
+        byte buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+
+        while (true)
+        {
+            ssize_t len = read(fd, buf, sizeof(buf));
+            if (len == -1 && errno != EAGAIN)
+                throw makeErrnoException("CFileEventWatcher::handleEvents - read");
+
+            if (len <= 0)
+                break;
+
+            const byte *ptr = buf;
+
+            do
+            {
+                const struct inotify_event *event = (const struct inotify_event *) ptr;
+                std::string filename;
+                if (event->len) // if watching directory event->name is populated with file within that dir.
+                    filename = event->name;
+                else
+                {
+                    // if watching a file, lookup filename from event handle
+                    CriticalBlock b(crit);
+                    auto iter = monitoredFilesByFd.find(event->wd);
+                    if (iter != monitoredFilesByFd.end())
+                    {
+                        filename = iter->second->filename;
+                        break;
+                    }
+                }
+                /* NB: in this impl. inotify_event flags are same as FileWatchEvents bit masks
+                 * If other implementations differ, they will need mapping to FileWatchEvents
+                 */
+                FileWatchEvents events = static_cast<FileWatchEvents>(event->mask);
+
+                callback(filename.c_str(), events);
+
+                ptr += sizeof(struct inotify_event) + event->len;
+            }
+            while (ptr < (buf + len));
+        }
+    }
+    void checkClose(int h)
+    {
+        if (-1 != h)
+            close(h);
+    }
+public:
+    CFileEventWatcher(FileWatchFunc _callback) : callback(_callback), threaded("CFileEventWatcher", this)
+    {
+        inotifyFd = inotify_init1(IN_NONBLOCK|IN_CLOEXEC);
+        if (-1 == inotifyFd)
+            throw makeErrnoException(-1, "CFileEventWatcher - inotify_init1");
+
+        if (pipe2(pipefd, O_NONBLOCK|O_CLOEXEC))
+            throw makeErrnoException(-1, "CFileEventWatcher - create pipe failed");
+
+        /*
+         * Setup an array of file handles to use with poll.
+         * Add the inotify fd that will receive event info on
+         * Add the pipe input fd created above, this is used to write to, to "wake up" the poll loop when watcher is stopped.
+         */
+        toPoll[0].fd = pipefd[0];
+        toPoll[0].events = POLLIN;
+        toPoll[1].fd = inotifyFd;
+        toPoll[1].events = POLLIN;
+    }
+    ~CFileEventWatcher()
+    {
+        stop();
+        checkClose(inotifyFd);
+        checkClose(pipefd[0]);
+        checkClose(pipefd[1]);
+    }
+    virtual void start() override
+    {
+        if (stopped)
+        {
+            stopped = false;
+            threaded.start(false);
+        }
+    }
+    virtual void stop() override
+    {
+        if (stopped)
+            return;
+        stopped = true;
+
+        const byte c = 0;
+        if (write(pipefd[1], &c, 1) != 1)
+        {
+            Owned<IException> e = makeErrnoException("CFileEventWatcher::stop() - write -> pipefd[1]");
+            EXCLOG(e);
+        }
+        threaded.join();
+    }
+    virtual bool add(const char *filename, FileWatchEvents events) override
+    {
+        if (isEmptyString(filename))
+            throw makeStringException(JLIBERR_FileEventWatcherAddInvalidEmpty, "CFileEventWatcher::add() - invalid empty filename");
+        CriticalBlock b(crit);
+        auto iter = monitoredFiles.find(filename);
+        if (iter != monitoredFiles.end()) // filename already monitored
+            return false;
+
+        /* NB: in this impl. inotify_event flags are same as FileWatchEvents bit masks
+         * If other implementations differ, events will need mapping to the underlying impl.
+         */
+        int iNotifyEvents = static_cast<int>(events);
+        int wd = inotify_add_watch(inotifyFd, filename, iNotifyEvents);
+        if (-1 == wd)
+            throw makeErrnoExceptionV(-1, "CFileEventWatcher::add() - Cannot watch '%s'", filename);
+        Owned<CMonitoredItem> item = new CMonitoredItem(filename, wd, events);
+        monitoredFiles.emplace(filename, item);
+        monitoredFilesByFd.emplace(wd, item);
+
+        return true;
+    }
+    virtual bool remove(const char *filename) override
+    {
+        if (isEmptyString(filename))
+            return false;
+
+        CriticalBlock b(crit);
+        auto iter = monitoredFiles.find(filename);
+        if (iter == monitoredFiles.end()) // filename is not being monitored
+            return false;
+        CMonitoredItem *item = iter->second;
+        if (item->pendingRemoval) // already flagged for removal
+            return false;
+
+        item->pendingRemoval = true;
+        pendingRemovals.emplace(item->watchFd);
+
+        if (-1 == inotify_rm_watch(inotifyFd, item->watchFd))
+            throw makeErrnoException("CFileEventWatcher::remove() - inotify_rm_watch()");
+        return true;
+    }
+// IThreaded impl.
+    virtual void threadmain() override
+    {
+        try
+        {
+            while (true)
+            {
+                int poll_num = poll(toPoll, 2, -1);
+                if (-1 == poll_num)
+                {
+                    if (EINTR == errno)
+                        continue;
+                    throw makeErrnoException("CFileEventWatcher - poll error");
+                }
+
+                if (poll_num)
+                {
+                    if (toPoll[0].revents & POLLIN)
+                    {
+                        if (stopped)
+                            break;
+                    }
+                    else if (toPoll[1].revents & POLLIN)
+                    {
+                        handleEvents(inotifyFd);
+
+                        // clear any pending deletes
+                        CriticalBlock b(crit);
+                        for (const auto fd: pendingRemovals)
+                        {
+                            auto iter = monitoredFilesByFd.find(fd);
+                            if (iter != monitoredFilesByFd.end())
+                            {
+                                CMonitoredItem *item = iter->second;
+                                if (item->pendingRemoval) // if false, it implies the handle was removed, but has been reused and re-added since removal.
+                                {
+                                    monitoredFiles.erase(item->filename);
+                                    monitoredFilesByFd.erase(iter);
+                                }
+                            }
+                        }
+                        pendingRemovals.clear();
+                    }
+                }
+            }
+        }
+        catch (IException *e)
+        {
+            EXCLOG(e);
+            e->Release();
+        }
+    }
+};
+
+IFileEventWatcher *createFileEventWatcher(FileWatchFunc callback)
+{
+    return new CFileEventWatcher(callback);
+}
+#else
+IFileEventWatcher *createFileEventWatcher(FileWatchFunc callback)
+{
+    UNIMPLEMENTED_X("createFileEventWatcher() not supported on this platform");
+}
+#endif // __linux__
+
+
+//---- Storage plane related functions ----------------------------------------------------
+
+
+
+// NB: This implementation is not thread-safe.
+// Therefore it should only be used by use cases that are single threaded
+class CBlockedFileIO : public CSimpleInterfaceOf<IFileIO>
+{
+    Owned<IFileIO> io;
+    size32_t blockSize = 0;
+    size32_t readLen = 0;
+    void *buffer = nullptr;
+    offset_t lastReadPos = (offset_t)-1;
+    MemoryBuffer mb;
+    std::atomic<bool> isActive{false};
+public:
+    CBlockedFileIO(IFileIO *_io, size32_t _blockSize) : io(_io), blockSize(_blockSize)
+    {
+        buffer = mb.reserveTruncate(blockSize);
+    }
+    virtual size32_t read(offset_t pos, size32_t len, void *data) override
+    {
+        if (unlikely(len > blockSize))
+            return io->read(pos, len, data);
+
+        //A sanity check to catch calls from multiple threads - (see HPCC-31852).
+        if (unlikely(isActive))
+            throw makeStringExceptionV(JLIBERR_ReentrantCallCBlockedFileIORead, "Reentrant call to CBlockedFileIO::read(%llu, %u) [%llu]", pos, len, lastReadPos);
+        isActive = true;
+
+        size32_t totalCopied = 0;
+        try
+        {
+            byte *dest = (byte *) data;
+            while (len)
+            {
+                offset_t readPos = (pos / blockSize) * blockSize; // NB: could be beyond end of file
+                if (readPos != lastReadPos)
+                {
+                    readLen = io->read(readPos, blockSize, buffer); // NB: can be less than blockSize (and 0 if beyond end of file)
+                    lastReadPos = readPos;
+                }
+                offset_t endPos = readPos+readLen;
+                size32_t copyNow;
+                if (pos+len <= endPos) // common case hopefully
+                    copyNow = len;
+                else if (pos < endPos)
+                    copyNow = endPos-pos;
+                else // nothing to copy
+                    break;
+                memcpy(dest, ((byte *)buffer) + pos-readPos, copyNow);
+                len -= copyNow;
+                pos += copyNow;
+                dest += copyNow;
+                totalCopied += copyNow;
+            }
+        }
+        catch (...)
+        {
+            isActive = false;
+            throw;
+        }
+        isActive = false;
+        return totalCopied;
+    }
+    virtual offset_t size() override { return io->size(); }
+    virtual size32_t write(offset_t pos, size32_t len, const void * data) override { throwUnexpected(); }
+    virtual void setSize(offset_t size) override { throwUnexpected(); }
+    virtual void flush() override { throwUnexpected(); }
+    virtual void close() override { io->close(); }
+    virtual unsigned __int64 getStatistic(StatisticKind kind) override { return io->getStatistic(kind); }
+    virtual IFile * queryFile() const { return io->queryFile(); }
+};
+
+extern IFileIO *createBlockedIO(IFileIO *base, size32_t blockSize)
+{
+    return new CBlockedFileIO(base, blockSize);
+}
+
+///---------------------------------------------------------------------------------------------------------------------
+
+// Module-level global that will contain a list of pluggable file type
+// names (e.g. "parquet", "csv") that are supported through the
+// generic disk reader and writer interfaces
+static StringArray genericFileTypeNameList;
+
+void addAvailableGenericFileTypeName(const char * name)
+{
+    if (!genericFileTypeNameList.contains(name))
+        genericFileTypeNameList.append(name);
+}
+
+// Determine if file type is defined; used by the ECL parser
+bool hasGenericFiletypeName(const char * name)
+{
+    ForEachItemIn(idx, genericFileTypeNameList)
+    {
+        if (strieq(genericFileTypeNameList.item(idx), name))
+            return true;
+    }
+
+    return false;
+}
+
+IAPICopyClient * createApiCopyClient(IStorageApiInfo * source, IStorageApiInfo * target)
+{
+    ReadLockBlock block(containedFileHookLock);
+    ForEachItemIn(i, containedFileHooks)
+    {
+        IAPICopyClient * copyClient = containedFileHooks.item(i).getCopyApiClient(source, target);
+        if (copyClient)
+            return copyClient;
+    }
+    return nullptr;
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+// Cache/update plane attributes settings
+static unsigned jFileHookId = 0;
+
+MODULE_INIT(INIT_PRIORITY_STANDARD)
+{
+    auto updateFunc = [&](const IPropertyTree *oldComponentConfiguration, const IPropertyTree *oldGlobalConfiguration)
+    {
+        expertEnableIFileFlagsMask = IFEnone;
+        expertDisableIFileFlagsMask = IFEnone;
+
+        Owned<IPropertyTree> componentConfig = getComponentConfig();
+        Owned<IPropertyTree> globalConfig = getGlobalConfig();
+        StringBuffer fileFlagsStr;
+        if (componentConfig->getProp("expert/@enableIFileMask", fileFlagsStr) || globalConfig->getProp("expert/@enableIFileMask", fileFlagsStr))
+            expertEnableIFileFlagsMask = (IFEflags)strtoul(fileFlagsStr, NULL, 0);
+
+        if (componentConfig->getProp("expert/@disableIFileMask", fileFlagsStr.clear()) || globalConfig->getProp("expert/@disableIFileMask", fileFlagsStr))
+            expertDisableIFileFlagsMask = (IFEflags)strtoul(fileFlagsStr, NULL, 0);
+
+        safeStatBehaviour = static_cast<SafeStatBehaviour>(componentConfig->getPropInt("expert/@safeStatBehaviour", globalConfig->getPropInt("expert/@safeStatBehaviour", static_cast<unsigned>(defaultSafeStatBehaviour))));
+        if (safeStatBehaviour >= SafeStatBehaviour::Count) // safeguard against bad config value
+            safeStatBehaviour = defaultSafeStatBehaviour;
+
+        std::string propName = "expert/@" + std::string(getPlaneAttributeString(FileSyncWriteClose));
+        if (componentConfig->hasProp(propName.c_str()))
+            defaultFileSyncWriteCloseEnabled = componentConfig->getPropBool(propName.c_str());
+        else
+        {
+            if (globalConfig->hasProp(propName.c_str()))
+                defaultFileSyncWriteCloseEnabled = globalConfig->getPropBool(propName.c_str());
+        }
+    };
+    jFileHookId = installConfigUpdateHook(updateFunc, true);
+
+    return true;
+}
+
+MODULE_EXIT()
+{
+    removeConfigUpdateHook(jFileHookId);
+}
+
+bool getFileSyncWriteCloseEnabled(const char *planeName)
+{
+    return 0 != getPlaneAttributeValue(planeName, FileSyncWriteClose, defaultFileSyncWriteCloseEnabled ? 1 : 0);
+}
+
+unsigned getWriteSyncMarginMs(const char * planeName)
+{
+    constexpr unsigned dft = 0;
+    return (unsigned)getPlaneAttributeValue(planeName, WriteSyncMarginMs, dft);
+}
+
+static constexpr bool defaultConcurrentWriteSupport = isContainerized() ? false : true;
+bool getConcurrentWriteSupported(const char *planeName)
+{
+    return 0 != getPlaneAttributeValue(planeName, ConcurrentWriteSupport, defaultConcurrentWriteSupport ? 1 : 0);
+}
+
+static size32_t getBlockedSizeFromFile(const char *filePath, PlaneAttributeType type, size32_t defaultSize)
+{
+    if (filePath)
+    {
+        Owned<const IStoragePlane> plane = getStoragePlaneFromPath(filePath, false);
+        if (plane)
+            return plane->getAttribute(type, defaultSize);
+    }
+    return defaultSize;
+}
+
+static size32_t getBlockedSizeFromFile(IFile *file, PlaneAttributeType type, size32_t defaultSize)
+{
+    if (file)
+    {
+        const char * filename = file->queryFilename();
+        return getBlockedSizeFromFile(filename, type, defaultSize);
+    }
+    return defaultSize;
+}
+
+size32_t getBlockedSequentialIO(const char *filePath, size32_t defaultSize)
+{
+    return getBlockedSizeFromFile(filePath, BlockedSequentialIO, defaultSize);
+}
+
+size32_t getBlockedSequentialIO(IFile *file, size32_t defaultSize)
+{
+    return getBlockedSizeFromFile(file, BlockedSequentialIO, defaultSize);
+}
+
+size32_t getBlockedSequentialIO(IFileIO * fileio, size32_t defaultSize)
+{
+    IFile * file = fileio->queryFile();
+    return getBlockedSequentialIO(file, defaultSize);
+}
+
+size32_t getBlockedRandomIO(const char *filePath, size32_t defaultSize)
+{
+    return getBlockedSizeFromFile(filePath, BlockedRandomIO, defaultSize);
+}
+
+size32_t getBlockedRandomIO(IFile *file, size32_t defaultSize)
+{
+    return getBlockedSizeFromFile(file, BlockedRandomIO, defaultSize);
+}
+
+size32_t getBlockedRandomIO(IFileIO * fileio, size32_t defaultSize)
+{
+    IFile * file = fileio->queryFile();
+    return getBlockedRandomIO(file, defaultSize);
+}

@@ -19,8 +19,7 @@
   </bookinfo>
 
   <chapter id="Command_Line_DFU">
-    <title><emphasis role="bold">Interface de linha de comando
-    DFU.</emphasis></title>
+    <title>Interface de linha de comando DFUPlus</title>
 
     <sect1 id="Command_Line_InterfaceDFU" role="nobrk">
       <title>Interface de Linha de Comando</title>
@@ -150,7 +149,7 @@
 
               <tbody>
                 <row>
-                  <entry><emphasis>servidor</emphasis></entry>
+                  <entry><emphasis>server</emphasis></entry>
 
                   <entry>A URL (http:// ou https://) e/ou endereço IP do
                   servidor ESP . A porta também deve ser incluída.</entry>
@@ -211,6 +210,14 @@
                   <entry>Opcional. O número de conexões simultâneas para
                   limitar a <emphasis>operação </emphasis>. Se omitido, o
                   padrão é 25.</entry>
+                </row>
+
+                <row>
+                  <entry><emphasis><emphasis>nocommon</emphasis></emphasis></entry>
+
+                  <entry>Opcional. Um sinalizador booleano (0 | 1, padrão=1).
+                  Defina como 0 para habilitar a "comunização" de processos
+                  pull ou push no mesmo host.</entry>
                 </row>
 
                 <row>
@@ -300,7 +307,13 @@
           estar em letras minúsculas. As opções que raramente são alteradas
           podem ser colocadas no arquivo dfuplus.ini. Por exemplo:</para>
 
-          <programlisting>server=http://10.150.50.12:8010 username=rlor password=password overwrite=1 replicate=1</programlisting>
+          <programlisting>;The values below are examples, you should change them to match your platform deployment
+server=http://10.150.50.12:8010
+username=rlor
+<!--#synthpii-->
+password=password
+overwrite=1
+replicate=1</programlisting>
 
           <para>Em todos os exemplos abaixo, vamos supor que dfuplus.ini
           contém o conteúdo acima.</para>
@@ -349,7 +362,17 @@
 
                     <entry>Opcional. O endereço IP da máquina de origem. Se
                     omitido, as informações devem ser fornecidas pelo
-                    parâmetro <emphasis>srcxml</emphasis></entry>
+                    parâmetro <emphasis>srcxml</emphasis> ou pelo parâmetro
+                    <emphasis>srcplane</emphasis>.</entry>
+                  </row>
+
+                  <row>
+                    <entry>srcplane</entry>
+
+                    <entry>Opcional. O plano de armazenamendo da fonte
+                    contendo o arquivo fonte. Observação:
+                    <emphasis>srcplane</emphasis> não deve ser utilizado ao
+                    mesmo tempo que o <emphasis>srcip</emphasis>.</entry>
                   </row>
 
                   <row>
@@ -389,7 +412,7 @@
                   </row>
 
                   <row>
-                    <entry>prefixo</entry>
+                    <entry>prefix</entry>
 
                     <entry>Opcional. Ambos a seguir (separados por
                     vírgula):</entry>
@@ -428,10 +451,13 @@
                   <row>
                     <entry><emphasis>expireDays</emphasis></entry>
 
-                    <entry>Opcional. Um valor inteiro indicando o número de
-                    dias restantes para o arquivo ser removido
-                    automaticamente. Se omitido, o padrão é -1 (sem data de
-                    validade).</entry>
+                    <entry>Opcional. Especifica que o arquivo é temporário e
+                    deve ser excluído automaticamente após o número especificado
+                    de dias desde que o arquivo foi lido. Se omitido, o padrão
+                    é -1 (nunca expira). Se definido como 0, o arquivo é
+                    excluído automaticamente quando atinge o limite definido na
+                    configuração <emphasis role="bold">expiryDefault</emphasis>
+                    do Sasha Server.</entry>
                   </row>
 
                   <row>
@@ -443,7 +469,16 @@
                   </row>
 
                   <row>
-                    <entry><programlisting role="tab">  <emphasis role="bold">fixed</emphasis> Opções de formato fixo:</programlisting></entry>
+                    <entry><emphasis>dstNumParts</emphasis></entry>
+
+                    <entry>Opcional. Opcional. Defina como um inteiro positivo
+                    para sobrepor o número de partes criadas ao fazer spray. Se
+                    omitido (ou definido como 0), o spray usa a contagem de
+                    partes padrão do cluster de destino.</entry>
+                  </row>
+
+                  <row>
+                    <entry><programlisting role="tab">  <emphasis role="bold">fixed</emphasis> format options:</programlisting></entry>
                   </row>
 
                   <row>
@@ -453,8 +488,7 @@
                   </row>
 
                   <row>
-                    <entry><programlisting role="tab"><emphasis role="bold"/>Opções para formato <emphasis
-                          role="bold">csv/delimited</emphasis>:</programlisting></entry>
+                    <entry><programlisting role="tab">  <emphasis role="bold">csv/delimited</emphasis> options:</programlisting></entry>
                   </row>
 
                   <row>
@@ -495,12 +529,11 @@
                   </row>
 
                   <row>
-                    <entry><programlisting role="tab"><emphasis role="bold">  </emphasis>Opções para formato <emphasis
-                          role="bold">XML</emphasis>:</programlisting></entry>
+                    <entry><programlisting role="tab"><emphasis role="bold">  xml</emphasis> format options:</programlisting></entry>
                   </row>
 
                   <row>
-                    <entry><programlisting role="tab">    'rowtag'</programlisting></entry>
+                    <entry><programlisting role="tab">    rowtag</programlisting></entry>
 
                     <entry>A tag do XML que identifica cada registro.
                     Obrigatório.</entry>
@@ -528,20 +561,20 @@
 
           <programlisting>//fixed spray example:
 dfuplus action=spray srcip=10.150.50.14
-          srcfile=c:\import\timezones.txt dstname=RTTEMP::timezones.txt
-          dstcluster=thor format=fixed recordsize=155
+          srcfile=/var/lib/HPCCSystems/mydropzone/timezones.txt dstname=RTTEMP::timezones.txt
+          dstcluster=mythor format=fixed recordsize=155
 
 //fixed spray example using a srcxml file:
-dfuplus action=spray srcxml=c:\import\flattimezones.xml
-          dstname=RTTEMP::timezones.txt dstcluster=thor recordsize=155
+dfuplus action=spray srcxml=/var/lib/HPCCSystems/mydropzone/flattimezones.xml
+          dstname=RTTEMP::timezones.txt dstcluster=mythor recordsize=155
 
 //csv spray example:
 dfuplus action=spray srcip=10.150.50.14
-          srcfile=c:\import\timezones.csv dstname=RTTEMP::timezones.csv
-          dstcluster=thor format=csv
+          srcfile=/var/lib/HPCCSystems/mydropzone/timezones.csv dstname=RTTEMP::timezones.csv
+          dstcluster=mythor format=csv
 
 //the spray.xml file contains:
-&lt;File directory="c:\import\"
+&lt;File directory="/var/lib/HPCCSystems/mydropzone/"
    group="thor"
    modified="2004-04-27T14:58:38"
    name="zip"
@@ -562,32 +595,38 @@ dfuplus action=spray srcip=10.150.50.14
    size="165"/&gt;
 &lt;/File&gt;
 
-//fixed spray example using the above spray.xml file to
-          combine
+//fixed spray example using the above spray.xml file to combine
 // multiple source files into a single logical file
-// in this case, zip._1_of_3, zip._2_of_3, and zip._3_of_3
-          into zip1:
+// in this case, zip._1_of_3, zip._2_of_3, and zip._3_of_3 into zip1:
 dfuplus action=spray srcxml=spray.xml
-          dstcluster=thordstname=RTTEMP::myzip1 recordsize=5
+          dstcluster=mythor dstname=RTTEMP::myzip1 recordsize=5
 
 //xml spray example:
 dfuplus action=spray srcip=10.150.50.14
-          srcfile=c:\import\timezones.xml dstname=RTTEMP::timezones.xml
-          dstcluster=thor format=xml rowtag=area
+          srcfile=/var/lib/HPCCSystems/mydropzone/timezones.xml dstname=RTTEMP::timezones.xml
+          dstcluster=mythor format=xml rowtag=area
 
 //Multiple spray all .JPG and .BMP files under
-// c:\import on 10.150.51.26 to single logical file
-          LE::imagedb:
-dfuplus action=spray srcip=10.150.51.26
-          srcfile=c:\import\*.jpg,c:\import\*.bmp
+// /var/lib/HPCCSystems/mydropzone/ on 10.150.51.26 to single logical file LE::imagedb
 
-dstcluster=le_thor dstname=LE::imagedb overwrite=1
+dfuplus action=spray srcip=10.150.51.26
+          srcfile=/var/lib/HPCCSystems/mydropzone/*.jpg,/var/lib/HPCCSystems/mydropzone/*.bmp
+          dstcluster=mythor 
+          dstname=LE::imagedb 
+          overwrite=1
           prefix=FILENAME,FILESIZE nosplit=1
 //this would result in a RECORD structure like this:
 imageRecord := RECORD
 STRING filename;
 DATA image; //first 4 bytes contain the length of the image data
-END;</programlisting>
+END;
+// using srcplane
+dfuplus action=spray srcplane=lzstorageplane 
+        srcfile=/var/lib/HPCCSystems/dropzone/largedata1 
+        dstname=mytest::test:spraytest 
+        dstcluster=mydatastorageplane recordsize=58 overwrite=1 server=127.0.0.1:8010
+
+</programlisting>
         </sect3>
 
         <sect3 id="CLI_DFU_DeSprayOperations">
@@ -620,9 +659,21 @@ END;</programlisting>
                 <row>
                   <entry><emphasis>dstip</emphasis></entry>
 
-                  <entry>Opcional. O endereço IP do nó do servidor. Se
+                  <entry>Opcional. O endereço IP da máquina de destino. Se
                   omitido, as informações devem ser fornecidas pelo parâmetro
-                  <emphasis>dstxml</emphasis> .</entry>
+                  <emphasis>dstxml</emphasis> ou <emphasis>dstplane</emphasis>.
+                  Obsoleto, você deve usar <emphasis>dstplane</emphasis> em seu
+                  lugar.</entry>
+                </row>
+
+                <row>
+                  <entry><emphasis>dstplane</emphasis></entry>
+
+                  <entry>Opcional. O plano de armazenamento do destino.
+                  Observação: <emphasis>dstplane</emphasis> não deve ser usado
+                  ao mesmo tempo que <emphasis>dstip</emphasis>. Em uma
+                  implantação em contêiner, o <emphasis>dstplane</emphasis> é
+                  necessário se você tiver mais de uma landinz zone.</entry>
                 </row>
 
                 <row>
@@ -682,6 +733,20 @@ END;</programlisting>
                   Se você nunca precisar fazer isso, a opção filesize pode ser
                   omitida. </para></entry>
                 </row>
+
+                <row>
+                  <entry><emphasis>wrap= 0 | 1</emphasis></entry>
+
+                  <entry>Opcional. Se definido como 1, faz o despray como
+                  arquivos múltiplos em uma landing zone. Padrão é 0.</entry>
+                </row>
+
+                <row>
+                  <entry><emphasis>multicopy= 0 | 1</emphasis></entry>
+
+                  <entry>Opcional. Se for configurado para 1, cada parte do
+                  destino obtém o arquivo inteiro. Padrão é 0.</entry>
+                </row>
               </tbody>
             </tgroup>
           </informaltable>
@@ -689,9 +754,9 @@ END;</programlisting>
           <para>Exemplos:</para>
 
           <programlisting>dfuplus action=despray dstip=10.150.50.14
-   dstfile=c:\import\despray\timezones.txt srcname=RTTEMP::timezones.txt
+   dstfile=/var/lib/HPCCSystems/mydropzone/timezones.txt srcname=RTTEMP::timezones.txt
 //the spray.xml file contains:
-&lt;File directory="c:\import\"
+&lt;File directory="/var/lib/HPCCSystems/mydropzone/"
    group="thor"
    modified="2004-04-27T14:58:38"
    name="zip"
@@ -714,7 +779,7 @@ size="165"/&gt;
 //despray example using the above spray.xml file to split a single
 // logical file into multiple destination files
 // in this case, zip._1_of_3, zip._2_of_3, and zip._3_of_3 from zip1:
-dfuplus action=despray dstxml=spray.xml dstcluster=thor
+dfuplus action=despray dstxml=spray.xml dstcluster=mythor
           srcname=RTTEMP::myzip1
 
 
@@ -726,8 +791,14 @@ DATA image; //first 4 bytes contain the length of the image data
 
 //you can despray into its component files like this:
 dfuplus action=dspray srcname=le::imagedb
-          dstip=10.150.51.26 dstfile=c:\export\
+          dstip=10.150.51.26 dstfile=/var/lib/HPCCSystems/mydropzone/
           splitprefix=FILENAME,FILESIZE
+
+// using dstplane
+dfuplus action=despray srcname=mytest::test:spraytest 
+        dstplane=lzstorageplane 
+        dstfile=mydespraytest server=127.0.0.1:8010
+
 </programlisting>
         </sect3>
 
@@ -747,6 +818,13 @@ dfuplus action=dspray srcname=le::imagedb
           remota. Para fazer a cópia remota de um arquivo que contém um campo
           de comprimento variável, é preciso incluir a opção <emphasis
           role="bold">nosplit</emphasis> .</para>
+
+          <para>Para copiar um superfile e manter sua estrutura, use a operação
+          <link linkend="CLI_DFU_CopySuperOperations">copysuper</link>. Se você
+          usar a operação copy para um superfile, ela consolida todo o conteúdo
+          do superfile em um único arquivo lógico no destino, não em um
+          superfile. Isso não é válido para um superfile que contém INDEXes e
+          produzirá um erro.</para>
 
           <para>Essas <emphasis>opções </emphasis>são usadas pela <emphasis
           role="bold">operação</emphasis> <emphasis>copy
@@ -796,7 +874,7 @@ dfuplus action=dspray srcname=le::imagedb
                 </row>
 
                 <row>
-                  <entry><emphasis><emphasis>password</emphasis>
+                  <entry><emphasis><emphasis>srcpassword</emphasis>
                   </emphasis></entry>
 
                   <entry>Opcional. A senha usada para acessar o
@@ -812,6 +890,14 @@ dfuplus action=dspray srcname=le::imagedb
                   se a compactação do arquivo de origem deve ser preservada.
                   Se omitido, o padrão é 1.</entry>
                 </row>
+
+                <row>
+                  <entry><emphasis>ensure</emphasis></entry>
+
+                  <entry>Opcional. Copia o arquivo lógico, mas não copia
+                  partes do arquivo se eles já existirem. O padrão é
+                  FALSE.</entry>
+                </row>
               </tbody>
             </tgroup>
           </informaltable>
@@ -819,7 +905,8 @@ dfuplus action=dspray srcname=le::imagedb
           <para>Exemplo:</para>
 
           <programlisting>dfuplus action=copy srcname=RTTEMP::timezones.txt
-          dstname=srcname=RTTEMP::COPY::timezones.txt dstcluster=thor</programlisting>
+                    dstname=RTTEMP::COPY::timezones.txt 
+                    dstcluster=mythor</programlisting>
         </sect3>
 
         <sect3 id="CLI_DFU_RemoveOps">
@@ -1135,6 +1222,75 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
           <programlisting>dfuplus action=removesuper superfile=mysuper subfiles=file1,file2</programlisting>
         </sect3>
 
+        <sect3 id="CLI_DFU_CopySuperOperations">
+          <title>Operações Copysuper:</title>
+
+          <para>A operação <emphasis role="bold">copysuper</emphasis> copia um
+          superfile de um cluster para outro.</para>
+
+          <para>Essas <emphasis>opções </emphasis>são usadas pela operação
+          <emphasis role="bold">copysuper</emphasis>
+          <emphasis>:</emphasis></para>
+
+          <para><informaltable colsep="1" frame="all" rowsep="1">
+              <tgroup cols="2">
+                <colspec colwidth="142.40pt"/>
+
+                <colspec/>
+
+                <tbody>
+                  <row>
+                    <entry><emphasis>srcname=&lt;source-super-name&gt;
+                    </emphasis></entry>
+
+                    <entry>O nome lógico do superfile de origem.</entry>
+                  </row>
+
+                  <row>
+                    <entry>dstname=&lt;destination-super-name&gt;</entry>
+
+                    <entry>O nome lógico do superfile de destino.</entry>
+                  </row>
+
+                  <row>
+                    <entry>dstcluster=&lt;cluster-name&gt;</entry>
+
+                    <entry>O nome do cluster de destino. Para uma implantação
+                    conteinerizada, defina isto como o plano de dados de destino
+                    (por exemplo, dstcluster=data)</entry>
+                  </row>
+
+                  <row>
+                    <entry><emphasis><emphasis><emphasis>srcdali</emphasis>
+                    </emphasis></emphasis></entry>
+
+                    <entry>O hostname ou IP do servidor Dali de origem.</entry>
+                  </row>
+
+                  <row>
+                    <entry><emphasis><emphasis><emphasis>srcusername</emphasis>
+                    </emphasis></emphasis></entry>
+
+                    <entry>Opcional, o nome de usuário a ser usado para o
+                    ambiente de origem.</entry>
+                  </row>
+
+                  <row>
+                    <entry><emphasis><emphasis><emphasis>srcpassword</emphasis>
+                    </emphasis></emphasis></entry>
+
+                    <entry>Opcional, a senha a ser usada para o ambiente de
+                    origem.</entry>
+                  </row>
+                </tbody>
+              </tgroup>
+            </informaltable></para>
+
+          <para>Exemplo:</para>
+
+          <programlisting>dfuplus action=copysuper srcname=jd::super1 dstname=jd::super2 dstcluster=mythor srcdali=. </programlisting>
+        </sect3>
+
         <sect3 id="CLI_DFU_ListSuperOperations">
           <title>Operações Listsuper:</title>
 
@@ -1166,7 +1322,7 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <para>Exemplo:</para>
 
-          <programlisting>dfuplus action=listsuper superfile=mysuper</programlisting>
+          <programlisting>dfuplus action=listsuper superfile=mysuper </programlisting>
         </sect3>
 
         <sect3 id="CLI_DFU_StatusOperations">
@@ -1189,13 +1345,23 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
                     <entry><emphasis><emphasis><emphasis>wuid</emphasis>
                     </emphasis></emphasis></entry>
 
-                    <entry>O identificador de uma workunit</entry>
+                    <entry>O identificador da workunit.</entry>
+                  </row>
+
+                  <row>
+                    <entry><emphasis><emphasis><emphasis>limit</emphasis></emphasis></emphasis></entry>
+
+                    <entry>Para workunits do publicador, isso limita o número de
+                    workunits filhas a listar. Se definido como 0, somente o
+                    status pai será retornado. O padrão é 1000.</entry>
                   </row>
                 </tbody>
               </tgroup>
             </informaltable>Exemplo:</para>
 
-          <programlisting>dfuplus action=status wuid=W20050309-093020</programlisting>
+          <programlisting>dfuplus action=status wuid=D20220816-135243
+dfuplus action=status limit=300 wuid=P20230301-123456
+dfuplus action=status limit=0 wuid=P20230301-987654</programlisting>
 
           <para/>
         </sect3>
@@ -1315,10 +1481,10 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <para>Exemplo:</para>
 
-          <programlisting>dfuplus action=savexml srcname=RTTEMP::timezones.txt
+          <programlisting>dfuplus action=savexml srcname=rttemp::timezones.txt
           dstxml=flattimezones.xml
     // this results in the following XML file:
-    &lt;File directory="c:\thordata\rttemp"
+    &lt;File directory="/var/lib/HPCCSystems/hpcc-data/thor/rttemp"
           group="thor"
           modified="2004-06-18T14:17:16"
           name="timezones.txt"
@@ -1452,10 +1618,10 @@ dfuplus action=add srcxml=exportedMysuper.xml dstname=Mysuper
 
           <para>Exemplo:</para>
 
-          <programlisting>dfuplus action=monitor event=MyEvent ip=edata10 file=/dz/arr.txt
+          <programlisting>dfuplus action=monitor event=MyEvent ip=edata10 file=/var/lib/HPCCSystems/mydropzone/arr.txt
 dfuplus action=monitor event=MyEvent ip=10.150.10.75
-            file=c:\dz\* shotlimit=-1 sub=1
-dfuplus action=monitor event=MyEvent file=//10.15.13.21/dz/*.txt
+            file=/var/lib/HPCCSystems/mydropzone/* shotlimit=-1 sub=1
+dfuplus action=monitor event=MyEvent file=//10.15.13.21/var/lib/HPCCSystems/mydropzone/*.txt
 dfuplus action=monitor event=MyEvent lfn=RTTEMP::OUT::MyFile</programlisting>
         </sect3>
 
@@ -1568,8 +1734,7 @@ dfuplus action=monitor event=MyEvent lfn=RTTEMP::OUT::MyFile</programlisting>
 
           <programlisting>dfuplus action=erasehistory lfn=progguide::exampledata::accounts_copy dstxml=c:\temp\jim.xml
 
-  // this removes the history metadata from the file 
-  and writes an XML file containing the following:
+  // this removes the history metadata from the file and writes an XML file containing the following:
   &lt;History&gt;
     &lt;Origin ip="127.0.0.1"
             name="accounts"

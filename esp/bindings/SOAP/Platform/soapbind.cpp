@@ -34,6 +34,11 @@
 #include "SOAP/Platform/soapservice.hpp"
 #include "SOAP/Platform/soapmessage.hpp"
 #include "SOAP/xpp/xjx/xjxpp.hpp"
+#include "jmetrics.hpp"
+
+static std::once_flag metricsInitialized;
+static std::shared_ptr<hpccMetrics::CounterMetric> pSoapRequestCount;
+
 
 #define ESP_FACTORY DECL_EXPORT
 
@@ -62,15 +67,18 @@ int CSoapBinding::processRequest(IRpcMessage* rpc_call, IRpcMessage* rpc_respons
     return 0;
 }
 
-CHttpSoapBinding::CHttpSoapBinding():EspHttpBinding(NULL, NULL, NULL)
+CHttpSoapBinding::CHttpSoapBinding()
+: CHttpSoapBinding(NULL, NULL, NULL)
 {
-    log_level_=hsl_none;
 }
 
 CHttpSoapBinding::CHttpSoapBinding(IPropertyTree* cfg, const char *bindname, const char *procname, http_soap_log_level level)
 : EspHttpBinding(cfg, bindname, procname)
 {
     log_level_=level;
+    std::call_once(metricsInitialized, [](){
+        pSoapRequestCount = hpccMetrics::registerCounterMetric("esp.soap.requests.received", "Number of JSON and SOAP POST requests received", SMeasureCount);
+    });
 }
 
 CHttpSoapBinding::~CHttpSoapBinding()
@@ -82,26 +90,13 @@ const char * CHttpSoapBinding::getTransportType()
     return "http";
 }
 
-static CSoapFault* makeSoapFault(CHttpRequest* request, IMultiException* me, const char *ns)
+static CSoapFault* makeSoapFault(CHttpRequest* request, IMultiException* me, const char *ns, const char* schemaLocation)
 {
-    const char* svcName = request->queryServiceName();
-    if (svcName && *svcName)
+    if (!isEmptyString(schemaLocation))
     {
-        const char* method = request->queryServiceMethod();
-        StringBuffer host;
-        const char* wsdlAddr = request->queryParameters()->queryProp("__wsdl_address");
-        if (wsdlAddr && *wsdlAddr)
-            host.append(wsdlAddr);
-        else
-        {
-            host.append(request->queryHost());
-            if (request->getPort()>0)
-              host.append(":").append(request->getPort());
-        }
-        
-        VStringBuffer ns_ext("xmlns=\"%s\""
-            " xsi:schemaLocation=\"%s %s/%s/%s?xsd\"", 
-            ns, ns, host.str(), svcName, method ? method : "");
+        StringBuffer ns_ext;
+        appendXMLAttr(ns_ext, "xmlns", ns, nullptr, true);
+        appendXMLAttr(ns_ext, "schemaLocation", schemaLocation, "xsi", true);
         return new CSoapFault(me, ns_ext);
     }
 
@@ -110,6 +105,7 @@ static CSoapFault* makeSoapFault(CHttpRequest* request, IMultiException* me, con
 
 int CHttpSoapBinding::onSoapRequest(CHttpRequest* request, CHttpResponse* response)
 {
+    pSoapRequestCount->inc(1);
     IEspContext* ctx = request->queryContext();
     if (ctx && ctx->getResponseFormat()==ESPSerializationJSON)
     {
@@ -123,6 +119,8 @@ int CHttpSoapBinding::onSoapRequest(CHttpRequest* request, CHttpResponse* respon
         {
             errcode = mex->errorCode();
             mex->serializeJSON(msgbuf, 0, true, true, true);
+            StringBuffer errMessage;
+            ctx->addTraceSummaryValue(LogMin, "msg", mex->errorMessage(errMessage).str(), TXSUMMARY_GRP_ENTERPRISE);
             mex->Release();
         }
         catch (IException* e)
@@ -131,6 +129,8 @@ int CHttpSoapBinding::onSoapRequest(CHttpRequest* request, CHttpResponse* respon
             Owned<IMultiException> mex = MakeMultiException("Esp");
             mex->append(*e); // e is owned by mex
             mex->serializeJSON(msgbuf, 0, true, true, true);
+            StringBuffer errMessage;
+            ctx->addTraceSummaryValue(LogMin, "msg", e->errorMessage(errMessage).str(), TXSUMMARY_GRP_ENTERPRISE);
         }
         catch (...)
         {
@@ -138,6 +138,7 @@ int CHttpSoapBinding::onSoapRequest(CHttpRequest* request, CHttpResponse* respon
             Owned<IMultiException> mex = MakeMultiException("Esp");
             mex->append(*MakeStringException(500, "Internal Server Error"));
             mex->serializeJSON(msgbuf, 0, true, true, true);
+            ctx->addTraceSummaryValue(LogMin, "msg", "Internal Server Error", TXSUMMARY_GRP_ENTERPRISE);
         }
         SetHTTPErrorStatus(errcode, response);
         response->setContentType(HTTP_TYPE_JSON);
@@ -153,23 +154,38 @@ int CHttpSoapBinding::onSoapRequest(CHttpRequest* request, CHttpResponse* respon
         catch (IMultiException* mex)
         {
             StringBuffer ns;
-            soapFault.setown(makeSoapFault(request,mex, generateNamespace(*request->queryContext(), request, request->queryServiceName(), request->queryServiceMethod(), ns).str()));
+            StringBuffer schemaLocation;
+            generateNamespace(*request->queryContext(), request, request->queryServiceName(), request->queryServiceMethod(), ns);
+            getSchemaLocation(*ctx, request, ns, schemaLocation);
+            soapFault.setown(makeSoapFault(request,mex, ns.str(), schemaLocation.str()));
             //SetHTTPErrorStatus(mex->errorCode(),response);
             SetHTTPErrorStatus(500,response);
+            StringBuffer errMessage;
+            ctx->addTraceSummaryValue(LogMin, "msg", mex->errorMessage(errMessage).str(), TXSUMMARY_GRP_ENTERPRISE);
+            VStringBuffer fault("F%d", mex->errorCode());
+            ctx->addTraceSummaryValue(LogMin, "custom_fields.soapFaultCode", fault.str(), TXSUMMARY_GRP_ENTERPRISE);
             mex->Release();
         }
         catch (IException* e)
         {
             StringBuffer ns;
+            StringBuffer schemaLocation;
+            generateNamespace(*request->queryContext(), request, request->queryServiceName(), request->queryServiceMethod(), ns);
+            getSchemaLocation(*ctx, request, ns, schemaLocation);
             Owned<IMultiException> mex = MakeMultiException("Esp");
             mex->append(*e); // e is owned by mex
-            soapFault.setown(makeSoapFault(request,mex, generateNamespace(*request->queryContext(), request, request->queryServiceName(), request->queryServiceMethod(), ns).str()));
+            soapFault.setown(makeSoapFault(request,mex, ns.str(), schemaLocation.str()));
             SetHTTPErrorStatus(500,response);
+            StringBuffer errMessage;
+            ctx->addTraceSummaryValue(LogMin, "msg", e->errorMessage(errMessage).str(), TXSUMMARY_GRP_ENTERPRISE);
+            VStringBuffer fault("F%d", mex->errorCode());
+            ctx->addTraceSummaryValue(LogMin, "custom_fields.soapFaultCode", fault.str(), TXSUMMARY_GRP_ENTERPRISE);
         }
         catch (...)
         {
             soapFault.setown(new CSoapFault(500,"Internal Server Error"));
             SetHTTPErrorStatus(500,response);
+            ctx->addTraceSummaryValue(LogMin, "msg", "Internal Server Error", TXSUMMARY_GRP_ENTERPRISE);
         }
         //response->setContentType(soapFault->get_content_type());
         response->setContentType(HTTP_TYPE_TEXT_XML_UTF8);
@@ -242,7 +258,7 @@ int CHttpSoapBinding::HandleSoapRequest(CHttpRequest* request, CHttpResponse* re
             response->sendBasicChallenge(m_challenge_realm.str(), false);
         else if (status == SOAP_AUTHENTICATION_ERROR)
         {
-            throw MakeStringExceptionDirect(401,"Unauthorized Access");
+            throw makeStringExceptionV(401, "Unauthorized Access: %s - user=%s", ctx->queryServiceName(nullptr), nullText(ctx->queryUserId()));
         }
         else
             response->setStatus(HTTP_STATUS_OK);
@@ -255,6 +271,43 @@ int CHttpSoapBinding::HandleSoapRequest(CHttpRequest* request, CHttpResponse* re
     return 0;
 }
 
+static IPropertyTree *createSecClientConfig(const char *clientCertFileOrBuf, const char *clientPrivKeyFileOrBuf, const char *caCertsPathOrBuf, bool acceptSelfSigned)
+{
+    Owned<IPropertyTree> info = createPTree();
+
+    if (!isEmptyString(clientCertFileOrBuf))
+    {
+        if (containsEmbeddedKey(clientCertFileOrBuf))
+            info->setProp("certificate_pem", clientCertFileOrBuf);
+        else
+            info->setProp("certificate", clientCertFileOrBuf);
+
+        if (!isEmptyString(clientPrivKeyFileOrBuf))
+        {
+            if (containsEmbeddedKey(clientPrivKeyFileOrBuf))
+                info->setProp("privatekey_pem", clientPrivKeyFileOrBuf);
+            else
+                info->setProp("privatekey", clientPrivKeyFileOrBuf);
+        }
+    }
+
+    IPropertyTree *verify = ensurePTree(info, "verify");
+
+    if (!isEmptyString(caCertsPathOrBuf))
+    {
+        IPropertyTree *ca = ensurePTree(verify, "ca_certificates");
+        if (containsEmbeddedKey(caCertsPathOrBuf))
+            ca->setProp("pem", caCertsPathOrBuf);
+        else
+            ca->setProp("@path", caCertsPathOrBuf);
+    }
+
+    verify->setPropBool("@enable", true);
+    verify->setPropBool("@accept_selfsigned", acceptSelfSigned);
+    verify->setProp("trusted_peers", "anyone");
+
+    return info.getClear();
+}
 
 void CSoapRequestBinding::post(const char *proxy, const char* url, IRpcResponseBinding& response, const char *soapaction)
 {
@@ -271,6 +324,11 @@ void CSoapRequestBinding::post(const char *proxy, const char* url, IRpcResponseB
         soapclient.setConnectTimeoutMs(connectTimeoutMs_);
     if (readTimeoutSecs_)
         soapclient.setReadTimeoutSecs(readTimeoutSecs_);
+    if (mtls_secret_.length())
+        soapclient.setMtlsSecretName(mtls_secret_);
+
+    if (client_cert_.length() || ca_certs_.length() || accept_self_signed_)
+        soapclient.setSecureSocketConfig(createSecClientConfig(client_cert_, client_priv_key_, ca_certs_, accept_self_signed_));
 
     soapclient.setUsernameToken(soap_getUserId(), soap_getPassword(), soap_getRealm());
 

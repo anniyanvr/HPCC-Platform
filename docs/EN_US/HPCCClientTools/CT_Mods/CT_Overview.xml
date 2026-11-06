@@ -9,9 +9,9 @@
 
   <informaltable colsep="1" frame="all" rowsep="1">
     <tgroup cols="2">
-      <colspec align="left" colwidth="122.40pt" />
+      <colspec align="left" colwidth="122.40pt"/>
 
-      <colspec />
+      <colspec/>
 
       <tbody>
         <row>
@@ -110,7 +110,7 @@
         <listitem>
           <para>From the HPCC Systems<superscript>®</superscript> download
           page, <ulink
-          url="http://hpccsystems.com/download/free-community-edition/client-tools">http://hpccsystems.com/download/free-community-edition/client-tools</ulink></para>
+          url="https://hpccsystems.com/download/">https://hpccsystems.com/download/</ulink></para>
 
           <para>Download the appropriate Client Tools for your Operating
           System. (available for CentOS, Ubuntu, Mac OSX, or Windows)</para>
@@ -143,19 +143,6 @@
 
       <para>An RPM installation package is provided. <programlisting>sudo yum install &lt;rpm file name&gt;</programlisting></para>
 
-      <para><variablelist>
-          <varlistentry>
-            <term>Note:</term>
-
-            <listitem>
-              <para>If you are using CentOS 6 you may need to run the
-              following command to properly enable the installation.</para>
-            </listitem>
-          </varlistentry>
-        </variablelist></para>
-
-      <para><programlisting>sudo wget http://people.centos.org/tru/devtools-2/devtools-2.repo -O /etc/yum.repos.d/devtools-2.repo</programlisting></para>
-
       <para><emphasis role="bold">Debian-Based Systems
       (Ubuntu):</emphasis></para>
 
@@ -163,9 +150,11 @@
       the package, use:</para>
 
       <programlisting>sudo dpkg -i &lt;deb filename&gt;</programlisting>
-	  <para>After installing the package, run the following to update any dependencies:</para>
 
-        <programlisting>sudo apt-get install -f </programlisting>
+      <para>After installing the package, run the following to "fix" any
+      missing dependencies:</para>
+
+      <programlisting>sudo apt-get install -f </programlisting>
 
       <para><emphasis role="bold">Mac OSX:</emphasis></para>
 
@@ -196,7 +185,7 @@
       for this purpose.</para>
 
       <para><graphic align="left"
-      fileref="../../images/ECLCmdPrompt.jpg" /></para>
+      fileref="../../images/ECLCmdPrompt.jpg"/></para>
     </sect2>
   </sect1>
 </chapter>

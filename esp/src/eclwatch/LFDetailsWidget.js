@@ -10,6 +10,8 @@ define([
 
     "dijit/registry",
 
+    "src/Utility",
+
     "hpcc/_TabContainerWidget",
     "hpcc/DelayLoadWidget",
     "src/Clippy",
@@ -17,6 +19,7 @@ define([
     "src/ESPDFUWorkunit",
     "src/FileSpray",
     "src/DataPatternsWidget",
+    "src/Session",
 
     "dojo/text!../templates/LFDetailsWidget.html",
 
@@ -48,8 +51,8 @@ define([
     "hpcc/TableContainer"
 
 ], function (exports, declare, lang, nlsHPCCMod, dom, domAttr, domClass, domForm,
-    registry,
-    _TabContainerWidget, DelayLoadWidget, Clippy, ESPLogicalFile, ESPDFUWorkunit, FileSpray, DataPatternsWidget,
+    registry, Utility,
+    _TabContainerWidget, DelayLoadWidget, Clippy, ESPLogicalFile, ESPDFUWorkunit, FileSpray, DataPatternsWidget, Session,
     template) {
 
     var nlsHPCC = nlsHPCCMod.default;
@@ -68,7 +71,6 @@ define([
         contentWidget: null,
         dataPatternsWidget: null,
         sourceWidget: null,
-        defWidget: null,
         xmlWidget: null,
         filePartsWidget: null,
         queriesWidget: null,
@@ -92,7 +94,6 @@ define([
             this.contentWidget = registry.byId(this.id + "_Content");
             this.dataPatternsWidget = registry.byId(this.id + "_DataPatterns");
             this.sourceWidget = registry.byId(this.id + "_Source");
-            this.defWidget = registry.byId(this.id + "_DEF");
             this.xmlWidget = registry.byId(this.id + "_XML");
             this.filePartsWidget = registry.byId(this.id + "_FileParts");
             this.queriesWidget = registry.byId(this.id + "_Queries");
@@ -163,12 +164,8 @@ define([
         },
         _onSave: function (event) {
             var context = this;
-            var protectedCheckbox = registry.byId(this.id + "isProtected");
-            var restrictedCheckbox = registry.byId(this.id + "isRestricted");
             this.logicalFile.save({
                 Description: dom.byId(context.id + "Description").value,
-                isProtected: protectedCheckbox.get("checked"),
-                isRestricted: restrictedCheckbox.get("checked")
             }, null);
         },
         _onDelete: function (event) {
@@ -275,12 +272,18 @@ define([
             });
             this.logicalFile.refresh();
 
-            this.isProtected.on("change", function (evt) {
-                context._onSave();
+            this.isProtected.on("click", function (evt) {
+                var protectedCheckbox = registry.byId(context.id + "isProtected");
+                context.logicalFile.save({
+                    isProtected: protectedCheckbox.get("checked")
+                }, null);
             });
 
-            this.isRestricted.on("change", function (evt) {
-                context._onSave();
+            this.isRestricted.on("click", function (evt) {
+                var restrictedCheckbox = registry.byId(context.id + "isRestricted");
+                context.logicalFile.save({
+                    isRestricted: restrictedCheckbox.get("checked")
+                }, null);
             });
         },
 
@@ -296,18 +299,12 @@ define([
                 } else if (currSel.id === this.dataPatternsWidget.id) {
                     this.dataPatternsWidget.init({
                         NodeGroup: this.logicalFile.NodeGroup,
-                        LogicalName: this.logicalFile.Name
+                        LogicalName: this.logicalFile.Name,
+                        Modified: this.logicalFile.Modified
                     });
                 } else if (currSel.id === this.sourceWidget.id) {
                     this.sourceWidget.init({
                         ECL: this.logicalFile.Ecl
-                    });
-                } else if (currSel.id === this.defWidget.id) {
-                    var context = this;
-                    this.logicalFile.fetchDEF(function (response) {
-                        context.defWidget.init({
-                            ECL: response
-                        });
                     });
                 } else if (currSel.id === this.xmlWidget.id) {
                     var context = this;
@@ -399,7 +396,6 @@ define([
                 }
                 this.contentWidget.reset();
                 this.sourceWidget.reset();
-                this.defWidget.reset();
                 this.xmlWidget.reset();
                 this.filePartsWidget.reset();
                 this.widget._Queries.reset();
@@ -458,6 +454,12 @@ define([
                 }
             } else if (name === "RecordSize" && newValue === "0") {
                 this.updateInput("RecordSize", oldValue, this.i18n.NoPublishedSize);
+            } else if (name === "Cost") {
+                this.updateInput("FormattedCost", oldValue, Session.formatCost(newValue));
+            } else if (name === "MinSkew") {
+                domAttr.set(this.id + "MinSkew", "innerHTML", this.logicalFile.MinSkew ? this.logicalFile.MinSkew + "%" : "");
+            } else if (name === "MaxSkew") {
+                domAttr.set(this.id + "MaxSkew", "innerHTML", this.logicalFile.MaxSkew ? this.logicalFile.MaxSkew + "%" : "");
             }
         },
 

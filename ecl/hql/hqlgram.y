@@ -39,6 +39,11 @@
 #undef YYSTYPE
 #define YYSTYPE attribute
 
+#if defined(__clang__) || defined(__GNUC__)
+//Disable the warning for the whole file.  It does not work if it only surrounds the #includes
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+#endif
+
 #include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,7 +130,7 @@ static void eclsyntaxerror(HqlGram * parser, const char * s, short yystate, int 
   AND
   ANY
   APPLY
-  _ARRAY_
+  TOK_ARRAY
   AS
   ASCII
   ASIN
@@ -188,6 +193,7 @@ static void eclsyntaxerror(HqlGram * parser, const char * s, short yystate, int 
   DISTRIBUTION
   DYNAMIC
   EBCDIC
+  ECLAGENT
   ECLCRC
   ELSE
   ELSEIF
@@ -228,6 +234,7 @@ static void eclsyntaxerror(HqlGram * parser, const char * s, short yystate, int 
   FIRST
   TOK_FIXED
   FLAT
+  FORMENCODED
   FORMAT_ATTR
   FORWARD
   FROM
@@ -237,6 +244,7 @@ static void eclsyntaxerror(HqlGram * parser, const char * s, short yystate, int 
   FULL
   FUNCTION
   GETENV
+  GETSECRET
   GLOBAL
   GRAPH
   GROUP
@@ -282,6 +290,7 @@ static void eclsyntaxerror(HqlGram * parser, const char * s, short yystate, int 
   LAST
   LEFT
   LENGTH
+  LENGTHSIZE
   LIBRARY
   LIKELY
   LIMIT
@@ -391,6 +400,7 @@ static void eclsyntaxerror(HqlGram * parser, const char * s, short yystate, int 
   RECOVERY
   REFRESH
   REGEXFIND
+  REGEXEXTRACT
   REGEXFINDSET
   REGEXREPLACE
   REGROUP
@@ -470,6 +480,7 @@ static void eclsyntaxerror(HqlGram * parser, const char * s, short yystate, int 
   TOK_TRUE
   TYPE
   TYPEOF
+  UNCOMPRESSED
   UNICODEORDER
   UNGROUP
   UNLIKELY
@@ -803,7 +814,7 @@ explicitDatasetType1
                             $$.setType(tableType.getClear());
                             $$.setPosition($1);
                         }
-    | _ARRAY_ explicitDatasetType
+    | TOK_ARRAY explicitDatasetType
                         {
                             $$.setType(makeOutOfLineModifier($2.getType()));
                             $$.setPosition($1);
@@ -1059,8 +1070,7 @@ badObject
 macro
     : MACRO             {
                             Owned<IFileContents> contents = $1.getContents();
-                            IAtom * globalId = parser->queryGlobalScopeId();
-                            IHqlExpression* expr = createUnknown(no_macro, makeBoolType(), globalId, LINK(contents));
+                            IHqlExpression* expr = createMacro(false, parser->queryGlobalScope(), contents);
 #if defined(TRACE_MACRO)
                             DBGLOG("MACRO>> verify: macro definition at %d:%d\n",yylval.startLine, yylval.startColumn);
 #endif
@@ -1075,8 +1085,7 @@ macro
     | COMPLEX_MACRO     {
                             Owned<IFileContents> contents = $1.getContents();
 
-                            IAtom * globalId = parser->queryGlobalScopeId();
-                            IHqlExpression* expr = createUnknown(no_macro, makeVoidType(), globalId, LINK(contents));
+                            IHqlExpression* expr = createMacro(true, parser->queryGlobalScope(), contents);
 
 #if defined(TRACE_MACRO)
                             DBGLOG("MACRO>> verify: macro definition at %d:%d\n",yylval.startLine, yylval.startColumn);
@@ -1773,7 +1782,7 @@ optPersistOpts
     ;
 
 persistOpts
-    : persistOpt
+: persistOpt
     | persistOpts ',' persistOpt
                         {
                             $$.setExpr(createComma($1.getExpr(), $3.getExpr()), $1);
@@ -1783,7 +1792,7 @@ persistOpts
 persistOpt
     : fewMany
     | expireAttr
-    | queueAttr
+    | planeAttr
     | REFRESH '(' expression ')'
                         {
                             parser->normalizeExpression($3, type_boolean, true);
@@ -2879,6 +2888,25 @@ actionStmt
                             parser->reportError(ERR_EXPECTED, $3, "OUTPUT cannot be applied to an action");
                             $$.inherit($3);
                         }
+    | EVALUATE '(' ECLAGENT ',' actionStmt ')'
+                        {
+                            // $$.setExpr(createValue(no_nothor, makeVoidType(), $5.getExpr()), $1);
+                            IHqlExpression * action = $5.getExpr();
+                            Linked<ITypeInfo> type = action->queryType();
+                            IHqlExpression * indep = createValue(no_independent, makeNullType(), createConstant(ECL_AGENT_CLUSTER_NAME));
+                            $$.setExpr(createValue(no_colon, type.getClear(), { action, indep }, true), $1);
+                        }
+    | EVALUATE '(' expression ',' actionStmt ')'
+                        {
+                            // Syntactic sugar for:
+                            //      actionStmt : INDEPENDENT(expression)
+                            parser->normalizeExpression($3, type_string, true);
+                            IHqlExpression * clusterName = $3.getExpr();
+                            IHqlExpression * action = $5.getExpr();
+                            Linked<ITypeInfo> type = action->queryType();
+                            IHqlExpression * indep = createValue(no_independent, makeNullType(), clusterName);
+                            $$.setExpr(createValue(no_colon, type.getClear(), { action, indep }, true), $1);
+                        }
     ;
 
 
@@ -3050,6 +3078,9 @@ buildFlag
                             $$.setPosition($1);
                         }
     | planeAttr
+    | SINGLE            {
+                            $$.setExpr(createExprAttribute(widthAtom, createConstant(1)), $1);
+                        }
     | WIDTH '(' expression ')'
                         {
                             parser->normalizeExpression($3, type_numeric, false);
@@ -3072,32 +3103,15 @@ buildFlag
                             $$.setExpr(createComma(createAttribute(noRootAtom), createExprAttribute(distributedAtom, $3.getExpr()), createLocalAttribute()));
                             $$.setPosition($1);
                         }
-    | COMPRESSED '(' compressMode ')'
-                        {
-                            $$.setExpr(createExprAttribute(compressedAtom, $3.getExpr()));
-                            $$.setPosition($1);
-                        }
     | DEDUP
                         {
                             $$.setExpr(createAttribute(dedupAtom), $1);
-                        }
-    | FILEPOSITION optConstBoolArg
-                        {
-                            $$.setExpr(createExprAttribute(filepositionAtom, $2.getExpr()), $1);
-                        }
-    | MAXLENGTH
-                        {
-                            $$.setExpr(createExprAttribute(maxLengthAtom), $1);
-                        }
-    | MAXLENGTH '(' constExpression ')'
-                        {
-                            parser->normalizeExpression($3, type_numeric, false);
-                            $$.setExpr(createExprAttribute(maxLengthAtom, $3.getExpr()), $1);
                         }
     | RESTRICTED        {
                             $$.setExpr(createAttribute(restrictedAtom));
                             $$.setPosition($1);
                         }
+    | indexOrBuildFlag
     | expression
     ;
 
@@ -3425,15 +3439,30 @@ indexFlag
                             $$.setExpr(createAttribute(fixedAtom));
                             $$.setPosition($1);
                         }
-    | COMPRESSED '(' compressMode ')'
-                        {
-                            $$.setExpr(createExprAttribute(compressedAtom, $3.getExpr()));
-                            $$.setPosition($1);
-                        }
     | DYNAMIC
                         {
                             $$.setExpr(createAttribute(dynamicAtom));
                             $$.setPosition($1);
+                        }
+    | indexOrBuildFlag
+    | bloomAttr
+    | hashedIndexAttr
+    | commonAttribute
+    ;
+
+indexOrBuildFlag
+    : TRIM
+                        {
+                            $$.setExpr(createExprAttribute(trimAtom), $1);
+                        }
+    | PACKED
+                        {
+                            $$.setExpr(createExprAttribute(packedAtom), $1);
+                        }
+    | PACKED '(' constExpression ')'
+                        {
+                            parser->normalizeExpression($3, type_numeric, false);
+                            $$.setExpr(createExprAttribute(packedAtom, $3.getExpr()), $1);
                         }
     | FILEPOSITION optConstBoolArg
                         {
@@ -3448,9 +3477,13 @@ indexFlag
                             parser->normalizeExpression($3, type_numeric, false);
                             $$.setExpr(createExprAttribute(maxLengthAtom, $3.getExpr()), $1);
                         }
-    | bloomAttr
-    | hashedIndexAttr
-    | commonAttribute
+    | COMPRESSED '(' compressMode ')'
+                        {
+                            $$.setExpr(createExprAttribute(compressedAtom, $3.getExpr()));
+                            // if (!$$.queryExpr()->queryChild(0)->isAttribute())
+                            //    $$.setExpr(createComma($$.getExpr(), createExprAttribute(filepositionAtom, createConstant(false))));
+                            $$.setPosition($1);
+                        }
     ;
 
 compressMode
@@ -3468,6 +3501,11 @@ compressMode
                             $$.setExpr(createAttribute(rowAtom));
                             $$.setPosition($1);
                         }
+    | constExpression
+                        {
+                            parser->normalizeExpression($1, type_string, true, false);
+                            $$.inherit($1);
+                        }
     ;
 
 optOutputFlags
@@ -3480,6 +3518,21 @@ outputFlags
     | outputFlags ',' outputFlag
                         { $$.setExpr(createComma($1.getExpr(), $3.getExpr())); $$.setPosition($1); }
     ;
+
+compressionOptions
+    : COMPRESSED        {
+                            $$.setExpr(createAttribute(compressedAtom));
+                            $$.setPosition($1);
+                        }
+    | UNCOMPRESSED
+                        {
+                            $$.setExpr(createAttribute(noCompressAtom));
+                            $$.setPosition($1);
+                        }
+    | __COMPRESSED__    {
+                            $$.setExpr(createAttribute(__compressed__Atom));
+                            $$.setPosition($1);
+                        }
 
 outputFlag
     : EXTEND            {
@@ -3496,14 +3549,7 @@ outputFlag
                             $$.setExpr(createExprAttribute(csvAtom, args));
                             $$.setPosition($1);
                         }
-    | COMPRESSED        {
-                            $$.setExpr(createAttribute(compressedAtom));
-                            $$.setPosition($1);
-                        }
-    | __COMPRESSED__    {
-                            $$.setExpr(createAttribute(__compressed__Atom));
-                            $$.setPosition($1);
-                        }
+    | compressionOptions
     | __GROUPED__       {
                             $$.setExpr(createAttribute(groupedAtom));
                             $$.setPosition($1);
@@ -3548,6 +3594,11 @@ outputFlag
                             $3.unwindCommaList(args);
                             $$.setExpr(createExprAttribute(jsonAtom, args), $1);
                         }
+    | TYPE '(' UNKNOWN_ID attribs ')'
+                        {
+                            parser->setPluggableModeExpr($$, $3, $4);
+                            $$.setPosition($1);
+                        }
     | UPDATE            {
                             $$.setExpr(createComma(createAttribute(updateAtom), createAttribute(overwriteAtom)), $1);
                         }
@@ -3559,6 +3610,9 @@ outputFlag
                             $$.setPosition($1);
                         }
     | planeAttr
+    | SINGLE            {
+                            $$.setExpr(createExprAttribute(widthAtom, createConstant(1)), $1);
+                        }
     | WIDTH '(' expression ')'
                         {
                             parser->normalizeExpression($3, type_numeric, false);
@@ -3768,6 +3822,12 @@ soapFlag
                             parser->normalizeExpression($3, type_string, false);
                             $$.setExpr(createExprAttribute(logAtom, $3.getExpr()), $1);
                         }
+    | TOK_LOG '(' expression ',' expression ')'
+                        {
+                            parser->normalizeExpression($3, type_string, false);
+                            parser->normalizeExpression($5, type_string, false);
+                            $$.setExpr(createExprAttribute(logAtom, $3.getExpr(), $5.getExpr()), $1);
+                        }
     | XML_TOKEN         {
                             $$.setExpr(createAttribute(xmlAtom));
                             $$.setPosition($1);
@@ -3778,6 +3838,16 @@ soapFlag
                             $3.unwindCommaList(args);
                             $$.setExpr(createExprAttribute(xmlAtom, args), $1);
                         }
+    | FORMENCODED       {
+                            $$.setExpr(createAttribute(formEncodedAtom));
+                            $$.setPosition($1);
+                        }
+    | FORMENCODED '(' expression ')'
+                        {
+                            parser->normalizeExpression($3, type_string, true);
+                            $$.setExpr(createExprAttribute(formEncodedAtom, $3.getExpr()));
+                            $$.setPosition($1);
+                        }
     | JSON_TOKEN        {
                             $$.setExpr(createAttribute(jsonAtom));
                             $$.setPosition($1);
@@ -3787,6 +3857,19 @@ soapFlag
                             HqlExprArray args;
                             $3.unwindCommaList(args);
                             $$.setExpr(createExprAttribute(jsonAtom, args), $1);
+                        }
+    | PERSIST
+                        {
+                            $$.setExpr(createAttribute(persistAtom), $1);
+                        }
+    | PERSIST '(' expression ')'
+                        {
+                            //Allow either bool or an integer as the parameter
+                            if ($3.queryExprType()->isBoolean())
+                                parser->normalizeExpression($3, type_boolean, true);
+                            else
+                                parser->normalizeExpression($3, type_int, false);
+                            $$.setExpr(createExprAttribute(persistAtom, $3.getExpr()), $1);
                         }
     ;
 
@@ -4169,12 +4252,12 @@ formalQualifier
 
 
 paramDefinition
-    : setType knownOrUnknownId defvalue 
+    : setType UNKNOWN_ID defvalue
                         {   
                             $$.clear(); 
                             parser->addParameter($1, $2.getId(), $1.getType(), $3.getExpr());
                         }
-    | paramType knownOrUnknownId defvalue   
+    | paramType UNKNOWN_ID defvalue
                         {   
                             $$.clear();
                             parser->addParameter($1, $2.getId(), $1.getType(), $3.getExpr());
@@ -4183,7 +4266,7 @@ paramDefinition
                         {
                            $$.clear();
                            parser->addListElement(createAttribute(noTypeAtom));
-                           parser->addParameter($1, $1.getId(), LINK(parser->defaultIntegralType), $2.getExpr());
+                           parser->addParameter($1, $1.getId(), LINK(defaultIntegralType), $2.getExpr());
                         }
     | anyFunction defvalue
                         {
@@ -4191,25 +4274,25 @@ paramDefinition
                            $$.clear();
                            parser->addListElement(createAttribute(noTypeAtom));
                            OwnedHqlExpr func = $1.getExpr();
-                           parser->addParameter($1, func->queryId(), LINK(parser->defaultIntegralType), $2.getExpr());
+                           parser->addParameter($1, func->queryId(), LINK(defaultIntegralType), $2.getExpr());
                         }
-    | ANY DATASET knownOrUnknownId
+    | ANY DATASET UNKNOWN_ID
                         {
                             $$.clear();
                             parser->addParameter($1, $3.getId(), makeTableType(makeRowType(queryNullRecord()->getType())), NULL);
                         }
-    | ANY knownOrUnknownId defvalue
+    | ANY UNKNOWN_ID defvalue
                         {
                             $$.clear();
                             parser->setTemplateAttribute();
                             parser->addParameter($1, $2.getId(), makeAnyType(), $3.getExpr());
                         }
-    | paramType knownOrUnknownId nestedParmdef defFuncValue
+    | paramType UNKNOWN_ID nestedParmdef defFuncValue
                         {
                             $$.clear();
                             parser->addFunctionParameter($1, $2.getId(), $1.getType(), $4.getExpr());
                         }
-    | setType knownOrUnknownId nestedParmdef defFuncValue
+    | setType UNKNOWN_ID nestedParmdef defFuncValue
                         {
                             $$.clear();
                             parser->addFunctionParameter($1, $2.getId(), $1.getType(), $4.getExpr());
@@ -4932,6 +5015,11 @@ fieldAttr
                             parser->normalizeExpression($3, type_int, true, false);
                             $$.setExpr(createExprAttribute(maxLengthAtom, $3.getExpr()));
                         }
+    | LENGTHSIZE '(' expression ')'
+                        {
+                            parser->normalizeExpression($3, type_int, true, false);
+                            $$.setExpr(createExprAttribute(lengthSizeAtom, $3.getExpr()));
+                        }
     | MAXSIZE '(' expression ')' 
                         {
                             parser->normalizeExpression($3, type_int, true, false);
@@ -5098,7 +5186,7 @@ defaultValue
 setType
     : SET                   
                         {
-                            $$.setType(makeSetType(LINK(parser->defaultIntegralType)));
+                            $$.setType(makeSetType(LINK(defaultIntegralType)));
                         }
     | SET OF ANY            
                         {
@@ -5225,7 +5313,7 @@ simpleType
                             if (!type)
                             {
                                 parser->reportError(ERR_TYPEOF_ILLOPERAND, $3, "Illegal operand for TYPEOF");
-                                type = LINK(parser->defaultIntegralType);
+                                type = LINK(defaultIntegralType);
                             }
                             else
                             {
@@ -5801,7 +5889,7 @@ expr
                                 unsigned l = t1->getStringLen();
                                 unsigned r = t2->getStringLen();
                                 unsigned size = UNKNOWN_LENGTH;
-                                if ((l != UNKNOWN_LENGTH) && (r != UNKNOWN_LENGTH))
+                                if (!isUnknownLength(l) && !isUnknownLength(r))
                                     size = l + r;
                                 //MORE: case sensitive?
                                 ICharsetInfo * charset = t1->queryCharset();
@@ -5843,7 +5931,7 @@ expr
                             parser->normalizeExpression($1);
                             parser->normalizeExpression($3);
                             if (!isDecimalType($1.queryExprType()) && !isDecimalType($3.queryExprType()))
-                                parser->ensureType($1, parser->defaultRealType);
+                                parser->ensureType($1, defaultRealType);
                             $$.setExpr(parser->createArithmeticOp(no_div, $1, $3), $1);
                         }
     | expr '%' expr     {
@@ -6024,7 +6112,7 @@ primexpr
                             IHqlExpression *expr = $2.getExpr();
                             ITypeInfo *exprType = expr->queryType();
                             ITypeInfo *type = $1.getType();
-                            if ((exprType->getSize() != UNKNOWN_LENGTH) && (exprType->getSize() < type->getSize()) && type->getSize() != UNKNOWN_LENGTH)
+                            if (!isUnknownLength(exprType->getSize()) && (exprType->getSize() < type->getSize()) && !isUnknownLength(type->getSize()))
                                 parser->reportError(ERR_TYPETRANS_LARGERTYPE, $1, "Type transfer: target type in is larger than source type");
                             $$.setExpr(createValue(no_typetransfer, type, expr));
                         }
@@ -6059,11 +6147,11 @@ primexpr1
                         {   $$.inherit($2); }
     | COUNT '(' startTopFilter aggregateFlags ')' endTopFilter
                         {
-                            $$.setExpr(createValue(no_count, LINK(parser->defaultIntegralType), { $3.getExpr(), $4.getExpr() }, true));
+                            $$.setExpr(createValue(no_count, LINK(defaultIntegralType), { $3.getExpr(), $4.getExpr() }, true));
                         }
     | COUNT '(' GROUP optExtraFilter ')'
                         {
-                            $$.setExpr(createValue(no_countgroup, LINK(parser->defaultIntegralType), $4.getExpr()));
+                            $$.setExpr(createValue(no_countgroup, LINK(defaultIntegralType), $4.getExpr()));
                         }
     | COUNT '(' SORTLIST_ID ')'
                         {
@@ -6074,7 +6162,7 @@ primexpr1
                         }
     | COUNT '(' dictionary ')'
                         {
-                            $$.setExpr(createValue(no_countdict, LINK(parser->defaultIntegralType), $3.getExpr()));
+                            $$.setExpr(createValue(no_countdict, LINK(defaultIntegralType), $3.getExpr()));
                         }
     | CHOOSE '(' expression ',' chooseList ')'
                         {
@@ -6154,7 +6242,7 @@ primexpr1
                             HqlExprArray sortItems;
                             parser->endList(sortItems);
                             IHqlExpression * hash = parser->processSortList($4, no_hash, NULL, sortItems, NULL, NULL);
-                            $$.setExpr(createValue(no_hash, LINK(parser->uint4Type), hash));
+                            $$.setExpr(createValue(no_hash, LINK(uint4Type), hash));
                         }
     | HASH32 '(' beginList sortList ')'
                         {
@@ -6182,11 +6270,11 @@ primexpr1
                             HqlExprArray sortItems;
                             parser->endList(sortItems);
                             IHqlExpression * hash = parser->processSortList($4, no_hash, NULL, sortItems, NULL, NULL);
-                            $$.setExpr(createValue(no_crc, LINK(parser->uint4Type), hash), $1);
+                            $$.setExpr(createValue(no_crc, LINK(uint4Type), hash), $1);
                         }
     | ECLCRC '(' goodObject ')'
                         {
-                            $$.setExpr(createValue(no_eclcrc, LINK(parser->uint4Type), createAttribute(_original_Atom, $3.getExpr())), $1);
+                            $$.setExpr(createValue(no_eclcrc, LINK(uint4Type), createAttribute(_original_Atom, $3.getExpr())), $1);
                         }
     | ECLCRC '(' goodObject ',' PARSE ')'
                         {
@@ -6269,7 +6357,7 @@ primexpr1
                         }
     | RANDOM '(' ')'
                         {
-                            $$.setExpr(createValue(no_random, LINK(parser->uint4Type), parser->createVolatileId()));
+                            $$.setExpr(createValue(no_random, LINK(uint4Type), parser->createVolatileId()));
                         }
     | ROUND '(' expression ')'
                         {
@@ -6303,7 +6391,7 @@ primexpr1
     | LENGTH '(' expression ')'
                         {
                             parser->normalizeExpression($3, type_stringorunicode, false);
-                            $$.setExpr(createValue(no_charlen, LINK(parser->uint4Type), $3.getExpr()));
+                            $$.setExpr(createValue(no_charlen, LINK(uint4Type), $3.getExpr()));
                         }
     | TRIM '(' expression optTrimFlags ')'
                         {
@@ -6376,53 +6464,113 @@ primexpr1
                                 parser->reportError(ERR_NEGATIVE_WIDTH, $5, "REALFORMAT does not support negative widths");
                             $$.setExpr(createValue(no_realformat, makeStringType(UNKNOWN_LENGTH, NULL, NULL), $3.getExpr(), $5.getExpr(), $7.getExpr()));
                         }
-    | TOXML '(' dataRow ')'
+    | TOXML '(' dataRow optToXMLToJSONFlags ')'
                         {
                             //MORE Could allow ,NOTRIM,OPT,???flags
-                            $$.setExpr(createValue(no_toxml, makeUtf8Type(UNKNOWN_LENGTH, NULL), $3.getExpr()));
+                            $$.setExpr(createValue(no_toxml, makeUtf8Type(UNKNOWN_LENGTH, NULL), $3.getExpr(), $4.getExpr()));
                         }
-    | TOJSON '(' dataRow ')'
+    | TOJSON '(' dataRow optToXMLToJSONFlags ')'
                         {
                             //MORE Could allow ,NOTRIM,OPT,???flags
-                            $$.setExpr(createValue(no_tojson, makeUtf8Type(UNKNOWN_LENGTH, NULL), $3.getExpr()));
+                            $$.setExpr(createValue(no_tojson, makeUtf8Type(UNKNOWN_LENGTH, NULL), $3.getExpr(), $4.getExpr()));
                         }
     | REGEXFIND '(' expression ',' expression regexOpt ')'
                         {
-                            parser->normalizeExpression($3, type_stringorunicode, false);
-                            if(isUnicodeType($3.queryExprType()))
+                            if(isUTF8Type($3.queryExprType()))
+                            {
+                                parser->normalizeExpression($3, type_utf8, false);
+                                parser->checkRegex($3);
+                                parser->normalizeExpression($5, type_utf8, false);
+                            }
+                            else if(isUnicodeType($3.queryExprType()))
+                            {
+                                parser->normalizeExpression($3, type_unicode, false);
+                                parser->checkRegex($3);
                                 parser->normalizeExpression($5, type_unicode, false);
+                            }
                             else
+                            {
+                                parser->normalizeExpression($3, type_string, false);
+                                parser->checkRegex($3);
                                 parser->normalizeExpression($5, type_string, false);
+                            }
                             $$.setExpr(createValue(no_regex_find, makeBoolType(), $3.getExpr(), $5.getExpr(), $6.getExpr()));
                         }
     | REGEXFIND '(' expression ',' expression ',' expression regexOpt ')'
                         {
-                            parser->normalizeExpression($3, type_stringorunicode, false);
                             Owned<ITypeInfo> subType;
-                            if(isUnicodeType($3.queryExprType()))
+                            if(isUTF8Type($3.queryExprType()))
                             {
+                                parser->normalizeExpression($3, type_utf8, false);
+                                parser->checkRegex($3);
+                                parser->normalizeExpression($5, type_utf8, false);
+                                subType.setown(makeUtf8Type(UNKNOWN_LENGTH, 0));
+                            }
+                            else if(isUnicodeType($3.queryExprType()))
+                            {
+                                parser->normalizeExpression($3, type_unicode, false);
+                                parser->checkRegex($3);
                                 parser->normalizeExpression($5, type_unicode, false);
                                 subType.setown(makeUnicodeType(UNKNOWN_LENGTH, 0));
                             }
                             else
                             {
+                                parser->normalizeExpression($3, type_string, false);
+                                parser->checkRegex($3);
                                 parser->normalizeExpression($5, type_string, false);
                                 subType.setown(makeStringType(UNKNOWN_LENGTH));
                             }
                             parser->normalizeExpression($7, type_int, false);
                             $$.setExpr(createValue(no_regex_find, subType.getLink(), { $3.getExpr(), $5.getExpr(), $7.getExpr(), $8.getExpr() }));
                         }
-    | REGEXFINDSET '(' expression ',' expression regexOpt ')'
+    | REGEXEXTRACT '(' expression ',' expression regexOpt ')'
                         {
-                            parser->normalizeExpression($3, type_stringorunicode, false);
                             Owned<ITypeInfo> retType;
-                            if(isUnicodeType($3.queryExprType()))
+                            if(isUTF8Type($3.queryExprType()))
                             {
+                                parser->normalizeExpression($3, type_utf8, false);
+                                parser->checkRegex($3);
+                                parser->normalizeExpression($5, type_utf8, false);
+                                retType.setown(makeUtf8Type(UNKNOWN_LENGTH, $3.queryExprType()->queryLocale()));
+                            }
+                            else if(isUnicodeType($3.queryExprType()))
+                            {
+                                parser->normalizeExpression($3, type_unicode, false);
+                                parser->checkRegex($3);
                                 parser->normalizeExpression($5, type_unicode, false);
                                 retType.setown(makeUnicodeType(UNKNOWN_LENGTH, $3.queryExprType()->queryLocale()));
                             }
                             else
                             {
+                                parser->normalizeExpression($3, type_string, false);
+                                parser->checkRegex($3);
+                                parser->normalizeExpression($5, type_string, false);
+                                retType.setown(makeStringType(UNKNOWN_LENGTH));
+                            }
+
+                            $$.setExpr(createValue(no_regex_extract, makeSetType(retType.getLink()), $3.getExpr(), $5.getExpr(), $6.getExpr()), $1);
+                        }
+    | REGEXFINDSET '(' expression ',' expression regexOpt ')'
+                        {
+                            Owned<ITypeInfo> retType;
+                            if(isUTF8Type($3.queryExprType()))
+                            {
+                                parser->normalizeExpression($3, type_utf8, false);
+                                parser->checkRegex($3);
+                                parser->normalizeExpression($5, type_utf8, false);
+                                retType.setown(makeUtf8Type(UNKNOWN_LENGTH, $3.queryExprType()->queryLocale()));
+                            }
+                            else if(isUnicodeType($3.queryExprType()))
+                            {
+                                parser->normalizeExpression($3, type_unicode, false);
+                                parser->checkRegex($3);
+                                parser->normalizeExpression($5, type_unicode, false);
+                                retType.setown(makeUnicodeType(UNKNOWN_LENGTH, $3.queryExprType()->queryLocale()));
+                            }
+                            else
+                            {
+                                parser->normalizeExpression($3, type_string, false);
+                                parser->checkRegex($3);
                                 parser->normalizeExpression($5, type_string, false);
                                 retType.setown(makeStringType(UNKNOWN_LENGTH));
                             }
@@ -6431,16 +6579,27 @@ primexpr1
                         }
     | REGEXREPLACE '(' expression ',' expression ',' expression regexOpt ')'
                         {
-                            parser->normalizeExpression($3, type_stringorunicode, false);
                             Owned<ITypeInfo> retType;
-                            if(isUnicodeType($3.queryExprType()))
+                            if(isUTF8Type($3.queryExprType()))
                             {
+                                parser->normalizeExpression($3, type_utf8, false);
+                                parser->checkRegex($3);
+                                parser->normalizeExpression($5, type_utf8, false);
+                                parser->normalizeExpression($7, type_utf8, false);
+                                retType.setown(makeUtf8Type(UNKNOWN_LENGTH, 0));
+                            }
+                            else if(isUnicodeType($3.queryExprType()))
+                            {
+                                parser->normalizeExpression($3, type_unicode, false);
+                                parser->checkRegex($3);
                                 parser->normalizeExpression($5, type_unicode, false);
                                 parser->normalizeExpression($7, type_unicode, false);
                                 retType.setown(makeUnicodeType(UNKNOWN_LENGTH, 0));
                             }
                             else
                             {
+                                parser->normalizeExpression($3, type_string, false);
+                                parser->checkRegex($3);
                                 parser->normalizeExpression($5, type_string, false);
                                 parser->normalizeExpression($7, type_string, false);
                                 retType.setown(makeStringType(UNKNOWN_LENGTH));
@@ -6459,7 +6618,7 @@ primexpr1
                             IHqlExpression *expr = $3.getExpr();
                             ITypeInfo *exprType = expr->queryType();
                             ITypeInfo *type = $5.getType();
-                            if ((exprType->getSize() != UNKNOWN_LENGTH) && (exprType->getSize() < type->getSize()) && type->getSize() != UNKNOWN_LENGTH)
+                            if (!isUnknownLength(exprType->getSize()) && (exprType->getSize() < type->getSize()) && !isUnknownLength(type->getSize()))
                                 parser->reportError(ERR_TYPETRANS_LARGERTYPE, $5, "Type transfer: target type in is larger than source type");
                             $$.setExpr(createTypeTransfer(expr, type));
                         }
@@ -6566,11 +6725,11 @@ primexpr1
                         }
     | WHICH '(' optCondList ')'
                         {
-                            $$.setExpr(createValue(no_which, LINK(parser->uint4Type), { $3.getExpr() }, true), $1);
+                            $$.setExpr(createValue(no_which, LINK(uint4Type), { $3.getExpr() }, true), $1);
                         }
     | REJECTED '(' optCondList ')'
                         {
-                            $$.setExpr(createValue(no_rejected, LINK(parser->uint4Type), { $3.getExpr() }, true), $1);
+                            $$.setExpr(createValue(no_rejected, LINK(uint4Type), { $3.getExpr() }, true), $1);
                         }
     | SIZEOF '(' sizeof_type_target optMaxMin ')'
                         {
@@ -6580,7 +6739,7 @@ primexpr1
                                 parser->checkSizeof(type,$1);
 
                             //rather easier to create a dummy argument with the correct type.
-                            $$.setExpr(createValue(no_sizeof, LINK(parser->uint4Type), createValue(no_none, type), max.getClear()));
+                            $$.setExpr(createValue(no_sizeof, LINK(uint4Type), createValue(no_none, type), max.getClear()));
                         }
     | SIZEOF '(' sizeof_expr_target optMaxMin ')'
                         {
@@ -6588,7 +6747,7 @@ primexpr1
                             OwnedHqlExpr max = $4.getExpr();
                             if (!max)
                                 parser->checkSizeof(arg,$1);
-                            $$.setExpr(createValue(no_sizeof, LINK(parser->uint4Type), arg.getClear(), max.getClear()));
+                            $$.setExpr(createValue(no_sizeof, LINK(uint4Type), arg.getClear(), max.getClear()));
                         }
     | SIZEOF '(' error ')'
                         {
@@ -6599,13 +6758,13 @@ primexpr1
                         {
                             parser->normalizeExpression($3);
                             parser->normalizeExpression($5, type_set, false);
-                            $$.setExpr(createValue(no_rank, LINK(parser->uint4Type), $3.getExpr(), $5.getExpr(), $6.getExpr()));
+                            $$.setExpr(createValue(no_rank, LINK(uint4Type), $3.getExpr(), $5.getExpr(), $6.getExpr()));
                         }
     | RANKED '(' expression ',' expression optAscDesc')'
                         {
                             parser->normalizeExpression($3);
                             parser->normalizeExpression($5, type_set, false);
-                            $$.setExpr(createValue(no_ranked, LINK(parser->uint4Type), $3.getExpr(), $5.getExpr(), $6.getExpr()));
+                            $$.setExpr(createValue(no_ranked, LINK(uint4Type), $3.getExpr(), $5.getExpr(), $6.getExpr()));
                         }
     | COUNT             {
                             $$.setExpr(parser->getActiveCounter($1));
@@ -6763,11 +6922,11 @@ primexpr1
                         }
     | MATCHLENGTH '(' patternReference ')'
                         {
-                            $$.setExpr(createValue(no_matchlength, LINK(parser->uint4Type), $3.getExpr())); //, parser->createUniqueId()));
+                            $$.setExpr(createValue(no_matchlength, LINK(uint4Type), $3.getExpr())); //, parser->createUniqueId()));
                         }
     | MATCHPOSITION '(' patternReference ')'
                         {
-                            $$.setExpr(createValue(no_matchposition, LINK(parser->uint4Type), $3.getExpr())); //, parser->createUniqueId()));
+                            $$.setExpr(createValue(no_matchposition, LINK(uint4Type), $3.getExpr())); //, parser->createUniqueId()));
                         }
     | MATCHED
                         {
@@ -6787,11 +6946,11 @@ primexpr1
                         }
     | MATCHLENGTH
                         {
-                            $$.setExpr(createValue(no_matchlength, LINK(parser->uint4Type))); //, parser->createUniqueId()));
+                            $$.setExpr(createValue(no_matchlength, LINK(uint4Type))); //, parser->createUniqueId()));
                         }
     | MATCHPOSITION
                         {
-                            $$.setExpr(createValue(no_matchposition, LINK(parser->uint4Type))); //, parser->createUniqueId()));
+                            $$.setExpr(createValue(no_matchposition, LINK(uint4Type))); //, parser->createUniqueId()));
                         }
     | MATCHED '(' ')'
                         {
@@ -6811,11 +6970,11 @@ primexpr1
                         }
     | MATCHLENGTH '(' ')'
                         {
-                            $$.setExpr(createValue(no_matchlength, LINK(parser->uint4Type))); //, parser->createUniqueId()));
+                            $$.setExpr(createValue(no_matchlength, LINK(uint4Type))); //, parser->createUniqueId()));
                         }
     | MATCHPOSITION '(' ')'
                         {
-                            $$.setExpr(createValue(no_matchposition, LINK(parser->uint4Type))); //, parser->createUniqueId()));
+                            $$.setExpr(createValue(no_matchposition, LINK(uint4Type))); //, parser->createUniqueId()));
                         }
     | MATCHTEXT '(' expression ')'
                         {
@@ -6885,11 +7044,11 @@ primexpr1
                             IHqlExpression * e = $3.getExpr();
                             $$.setExpr(createValue(no_assertkeyed, e->getType(), e));
                         }
-    | KEYED '(' expression ',' OPT ')'
+    | KEYED '(' expression ',' OPT optConstBoolArg ')'
                         {
                             parser->normalizeExpression($3);
                             IHqlExpression * e = $3.getExpr();
-                            $$.setExpr(createValue(no_assertkeyed, e->getType(), e, createAttribute(extendAtom)));
+                            $$.setExpr(createValue(no_assertkeyed, e->getType(), e, createExprAttribute(extendAtom, $6.getExpr())));
                         }
     | STEPPED '(' expression ')'
                         {
@@ -6983,8 +7142,10 @@ primexpr1
                         }
     | COUNT '(' expressionList ')'
                         {
+                            if (parser->isSingleValuedExpressionList($3))
+                                parser->reportWarning(CategoryMistake, WRN_SILLY_COUNT,$1.pos,"COUNT() on a scalar expression is always 1, was this intended?");
                             OwnedHqlExpr list = parser->createListFromExpressionList($3);
-                            $$.setExpr(createValue(no_countlist, LINK(parser->defaultIntegralType), LINK(list)));
+                            $$.setExpr(createValue(no_countlist, LINK(defaultIntegralType), LINK(list)));
                             $$.setPosition($1);
                         }
     | EXISTS '(' expressionList ')'
@@ -6998,6 +7159,9 @@ primexpr1
                         }
     | SUM '(' expressionList ')'
                         {
+                            if (parser->isSingleValuedExpressionList($3))
+                                parser->reportWarning(CategoryUnexpected, WRN_UNUSUAL_AGGREGATE,$1.pos,"Unusual SUM(scalar) - was SUM(dataset, scalar) intended?");
+
                             OwnedHqlExpr list = parser->createListFromExpressionList($3);
                             ITypeInfo * elemType = parser->queryElementType($3, list);
                             Owned<ITypeInfo> sumType = getSumAggType(elemType);
@@ -7006,6 +7170,9 @@ primexpr1
                         }
     | MAX '(' expressionList ')'
                         {
+                            if (parser->isSingleValuedExpressionList($3))
+                                parser->reportWarning(CategoryUnexpected, WRN_UNUSUAL_AGGREGATE,$1.pos,"Unusual MAX(scalar) - was MAX(dataset, scalar) intended?");
+
                             OwnedHqlExpr list = parser->createListFromExpressionList($3);
                             ITypeInfo * elemType = parser->queryElementType($3, list);
                             $$.setExpr(createValue(no_maxlist, LINK(elemType), LINK(list)));
@@ -7013,6 +7180,9 @@ primexpr1
                         }
     | MIN '(' expressionList ')'
                         {
+                            if (parser->isSingleValuedExpressionList($3))
+                                parser->reportWarning(CategoryUnexpected, WRN_UNUSUAL_AGGREGATE,$1.pos,"Unusual MIN(scalar) - was MIN(dataset, scalar) intended?");
+
                             OwnedHqlExpr list = parser->createListFromExpressionList($3);
                             ITypeInfo * elemType = parser->queryElementType($3, list);
                             $$.setExpr(createValue(no_minlist, LINK(elemType), LINK(list)));
@@ -7020,6 +7190,9 @@ primexpr1
                         }
     | AVE '(' expressionList ')'
                         {
+                            if (parser->isSingleValuedExpressionList($3))
+                                parser->reportWarning(CategoryUnexpected, WRN_UNUSUAL_AGGREGATE,$1.pos,"Unusual AVE(scalar) - was AVE(dataset, scalar) intended?");
+
                             OwnedHqlExpr list = parser->createListFromExpressionList($3);
                             $$.setExpr(parser->createAveList($3, list));
                             $$.setPosition($1);
@@ -7126,6 +7299,12 @@ primexpr1
                             parser->normalizeExpression($3, type_stringorunicode, false);
                             parser->normalizeExpression($5, type_stringorunicode, false);
                             $$.setExpr(createValue(no_getenv, makeVarStringType(UNKNOWN_LENGTH), $3.getExpr(), $5.getExpr()), $1);
+                        }
+    | GETSECRET '(' expression ',' expression ')'
+                        {
+                            parser->normalizeExpression($3, type_stringorunicode, false);
+                            parser->normalizeExpression($5, type_stringorunicode, false);
+                            $$.setExpr(createValue(no_getsecret, makeDataType(UNKNOWN_LENGTH), $3.getExpr(), $5.getExpr()), $1);
                         }
     | __STAND_ALONE__   
                         {
@@ -7280,6 +7459,11 @@ xmlEncodeFlags
     | ',' ALL           { $$.setExpr(createAttribute(allAtom)); }
     ;
 
+optToXMLToJSONFlags
+    :                   { $$.setNullExpr(); }
+    | ',' ALL           { $$.setExpr(createAttribute(allAtom)); }
+    ;
+
 aggregateFlags
     :                   { $$.setNullExpr(); }
     | aggregateFlags ',' aggregateFlag
@@ -7349,7 +7533,8 @@ abstractModule
                         }
     | HASH_DOLLAR
                         {
-                            IHqlExpression * scopeExpr = queryExpression(parser->queryMacroScope());
+                            IEclPackage * package = nullptr;
+                            IHqlExpression * scopeExpr = queryExpression(parser->queryMacroScope(package));
                             $$.setExpr(LINK(scopeExpr), $1);
                         }
     | VALUE_MACRO abstractModule ENDMACRO
@@ -7427,8 +7612,8 @@ abstractModule
     | IF '(' booleanExpr ',' abstractModule ',' abstractModule ')'
                         {
                             parser->checkConstant($3, true);
+                            OwnedITypeInfo scopeType = parser->checkCompatibleScopes($5, $7);
                             OwnedHqlExpr trueExpr = $5.getExpr();
-                            OwnedITypeInfo scopeType = trueExpr->getType();  // actually needs to be the common base class.
                             OwnedHqlExpr module = createValue(no_if, scopeType.getClear(), $3.getExpr(), LINK(trueExpr), $7.getExpr());
                             $$.setExpr(createDelayedScope(module.getClear()), $1);
                         }
@@ -7666,7 +7851,7 @@ simpleDataRow
                                 OwnedHqlExpr selSeq = parser->getSelectorSequence();
                                 OwnedHqlExpr selector = createSelector(no_right, right, selSeq);
                                 OwnedHqlExpr rows = parser->resolveRows($1, selector);
-                                OwnedHqlExpr index = createConstant(createIntValue($1.getInt(), LINK(parser->defaultIntegralType)));
+                                OwnedHqlExpr index = createConstant(createIntValue($1.getInt(), LINK(defaultIntegralType)));
                                 $$.setExpr(createRow(no_selectnth, rows.getClear(), index.getClear()), $1);
                             }
                             else
@@ -7850,7 +8035,7 @@ simpleDataRow
                             parser->normalizeExpression($3);
                             IHqlExpression *expr = $3.getExpr();
                             IHqlExpression *record = $5.getExpr();
-//                          if ((exprType->getSize() != UNKNOWN_LENGTH) && (exprType->getSize() < type->getSize()) && type->getSize() != UNKNOWN_LENGTH)
+//                          if (!isUnknownLength(exprType->getSize()) && (exprType->getSize() < type->getSize()) && !isUnknownLength(type->getSize()))
 //                              parser->reportError(ERR_TYPETRANS_LARGERTYPE, $5, "Type transfer: target type in is larger than source type");
                             $$.setExpr(createRow(no_typetransfer, record, expr));
                             $$.setPosition($1);
@@ -8285,6 +8470,25 @@ dataSet
                             IHqlExpression * from = $3.getExpr();
                             $$.setExpr(createDataset(no_choosen, ds, createComma(createConstant(CHOOSEN_ALL_LIMIT), from)));
                         }
+    | EVALUATE '(' ECLAGENT ',' dataSet ')'
+                        {
+                            // $$.setExpr(createDataset(no_nothor, $5.getExpr()), $1);
+                            IHqlExpression * ds = $5.getExpr();
+                            Linked<ITypeInfo> type = ds->queryType();
+                            IHqlExpression * indep = createValue(no_independent, makeNullType(), createConstant(ECL_AGENT_CLUSTER_NAME));
+                            $$.setExpr(createDataset(no_colon, { ds, indep }), $1);
+                        }
+    | EVALUATE '(' expression ',' dataSet ')'
+                        {
+                            // Syntactic sugar for:
+                            //      dataSet : INDEPENDENT(expression)
+                            parser->normalizeExpression($3, type_string, true);
+                            IHqlExpression * clusterName = $3.getExpr();
+                            IHqlExpression * ds = $5.getExpr();
+                            Linked<ITypeInfo> type = ds->queryType();
+                            IHqlExpression * indep = createValue(no_independent, makeNullType(), clusterName);
+                            $$.setExpr(createDataset(no_colon, { ds, indep }), $1);
+                        }
     ;
 
 simpleDataSet
@@ -8395,6 +8599,13 @@ simpleDataSet
                             $$.setExpr(createDataset(op, $3.getExpr(), createComma($6.getExpr(), $7.getExpr())));
                             $$.setPosition($1);
                         }
+    | DISTRIBUTE '(' startTopFilter startDistributeAttrs ',' WIDTH '('  expression ')' optDistributeAttrs ')' endTopFilter
+                        {
+                            parser->normalizeExpression($8, type_numeric, false);
+                            OwnedHqlExpr width = createExprAttribute(widthAtom, $8.getExpr());
+                            $$.setExpr(createDataset(no_nwaydistribute, $3.getExpr(), createComma(width.getClear(), $10.getExpr())));
+                            $$.setPosition($1);
+                        }
     | DISTRIBUTE '(' startTopFilter startDistributeAttrs optDistributeAttrs ')' endTopFilter
                         {
                             OwnedHqlExpr ds = $3.getExpr();
@@ -8420,7 +8631,7 @@ simpleDataSet
                             OwnedHqlExpr fields = parser->processSortList($9, no_distribute, NULL, sortItems, NULL, NULL);
                             HqlExprArray args;
                             unwindChildren(args, fields);
-                            OwnedHqlExpr value = createValue(no_sortpartition, LINK(parser->defaultIntegralType), args);
+                            OwnedHqlExpr value = createValue(no_sortpartition, LINK(defaultIntegralType), args);
                             $$.setExpr(createDataset(no_distribute, { $3.getExpr(), value.getClear(), $11.getExpr() }));
                             $$.setPosition($1);
                         }
@@ -8483,7 +8694,7 @@ simpleDataSet
                             OwnedHqlExpr fields = parser->processSortList($7, no_distribute, NULL, sortItems, NULL, NULL);
                             HqlExprArray args;
                             unwindChildren(args, fields);
-                            OwnedHqlExpr value = createValue(no_sortpartition, LINK(parser->defaultIntegralType), args);
+                            OwnedHqlExpr value = createValue(no_sortpartition, LINK(defaultIntegralType), args);
                             $$.setExpr(createDataset(no_distribute, $3.getExpr(), value.getClear()));
                             $$.setPosition($1);
                         }
@@ -8595,13 +8806,13 @@ simpleDataSet
                             $$.setExpr(createDataset(no_process, { left, right, $8.getExpr(), $10.getExpr(), attr, $14.getExpr() }));
                             $$.setPosition($1);
                         }
-    | ROLLUP '(' startTopLeftRightSeqFilter ',' expression ',' transform optCommonAttrs ')' endTopLeftRightFilter endSelectorSequence
+    | ROLLUP '(' startTopLeftRightSeqFilter ',' expression ',' endTopFilter transform optCommonAttrs ')' endSelectorSequence
                         {
                             parser->normalizeExpression($5);
-                            parser->ensureTransformTypeMatch($7, $3.queryExpr());
+                            parser->ensureTransformTypeMatch($8, $3.queryExpr());
 
-                            OwnedHqlExpr tr = $7.getExpr();
-                            IHqlExpression *attr = $8.getExpr();
+                            OwnedHqlExpr tr = $8.getExpr();
+                            IHqlExpression *attr = $9.getExpr();
                             $$.setExpr(createDataset(no_rollup, { $3.getExpr(), $5.getExpr(), tr.getClear(), attr, $11.getExpr() }));
                             parser->checkDistribution($3, $$.queryExpr(), false);
                             $$.setPosition($1);
@@ -8642,11 +8853,11 @@ simpleDataSet
                             parser->checkDistribution($3, $$.queryExpr(), false);
                             $$.setPosition($1);
                         }
-    | ROLLUP '(' startTopLeftRightSeqFilter ',' startLeftRowsGroup ',' transform ')' endRowsGroup endTopLeftRightFilter endSelectorSequence
+    | ROLLUP '(' startTopLeftRightSeqFilter ',' startLeftRowsGroup ',' transform optCommonAttrs ')' endRowsGroup endTopLeftRightFilter endSelectorSequence
                         {
                             parser->checkGrouped($3);
                             IHqlExpression *attr = NULL;
-                            $$.setExpr(createDataset(no_rollupgroup, { $3.getExpr(), $7.getExpr(), attr, $9.getExpr(), $11.getExpr() }));
+                            $$.setExpr(createDataset(no_rollupgroup, { $3.getExpr(), $7.getExpr(), attr, $10.getExpr(), $12.getExpr(), $8.getExpr() }));
                             $$.setPosition($1);
                         }
     | COMBINE '(' startLeftDelaySeqFilter ',' startRightFilter optCommonAttrs ')' endSelectorSequence
@@ -8887,6 +9098,15 @@ simpleDataSet
                             $$.setExpr(createDataset(no_nonempty, args));
                             $$.setPosition($1);
                         }
+    | PREFETCH '(' startLeftSeqFilter endSelectorSequence optPrefetchOptions ')'
+                        {
+                            OwnedHqlExpr transform = parser->createRowAssignTransform($3, $3.queryExpr()->queryRecord(), $4);
+                            HqlExprArray args;
+                            $5.unwindCommaList(args);
+                            OwnedHqlExpr prefetchAttr = createExprAttribute(prefetchAtom, args);
+                            $$.setExpr(createDataset(no_hqlproject, { $3.getExpr(), transform.getClear(), prefetchAttr.getClear(), $4.getExpr() }));
+                            $$.setPosition($1);
+                        }
     | PROJECT '(' startLeftSeqFilter ',' beginCounterScope transform endCounterScope projectOptions ')' endSelectorSequence
                         {
                             IHqlExpression *te = createComma($6.getExpr(), $8.getExpr(), $10.getExpr());
@@ -8901,8 +9121,7 @@ simpleDataSet
                         {
                             OwnedHqlExpr transform = parser->createRowAssignTransform($3, $6, $10);
                             $6.release();
-                            $7.release();
-                            $$.setExpr(createDataset(no_hqlproject, $3.getExpr(), createComma(transform.getClear(), $8.getExpr(), $10.getExpr())));
+                            $$.setExpr(createDataset(no_hqlproject, { $3.getExpr(), transform.getClear(), $8.getExpr(), $10.getExpr(), $7.getExpr() }));
                             $$.setPosition($1);
                         }
     | PULL '(' startTopFilter ')' endTopFilter
@@ -9127,6 +9346,11 @@ simpleDataSet
                             OwnedHqlExpr transform = parser->extractTransformFromExtra(extra);
 
                             parser->inheritRecordMaxLength(dataset, record);
+
+                            // inherit packed attribute from the inputbase index
+                            IHqlExpression * inputPacked = dataset->queryAttribute(packedAtom);
+                            if (inputPacked && isKey(dataset) && !queryAttributeInList(packedAtom, extra))
+                                extra.setown(createComma(extra.getClear(), LINK(inputPacked)));
 
                             record.setown(parser->checkIndexRecord(record, $5, extra));
 
@@ -10107,17 +10331,46 @@ prefetchAttribute
                             $$.setExpr(createExprAttribute(prefetchAtom));
                             $$.setPosition($1);
                         }
-    | PREFETCH '(' expression ')'
+    | PREFETCH '(' prefetchOptions ')'
                         {
-                            parser->normalizeExpression($3, type_int, false);
-                            $$.setExpr(createExprAttribute(prefetchAtom, $3.getExpr()));
-                            $$.setPosition($1);
+                            HqlExprArray args;
+                            $3.unwindCommaList(args);
+                            $$.setExpr(createExprAttribute(prefetchAtom, args), $1);
                         }
-    | PREFETCH '(' expression ',' PARALLEL ')'
+    ;
+
+prefetchOption
+    : PARALLEL
                         {
-                            parser->normalizeExpression($3, type_int, false);
-                            $$.setExpr(createExprAttribute(prefetchAtom, $3.getExpr(), createExprAttribute(parallelAtom)));
-                            $$.setPosition($1);
+                            $$.setExpr(createExprAttribute(parallelAtom), $1);
+                        }
+    | SEQUENTIAL
+                        {
+                            $$.setExpr(createExprAttribute(sequentialAtom), $1);
+                        }
+    ;
+
+prefetchOptions
+    : prefetchOption
+    | expression
+                        {
+                            parser->normalizeExpression($1, type_int, false);
+                        }
+    | expression ',' prefetchOption
+                        {
+                            parser->normalizeExpression($1, type_int, false);
+                            $$.setExpr(createComma($1.getExpr(), $3.getExpr()));
+                        }
+    ;
+
+optPrefetchOptions
+    : ',' prefetchOptions
+                        {
+                            $$.inherit($2);
+                        }
+    |
+                        {
+                            $$.setNullExpr();
                         }
     ;
 
@@ -10386,7 +10639,7 @@ mode
     : FLAT              {   $$.setExpr(createValue(no_flat, makeNullType()));   }
     | CSV               {   $$.setExpr(createValue(no_csv, makeNullType()));    }
     | CSV '(' csvOptions ')'
-                        {   
+                        {
                             HqlExprArray args;
                             $3.unwindCommaList(args);
                             $$.setExpr(createValue(no_csv, makeNullType(), args));
@@ -10434,6 +10687,10 @@ mode
                             $$.setExpr(createValue(no_json, makeNullType(), args));
                         }
     | pipe
+    | TYPE '(' UNKNOWN_ID attribs ')'
+                        {
+                            parser->setPluggableModeExpr($$, $3, $4);
+                        }
     ;
 
 dsOption
@@ -13118,7 +13375,7 @@ bool HqlGram::canFollowCurrentState(int yychar, const short * activeState)
   const yytype_int16 * yyssp = activeState;
   const yytype_int16 * maxyyssp = yyssp;
   const unsigned MaxTempStates = 4;
-  yytype_int16 tempstate[MaxTempStates];
+  yytype_int16 tempstate[MaxTempStates] = { 0 };
 
   int yystate = *yyssp;
   int yyn;
@@ -13144,7 +13401,7 @@ bool HqlGram::canFollowCurrentState(int yychar, const short * activeState)
   yyssp++;
 
   assertex(yyssp > maxyyssp);
-  if (yyssp - maxyyssp > MaxTempStates)
+  if (yyssp - maxyyssp > (signed)MaxTempStates)
     return false;
   tempstate[yyssp-maxyyssp-1] = yystate;
 

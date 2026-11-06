@@ -27,13 +27,22 @@ project( SMCLib )
 include(${HPCC_SOURCE_DIR}/esp/scm/smcscm.cmake)
 
 set (    SRCS
+         ${ESPSCM_GENERATED_DIR}/common_esp.cpp
          ${HPCC_SOURCE_DIR}/dali/sasha/sacmd.cpp
-         ${ESPSCM_GENERATED_DIR}/ws_topology_esp.cpp 
+         ${ESPSCM_GENERATED_DIR}/ws_topology_esp.cpp
+         ${ESPSCM_GENERATED_DIR}/ws_resources_esp.cpp
          LogicFileWrapper.cpp 
-         TpWrapper.cpp 
+         TpCommon.cpp
          WUXMLInfo.cpp
          InfoCacheReader.cpp
     )
+
+if (CONTAINERIZED)
+    set (SRCS  ${SRCS}  TpContainer.cpp)
+else ()
+    set (SRCS  ${SRCS}  TpWrapper.cpp)
+endif()
+
 
 include_directories ( 
          ./../../../system/mp 
@@ -60,22 +69,30 @@ include_directories (
          ${HPCC_SOURCE_DIR}/common/thorhelper
     )
 
-ADD_DEFINITIONS( -D_USRDLL -DSMCLIB_EXPORTS )
+ADD_DEFINITIONS( -D_USRDLL -DSMCLIB_EXPORTS -DWSWU_API_LOCAL -DWsResources_API_LOCAL )
 
 HPCC_ADD_LIBRARY( SMCLib SHARED ${SRCS} )
 add_dependencies(SMCLib espscm)
 install ( TARGETS SMCLib RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( SMCLib
+target_link_libraries ( SMCLib PRIVATE
          jlib
+         mp
          remote 
          xmllib 
          esphttp 
          dalibase 
-         environment 
-         dalift 
          dllserver 
          nbcd 
          eclrtl 
          deftype 
+         thorhelper
          workunit 
     )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( SMCLib PRIVATE environment )
+endif()
+
+IF (USE_OPENSSL)
+    target_link_libraries ( SMCLib PRIVATE securesocket )
+ENDIF()

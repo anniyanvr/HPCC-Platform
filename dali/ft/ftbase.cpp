@@ -30,10 +30,12 @@
 #include "daftmc.hpp"
 #include "dasds.hpp"
 #include "daftcfg.hpp"
-#include "environment.hpp"
-#include "dalienv.hpp"
 #include "rmtspawn.hpp"
 
+#ifndef _CONTAINERIZED
+#include "environment.hpp"
+#include "dalienv.hpp"
+#endif
 
 //----------------------------------------------------------------------------
 
@@ -64,7 +66,8 @@ void renameDfuTempToFinal(const RemoteFilename & realname)
         EXCLOG(e, "Failed to rename target file");
         StringBuffer oldName;
         realname.getPath(oldName);
-        LOG(MCdebugInfoDetail, unknownJob, "Error: Rename %s->%s failed - tring to delete target and rename again", oldName.str(), newTailname.str());
+        if (doTrace(traceSprayDetails))
+            LOG(MCdebugInfoDetail, "Error: Rename %s->%s failed - tring to delete target and rename again", oldName.str(), newTailname.str());
         e->Release();
         OwnedIFile old = createIFile(realname);
         old->remove();
@@ -123,11 +126,14 @@ void PartitionPoint::deserialize(MemoryBuffer & in)
 
 void PartitionPoint::display()
 {
-    StringBuffer fulli, fullo;
-    LOG(MCdebugInfoDetail, unknownJob,
-             "Partition %s{%d}[%" I64F "d size %" I64F "d]->%s{%d}[%" I64F "d size %" I64F "d]",
-             inputName.getPath(fulli).str(), whichInput, inputOffset, inputLength,
-             outputName.getPath(fullo).str(), whichOutput, outputOffset, outputLength);
+    if (doTrace(tracePartitionDetails, traceDetailed))
+    {
+        StringBuffer fulli, fullo;
+        LOG(MCdebugInfoDetail,
+                "Partition %s{%d}[%" I64F "d size %" I64F "d]->%s{%d}[%" I64F "d size %" I64F "d]",
+                inputName.getPath(fulli).str(), whichInput, inputOffset, inputLength,
+                outputName.getPath(fullo).str(), whichOutput, outputOffset, outputLength);
+    }
 }
 
 
@@ -184,7 +190,7 @@ const char * FFTtext[FFTlast] = {
     "utf-8", "utf-8n",
     "utf-16", "utf-16be", "utf-16le",
     "utf-32", "utf-32be", "utf-32le",
-    "recfm-vb", "recfm-v", "variablebigendian"
+    "recfm-vb", "recfm-v", "variablebigendian", "key"
 };
 
 void FileFormat::deserialize(MemoryBuffer & in)
@@ -243,6 +249,7 @@ unsigned FileFormat::getUnitSize() const
     case FFTcsv:
     case FFTutf:
     case FFTutf8: case FFTutf8n:
+    case FFTkey:
         return 1;
     case FFTutf16: case FFTutf16be: case FFTutf16le:
         return 2;
@@ -346,6 +353,13 @@ bool FileFormat::restore(IPropertyTree * props)
         type = FFTrecfmvb;
     else if ((stricmp(format, "recfmv")==0)||(stricmp(format, "recfm-v")==0))
         type = FFTrecfmv;
+#if 0
+    else if (strieq(props->queryProp("@kind"), "key"))
+    {
+        //MORE: Will this cause issues for backward compatibility?
+        type = FFTkey;
+    }
+#endif
     else if (props->hasProp(FPrecordSize))
     {
         type = FFTfixed;
@@ -401,6 +415,10 @@ void FileFormat::save(IPropertyTree * props)
     case FFTrecfmv:
         props->setProp(FPformat, FFTtext[type]);
         props->setProp(FPkind, FFTtext[FFTrecfmv]);
+        break;
+    case FFTkey:
+        props->setProp(FPformat, FFTtext[type]);
+        props->setProp(FPkind, FFTtext[type]);
         break;
     default:
         PROGLOG("unknown type %d",(int)type);
@@ -540,6 +558,8 @@ void OutputProgress::reset()
     outputLength = 0;
     hasCompressed = false;
     compressedPartSize = 0;
+    numWrites = 0;
+    numReads = 0;
 }
 
 MemoryBuffer & OutputProgress::deserializeCore(MemoryBuffer & in)
@@ -567,6 +587,9 @@ MemoryBuffer & OutputProgress::deserializeExtra(MemoryBuffer & in, unsigned vers
             if (hasCompressed)
                 in.read(compressedPartSize);
             break;
+        case 2:
+            in.readPacked(numWrites).readPacked(numReads);
+            break;
         }
     }
     return in;
@@ -576,7 +599,8 @@ MemoryBuffer & OutputProgress::deserializeExtra(MemoryBuffer & in, unsigned vers
 static const char * const statusText[] = {"Init","Active","Copied","Renamed"};
 void OutputProgress::trace()
 {
-    LOG(MCdebugInfoDetail, unknownJob, "Chunk %d status: %s  input length: %" I64F "d[CRC:%x] -> output length:%" I64F "d[CRC:%x]", whichPartition, statusText[status], inputLength, inputCRC, outputLength, outputCRC);
+    if (doTrace(traceSprayDetails, traceDetailed))
+        LOG(MCdebugInfoDetail, "Chunk %d status: %s  input length: %" I64F "d[CRC:%x] -> output length:%" I64F "d[CRC:%x]", whichPartition, statusText[status], inputLength, inputCRC, outputLength, outputCRC);
 }
 
 MemoryBuffer & OutputProgress::serializeCore(MemoryBuffer & out)
@@ -596,8 +620,11 @@ MemoryBuffer & OutputProgress::serializeExtra(MemoryBuffer & out, unsigned versi
     {
     case 1:
         out.append(hasCompressed);
-        if (hasCompressed )
+        if (hasCompressed)
             out.append(compressedPartSize);
+        break;
+    case 2:
+        out.appendPacked(numWrites).appendPacked(numReads);
         break;
     }
     return out;
@@ -615,6 +642,8 @@ void OutputProgress::set(const OutputProgress & other)
     resultTime = other.resultTime;
     hasCompressed = other.hasCompressed;
     compressedPartSize = other.compressedPartSize;
+    numWrites = other.numWrites;
+    numReads = other.numReads;
 }
 
 void OutputProgress::restore(IPropertyTree * tree)
@@ -629,6 +658,8 @@ void OutputProgress::restore(IPropertyTree * tree)
     resultTime.setString(tree->queryProp("@modified"));
     hasCompressed = tree->getPropBool("@compressed");
     compressedPartSize = tree->getPropInt64("@compressedPartSize");
+    numWrites = tree->getPropInt64("@numWrites");
+    numReads = tree->getPropInt64("@numReads");
 }
 
 void OutputProgress::save(IPropertyTree * tree)
@@ -647,23 +678,31 @@ void OutputProgress::save(IPropertyTree * tree)
     }
     tree->setPropInt("@compressed", hasCompressed);
     tree->setPropInt64("@compressedPartSize", compressedPartSize);
+    tree->setPropInt64("@numWrites", numWrites);
+    tree->setPropInt64("@numReads", numReads);
 }
 
 
 void displayProgress(OutputProgressArray & progress)
 {
-    LOG(MCdebugInfoDetail, unknownJob, "Progress:");
-    ForEachItemIn(idx, progress)
-        progress.item(idx).trace();
+    if (doTrace(traceSprayDetails, traceDetailed))
+    {
+        LOG(MCdebugInfoDetail, "Progress:");
+        ForEachItemIn(idx, progress)
+            progress.item(idx).trace();
+    }
 }
 
 //---------------------------------------------------------------------------
 
 void displayPartition(PartitionPointArray & partition)
 {
-    LOG(MCdebugInfoDetail, unknownJob, "Partition:");
-    ForEachItemIn(idx, partition)
-        partition.item(idx).display();
+    if (doTrace(tracePartitionDetails, traceDetailed))
+    {
+        LOG(MCdebugInfoDetail, "Partition:");
+        ForEachItemIn(idx, partition)
+            partition.item(idx).display();
+    }
 }
 
 void deserialize(PartitionPointArray & partition, MemoryBuffer & in)
@@ -696,6 +735,7 @@ CrcIOStream::CrcIOStream(IFileIOStream * _stream, unsigned startCRC)
 
 void CrcIOStream::flush()
 {
+    stream->flush();
 }
 
 size32_t CrcIOStream::read(size32_t len, void * data)
@@ -733,11 +773,13 @@ size32_t CrcIOStream::write(size32_t len, const void * data)
 static int breakCount;
 bool daftAbortHandler()
 {
-    LOG(MCprogress, unknownJob, "Aborting...");
+    LOG(MCprogress, "Aborting...");
     // hit ^C 3 times to really stop it...
     if (breakCount++ >= 2)
     {
+#ifndef _CONTAINERIZED
         closeEnvironment();
+#endif
         return true;
     }
     return false;
@@ -747,8 +789,12 @@ bool daftAbortHandler()
 
 const char * queryFtSlaveExecutable(const IpAddress &ip, StringBuffer &ret)
 {
+#ifdef _CONTAINERIZED
+    return ret.append("ftslave");
+#else
     StringBuffer dir; // not currently used
     return querySlaveExecutable("FTSlaveProcess", "ftslave", NULL, ip, ret, dir);
+#endif
 }
 
 static StringAttr ftslavelogdir;

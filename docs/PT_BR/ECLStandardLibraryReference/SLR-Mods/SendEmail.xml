@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE sect1 PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
 "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <sect1 id="SendEmail">
@@ -12,57 +12,109 @@
       <primary>Email.SendEmail</primary>
     </indexterm> <indexterm>
       <primary>SendEmail</primary>
-    </indexterm>( </emphasis> <emphasis>sendto, subject, body, server, port, sender</emphasis> <emphasis role="bold"> )</emphasis></para>
+    </indexterm>( </emphasis> <emphasis>to, subject, body, mailServer, port,
+  sender, cc, bcc, highPriority, rptErrAsFail</emphasis> <emphasis
+  role="bold"> )</emphasis></para>
 
   <informaltable colsep="1" frame="all" rowsep="1">
     <tgroup cols="2">
-      <colspec colwidth="80.50pt" />
+      <colspec colwidth="80.50pt"/>
 
-      <colspec />
+      <colspec/>
 
       <tbody>
         <row>
-          <entry><emphasis>sendto</emphasis></entry>
+          <entry><emphasis>to</emphasis></entry>
 
-          <entry>Uma string terminada por nulo que contém uma lista delimitada por vírgulas dos endereços dos destinatários. A validade dos endereços não é verificada. Portanto, é responsabilidade do programador garantir essa validade.</entry>
+          <entry>Uma string terminada por nulo que contém uma lista delimitada
+          por vírgulas dos endereços dos destinatários pretendidos. A validade
+          dos endereços não é verificada, portanto é responsabilidade do
+          programador garantir que todos sejam válidos.</entry>
         </row>
 
         <row>
           <entry><emphasis>subject</emphasis></entry>
 
-          <entry>Uma string terminada por nulo que contém a linha de assunto.</entry>
+          <entry>Uma string terminada por nulo que contém a linha de
+          assunto.</entry>
         </row>
 
         <row>
           <entry><emphasis>body</emphasis></entry>
 
-          <entry>Uma string terminada por nulo que contém o texto do e-mail a ser enviado. Essa string deve ter a codificação de caracteres "ISO-8859-1 (latin1)" (o conjunto de caracteres padrão do ECL). Texto em qualquer outro conjunto de caracteres deve ser enviado como anexo (consulte a função STD.System.Email.SendEmailAttachText()).</entry>
+          <entry>Uma string terminada por nulo que contém o texto do e-mail a
+          ser enviado. Essa string deve usar a codificação de caracteres
+          "ISO-8859-1 (latin1)" (o conjunto de caracteres padrão do ECL).
+          Texto em qualquer outro conjunto de caracteres deve ser enviado como
+          anexo (consulte as funções <link
+          linkend="SendEmailAttachText">STD.System.Email.SendEmailAttachText()</link>
+          ou <link
+          linkend="SendEmailAttachData">STD.System.Email.SendEmailAttachData()
+          </link>).</entry>
         </row>
 
         <row>
-          <entry><emphasis>server</emphasis></entry>
+          <entry><emphasis>mailServer</emphasis></entry>
 
-          <entry>Opcional. Uma string terminada por nulo que contém o nome do servidor de e-mail. Se omitida, assume o valor padrão da variável de ambiente SMTPserver.</entry>
+          <entry>Opcional. Uma string terminada por nulo que contém o nome do
+          servidor de e-mail. Se omitida, o padrão é o valor da variável de
+          ambiente SMTPserver.</entry>
         </row>
 
         <row>
           <entry><emphasis>port</emphasis></entry>
 
-          <entry>Opcional. Um valor inteiro UNSIGNED4 que contém o número da porta. Se omitido, assume o valor padrão da variável de ambiente SMTPport.</entry>
+          <entry>Opcional. Um valor inteiro UNSIGNED4 que contém o número da
+          porta. Se omitido, o padrão é o valor da variável de ambiente
+          SMTPport.</entry>
         </row>
 
         <row>
           <entry><emphasis>sender</emphasis></entry>
 
-          <entry>Opcional. Uma string terminada por nulo que contém o endereço do remetente. Se omitida, assume o valor padrão da variável de ambiente emailSenderAddress.</entry>
+          <entry>Opcional. Uma string terminada por nulo que contém o endereço
+          do remetente. Se omitida, o padrão é o valor da variável de ambiente
+          emailSenderAddress.</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>cc</emphasis></entry>
+
+          <entry>Opcional. Endereços delimitados por vírgulas de destinatários
+          de cópia. O padrão é uma string vazia (nenhum).</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>bcc</emphasis></entry>
+
+          <entry>Opcional. Endereços delimitados por vírgulas de destinatários
+          de cópia oculta. O padrão é uma string vazia (nenhum).</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>highPriority</emphasis></entry>
+
+          <entry>Opcional. Um indicador booleano TRUE/FALSE que, quando TRUE,
+          envia a mensagem com alta prioridade. O padrão é FALSE (prioridade
+          normal).</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>rptErrAsFail</emphasis></entry>
+
+          <entry>Opcional. Um indicador booleano TRUE/FALSE que, quando TRUE,
+          faz com que qualquer erro ao tentar enviar o e-mail resulte em um
+          erro/exceção. O padrão é TRUE.</entry>
         </row>
       </tbody>
     </tgroup>
   </informaltable>
 
-  <para>A função  <emphasis role="bold">SendEmail </emphasis> envia uma mensagem de e-mail.</para>
+  <para>A função <emphasis role="bold">SendEmail </emphasis> envia uma
+  mensagem de e-mail.</para>
 
   <para>Exemplo:</para>
 
-  <programlisting format="linespecific">STD.System.Email.SendEmail( 'me@mydomain.com', 'testing 1,2,3', 'this is a test message');</programlisting>
+  <programlisting format="linespecific">IMPORT STD;
+<!--#synthpii-->STD.System.Email.SendEmail( 'me@example.com', 'testing 1,2,3', 'this is a test message');</programlisting>
 </sect1>

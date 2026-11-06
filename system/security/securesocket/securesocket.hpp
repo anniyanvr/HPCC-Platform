@@ -45,18 +45,30 @@ enum SecureSocketType
 #define SSLogNormal 5
 #define SSLogMax    10
 
+#define PORT_CHECK_SSL_ACCEPT_ERROR -9995
+
+interface IAsyncProcessor;
+interface IAsyncCallback;
+
 // One instance per connection
 interface ISecureSocket : implements ISocket
 {
     virtual int secure_accept(int logLevel=1) = 0;
     virtual int secure_connect(int logLevel=1) = 0;
+    virtual StringBuffer& get_ssl_version(StringBuffer& ver) = 0;
+    
+    // Async TLS operations - use io_uring when available
+    virtual void startAsyncAccept(IAsyncProcessor * processor, IAsyncCallback & callback, int logLevel=1) = 0;
+    virtual void startAsyncConnect(IAsyncProcessor * processor, IAsyncCallback & callback, int logLevel=1) = 0;
+    virtual void startAsyncRead(IAsyncProcessor * processor, void * buf, size32_t minSize, size32_t maxSize, IAsyncCallback & callback) = 0;
+    virtual void startAsyncWrite(IAsyncProcessor * processor, const void * buf, size32_t size, IAsyncCallback & callback) = 0;
 };
 
 // One instance per program running
 interface ISecureSocketContext : implements IInterface
 {
-    virtual ISecureSocket* createSecureSocket(ISocket* sock, int loglevel = SSLogNormal) = 0;
-    virtual ISecureSocket* createSecureSocket(int sockfd, int loglevel = SSLogNormal) = 0;
+    virtual ISecureSocket* createSecureSocket(ISocket* sock, int loglevel = SSLogNormal, const char *fqdn = nullptr) = 0;
+    virtual ISecureSocket* createSecureSocket(int sockfd, int loglevel = SSLogNormal, const char *fqdn = nullptr) = 0;
 };
 
 interface ICertificate : implements IInterface
@@ -78,19 +90,41 @@ interface ICertificate : implements IInterface
 };
 
 typedef ISecureSocketContext* (*createSecureSocketContext_t)(SecureSocketType);
-typedef ISecureSocketContext* (*createSecureSocketContextEx_t)(const char* certfile, const char* privkeyfile, const char* passphrase, SecureSocketType);
+typedef ISecureSocketContext* (*createSecureSocketContextEx_t)(const char* certFileOrBuf, const char* privKeyFileOrBuf, const char* passphrase, SecureSocketType);
 typedef ISecureSocketContext* (*createSecureSocketContextEx2_t)(IPropertyTree* config, SecureSocketType);
+typedef ISecureSocketContext* (*createSecureSocketContextSecret_t)(const char *mtlsSecretName, SecureSocketType);
+typedef ISecureSocketContext* (*createSecureSocketContextSecretSrv_t)(const char *mtlsSecretName, const char *optTrustedPeers, bool requireMtlsConfig);
 
 extern "C" {
 
+//The following allow the creation of a secure socket context where the certificates will automatically be updated when they expire.
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextSynced(const ISyncedPropertyTree * config, SecureSocketType sockettype); // Will become the primary (only) factory method
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextSecret(const char *mtlsSecretName, SecureSocketType);
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextSecretSrv(const char *mtlsSecretName, const char *optTrustedPeers, bool requireMtlsConfig);
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextSSF(ISmartSocketFactory* ssf);
+
+//Helper function to aid migration to the functions above.  This should eventually be removed.
+SECURESOCKET_API IPropertyTree * createSecureSocketConfig(const char* certFileOrBuf, const char* privKeyFileOrBuf, const char* passphrase, bool createIfAllNull);
+
+//Legacy factory methods - should be phased out.
 SECURESOCKET_API ISecureSocketContext* createSecureSocketContext(SecureSocketType);
-SECURESOCKET_API ISecureSocketContext* createSecureSocketContextEx(const char* certfile, const char* privkeyfile, const char* passphrase, SecureSocketType);
-SECURESOCKET_API ISecureSocketContext* createSecureSocketContextEx2(IPropertyTree* config, SecureSocketType);
+SECURESOCKET_API ISecureSocketContext* createSecureSocketContextEx2(const IPropertyTree* config, SecureSocketType);
 SECURESOCKET_API ICertificate *createCertificate();
 SECURESOCKET_API int signCertificate(const char* csr, const char* ca_certificate, const char* ca_privkey, const char* ca_passphrase, int days, StringBuffer& certificate);
 };
 
-SECURESOCKET_API ISmartSocketFactory *createSecureSmartSocketFactory(const char *_socklist, bool _retry = false, unsigned _retryInterval = 60, unsigned _dnsInterval = (unsigned) -1);
+
+SECURESOCKET_API ISmartSocketFactory *createSecureSmartSocketFactory(const char *_socklist, IPropertyTree* _tlsConfig, bool _retry = false, unsigned _retryInterval = 60, unsigned _dnsInterval = (unsigned) -1);
+SECURESOCKET_API ISmartSocketFactory *createSecureSmartSocketFactory(IPropertyTree &service, bool _retry = false, unsigned _retryInterval = 60, unsigned _dnsInterval = (unsigned) -1);
+
+SECURESOCKET_API IConversation *createSingletonSecureSocketConnection(unsigned short port,SocketEndpoint *_ep=nullptr);
+
+namespace securesocket
+{
+    // Function to reset TLS io_uring cache for unit testing
+    // Call this after modifying expert/@useTLSIOUring config to force re-read
+    SECURESOCKET_API void resetTLSIOUringEnabledCache();
+}
 
 #endif
 

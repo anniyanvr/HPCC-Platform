@@ -49,31 +49,40 @@ function update_chart_file()
     local _new_point=$3
     local _new_sequence=$4
     local _new_minor=$5
+    local _new_major=$6
     if [ -z "$_new_minor" ] ; then
       _new_minor=$HPCC_MINOR
     fi
+    if [ -z "$_new_major" ] ; then
+      _new_major=$HPCC_MAJOR
+    fi
     if [ "$_new_maturity" == "release" ] ; then
-      local _v=${HPCC_MAJOR}.${_new_minor}.${_new_point}
+      local _v=${_new_major}.${_new_minor}.${_new_point}
     else
-      local _v=${HPCC_MAJOR}.${_new_minor}.${_new_point}-${_new_maturity}${_new_sequence}
+      local _v=${_new_major}.${_new_minor}.${_new_point}-${_new_maturity}${_new_sequence}
     fi
     
     if [ -n "$VERBOSE" ] ; then
       echo sed -E \
        -e "s/^version: .*$/version: $_v/" \
        -e "s/^appVersion: .*$/appVersion: $_v/" \
+       -e "s/helmVersion: .*$/helmVersion: $_v/" \
        -i.bak $_chart
     fi
     if [ -z "$DRYRUN" ] ; then 
       sed -E \
        -e "s/^version: .*$/version: $_v/" \
        -e "s/^appVersion: .*$/appVersion: $_v/" \
+       -e "s/helmVersion: .*$/helmVersion: $_v/" \
        -i.bak $_chart
-       cat $_chart
     else
       sed -E \
        -e "s/^version: .*$/version: $_v/" \
        -e "s/^appVersion: .*$/appVersion: $_v/" \
-       $_chart
+       -e "s/helmVersion: .*$/helmVersion: $_v/" \
+       $_chart > $_chart.bak
     fi
+    CHART_CHANGED=0
+    diff -y  --suppress-common-lines $_chart $_chart.bak || CHART_CHANGED=1
+    rm -f $_chart.bak
 }

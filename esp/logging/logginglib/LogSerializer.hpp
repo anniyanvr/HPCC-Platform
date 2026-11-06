@@ -36,7 +36,7 @@ const char* const logRequestScriptValues = "ScriptValues";
 class CLogRequestInFile : public CSimpleInterface
 {
     StringAttr fileName;
-    offset_t pos;
+    offset_t pos = 0;
     unsigned size = 0;
     StringAttr GUID;
     StringAttr option;
@@ -62,7 +62,7 @@ class CLogSerializer : public CInterface
     __int64 m_bytesWritten;
     unsigned long m_ItemCount;//
     unsigned long fileSize;//
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
 protected:
     IFile* m_file;
     IFileIO* m_fileio;

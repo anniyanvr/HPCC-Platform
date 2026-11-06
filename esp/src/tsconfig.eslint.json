@@ -1,0 +1,14 @@
+{
+    "extends": "./tsconfig.dojo.json",
+    "compilerOptions": {
+        "noEmit": true
+    },
+    "include": [
+        "src/**/*.ts",
+        "src/**/*.tsx",
+        "src-react/**/*.ts",
+        "src-react/**/*.tsx",
+        "src-dojo/**/*.ts",
+        "vite.config.mts"
+    ]
+}

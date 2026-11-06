@@ -85,6 +85,10 @@
 #define DFTERR_NoMatchingDropzonePath           8112
 #define DFTERR_LocalhostAddressUsed             8113
 #define DFTERR_InvalidSuperindexCopy            8114
+#define DFTERR_NoMatchingDropzonePlane          8115
+#define DFTERR_CannotConvertKeyFile             8116
+#define DFTERR_CannotCompressKey                8117
+#define DFTERR_InconsistentQuoteSeparator       8118
 
 //Internal errors
 #define DFTERR_UnknownFormatType                8190
@@ -108,7 +112,7 @@
 #define DFTERR_UnknownFileFormatX_Text          "Unknown format '%s' for source file"
 #define DFTERR_CouldNotOpenFilePart_Text        "Could not open file part %s"
 #define DFTERR_FailedStartSlave_Text            "Failed to start child slave '%s'"
-#define DFTERR_CopyFailed_Text                  "Copy failed (unknown reason)"
+#define DFTERR_CopyFailed_Text                  "Copy failed (%s)"
 #define DFTERR_ReplicateNumPartsDiffer_Text     "Number of parts in source and target must match when replicating"
 #define DFTERR_CopyFileOntoSelf_Text            "Trying to copy a file (%s) onto itself"
 #define DFTERR_TargetFormatUnknownSource_Text   "Cannot omit source format if target format is supplied"
@@ -155,8 +159,12 @@
 #define DFTERR_InvalidXmlPartSize_Text          "Invalid XML part size:%" I64F "d! Size is less than XML Header (%" I64F "d) + Footer (%" I64F "d)) size!"
 #define DFTERR_InvalidFilePath_Text             "Invalid file path: '%s'. For security reason it is forbidden to use '%s' or '%s' to build a path!"
 #define DFTERR_NoMatchingDropzonePath_Text      "No Drop Zone on '%s' configured at '%s'."
+#define DFTERR_NoMatchingDropzonePlane_Text     "No Drop Zone for '%s'"
 #define DFTERR_LocalhostAddressUsed_Text        "Localhost address used in remote file name: '%s'"
 #define DFTERR_InvalidSuperindexCopy_Text       "Source file %s is a super index file but copying as a simple logical file"
+#define DFTERR_CannotConvertKeyFile_Text        "Cannot convert key file to a different format"
+#define DFTERR_CannotCompressKey_Text           "Compress output is not compatible with copying a key file"
+#define DFTERR_InconsistentQuoteSeparator_Text  "The quote character %s and separator %s are inconsistent with the file contents"
 
 #define DFTERR_UnknownFormatType_Text           "INTERNAL: Save unknown format type"
 #define DFTERR_OutputOffsetMismatch_Text        "INTERNAL: Output offset does not match expected (%" I64F "d expected %" I64F "d) at %s of block %d"

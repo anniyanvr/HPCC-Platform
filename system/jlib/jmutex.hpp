@@ -22,17 +22,22 @@
 
 #include <assert.h>
 #include <atomic>
+#include <chrono>
+#include <mutex>
+#include <shared_mutex>
+#include <functional>
 #include "jiface.hpp"
+#include "jprotrace.hpp"
 #include "jsem.hpp"
 
 extern jlib_decl void ThreadYield();
-extern jlib_decl void spinUntilReady(atomic_t &value);
+extern jlib_decl void ThreadYieldNonRR();
 extern jlib_decl void spinUntilReady(std::atomic_uint &value);
 
 
 #ifdef _DEBUG
 //#define SPINLOCK_USE_MUTEX // for testing
-//#define SPINLOCK_RR_CHECK     // checks for realtime threads
+#define SPINLOCK_RR_CHECK     // checks for realtime threads
 #define _ASSERT_LOCK_SUPPORT
 #endif
 
@@ -46,24 +51,40 @@ extern jlib_decl void spinUntilReady(std::atomic_uint &value);
 #endif
 
 #ifdef _WIN32
-class jlib_decl Mutex
+class jlib_decl LegacyMutex
 {
+friend class Monitor;
 protected:
-    Mutex(const char *name)
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
+    LegacyMutex([[maybe_unused]] const char *syncName, const char *name)
     {
         mutex = CreateMutex(NULL, FALSE, name);
         assertex(mutex);
         lockcount = 0;
         owner = 0;
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_lock(syncName);
+#endif
     }
 public:
-    Mutex()
+    LegacyMutex([[maybe_unused]] const char *syncName)
     {
         mutex = CreateMutex(NULL, FALSE, NULL);
         lockcount = 0;
         owner = 0;
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_lock(syncName);
+#endif
     }
-    ~Mutex()
+    ~LegacyMutex()
     {
         if (owner != 0)
             printf("Warning - Owned mutex destroyed"); // can't use DBGLOG here!
@@ -71,7 +92,9 @@ public:
     }
     void lock()
     {
+        noteEvent(EventLockWait);
         WaitForSingleObject(mutex, INFINITE);
+        noteEvent(EventLockAcquire);
         if (lockcount) {
             if(owner!=GetCurrentThreadId())     // I think only way this can happen is with unhandled thread exception
                 lockcount = 0;                  // (don't assert as unhandled error may get lost)
@@ -81,8 +104,13 @@ public:
     }
     bool lockWait(unsigned timeout)
     {
+        noteEvent(EventLockWait);
         if (WaitForSingleObject(mutex, (long)timeout)!=WAIT_OBJECT_0)
+        {
+            noteEvent(EventLockWaitTimeout);
             return false;
+        }
+        noteEvent(EventLockAcquire);
         if (lockcount) {
             if(owner!=GetCurrentThreadId())     // I think only way this can happen is with unhandled thread exception
                 lockcount = 0;                  // (don't assert as unhandled error may get lost)
@@ -98,6 +126,7 @@ public:
         if (lockcount==0)
             owner = 0;
         ReleaseMutex(mutex);
+        noteEvent(EventLockRelease);
     }
 
 protected:
@@ -121,27 +150,19 @@ protected:
     
 private:
     int lockcount;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
 };
-
-class jlib_decl NamedMutex: public Mutex
-{
-public:
-    NamedMutex(const char *name)
-        : Mutex(name)
-    {
-    }   
-};
-
-
 
 #else // posix
 
-class jlib_decl Mutex
+class jlib_decl LegacyMutex
 {
+    friend class Monitor;
 public:
-    Mutex();
-//  Mutex(const char *name);    //not supported
-    ~Mutex();
+    LegacyMutex([[maybe_unused]] const char *syncName);
+    ~LegacyMutex();
     void lock();
     bool lockWait(unsigned timeout);
     void unlock();
@@ -151,37 +172,170 @@ protected:
     int unlockAll();
     void lockAll(int);
 private:
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
     int lockcount;
     pthread_cond_t lock_free;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
+};
+#endif
+
+class jlib_decl SimpleMutex
+{
+public:
+    SimpleMutex([[maybe_unused]] const char *syncName)
+    {
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_lock(syncName);
+#endif
+    }
+    void lock()
+    {
+        noteEvent(EventLockWait);
+        mutex.lock();
+        noteEvent(EventLockAcquire);
+    };
+    void unlock()
+    {
+        mutex.unlock();
+        noteEvent(EventLockRelease);
+    };
+private:
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
+    std::mutex mutex;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
 };
 
+class jlib_decl Mutex
+{
+public:
+    Mutex([[maybe_unused]] const char *syncName)
+    {
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_lock(syncName);
+#endif
+    }
+    void lock()
+    {
+        noteEvent(EventLockWait);
+        mutex.lock();
+        noteEvent(EventLockAcquire);
+    };
+    void unlock()
+    {
+        mutex.unlock();
+        noteEvent(EventLockRelease);
+    };
+private:
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
+    std::recursive_mutex mutex;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
+};
+
+class jlib_decl TimedMutex
+{
+public:
+    TimedMutex([[maybe_unused]] const char *syncName)
+    {
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_lock(syncName);
+#endif
+    }
+    void lock()
+    {
+        noteEvent(EventLockWait);
+        mutex.lock();
+        noteEvent(EventLockAcquire);
+    };
+    bool lockWait(unsigned timeout);
+    void unlock()
+    {
+        mutex.unlock();
+        noteEvent(EventLockRelease);
+    };
+private:
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
+    std::recursive_timed_mutex mutex;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
+};
 
 class jlib_decl NamedMutex
 {
 public:
-    NamedMutex(const char *name);   
+    NamedMutex([[maybe_unused]] const char *syncName, const char *name);
     ~NamedMutex();
     void lock();
     bool lockWait(unsigned timeout);
     void unlock();
 private:
-    Mutex threadmutex;
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
+    TimedMutex threadmutex{SYNC_LOCATION};
     char *mutexfname;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
 };
 
-
-
-#endif
-
-class jlib_decl synchronized
+template<class T> class jlib_decl MutexBlock
 {
 private:
-    Mutex &mutex;
+    T &mutex;
+public:
+    MutexBlock(T &m) : mutex(m) { mutex.lock(); };
+    ~MutexBlock() { mutex.unlock(); };
+};
+
+typedef MutexBlock<Mutex> synchronized;
+
+class jlib_decl TimedMutexBlock
+{
+private:
+    TimedMutex &mutex;
     void throwLockException(unsigned timeout);
 public:
-    synchronized(Mutex &m) : mutex(m) { mutex.lock(); };
-    synchronized(Mutex &m,unsigned timeout) : mutex(m) { if(!mutex.lockWait(timeout)) throwLockException(timeout);  }
-    inline ~synchronized() { mutex.unlock(); };
+    TimedMutexBlock(TimedMutex &m) : mutex(m) { mutex.lock(); };
+    TimedMutexBlock(TimedMutex &m, unsigned timeout) : mutex(m) { if(!mutex.lockWait(timeout)) throwLockException(timeout);  }
+    inline ~TimedMutexBlock() { mutex.unlock(); };
 };
 
 #ifdef _WIN32
@@ -200,15 +354,23 @@ class jlib_decl CriticalSection
     // lightweight mutex within a single process
 private:
     CRITICAL_SECTION flags;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
 #ifdef _ASSERT_LOCK_SUPPORT
     ThreadId owner;
     unsigned depth;
 #endif
     inline CriticalSection(CriticalSection &) = delete;
 public:
-    inline CriticalSection()
+        inline CriticalSection([[maybe_unused]] const char *syncName)
     {
         InitializeCriticalSection(&flags);
+#ifdef PROTRACE_LOCKS
+        if (syncName) {
+            syncid = protrace::note_lock(syncName);
+        }
+#endif
 #ifdef _ASSERT_LOCK_SUPPORT
         owner = 0;
         depth = 0;
@@ -223,7 +385,9 @@ public:
     };
     inline void enter()
     {
+        noteEvent(EventLockWait);
         EnterCriticalSection(&flags);
+        noteEvent(EventLockAcquire);
 #ifdef _ASSERT_LOCK_SUPPORT
         if (owner)
         {
@@ -244,6 +408,7 @@ public:
             owner = 0;
 #endif
         LeaveCriticalSection(&flags);
+        noteEvent(EventLockRelease);
     };
     inline void assertLocked()
     {
@@ -251,9 +416,36 @@ public:
         assertex(owner == GetCurrentThreadId());
 #endif
     }
+    inline bool tryEnter()
+    {
+        if (!TryEnterCriticalSection(&flags))
+        {
+            noteEvent(EventLockTryWaitFail);
+            return false;
+        }
+        noteEvent(EventLockTryWaitAcquire);
+#ifdef _ASSERT_LOCK_SUPPORT
+        if (owner)
+        {
+            assertex(owner==GetCurrentThreadId());
+            depth++;
+        }
+        else
+            owner = GetCurrentThreadId();
+#endif
+        return true;
+    }
 #ifdef ENABLE_CHECKEDCRITICALSECTIONS
     bool wouldBlock()  { if (TryEnterCriticalSection(&flags)) { leave(); return false; } return true; } // debug only
 #endif
+private:
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
 };
 #else
 
@@ -264,16 +456,23 @@ class CriticalSection
 {
 private:
     MutexId mutex;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
 #ifdef _ASSERT_LOCK_SUPPORT
     ThreadId owner;
     unsigned depth;
 #endif
     CriticalSection (const CriticalSection &);  
 public:
-    inline CriticalSection()
+        inline CriticalSection([[maybe_unused]] const char *syncName)
     {
         pthread_mutexattr_t attr;
         pthread_mutexattr_init(&attr);
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_lock(syncName);
+#endif
 #ifdef _DEBUG
         verifyex(pthread_mutexattr_settype(&attr,PTHREAD_MUTEX_RECURSIVE)==0); // verify supports attr
 #else
@@ -297,7 +496,9 @@ public:
 
     inline void enter()
     {
+        noteEvent(EventLockWait);
         pthread_mutex_lock(&mutex);
+        noteEvent(EventLockAcquire);
 #ifdef _ASSERT_LOCK_SUPPORT
         if (owner)
         {
@@ -319,11 +520,41 @@ public:
             owner = 0;
 #endif
         pthread_mutex_unlock(&mutex);
+        noteEvent(EventLockRelease);
     }
     inline void assertLocked()
     {
 #ifdef _ASSERT_LOCK_SUPPORT
         assertex(owner == GetCurrentThreadId());
+#endif
+    }
+
+    inline bool tryEnter()
+    {
+        int ret = pthread_mutex_trylock(&mutex);
+        if (ret != 0)
+        {
+            noteEvent(EventLockTryWaitFail);
+            return false;
+        }
+        noteEvent(EventLockTryWaitAcquire);
+#ifdef _ASSERT_LOCK_SUPPORT
+        if (owner)
+        {
+            assertex(owner==GetCurrentThreadId());
+            depth++;
+        }
+        else
+            owner = GetCurrentThreadId();
+#endif
+        return true;
+    }
+private:
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
 #endif
     }
 };
@@ -362,32 +593,38 @@ class CLeavableCriticalBlock
 public:
     inline CLeavableCriticalBlock(CriticalSection &_crit) : crit(_crit)
     {
-        enter();
+        ensureEnter();
     }
     inline CLeavableCriticalBlock(CriticalSection &_crit, bool lock) : crit(_crit)
     {
         if (lock)
-            enter();
+            ensureEnter();
     }
     inline ~CLeavableCriticalBlock()
     {
         if (locked)
             crit.leave();
     }
-    inline void enter()
+    inline void ensureEnter()
     {
         if (locked)
             return;
-        crit.enter();
         locked = true;
+        crit.enter();
     }
-    inline void leave()
+    inline void ensureLeave()
     {
         if (locked)
         {
             locked = false;
             crit.leave();
         }
+    }
+    inline bool tryEnter()
+    {
+        assertex(!locked);
+        locked = crit.tryEnter();
+        return locked;
     }
 };
 
@@ -396,15 +633,35 @@ public:
 
 class  SpinLock
 {
-    CriticalSection sect;
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
+    CriticalSection sect{SYNC_LOCATION};
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
 public:
+    inline SpinLock([[maybe_unused]] const char *syncName)
+    {
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_spinlock(syncName);
+#endif
+    }
     inline void enter()       
     { 
+        noteEvent(EventLockWait);
         sect.enter();
+        noteEvent(EventLockAcquire);
     }
     inline void leave()
     { 
         sect.leave();
+        noteEvent(EventLockRelease);
     }
 };
 
@@ -412,13 +669,27 @@ public:
 
 class jlib_decl  SpinLock
 {
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
     std::atomic_uint value{false};  // Use an atomic_uint rather than a bool because it is more efficient on power8
     unsigned nesting = 0;           // This is not atomic since it is only accessed by one thread at a time
     std::atomic<ThreadId> owner{0};
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
     inline SpinLock(SpinLock & value __attribute__((unused))) = delete; // to prevent inadvertent use as block
 public:
-    inline SpinLock()
-    {   
+    inline SpinLock([[maybe_unused]] const char *syncName)
+    {
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_spinlock(syncName);
+#endif
     }
 #ifdef _DEBUG
     ~SpinLock()             
@@ -429,8 +700,9 @@ public:
 #endif
     inline void enter()       
     { 
+        noteEvent(EventLockWait);
         ThreadId self = GetCurrentThreadId(); 
-#ifdef SPINLOCK_RR_CHECK    // as requested by RKC 
+#if defined(SPINLOCK_RR_CHECK) && !defined(_WIN32)    // as requested by RKC
         int policy;
         sched_param param;
         if ((pthread_getschedparam(self, &policy, &param)==0)&&(policy==SCHED_RR)) {
@@ -445,11 +717,13 @@ public:
         {
             dbgassertex(value);
             nesting++;
+            noteEvent(EventLockAcquire);
             return;
         }
         while (unlikely(value.exchange(true, std::memory_order_acquire)))
             spinUntilReady(value);
         owner.store(self, std::memory_order_relaxed);
+        noteEvent(EventLockAcquire);
     }
     inline void leave()
     {
@@ -462,6 +736,7 @@ public:
         }
         else
             nesting--;
+        noteEvent(EventLockRelease);
     }
 };
 
@@ -489,31 +764,52 @@ public:
 #ifdef NRESPINLOCK_USE_SPINLOCK
 class jlib_decl NonReentrantSpinLock: public SpinLock
 {
+public:
+    NonReentrantSpinLock([[maybe_unused]] const char *syncName) : SpinLock(syncName)
+    {
+    }
 };
 #else
 #ifdef _DEBUG
 class jlib_decl NonReentrantSpinLock
 {
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
     std::atomic_uint value;
     std::atomic<ThreadId> owner;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
     inline NonReentrantSpinLock(NonReentrantSpinLock & value __attribute__((unused))) = delete; // to prevent inadvertent use as block
 public:
-    inline NonReentrantSpinLock() : value(false), owner(0)
+    inline NonReentrantSpinLock([[maybe_unused]] const char *syncName) : value(false), owner(0)
     {
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_spinlock(syncName);
+#endif
     }
     inline void enter()       
     { 
+        noteEvent(EventLockWait);
         ThreadId self = GetCurrentThreadId(); 
         assertex(self!=owner.load(std::memory_order_relaxed)); // check for reentrancy
         while (unlikely(value.exchange(true, std::memory_order_acquire)))
             spinUntilReady(value);
         owner.store(self, std::memory_order_relaxed);
+        noteEvent(EventLockAcquire);
     }
     inline void leave()
     { 
         assertex(GetCurrentThreadId()==owner.load(std::memory_order_relaxed)); // check for spurious leave
         owner.store(0, std::memory_order_relaxed);
         value.store(false, std::memory_order_release);
+        noteEvent(EventLockRelease);
     }
 };
 
@@ -521,20 +817,37 @@ public:
 
 class jlib_decl  NonReentrantSpinLock
 {
+    inline void noteEvent(EventType event)
+    {
+#ifdef PROTRACE_LOCKS
+        if (likely(syncid))
+            protraceRecord(static_cast<unsigned>(event), syncid);
+#endif
+    }
     std::atomic_uint value;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type syncid = 0;
+#endif
     inline NonReentrantSpinLock(NonReentrantSpinLock & value __attribute__((unused))) = delete; // to prevent inadvertent use as block
 public:
-    inline NonReentrantSpinLock() : value(false)
-    {   
+    inline NonReentrantSpinLock([[maybe_unused]] const char *syncName) : value(false)
+    {
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_spinlock(syncName);
+#endif
     }
     inline void enter()       
     { 
+        noteEvent(EventLockWait);
         while (unlikely(value.exchange(true, std::memory_order_acquire)))
             spinUntilReady(value);
+        noteEvent(EventLockAcquire);
     }
     inline void leave()
     { 
         value.store(false, std::memory_order_release);
+        noteEvent(EventLockRelease);
     }
 };
 #endif
@@ -561,14 +874,16 @@ public:
 
 
 
-class jlib_decl Monitor: public Mutex
+class jlib_decl Monitor
 {
     // Like a java object - you can synchronize on it for a block, wait for a notify on it, or notify on it
+    friend class MonitorBlock;
     Semaphore *sem;
     int waiting;
     void *last;
+    LegacyMutex mutex{SYNC_LOCATION};
 public:
-    Monitor() : Mutex() { sem = new Semaphore(); waiting = 0; last = NULL; }
+    Monitor() { sem = new Semaphore(SYNC_LOCATION); waiting = 0; last = NULL; }
 //  Monitor(const char *name) : Mutex(name) { sem = new Semaphore(name); waiting = 0; last = NULL; } // not supported
     ~Monitor() {delete sem;};
 
@@ -577,201 +892,257 @@ public:
     void notifyAll();   // only called when locked -- notifys for all waiting threads
 };
 
+class jlib_decl MonitorBlock
+{
+private:
+    Monitor &monitor;
+public:
+    MonitorBlock(Monitor &m) : monitor(m) { monitor.mutex.lock(); };
+    inline ~MonitorBlock() { monitor.mutex.unlock(); };
+};
+
+
 //--------------------------------------------------------------------------------------------------------------------
 
-//Currently disabled since performance profile of own implementation is preferable, and queryWriteLocked() cannot be implemented
-//#define USE_PTHREAD_RWLOCK
-
-#ifndef USE_PTHREAD_RWLOCK
-
-class jlib_decl ReadWriteLock
+class jlib_decl StdReadWriteLock
 {
-    bool lockRead(bool timed, unsigned timeout) { 
-                                cs.enter(); 
-                                if (writeLocks == 0) 
-                                {
-                                    readLocks++;
-                                    cs.leave();
-                                }
-                                else
-                                {
-                                    readWaiting++;
-                                    cs.leave();
-                                    if (timed)
-                                    {
-                                        if (!readSem.wait(timeout)) {
-                                            cs.enter(); 
-                                            if (!readSem.wait(0)) {
-                                                readWaiting--;
-                                                cs.leave();
-                                                return false;
-                                            }
-                                            cs.leave();
-                                        }
-                                    }
-                                    else
-                                        readSem.wait();
-                                    //NB: waiting and locks adjusted before the signal occurs.
-                                }
-                                return true;
-                            }
-    bool lockWrite(bool timed, unsigned timeout) { 
-                                cs.enter(); 
-                                if ((readLocks == 0) && (writeLocks == 0))
-                                {
-                                    writeLocks++;
-                                    cs.leave();
-                                }
-                                else
-                                {
-                                    writeWaiting++;
-                                    cs.leave();
-                                    if (timed)
-                                    {
-                                        if (!writeSem.wait(timeout)) {
-                                            cs.enter(); 
-                                            if (!writeSem.wait(0)) {
-                                                writeWaiting--;
-                                                cs.leave();
-                                                return false;
-                                            }
-                                            cs.leave();
-                                        }
-                                    }
-                                    else
-                                        writeSem.wait();
-                                    //NB: waiting and locks adjusted before the signal occurs.
-                                }
-#ifdef _DEBUG
-                                exclWriteOwner = GetCurrentThreadId();
-#endif
-                                return true;
-                            }
 public:
-    ReadWriteLock()
+    StdReadWriteLock(const char * syncName)
     {
-        readLocks = 0; writeLocks = 0; readWaiting = 0; writeWaiting = 0;
-#ifdef _DEBUG
-        exclWriteOwner = 0;
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_rwlock(syncName);
 #endif
     }
-    ~ReadWriteLock()        { assertex(readLocks == 0 && writeLocks == 0); }
+    ~StdReadWriteLock() = default;
 
-    void lockRead()         { lockRead(false, 0); }
-    void lockWrite()        { lockWrite(false, 0); }
-    bool lockRead(unsigned timeout) { return lockRead(true, timeout); }
-    bool lockWrite(unsigned timeout) { return lockWrite(true, timeout); }
-    unsigned queryReadLockCount() const { return readLocks; }
-    void unlock()           { 
-                                cs.enter(); 
-                                if (readLocks) readLocks--;
-                                else
-                                {
-                                    writeLocks--;
-#ifdef _DEBUG
-                                    exclWriteOwner = 0;
-#endif
-                                }
-                                assertex(writeLocks == 0);
-                                if (readLocks == 0)
-                                {
-                                    if (readWaiting)
-                                    {
-                                        unsigned numWaiting = readWaiting;
-                                        readWaiting = 0;
-                                        readLocks += numWaiting;
-                                        readSem.signal(numWaiting);
-                                    }
-                                    else if (writeWaiting)
-                                    {
-                                        writeWaiting--;
-                                        writeLocks++;
-                                        writeSem.signal();
-                                    }
-                                }
-                                cs.leave();
-                            }
-    bool queryWriteLocked() { return (writeLocks != 0); }
-    void unlockRead()       { unlock(); }
-    void unlockWrite()      { unlock(); }
+    void lockRead()
+    {
+        noteEvent(EventRwlockReadWait);
+        mutex.lock_shared();
+        noteEvent(EventRwlockReadAcquire);
+    }
 
-    //MORE: May want to use the pthread implementations under linux.
+    void lockWrite()
+    {
+        noteEvent(EventRwlockWriteWait);
+        mutex.lock();
+        noteEvent(EventRwlockWriteAcquire);
+    }
+
+    void unlockRead()
+    {
+        noteEvent(EventRwlockReadRelease);
+        mutex.unlock_shared();
+    }
+
+    void unlockWrite()
+    {
+        noteEvent(EventRwlockWriteRelease);
+        mutex.unlock();
+    }
+
 protected:
-    CriticalSection     cs;
-    Semaphore           readSem;
-    Semaphore           writeSem;
-    unsigned            readLocks;
-    unsigned            writeLocks;
-    unsigned            readWaiting;
-    unsigned            writeWaiting;
-#ifdef _DEBUG
-    ThreadId            exclWriteOwner;
+    inline void noteEvent(EventType ev)
+    {
+#ifdef PROTRACE_LOCKS
+        protraceRecord(ev, syncid);
+#endif
+    }
+
+    std::shared_mutex     mutex;
+#ifdef PROTRACE_LOCKS
+    sync_uid_type               syncid = 0;
 #endif
 };
 
-#else
-
-class jlib_decl ReadWriteLock
+class StdReadLockBlock
 {
+    StdReadWriteLock *lock;
 public:
-    ReadWriteLock()         { pthread_rwlock_init(&rwlock, nullptr); }
-    ~ReadWriteLock()        { pthread_rwlock_destroy(&rwlock); }
-
-    void lockRead()         { pthread_rwlock_rdlock(&rwlock); }
-    void lockWrite()        { pthread_rwlock_wrlock(&rwlock); }
-    bool lockRead(unsigned timeout);
-    bool lockWrite(unsigned timeout);
-    void unlock()           { pthread_rwlock_unlock(&rwlock); }
-    void unlockRead()       { pthread_rwlock_unlock(&rwlock); }
-    void unlockWrite()      { pthread_rwlock_unlock(&rwlock); }
-    //  bool queryWriteLocked(); // I don't think this can be implemented on top of the pthread interface
-
-protected:
-    pthread_rwlock_t    rwlock;
-};
-
-#endif
-
-class ReadLockBlock
-{
-    ReadWriteLock *lock;
-public:
-    ReadLockBlock(ReadWriteLock &l) : lock(&l)      { lock->lockRead(); }
-    ~ReadLockBlock()                                { if (lock) lock->unlockRead(); }
+    StdReadLockBlock(StdReadWriteLock &l) : lock(&l)    { lock->lockRead(); }
+    ~StdReadLockBlock()                                 { if (lock) lock->unlockRead(); }
     void clear()
     {
         if (lock)
         {
             lock->unlockRead();
-            lock = NULL;
+            lock = nullptr;
         }
     }
 };
 
-class WriteLockBlock
+class StdWriteLockBlock
 {
-    ReadWriteLock *lock;
+    StdReadWriteLock *lock;
 public:
-    WriteLockBlock(ReadWriteLock &l) : lock(&l)     { lock->lockWrite(); }
-    ~WriteLockBlock()                               { if (lock) lock->unlockWrite(); }
+    StdWriteLockBlock(StdReadWriteLock &l) : lock(&l)   { lock->lockWrite(); }
+    ~StdWriteLockBlock()                                { if (lock) lock->unlockWrite(); }
     void clear()
     {
         if (lock)
         {
             lock->unlockWrite();
-            lock = NULL;
+            lock = nullptr;
+        }
+    }
+};
+
+//--------------------------------------------------------------------------------------------------------------------
+
+class jlib_decl StdTimedReadWriteLock
+{
+public:
+    StdTimedReadWriteLock(const char * syncName)
+    {
+#ifdef PROTRACE_LOCKS
+        if (syncName)
+            syncid = protrace::note_rwlock(syncName);
+#endif
+    }
+    ~StdTimedReadWriteLock() = default;
+
+    void lockRead()
+    {
+        noteEvent(EventRwlockReadWait);
+        mutex.lock_shared();
+        readLocks.fetch_add(1, std::memory_order_relaxed);
+        noteEvent(EventRwlockReadAcquire);
+    }
+
+    bool lockRead(unsigned timeout)
+    {
+        if (timeout == (unsigned)-1)
+        {
+            lockRead();
+            return true;
+        }
+
+        noteEvent(EventRwlockReadWait);
+        if (!mutex.try_lock_shared_for(std::chrono::milliseconds(timeout)))
+        {
+            noteEvent(EventRwlockReadWaitTimeout);
+            return false;
+        }
+        readLocks.fetch_add(1, std::memory_order_relaxed);
+        noteEvent(EventRwlockReadAcquire);
+        return true;
+    }
+
+    void lockWrite()
+    {
+        noteEvent(EventRwlockWriteWait);
+        mutex.lock();
+        writeLocked.store(true, std::memory_order_relaxed);
+        noteEvent(EventRwlockWriteAcquire);
+    }
+
+    bool lockWrite(unsigned timeout)
+    {
+        if (timeout == (unsigned)-1)
+        {
+            lockWrite();
+            return true;
+        }
+
+        noteEvent(EventRwlockWriteWait);
+        if (!mutex.try_lock_for(std::chrono::milliseconds(timeout)))
+        {
+            noteEvent(EventRwlockWriteWaitTimeout);
+            return false;
+        }
+        writeLocked.store(true, std::memory_order_relaxed);
+        noteEvent(EventRwlockWriteAcquire);
+        return true;
+    }
+
+    void unlockRead()
+    {
+        noteEvent(EventRwlockReadRelease);
+        readLocks.fetch_sub(1, std::memory_order_relaxed);
+        mutex.unlock_shared();
+    }
+
+    void unlockWrite()
+    {
+        noteEvent(EventRwlockWriteRelease);
+        writeLocked.store(false, std::memory_order_relaxed);
+        mutex.unlock();
+    }
+
+    void unlock()
+    {
+        if (writeLocked.load(std::memory_order_relaxed))
+            unlockWrite();
+        else
+            unlockRead();
+    }
+
+    unsigned queryReadLockCount() const { return readLocks.load(std::memory_order_relaxed); }
+    bool queryWriteLocked() const       { return writeLocked.load(std::memory_order_relaxed); }
+
+protected:
+    inline void noteEvent(EventType ev)
+    {
+#ifdef PROTRACE_LOCKS
+        protraceRecord(ev, syncid);
+#endif
+    }
+
+    std::shared_timed_mutex     mutex;
+    std::atomic<unsigned>       readLocks{0};
+    std::atomic<bool>           writeLocked{false};
+#ifdef PROTRACE_LOCKS
+    sync_uid_type               syncid = 0;
+#endif
+};
+
+class StdTimedReadLockBlock
+{
+    StdTimedReadWriteLock *lock;
+public:
+    StdTimedReadLockBlock(StdTimedReadWriteLock &l) : lock(&l)    { lock->lockRead(); }
+    ~StdTimedReadLockBlock()                                 { if (lock) lock->unlockRead(); }
+    void clear()
+    {
+        if (lock)
+        {
+            lock->unlockRead();
+            lock = nullptr;
+        }
+    }
+};
+
+class StdTimedWriteLockBlock
+{
+    StdTimedReadWriteLock *lock;
+public:
+    StdTimedWriteLockBlock(StdTimedReadWriteLock &l) : lock(&l)   { lock->lockWrite(); }
+    ~StdTimedWriteLockBlock()                                { if (lock) lock->unlockWrite(); }
+    void clear()
+    {
+        if (lock)
+        {
+            lock->unlockWrite();
+            lock = nullptr;
         }
     }
 };
 
 
-//--------------------------------------------------------------------------------------------------------------------
+using ReadWriteLock = StdReadWriteLock;
+using ReadLockBlock = StdReadLockBlock;
+using WriteLockBlock = StdWriteLockBlock;
+using TimedReadWriteLock = StdTimedReadWriteLock;
+using TimedReadLockBlock = StdTimedReadLockBlock;
+using TimedWriteLockBlock = StdTimedWriteLockBlock;
 
+//--------------------------------------------------------------------------------------------------------------------
 class Barrier
 {
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     int limit, remaining, waiting;
-    Semaphore sem;
+    Semaphore sem{SYNC_LOCATION};
 public:
     Barrier(int _limit) { init(_limit); }
     Barrier() { init(0); }
@@ -838,7 +1209,7 @@ public:
 #define USECHECKEDCRITICALSECTIONS
 #ifdef USECHECKEDCRITICALSECTIONS
 
-typedef Mutex CheckedCriticalSection;
+typedef TimedMutex CheckedCriticalSection;
 void jlib_decl checkedCritEnter(CheckedCriticalSection &crit, unsigned timeout, const char *fname, unsigned lnum);
 void jlib_decl checkedCritLeave(CheckedCriticalSection &crit);
 class  jlib_decl CheckedCriticalBlock
@@ -880,22 +1251,22 @@ public:
 
 class jlib_decl CheckedReadLockBlock
 {
-    ReadWriteLock &lock;
+    TimedReadWriteLock &lock;
 public:
-    CheckedReadLockBlock(ReadWriteLock &l, unsigned timeout, const char *fname,unsigned lnum);
+    CheckedReadLockBlock(TimedReadWriteLock &l, unsigned timeout, const char *fname,unsigned lnum);
     ~CheckedReadLockBlock()                             { lock.unlockRead(); }
 };
 
 class jlib_decl CheckedWriteLockBlock
 {
-    ReadWriteLock &lock;
+    TimedReadWriteLock &lock;
 public:
-    CheckedWriteLockBlock(ReadWriteLock &l, unsigned timeout, const char *fname, unsigned lnum);
+    CheckedWriteLockBlock(TimedReadWriteLock &l, unsigned timeout, const char *fname, unsigned lnum);
     ~CheckedWriteLockBlock()                                { lock.unlockWrite(); }
 };
 
-void jlib_decl checkedReadLockEnter(ReadWriteLock &l, unsigned timeout, const char *fname, unsigned lnum);
-void jlib_decl checkedWriteLockEnter(ReadWriteLock &l, unsigned timeout, const char *fname, unsigned lnum);
+void jlib_decl checkedReadLockEnter(TimedReadWriteLock &l, unsigned timeout, const char *fname, unsigned lnum);
+void jlib_decl checkedWriteLockEnter(TimedReadWriteLock &l, unsigned timeout, const char *fname, unsigned lnum);
 #define CHECKEDREADLOCKBLOCK(l,timeout)   CheckedReadLockBlock glue(block,__LINE__)(l,timeout,__FILE__,__LINE__)
 #define CHECKEDWRITELOCKBLOCK(l,timeout)  CheckedWriteLockBlock glue(block,__LINE__)(l,timeout,__FILE__,__LINE__)
 #define CHECKEDREADLOCKENTER(l,timeout) checkedReadLockEnter(l,timeout,__FILE__,__LINE__)
@@ -908,16 +1279,16 @@ void jlib_decl checkedWriteLockEnter(ReadWriteLock &l, unsigned timeout, const c
 #define CHECKEDCRITLEAVE(sect) (sect).leave()
 #define CHECKEDCRITICALBLOCK(sect,timeout)   CheckedCriticalBlock glue(block,__LINE__)(sect)
 #define CHECKEDCRITICALUNBLOCK(sect,timeout) CheckedCriticalUnblock glue(unblock,__LINE__)(sect)
-#define CHECKEDREADLOCKBLOCK(l,timeout)   ReadLockBlock glue(block,__LINE__)(l)
-#define CHECKEDWRITELOCKBLOCK(l,timeout)  WriteLockBlock glue(block,__LINE__)(l)
+#define CHECKEDREADLOCKBLOCK(l,timeout)   TimedReadLockBlock glue(block,__LINE__)(l)
+#define CHECKEDWRITELOCKBLOCK(l,timeout)  TimedWriteLockBlock glue(block,__LINE__)(l)
 #define CHECKEDREADLOCKENTER(l,timeout) (l).lockRead()
 #define CHECKEDWRITELOCKENTER(l,timeout) (l).lockWrite()
 #endif
 
 class CSingletonLock        // a lock that will generally only be locked once (for locking singleton objects - see below for examples
 {
-    volatile bool needlock;
-    CriticalSection  sect;
+    std::atomic<bool> needlock;
+    CriticalSection  sect{SYNC_UNTRACED}; // Singleton locks are generally uninteresting
 public:
     inline CSingletonLock()
     {
@@ -963,7 +1334,7 @@ public:
  * A template function for implementing a singleton object.  Using the same example as above would require:
 
     static std::atomic<void *> sobj;
-    static CriticalSection slock;
+    static CriticalSection slock{SYNC_UNTRACED};
     void *get()
     {
         return querySingleton(sobj, slock, []{ return createSObj; });
@@ -1002,11 +1373,164 @@ template <typename X>
 class Singleton
 {
 public:
-    template <typename FUNC> X * query(FUNC factory) { return querySingleton(singleton, cs, factory); }
-    X * queryExisting() const { return singleton.load(std::memory_order_acquire); }
+    X * query()
+    {
+        if (initialized.load(std::memory_order_acquire))
+            return singleton.load(std::memory_order_acquire);
+        return nullptr;
+    }
+
+    template <typename FUNC> X * query(FUNC factory)
+    {
+        if (initialized.load(std::memory_order_acquire))
+            return singleton.load(std::memory_order_acquire); // avoid crit
+        CriticalBlock block(cs);
+        if (initialized.load(std::memory_order_acquire))
+            return singleton.load(std::memory_order_acquire);
+        X * value = factory();
+        singleton.store(value, std::memory_order_release);
+        initialized.store(true, std::memory_order_release);
+        return value;
+    }
+
+    //destroy() is designed to be called from a static destructor, not thread safe with calls to query() ...
+    void destroy(std::function<void (X*)> destructor)
+    {
+        X * value = singleton.exchange(nullptr, std::memory_order_acq_rel);
+        if (value)
+            destructor(value);
+        initialized = false;
+    }
+    void destroy()
+    {
+        X * value = singleton.exchange(nullptr, std::memory_order_acq_rel);
+        delete value;
+        initialized = false;
+    }
 private:
     std::atomic<X *> singleton = {nullptr};
-    CriticalSection cs;
+    std::atomic<bool> initialized = {false};
+    CriticalSection cs{SYNC_LOCATION};
+};
+
+// Similar to class Shared<X>, but thread safe versions of the functions (avoid the need for critical sections)
+// Optional atomic query(std::function<CLASS *()> factoryFunc, CriticalSection & cs) allows for a singleton initialization.
+template <class CLASS> class AtomicShared
+{
+public:
+    inline AtomicShared()                              { ptr.store(nullptr, std::memory_order_relaxed); }
+    inline AtomicShared(CLASS * _ptr, bool owned)      { ptr.store(_ptr, std::memory_order_relaxed); if (!owned && _ptr) _ptr->Link(); }
+    inline AtomicShared(const AtomicShared & other)    { ptr.store(other.getLinkNonAtomic(), std::memory_order_relaxed); }
+#if defined(__cplusplus) && __cplusplus >= 201100
+    inline AtomicShared(AtomicShared && other)         { ptr.store(other.getClear(), std::memory_order_relaxed); }
+#endif
+    inline ~AtomicShared()                             { ::Release(ptr.load(std::memory_order_relaxed)); }
+    inline AtomicShared<CLASS> & operator = (const AtomicShared<CLASS> & other) { this->setown(other.getLinkNonAtomic()); return *this;  }
+
+    inline void clear()                                { ::Release(getClear()); }
+    inline CLASS * getClear()
+    {
+        return ptr.exchange(nullptr);
+    }
+    inline CLASS * getClearNonAtomic()
+    {
+        CLASS * result = ptr.load();
+        ptr.store(nullptr);
+        return result;
+    }
+
+    //The getLink() function cannot be implemented in a thread safe way - e.g. if clear is called concurrently
+    //then temp will point to a freed object.  (Might be possible with support for transactional memory...)
+    inline CLASS * getLinkNonAtomic() const
+    {
+        CLASS * temp = ptr;
+        if (temp)
+            temp->Link();
+        return temp;
+    }
+    inline CLASS * query() const
+    {
+        return ptr.load(std::memory_order_acquire);
+    }
+    template <typename FUNC>
+    inline CLASS * query(FUNC factoryFunc, CriticalSection & cs)
+    {
+        CLASS * result = ptr.load(std::memory_order_acquire);
+        if (result)
+            return result;
+        CriticalBlock block(cs);
+        if (ptr.load(std::memory_order_acquire))
+            return ptr.load(std::memory_order_acquire);
+        result = factoryFunc();
+        ptr.store(result, std::memory_order_release);
+        return result;
+    }
+    inline bool isSet() const                 { return ptr.load(std::memory_order_acquire) != nullptr; }
+    inline void set(CLASS * _ptr)
+    {
+        if (ptr.load(std::memory_order_acquire) != _ptr)
+        {
+            LINK(_ptr);
+            this->setown(_ptr);
+        }
+    }
+    inline bool setownIfNull(CLASS * _ptr)
+    {
+        if (!_ptr)
+            return false;
+
+        CLASS * expected = nullptr;
+        if (ptr.compare_exchange_strong(expected, _ptr))
+            return true;
+        _ptr->Release();
+        return false;
+    }
+    inline bool setIfNull(CLASS * _ptr)
+    {
+        if (!_ptr)
+            return false;
+
+        CLASS * expected = nullptr;
+        if (ptr.compare_exchange_strong(expected, _ptr))
+        {
+            _ptr->Link();
+            return true;
+        }
+        return false;
+    }
+    inline void setown(CLASS * _ptr)
+    {
+        CLASS * temp = ptr.exchange(_ptr);
+        ::Release(temp);
+    }
+    inline void setownNonAtomic(CLASS * _ptr)
+    {
+        CLASS * temp = ptr.load(std::memory_order_acquire);
+        ptr.store(_ptr, std::memory_order_release);
+        ::Release(temp);
+    }
+    inline CLASS * swap(CLASS * _ptr)
+    {
+        return ptr.exchange(_ptr);
+    }
+    //swap - this will only update this once, but other can temporarily have a null value
+    inline void swap(AtomicShared<CLASS> & other)
+    {
+        CLASS * temp = other.getClear();
+        temp = this->swap(temp);
+        temp = other.swap(temp);
+        ::Release(temp);
+    }
+
+protected:
+    inline AtomicShared(CLASS * _ptr)                  { ptr = _ptr; } // deliberately protected
+
+private:
+    inline void setown(const AtomicShared<CLASS> &other); // illegal - going to cause a -ve leak
+    inline AtomicShared<CLASS> & operator = (const CLASS * other);
+
+private:
+    std::atomic<CLASS *> ptr;
 };
 
 #endif

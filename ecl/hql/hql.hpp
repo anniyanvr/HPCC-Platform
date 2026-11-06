@@ -49,11 +49,11 @@ Relevant changes include
 
 */
 
-#define LANGUAGE_VERSION_MAJOR      BUILD_VERSION_MAJOR
-#define LANGUAGE_VERSION_MINOR      BUILD_VERSION_MINOR
-#define LANGUAGE_VERSION_SUB        BUILD_VERSION_POINT
+#define LANGUAGE_VERSION_MAJOR      hpccBuildInfo.buildVersionMajor
+#define LANGUAGE_VERSION_MINOR      hpccBuildInfo.buildVersionMinor
+#define LANGUAGE_VERSION_SUB        hpccBuildInfo.buildVersionPoint
 
-#define LANGUAGE_VERSION   estringify(LANGUAGE_VERSION_MAJOR) "." estringify(LANGUAGE_VERSION_MINOR) "." estringify(LANGUAGE_VERSION_SUB)
+#define LANGUAGE_VERSION  hpccBuildInfo.buildVersion
 
 
 #define DEFAULT_INT_SIZE 8
@@ -183,6 +183,7 @@ interface IEclRepository: public IInterface
 {
     virtual IHqlScope * queryRootScope() = 0;
     virtual IEclSource * getSource(const char * eclFullname) = 0;
+    virtual bool includeInArchive() const = 0;
 };
 
 //MORE: Make this more private
@@ -195,6 +196,14 @@ interface IEclRepositoryCallback : public IEclRepository
     virtual IHqlExpression * loadSymbol(IHqlRemoteScope *scope, IIdAtom * searchName) = 0;
     virtual IEclSource * getSource(IEclSource * parent, IIdAtom * searchName) = 0;
 };
+
+interface IEclPackage: public IEclRepository
+{
+    virtual const char * queryPackageName() = 0;
+};
+
+
+interface IGitUpdateLock;
 
 interface ICodegenContextCallback : public IInterface
 {
@@ -219,6 +228,16 @@ interface ICodegenContextCallback : public IInterface
      * Which platform was this query originally targeted to?
      */
     virtual void getTargetPlatform(StringBuffer & result) = 0;
+    /*
+    */
+    virtual IGitUpdateLock * getGitUpdateLock(const char * key) = 0;
+};
+
+interface IGitUpdateLock : extends IInterface
+{
+    virtual unsigned __int64 getLastFetchTimestamp() const = 0;
+    virtual unsigned __int64 getLastFailedFetchTimestamp() const = 0;
+    virtual void noteFetchResult(unsigned __int64 startTimestamp, bool succeeded) = 0;
 };
 
 

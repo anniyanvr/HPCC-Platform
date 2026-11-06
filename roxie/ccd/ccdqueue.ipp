@@ -33,27 +33,6 @@ interface IPendingCallback : public IInterface
     virtual MemoryBuffer &queryData() = 0;
 };
 
-interface IRoxieOutputQueueManager : public IInterface
-{
-    virtual void sendPacket(IRoxieQueryPacket *x, const IRoxieContextLogger &logctx) = 0;
-    virtual void sendIbyti(RoxiePacketHeader &header, const IRoxieContextLogger &logctx, unsigned subChannel) = 0;
-    virtual void sendAbort(RoxiePacketHeader &header, const IRoxieContextLogger &logctx) = 0;
-    virtual void sendAbortCallback(const RoxiePacketHeader &header, const char *lfn, const IRoxieContextLogger &logctx) = 0;
-    virtual IMessagePacker *createOutputStream(RoxiePacketHeader &x, bool outOfBand, const IRoxieContextLogger &logctx) = 0;
-    virtual bool replyPending(RoxiePacketHeader &x) = 0;
-    virtual bool abortCompleted(RoxiePacketHeader &x) = 0;
-
-    virtual unsigned getHeadRegionSize() const = 0;
-    virtual void setHeadRegionSize(unsigned newsize) = 0;
-
-    virtual void start() = 0;
-    virtual void stop() = 0;
-    virtual void join() = 0;
-    virtual IReceiveManager *queryReceiveManager() = 0;
-
-    virtual IPendingCallback *notePendingCallback(const RoxiePacketHeader &header, const char *lfn) = 0;
-    virtual void removePendingCallback(IPendingCallback *x) = 0;
-};
 
 class CDummyMessagePacker : implements IMessagePacker, public CInterface
 {
@@ -69,34 +48,11 @@ public:
         lastput = 0;
     }
 
-    virtual void *getBuffer(unsigned len, bool variable) override
-    {
-        if (variable)
-        {
-            char *ret = (char *) data.ensureCapacity(len + sizeof(RecordLengthType));
-            return ret + sizeof(RecordLengthType);
-        }
-        else
-        {
-            return data.ensureCapacity(len);
-        }
-    }
-
-    virtual void putBuffer(const void *buf, unsigned len, bool variable) override
-    {
-        if (variable)
-        {
-            buf = ((char *) buf) - sizeof(RecordLengthType);
-            *(RecordLengthType *) buf = len;
-            len += sizeof(RecordLengthType);
-        }
-        data.setWritePos(lastput + len);
-        lastput += len;
-    }
-
-    virtual void flush() override { }
-    virtual void sendMetaInfo(const void *buf, unsigned len) override { throwUnexpected(); }
-    virtual unsigned size() const override { return lastput; }
+    virtual void *getBuffer(unsigned len, bool variable) override;
+    virtual void putBuffer(const void *buf, unsigned len, bool variable) override;
+    virtual void flush() override;
+    virtual void sendMetaInfo(const void *buf, unsigned len) override;
+    virtual unsigned size() const override;
 };
 
 interface IPacketDiscarder : public IInterface
@@ -105,15 +61,15 @@ interface IPacketDiscarder : public IInterface
     virtual void stop() = 0;
 };
 
-extern IRoxieOutputQueueManager *ROQ;
-extern IRoxieOutputQueueManager *createOutputQueueManager(unsigned snifferChannel, unsigned numWorkers);
+extern IRoxieOutputQueueManager *createOutputQueueManager(unsigned numWorkers, bool encrypted);
 extern IReceiveManager *createLocalReceiveManager();
 extern IPacketDiscarder *createPacketDiscarder();
 extern void startPingTimer();
 extern void stopPingTimer();
-extern void closeMulticastSockets();
+extern void closeWorkerRequestSockets();
 extern void sendUnloadMessage(hash64_t hash, const char *id, const IRoxieContextLogger &logctx);
 
 extern unsigned getReplicationLevel(unsigned channel);
+extern unsigned getMySubChannel(unsigned channel);
 
 #endif

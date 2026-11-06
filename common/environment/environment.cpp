@@ -170,7 +170,7 @@ private:
     Owned<IRemoteConnection> conn;
     Owned<IPropertyTree> p;
     mutable MapStringToMyClass<IConstEnvBase> cache; // NB: map of 'MappingStringToIInterface' that Link's the added IConstEnvBase, and Release's on element removal.
-    mutable Mutex safeCache;
+    mutable Mutex safeCache{SYNC_LOCATION};
     mutable bool dropZoneCacheBuilt;
     mutable bool machineCacheBuilt;
     mutable bool sparkThorCacheBuilt;
@@ -207,7 +207,7 @@ private:
         if (!clusterGroupKeyNameCache)
         {
             StringBuffer keysDir;
-            envGetConfigurationDirectory("keys",nullptr, nullptr, keysDir);
+            getConfigurationDirectory(nullptr, "keys",nullptr, nullptr, keysDir);
 
             Owned<IPropertyTreeIterator> keyPairIt = p->getElements("EnvSettings/Keys/KeyPair");
             ForEach(*keyPairIt)
@@ -650,7 +650,7 @@ public:
 
 private:
     SubscriptionId sub_id;
-    Mutex  m_mutexEnv;
+    Mutex m_mutexEnv{SYNC_LOCATION};
     bool   m_constEnvUpdated;
     IEnvironmentFactory &factory;
 };
@@ -664,7 +664,7 @@ public:
     IMPLEMENT_IINTERFACE;
     typedef ArrayOf<SubscriptionId> SubscriptionIDs;
     SubscriptionIDs subIDs;
-    Mutex mutex;
+    Mutex mutex{SYNC_LOCATION};
     Owned<CSdsSubscription> subscription;
 
     CEnvironmentFactory()
@@ -1071,7 +1071,6 @@ extern ENVIRONMENT_API unsigned __int64 readSizeSetting(const char * sizeStr, co
     }
     return size;
 }
-
 
 class CConstInstanceInfo : public CConstEnvBase, implements IConstInstanceInfo
 {
@@ -1878,7 +1877,7 @@ bool CLocalEnvironment::getRunInfo(IStringVal & path, IStringVal & dir, const ch
         Owned<IConstMachineInfo> machine = getMachineByAddress(machineaddr);
         if (!machine)
         {
-            LOG(MCdebugInfo, unknownJob, "Unable to find machine for %s", machineaddr);
+            LOG(MCdebugInfo, "Unable to find machine for %s", machineaddr);
             return false;
         }
 
@@ -1886,7 +1885,7 @@ bool CLocalEnvironment::getRunInfo(IStringVal & path, IStringVal & dir, const ch
         Owned<IConstDomainInfo> domain = machine->getDomain();
         if (!domain)
         {
-            LOG(MCdebugInfo, unknownJob, "Unable to find domain for %s", machineaddr);
+            LOG(MCdebugInfo, "Unable to find domain for %s", machineaddr);
             return false;
         }
 
@@ -1897,7 +1896,7 @@ bool CLocalEnvironment::getRunInfo(IStringVal & path, IStringVal & dir, const ch
         Owned<IConstInstanceInfo> instance = getInstance(tag, version, targetdomain);
         if (!instance)
         {
-            LOG(MCdebugInfo, unknownJob, "Unable to find process %s for domain %s", tag, targetdomain.get());
+            LOG(MCdebugInfo, "Unable to find process %s for domain %s", tag, targetdomain.get());
             return false;
         }
         return instance->getRunInfo(path,dir,defprogname);
@@ -1945,7 +1944,7 @@ IConstDropZoneInfo * CLocalEnvironment::getDropZoneByAddressPath(const char * ne
     unsigned dropzonePathLen = _MAX_PATH + 1;
 
 #ifdef _DEBUG
-    LOG(MCdebugInfo, unknownJob, "Netaddress: '%s', targetFilePath: '%s'", netaddress, targetFilePath);
+    LOG(MCdebugInfo, "Netaddress: '%s', targetFilePath: '%s'", netaddress, targetFilePath);
 #endif
     // Check the directory path first
 
@@ -1973,10 +1972,10 @@ IConstDropZoneInfo * CLocalEnvironment::getDropZoneByAddressPath(const char * ne
 
 #ifdef _DEBUG
                 StringBuffer serverIpString;
-                serverIP.getIpText(serverIpString);
-                LOG(MCdebugInfo, unknownJob, "Listed server: '%s', IP: '%s'", dropzoneServer.str(), serverIpString.str());
+                serverIP.getHostText(serverIpString);
+                LOG(MCdebugInfo, "Listed server: '%s', IP: '%s'", dropzoneServer.str(), serverIpString.str());
 #endif
-                if (targetIp.ipequals(serverIP))
+                if (strisame(netaddress, dropzoneServer) || targetIp.ipequals(serverIP))
                 {
                     // OK the target is a valid machine in the server list we have a right drop zone candidate
                     // Keep this candidate drop zone if its directory path is shorter than we already have
@@ -2013,8 +2012,9 @@ IConstDropZoneInfoIterator * CLocalEnvironment::getDropZoneIteratorByAddress(con
                 {
                     IConstDropZoneServerInfo &serverElem = serverIter->query();
                     StringBuffer serverName;
-                    IpAddress serverIp(serverElem.getServer(serverName).str());
-                    if (serverIp.ipequals(toMatch))
+                    serverElem.getServer(serverName);
+                    IpAddress serverIp(serverName);
+                    if (strisame(addr, serverName) || serverIp.ipequals(toMatch))
                     {
                         matches.append(*LINK(&dz));
                         break;
@@ -2489,7 +2489,7 @@ unsigned CConstInstanceInfoIterator::count() const
 //==========================================================================================
 
 
-static CriticalSection getEnvSect;
+static CriticalSection getEnvSect{SYNC_LOCATION};
 
 extern ENVIRONMENT_API IEnvironmentFactory * getEnvironmentFactory(bool update)
 {
@@ -2551,7 +2551,7 @@ unsigned getAccessibleServiceURLList(const char *serviceType, std::vector<std::s
             Owned<IPropertyTreeIterator> espBindingIter = espProcessIter->query().getElements("EspBinding");
             ForEach(*espBindingIter)
             {
-                xpath.setf("Software/EspService[@name=\"%s\"]/Properties/@type",  espBindingIter->query().queryProp("@service"));
+                xpath.setf("Software/EspService[@name=\"%s\"]/Properties/@type", espBindingIter->query().queryProp("@service"));
 
                 if (strisame(env->queryProp(xpath), serviceType))
                 {
@@ -2614,6 +2614,44 @@ void getRoxieProcessServers(const char *process, SocketEndpointArray &servers)
     getRoxieProcessServers(queryRoxieProcessTree(root, process), servers);
 }
 
+extern ENVIRONMENT_API RoxieTargetType readRoxieTargetType(const char *roxieName)
+{
+    RoxieTargetType roxieTargetType = RTTUnknown;
+    if (isEmptyString(roxieName))
+        return roxieTargetType;
+
+    bool hasPortZero = false, hasNonZeroPort = false;
+    Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
+    Owned<IConstEnvironment> environment = factory->openEnvironment();
+    Owned<IPropertyTree> envRoot = &environment->getPTree();
+
+    VStringBuffer xpath("Software/RoxieCluster[@name='%s'][1]", roxieName);
+    IPropertyTree *cluster = envRoot->queryPropTree(xpath.str());
+    if (!cluster)
+        return roxieTargetType;
+    Owned<IPropertyTreeIterator> farmers = cluster->getElements("RoxieFarmProcess");
+    ForEach(*farmers)
+    {
+        IPropertyTree &farmer = farmers->query();
+        const char *port = farmer.queryProp("@port");
+        if (!port)
+            continue;
+        if (streq(port, "0"))
+            hasPortZero = true;
+        else
+            hasNonZeroPort = true;
+        if (hasNonZeroPort && hasPortZero)
+            break;
+    }
+    if (hasPortZero && hasNonZeroPort)
+        roxieTargetType = RTTBoth;
+    else if (hasPortZero)
+        roxieTargetType = RTTQueued;
+    else if (hasNonZeroPort)
+        roxieTargetType = RTTPublished;
+    return roxieTargetType;
+}
+
 #define WUERR_MismatchClusterSize               5008
 
 class CEnvironmentClusterInfo: implements IConstWUClusterInfo, public CInterface
@@ -2640,12 +2678,13 @@ class CEnvironmentClusterInfo: implements IConstWUClusterInfo, public CInterface
     unsigned channelsPerNode;
     unsigned numberOfSlaveLogs;
     int roxieReplicateOffset;
+    RoxieTargetType roxieTargetType = RTTUnknown;
 
 public:
     IMPLEMENT_IINTERFACE;
     CEnvironmentClusterInfo(const char *_name, const char *_prefix, const char *_alias, IPropertyTree *agent,
         IArrayOf<IPropertyTree> &eclServers, bool _legacyEclServer, IPropertyTree *eclScheduler, IArrayOf<IPropertyTree> &thors, IPropertyTree *roxie)
-        : name(_name), prefix(_prefix), alias(_alias), roxieRedundancy(0), channelsPerNode(0), numberOfSlaveLogs(0), roxieReplicateOffset(1), legacyEclServer(_legacyEclServer)
+        : name(_name), alias(_alias), legacyEclServer(_legacyEclServer), prefix(_prefix), roxieRedundancy(0), channelsPerNode(0), numberOfSlaveLogs(0), roxieReplicateOffset(1)
     {
         StringBuffer queue;
         if (thors.ordinality())
@@ -2705,6 +2744,7 @@ public:
                     roxieReplicateOffset = roxie->getPropInt("@cyclicOffset", 1);
                 }
             }
+            roxieTargetType = readRoxieTargetType(roxieProcess);
         }
         else
         {
@@ -2837,6 +2877,18 @@ public:
     virtual const char *getLdapPassword() const
     {
         return ldapPassword.str();
+    }
+    virtual RoxieTargetType getRoxieTargetType() const override
+    {
+        return roxieTargetType;
+    }
+    virtual bool canPublishQueries() const override
+    {
+        return roxieTargetType & RTTPublished;
+    }
+    virtual bool onlyPublishedQueries() const override
+    {
+        return roxieTargetType == RTTPublished;
     }
 };
 

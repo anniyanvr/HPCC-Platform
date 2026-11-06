@@ -35,12 +35,10 @@
                 <link rel="stylesheet" type="text/css" href="/esp/files/yui/build/button/assets/skins/sam/button.css" />
                 <link rel="stylesheet" type="text/css" href="/esp/files/css/espdefault.css" />
                 <link rel="stylesheet" type="text/css" href="/esp/files/css/eclwatch.css" />
-                <xsl:text disable-output-escaping="yes"><![CDATA[
-                    <script type="text/javascript" src="/esp/files/scripts/espdefault.js"></script>
-                    <script type="text/javascript" src="/esp/files/yui/build/yahoo-dom-event/yahoo-dom-event.js"></script>
-                    <script type="text/javascript" src="/esp/files/yui/build/container/container_core-min.js"></script>
-                    <script type="text/javascript" src="/esp/files/yui/build/menu/menu-min.js"></script>
-                ]]></xsl:text>
+                <script type="text/javascript" src="/esp/files/scripts/espdefault.js"></script>
+                <script type="text/javascript" src="/esp/files/yui/build/yahoo-dom-event/yahoo-dom-event.js"></script>
+                <script type="text/javascript" src="/esp/files/yui/build/container/container_core-min.js"></script>
+                <script type="text/javascript" src="/esp/files/yui/build/menu/menu-min.js"></script>
                 <title>EclWatch</title>
                 <script type="text/javascript">
                     var chatUrl='<xsl:value-of select="$chaturl0"/>';
@@ -1065,18 +1063,14 @@
                 </xsl:when>
                 <xsl:when test="string-length(GraphName) and (number(MemoryBlocked) > 0)">
                     <xsl:value-of select="State"/>
-                    (<a title="Graphview Control" href="javascript:go('/WsWorkunits/GVCAjaxGraph?Name={Wuid}&amp;GraphName={GraphName}&amp;SubGraphId={GID}&amp;SubGraphOnly=1')">
-                        <xsl:value-of select="Duration"/>
-                    </a>*)
+                    <xsl:value-of select="Duration"/>
                     <xsl:if test="string-length(Warning)">
                         <a class="thorstoppedrunningqueue" title="More Information" onclick="alert('{Warning}')">&#160;</a>
                     </xsl:if>
                 </xsl:when>
                 <xsl:when test="string-length(GraphName)">
                     <xsl:value-of select="State"/>
-                    (<a title="Graphview Control" href="javascript:go('/WsWorkunits/GVCAjaxGraph?Name={Wuid}&amp;GraphName={GraphName}&amp;SubGraphId={GID}&amp;SubGraphOnly=1')">
-                        <xsl:value-of select="Duration"/>
-                    </a>)
+                    <xsl:value-of select="Duration"/>
                     <xsl:if test="string-length(Warning)">
                         <a class="thorstoppedrunningqueue" title="More Information" onclick="alert('{Warning}')">&#160;</a>
                     </xsl:if>

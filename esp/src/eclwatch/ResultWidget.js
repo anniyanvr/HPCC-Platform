@@ -7,6 +7,7 @@ define([
 
     "dijit/registry",
     "dijit/form/TextBox",
+    "dijit/Tooltip",
 
     "dgrid/Grid",
     "dgrid/Keyboard",
@@ -25,6 +26,7 @@ define([
     "dojo/text!../templates/ResultWidget.html",
 
     "hpcc/FilterDropDownWidget",
+    "dojo/query",
     "dijit/layout/BorderContainer",
     "dijit/layout/ContentPane",
     "dijit/Toolbar",
@@ -32,7 +34,7 @@ define([
     "dijit/form/ToggleButton",
     "dijit/ToolbarSeparator"
 ], function (declare, lang, arrayUtil, nlsHPCCMod, ioQuery,
-    registry, TextBox,
+    registry, TextBox, Tooltip,
     Grid, Keyboard, ColumnResizer, CompoundColumns, DijitRegistry, PaginationModule,
     _Widget, ESPBaseMod, ESPWorkunit, ESPLogicalFile, TableContainer, DGridHeaderHookMod,
     template) {
@@ -100,12 +102,12 @@ define([
             this._doDownload("gzip");
         },
 
-        _onDownloadXLS: function (args) {
-            this._doDownload("xls");
-        },
-
         _onDownloadCSV: function (args) {
             this._doDownload("csv");
+        },
+
+        _onDownloadJSON: function (args) {
+            this._doDownload("json");
         },
 
         _onFileDetails: function (args) {
@@ -113,18 +115,22 @@ define([
         },
 
         _onDataPatterns: function (args) {
+            this.updateDataPatterns();
+        },
+
+        //  Implementation  ---
+        updateDataPatterns() {
             var context = this;
             if (this._logicalFile) {
                 var wuPromise = this.dataPatternsButton.get("checked") ? this._logicalFile.fetchDataPatternsWU() : Promise.resolve(null);
                 wuPromise.then(function (wu) {
-                    return context.gridDPHook.render(wu);
+                    return context.gridDPHook && context.gridDPHook.render(wu);
                 }).then(function () {
-                    context.grid.resize();
+                    context.grid?.resize();
                 });
             }
         },
 
-        //  Implementation  ---
         onErrorClick: function (line, col) {
         },
 
@@ -226,6 +232,16 @@ define([
                             context.gridDPHook.resize(evt.columnId);
                         }, 20);
                     });
+                    if (structure.filter(row => row.children).length > 0) {
+                        new Tooltip({
+                            connectId: context.id + "Toolbar",
+                            selector: ".downloadCSV",
+                            position: ["below"],
+                            getContent: function () {
+                                return context.i18n.DownloadToCSVNonFlatWarning;
+                            }
+                        });
+                    }
 
                 });
             } else {
@@ -275,6 +291,7 @@ define([
                             context.refreshActionState();
                         }
                     }
+                    context.updateDataPatterns();
                 });
             }
         },

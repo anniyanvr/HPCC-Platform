@@ -29,27 +29,33 @@
 #endif
 #include "referencedfilelist.hpp"
 #include "ws_wuresult.hpp"
+#include "jsmartsock.ipp"
+#include <atomic>
 
 #define UFO_DIRTY                                0x01
 #define UFO_RELOAD_TARGETS_CHANGED_PMID          0x02
 #define UFO_RELOAD_MAPPED_QUERIES                0x04
 #define UFO_REMOVE_QUERIES_NOT_IN_QUERYSET       0x08
 
-static const __uint64 defaultWUResultMaxSize = 10000000; //10M
+static const __uint64 defaultWUResultMaxSize = 0x100000*10; //10M
+static constexpr unsigned queryCopyMinParallelWindowSize = 1;
+static constexpr unsigned queryCopyMaxParallelWindowSize = 1024;
+static constexpr unsigned queryCopyMaxPreparationBatchSize = 4;
 
-class QueryFilesInUse : public CInterface, implements ISDSSubscription
+class QueryFilesInUse : public CInterface, implements ISDSSubscription, implements IThreaded
 {
-    mutable CriticalSection crit;
+    mutable CriticalSection crit{SYNC_LOCATION};
+    CThreaded threaded;
+    Semaphore sem{SYNC_LOCATION};
     MapStringTo<IUserDescriptor *> roxieUserMap;
-    IArrayOf<IUserDescriptor> roxieUsers;
 
     Owned<IPropertyTree> tree;
     SubscriptionId qsChange;
     SubscriptionId pmChange;
     SubscriptionId psChange;
-    mutable CriticalSection dirtyCrit; //if there were an atomic_or I would just use atomic
+    mutable CriticalSection dirtyCrit{SYNC_LOCATION}; //if there were an atomic_or I would just use atomic
     unsigned dirty;
-    bool aborting;
+    std::atomic_bool aborting;
 private:
     void loadTarget(IPropertyTree *tree, const char *target, unsigned flags);
     void loadTargets(IPropertyTree *tree, unsigned flags);
@@ -60,28 +66,36 @@ private:
         tree.setown(t.getClear());
     }
 
-    void updateUsers()
-    {
-        Owned<IStringIterator> clusters = getTargetClusters("RoxieCluster", NULL);
-        ForEach(*clusters)
-        {
-            SCMStringBuffer target;
-            clusters->str(target);
-
-            Owned<IConstWUClusterInfo> info = getTargetClusterInfo(target.str());
-            Owned<IUserDescriptor> user = createUserDescriptor();
-            user->set(info->getLdapUser(), info->getLdapPassword());
-            roxieUserMap.setValue(target.str(), user);
-            roxieUsers.append(*user.getClear());
-        }
-    }
+    void updateUsers();
 
 public:
     IMPLEMENT_IINTERFACE;
-    QueryFilesInUse() : aborting(false), qsChange(0), pmChange(0), psChange(0), dirty(UFO_DIRTY)
+    QueryFilesInUse() : threaded("QueryFilesInUse"), qsChange(0), pmChange(0), psChange(0), dirty(UFO_DIRTY), aborting(false)
     {
         tree.setown(createPTree("QueryFilesInUse"));
         updateUsers();
+        threaded.init(this, false);
+    }
+
+    ~QueryFilesInUse()
+    {
+        aborting = true;
+        sem.signal();
+        threaded.join();
+    }
+
+    virtual void threadmain()
+    {
+        subscribe();
+        while (!aborting)
+        {
+            //prepopulate the cache, lazy mode is very slow
+            //getTree() builds the cache, but only does work if the cache is dirty (changes in dali would have dirtied the cache)
+            Owned<IPropertyTree> thetree = getTree();
+            //wait 1 minute, then check if dirty again
+            if (sem.wait(60000))
+                break;
+        }
     }
 
     virtual void notify(SubscriptionId subid, const char *xpath, SDSNotifyFlags flags, unsigned valueLen, const void *valueData)
@@ -147,6 +161,8 @@ public:
     }
     IPropertyTree *getTree()
     {
+        //getTree() is thread safe because when load(flags) is called below it creates a new working tree,
+        //  the previous tree might still be in use outside this class, in which case it will not actually freed until there are no remaining references outstanding
         CriticalBlock b(crit);
         unsigned flags;
         {
@@ -174,8 +190,8 @@ struct WUShowScheduledFilters
 
     WUShowScheduledFilters(const char *_cluster, const char *_state, const char *_owner,
         const char *_jobName, const char *_eventName, const char *_eventText)
-        : cluster(_cluster), state(_state), owner(_owner),
-        jobName(_jobName), eventName(_eventName), eventText(_eventText) {};
+        : cluster(_cluster), state(_state),
+        eventName(_eventName), jobName(_jobName), owner(_owner), eventText(_eventText) {};
 };
 
 class CWUQueryDetailsReq
@@ -201,6 +217,42 @@ public:
     const bool getCheckAllNodes() const { return checkAllNodes; }
 };
 
+class CQueryCopyCleanupManager : implements IThreaded
+{
+public:
+    CQueryCopyCleanupManager();
+    ~CQueryCopyCleanupManager();
+
+    void start();
+    void stop();
+    void track(const char *wuid, ISecManager *secManager, ISecUser *secUser);
+    virtual void threadmain() override;
+
+private:
+    class CTrackedWorkunit : public CInterface, implements IInterface
+    {
+    public:
+        IMPLEMENT_IINTERFACE;
+
+        CTrackedWorkunit(const char *_wuid, ISecManager *_secManager, ISecUser *_secUser)
+            : wuid(_wuid), secManager(_secManager), secUser(_secUser ? _secUser->clone() : nullptr)
+        {
+        }
+
+        StringAttr wuid;
+        Linked<ISecManager> secManager;
+        Owned<ISecUser> secUser;
+    };
+
+    CriticalSection lifecycleCrit{SYNC_LOCATION};
+    CriticalSection crit{SYNC_LOCATION};
+    Semaphore wake{SYNC_LOCATION};
+    CThreaded thread;
+    IArrayOf<CTrackedWorkunit> trackedWorkunits;
+    std::atomic_bool stopping{false};
+    bool started = false;
+};
+
 class CWsWorkunitsEx : public CWsWorkunits
 {
 public:
@@ -212,6 +264,8 @@ public:
     {
         filesInUse.unsubscribe();
         filesInUse.abort();
+        queryCopyPreparationPool.clear();
+        queryCopyCleanupManager.stop();
         clusterQueryStatePool.clear();
     };
 
@@ -221,8 +275,6 @@ public:
         CWsWorkunits::setContainer(container);
         m_sched.setContainer(container);
     }
-    void refreshValidClusters();
-    bool isValidCluster(const char *cluster);
     void deploySharedObjectReq(IEspContext &context, IEspWUDeployWorkunitRequest & req, IEspWUDeployWorkunitResponse & resp, const char *dir, const char *xml=NULL);
     unsigned getGraphIdsByQueryId(const char *target, const char *queryId, StringArray& graphIds);
     bool getQueryFiles(IEspContext &context, const char* wuid, const char* query, const char* target, StringArray& logicalFiles, IArrayOf<IEspQuerySuperFile> *superFiles);
@@ -230,7 +282,8 @@ public:
     void checkAndSetClusterQueryState(IEspContext &context, const char* cluster, const char* querySetId, IArrayOf<IEspQuerySetQuery>& queries, bool checkAllNodes);
     void checkAndSetClusterQueryState(IEspContext &context, const char* cluster, StringArray& querySetIds, IArrayOf<IEspQuerySetQuery>& queries, bool checkAllNodes);
     IWorkUnitFactory *queryWUFactory() { return wuFactory; };
-    const char *getDataDirectory() const { return dataDirectory.str(); };
+    const char *getTempDirectory() const { return tempDirectory.str(); };
+    const char *getQueryDirectory() const { return queryDirectory.str(); };
 
     bool onWUQuery(IEspContext &context, IEspWUQueryRequest &req, IEspWUQueryResponse &resp);
     bool onWULightWeightQuery(IEspContext &context, IEspWULightWeightQueryRequest &req, IEspWULightWeightQueryResponse &resp);
@@ -314,8 +367,11 @@ public:
     bool onWUDetailsMeta(IEspContext &context, IEspWUDetailsMetaRequest &req, IEspWUDetailsMetaResponse &resp);
 
     void setPort(unsigned short _port){port=_port;}
-
+#ifndef _CONTAINERIZED
     bool isQuerySuspended(const char* query, IConstWUClusterInfo *clusterInfo, unsigned wait, StringBuffer& errorMessage);
+#else
+    bool isQuerySuspended(const char* query, const char* target, unsigned wait, StringBuffer& errorMessage);
+#endif
     bool onWUCreateZAPInfo(IEspContext &context, IEspWUCreateZAPInfoRequest &req, IEspWUCreateZAPInfoResponse &resp);
     bool onWUGetZAPInfo(IEspContext &context, IEspWUGetZAPInfoRequest &req, IEspWUGetZAPInfoResponse &resp);
     bool onWUCheckFeatures(IEspContext &context, IEspWUCheckFeaturesRequest &req, IEspWUCheckFeaturesResponse &resp);
@@ -325,6 +381,8 @@ public:
     bool onWUGetArchiveFile(IEspContext &context, IEspWUGetArchiveFileRequest &req, IEspWUGetArchiveFileResponse &resp);
     bool onWUEclDefinitionAction(IEspContext &context, IEspWUEclDefinitionActionRequest &req, IEspWUEclDefinitionActionResponse &resp);
     bool onWUGetPlugins(IEspContext &context, IEspWUGetPluginsRequest &req, IEspWUGetPluginsResponse &resp);
+    virtual bool onWUAnalyseHotspot(IEspContext &context, IEspWUAnalyseHotspotRequest &req, IEspWUAnalyseHotspotResponse &resp) override;
+    bool onWUHelperFileArchive(IEspContext &context, IEspWUHelperFileArchiveRequest &req, IEspWUHelperFileArchiveResponse &resp);
 
     bool unsubscribeServiceFromDali() override
     {
@@ -408,20 +466,27 @@ private:
     Owned<WUArchiveCache> wuArchiveCache;
     StringAttr sashaServerIp;
     unsigned short sashaServerPort;
-    BoolHash validClusters;
-    CriticalSection crit;
     WUSchedule m_sched;
     unsigned short port;
     Owned<IPropertyTree> directories;
     int maxRequestEntityLength;
+    Owned<IThreadPool> queryCopyPreparationPool;
+    CQueryCopyCleanupManager queryCopyCleanupManager;
+    unsigned queryCopyPreparationPoolSize = 4;
+    unsigned queryCopyMaxActiveRecompiles = 32;
+    unsigned queryCopyRecompileQueueTimeout = 2 * 60 * 60 * 1000;
+    unsigned queryCopyRecompileTimeout = 30 * 60 * 1000;
+    unsigned queryCopyProgressInterval = 30 * 1000;
     Owned<IThreadPool> clusterQueryStatePool;
     unsigned thorSlaveLogThreadPoolSize = THOR_SLAVE_LOG_THREAD_POOL_SIZE;
     Owned<IWorkUnitFactory> wuFactory;
-    StringBuffer dataDirectory;
+    StringBuffer tempDirectory;
     __uint64 wuResultMaxSize = defaultWUResultMaxSize;
+    StringAttr espApplicationName;
 
 public:
     QueryFilesInUse filesInUse;
+    MapStringToMyClass<ISmartSocketFactory> roxieConnMap;
     StringAttr zapEmailTo, zapEmailFrom, zapEmailServer;
     unsigned zapEmailMaxAttachmentSize = 0;
     unsigned zapEmailServerPort = 0;
@@ -435,6 +500,7 @@ public:
     CWsWorkunitsSoapBindingEx(IPropertyTree *cfg, const char *name, const char *process, http_soap_log_level llevel) : CWsWorkunitsSoapBinding(cfg, name, process, llevel)
     {
         wswService = NULL;
+        espApplicationName.set(process);
         VStringBuffer xpath("Software/EspProcess[@name=\"%s\"]/EspBinding[@name=\"%s\"]/BatchWatch", process, name);
         batchWatchFeaturesOnly = cfg->getPropBool(xpath.str(), false);
         directories.set(cfg->queryPropTree("Software/Directories"));
@@ -451,7 +517,7 @@ public:
 
     virtual void getNavigationData(IEspContext &context, IPropertyTree & data)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
         {
             CHttpSoapBinding::getNavigationData(context, data);
             return;
@@ -461,16 +527,19 @@ public:
             IPropertyTree *folder = ensureNavFolder(data, "ECL", "Run Ecl code and review Ecl workunits", NULL, false, 2);
             ensureNavLink(*folder, "Search Workunits", "/WsWorkunits/WUQuery?form_", "Search Workunits", NULL, NULL, 1);
             ensureNavLink(*folder, "Browse Workunits", "/WsWorkunits/WUQuery", "Browse Workunits", NULL, NULL, 2);
-            ensureNavLink(*folder, "ECL Playground", "/esp/files/stub.htm?Widget=ECLPlaygroundWidget", "ECL Editor, Executor, Graph and Result Viewer", NULL, NULL, 4);
+            ensureNavLink(*folder, "ECL Playground", "/esp/files/stub.html?Widget=ECLPlaygroundWidget", "ECL Editor, Executor, Graph and Result Viewer", NULL, NULL, 4);
 
             IPropertyTree *folderQueryset = ensureNavFolder(data, "Queries", NULL, NULL, false, 3);
             ensureNavLink(*folderQueryset, "Browse", "/WsWorkunits/WUQuerySets", "Browse Published Queries");
         }
     }
 
-    int onGetForm(IEspContext &context, CHttpRequest* request, CHttpResponse* response, const char *service, const char *method);
-    int onGet(CHttpRequest* request, CHttpResponse* response);
-    int onStartUpload(IEspContext& ctx, CHttpRequest* request, CHttpResponse* response, const char* service, const char* method);
+#ifndef _CONTAINERIZED
+    virtual int onGetForm(IEspContext &context, CHttpRequest* request, CHttpResponse* response, const char *service, const char *method) override;
+#endif
+    virtual int onGet(CHttpRequest* request, CHttpResponse* response) override;
+    virtual int onGetInstantQuery(IEspContext &context, CHttpRequest* request, CHttpResponse* response, const char *service, const char *method) override;
+    virtual int onStartUpload(IEspContext& ctx, CHttpRequest* request, CHttpResponse* response, const char* service, const char* method) override;
 
     virtual void addService(const char * name, const char * host, unsigned short port, IEspService & service)
     {
@@ -486,9 +555,63 @@ private:
     Owned<IPropertyTree> directories;
     unsigned thorSlaveLogThreadPoolSize = THOR_SLAVE_LOG_THREAD_POOL_SIZE;
     size32_t wuResultDownloadFlushThreshold = defaultWUResultDownloadFlushThreshold;
+    StringAttr espApplicationName;
 };
 
-void deploySharedObject(IEspContext &context, StringBuffer &wuid, const char *filename, const char *cluster, const char *name, const MemoryBuffer &obj, const char *dir, const char *xml=NULL);
+void deploySharedObject(IEspContext &context, StringBuffer &wuid, const char *cluster, const char *name, const MemoryBuffer &obj, const char *dir, const char *xml, bool protect, const char *sourceProcess, const char *sourceFilename);
+
+interface IQueryCopyPreparationTask : extends IInterface
+{
+    virtual void prepare() = 0;
+};
+
+class CQueryCopyPreparationThreadFactory : public CInterface, public IThreadFactory
+{
+    class CQueryCopyPreparationThread : public CInterface, implements IPooledThread
+    {
+        Owned<IQueryCopyPreparationTask> task;
+    public:
+        IMPLEMENT_IINTERFACE;
+
+        virtual void init(void *_param) override
+        {
+            task.setown((IQueryCopyPreparationTask *)_param);
+        }
+        virtual void threadmain() override
+        {
+            Owned<IQueryCopyPreparationTask> activeTask = task.getClear();
+            try
+            {
+                activeTask->prepare();
+            }
+            catch (IException *e)
+            {
+                StringBuffer msg;
+                IERRLOG("Exception in query-copy preparation thread: %s", e->errorMessage(msg).str());
+                e->Release();
+            }
+            catch (...)
+            {
+                IERRLOG("Unexpected exception in query-copy preparation thread");
+            }
+        }
+        virtual bool canReuse() const override
+        {
+            return true;
+        }
+        virtual bool stop() override
+        {
+            return false;
+        }
+    };
+
+public:
+    IMPLEMENT_IINTERFACE;
+    virtual IPooledThread *createNew() override
+    {
+        return new CQueryCopyPreparationThread();
+    }
+};
 
 class CClusterQueryStateParam : public CInterface
 {

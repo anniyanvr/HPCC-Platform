@@ -31,7 +31,7 @@ private:
     class list
     {
     public:
-        list(const ServerIdentifier &_ip, const list *_next, std::function<T *(const ServerIdentifier &)> tfunc) : ip(_ip), next(_next)
+        list(const ServerIdentifier &_ip, const list *_next, std::function<T *(const ServerIdentifier)> tfunc) : ip(_ip), next(_next)
         {
             entry = tfunc(ip);
         }
@@ -86,8 +86,21 @@ private:
     };
 
 public:
-    IpMapOf<T>(std::function<T *(const ServerIdentifier &)> _tfunc) : tfunc(_tfunc)
+    IpMapOf(std::function<T *(const ServerIdentifier)> _tfunc) : tfunc(_tfunc)
     {
+    }
+    ~IpMapOf()
+    {
+        for (unsigned idx = 0; idx < 256; idx++)
+        {
+            const list *head = table[idx].load(std::memory_order_acquire);
+            while (head)
+            {
+                const list *next = head->next;
+                delete head;
+                head = next;
+            }
+        }
     }
     T &lookup(const ServerIdentifier &) const;
     inline T &operator[](const ServerIdentifier &ip) const { return lookup(ip); }
@@ -103,9 +116,9 @@ public:
     myIterator end()   { return myIterator(nullptr, 256, nullptr); }
 
 private:
-    const std::function<T *(const ServerIdentifier &)> tfunc;
+    const std::function<T *(const ServerIdentifier)> tfunc;
     mutable std::atomic<const list *> table[256] = {};
-    mutable CriticalSection lock;
+    mutable CriticalSection lock{SYNC_LOCATION};
     mutable std::atomic<unsigned> firstHash = { 256 };
 };
 

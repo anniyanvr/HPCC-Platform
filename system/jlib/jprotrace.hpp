@@ -1,0 +1,280 @@
+/*##############################################################################
+
+    HPCC SYSTEMS software Copyright (C) 2026 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+
+#ifndef JPROTRACE_HPP
+#define JPROTRACE_HPP
+
+#ifdef _USE_PROTRACE
+#include <protrace.h>
+inline constexpr bool hasProtrace() { return true; }
+
+// If we record information about every critical section and lock it can quickly swamp all the other information
+// PROTRACE_LOCKS and PROTRACE_SEMAPHORES allow semaphores and locks to be conditionally tracked. (Both default off.)
+
+#else
+inline constexpr bool hasProtrace() { return false; }
+#endif
+
+#include <stdint.h>
+// Keep the #include dependencies to a minimum, as this header is included in many low level files.
+
+#include "jeventconst.hpp"
+
+interface IPropertyTree;
+
+
+enum class EventTask : byte;
+
+inline unsigned getTaskStartOp(EventTask task)
+{
+    return 256 + (static_cast<unsigned>(task) * 2);
+}
+
+inline unsigned getTaskStopOp(EventTask task)
+{
+    return getTaskStartOp(task) + 1;
+}
+
+inline __uint64 combineIdSeq(unsigned id, unsigned seq)
+{
+    return (static_cast<uint64_t>(seq) << 32) | id;
+}
+
+inline __uint64 combineTagSeq(unsigned tag, unsigned seq)
+{
+    return (static_cast<uint64_t>(seq) << 32) | tag;
+}
+
+inline __uint64 getProtraceTicks(cycle_t cycles)
+{
+#ifdef _USE_PROTRACE
+    return (cycles >> protrace::TICK_SHIFT);
+#else
+    return 0;
+#endif
+}
+
+inline void protraceRecord([[maybe_unused]] unsigned op)
+{
+#ifdef _USE_PROTRACE
+    protrace::record(static_cast<protrace::opcode_t>(op));
+#endif
+}
+
+inline void protraceRecord([[maybe_unused]] unsigned op, [[maybe_unused]] uint64_t v1)
+{
+#ifdef _USE_PROTRACE
+    protrace::record_payload(static_cast<protrace::opcode_t>(op), v1);
+#endif
+}
+
+inline void protraceRecord([[maybe_unused]] unsigned op, [[maybe_unused]] uint64_t v1, [[maybe_unused]] uint64_t v2)
+{
+#ifdef _USE_PROTRACE
+    protrace::record_payload(static_cast<protrace::opcode_t>(op), v1, v2);
+#endif
+}
+
+inline void protraceRecordAt([[maybe_unused]] unsigned op, [[maybe_unused]] cycle_t cycles)
+{
+#ifdef _USE_PROTRACE
+    protrace::record(static_cast<protrace::opcode_t>(op), static_cast<protrace::tick_t>(getProtraceTicks(cycles)));
+#endif
+}
+
+inline void protraceRecordAt([[maybe_unused]] unsigned op, [[maybe_unused]] cycle_t cycles, [[maybe_unused]] uint64_t v1)
+{
+#ifdef _USE_PROTRACE
+    protrace::emit(
+        protrace::create_event(static_cast<protrace::opcode_t>(op), static_cast<protrace::tick_t>(getProtraceTicks(cycles))),
+        protrace::create_payload(v1));
+#endif
+}
+
+inline void protraceRecordAt([[maybe_unused]] unsigned op, [[maybe_unused]] cycle_t cycles, [[maybe_unused]] uint64_t v1, [[maybe_unused]] uint64_t v2)
+{
+#ifdef _USE_PROTRACE
+    protrace::emit(
+        protrace::create_event(static_cast<protrace::opcode_t>(op), static_cast<protrace::tick_t>(getProtraceTicks(cycles))),
+        protrace::create_payload(v1),
+        protrace::create_payload(v2));
+#endif
+}
+
+inline void protraceRecordAt([[maybe_unused]] unsigned op, [[maybe_unused]] cycle_t cycles, [[maybe_unused]] uint64_t v1, [[maybe_unused]] uint64_t v2, [[maybe_unused]] uint64_t v3)
+{
+#ifdef _USE_PROTRACE
+    protrace::emit(
+        protrace::create_event(static_cast<protrace::opcode_t>(op), static_cast<protrace::tick_t>(getProtraceTicks(cycles))),
+        protrace::create_payload(v1),
+        protrace::create_payload(v2),
+        protrace::create_payload(v3));
+#endif
+}
+
+inline void protraceRecordMpRequestSend([[maybe_unused]] uint64_t requestId, [[maybe_unused]] uint64_t dataSize)
+{
+#ifdef _USE_PROTRACE
+    protraceRecord(EventMpRequestSend, requestId, dataSize);
+#endif
+}
+
+inline void protraceRecordMpRequestReceive([[maybe_unused]] uint64_t requestId)
+{
+#ifdef _USE_PROTRACE
+    protraceRecord(EventMpRequestReceive, requestId);
+#endif
+}
+
+inline void protraceRecordMpResponseSend([[maybe_unused]] uint64_t responseId, [[maybe_unused]] uint64_t dataSize)
+{
+#ifdef _USE_PROTRACE
+    protraceRecord(EventMpResponseSend, responseId, dataSize);
+#endif
+}
+
+inline void protraceRecordMpResponseReceive([[maybe_unused]] uint64_t responseId)
+{
+#ifdef _USE_PROTRACE
+    protraceRecord(EventMpResponseReceive, responseId);
+#endif
+}
+
+inline void protraceRecordEnqueueItem([[maybe_unused]] int64_t elementId)
+{
+#ifdef _USE_PROTRACE
+    protraceRecord(EventEnqueue, static_cast<uint64_t>(elementId));
+#endif
+}
+
+inline void protraceRecordEnqueueItem([[maybe_unused]] const void *element)
+{
+#ifdef _USE_PROTRACE
+    protraceRecord(EventEnqueue, static_cast<uint64_t>(reinterpret_cast<memsize_t>(element) >> 2));
+#endif
+}
+
+inline void protraceRecordDequeueItem([[maybe_unused]] int64_t elementId)
+{
+#ifdef _USE_PROTRACE
+    protraceRecord(EventDequeue, static_cast<uint64_t>(elementId));
+#endif
+}
+
+inline void protraceRecordDequeueItem([[maybe_unused]] const void *element)
+{
+#ifdef _USE_PROTRACE
+    protraceRecord(EventDequeue, static_cast<uint64_t>(reinterpret_cast<memsize_t>(element) >> 2));
+#endif
+}
+
+inline void protraceRecordTaskStart(EventTask task)
+{
+    protraceRecord(getTaskStartOp(task));
+}
+
+//Allow tasks to have an optional size
+inline void protraceRecordTaskStart(EventTask task, size32_t size)
+{
+    protraceRecord(getTaskStartOp(task), size);
+}
+
+inline void protraceRecordTaskStop(EventTask task)
+{
+    protraceRecord(getTaskStopOp(task));
+}
+
+inline void protraceNoteThreadName([[maybe_unused]] const char *name)
+{
+#ifdef _USE_PROTRACE
+    protrace::note_thread(protrace::get_tid(), name);
+#endif
+}
+
+inline uint32_t protraceNoteFunction([[maybe_unused]] const char *name)
+{
+#ifdef _USE_PROTRACE
+    return protrace::note_function(name);
+#else
+    return 0;
+#endif
+}
+
+inline void protraceNoteFilename([[maybe_unused]] unsigned id, [[maybe_unused]] const char *filename)
+{
+#if defined(_USE_PROTRACE) && defined(PROTRACE_DETAILED)
+    static auto & fileMapping = protrace::get_mapping_table(1, sizeof(uint32_t));
+    fileMapping.record_mapping(id, protrace::note_string(filename));
+#endif
+}
+
+// Registers a function name with protrace and holds the assigned ID.
+// Intended for use as a static local variable; zero-overhead when protrace is disabled.
+class TracedFunction
+{
+public:
+#ifdef _USE_PROTRACE
+    explicit TracedFunction(const char * name) : id(protrace::note_function(name)) {}
+    uint32_t getId() const { return id; }
+private:
+    const uint32_t id;
+#else
+    explicit TracedFunction(const char *) {}
+    constexpr uint32_t getId() const { return 0; }
+#endif
+};
+
+// RAII tracker for the scope of a function call; records enter/exit to protrace only.
+class FunctionScopeTracker
+{
+public:
+#ifdef _USE_PROTRACE
+    explicit FunctionScopeTracker(const TracedFunction & func) : id(func.getId())
+    {
+        protraceRecord(EventFunctionEnter, id);
+    }
+    ~FunctionScopeTracker()
+    {
+        protraceRecord(EventFunctionExit, id);
+    }
+private:
+    const uint32_t id;
+#else
+    explicit FunctionScopeTracker(const TracedFunction &) {}
+#endif
+};
+
+extern jlib_decl bool protraceResumeRecording();
+extern jlib_decl bool protraceSuspendRecording();
+extern jlib_decl bool protraceClearRecording(bool clearMetadata);
+extern jlib_decl void protraceInitialize(const char * component, IPropertyTree * componentConfig);
+
+class StringBuffer;
+
+// Returns a space-separated "key=value" summary of the tracer state, or "supported=false" if protrace is not built in
+extern jlib_decl StringBuffer & protraceStatus(StringBuffer & status);
+
+// Dump the current protrace recording to disk.
+// If filename is relative (or omitted), a file will be created in a temporary directory.
+// On success, outputFilename contains the generated/used filename.
+extern jlib_decl void protraceSaveRecording(StringBuffer & outputFilename, const char * filename, bool continueRecording);
+extern jlib_decl void protraceOnTerminate();
+
+extern jlib_decl bool protraceIndexCacheEvents;
+
+#endif

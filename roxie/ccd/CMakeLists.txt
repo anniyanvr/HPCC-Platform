@@ -25,9 +25,15 @@
 
 
 project( ccd ) 
+SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STRICT_CXX_FLAGS}")
+
+IF (USE_TBBMALLOC AND USE_TBBMALLOC_ROXIE)
+  find_package(TBB CONFIG REQUIRED)
+endif()
 
 set (   SRCS 
-        ccdactivities.cpp 
+        ccdactivities.cpp
+        ../ccdcache/ccdcache.cpp
         ccddali.cpp
         ccdcontext.cpp
         ccddebug.cpp
@@ -63,33 +69,36 @@ set (   SRCS
 
 include_directories ( 
          .
-         ${HPCC_SOURCE_DIR}/fs/dafsclient
-         ${HPCC_SOURCE_DIR}/system/jhtree
-         ${HPCC_SOURCE_DIR}/system/mp
-         ${HPCC_SOURCE_DIR}/common/workunit
-         ${HPCC_SOURCE_DIR}/roxie/udplib
-         ${HPCC_SOURCE_DIR}/roxie/roxie
-         ${HPCC_SOURCE_DIR}/common/environment
-         ${HPCC_SOURCE_DIR}/ecl/hthor
-         ${HPCC_SOURCE_DIR}/ecl/schedulectrl
-         ${HPCC_SOURCE_DIR}/rtl/nbcd
          ${HPCC_SOURCE_DIR}/common/deftype
-         ${HPCC_SOURCE_DIR}/system/include
+         ${HPCC_SOURCE_DIR}/common/dllserver
+         ${HPCC_SOURCE_DIR}/common/environment
+         ${HPCC_SOURCE_DIR}/common/thorhelper
+         ${HPCC_SOURCE_DIR}/common/pkgfiles
+         ${HPCC_SOURCE_DIR}/common/workunit
          ${HPCC_SOURCE_DIR}/dali/base
          ${HPCC_SOURCE_DIR}/dali/dfu
-         ${HPCC_SOURCE_DIR}/roxie/roxiemem
-         ${HPCC_SOURCE_DIR}/common/dllserver
-         ${HPCC_SOURCE_DIR}/system/jlib
-         ${HPCC_SOURCE_DIR}/common/thorhelper
+         ${HPCC_SOURCE_DIR}/dali/ft
+         ${HPCC_SOURCE_DIR}/ecl/hthor
+         ${HPCC_SOURCE_DIR}/ecl/schedulectrl
+         ${HPCC_SOURCE_DIR}/esp/clients/ws_dfsclient
+         ${HPCC_SOURCE_DIR}/fs/dafsclient
+         ${HPCC_SOURCE_DIR}/roxie/ccdcache
          ${HPCC_SOURCE_DIR}/rtl/eclrtl
          ${HPCC_SOURCE_DIR}/rtl/include
+         ${HPCC_SOURCE_DIR}/rtl/nbcd
+         ${HPCC_SOURCE_DIR}/roxie/roxie
+         ${HPCC_SOURCE_DIR}/roxie/roxiemem
+         ${HPCC_SOURCE_DIR}/roxie/udplib
+         ${HPCC_SOURCE_DIR}/system/include
+         ${HPCC_SOURCE_DIR}/system/jhtree
+         ${HPCC_SOURCE_DIR}/system/jlib
+         ${HPCC_SOURCE_DIR}/system/libbase58
+         ${HPCC_SOURCE_DIR}/system/mp
+         ${HPCC_SOURCE_DIR}/system/security/shared
+         ${HPCC_SOURCE_DIR}/system/security/securesocket
          ${HPCC_SOURCE_DIR}/testing/unittests
          ${CMAKE_BINARY_DIR}
          ${CMAKE_BINARY_DIR}/oss
-         ${HPCC_SOURCE_DIR}/dali/ft
-         ${HPCC_SOURCE_DIR}/system/security/shared
-         ${HPCC_SOURCE_DIR}/system/security/securesocket
-         ${HPCC_SOURCE_DIR}/system/libbase58
     )
 
 if (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG)
@@ -107,35 +116,46 @@ endif()
 
 
 HPCC_ADD_LIBRARY( ccd SHARED ${SRCS} )
+if (EMSCRIPTEN)
+    set_target_properties(ccd PROPERTIES COMPILE_FLAGS "${COMPILE_FLAGS} -Wno-error=nontrivial-memcall")
+endif ()
 install ( TARGETS ccd RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} ARCHIVE DESTINATION componentfiles/cl/lib )
 
-target_link_libraries ( ccd 
-         jlib
-         nbcd
-         roxiemem 
-         udplib 
+target_link_libraries ( ccd PRIVATE 
+         ${CppUnit_LIBRARIES}
          dafsclient 
-         eclrtl 
          dalibase 
          deftype 
-         thorhelper 
-         jhtree 
-         environment 
-         schedulectrl
          dllserver 
-         workunit 
+         eclrtl 
+         jhtree 
+         jlib
+         mp
          libbase58
+         nbcd
+         roxiemem 
+         schedulectrl
+         thorhelper 
+         udplib 
+         workunit 
+         ws_dfsclient
+         pkgfiles
     )
 
+if (NOT CONTAINERIZED)
+    target_link_libraries ( ccd PRIVATE environment )
+endif()
+
 IF (USE_OPENSSL)
-    target_link_libraries ( ccd
+    target_link_libraries ( ccd PRIVATE
     	securesocket
     )
 ENDIF()
 
 IF (USE_TBBMALLOC AND USE_TBBMALLOC_ROXIE)
-   add_dependencies ( ccd tbb )
-   target_link_libraries ( ccd libtbbmalloc_proxy libtbbmalloc)
+   target_link_libraries ( ccd PRIVATE TBB::tbb )
 ENDIF()
 
-
+if (CMAKE_DL_LIBS)
+  target_link_libraries ( ccd PRIVATE ${CMAKE_DL_LIBS} )
+endif()

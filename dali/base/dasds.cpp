@@ -15,7 +15,11 @@
     limitations under the License.
 ############################################################################## */
 
-#define da_decl DECL_EXPORT
+#include <queue>
+#include <list>
+#include <unordered_map>
+#include <future>
+
 #include "platform.h"
 #include "jhash.hpp"
 #include "jlib.hpp"
@@ -31,6 +35,8 @@
 #include "jqueue.tpp"
 #include "dautils.hpp"
 #include "dadfs.hpp"
+#include "jmetrics.hpp"
+#include "jstream.hpp"
 
 #define DEBUG_DIR "debug"
 #define DEFAULT_KEEP_LASTN_STORES 10 // should match default in dali.xsd
@@ -44,6 +50,7 @@ static unsigned readWriteSlowTracing = 10000; // 10s default
 static bool readWriteStackTracing = false;
 static unsigned fakeCritTimeout = 60000;
 static unsigned readWriteTimeout = 60000;
+static constexpr unsigned storeReadLockTraceIntervalMs = 60000; // minimum gap between store read-lock stats traces
 
 // #define NODELETE
 // #define DISABLE_COALESCE_QUIETTIME
@@ -72,7 +79,6 @@ static unsigned readWriteTimeout = 60000;
 #define DELTADETACHED "dalidet"
 #define DELTAINPROGRESS "delta.progress"
 #define DETACHINPROGRESS "detach.progress"
-#define TMPSAVENAME "dali_store_tmp.xml"
 #define INIT_NODETABLE_SIZE 0x380000
 
 #define DEFAULT_LCIDLE_PERIOD (60*10)  // time has to be quiet for before blocking/saving (when using @lightweightCoalesce)
@@ -80,19 +86,20 @@ static unsigned readWriteTimeout = 60000;
 #define DEFAULT_LCIDLE_RATE 1          // 1 write transactions per idle period. <= this rate is deemed idle (suitable for save)
 #define STORENOTSAVE_WARNING_PERIOD 72 // hours
 
-static unsigned msgCount=(unsigned)-1;
+static std::shared_ptr<hpccMetrics::CounterMetric> pSdsRequestsReceived;
+static std::shared_ptr<hpccMetrics::CounterMetric> pSdsRequestsStarted;
+static std::shared_ptr<hpccMetrics::CounterMetric> pSdsRequestsCompleted;
+static std::shared_ptr<hpccMetrics::GaugeMetricFromCounters> pSdsRequestsPending;
 
-// # HELP sds_requests The total number of Dali SDS requests handled
-// # TYPE sds_requests counter
-// Probably requires this counter to be held in a __int64 scalar.
+MODULE_INIT(INIT_PRIORITY_STANDARD)
+{
+    pSdsRequestsReceived = hpccMetrics::registerCounterMetric("dali.sds.requests.received", "The total number of Dali SDS requests received", SMeasureCount);
+    pSdsRequestsStarted = hpccMetrics::registerCounterMetric("dali.sds.requests.started", "The total number of Dali SDS requests started", SMeasureCount);
+    pSdsRequestsCompleted = hpccMetrics::registerCounterMetric("dali.sds.requests.completed", "The total number of Dali SDS requests completed", SMeasureCount);
+    pSdsRequestsPending = hpccMetrics::registerGaugeFromCountersMetric("dali.sds.requests.pending", "Current number of pending SDS requests", SMeasureCount, pSdsRequestsReceived, pSdsRequestsStarted);
+    return true;
+}
 
-// # HELP sds_active_requests Current number of active SDS requests being handled.
-// # TYPE sds_active_requests gauge
-// A unsigned scalar should suffice, i.e. never going to have that many active transactions
-
-// # HELP sds_pending_requests Current number of pending SDS requests.
-// # TYPE sds_pending_requests gauge
-// A unsigned scalar should suffice, i.e. never going to have that many pending transactions
 
 // #define TEST_NOTIFY_HANDLER
 
@@ -103,7 +110,9 @@ static unsigned msgCount=(unsigned)-1;
 #define SUBNTFY_POOL_SIZE 400
 #define SUBSCAN_POOL_SIZE 100
 #define RTM_INTERNAL        0x80000000 // marker for internal connection (performed within a transaction)
-#define DEFAULT_EXTERNAL_SIZE_THRESHOLD (10*1024)
+
+static constexpr memsize_t defaultExternalSizeThreshold = 10 * 1024; // 10k
+static constexpr memsize_t defaultExtCacheSizeMB = 10;
 
 #define NOTIFY_ATTR "@sds:notify"
 #define FETCH_ENTIRE      -1
@@ -122,7 +131,7 @@ enum notifications { notify_delete=1 };
 static const char *notificationStr(notifications n)
 {
     switch (n)
-    { 
+    {
         case notify_delete: return "Notify Delete";
         default: return "UNKNOWN NOTIFY TYPE";
     }
@@ -213,10 +222,10 @@ public:
 };
 class CLCLockBlock : public CInterface
 {
-    ReadWriteLock &lock;
+    TimedReadWriteLock &lock;
     unsigned got, lnum;
 public:
-    CLCLockBlock(ReadWriteLock &_lock, bool readLock, unsigned timeout, const char *fname, unsigned _lnum) : lock(_lock), lnum(_lnum)
+    CLCLockBlock(TimedReadWriteLock &_lock, bool readLock, unsigned timeout, const char *fname, unsigned _lnum) : lock(_lock), lnum(_lnum)
     {
         got = msTick();
         for (;;)
@@ -231,7 +240,7 @@ public:
                 if (lock.lockWrite(timeout))
                     break;
             }
-            PROGLOG("CLCLockBlock(write=%d) timeout %s(%d), took %d ms",!readLock,fname,lnum,got-msTick());
+            PROGLOG("CLCLockBlock(write=%d) timeout %s(%d), took %d ms",!readLock,fname,lnum,msTick()-got);
             if (readWriteStackTracing)
                 PrintStackReport();
         }
@@ -262,9 +271,9 @@ public:
 };
 class CLCLockBlock : public CInterface
 {
-    ReadWriteLock &lock;
+    TimedReadWriteLock &lock;
 public:
-    CLCLockBlock(ReadWriteLock &_lock, bool readLock, unsigned timeout, const char *fname, unsigned lnum) : lock(_lock)
+    CLCLockBlock(TimedReadWriteLock &_lock, bool readLock, unsigned timeout, const char *fname, unsigned lnum) : lock(_lock)
     {
         if (readLock)
             lock.lockRead();
@@ -306,8 +315,8 @@ void CLCLockBlock::changeToWrite(const char *msg)
 #define CHECKEDDALIREADLOCKBLOCK(l, timeout)  Owned<CLCLockBlock> glue(block,__LINE__) = new CLCLockBlock(l, true, timeout, __FILE__, __LINE__)
 #define CHECKEDDALIWRITELOCKBLOCK(l, timeout)  Owned<CLCLockBlock> glue(block,__LINE__) = new CLCLockBlock(l, false, timeout, __FILE__, __LINE__)
 #else
-#define CHECKEDDALIREADLOCKBLOCK(l,timeout)   ReadLockBlock glue(block,__LINE__)(l)
-#define CHECKEDDALIWRITELOCKBLOCK(l,timeout)  WriteLockBlock glue(block,__LINE__)(l)
+#define CHECKEDDALIREADLOCKBLOCK(l,timeout)   TimedReadLockBlock glue(block,__LINE__)(l)
+#define CHECKEDDALIWRITELOCKBLOCK(l,timeout)  TimedWriteLockBlock glue(block,__LINE__)(l)
 #endif
 
 #define OVERFLOWSIZE 50000
@@ -315,7 +324,7 @@ class CFitArray
 {
     unsigned size;
     CRemoteTreeBase **ptrs; // offset 0 not used
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     unsigned nextId, chk;
     unsigned freeChainHead;
 
@@ -359,7 +368,7 @@ public:
     ~CFitArray()  { free(ptrs); }
     void reset()
     {
-        if (ptrs) 
+        if (ptrs)
             free(ptrs);
         size = 0;
         ptrs = NULL;
@@ -406,17 +415,22 @@ public:
 
 enum IncInfo { IINull=0x00, IncData=0x01, IncDetails=0x02, IncConnect=0x04, IncDisconnect=0x08, IncDisconnectDelete=0x24 };
 
-StringBuffer &constructStoreName(const char *storeBase, unsigned e, StringBuffer &res)
+StringBuffer &constructStoreName(const char *storeBase, unsigned e, StringBuffer &res, const char *extension)
 {
     res.append(storeBase);
     if (e)
         res.append(e);
-    res.append(".xml");
+    res.append(extension);
+
     return res;
 }
 
 ////////////////
-static CheckedCriticalSection loadStoreCrit, saveStoreCrit, saveIncCrit, nfyTableCrit, extCrit, blockedSaveCrit;
+static CheckedCriticalSection saveStoreCrit{SYNC_LOCATION};
+static CheckedCriticalSection saveIncCrit{SYNC_LOCATION};
+static CheckedCriticalSection nfyTableCrit{SYNC_LOCATION};
+static CheckedCriticalSection extCrit{SYNC_LOCATION};
+static CheckedCriticalSection blockedSaveCrit{SYNC_LOCATION};
 class CCovenSDSManager;
 static CCovenSDSManager *SDSManager;
 
@@ -478,7 +492,7 @@ class CSDSTransactionServer : public Thread, public CTransactionLogTracker
 {
 public:
     CSDSTransactionServer(CCovenSDSManager &_manager);
-    
+
     void stop();
     void processMessage(CMessageBuffer &mb);
     const bool &queryStopped() const { return stopped; }
@@ -562,18 +576,18 @@ public:
     IMPLEMENT_IINTERFACE;
 
     CServerConnection(ISDSConnectionManager &manager, ConnectionId connectionId, const char *xpath, SessionId id, unsigned mode, unsigned timeout, IPropertyTree *_parent, ConnInfoFlags _connInfoFlags)
-        : CConnectionBase(manager, connectionId, xpath, id, mode, timeout), parent(_parent), connInfoFlags(_connInfoFlags)
+        : CConnectionBase(manager, connectionId, xpath, id, mode, timeout), connInfoFlags(_connInfoFlags), parent(_parent)
     {
         INIT_NAMEDCOUNT;
         subsid = 0;
         established = false;
     }
-    
+
     ~CServerConnection();
 
     void initPTreePath(PTree &root, PTree &tail)
     {
-        if (&root != &tail) 
+        if (&root != &tail)
         {
             StringBuffer head;
             const char *_tail = splitXPath(xpath, head);
@@ -637,7 +651,7 @@ public:
     void unsubscribeSession()
     {
         if (subsid) {
-            querySessionManager().unsubscribeSession(subsid);   
+            querySessionManager().unsubscribeSession(subsid);
             subsid = 0;
         }
     }
@@ -944,7 +958,7 @@ void serializeVisibleAttributes(IPropertyTree &tree, MemoryBuffer &mb)
         for (;;)
         {
             const char *attr = aIter->queryName();
-            if (0 != strcmp(EXT_ATTR, attr))
+            if (0 != strncmp("@sds:", attr, 5))
             {
                 mb.append(attr);
                 mb.append(aIter->queryValue());
@@ -955,6 +969,29 @@ void serializeVisibleAttributes(IPropertyTree &tree, MemoryBuffer &mb)
     }
     aIter->Release();
     mb.append(""); // attribute terminator. i.e. blank attr name.
+}
+
+bool filesMatch(IFile *file1, IFile *file2, bool compareTimes=true)
+{
+    if (file1->exists())
+    {
+        if (file2->exists())
+        {
+            if (file1->size() == file2->size())
+            {
+                if (!compareTimes) return true;
+                CDateTime modifiedTimeBackup;
+                file1->getTime(NULL, &modifiedTimeBackup, NULL);
+                CDateTime modifiedTime;
+                file2->getTime(NULL, &modifiedTime, NULL);
+                if (0 == modifiedTimeBackup.compare(modifiedTime, false))
+                    return true;
+            }
+        }
+    }
+    else
+        return !file2->exists();
+    return false;
 }
 
 void writeDelta(StringBuffer &xml, IFile &iFile, const char *msg="", unsigned retrySecs=0, unsigned retryAttempts=10)
@@ -1002,12 +1039,13 @@ void writeDelta(StringBuffer &xml, IFile &iFile, const char *msg="", unsigned re
             sprintf(strNum, "%016" I64F "X", fLen);
             memcpy(headerPtr + deltaHeaderSizeOff, strNum, 16);
             iFileIO->write(0, strlen(deltaHeader), headerPtr);
+            iFileIO->close();
         }
         catch (IException *e)
         {
             exception.setown(e);
             StringBuffer s(msg);
-            IERRLOG(e, s.append("writeDelta, failed").str());
+            OWARNLOG(e, s.append("writeDelta, failed").str());
         }
         if (!exception.get())
             break;
@@ -1015,7 +1053,7 @@ void writeDelta(StringBuffer &xml, IFile &iFile, const char *msg="", unsigned re
             return;
         if (0 == --_retryAttempts)
         {
-            IWARNLOG("writeDelta, too many retry attempts [%d]", retryAttempts);
+            DISLOG("writeDelta, too many retry attempts [%d]", retryAttempts);
             return;
         }
         exception.clear();
@@ -1024,111 +1062,209 @@ void writeDelta(StringBuffer &xml, IFile &iFile, const char *msg="", unsigned re
     }
 }
 
-struct BackupQueueItem
+void cleanChangeTree(IPropertyTree &tree)
 {
-    static unsigned typeMask;
-    enum flagt { f_delta=0x1, f_addext=0x2, f_delext=0x3, f_first=0x10 };
-    BackupQueueItem() : edition((unsigned)-1), flags(0) { text = new StringBuffer; dataLength = 0; data = NULL; }
-    ~BackupQueueItem()
+    tree.removeProp("@id");
+    Owned<IPropertyTreeIterator> iter = tree.getElements(RENAME_TAG);
+    ForEach (*iter)
+        iter->query().removeProp("@id");
+    iter.setown(tree.getElements(DELETE_TAG));
+    ForEach (*iter)
+        iter->query().removeProp("@id");
+    iter.setown(tree.getElements(RESERVED_CHANGE_NODE));
+    ForEach (*iter)
+        cleanChangeTree(iter->query());
+}
+
+class CTransactionItem : public CSimpleInterface
+{
+public:
+    enum flagt : byte { f_none, f_delta, f_addext, f_delext } type = f_none;
+    char *name;
+    union
     {
-        delete text;
-        if (data) free(data);
+        IPropertyTree *deltaTree;
+        struct
+        {
+            void *data;
+            unsigned dataLength;
+            std::atomic<bool> pendingWrite;
+        } ext;
+    };
+
+    CTransactionItem(char *path, IPropertyTree *_deltaTree) : deltaTree(_deltaTree)
+    {
+        type = f_delta;
+        name = path;
     }
-    StringBuffer *text;
-    unsigned edition;
-    unsigned dataLength;
-    void *data;
-    byte flags;
+    CTransactionItem(char *_name) : name(_name)
+    {
+        type = f_delext;
+    }
+    CTransactionItem(char *_name, size32_t _dataLength, void *_data, bool _pendingWrite) : name(_name), ext{ _data, _dataLength, _pendingWrite }
+    {
+        type = f_addext;
+    }
+    ~CTransactionItem()
+    {
+        free(name);
+        switch (type)
+        {
+            case f_delta:
+                ::Release(deltaTree);
+                break;
+            case f_addext:
+                free(ext.data);
+                break;
+            case f_delext:
+            default:
+                break;
+        }
+    }
 };
-unsigned BackupQueueItem::typeMask = 0x0f;
-class CBackupHandler : public CInterface, implements IThreaded
+
+static constexpr unsigned defaultSaveThresholdSecs = 0; // disabled
+static constexpr unsigned defaultDeltaSaveTransactionThreshold = 0; // disabled
+static constexpr unsigned defaultDeltaMemMaxMB = 64; // 64MB a reasonably large default, to cope with large blobs being committed
+static constexpr unsigned defaultDeltaTransactionQueueLimit = 10000;
+class CDeltaWriter : implements IThreaded
 {
-    typedef QueueOf<BackupQueueItem, false> BackupQueue;
+    IStoreHelper *iStoreHelper = nullptr;
+    StringBuffer dataPath;
+    StringBuffer backupPath;
+    unsigned transactionQueueLimit = defaultDeltaTransactionQueueLimit; // absolute limit, will block if this far behind
+    memsize_t transactionMaxMem = defaultDeltaMemMaxMB * 0x100000;
+    unsigned totalQueueLimitHits = 0;
+    unsigned saveThresholdSecs = 0;
+    cycle_t lastSaveTime = 0;
+    cycle_t thresholdDuration = 0;
+
+    std::queue<Owned<CTransactionItem>> pending;
+    memsize_t pendingSz = 0;
+    CriticalSection pendingCrit{SYNC_LOCATION};
+    CCycleTimer timer;
+    StringBuffer deltaXml;
     CThreaded threaded;
-    BackupQueue itemQueue, freeQueue;
-    Semaphore pending, softQueueLimitSem;
-    bool aborted, waiting, addWaiting, async;
-    unsigned currentEdition, throttleCounter;
-    CriticalSection queueCrit, freeQueueCrit;
-    StringAttr backupPath;
-    unsigned freeQueueLimit;  // how many BackupQueueItems to cache for reuse
-    unsigned largeWarningThreshold;    // point at which to start warning about large queue
-    unsigned softQueueLimit; // threshold over which primary transactions will be delay by small delay, to allow backup catchup.
-    unsigned softQueueLimitDelay; // delay for above
-    CTimeMon warningTime;
-    unsigned recentTimeThrottled;
-    unsigned lastNumWarnItems;
-    IPropertyTree &config;
+    Semaphore pendingTransactionsSem{SYNC_LOCATION};
+    cycle_t timeThrottled = 0;
+    unsigned throttleCounter = 0;
+    bool writeRequested = false;
+    bool backupOutOfSync = false;
+    std::atomic<bool> aborted = false;
+    bool signalWhenAllWritten = false;
+    Semaphore allWrittenSem{SYNC_LOCATION};
 
-    const unsigned defaultFreeQueueLimit = 50;
-    const unsigned defaultLargeWarningThreshold = 50;
-    const unsigned defaultSoftQueueLimit = 200;
-    const unsigned defaultSoftQueueLimitDelay = 200;
-
-    BackupQueueItem *getFreeItem()
+    void validateDeltaBackup()
     {
-        BackupQueueItem *item;
+        // check consistency of delta
+        StringBuffer deltaFilename(dataPath);
+        iStoreHelper->getCurrentDeltaFilename(deltaFilename);
+        OwnedIFile iFileDelta = createIFile(deltaFilename.str());
+        deltaFilename.clear().append(backupPath);
+        iStoreHelper->getCurrentDeltaFilename(deltaFilename);
+        OwnedIFile iFileDeltaBackup = createIFile(deltaFilename.str());
+        if (!filesMatch(iFileDeltaBackup, iFileDelta, false))
         {
-            CriticalBlock b(freeQueueCrit);
-            item = freeQueue.dequeue();
-        }
-        if (!item)
-            item = new BackupQueueItem;
-        return item;
-    }
-    void clearQueue(BackupQueue &queue)
-    {
-        for (;;)
-        {
-            BackupQueueItem *item = queue.dequeue();
-            if (!item) break;
-            delete item;
+            OWARNLOG("Delta file backup doesn't exist or differs, filename=%s", deltaFilename.str());
+            copyFile(iFileDeltaBackup, iFileDelta);
         }
     }
-    void writeExt(const char *name, const unsigned length, const void *data, unsigned retrySecs=0, unsigned retryAttempts=10)
+    void writeXml()
+    {
+        try
+        {
+            StringBuffer deltaFilename(dataPath);
+            iStoreHelper->getCurrentDeltaFilename(deltaFilename);
+            OwnedIFile iFile = createIFile(deltaFilename.str());
+            writeDelta(deltaXml, *iFile, "writeXml", 1, INFINITE);
+        }
+        catch (IException *e)
+        {
+            VStringBuffer errMsg("writeXml: failed to save delta data, blockedDelta size=%d", deltaXml.length());
+            OWARNLOG(e, errMsg.str());
+            e->Release();
+            return;
+        }
+        if (backupPath.length())
+        {
+            try
+            {
+                if (backupOutOfSync) // true if there was previously an exception during synchronously writing delta to backup.
+                {
+                    OWARNLOG("Backup delta is out of sync due to a prior backup write error, attempting to resync");
+                    // catchup - check and copy primary delta to backup
+                    validateDeltaBackup();
+                    backupOutOfSync = false;
+                    OWARNLOG("Backup delta resynchronized");
+                }
+                else
+                {
+                    StringBuffer deltaFilename(backupPath);
+                    constructStoreName(DELTANAME, iStoreHelper->queryCurrentEdition(), deltaFilename, ".xml");
+                    OwnedIFile iFile = createIFile(deltaFilename.str());
+                    ::writeDelta(deltaXml, *iFile, "backup - ", 1, 10); // backup is less critical - will be synched at startup
+                }
+            }
+            catch (IException *e)
+            {
+                OERRLOG(e, "writeXml: failed to save backup delta data");
+                e->Release();
+                backupOutOfSync = true;
+            }
+        }
+        if (deltaXml.length() > (0x100000 * 10)) // >= 10MB
+            deltaXml.kill();
+        else
+            deltaXml.clear();
+    }
+    void writeExt(const char *basePath, const char *name, const unsigned length, const void *data, unsigned retrySecs=0, unsigned retryAttempts=10)
     {
         Owned<IException> exception;
         unsigned _retryAttempts = retryAttempts;
-        StringBuffer rL(remoteBackupLocation);
+        StringBuffer rL(basePath);
+        rL.append(name);
         for (;;)
         {
             try
             {
-                rL.append(name);
                 Owned<IFile> iFile = createIFile(rL.str());
                 Owned<IFileIO> fileIO = iFile->open(IFOcreate);
                 fileIO->write(0, length, data);
+                fileIO->close();
             }
             catch (IException *e)
             {
                 exception.setown(e);
                 StringBuffer err("Saving external (backup): ");
-                LOG(MCoperatorError, unknownJob, e, err.append(rL).str());
+                OERRLOG(e, err.append(rL).str());
             }
             if (!exception.get())
                 break;
             if (0 == retrySecs)
                 return;
-            if (0 == --_retryAttempts)
+            if (_retryAttempts != INFINITE)
             {
-                IWARNLOG("writeExt, too many retry attempts [%d]", retryAttempts);
-                return;
+                if (0 == --_retryAttempts)
+                {
+                    IWARNLOG("writeExt, too many retry attempts [%d]", retryAttempts);
+                    return;
+                }
             }
             exception.clear();
             DBGLOG("writeExt, retrying");
             MilliSleep(retrySecs*1000);
         }
     }
-    void deleteExt(const char *name, unsigned retrySecs=0, unsigned retryAttempts=10)
+    void deleteExt(const char *basePath, const char *name, unsigned retrySecs=0, unsigned retryAttempts=10)
     {
         Owned<IException> exception;
         unsigned _retryAttempts = retryAttempts;
-        StringBuffer rL(remoteBackupLocation);
+        StringBuffer rL(basePath);
+        rL.append(name);
         for (;;)
         {
             try
             {
-                rL.append(name);
                 Owned<IFile> iFile = createIFile(rL.str());
                 iFile->remove();
             }
@@ -1136,267 +1272,207 @@ class CBackupHandler : public CInterface, implements IThreaded
             {
                 exception.setown(e);
                 StringBuffer err("Removing external (backup): ");
-                LOG(MCoperatorWarning, unknownJob, e, err.append(rL).str());
+                OWARNLOG(e, err.append(rL).str());
             }
             if (!exception.get())
                 break;
             if (0 == retrySecs)
                 return;
-            if (0 == --_retryAttempts)
+            if (_retryAttempts != INFINITE)
             {
-                IWARNLOG("deleteExt, too many retry attempts [%d]", retryAttempts);
-                return;
+                if (0 == --_retryAttempts)
+                {
+                    IWARNLOG("deleteExt, too many retry attempts [%d]", retryAttempts);
+                    return;
+                }
             }
             exception.clear();
             DBGLOG("deleteExt, retrying");
             MilliSleep(retrySecs*1000);
         }
     }
-    bool writeDelta(StringBuffer &xml, unsigned edition, bool first)
+    bool save(std::queue<Owned<CTransactionItem>> &todo);
+    void requestAsyncWrite()
     {
-        StringBuffer deltaFilename(backupPath);
-        constructStoreName(DELTANAME, edition, deltaFilename);
-        OwnedIFile iFile = createIFile(deltaFilename.str());
-        if (!first && !iFile->exists())
-            return false; // discard
-        ::writeDelta(xml, *iFile, "CBackupHandler - ", 60, 30);
-        return true;
+        // must be called whilst pendingCrit is held + writeRequested == false
+        writeRequested = true;
+        pendingTransactionsSem.signal();
     }
-    void clearOld()
+    void addToQueue(CTransactionItem *item);
+public:
+    CDeltaWriter() : threaded("CDeltaWriter")
     {
-        CriticalBlock b(queueCrit);
-        for (;;)
+    }
+    ~CDeltaWriter()
+    {
+        stop();
+    }
+    void init(IStoreHelper *_iStoreHelper)
+    {
+        iStoreHelper = _iStoreHelper;
+        iStoreHelper->getPrimaryLocation(dataPath);
+        iStoreHelper->getBackupLocation(backupPath);
+
+        Owned<const IPropertyTree> config = getComponentConfig();
+        saveThresholdSecs = config->getPropInt("sds/@deltaSaveThresholdSecs", defaultSaveThresholdSecs);
+        transactionQueueLimit = config->getPropInt("sds/@deltaTransactionQueueLimit", defaultDeltaTransactionQueueLimit);
+        unsigned deltaTransactionMaxMemMB = config->getPropInt("sds/@deltaTransactionMaxMemMB", defaultDeltaMemMaxMB);
+        transactionMaxMem = (memsize_t)deltaTransactionMaxMemMB * 0x100000;
+        if (saveThresholdSecs)
         {
-            BackupQueueItem *item = itemQueue.dequeue();
-            if (!item) break;
-            if (BackupQueueItem::f_delta == (item->flags & BackupQueueItem::typeMask))
+            thresholdDuration = queryOneSecCycles() * saveThresholdSecs;
+            lastSaveTime = get_cycles_now();
+        }
+        if (0 == transactionQueueLimit) // treat 0 as disabled, meaning that the # pending transactions will not be considered
+            transactionQueueLimit = INFINITE;
+
+        aborted = false;
+        writeRequested = false;
+        VStringBuffer msg("CDeltaWriter started - deltaSaveThresholdSecs=%u, deltaTransactionMaxMemMB=%u", saveThresholdSecs, deltaTransactionMaxMemMB);
+        msg.append(", deltaTransactionQueueLimit=");
+        if (INFINITE == transactionQueueLimit)
+            msg.append("<DISABLED>");
+        else
+            msg.append(transactionQueueLimit);
+        PROGLOG("%s", msg.str());
+
+        if ((transactionQueueLimit > 1) && (transactionMaxMem > 0))
+            threaded.init(this, false);
+        else
+            PROGLOG("All transactions will be committed synchronously");
+    }
+    void addDelta(char *path, IPropertyTree *delta)
+    {
+        CTransactionItem *item = new CTransactionItem(path, delta);
+        addToQueue(item);
+    }
+    CTransactionItem *addExt(char *name, size32_t length, void *content)
+    {
+        CTransactionItem *item = new CTransactionItem(name, length, content, true);
+        addToQueue(LINK(item));
+        return item;
+    }
+    void removeExt(char *name)
+    {
+        CTransactionItem *item = new CTransactionItem(name);
+        addToQueue(item);
+    }
+    void flush()
+    {
+        // ensure all pending transactions are written out
+        // if necessary wait until CDeltaWriter thread has finished
+        bool waitUntilAllWritten = false;
+        {
+            CriticalBlock b(pendingCrit);
+            if (!writeRequested)
             {
-                item->text->clear();
-                if (freeQueue.ordinality() < freeQueueLimit)
-                    freeQueue.enqueue(item);
-                else
-                    delete item;
+                if (pendingSz) // the writer thread is idle, but there are some transactions that the writer hasn't seen yet
+                {
+                    // NB: will never happen in default configuration (i.e. unless @deltaSaveThresholdSecs is enabled)
+                    // because addToQueue (in default config) will always call requestAsyncWrite() as soon as anything is queued
+                    requestAsyncWrite();
+                }
+            }
+            // NB: this is not an else, because if called, requestAsyncWrite() above will set writeRequested=true
+            if (writeRequested)
+            {
+                signalWhenAllWritten = true; // will ensure writer thread signals (via allWrittenSem) when it is done (writeRequested reset to false)
+                waitUntilAllWritten = true;
             }
         }
-        if (addWaiting && itemQueue.ordinality()<softQueueLimit)
-            softQueueLimitSem.signal();
-    }
-
-public:
-    CBackupHandler(IPropertyTree &_config) : config(_config), threaded("CBackupHandler")
-    {
-        currentEdition = (unsigned)-1;
-        addWaiting = waiting = async = false;
-        aborted = true;
-        throttleCounter = 0;
-        recentTimeThrottled = 0;
-        lastNumWarnItems = 0;
-        freeQueueLimit = config.getPropInt("@backupFreeQueueLimit", defaultFreeQueueLimit);
-        largeWarningThreshold = config.getPropInt("@backupLargeWarningThreshold", defaultLargeWarningThreshold);
-        softQueueLimit = config.getPropInt("@backupSoftQueueLimit", defaultSoftQueueLimit);
-        softQueueLimitDelay = config.getPropInt("@backupSoftQueueLimitDelay", defaultSoftQueueLimitDelay);
-    }
-    ~CBackupHandler()
-    {
-        clearQueue(freeQueue);
-        clearQueue(itemQueue);
-    }
-    void init(const char *_backupPath, bool _async)
-    {
-        backupPath.set(_backupPath);
-        async = _async;
-        aborted = false;
-        PROGLOG("BackupHandler started, async=%s", async?"true":"false");
-        threaded.init(this);
+        if (waitUntilAllWritten)
+        {
+            // this should not be here long, but log just in case
+            while (!allWrittenSem.wait(10000))
+            {
+                if (aborted) // can ony happen if CDeltaWriter thread is stopping
+                    return;
+                WARNLOG("Waiting on CDeltaWriter to flush transactions");
+            }
+        }
     }
     void stop()
     {
         if (!aborted)
         {
             aborted = true;
-            pending.signal();
+            pendingTransactionsSem.signal();
+            allWrittenSem.signal();
             threaded.join();
         }
-    }
-    void removeExt(const char *fname)
-    {
-        if (aborted) return;
-        if (!async)
-        {
-            deleteExt(fname);
-            return;
-        }
-        BackupQueueItem *item = getFreeItem();
-        item->text->append(fname);
-        item->flags = BackupQueueItem::f_delext;
-        add(item);
-    }
-    void addExt(const char *fname, unsigned length, void *data)
-    {
-        if (aborted) return;
-        if (!async)
-        {
-            writeExt(fname, length, data);
-            free(data);
-            return;
-        }
-        BackupQueueItem *item = getFreeItem();
-        item->text->append(fname);
-        item->dataLength = length;
-        item->data = data; // take ownership
-        item->flags = BackupQueueItem::f_addext;
-        add(item);
-    }
-    void addDelta(StringBuffer &xml, unsigned edition, bool first)
-    {
-        if (aborted) return;
-        if (!async)
-        {
-            writeDelta(xml, edition, first);
-            if (xml.length() > 0x100000)
-                xml.kill();
-            else
-                xml.clear();
-            return;
-        }
-        if (edition != currentEdition)
-        {
-            clearOld();
-            currentEdition = edition;
-        }
-        BackupQueueItem *item = getFreeItem();
-        xml.swapWith(*item->text);
-        item->edition = edition;
-        item->flags = BackupQueueItem::f_delta | BackupQueueItem::f_first;
-        add(item);
-    }
-    void add(BackupQueueItem *item)
-    {
-        CriticalBlock b(queueCrit);
-        itemQueue.enqueue(item);
-        unsigned items=itemQueue.ordinality();
-        if (0==items%largeWarningThreshold)
-        {
-            if (items>lastNumWarnItems) // track as they go up
-            {
-                IWARNLOG("Backup thread has a high # (%d) of pending transaction queued to write", items);
-                lastNumWarnItems = items;
-            }
-            else if (warningTime.elapsed() >= 60000) // if falling, avoid logging too much
-            {
-                IWARNLOG("Backup thread has a high # (%d) of pending transaction queued to write", items);
-                lastNumWarnItems = 0;
-                warningTime.reset(0);
-            }
-        }
-        if (items>=softQueueLimit)
-        {
-            addWaiting = true;
-            unsigned ms = msTick();
-            {
-                CriticalUnblock b(queueCrit);
-                softQueueLimitSem.wait(softQueueLimitDelay);
-            }
-            addWaiting = false;
-            recentTimeThrottled += (msTick()-ms); // reset when queue < largeWarningThreshold
-            if (recentTimeThrottled >= softQueueLimitDelay && (0 == throttleCounter % 10)) // softQueueLimit exceeded - log every 10 transactions if recentTimeThrottled >= softQueueLimitDelay (1 unsignalled delay)
-                IWARNLOG("Primary transactions are being delayed by lagging backup, currently %d queued, recent total throttle delay=%d", items, recentTimeThrottled);
-            ++throttleCounter; // also reset when queue < largeWarningThreshold
-        }
-        if (waiting)
-            pending.signal();
-    }
-    bool doIt(BackupQueueItem &item)
-    {
-        try
-        {
-            switch (item.flags & BackupQueueItem::typeMask)
-            {
-                case BackupQueueItem::f_delta:
-                    return writeDelta(*item.text, item.edition, 0 != (item.flags & BackupQueueItem::f_first));
-                case BackupQueueItem::f_addext:
-                    writeExt(item.text->str(), item.dataLength, item.data, 60, 30);
-                    return true;
-                case BackupQueueItem::f_delext:
-                    deleteExt(item.text->str(), 60, 30);
-                    return true;
-            }
-        }
-        catch (IException *e)
-        {
-            IERRLOG(e, "BackupHandler(async) write operation failed, possible backup data loss");
-            e->Release();
-        }
-        return false;
     }
 // IThreaded
     virtual void threadmain() override
     {
-        for (;;)
+        PROGLOG("CDeltaWriter thread started");
+        try
         {
-            BackupQueueItem *item=NULL;
-            do
+            while (!aborted)
             {
-                CriticalBlock b(queueCrit);
-                if (itemQueue.ordinality())
-                {
-                    item = itemQueue.dequeue();
-                    if (addWaiting && itemQueue.ordinality()<softQueueLimit)
-                        softQueueLimitSem.signal();
-                    if (itemQueue.ordinality() < largeWarningThreshold) // reset stats when falls below
-                    {
-                        recentTimeThrottled = 0;
-                        throttleCounter = 0;
-                    }
-                }
+                bool semTimedout = false;
+                if (saveThresholdSecs)
+                    semTimedout = !pendingTransactionsSem.wait(saveThresholdSecs * 1000);
                 else
-                {
-                    waiting = true;
-                    {
-                        CriticalUnblock b(queueCrit);
-                        if (!aborted)
-                            pending.wait();
-                    }
-                    waiting = false;
-                }
+                    pendingTransactionsSem.wait();
+
                 if (aborted)
+                    break;
+                // keep going whilst there's things pending
+                while (true)
                 {
-                    if (item) delete item;
-                    PROGLOG("BackupHandler stopped");
-                    return;
+                    // NB: ensure consistent lock ordering of blockedSaveCrit and pendingCrit
+                    CHECKEDCRITICALBLOCK(blockedSaveCrit, fakeCritTimeout); // because if Dali is saving state (::blockingSave), it will clear pending
+                    std::queue<Owned<CTransactionItem>> todo;
+                    {
+                        CriticalBlock b(pendingCrit);
+                        todo = std::move(pending);
+                        if (0 == todo.size())
+                        {
+                            if (writeRequested)
+                            {
+                                // NB: if here, implies someone signalled via requestAsyncWrite()
+
+                                // if reason we're here is because sem timedout, consume the signal that was sent
+                                if (semTimedout)
+                                    pendingTransactionsSem.wait();
+
+                                writeRequested = false;
+                                if (signalWhenAllWritten) // can only be true if writeRequested was true
+                                {
+                                    signalWhenAllWritten = false;
+                                    allWrittenSem.signal();
+                                }
+                            }
+                            break;
+                        }
+                        pendingSz = 0;
+                    }
+
+                    // Because blockedSaveCrit is held, it will also block 'synchronous save' (see addToQueue)
+                    // i.e. if stuck here, the transactions will start building up, and trigger a 'Forced synchronous save',
+                    // which will in turn block. This must complete!
+                    while (!save(todo)) // if temporarily blocked, wait a bit (blocking window is short)
+                        MilliSleep(1000);
                 }
             }
-            while (!item);
-            if (!doIt(*item))
-                clearOld();
-            CriticalBlock b(freeQueueCrit);
-            if (freeQueue.ordinality() < freeQueueLimit)
-            {
-                if (item->text->length() > 0x100000)
-                    item->text->kill();
-                else
-                    item->text->clear();
-                if (item->data)
-                {
-                    free(item->data);
-                    item->data = NULL;
-                    item->dataLength = 0;
-                }
-                freeQueue.enqueue(item);
-            }
-            else
-                delete item;
         }
+        catch (IException *e)
+        {
+            DISLOG(e, "CDeltaWriter: thread exited. Remedial action must be taken. Save, shutdown or restart ASAP.");
+            e->Release();
+        }
+        aborted = true;
     }
 };
 
+
 class CExternalFile : public CInterface
 {
-    StringAttr ext, dataPath;
 protected:
-    CBackupHandler &backupHandler;
+    CCovenSDSManager &manager;
+    StringAttr ext, dataPath;
 public:
-    CExternalFile(const char *_ext, const char *_dataPath, CBackupHandler &_backupHandler) : ext(_ext), dataPath(_dataPath), backupHandler(_backupHandler) { }
+    CExternalFile(const char *_ext, const char *_dataPath, CCovenSDSManager &_manager) : manager(_manager), ext(_ext), dataPath(_dataPath) { }
     const char *queryExt() { return ext; }
     StringBuffer &getName(StringBuffer &fName, const char *base)
     {
@@ -1413,61 +1489,28 @@ public:
         Owned<IFile> iFile = createIFile(filename.str());
         return iFile->exists();
     }
-    void remove(const char *name)
-    {
-        StringBuffer filename;
-        getFilename(filename, name);
-        Owned<IFile> iFile = createIFile(filename.str());
-        iFile->remove();
-        if (remoteBackupLocation.length())
-        {
-            StringBuffer fname(name);
-            backupHandler.removeExt(fname.append(queryExt()).str());
-        }       
-    }
+    void remove(const char *name);
 };
 
+// deprecated, only used to convert if found on load
 class CLegacyBinaryFileExternal : public CExternalFile, implements IExternalHandler
 {
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(CExternalFile);
 
-    CLegacyBinaryFileExternal(const char *dataPath, CBackupHandler &backupHandler) : CExternalFile("." EF_LegacyBinaryValue, dataPath, backupHandler) { }
+    CLegacyBinaryFileExternal(const char *dataPath, CCovenSDSManager &manager) : CExternalFile("." EF_LegacyBinaryValue, dataPath, manager) { }
     virtual void resetAsExternal(IPropertyTree &tree)
     {
-        tree.setProp(NULL, (char *)NULL);
+        throwUnexpected();
     }
     virtual void readValue(const char *name, MemoryBuffer &mb)
     {
-        StringBuffer filename;
-        getFilename(filename, name);
-
-        Owned<IFile> iFile = createIFile(filename.str());
-        size32_t sz = (size32_t)iFile->size();
-        if ((unsigned)-1 == sz)
-        {
-            StringBuffer s("Missing external file ");
-            Owned<IException> e = MakeSDSException(SDSExcpt_MissingExternalFile, "%s", filename.str());
-            LOG(MCoperatorWarning, unknownJob, e, s.str()); 
-            StringBuffer str("EXTERNAL BINARY FILE: \"");
-            str.append(filename.str()).append("\" MISSING");
-            CPTValue v(str.length()+1, str.str(), false);
-            v.serialize(mb);
-        }
-        else
-        {
-            Owned<IFileIO> fileIO = iFile->open(IFOread);
-            MemoryBuffer vmb;
-            verifyex(sz == ::read(fileIO, 0, sz, vmb));
-            CPTValue v(sz, vmb.toByteArray(), true);
-            v.serialize(mb);
-        }
+        throwUnexpected();
     }
     virtual void read(const char *name, IPropertyTree &owner, MemoryBuffer &mb, bool withValue)
     {
         StringBuffer filename;
         getFilename(filename, name);
-
         const char *_name = owner.queryName();
         if (!_name) _name = "";
         mb.append(_name);
@@ -1478,18 +1521,18 @@ public:
 
         Owned<IFile> iFile = createIFile(filename.str());
         size32_t sz = (size32_t)iFile->size();
-        if ((unsigned)-1 == sz)
+        if ((size32_t)-1 == sz)
         {
             StringBuffer s("Missing external file ");
             if (*_name)
                 s.append("in property ").append(_name);
             Owned<IException> e = MakeSDSException(SDSExcpt_MissingExternalFile, "%s", filename.str());
-            LOG(MCoperatorWarning, unknownJob, e, s.str()); 
+            OWARNLOG(e, s.str());
             if (withValue)
             {
                 StringBuffer str("EXTERNAL BINARY FILE: \"");
                 str.append(filename.str()).append("\" MISSING");
-                CPTValue v(str.length()+1, str.str(), false);
+                CPTValue v(str.length()+1, str.str());
                 v.serialize(mb);
             }
             else
@@ -1502,7 +1545,7 @@ public:
                 MemoryBuffer vmb;
                 Owned<IFileIO> fileIO = iFile->open(IFOread);
                 verifyex(sz == ::read(fileIO, 0, sz, vmb));
-                CPTValue v(sz, vmb.toByteArray(), true);
+                CPTValue v(sz, vmb.toByteArray(), true, COMPRESS_METHOD_NONE, COMPRESS_METHOD_DEFAULT);
                 v.serialize(mb);
             }
             else
@@ -1511,21 +1554,7 @@ public:
     }
     virtual void write(const char *name, IPropertyTree &tree)
     {
-        StringBuffer filename;
-        getFilename(filename, name);
-        Owned<IFile> iFile = createIFile(filename.str());
-        Owned<IFileIO> fileIO = iFile->open(IFOcreate);
-
-        MemoryBuffer out;
-        ((PTree &)tree).queryValue()->serialize(out);
-        const char *data = out.toByteArray();
-        unsigned length = out.length();
-        fileIO->write(0, length, data);
-        if (remoteBackupLocation.length())
-        {
-            StringBuffer fname(name);
-            backupHandler.addExt(fname.append(queryExt()).str(), length, out.detach());
-        }
+        throwUnexpected();
     }
     virtual void remove(const char *name) { CExternalFile::remove(name); }
     virtual bool isValid(const char *name) { return CExternalFile::isValid(name); }
@@ -1536,141 +1565,36 @@ public:
 class CBinaryFileExternal : public CExternalFile, implements IExternalHandler
 {
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(CExternalFile);
 
-    CBinaryFileExternal(const char *dataPath, CBackupHandler &backupHandler) : CExternalFile("." EF_BinaryValue, dataPath, backupHandler) { }
+    CBinaryFileExternal(const char *dataPath, CCovenSDSManager &manager) : CExternalFile("." EF_BinaryValue, dataPath, manager) { }
     virtual void resetAsExternal(IPropertyTree &tree)
     {
         tree.setProp(NULL, (char *)NULL);
     }
-    virtual void readValue(const char *name, MemoryBuffer &mb)
-    {
-        StringBuffer filename;
-        getFilename(filename, name);
-
-        Owned<IFile> iFile = createIFile(filename.str());
-        size32_t sz = (size32_t)iFile->size();
-        if ((unsigned)-1 == sz)
-        {
-            StringBuffer s("Missing external file ");
-            Owned<IException> e = MakeSDSException(SDSExcpt_MissingExternalFile, "%s", filename.str());
-            LOG(MCoperatorWarning, unknownJob, e, s.str());
-            StringBuffer str("EXTERNAL BINARY FILE: \"");
-            str.append(filename.str()).append("\" MISSING");
-            CPTValue v(str.length()+1, str.str(), false);
-            v.serialize(mb);
-        }
-        else
-        {
-            Owned<IFileIO> fileIO = iFile->open(IFOread);
-            verifyex(sz == ::read(fileIO, 0, sz, mb));
-        }
-    }
-    virtual void read(const char *name, IPropertyTree &owner, MemoryBuffer &mb, bool withValue)
-    {
-        StringBuffer filename;
-        getFilename(filename, name);
-        const char *_name = owner.queryName();
-        if (!_name) _name = "";
-        mb.append(_name);
-
-        Owned<IFile> iFile = createIFile(filename.str());
-        size32_t sz = (size32_t)iFile->size();
-        if ((unsigned)-1 == sz)
-        {
-            byte flags = ((PTree &)owner).queryFlags();
-            IptFlagClr(flags, ipt_binary);
-            mb.append(flags);
-            serializeVisibleAttributes(owner, mb);
-            StringBuffer s("Missing external file ");
-            if (*_name)
-                s.append("in property ").append(_name);
-            Owned<IException> e = MakeSDSException(SDSExcpt_MissingExternalFile, "%s", filename.str());
-            LOG(MCoperatorWarning, unknownJob, e, s.str());
-            if (withValue)
-            {
-                StringBuffer str("EXTERNAL BINARY FILE: \"");
-                str.append(filename.str()).append("\" MISSING");
-                CPTValue v(str.length()+1, str.str(), false);
-                v.serialize(mb);
-            }
-            else
-                mb.append((size32_t)0);
-        }
-        else
-        {
-            byte flags = ((PTree &)owner).queryFlags();
-            mb.append(flags);
-            serializeVisibleAttributes(owner, mb);
-            if (withValue)
-            {
-                Owned<IFileIO> fileIO = iFile->open(IFOread);
-                verifyex(sz == ::read(fileIO, 0, sz, mb));
-            }
-            else
-                mb.append((size32_t)0);
-        }
-    }
-    virtual void write(const char *name, IPropertyTree &tree)
-    {
-        StringBuffer filename;
-        getFilename(filename, name);
-        Owned<IFile> iFile = createIFile(filename.str());
-        Owned<IFileIO> fileIO = iFile->open(IFOcreate);
-
-        MemoryBuffer out;
-        ((PTree &)tree).queryValue()->serialize(out);
-        const char *data = out.toByteArray();
-        unsigned length = out.length();
-        fileIO->write(0, length, data);
-        if (remoteBackupLocation.length())
-        {
-            StringBuffer fname(name);
-            backupHandler.addExt(fname.append(queryExt()).str(), length, out.detach());
-        }       
-    }
+    virtual void readValue(const char *name, MemoryBuffer &mb);
+    virtual void read(const char *name, IPropertyTree &owner, MemoryBuffer &mb, bool withValue);
+    virtual void write(const char *name, IPropertyTree &tree);
     virtual void remove(const char *name) { CExternalFile::remove(name); }
     virtual bool isValid(const char *name) { return CExternalFile::isValid(name); }
     virtual StringBuffer &getName(StringBuffer &fName, const char *base) { return CExternalFile::getName(fName, base); }
     virtual StringBuffer &getFilename(StringBuffer &fName, const char *base) { return CExternalFile::getFilename(fName, base); }
 };
 
+// deprecated, only used to convert if found on load
 class CXMLFileExternal : public CExternalFile, implements IExternalHandler
 {
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(CExternalFile);
 
-    CXMLFileExternal(const char *dataPath, CBackupHandler &backupHandler) : CExternalFile("." EF_XML, dataPath, backupHandler) { }
+    CXMLFileExternal(const char *dataPath, CCovenSDSManager &manager) : CExternalFile("." EF_XML, dataPath, manager) { }
     virtual void resetAsExternal(IPropertyTree &_tree)
     {
-        PTree &tree = *QUERYINTERFACE(&_tree, PTree);
-        ::Release(tree.detach());
+        throwUnexpected();
     }
     virtual void readValue(const char *name, MemoryBuffer &mb)
     {
-        StringBuffer filename;
-        getFilename(filename, name);
-        OwnedIFile ifile = createIFile(filename.str());
-        if (!ifile->exists())
-        {
-            StringBuffer s("Missing external file ");
-            Owned<IException> e = MakeSDSException(SDSExcpt_MissingExternalFile, "%s", filename.str());
-            LOG(MCoperatorWarning, unknownJob, e, s.str());
-            StringBuffer str("EXTERNAL XML FILE: \"");
-            str.append(filename.str()).append("\" MISSING");
-            CPTValue v(str.length()+1, str.str(), false);
-            v.serialize(mb);
-        }
-        else
-        {
-            Owned<IPropertyTree> tree;
-            tree.setown(createPTreeFromXMLFile(filename.str()));
-            IPTArrayValue *v = ((PTree *)tree.get())->queryValue();
-            if (v)
-                v->serialize(mb);
-            else
-                mb.append((size32_t)0);
-        }
+        throwUnexpected();
     }
     virtual void read(const char *name, IPropertyTree &owner, MemoryBuffer &mb, bool withValue)
     {
@@ -1685,7 +1609,7 @@ public:
             if (name && *name)
                 s.append("in property ").append(name);
             Owned<IException> e = MakeSDSException(SDSExcpt_MissingExternalFile, "%s", filename.str());
-            LOG(MCoperatorWarning, unknownJob, e, s.str());
+            OWARNLOG(e, s.str());
             StringBuffer str("EXTERNAL XML FILE: \"");
             str.append(filename.str()).append("\" MISSING");
             tree.setown(createPTree(owner.queryName()));
@@ -1702,20 +1626,7 @@ public:
     }
     virtual void write(const char *name, IPropertyTree &tree)
     {
-        StringBuffer filename;
-        getFilename(filename, name);
-        Owned<IFile> iFile = createIFile(filename.str());
-        Owned<IFileIO> fileIO = iFile->open(IFOcreate);
-        Owned<IFileIOStream> fstream = createBufferedIOStream(fileIO);
-        toXML(&tree, *fstream);
-        if (remoteBackupLocation.length())
-        {
-            StringBuffer fname(name);
-            StringBuffer str;
-            toXML(&tree, str);
-            unsigned l = str.length();
-            backupHandler.addExt(fname.append(queryExt()).str(), l, str.detach());
-        }       
+        throwUnexpected();
     }
     virtual void remove(const char *name) { CExternalFile::remove(name); }
     virtual bool isValid(const char *name) { return CExternalFile::isValid(name); }
@@ -1764,15 +1675,6 @@ void buildNotifyData(MemoryBuffer &notifyData, PDState state, CPTStack *stack, M
                 PTree &child = stack->item(s);
                 const char *str = child.queryName();
                 notifyData.append(strlen(str), str);
-                unsigned pos = child.querySiblingPosition();
-                if (0 == pos) // common case
-                    notifyData.append(3, "[1]");
-                else
-                {
-                    char temp[12];
-                    unsigned written = numtostr(temp, pos+1);
-                    notifyData.append('[').append(written, temp).append(']');
-                }
                 parent = &child;
                 s++;
                 if (s<n)
@@ -1808,7 +1710,7 @@ class CSubscriberNotifier : public CInterface
     };
 public:
     CSubscriberNotifier(CSubscriberNotifierTable &_table, CSubscriberContainerBase &_subscriber, MemoryBuffer &notifyData)
-        : table(_table), subscriber(_subscriber) //NB: takes ownership of subscriber
+        : subscriber(_subscriber), table(_table) //NB: takes ownership of subscriber
     {
         INIT_NAMEDCOUNT;
         change.setown(new CChange(notifyData));
@@ -1887,7 +1789,7 @@ public:
 
 private:
     SubConnMap subConnMap;
-    CheckedCriticalSection crit;
+    CheckedCriticalSection crit{SYNC_LOCATION};
 };
 
 //////////
@@ -1914,9 +1816,45 @@ typedef MapBetween<__int64, __int64, CServerRemoteTreePtr, CServerRemoteTreePtr>
 
 struct CStoreInfo
 {
-    unsigned edition;
-    unsigned crc;
+    unsigned edition{0};
+    struct CrcInfo
+    {
+        unsigned xmlCrc{0};
+        unsigned binaryCrc{0};
+    } crcInfo;
     StringAttr cache;
+
+
+    static void save(IFileIO *fileIO, unsigned *crcXml, unsigned *crcBinary)
+    {
+        assertex(fileIO);
+
+        CrcInfo crcInfo;
+        if (crcXml)
+            crcInfo.xmlCrc = *crcXml;
+        if (crcBinary)
+            crcInfo.binaryCrc = *crcBinary;
+        fileIO->write(0, sizeof(CrcInfo), &crcInfo);
+    }
+
+    void restore(IFileIO *fileIO)
+    {
+        assertex(fileIO);
+
+        // Only restore xmlCrc and binaryCrc
+        size32_t sz = fileIO->read(0, sizeof(CrcInfo), &crcInfo);
+        switch(sz)
+        {
+            case sizeof(CrcInfo):
+                break;
+            case sizeof(unsigned):
+                crcInfo.binaryCrc = 0;
+                break;
+            default:
+                crcInfo = {};
+                break;
+        }
+    }
 };
 
 interface ICoalesce : extends IInterface
@@ -1939,22 +1877,127 @@ interface INodeSubscriptionManager : extends ISubscriptionManager
 
 //////////////////////
 
+
+class CExtCache
+{
+    CriticalSection crit{SYNC_LOCATION};
+    std::list<Linked<CTransactionItem>> order;
+    std::unordered_map<std::string, std::list<Linked<CTransactionItem>>::iterator> extTable;
+    memsize_t cachedSz = 0;
+    memsize_t cacheSzLimit = 0;
+
+    void purge()
+    {
+        for (auto it = order.begin(); it != order.end();)
+        {
+            CTransactionItem *item = *it;
+            if (item->ext.pendingWrite)
+                it++;
+            else
+            {
+                cachedSz -= item->ext.dataLength;
+                extTable.erase(item->name);
+                it = order.erase(it);
+                if (cachedSz <= cacheSzLimit)
+                    break;
+            }
+        }
+    }
+    void doAdd(CTransactionItem *item)
+    {
+        CriticalBlock b(crit);
+        auto it = extTable.find(item->name);
+        if (it != extTable.end())
+        {
+            Linked<CTransactionItem> &existingItem = *(it->second);
+            cachedSz -= existingItem->ext.dataLength;
+            existingItem.set(item);
+            order.splice(order.end(), order, it->second); // move to front of FIFO list
+        }
+        else
+        {
+            auto listIt = order.insert(order.end(), item);
+            extTable[item->name] = listIt;
+        }
+        cachedSz += item->ext.dataLength;
+        if (cachedSz > cacheSzLimit)
+            purge();
+    }
+public:
+    void init(memsize_t _cacheSzLimit)
+    {
+        cacheSzLimit = _cacheSzLimit;
+    }
+    void add(const char *name, size_t sz, const void *data) // will clone data
+    {
+        if (sz > cacheSzLimit)
+            return;
+        MemoryAttr ma;
+        ma.set(sz, data);
+        Owned<CTransactionItem> item = new CTransactionItem(strdup(name), sz, ma.detach(), false);
+        doAdd(item);
+    }
+    void add(CTransactionItem *item)
+    {
+        if (item->ext.dataLength > cacheSzLimit)
+        {
+            remove(item->name);
+            return;
+        }
+        doAdd(item);
+    }
+    void remove(const char *key)
+    {
+        CriticalBlock b(crit);
+        auto mapIt = extTable.find(key);
+        if (mapIt != extTable.end())
+        {
+            auto listIter = mapIt->second;
+            Linked<CTransactionItem> &existingItem = *listIter;
+            cachedSz -= existingItem->ext.dataLength;
+            assertex(listIter != order.erase(listIter));
+            assertex(mapIt != extTable.erase(mapIt));
+        }
+    }
+    bool lookup(const char *key, MemoryBuffer &mb)
+    {
+        CLeavableCriticalBlock b(crit);
+        auto it = extTable.find(key);
+        if (it == extTable.end())
+            return false;
+        Linked<CTransactionItem> item = *(it->second);
+        b.ensureLeave();
+        mb.append(item->ext.dataLength, item->ext.data);
+        return true;
+    }
+};
+
+
+//////////////////////
+
 enum LockStatus { LockFailed, LockHeld, LockTimedOut, LockSucceeded };
 
+enum SaveStoreFlags
+{
+    ssf_none  = 0x0,
+    ssf_flush = 0x1,
+    ssf_stop  = 0x2
+};
+BITMASK_ENUM(SaveStoreFlags);
 class CCovenSDSManager : public CSDSManagerBase, implements ISDSManagerServer, implements ISubscriptionManager, implements IExceptionHandler
 {
 public:
     IMPLEMENT_IINTERFACE;
 
-    CCovenSDSManager(ICoven &_coven, IPropertyTree &config, const char *dataPath, const char *daliName);
+    CCovenSDSManager(ICoven &_coven, const char *dataPath, const char *daliName);
     ~CCovenSDSManager();
 
     void start();
     void stop();
     void restart(IException * e);
 
-    void loadStore(const char *store=NULL, const bool *abort=NULL);
-    void saveStore(const char *store=NULL, bool currentEdition=false);
+    void loadStore(const bool *abort=NULL);
+    void saveStore(const char *store, SaveStoreFlags flags);
     void checkEnvironment(IPropertyTree *oldEnv, IPropertyTree *newEnv);
     bool unlock(__int64 treeId, ConnectionId connectionId, bool delayDelete=false);
     void unlockAll(__int64 treeId);
@@ -1990,7 +2033,7 @@ public:
     CServerRemoteTree *queryRegisteredTree(__int64 uniqId);
     CServerRemoteTree *getRegisteredTree(__int64 uniqId);
     CServerRemoteTree *queryRoot();
-    void saveDelta(const char *path, IPropertyTree &changeTree);
+    void serializeDelta(const char *path, IPropertyTree *changeTree);
     CSubscriberContainerList *getSubscribers(const char *xpath, CPTStack &stack);
     void getExternalValue(__int64 index, MemoryBuffer &mb);
     IPropertyTree *getXPathsSortLimitMatchTree(const char *baseXPath, const char *matchXPath, const char *sortby, bool caseinsensitive, bool ascending, unsigned from, unsigned limit);
@@ -2051,6 +2094,7 @@ public:
     virtual void setConfigOpt(const char *opt, const char *value);
     virtual unsigned queryCount(const char *xpath);
     virtual bool updateEnvironment(IPropertyTree *newEnv, bool forceGroupUpdate, StringBuffer &response);
+    virtual void closedown() override;
 
 // ISubscriptionManager impl.
     virtual void add(ISubscription *subs,SubscriptionId id);
@@ -2060,20 +2104,32 @@ public:
     virtual bool fireException(IException *e);
 
 public: // data
-    mutable ReadWriteLock dataRWLock;
-    CheckedCriticalSection connectCrit;
-    CheckedCriticalSection connDestructCrit;
-    CheckedCriticalSection cTableCrit;
-    CheckedCriticalSection sTableCrit;
-    CheckedCriticalSection lockCrit;
-    CheckedCriticalSection treeRegCrit;
+    mutable TimedReadWriteLock dataRWLock{SYNC_LOCATION};
+    CheckedCriticalSection connectCrit{SYNC_LOCATION};
+    CheckedCriticalSection connDestructCrit{SYNC_LOCATION};
+    CheckedCriticalSection cTableCrit{SYNC_LOCATION};
+    CheckedCriticalSection sTableCrit{SYNC_LOCATION};
+    CheckedCriticalSection lockCrit{SYNC_LOCATION};
+    CheckedCriticalSection treeRegCrit{SYNC_LOCATION};
     Owned<Thread> unhandledThread;
     unsigned writeTransactions;
-    bool ignoreExternals;
+    std::atomic<bool> ignoreExternals;
     StringAttr dataPath;
     StringAttr daliName;
     Owned<IPropertyTree> properties;
 private:
+    struct StoreReadLockStats
+    {
+        unsigned __int64 count = 0;
+        unsigned __int64 blockedNs = 0;
+        unsigned __int64 maxBlockedNs = 0;
+        unsigned __int64 holdNs = 0;
+        unsigned __int64 maxHoldNs = 0;
+    };
+
+    void updateStoreReadLockAcquireStats(unsigned __int64 blockedNs) const;
+    bool updateStoreReadLockReleaseStats(unsigned __int64 heldNs, StoreReadLockStats &snapshot) const;
+
     void validateBackup();
     void validateDeltaBackup();
     LockStatus establishLock(CLock &lock, __int64 treeId, ConnectionId connectionId, SessionId sessionId, unsigned mode, unsigned timeout, IUnlockCallback &lockCallback);
@@ -2082,10 +2138,10 @@ private:
 
     CSubscriberTable subscribers;
     CSDSTransactionServer server;
+    StringAttr storeBase;
     ICoven &coven;
     CServerRemoteTree *root;
     CFitArray allNodes;
-    IPropertyTree &config;
     MemoryBuffer incrementBuffer;
     Owned<ICoalesce> coalesce;
     unsigned __int64 nextExternal;
@@ -2101,8 +2157,19 @@ private:
     IStoreHelper *iStoreHelper;
     bool doTimeComparison;
     StringBuffer blockedDelta;
-    CBackupHandler backupHandler;
+    CDeltaWriter deltaWriter;
+    CExtCache extCache;
     bool backupOutOfSync = false;
+
+    // Instrumentation for store read-lock usage. lockStoreRead()/unlockStoreRead() can be
+    // called frequently (e.g. by paginated DFS scans), so accumulate simple totals and
+    // trace them at most once per interval.
+    mutable CriticalSection storeReadLockStatsCrit{"DaliSDSReadLockStatsCrit"};
+    mutable StoreReadLockStats storeReadLockStats;
+    mutable CCycleTimer storeReadLockReportTimer;
+
+friend class CExternalFile;
+friend class CBinaryFileExternal;
 };
 
 ISDSManagerServer &querySDSServer()
@@ -2111,6 +2178,161 @@ ISDSManagerServer &querySDSServer()
     return *SDSManager;
 }
 
+/////////////////
+
+void CExternalFile::remove(const char *name)
+{
+    StringBuffer filename(name);
+    filename.append(ext);
+    manager.extCache.remove(filename);
+    manager.deltaWriter.removeExt(filename.detach());
+}
+
+void CBinaryFileExternal::readValue(const char *name, MemoryBuffer &mb)
+{
+    StringBuffer extName;
+    getName(extName, name);
+    if (manager.extCache.lookup(extName, mb))
+        return;
+
+    StringBuffer filename;
+    getFilename(filename, name);
+    Owned<IFile> iFile = createIFile(filename.str());
+    size32_t sz = (size32_t)iFile->size();
+    if ((size32_t)-1 == sz)
+    {
+        StringBuffer s("Missing external file ");
+        Owned<IException> e = MakeSDSException(SDSExcpt_MissingExternalFile, "%s", filename.str());
+        OWARNLOG(e, s.str());
+        StringBuffer str("EXTERNAL BINARY FILE: \"");
+        str.append(filename.str()).append("\" MISSING");
+        CPTValue v(str.length()+1, str.str());
+        v.serialize(mb);
+    }
+    else
+    {
+        Owned<IFileIO> fileIO = iFile->open(IFOread);
+        void *extData = mb.reserveTruncate(sz);
+        verifyex(sz == fileIO->read(0, sz, extData));
+        manager.extCache.add(extName, sz, extData);
+    }
+}
+
+void CBinaryFileExternal::read(const char *name, IPropertyTree &owner, MemoryBuffer &mb, bool withValue)
+{
+    const char *_name = owner.queryName();
+    if (!_name) _name = "";
+    mb.append(_name);
+
+    size32_t flagsPos = mb.length();
+    byte flags = ((PTree &)owner).queryFlags();
+    mb.append(flags);
+    serializeVisibleAttributes(owner, mb);
+
+    if (withValue)
+    {
+        StringBuffer extName;
+        getName(extName, name);
+        if (manager.extCache.lookup(extName, mb))
+            return;
+
+        StringBuffer filename;
+        getFilename(filename, name);
+        Owned<IFile> iFile = createIFile(filename.str());
+        size32_t sz = (size32_t)iFile->size();
+        if ((size32_t)-1 == sz)
+        {
+            IptFlagClr(flags, ipt_binary);
+            mb.writeDirect(flagsPos, sizeof(flags), &flags);
+
+            StringBuffer s("Missing external file ");
+            if (*_name)
+                s.append("in property ").append(_name);
+            Owned<IException> e = MakeSDSException(SDSExcpt_MissingExternalFile, "%s", filename.str());
+            OWARNLOG(e, s.str());
+            StringBuffer str("EXTERNAL BINARY FILE: \"");
+            str.append(filename.str()).append("\" MISSING");
+            CPTValue v(str.length()+1, str.str());
+            v.serialize(mb);
+        }
+        else
+        {
+            Owned<IFileIO> fileIO = iFile->open(IFOread);
+            void *extData = mb.reserveTruncate(sz);
+            verifyex(sz == fileIO->read(0, sz, extData));
+            manager.extCache.add(extName, sz, extData);
+        }
+    }
+    else
+        mb.append((size32_t)0);
+}
+
+void CBinaryFileExternal::write(const char *name, IPropertyTree &tree)
+{
+    StringBuffer filename(name);
+    filename.append(ext);
+
+    MemoryBuffer out;
+    ((PTree &)tree).queryValue()->serialize(out);
+    size32_t len = out.length();
+    Owned<CTransactionItem> item = manager.deltaWriter.addExt(filename.detach(), len, out.detach());
+    manager.extCache.add(item);
+}
+
+/////////////////
+
+void CDeltaWriter::addToQueue(CTransactionItem *item)
+{
+    bool needsSyncSave = false;
+    size_t items;
+    {
+        CriticalBlock b(pendingCrit);
+        pending.push(item);
+        // add actual size for externals, and nominal '100 byte' value for delta transactions
+        // it will act. as a rough guide to appoaching size threshold. It is not worth
+        // synchronously preparing and serializing here (which will be done asynchronously later)
+        pendingSz += (CTransactionItem::f_addext == item->type) ? item->ext.dataLength : 100;
+        items = pending.size();
+        if ((pendingSz < transactionMaxMem) && (items < transactionQueueLimit))
+        {
+            if (lastSaveTime && ((get_cycles_now() - lastSaveTime) < thresholdDuration))
+                return;
+
+            if (!writeRequested)
+                requestAsyncWrite();
+        }
+        else // here if exceeded transationQueueLimit, transactionMaxMem or exceeded time threshold (deltaSaveThresholdSecs)
+            needsSyncSave = true;
+    }
+    if (needsSyncSave)
+    {
+        if (aborted) // critical situation if delta writer is no longer running (there will have been previous errors)
+            DISLOG("CDeltaWriter thread was aborted! Dali is compromised. Save, shutdown or restart ASAP.");
+
+        ++totalQueueLimitHits;
+        // force a synchronous save
+        CCycleTimer timer;
+        PROGLOG("Forcing synchronous save of %u transactions (pendingSz=%zu)", (unsigned)items, pendingSz);
+
+        // NB: ensure consistent lock ordering of blockedSaveCrit and pendingCrit
+        CHECKEDCRITICALBLOCK(blockedSaveCrit, fakeCritTimeout); // because if Dali is saving state (::blockingSave), it will clear pending
+        CriticalBlock b(pendingCrit);
+        items = pending.size();
+        // NB: items could be 0. It's possible that the delta writer has caught up and flushed pending already
+        if (items && save(pending)) // if temporarily blocked, continue, meaning queue limit will overrun a bit (blocking window is short)
+        {
+            pendingSz = 0;
+            timeThrottled += timer.elapsedCycles();
+            ++throttleCounter;
+            if (timeThrottled >= queryOneSecCycles())
+            {
+                IWARNLOG("Transactions throttled - current items = %u, since last message throttled-time/transactions = { %u ms, %u }, total hard limit hits = %u", (unsigned)items, (unsigned)cycle_to_millisec(timeThrottled), throttleCounter, totalQueueLimitHits);
+                timeThrottled = 0;
+                throttleCounter = 0;
+            }
+        }
+    }
+}
 /////////////////
 
 void CConnectionSubscriptionManager::add(ISubscription *sub, SubscriptionId id)
@@ -2274,7 +2496,7 @@ CServerConnection::~CServerConnection()
 
 void CServerConnection::aborted(SessionId id)
 {
-    LOG(MCdebugInfo, unknownJob, "CServerConnection: connection aborted (%" I64F "x) sessId=%" I64F "x",connectionId, id);
+    LOG(MCdebugInfo, "CServerConnection: connection aborted (%" I64F "x) sessId=%" I64F "x",connectionId, id);
 #if 0 // JCSMORE - think this is ok, but concerned about deadlock, change later.
     Owned<CLCLockBlock> lockBlock = new CLCLockBlock(((CCovenSDSManager &)manager).dataRWLock, false, readWriteTimeout, __FILE__, __LINE__);
     SDSManager->disconnect(connectionId, false);
@@ -2290,12 +2512,14 @@ enum IncCmd { None, PropDelete, AttrDelete, PropChange, PropNew, PropExisting, C
 CRemoteTreeBase::CRemoteTreeBase(const char *name, IPTArrayValue *value, ChildMap *children)
     : SDS_PTREE(name, ipt_none, value, children)
 {
-    serverId = 0;
 }
 
 CRemoteTreeBase::CRemoteTreeBase(MemoryBuffer &mb)
 {
-    serverId = 0;
+}
+
+CRemoteTreeBase::CRemoteTreeBase(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx)
+{
 }
 
 void CRemoteTreeBase::deserializeRT(MemoryBuffer &src)
@@ -2316,7 +2540,7 @@ void CRemoteTreeBase::deserializeChildrenRT(MemoryBuffer &src)
         src.reset(pos); // reset to re-read tree name
         CRemoteTreeBase *child = (CRemoteTreeBase *) create(NULL);
         child->deserializeRT(src);
-        addPropTree(eName, child);
+        deserializeAddPropTree(child);
     }
 }
 
@@ -2328,6 +2552,44 @@ void CRemoteTreeBase::deserializeSelfRT(MemoryBuffer &mb)
     mb.read(_serverId);
     if (_serverId)
         setServerId(_serverId); // ignore deserializing 0 serverId (indicated new)
+}
+
+void CRemoteTreeBase::deserializeRT(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx)
+{
+    deserializeSelfRT(src, ctx);
+    deserializeChildrenRT(src, ctx);
+}
+
+void CRemoteTreeBase::deserializeSelfRT(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx)
+{
+    deserializeSelf(src, ctx);
+    assertex(!isnocase());
+    __int64 _serverId;
+    ctx.readEndian(src, _serverId);
+    if (_serverId)
+        setServerId(_serverId); // ignore deserializing 0 serverId (indicated new)
+}
+
+void CRemoteTreeBase::deserializeChildrenRT(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx)
+{
+    for (;;)
+    {
+        switch (isNextByteZero(src))
+        {
+        case NextByteStatus::nextByteIsNonZero:
+        {
+            CRemoteTreeBase *child = (CRemoteTreeBase *) create(NULL);
+            child->deserializeRT(src, ctx);
+            deserializeAddPropTree(child);
+            break;
+        }
+        case NextByteStatus::nextByteIsZero:
+            src.skip(1);
+            return;
+        case NextByteStatus::endOfStream:
+            throwUnexpectedX("deserializeChildrenRT: end of stream, expected child name or terminator");
+        }
+    }
 }
 
 void CRemoteTreeBase::setServerId(__int64 _serverId)
@@ -2375,7 +2637,7 @@ CRemoteTreeBase *CRemoteTreeBase::createChild(int pos, const char *childName)
 
 ///////////
 
-static CheckedCriticalSection suppressedOrphanUnlockCrit; // to temporarily suppress unlockall
+static CheckedCriticalSection suppressedOrphanUnlockCrit{SYNC_LOCATION}; // to temporarily suppress unlockall
 static bool suppressedOrphanUnlock=false;
 
 //Do not override the packing for this class - otherwise the fixed size allocator will allocate
@@ -2444,7 +2706,7 @@ class CServerRemoteTree : public CRemoteTreeBase
             const void *fp = getFindParam(tree);
             IPropertyTree *et = (IPropertyTree *)SuperHashTable::find(vs, fp);
             if (et)
-                removeExact(et);        
+                removeExact(et);
             return ChildMap::set(key, tree);
         }
     };
@@ -2475,9 +2737,10 @@ public:
     {
         CServerRemoteTree_Allocator->dealloc(p);
     }
-#endif  
-    
+#endif
+
     CServerRemoteTree(MemoryBuffer &mb) : CRemoteTreeBase(mb) { init(); }
+    CServerRemoteTree(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx) : CRemoteTreeBase(in, ctx) { init(); }
     CServerRemoteTree(const char *name=NULL, IPTArrayValue *value=NULL, ChildMap *children=NULL)
         : CRemoteTreeBase(name, value, children) { init(); }
 
@@ -2491,7 +2754,7 @@ public:
             try { SDSManager->deleteExternal(index); }
             catch (IException *e)
             {
-                LOG(MCoperatorWarning, unknownJob, e, StringBuffer("Deleting external reference for ").append(queryName()).str());
+                OWARNLOG(e, StringBuffer("Deleting external reference for ").append(queryName()).str());
                 e->Release();
             }
         }
@@ -2559,6 +2822,13 @@ public:
         return new CServerRemoteTree(mb);
     }
 
+    virtual IPropertyTree *create(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx) override
+    {
+        Owned<CServerRemoteTree> tree = new CServerRemoteTree();
+        tree->deserializeFromStream(in, ctx);
+        return tree.getClear();
+    }
+
     virtual void createChildMap() override { children = new COrphanHandler(); }
 
     inline bool testExternalCandidate()
@@ -2593,7 +2863,7 @@ public:
 
         if (cutoff < 0 || depth<cutoff)
         {
-            IPropertyTreeIterator *iter = getElements("*");
+            Owned<IPropertyTreeIterator> iter = getElements("*");
             iter->first();
             while (iter->isValid())
             {
@@ -2602,8 +2872,6 @@ public:
                 child->serializeCutOffRT(tgt, cutoff, depth+1, extValues);
                 iter->next();
             }
-            iter->Release();
-
         }
         tgt.append(""); // element terminator. i.e. blank child name.
     }
@@ -2637,9 +2905,17 @@ public:
         src.read(STIInfo);
     }
 
+    virtual void deserializeSelfRT(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx) override
+    {
+        CRemoteTreeBase::deserializeSelfRT(src, ctx);
+        assertex(!isnocase());
+        byte STIInfo;
+        ::read(src, STIInfo);
+    }
+
     virtual void removingElement(IPropertyTree *tree, unsigned pos) override
     {
-        COrphanHandler::setOrphans(*(CServerRemoteTree *)tree, true);       
+        COrphanHandler::setOrphans(*(CServerRemoteTree *)tree, true);
         CRemoteTreeBase::removingElement(tree, pos);
     }
 
@@ -2648,8 +2924,18 @@ public:
         if (isAttribute(xpath)) return false;
         if (CRemoteTreeBase::isCompressed(xpath)) return true;
         if (SDSManager->ignoreExternals) return false;
-        CServerRemoteTree *child = (CServerRemoteTree *)queryPropTree(xpath);
+        IPropertyTree * child = queryPropTree(xpath);
         return child->hasProp(EXT_ATTR);
+    }
+
+    virtual CompressionMethod getCompressionType() const override
+    {
+        CompressionMethod method = CRemoteTreeBase::getCompressionType();
+        if (method) return method;
+        if (SDSManager->ignoreExternals) return COMPRESS_METHOD_NONE;
+        if (!hasProp(EXT_ATTR))
+            return COMPRESS_METHOD_NONE;
+        return (CompressionMethod)getPropInt(COMPRESS_ATTR, COMPRESS_METHOD_LZW_LITTLE_ENDIAN);
     }
 
     bool getProp(const char *xpath, StringBuffer &ret) const override
@@ -2687,6 +2973,7 @@ private:
     PDState processData(IPropertyTree &changeTree, Owned<CBranchChange> &parentBranchChange, MemoryBuffer &newIds);
     PDState checkChange(IPropertyTree &tree, CBranchChange &parentBranchChange);
 friend class COrphanHandler;
+friend class CDeltaWriter;
 };
 
 class CNodeSubscriberContainer : public CSubscriberContainerBase
@@ -2696,7 +2983,7 @@ class CNodeSubscriberContainer : public CSubscriberContainerBase
     ICopyArrayOf<CServerRemoteTree> nodes; // never linked, node must signal the unsubscription and removal of subscriber and these references
 public:
     CNodeSubscriberContainer(ISubscription *subscriber, SubscriptionId id, bool _sendValue, const char *_xpath)
-        : CSubscriberContainerBase(subscriber, id), sendValue(_sendValue), xpath(_xpath)
+        : CSubscriberContainerBase(subscriber, id), xpath(_xpath), sendValue(_sendValue)
     {
     }
     bool querySendValue() const { return sendValue; }
@@ -2733,7 +3020,7 @@ public:
     CCovenSDSManager &owner;
     OwningSimpleHashTableOf<CNodeSubscriberContainer, SubscriptionId> subscribersById;
     OwningSimpleHashTableOf<CNodeSubscriberContainerList, CServerRemoteTree *> subscriberListByNode;
-    mutable CriticalSection subscriberListCrit;
+    mutable CriticalSection subscriberListCrit{SYNC_LOCATION};
 
     void _notify(CServerRemoteTree *node, PDState state, IArrayOf<CNodeSubscriberContainer> &subscribers)
     {
@@ -3051,7 +3338,7 @@ PDState CServerRemoteTree::checkChange(IPropertyTree &changeTree, CBranchChange 
     {
         bool binary=changeTree.isBinary(NULL);
         IPTArrayValue *v = ((PTree &)changeTree).queryValue();
-        setValue(v?new CPTValue(v->queryValueRawSize(), v->queryValueRaw(), binary, true, v->isCompressed()):NULL, binary);
+        setValue(v?new CPTValue(v->queryValueRawSize(), v->queryValueRaw(), binary, v->getCompressionType(), COMPRESS_METHOD_NONE):NULL, binary);
         if (changeTree.getPropBool("@new"))
             mergePDState(res, PDS_New);
         mergePDState(res, PDS_Data);
@@ -3075,7 +3362,7 @@ PDState CServerRemoteTree::checkChange(IPropertyTree &changeTree, CBranchChange 
             getPropBin(NULL, mb);
         changeTree.getPropBin(NULL, mb);
         if (binary)
-            setPropBin(NULL, mb.length(), mb.toByteArray());
+            setPropBin(NULL, mb.length(), mb.toByteArray(), COMPRESS_METHOD_DEFAULT);
         else
         {
             mb.append('\0');
@@ -3094,6 +3381,7 @@ PDState CServerRemoteTree::checkChange(IPropertyTree &changeTree, CBranchChange 
             {
                 SDSManager->deleteExternal(index); // i.e. no longer e.g. now less than threshold.
                 r = removeProp(EXT_ATTR);
+                removeProp(COMPRESS_ATTR);
             }
             else
                 SDSManager->writeExternal(*this, false, index);
@@ -3103,6 +3391,7 @@ PDState CServerRemoteTree::checkChange(IPropertyTree &changeTree, CBranchChange 
                 if (!t)
                     t = changeTree.addPropTree(ATTRDELETE_TAG, createPTree());
                 t->addProp(EXT_ATTR, "");
+                t->setProp(COMPRESS_ATTR, nullptr);//MORE: What should this do?
             }
             else
                 changeTree.setProp(NULL, (const char *)NULL);
@@ -3117,6 +3406,7 @@ PDState CServerRemoteTree::checkChange(IPropertyTree &changeTree, CBranchChange 
                     t = changeTree.addPropTree(ATTRCHANGE_TAG, createPTree());
                 changeTree.setProp(NULL, (const char *)NULL);
                 t->setProp(EXT_ATTR, queryProp(EXT_ATTR));
+                t->setProp(COMPRESS_ATTR, queryProp(COMPRESS_ATTR));
             }
             catch (IException *)
             {
@@ -3231,13 +3521,13 @@ class CLock : implements IInterface, public CInterface
     unsigned sub, readLocks, holdLocks, pending, waiting;
     IdPath idPath;
     ConnectionInfoMap connectionInfo;
-    mutable CheckedCriticalSection crit;
-    Semaphore sem;
+    mutable CheckedCriticalSection crit{SYNC_LOCATION};
+    Semaphore sem{SYNC_LOCATION};
     StringAttr xpath;
     __int64 treeId;
     bool exclusive;
     Linked<CServerRemoteTree> parent, child;
-    
+
 #ifdef _DEBUG
     DebugInfo debugInfo;
 #endif
@@ -3250,7 +3540,7 @@ class CLock : implements IInterface, public CInterface
         {
             IArrayOf<IMapping> entries;
             {
-                CHECKEDCRITICALBLOCK(crit, fakeCritTimeout);    
+                CHECKEDCRITICALBLOCK(crit, fakeCritTimeout);
                 HashIterator iter(connectionInfo);
                 ForEach (iter)
                     entries.append(*LINK(&iter.query()));
@@ -3258,7 +3548,7 @@ class CLock : implements IInterface, public CInterface
             ForEachItemIn(e, entries)
             {
                 IMapping &imap = entries.item(e);
-                LockData *lD = connectionInfo.mapToValue(&imap);            
+                LockData *lD = connectionInfo.mapToValue(&imap);
                 Owned<INode> node = querySessionManager().getProcessSessionNode(lD->sessId);
                 if (node)
                 {
@@ -3277,7 +3567,7 @@ class CLock : implements IInterface, public CInterface
                         else
                         {
                             StringBuffer nodeStr;
-                            node->endpoint().getUrlStr(nodeStr);
+                            node->endpoint().getEndpointHostText(nodeStr);
                             PROGLOG("Validating connection to %s", nodeStr.str());
                             if (!queryWorldCommunicator().verifyConnection(node, LOCKSESSCHECK))
                             {
@@ -3517,7 +3807,7 @@ public:
     IMPLEMENT_IINTERFACE;
 
     CLock(CLockTable &_table, __int64 _treeId, IdPath &_idPath, const char *_xpath, unsigned mode, ConnectionId id, SessionId sessId)
-        : table(_table), treeId(_treeId), xpath(_xpath), exclusive(false), sub(0), readLocks(0), holdLocks(0), waiting(0), pending(0)
+        : table(_table), sub(0), readLocks(0), holdLocks(0), pending(0), waiting(0), xpath(_xpath), treeId(_treeId), exclusive(false)
     {
         INIT_NAMEDCOUNT;
         verifyex(tryLock(mode, id, sessId)==LockSucceeded);
@@ -3727,7 +4017,7 @@ template <> void CLockTable::onRemove(void *et)
 ///////////////
 
 CSDSTransactionServer::CSDSTransactionServer(CCovenSDSManager &_manager)
- : Thread("SDS Manager, CSDSTransactionServer"), manager(_manager), CTransactionLogTracker(DAMP_SDSCMD_MAX)
+ : Thread("SDS Manager, CSDSTransactionServer"), CTransactionLogTracker(DAMP_SDSCMD_MAX), manager(_manager)
 {
     stopped = true;
 }
@@ -3735,7 +4025,9 @@ CSDSTransactionServer::CSDSTransactionServer(CCovenSDSManager &_manager)
 int CSDSTransactionServer::run()
 {
     ICoven &coven=queryCoven();
-    CMessageHandler<CSDSTransactionServer> handler("CSDSTransactionServer",this,&CSDSTransactionServer::processMessage, &manager, 100, TIMEOUT_ON_CLOSEDOWN);
+    unsigned maxThreads = 400; // NB: can exceed with up to 1s delay
+    maxThreads = getComponentConfigSP()->getPropInt("expert/@daliSdsTransactionPoolLimit", maxThreads);
+    CMessageHandler<CSDSTransactionServer> handler("CSDSTransactionServer", this, &CSDSTransactionServer::processMessage, &manager, maxThreads, TIMEOUT_ON_CLOSEDOWN);
     stopped = false;
     CMessageBuffer mb;
     while (!stopped)
@@ -3756,15 +4048,7 @@ int CSDSTransactionServer::run()
             mb.clear();
             if (coven.recv(mb, RANK_ALL, MPTAG_DALI_SDS_REQUEST, NULL))
             {
-                // 1) Need to increment sds_requests here
-                // NB: it will never be decremented. This is total for life of this instance.
-                
-                // 2) Need to increment sds_active_requests here
-                // and ensure it's scoped, such that it is guaranteed
-                // to decrement when handling is complete.
-                // NB: most transactions are handled asynchronously, so decrement will need to happen on another thread
-
-                msgCount++;
+                pSdsRequestsReceived->fastInc(1);
                 try
                 {
                     SdsCommand action;
@@ -3787,11 +4071,6 @@ int CSDSTransactionServer::run()
                         case DAMP_SDSCMD_GETELEMENTSRAW:
                         case DAMP_SDSCMD_GETCOUNT:
                         {
-                            // 1) Need to increment sds_pending_requests here.
-                            // NB: pending requests are those received, but not yet being handled (not active)
-                            // e.g. because thread pool limits are blocking them.
-                            // sds_pending_requests should be decremented, when the transactions starts in processMessage()
-
                             mb.reset();
                             handler.handleMessage(mb);
                             mb.clear(); // ^ has copied mb
@@ -3887,7 +4166,7 @@ int CSDSTransactionServer::run()
                     StringBuffer s;
                     mb.append(e->errorMessage(s).str());
                     StringBuffer clientUrl("EXCEPTION in reply to client ");
-                    mb.getSender().getUrlStr(clientUrl);
+                    mb.getSender().getEndpointHostText(clientUrl);
                     EXCLOG(e, clientUrl.str(), MSGCLS_warning);
                     e->Release();
                 }
@@ -3912,7 +4191,7 @@ int CSDSTransactionServer::run()
         catch (IException *e)
         {
             StringBuffer s("Failure receiving message from client ");
-            mb.getSender().getUrlStr(s);
+            mb.getSender().getEndpointHostText(s);
             IWARNLOG(e, s.str());
             e->Release();
         }
@@ -4025,7 +4304,7 @@ bool checkOldFormat(CServerRemoteTree *parentServerTree, IPropertyTree *tree, Me
                 ((PTree *)tree)->setValue(v, binary);
             }
             else
-                ((PTree *)tree)->setValue(new CPTValue(0, NULL, false, true, false), false);
+                ((PTree *)tree)->setValue(new CPTValue(), false);
 
             Owned<IAttributeIterator> attrs = clientTree->getAttributes();
             if (attrs->first())
@@ -4100,12 +4379,9 @@ bool translateOldFormat(CServerRemoteTree *parentServerTree, IPropertyTree *pare
 
 void CSDSTransactionServer::processMessage(CMessageBuffer &mb)
 {
-    // 1) Decrement sds_pending_requests here.
-    // NB: request has started, no longer pending
-    // See CSDSTransactionServer::run() for where needs to be incremented. 
-
-    // 2) Ensure sds_active_requests is decremented, when processMessage() is finished
-    // e.g. use a scoped object here, and decrement in dtor.
+    pSdsRequestsStarted->inc(1);
+    // Ensure that number of completed requests is incremented when the function completes.
+    COnScopeExit incCompletedOnExit([&](){ pSdsRequestsCompleted->inc(1); });
 
     TimingBlock xactTimingBlock(xactTimingStats);
     ICoven &coven = queryCoven();
@@ -4182,7 +4458,7 @@ void CSDSTransactionServer::processMessage(CMessageBuffer &mb)
                 unsigned startPos = mb.getPos();
                 mb.read(id);
                 mb.read(timeout);
-                
+
                 Owned<IMultipleConnector> mConnect = deserializeIMultipleConnector(mb);
                 mb.clear();
 
@@ -4404,7 +4680,7 @@ void CSDSTransactionServer::processMessage(CMessageBuffer &mb)
                     transactionLog.log("disconnect=%s, data=%s, deleteRoot=%s", disconnect?"true":"false", data?"true":"false", deleteRoot?"true":"false");
                 }
                 Owned<CLCLockBlock> lockBlock;
-                { 
+                {
                     CheckTime block1("DAMP_SDSCMD_DATA.1");
                     if (data || deleteRoot)
                         lockBlock.setown(new CLCLockBlock(manager.dataRWLock, false, readWriteTimeout, __FILE__, __LINE__));
@@ -4441,7 +4717,7 @@ void CSDSTransactionServer::processMessage(CMessageBuffer &mb)
                         CheckTime block6("DAMP_SDSCMD_DATA.6");
                         StringBuffer path;
                         connection->queryPTreePath().getAbsolutePath(path);
-                        manager.saveDelta(path.str(), *changeTree);
+                        manager.serializeDelta(path.str(), changeTree.getClear());
                     }
                     mb.clear();
                     mb.append((int)DAMP_SDSREPLY_OK);
@@ -4519,7 +4795,7 @@ void CSDSTransactionServer::processMessage(CMessageBuffer &mb)
                 StringAttr matchXPath, sortBy;
                 bool caseinsensitive, ascending;
                 unsigned from, limit;
-                
+
                 mb.read(xpath);
                 mb.read(matchXPath);
                 mb.read(sortBy);
@@ -4600,8 +4876,8 @@ void CSDSTransactionServer::processMessage(CMessageBuffer &mb)
                 throwUnexpected();
         }
     }
-    catch (IException *e)                                       
-    {                                                           
+    catch (IException *e)
+    {
         mb.clear();
         mb.append((int) DAMP_SDSREPLY_ERROR);
         StringBuffer s;
@@ -4618,9 +4894,9 @@ void CSDSTransactionServer::processMessage(CMessageBuffer &mb)
         mb.append(e->errorCode());
         mb.append(e->errorMessage(s.clear()));
         StringBuffer clientUrl("EXCEPTION in reply to client ");
-        mb.getSender().getUrlStr(clientUrl);                    
-        EXCLOG(e, clientUrl.str(), MSGCLS_warning);             
-        e->Release();                                           
+        mb.getSender().getEndpointHostText(clientUrl);
+        EXCLOG(e, clientUrl.str(), MSGCLS_warning);
+        e->Release();
     }
     catch (DALI_CATCHALL)
     {
@@ -4631,12 +4907,12 @@ void CSDSTransactionServer::processMessage(CMessageBuffer &mb)
         mb.append(e->errorCode());
         mb.append(e->errorMessage(s).str());
         StringBuffer clientUrl("EXCEPTION in reply to client ");
-        mb.getSender().getUrlStr(clientUrl);
-        LOG(MCoperatorError, unknownJob, e);
+        mb.getSender().getEndpointHostText(clientUrl);
+        OERRLOG(e);
     }
-    try { 
+    try {
         CheckTime block10("DAMP_REQUEST reply");
-        coven.reply(mb); 
+        coven.reply(mb);
     }
     catch (IMP_Exception *e)
     {
@@ -4652,13 +4928,13 @@ void CSDSTransactionServer::processMessage(CMessageBuffer &mb)
         StringBuffer s;
         mb.append(e->errorMessage(s).str());
         StringBuffer clientUrl("EXCEPTION in reply to client ");
-        mb.getSender().getUrlStr(clientUrl);
+        mb.getSender().getEndpointHostText(clientUrl);
         EXCLOG(e, clientUrl.str(), MSGCLS_warning);
         e->Release();
         try
         {
             coven.reply(mb);
-            LOG(MCdebugInfo, unknownJob, "Failed to reply, but succeeded sending initial reply error to client");
+            LOG(MCdebugInfo, "Failed to reply, but succeeded sending initial reply error to client");
         }
         catch (IException *e)
         {
@@ -4793,10 +5069,10 @@ inline unsigned prevEditionN(unsigned e, unsigned i=1)
     return e-i;
 }
 
-void removeDaliFile(const char *path, const char *base, unsigned e)
+void removeDaliFile(const char *path, const char *base, const char *extension, unsigned e)
 {
     StringBuffer filename(path);
-    constructStoreName(base, e, filename);
+    constructStoreName(base, e, filename, extension);
     OwnedIFile iFile = createIFile(filename.str());
     try
     {
@@ -4828,65 +5104,31 @@ void initializeInternals(IPropertyTree *root)
     root->addPropTree("Status/Servers",createPTree());
 }
 
-IPropertyTree *loadStore(const char *storeFilename, IPTreeMaker *iMaker, unsigned crcValidation, bool logErrorsOnly=false, const bool *abort=NULL)
+void clearStaleMeteData(IPropertyTree *root)
 {
-    CHECKEDCRITICALBLOCK(loadStoreCrit, fakeCritTimeout);
-    CHECKEDCRITICALBLOCK(saveStoreCrit, fakeCritTimeout);
-    Owned<IPropertyTree> root;
-    try
+    // JobQueues
+    // Remove all Client entries from all queues. By definition they are stale (they should normally be removed when the client disconnects)
+    Owned<IPropertyTreeIterator> jobQueues = root->getElements("JobQueues/Queue");
+    ForEach(*jobQueues)
     {
-        OwnedIFile iFileStore = createIFile(storeFilename);
-        OwnedIFileIO iFileIOStore = iFileStore->open(IFOread);
-        if (!iFileIOStore)
-            throw MakeSDSException(SDSExcpt_OpenStoreFailed, "%s", storeFilename);
-
-        Owned<IFileIOStream> fstream = createIOStream(iFileIOStore);
-        Owned<ICrcIOStream> crcPipeStream = createCrcPipeStream(fstream);
-        Owned<IIOStream> ios = createBufferedIOStream(crcPipeStream);
-        root.setown((CServerRemoteTree *) createPTree(*ios, ipt_none, ptr_ignoreWhiteSpace, iMaker));
-        ios.clear();
-        unsigned crc = crcPipeStream->queryCrc();
-
-        if (crcValidation && crc != crcValidation)
-            IWARNLOG("Error processing store %s - CRC ERROR (file size=%" I64F "d, validation crc=%x, calculated crc=%x)", storeFilename, iFileIOStore->size(), crcValidation, crc); // not fatal yet (maybe later)
+        IPropertyTree &queue = jobQueues->query();
+        while (queue.removeProp("Client"));
     }
-    catch (IException *e)
-    {
-        if (!abort)
-        {
-            StringBuffer s("Exception - loading store file : ");
-            s.appendf("%s", storeFilename);
-            IERRLOG(e, s.str());
-        }
-        if (SDSExcpt_OpenStoreFailed != e->errorCode())
-            if (!logErrorsOnly)
-                throw;
-        e->Release();
-    }
-    catch (DALI_CATCHALL)
-    {
-        IException *e = MakeStringException(0, "Unknown exception - loading store file : %s", storeFilename);
-        LOG(MCdisaster, unknownJob, e, "");
-        if (!logErrorsOnly)
-            throw;
-        e->Release();
-    }
-    return LINK(root);
 }
 
+static constexpr size32_t bufferSize1mb = 0x100000;
 
 // Not really coalescing, blocking transations and saving store (which will delete pending transactions).
 class CLightCoalesceThread : implements ICoalesce, public CInterface
 {
     bool stopped = false;
     bool within24 = false;
-    Semaphore sem;
+    Semaphore sem{SYNC_LOCATION};
     unsigned lastSaveWriteTransactions = 0;
     unsigned lastWarning = 0;
-    unsigned idlePeriod, minimumTimeBetweenSaves, idleRate;
-    Linked<IPropertyTree> config;
+    unsigned idlePeriodSecs, minimumSecsBetweenSaves, idleRate;
     Owned<IJlibDateTime> quietStartTime, quietEndTime;
-    CheckedCriticalSection crit;
+    CheckedCriticalSection crit{SYNC_LOCATION};
     IStoreHelper *iStoreHelper;
 
     class CThreaded : public Thread
@@ -4894,17 +5136,17 @@ class CLightCoalesceThread : implements ICoalesce, public CInterface
         CLightCoalesceThread *coalesce;
     public:
         CThreaded() : Thread("CLightCoalesceThread") { coalesce = NULL; }
-        void init(CLightCoalesceThread *_coalesce) { coalesce = _coalesce; start(); }
+        void init(CLightCoalesceThread *_coalesce) { coalesce = _coalesce; start(false); }
         virtual int run() { coalesce->threadmain(); return 1; }
     } threaded;
 public:
     IMPLEMENT_IINTERFACE;
-    CLightCoalesceThread(IPropertyTree &_config, IStoreHelper *_iStoreHelper) : config(&_config), iStoreHelper(_iStoreHelper)
+    CLightCoalesceThread(const IPropertyTree &config, IStoreHelper *_iStoreHelper) : iStoreHelper(_iStoreHelper)
     {
-        idlePeriod = config->getPropInt("@lCIdlePeriod", DEFAULT_LCIDLE_PERIOD)*1000;
-        minimumTimeBetweenSaves = config->getPropInt("@lCMinTime", DEFAULT_LCMIN_TIME)*1000;
-        idleRate = config->getPropInt("@lCIdleRate", DEFAULT_LCIDLE_RATE);
-        char const *quietStartTimeStr = config->queryProp("@lCQuietStartTime");
+        idlePeriodSecs = config.getPropInt("@lCIdlePeriod", DEFAULT_LCIDLE_PERIOD);
+        minimumSecsBetweenSaves = config.getPropInt("@lCMinTime", DEFAULT_LCMIN_TIME);
+        idleRate = config.getPropInt("@lCIdleRate", DEFAULT_LCIDLE_RATE);
+        char const *quietStartTimeStr = config.queryProp("@lCQuietStartTime");
         if (quietStartTimeStr)
         {
             if (*quietStartTimeStr)
@@ -4916,7 +5158,7 @@ public:
             else
                 quietStartTimeStr = NULL;
         }
-        char const *quietEndTimeStr = config->queryProp("@lCQuietEndTime");
+        char const *quietEndTimeStr = config.queryProp("@lCQuietEndTime");
         if (quietStartTimeStr && !quietEndTimeStr)
         {
             OWARNLOG("Start time for quiet period specified without end time, ignoring times");
@@ -4944,12 +5186,12 @@ public:
         unsigned t = 0;
         lastSaveWriteTransactions = SDSManager->writeTransactions;
         lastWarning = 0;
-    
+
         unsigned lastEdition = iStoreHelper->queryCurrentEdition();
         while (!stopped)
         {
             unsigned writeTransactionsNow = SDSManager->writeTransactions;
-            if (!sem.wait(idlePeriod))
+            if (!sem.wait(idlePeriodSecs*1000))
             {
                 if (writeTransactionsNow != lastSaveWriteTransactions)
                 {
@@ -4970,19 +5212,18 @@ public:
                     {
                         unsigned transactions = SDSManager->writeTransactions-writeTransactionsNow; // don't care about rollover.
                         if (0 == transactions ||
-                            (0 != idleRate && idlePeriod>=60000 && (transactions/(idlePeriod/60000))<=idleRate))
+                            (0 != idleRate && idlePeriodSecs>=60 && (transactions/(idlePeriodSecs/60))<=idleRate))
                         {
                             StringBuffer filename;
                             iStoreHelper->getPrimaryLocation(filename);
-                            iStoreHelper->getCurrentStoreFilename(filename);
+                            iStoreHelper->getCurrentStoreFilename(filename, StoreFormat::XML);
                             OwnedIFile iFile = createIFile(filename);
-                            CDateTime createTime, nowTime;
-                            nowTime.setNow();
-                            int diff = 0;
+                            CDateTime createTime;
+                            __int64 sinceLastSaveSecs = 0;
                             try
                             {
                                 if (iFile->getTime(&createTime, NULL, NULL))
-                                    diff = ((int)nowTime.getSimple()-(int)createTime.getSimple())*1000;
+                                    sinceLastSaveSecs = (__int64)difftime(time(nullptr), createTime.getSimple()); // round to whole seconds
                             }
                             catch (IException *e)
                             {
@@ -4991,11 +5232,13 @@ public:
                                 EXCLOG(e, errMsg.str());
                                 e->Release();
                             }
-                            int period;
-                            if (diff<=0 || diff > (int)minimumTimeBetweenSaves) // <0 - createTime>nowTime, assume time skew and allow save.
+                            unsigned nextWaitPeriod = 0;
+                            // <=0 - either file doesn't exist, or assume time skew and allow save.
+                            if ((sinceLastSaveSecs <= 0) || (sinceLastSaveSecs > minimumSecsBetweenSaves))
                             {
-                                period = minimumTimeBetweenSaves-idlePeriod;
-                                if (0 > period) period = 0;
+                                if (idlePeriodSecs<minimumSecsBetweenSaves)
+                                    nextWaitPeriod = minimumSecsBetweenSaves-idlePeriodSecs;
+
                                 {
                                     CHECKEDCRITICALBLOCK(saveStoreCrit, fakeCritTimeout);
                                     SDSManager->blockingSave(&lastSaveWriteTransactions);
@@ -5003,16 +5246,19 @@ public:
                                 }
                                 t = lastWarning = 0;
                             }
-                            else
-                                period = minimumTimeBetweenSaves-diff;
-                            sem.wait(period);
+                            else if (sinceLastSaveSecs >= 0)
+                            {
+                                // sinceLastSaveSecs guaranteed to be <= minimumSecsBetweenSaves
+                                nextWaitPeriod = minimumSecsBetweenSaves-(unsigned)sinceLastSaveSecs;
+                            }
+                            sem.wait(nextWaitPeriod*1000);
                         }
                         else
                         {
-                            t += idlePeriod/1000;
+                            t += idlePeriodSecs;
                             if (t/3600 >= STORENOTSAVE_WARNING_PERIOD && ((t-lastWarning)/3600>(STORENOTSAVE_WARNING_PERIOD/2)))
                             {
-                                OWARNLOG("Store has not been saved for %d hours", t/3600);
+                                OERRLOG("Store has not been saved for %d hours", t/3600);
                                 lastWarning = t;
                             }
                         }
@@ -5086,14 +5332,19 @@ public:
     }
 };
 
+
 class CStoreHelper : implements IStoreHelper, public CInterface
 {
     StringAttr storeName, location, remoteBackupLocation;
     CStoreInfo storeInfo, deltaInfo;
-    unsigned configFlags;
-    const bool *abort;
-    unsigned delay, keepStores;
-    SessionId mySessId;
+    unsigned configFlags{0};
+    const bool *abort{nullptr};
+    unsigned delay{0};
+    unsigned keepStores{0};
+    SessionId mySessId{0};
+    size32_t bufferSize{0};
+    bool saveBinary{true};
+    bool saveAsync{false};
 
     void clearStoreInfo(const char *base, const char *location, unsigned edition, CStoreInfo *storeInfo=NULL)
     {
@@ -5109,7 +5360,7 @@ class CStoreHelper : implements IStoreHelper, public CInterface
             ForEach (*dIter)
             {
                 for (;;)
-                {   
+                {
                     try { dIter->query().remove(); break; }
                     catch (IException *e)
                     {
@@ -5129,7 +5380,7 @@ class CStoreHelper : implements IStoreHelper, public CInterface
                 path.append(storeInfo->cache);
                 OwnedIFile iFile = createIFile(path.str());
                 for (;;)
-                {   
+                {
                     try { iFile->remove(); break; }
                     catch (IException *e)
                     {
@@ -5144,25 +5395,29 @@ class CStoreHelper : implements IStoreHelper, public CInterface
         }
     }
 
-    void writeStoreInfo(const char *base, const char *location, unsigned edition, unsigned *crc, CStoreInfo *storeInfo=NULL)
+    void writeStoreInfo(const char *base, const char *location, unsigned edition, unsigned *crcXml, unsigned *crcBinary, CStoreInfo *storeInfo)
     {
+        assertex(storeInfo);
+
         StringBuffer path, filename;
         filename.append(base).append('.').append(edition);
-        if (location) path.append(location);
+        if (location)
+            path.append(location);
         path.append(filename);
 
         OwnedIFile iFile = createIFile(path.str());
         OwnedIFileIO iFileIO = iFile->open(IFOcreate);
-        if (crc)
-            iFileIO->write(0, sizeof(unsigned), crc);
-        if (storeInfo)
-            storeInfo->cache.set(filename.str());
+        storeInfo->save(iFileIO, crcXml, crcBinary);
+
+        storeInfo->cache.set(filename.str());
+        iFileIO->close();
     }
 
-    void updateStoreInfo(const char *base, const char *location, unsigned edition, unsigned *crc, CStoreInfo *storeInfo=NULL)
+    void updateStoreInfo(const char *base, const char *location, unsigned edition, unsigned *crcXml, unsigned *crcBinary, CStoreInfo *storeInfo)
     {
+        assertex(storeInfo);
         clearStoreInfo(base, location, edition, storeInfo);
-        writeStoreInfo(base, location, edition, crc, storeInfo);
+        writeStoreInfo(base, location, edition, crcXml, crcBinary, storeInfo);
     }
 
     void refreshInfo(CStoreInfo &info, const char *base)
@@ -5222,10 +5477,7 @@ class CStoreHelper : implements IStoreHelper, public CInterface
         const char *name = fname.str();
         const char *editionBegin = name+strlen(base)+1;
         info.edition = atoi(editionBegin);
-        if (iFileIO->size())
-            iFileIO->read(0, sizeof(unsigned), &info.crc);
-        else
-            info.crc = 0;
+        info.restore(iFileIO);
     }
 
     void refreshStoreInfo() { refreshInfo(storeInfo, "store"); }
@@ -5237,7 +5489,7 @@ class CStoreHelper : implements IStoreHelper, public CInterface
         wcard.append(base).append(".*");
         Owned<IDirectoryIterator> dIter = createDirectoryIterator(location, wcard.str());
         if (!dIter->first())
-            updateStoreInfo(base, location, 0, NULL, &info);
+            updateStoreInfo(base, location, 0, nullptr, nullptr, &info);
         else if (dIter->next())
             throw MakeStringException(0, "Multiple store.X files - only one corresponding to latest dalisds<X>.xml should exist");
     }
@@ -5245,14 +5497,89 @@ class CStoreHelper : implements IStoreHelper, public CInterface
     void renameDelta(unsigned oldEdition, unsigned newEdition, const char *path)
     {
         StringBuffer deltaName(path);
-        constructStoreName(DELTANAME, oldEdition, deltaName);
+        constructStoreName(DELTANAME, oldEdition, deltaName, ".xml");
         OwnedIFile oldDelta = createIFile(deltaName.str());
         if (oldDelta->exists())
         {
             deltaName.clear();
-            constructStoreName(DELTANAME, newEdition, deltaName);
+            constructStoreName(DELTANAME, newEdition, deltaName, ".xml");
             oldDelta->rename(deltaName.str());
         }
+    }
+
+    IPropertyTree *loadStoreType(StoreFormat storeFormat, IPTreeNodeCreator *nodeCreator, const bool *abort)
+    {
+        StringBuffer storeFilename(location);
+        unsigned storedCrc = 0;
+        getCurrentStoreFilename(storeFilename, storeFormat, &storedCrc);
+
+        bool isBinary = (storeFormat == StoreFormat::BINARY);
+        try
+        {
+            Owned<IPropertyTree> result;
+
+            OwnedIFile iFileStore = createIFile(storeFilename);
+            OwnedIFileIO iFileIOStore = iFileStore->open(IFOread);
+            if (!iFileIOStore)
+            {
+                if (isBinary)
+                    return nullptr;
+                else
+                    throw MakeSDSException((SDSExcpt_OpenStoreFailed), "xml file: %s", storeFilename.str());
+            }
+
+            offset_t fSize = iFileIOStore->size();
+            PROGLOG("Loading %s store %u (size=%.2f MB, storedCrc=%x)", isBinary ? "Binary" : "XML", queryCurrentEdition(), ((double)fSize) / 0x100000, storedCrc);
+
+            Owned<ISerialInputStream> serialStream = createSerialInputStream(iFileIOStore);
+            Owned<ISerialInputStream> progressStream = createProgressStream(serialStream, 0, fSize, "Load progress", 60);
+            Owned<ICrcSerialInputStream> crcSerialStream = createCrcInputStream(progressStream);
+            Owned<IBufferedSerialInputStream> bufInStream = createBufferedInputStream(crcSerialStream, bufferSize);
+
+            if (isBinary)
+                result.setown(createPTreeFromBinary(*bufInStream, nodeCreator));
+            else
+            {
+                Owned<IPTreeMaker> treeMaker = createPTreeMaker(ipt_none, nullptr, nodeCreator);
+
+                class CSerialInputStreamWrapper : public CSimpleInterfaceOf<ISimpleReadStream>
+                {
+                    ISerialInputStream *stream;
+
+                public:
+                    CSerialInputStreamWrapper(ISerialInputStream *_stream) : stream(_stream) {}
+                    virtual size32_t read(size32_t len, void *data) override
+                    {
+                        return stream->read(len, data);
+                    }
+                };
+
+                Owned<ISimpleReadStream> wrapper = new CSerialInputStreamWrapper(bufInStream);
+                result.setown(createPTree(*wrapper, ipt_none, ptr_ignoreWhiteSpace, treeMaker));
+            }
+
+            unsigned crc = crcSerialStream->queryCrc();
+
+            if (storedCrc && storedCrc != crc)
+                IWARNLOG("Error processing store %s - CRC ERROR (file size=%" I64F "d, validation crc=%x, calculated crc=%x)", storeFilename.str(), iFileIOStore->size(), storedCrc, crc);
+
+            return result.getClear();
+        }
+        catch (IException *e)
+        {
+            if (!abort)
+                IERRLOG(e, VStringBuffer("Exception - loading store file : %s", storeFilename.str()));
+            if (SDSExcpt_OpenStoreFailed != e->errorCode())
+                throw;
+            e->Release();
+        }
+        catch (DALI_CATCHALL)
+        {
+            IException *e = MakeStringException(0, "Unknown exception - loading %s store file : %s", isBinary ? "Binary" : "XML", storeFilename.str());
+            DISLOG(e);
+            throw;
+        }
+        return nullptr;
     }
 
     struct CheckDeltaBlock
@@ -5268,6 +5595,7 @@ class CStoreHelper : implements IStoreHelper, public CInterface
 
             OwnedIFileIO detachIPIO = detachIPIFile->open(IFOcreate);
             detachIPIO->write(0, sizeof(storeHelper.mySessId), &storeHelper.mySessId);
+            detachIPIO->close();
             detachIPIO.clear();
             detachIPIFile->rename(activeDetachIPStr.str());
             // check often do not wait any longer than necessary
@@ -5275,7 +5603,7 @@ class CStoreHelper : implements IStoreHelper, public CInterface
             while (deltaIPIFile->exists())
             {
                 if (0 == d++ % 50)
-                    PROGLOG("Waiting for a saveDelta in progress");
+                    PROGLOG("Waiting for a writeXml in progress");
                 MilliSleep(100);
             }
         }
@@ -5305,7 +5633,7 @@ class CStoreHelper : implements IStoreHelper, public CInterface
 public:
     IMPLEMENT_IINTERFACE;
 
-    CStoreHelper(const char *_storeName, const char *_location, const char *_remoteBackupLocation, unsigned _configFlags, unsigned _keepStores, unsigned _delay, const bool *_abort) : storeName(_storeName), location(_location), remoteBackupLocation(_remoteBackupLocation), configFlags(_configFlags), keepStores(_keepStores), delay(_delay), abort(_abort)
+    CStoreHelper(const char *_storeName, const char *_location, const char *_remoteBackupLocation, unsigned _configFlags, unsigned _keepStores, unsigned _delay, const bool *_abort, bool _saveBinary, bool _saveAsync) : storeName(_storeName), location(_location), remoteBackupLocation(_remoteBackupLocation), configFlags(_configFlags), abort(_abort), delay(_delay), keepStores(_keepStores), saveBinary(_saveBinary), saveAsync(_saveAsync)
     {
         mySessId = daliClientActive()?myProcessSession():0;
         if (!keepStores) keepStores = DEFAULT_KEEP_LASTN_STORES;
@@ -5341,7 +5669,7 @@ public:
                                 if (newName.charAt(i)==':')
                                     newName.setCharAt(i,'_');
                             newName.append(".unused");
-                            PROGLOG("Detected spurious data file : '%s' - renaming to %s", file.queryFilename(), newName.str());
+                            PROGLOG("Detected spurious data file : '%s' - renaming to %s (current edition=%u, file edition=%u)", file.queryFilename(), newName.str(), edition, fileEdition);
                             try
                             {
                                 file.rename(newName.str());
@@ -5364,25 +5692,50 @@ public:
             ForEach(*dIter)
                 dIter->query().remove();
         }
+        StringBuffer planeName;
+        if (findPlaneFromPath(location, planeName))
+            bufferSize = (size32_t)getPlaneAttributeValue(planeName, BlockedSequentialIO, bufferSize);
     }
     virtual StringBuffer &getDetachedDeltaName(StringBuffer &detachName)
     {
         refreshDeltaInfo();
-        constructStoreName(DELTADETACHED, deltaInfo.edition, detachName);
+        constructStoreName(DELTADETACHED, deltaInfo.edition, detachName, ".xml");
         return detachName;
+    }
+    virtual IPropertyTree *loadStore(IPTreeNodeCreator *nodeCreator, const bool *abort) override
+    {
+        // Try loading binary store first if it exists
+        IPropertyTree *root = nullptr;
+        try
+        {
+            root = loadStoreType(StoreFormat::BINARY, nodeCreator, abort);
+        }
+        catch (IException *e)
+        {
+            // Log the exception but do not re-throw or exit to allow fall back to loading the XML store
+            EXCLOG(e);
+            e->Release();
+        }
+        if (!root)
+            root = loadStoreType(StoreFormat::XML, nodeCreator, abort);
+        return root;
     }
     virtual bool loadDelta(const char *filename, IFile *iFile, IPropertyTree *root)
     {
         Owned<IFileIO> iFileIO = iFile->open(IFOread);
         if (!iFileIO) // no delta to load
             return true;
+        offset_t fSize = iFileIO->size();
+        PROGLOG("Loading delta: %s (size=%.2f MB)", filename, ((double)fSize) / 0x100000);
+        size32_t lenDeltaHeader = strlen(deltaHeader);
         MemoryBuffer tmp;
-        char *ptr = (char *) tmp.reserveTruncate(strlen(deltaHeader));
+        char *ptr = (char *) tmp.reserveTruncate(lenDeltaHeader+1);
         unsigned embeddedCrc = 0;
         offset_t pos = 0;
         bool hasCrcHeader = false; // check really only needed for deltas proceeding CRC header
-        if (strlen(deltaHeader) == iFileIO->read(0, strlen(deltaHeader), ptr))
+        if (lenDeltaHeader == iFileIO->read(0, lenDeltaHeader, ptr))
         {
+            ptr[lenDeltaHeader] = '\0';
             if (0 == memicmp(deltaHeader, ptr, 5))
             {
                 pos = deltaHeaderSizeStart;
@@ -5413,7 +5766,8 @@ public:
         }
         OwnedIFileIOStream iFileIOStream = createIOStream(iFileIO);
         iFileIOStream->seek(pos, IFSbegin);
-        Owned<ICrcIOStream> crcPipeStream = createCrcPipeStream(iFileIOStream); // crc *rest* of stream
+        OwnedIFileIOStream progressedIFileIOStream = createProgressIFileIOStream(iFileIOStream, fSize, "Load progress", 60);
+        Owned<ICrcIOStream> crcPipeStream = createCrcPipeStream(progressedIFileIOStream); // crc *rest* of stream
         Owned<IIOStream> ios = createBufferedIOStream(crcPipeStream);
         bool noErrors;
         Owned<IException> deltaE;
@@ -5435,7 +5789,7 @@ public:
         bool res = false;
         if (errors) *errors = false;
         StringBuffer deltaFilename(location);
-        constructStoreName(DELTANAME, storeInfo.edition, deltaFilename);
+        constructStoreName(DELTANAME, storeInfo.edition, deltaFilename, ".xml");
 
         StringBuffer detachPath(location);
         OwnedIFile detachedDeltaIFile = createIFile(getDetachedDeltaName(detachPath).str());
@@ -5457,7 +5811,6 @@ public:
                 if (!iFile->exists())
                     break;
             }
-            PROGLOG("Loading delta: %s", filename.get());
 
             bool noError;
             Owned<IException> deltaE;
@@ -5525,152 +5878,284 @@ public:
         }
         return res;
     }
-    virtual void saveStore(IPropertyTree *root, unsigned *_newEdition, bool currentEdition=false)
+
+    IFile *saveStoreToFile(const IPropertyTree *root, StoreFormat format, unsigned &crc)
     {
-        LOG(MCdebugProgress, unknownJob, "Saving store");
+        const bool isBinary = (format == StoreFormat::BINARY);
+        LOG(MCdebugProgress, "Saving store to %s", isBinary ? "binary" : "XML");
+        assertex(root);
+
+        StringBuffer tmpStoreName;
+        Owned<IFileIO> iFileIOTmpStore(createUniqueFile(location, VStringBuffer("dali_store_tmp%s", isBinary ? ".bin" : ".xml").str(), nullptr, tmpStoreName));
+        Owned<IFile> iFile = LINK(iFileIOTmpStore->queryFile());
+        dbgassertex(iFile);
+        StringBuffer planeName;
+        size32_t bufferSize = bufferSize1mb;
+        try
+        {
+            if (findPlaneFromPath(location, planeName))
+                bufferSize = (size32_t)getPlaneAttributeValue(planeName, BlockedSequentialIO, bufferSize);
+
+            if (isBinary)
+            {
+                Owned<ISerialOutputStream> serialStream = createSerialOutputStream(iFileIOTmpStore);
+                Owned<ICrcSerialOutputStream> crcSerialStream = createCrcOutputStream(serialStream);
+                Owned<IBufferedSerialOutputStream> bufOutStream = createBufferedOutputStream(crcSerialStream, bufferSize);
+                root->serializeToStream(*bufOutStream);
+                bufOutStream->flush();
+                bufOutStream.clear();
+                crcSerialStream->flush();
+                crc = crcSerialStream->queryCrc();
+                crcSerialStream.clear();
+                serialStream->flush();
+                serialStream.clear();
+            }
+            else
+            {
+                OwnedIFileIOStream fstream = createIOStream(iFileIOTmpStore);
+                Owned<ICrcIOStream> crcPipeStream = createCrcPipeStream(fstream);
+                Owned<IIOStream> ios = createBufferedIOStream(crcPipeStream, bufferSize);
+
+#ifdef _DEBUG
+                toXML(root, *ios); // formatted (default)
+#else
+                toXML(root, *ios, 0, 0);
+#endif
+                ios->flush();
+                ios.clear();
+                fstream.clear();
+                crcPipeStream->flush();
+                crc = crcPipeStream->queryCrc();
+                crcPipeStream.clear();
+            }
+            iFileIOTmpStore->close();
+        }
+        catch (IException *e)
+        {
+            iFile->remove();
+            EXCLOG(e);
+            throw;
+        }
+        catch (DALI_CATCHALL)
+        {
+            iFile->remove();
+            DISLOG("%s", VStringBuffer("Unknown exception - Error saving %s store", isBinary ? "binary" : "XML").str());
+            throw;
+        }
+
+        return iFile.getClear();
+    }
+    virtual void saveStore(IPropertyTree *root, unsigned *_newEdition) override
+    {
+        LOG(MCdebugProgress, "Saving store");
 
         refreshStoreInfo();
 
         unsigned edition = storeInfo.edition;
-        unsigned newEdition = currentEdition?edition:nextEditionN(edition);
-        bool done = false;
+        unsigned newEdition = nextEditionN(edition);
+        bool savesCompleted = false;
+
+        OwnedIFile iXmlFileTmpStore;
         try
         {
-            unsigned crc = 0;
-            StringBuffer tmpStoreName;
-            OwnedIFileIO iFileIOTmpStore = createUniqueFile(location, TMPSAVENAME, NULL, tmpStoreName);
-            OwnedIFile iFileTmpStore = createIFile(tmpStoreName);
-            try
-            {
-                OwnedIFileIOStream fstream = createIOStream(iFileIOTmpStore);
-                Owned<ICrcIOStream> crcPipeStream = createCrcPipeStream(fstream);
-                Owned<IIOStream> ios = createBufferedIOStream(crcPipeStream);
+            OwnedIFile iBinaryFileTmpStore;
+            unsigned xmlCrc{0};
+            unsigned binaryCrc{0};
 
-#ifdef _DEBUG
-                toXML(root, *ios);          // formatted (default)
-#else
-                toXML(root, *ios, 0, 0);
-#endif
-                ios.clear();
-                fstream.clear();
-                crc = crcPipeStream->queryCrc();
-                crcPipeStream.clear();
-                iFileIOTmpStore.clear();
-            }
-            catch (IException *e)
+            // Execute save operations
+            if (saveBinary)
             {
-                OERRLOG(e, "Exception(1) - Error saving store file");
-                iFileIOTmpStore.clear();
-                iFileTmpStore->remove();
-                throw;
-            }
+                std::future<IFile *> xmlStoreSavedFuture;
+                if (saveAsync)
+                {
+                    // Save the XML in the background
+                    auto asyncXmlSaveFunc = [this, &xmlCrc, root]() -> IFile *
+                    {
+                        LOG(MCdebugProgress, "Saving XML store asynch");
+                        return saveStoreToFile(root, StoreFormat::XML, xmlCrc);
+                    };
+                    xmlStoreSavedFuture = std::async(std::launch::async, asyncXmlSaveFunc);
+                }
+                else // if synchronous save XML 1st
+                    iXmlFileTmpStore.setown(saveStoreToFile(root, StoreFormat::XML, xmlCrc));
 
-            StringBuffer newStoreName;
-            constructStoreName(storeName, newEdition, newStoreName);
-            StringBuffer newStoreNamePath(location);
-            newStoreNamePath.append(newStoreName);
+                try
+                {
+                    iBinaryFileTmpStore.setown(saveStoreToFile(root, StoreFormat::BINARY, binaryCrc));
+                }
+                catch (IException *e)
+                {
+                    OWARNLOG(e, "Exception - Error saving Binary store");
+                    e->Release();
+                    // Any binary save failure is ignored as only the XML save is critical
+                }
+                catch (DALI_CATCHALL)
+                {
+                    OWARNLOG("Unknown exception - Error saving Binary store");
+                    // Any binary save failure is ignored as only the XML save is critical
+                }
+
+                if (saveAsync)
+                    iXmlFileTmpStore.setown(xmlStoreSavedFuture.get());
+            }
+            else
+                iXmlFileTmpStore.setown(saveStoreToFile(root, StoreFormat::XML, xmlCrc));
+
+            // Rename temporary store files to new store files using edition number
+            StringBuffer newXmlStoreName;
+            constructStoreName(storeName, newEdition, newXmlStoreName, ".xml");
+            StringBuffer newXmlStoreNamePath(location);
+            newXmlStoreNamePath.append(newXmlStoreName);
+            StringBuffer newBinaryStoreName;
+            constructStoreName(storeName, newEdition, newBinaryStoreName, ".bin");
+            StringBuffer newBinaryStoreNamePath(location);
+            newBinaryStoreNamePath.append(newBinaryStoreName);
+
+            // Check that Sasha Coalescer has not updated the edition whilst saving the store
             refreshStoreInfo();
             if (storeInfo.edition != edition)
             {
-                OWARNLOG("Another process has updated the edition whilst saving the store: %s", newStoreNamePath.str());
-                iFileTmpStore->remove();
+                WARNLOG("Another process has updated the edition whilst saving the store: %s", newXmlStoreNamePath.str());
+                if (iXmlFileTmpStore)
+                    iXmlFileTmpStore->remove();
+                if (iBinaryFileTmpStore)
+                    iBinaryFileTmpStore->remove();
                 return;
             }
             try
             {
-                OwnedIFile newStoreIFile = createIFile(newStoreNamePath.str());
+                OwnedIFile newStoreIFile = createIFile(newXmlStoreNamePath.str());
                 newStoreIFile->remove();
-                iFileTmpStore->rename(newStoreName.str());
+                iXmlFileTmpStore->rename(newXmlStoreName.str());
             }
             catch (IException *e)
             {
                 StringBuffer errMsg;
-                EXCLOG(e, errMsg.append("Failed to rename new store to : ").append(newStoreNamePath).append(". Has already been created by another process?").str());
+                EXCLOG(e, errMsg.append("Failed to rename new xml store to : ").append(newXmlStoreNamePath).append(". Has already been created by another process?").str());
                 e->Release();
-                iFileTmpStore->remove();
+                if (iXmlFileTmpStore)
+                    iXmlFileTmpStore->remove();
+                if (iBinaryFileTmpStore)
+                    iBinaryFileTmpStore->remove();
                 return;
             }
+            if (iBinaryFileTmpStore)
+            {
+                try
+                {
+                    OwnedIFile newStoreIFile = createIFile(newBinaryStoreNamePath.str());
+                    newStoreIFile->remove();
+                    iBinaryFileTmpStore->rename(newBinaryStoreName.str());
+                }
+                catch (IException *e)
+                {
+                    StringBuffer errMsg;
+                    EXCLOG(e, errMsg.append("Failed to rename new binary store to : ").append(newBinaryStoreNamePath).append(". Has already been created by another process?").str());
+                    e->Release();
+                    iBinaryFileTmpStore->remove();
+                }
+            }
 
+            constexpr const char *storeFileName = "store";
             if (0 != (SH_CheckNewDelta & configFlags))
             {
                 CheckDeltaBlock cD(*this);
-                try { renameDelta(edition, newEdition, location); }
+                try
+                {
+                    renameDelta(edition, newEdition, location);
+                }
                 catch (IException *e)
                 {
-                    StringBuffer s("Exception(2) - Error saving store file");
-                    OERRLOG(e, s.str());
+                    StringBuffer s("Exception - Error renaming delta whilst saving store file");
+                    DISLOG(e, s.str());
                     e->Release();
                     return;
                 }
                 if (remoteBackupLocation.length())
                 {
-                    try { renameDelta(edition, newEdition, remoteBackupLocation); }
+                    try
+                    {
+                        renameDelta(edition, newEdition, remoteBackupLocation);
+                    }
                     catch (IException *e)
                     {
-                        LOG(MCoperatorError, unknownJob, e, "Failure handling backup");
+                        OERRLOG(e, "Exception - Error renaming backup delta whilst saving store file");
                         e->Release();
                     }
                 }
-                clearStoreInfo("store", location, 0, NULL);
-                writeStoreInfo("store", location, newEdition, &crc, &storeInfo);
             }
-            else
-            {
-                clearStoreInfo("store", location, 0, NULL);
-                writeStoreInfo("store", location, newEdition, &crc, &storeInfo);
-            }
+            clearStoreInfo(storeFileName, location, 0, NULL);
+            writeStoreInfo(storeFileName, location, newEdition, &xmlCrc, iBinaryFileTmpStore ? &binaryCrc : nullptr, &storeInfo);
 
             try
             {
                 if (remoteBackupLocation.length())
                 {
                     PROGLOG("Copying store to backup location");
-                    StringBuffer rL(remoteBackupLocation);
-                    constructStoreName(storeName, newEdition, rL);
-                    copyFile(rL.str(), newStoreNamePath.str());
+                    StringBuffer rLxml(remoteBackupLocation);
+                    constructStoreName(storeName, newEdition, rLxml, ".xml");
+                    copyFile(rLxml.str(), newXmlStoreNamePath.str());
+                    if (iBinaryFileTmpStore)
+                    {
+                        StringBuffer rLbinary(remoteBackupLocation);
+                        constructStoreName(storeName, newEdition, rLbinary, ".bin");
+                        copyFile(rLbinary.str(), newBinaryStoreNamePath.str());
+                    }
 
-                    clearStoreInfo("store", remoteBackupLocation, 0, NULL);
-                    writeStoreInfo("store", remoteBackupLocation, newEdition, &crc, &storeInfo);
-                    PROGLOG("Copy done");
+                    clearStoreInfo(storeFileName, remoteBackupLocation, 0, NULL);
+                    writeStoreInfo(storeFileName, remoteBackupLocation, newEdition, &xmlCrc, (iBinaryFileTmpStore ? &binaryCrc : nullptr), &storeInfo);
+                    PROGLOG("Copy store done");
                 }
             }
             catch (IException *e)
             {
                 StringBuffer s;
-                LOG(MCoperatorError, unknownJob, e, s.append("Failure to backup dali to remote location: ").append(remoteBackupLocation));
+                OERRLOG(e, s.append("Failure to backup dali to remote location: ").append(remoteBackupLocation));
                 e->Release();
             }
 
             if (_newEdition)
                 *_newEdition = newEdition;
-            done = true;
+            savesCompleted = true;
 
-            LOG(MCdebugProgress, unknownJob, "Store saved");
+            LOG(MCdebugProgress, "Store %u saved", newEdition);
         }
         catch (IException *e)
         {
-            StringBuffer s("Exception(3) - Error saving store file");
-            OERRLOG(e, s.str());
+            StringBuffer s("Exception - Error saving store file");
+            DISLOG(e, s.str());
             e->Release();
+            if (iXmlFileTmpStore)
+                iXmlFileTmpStore->remove();
         }
-        if (done)
+        if (savesCompleted)
         {
 #ifndef NODELETE
-            unsigned toDeleteEdition = prevEditionN(edition, keepStores+(currentEdition?1:0));
+            unsigned toDeleteEdition = prevEditionN(edition, keepStores);
+            // Delete previous xml store
             StringBuffer filename(location);
-            constructStoreName(storeName, toDeleteEdition, filename);
+            constructStoreName(storeName, toDeleteEdition, filename, ".xml");
             OwnedIFile iFile = createIFile(filename.str());
             if (iFile->exists())
-                PROGLOG("Deleting old store: %s", filename.str());
-            removeDaliFile(location, storeName, toDeleteEdition);
-            removeDaliFile(location, DELTANAME, toDeleteEdition);
-            removeDaliFile(location, DELTADETACHED, toDeleteEdition);
+                PROGLOG("Deleting old xml store: %s", filename.str());
+            removeDaliFile(location, storeName, ".xml", toDeleteEdition);
+            removeDaliFile(location, DELTANAME, ".xml", toDeleteEdition);
+            removeDaliFile(location, DELTADETACHED, ".xml", toDeleteEdition);
             if (remoteBackupLocation)
             {
-                removeDaliFile(remoteBackupLocation, storeName, toDeleteEdition);
-                removeDaliFile(remoteBackupLocation, DELTANAME, toDeleteEdition);
-                removeDaliFile(remoteBackupLocation, DELTADETACHED, toDeleteEdition);
+                removeDaliFile(remoteBackupLocation, storeName, ".xml", toDeleteEdition);
+                removeDaliFile(remoteBackupLocation, DELTANAME, ".xml", toDeleteEdition);
+                removeDaliFile(remoteBackupLocation, DELTADETACHED, ".xml", toDeleteEdition);
             }
+            // Delete previous binary store
+            filename.set(location);
+            constructStoreName(storeName, toDeleteEdition, filename, ".bin");
+            iFile.setown(createIFile(filename.str()));
+            if (iFile->exists())
+                PROGLOG("Deleting old binary store: %s", filename.str());
+            removeDaliFile(location, storeName, ".bin", toDeleteEdition);
+            if (remoteBackupLocation)
+                removeDaliFile(remoteBackupLocation, storeName, ".bin", toDeleteEdition);
 #endif
         }
     }
@@ -5679,20 +6164,23 @@ public:
         refreshStoreInfo();
         return storeInfo.edition;
     }
-    virtual StringBuffer &getCurrentStoreFilename(StringBuffer &res, unsigned *crc=NULL)
+    virtual StringBuffer &getCurrentStoreFilename(StringBuffer &res, StoreFormat storeFormat, unsigned *crc) override
     {
         refreshStoreInfo();
-        constructStoreName(storeName, storeInfo.edition, res);
+        constructStoreName(storeName, storeInfo.edition, res, (storeFormat == StoreFormat::BINARY ? ".bin" : ".xml"));
         if (crc)
-            * crc = storeInfo.crc;
+        {
+            if (storeFormat == StoreFormat::BINARY)
+                *crc = storeInfo.crcInfo.binaryCrc;
+            else
+                *crc = storeInfo.crcInfo.xmlCrc;
+        }
         return res;
     }
-    virtual StringBuffer &getCurrentDeltaFilename(StringBuffer &res, unsigned *crc=NULL)
+    virtual StringBuffer &getCurrentDeltaFilename(StringBuffer &res)
     {
         refreshDeltaInfo();
-        constructStoreName(DELTANAME, deltaInfo.edition, res);
-        if (crc)
-            * crc = deltaInfo.crc; // TBD, combine into store.<edition>.<store_crc>.<delta_crc>
+        constructStoreName(DELTANAME, deltaInfo.edition, res, ".xml");
         return res;
     }
     virtual StringBuffer &getCurrentStoreInfoFilename(StringBuffer &res)
@@ -5749,10 +6237,30 @@ public:
 friend struct CheckDeltaBlock;
 };
 
-IStoreHelper *createStoreHelper(const char *storeName, const char *location, const char *remoteBackupLocation, unsigned configFlags, unsigned keepStores, unsigned delay, const bool *abort)
+IStoreHelper *createStoreHelper(const char *storeName, const char *location, const char *remoteBackupLocation, unsigned configFlags, unsigned keepStores, unsigned delay, const bool *abort, bool saveBinary, bool saveAsync)
 {
     if (!storeName) storeName = "dalisds";
-    return new CStoreHelper(storeName, location, remoteBackupLocation, configFlags, keepStores, delay, abort);
+    return new CStoreHelper(storeName, location, remoteBackupLocation, configFlags, keepStores, delay, abort, saveBinary, saveAsync);
+}
+
+///////////////
+
+static CConfigUpdateHook configUpdateHook;
+static void initializeStorageGroups(IPropertyTree *oldEnvironment) // oldEnvironment always null in containerized
+{
+    bool forceGroupUpdate = getComponentConfigSP()->getPropBool("dfs/@forceGroupUpdate");
+    StringBuffer response;
+    initClusterAndStoragePlaneGroups(response, forceGroupUpdate, oldEnvironment);
+    if (isContainerized())
+    {
+        auto updateFunc = [](const IPropertyTree *oldComponentConfiguration, const IPropertyTree *oldGlobalConfiguration)
+        {
+            bool forceGroupUpdate = getComponentConfigSP()->getPropBool("dfs/@forceGroupUpdate");
+            StringBuffer response;
+            initClusterAndStoragePlaneGroups(response, forceGroupUpdate, nullptr);
+        };
+        configUpdateHook.installOnce(updateFunc, false);
+    }
 }
 
 ///////////////
@@ -5762,19 +6270,23 @@ IStoreHelper *createStoreHelper(const char *storeName, const char *location, con
 #pragma warning (disable : 4355)  // 'this' : used in base member initializer list
 #endif
 
-CCovenSDSManager::CCovenSDSManager(ICoven &_coven, IPropertyTree &_config, const char *_dataPath, const char *_daliName)
-    : coven(_coven), config(_config), server(*this), dataPath(_dataPath), daliName(_daliName), backupHandler(_config)
+CCovenSDSManager::CCovenSDSManager(ICoven &_coven, const char *_dataPath, const char *_daliName)
+    : dataPath(_dataPath), daliName(_daliName), server(*this), coven(_coven)
 {
-    config.Link();
-    restartOnError = config.getPropBool("@restartOnUnhandled");
+    Owned<const IPropertyTree> config = getComponentConfig()->getPropTree("sds");
+    if (!config)
+        config.setown(createPTree("sds"));
+
+    restartOnError = config->getPropBool("@restartOnUnhandled");
     root = NULL;
     writeTransactions=0;
     externalEnvironment = false;
     ignoreExternals=false;
     unsigned initNodeTableSize = queryCoven().getInitSDSNodes();
     allNodes.ensure(initNodeTableSize?initNodeTableSize:INIT_NODETABLE_SIZE);
-    externalSizeThreshold = config.getPropInt("@externalSizeThreshold", DEFAULT_EXTERNAL_SIZE_THRESHOLD);
-    remoteBackupLocation.set(config.queryProp("@remoteBackupLocation"));
+    externalSizeThreshold = config->getPropInt("@externalSizeThreshold", defaultExternalSizeThreshold);
+    remoteBackupLocation.set(config->queryProp("@remoteBackupLocation"));
+    PROGLOG("externalSizeThreshold = %u", externalSizeThreshold);
     nextExternal = 1;
     if (0 == coven.getServerRank())
     {
@@ -5818,18 +6330,22 @@ CCovenSDSManager::CCovenSDSManager(ICoven &_coven, IPropertyTree &_config, const
     registerSubscriptionManager(SDSNODE_PUBLISHER, nodeSubscriptionManager);
 
     // add external handlers
-    Owned<CXMLFileExternal> xmlExternalHandler = new CXMLFileExternal(dataPath, backupHandler);
+    Owned<CXMLFileExternal> xmlExternalHandler = new CXMLFileExternal(dataPath, *this);
     externalHandlers.replace(* new CExternalHandlerMapping(EF_XML, *xmlExternalHandler));
-    Owned<CLegacyBinaryFileExternal> legacyBinaryExternalHandler = new CLegacyBinaryFileExternal(dataPath, backupHandler);
+    Owned<CLegacyBinaryFileExternal> legacyBinaryExternalHandler = new CLegacyBinaryFileExternal(dataPath, *this);
     externalHandlers.replace(* new CExternalHandlerMapping(EF_LegacyBinaryValue, *legacyBinaryExternalHandler));
-    Owned<CBinaryFileExternal> binaryExternalHandler = new CBinaryFileExternal(dataPath, backupHandler);
+    Owned<CBinaryFileExternal> binaryExternalHandler = new CBinaryFileExternal(dataPath, *this);
     externalHandlers.replace(* new CExternalHandlerMapping(EF_BinaryValue, *binaryExternalHandler));
 
     properties.setown(createPTree("Properties"));
-    IPropertyTree *clientProps = properties->setPropTree("Client", config.hasProp("Client") ? config.getPropTree("Client") : createPTree());
+    IPropertyTree *clientProps = properties->setPropTree("Client", config->hasProp("Client") ? config->getPropTree("Client") : createPTree());
     clientProps->setPropBool("@serverIterAvailable", true);
     clientProps->setPropBool("@useAppendOpt", true);
     clientProps->setPropBool("@serverGetIdsAvailable", true);
+    bool saveBinary = config->getPropBool("@saveBinary", true);
+    clientProps->setPropBool("@saveBinary", saveBinary);
+    bool saveAsync = config->getPropBool("@saveAsync", true);
+    clientProps->setPropBool("@saveAsync", saveAsync);
     IPropertyTree *throttle = clientProps->setPropTree("Throttle", createPTree());
     throttle->setPropInt("@limit", CLIENT_THROTTLE_LIMIT);
     throttle->setPropInt("@delay", CLIENT_THROTTLE_DELAY);
@@ -5846,26 +6362,24 @@ CCovenSDSManager::CCovenSDSManager(ICoven &_coven, IPropertyTree &_config, const
         }
         rfn.setLocalPath(cwd);
     }
-    unsigned keepLastN = config.getPropInt("@keepStores", DEFAULT_KEEP_LASTN_STORES);
+    unsigned keepLastN = config->getPropInt("@keepStores", DEFAULT_KEEP_LASTN_STORES);
     StringBuffer path;
     rfn.getRemotePath(path);
     properties->setProp("@dataPathUrl", path.str());
     properties->setPropInt("@keepStores", keepLastN);
     if (remoteBackupLocation.length())
-    {
         properties->setProp("@backupPathUrl", remoteBackupLocation.get());
-        backupHandler.init(remoteBackupLocation, config.getPropBool("@asyncBackup", true));
-    }
 
-    const char *storeName = config.queryProp("@store");
-    if (!storeName) storeName = "dalisds";
+    storeBase.set(config->queryProp("@store"));
+    if (0 == storeBase.length())
+        storeBase.set("dalisds");
 #if 1 // legacy
-    StringBuffer tail, ext;
-    splitFilename(storeName, NULL, NULL, &tail, &ext);
-    if (0 == stricmp(".xml", ext.str()))
+    else
     {
-        config.setProp("@store", tail.str());
-        storeName = tail.str();
+        StringBuffer tail, ext;
+        splitFilename(storeBase, NULL, NULL, &tail, &ext);
+        if (0 == stricmp(".xml", ext.str()))
+            storeBase.set(tail);
     }
 #endif
     StringBuffer tmp(dataPath);
@@ -5874,12 +6388,22 @@ CCovenSDSManager::CCovenSDSManager(ICoven &_coven, IPropertyTree &_config, const
     OwnedIFile detachIPIFile = createIFile(tmp.append(DETACHINPROGRESS).str());
     detachIPIFile->remove();
 
-    unsigned configFlags = config.getPropBool("@recoverFromIncErrors", true) ? SH_RecoverFromIncErrors : 0;
-    configFlags |= config.getPropBool("@backupErrorFiles", true) ? SH_BackupErrorFiles : 0;
-    iStoreHelper = createStoreHelper(storeName, dataPath, remoteBackupLocation, configFlags, keepLastN, 100, &server.queryStopped());
+    unsigned configFlags = config->getPropBool("@recoverFromIncErrors", true) ? SH_RecoverFromIncErrors : 0;
+    configFlags |= config->getPropBool("@backupErrorFiles", true) ? SH_BackupErrorFiles : 0;
+    iStoreHelper = createStoreHelper(storeBase, dataPath, remoteBackupLocation, configFlags, keepLastN, 100, &server.queryStopped(), saveBinary, saveAsync);
     doTimeComparison = false;
-    if (config.getPropBool("@lightweightCoalesce", true))
-        coalesce.setown(new CLightCoalesceThread(config, iStoreHelper));
+    if (config->getPropBool("@lightweightCoalesce", true))
+        coalesce.setown(new CLightCoalesceThread(*config, iStoreHelper));
+
+    // if enabled (default), ensure the ext cache size is bigger than the pending delta writer cache
+    // to ensure that when the ext cache is full, there are transaction items to flush that aren't still
+    // pending on write.
+    unsigned extCacheSizeMB = config->getPropInt("@extCacheSizeMB", defaultExtCacheSizeMB);
+    unsigned deltaTransactionMaxMemMB = config->getPropInt("@deltaTransactionMaxMemMB", defaultDeltaMemMaxMB);
+    if (extCacheSizeMB && deltaTransactionMaxMemMB && (extCacheSizeMB <= deltaTransactionMaxMemMB))
+        extCacheSizeMB = deltaTransactionMaxMemMB + 1;
+    size32_t extCacheSize = extCacheSizeMB * 0x100000;
+    extCache.init(extCacheSize);
 }
 
 #ifdef _MSC_VER
@@ -5888,41 +6412,22 @@ CCovenSDSManager::CCovenSDSManager(ICoven &_coven, IPropertyTree &_config, const
 
 CCovenSDSManager::~CCovenSDSManager()
 {
-    backupHandler.stop();
     if (unhandledThread) unhandledThread->join();
     if (coalesce) coalesce->stop();
+    deltaWriter.stop();
     scanNotifyPool.clear();
     notifyPool.clear();
     connections.kill();
     ::Release(iStoreHelper);
-    if (!config.getPropBool("@leakStore", true)) // intentional default leak of time consuming deconstruction of tree
+    if (!getComponentConfigSP()->getPropBool("sds/@leakStore", true)) // intentional default leak of time consuming deconstruction of tree
         ::Release(root);
     else
         enableMemLeakChecking(false);
-    config.Release();
 }
 
-bool compareFiles(IFile *file1, IFile *file2, bool compareTimes=true)
+void CCovenSDSManager::closedown()
 {
-    if (file1->exists())
-    {
-        if (file2->exists())
-        {
-            if (file1->size() == file2->size())
-            {
-                if (!compareTimes) return true;
-                CDateTime modifiedTimeBackup;
-                file1->getTime(NULL, &modifiedTimeBackup, NULL);
-                CDateTime modifiedTime;
-                file2->getTime(NULL, &modifiedTime, NULL);
-                if (0 == modifiedTimeBackup.compare(modifiedTime, false))
-                    return true;
-            }
-        }
-    }
-    else
-        return !file2->exists();
-    return false;
+    //Should never be called - but do not assert since it is harmless and it is better not to report
 }
 
 void CCovenSDSManager::validateDeltaBackup()
@@ -5934,7 +6439,7 @@ void CCovenSDSManager::validateDeltaBackup()
     deltaFilename.clear().append(remoteBackupLocation);
     iStoreHelper->getCurrentDeltaFilename(deltaFilename);
     OwnedIFile iFileDeltaBackup = createIFile(deltaFilename.str());
-    if (!compareFiles(iFileDeltaBackup, iFileDelta, false))
+    if (!filesMatch(iFileDeltaBackup, iFileDelta, false))
     {
         OWARNLOG("Delta file backup doesn't exist or differs, filename=%s", deltaFilename.str());
         copyFile(iFileDeltaBackup, iFileDelta);
@@ -5959,13 +6464,13 @@ void CCovenSDSManager::validateBackup()
 
     // ensure there's a copy of the primary store present at startup.
     StringBuffer storeFilename(dataPath);
-    iStoreHelper->getCurrentStoreFilename(storeFilename);
+    iStoreHelper->getCurrentStoreFilename(storeFilename, StoreFormat::XML);
     OwnedIFile iFileStore = createIFile(storeFilename.str());
 
     storeFilename.clear().append(remoteBackupLocation);
-    iStoreHelper->getCurrentStoreFilename(storeFilename);
+    iStoreHelper->getCurrentStoreFilename(storeFilename, StoreFormat::XML);
     OwnedIFile iFileBackupStore = createIFile(storeFilename.str());
-    if (!compareFiles(iFileBackupStore, iFileStore))
+    if (!filesMatch(iFileBackupStore, iFileStore))
     {
         OWARNLOG("Store backup file doesn't exist or differs, filename=%s", storeFilename.str());
         copyFile(iFileBackupStore, iFileStore);
@@ -6016,65 +6521,47 @@ void CCovenSDSManager::checkEnvironment(IPropertyTree *oldEnv, IPropertyTree *ne
     }
 }
 
-void CCovenSDSManager::loadStore(const char *storeName, const bool *abort)
+void CCovenSDSManager::loadStore(const bool *abort)
 {
     if (root) root->Release();
-
-    class CNodeCreate : implements IPTreeNodeCreator, public CInterface
-    {
-    public:
-        IMPLEMENT_IINTERFACE;
-        virtual IPropertyTree *create(const char *tag) { return createServerTree(tag); }
-    } nodeCreator;
-    class CSDSTreeMaker : public CPTreeMaker
-    {
-    public:
-        CSDSTreeMaker(IPTreeNodeCreator *nodeCreator) : CPTreeMaker(ipt_none, nodeCreator) { }
-        virtual void endNode(const char *tag, unsigned length, const void *value, bool binary, offset_t endOffset)
-        {
-            IPropertyTree *node = queryCurrentNode();
-            CPTreeMaker::endNode(tag, length, value, binary, endOffset);
-            if (((CServerRemoteTree *)node)->testExternalCandidate())
-                convertQueue.append(*(CServerRemoteTree *)node);
-        }
-        ICopyArrayOf<CServerRemoteTree> convertQueue;
-    } treeMaker(&nodeCreator);
 
     Owned<IPropertyTree> oldEnvironment;
     try
     {
-        bool saveNeeded = false;
-        if (!storeName)
-            storeName = config.queryProp("@store");
+        CHECKEDCRITICALBLOCK(saveStoreCrit, fakeCritTimeout);
 
-        unsigned crc = 0;
-        StringBuffer storeFilename(dataPath);
-        iStoreHelper->getCurrentStoreFilename(storeFilename, &crc);
+        class CNodeCreate : public CSimpleInterfaceOf<IPTreeNodeCreator>
+        {
+        public:
+            virtual IPropertyTree *create(const char *tag) { return createServerTree(tag); }
+        };
+        Owned<IPTreeNodeCreator> nodeCreator = new CNodeCreate();
 
-        LOG(MCdebugInfo, unknownJob, "loading store %d, storedCrc=%x", iStoreHelper->queryCurrentEdition(), crc);
-        root = (CServerRemoteTree *)::loadStore(storeFilename.str(), &treeMaker, crc, false, abort);
+        root = (CServerRemoteTree *)iStoreHelper->loadStore(nodeCreator, abort);
         if (!root)
         {
-            StringBuffer s(storeName);
-            LOG(MCdebugInfo, unknownJob, "Store %d does not exist, creating new store", iStoreHelper->queryCurrentEdition());
+            LOG(MCdebugInfo, "Store %d does not exist, creating new store", iStoreHelper->queryCurrentEdition());
             root = new CServerRemoteTree("SDS");
         }
         bool errors;
         Owned<IException> deltaE;
         try { iStoreHelper->loadDeltas(root, &errors); }
         catch (IException *e) { deltaE.setown(e); errors = true; }
-        if (errors && config.getPropBool("@backupErrorFiles", true))
+        if (errors && getComponentConfigSP()->getPropBool("sds/@backupErrorFiles", true))
         {
+            // backup the XML file only, the binary is not strictly necessary
+            StringBuffer storeFilename(dataPath);
+            iStoreHelper->getCurrentStoreFilename(storeFilename, StoreFormat::XML);
             iStoreHelper->backup(storeFilename.str());
             if (deltaE.get())
                 throw LINK(deltaE);
         }
-        LOG(MCdebugInfo, unknownJob, "store loaded");
-        const char *environment = config.queryProp("@environment");
+        LOG(MCdebugInfo, "store and deltas loaded");
+        const char *environment = getComponentConfigSP()->queryProp("sds/@environment");
 
         if (environment && *environment)
         {
-            LOG(MCdebugInfo, unknownJob, "loading external Environment from: %s", environment);
+            LOG(MCdebugInfo, "loading external Environment from: %s", environment);
             Owned<IFile> envFile = createIFile(environment);
             if (!envFile->exists())
                 throw MakeStringException(0, "'%s' does not exist", environment);
@@ -6215,7 +6702,7 @@ void CCovenSDSManager::loadStore(const char *storeName, const bool *abort)
                             if (missN > refN)
                                 break;
                             ++missP;
-                        }   
+                        }
                         // i.e. found in backup, but was listed missing in primary
                         if (found)
                         {
@@ -6365,30 +6852,19 @@ void CCovenSDSManager::loadStore(const char *storeName, const bool *abort)
             }
         }
         root->removeProp("External"); // remove legacy /External if present
-        unsigned items = treeMaker.convertQueue.ordinality();
-        if (items)
-        {
-            LOG(MCdebugInfo, unknownJob, "Converting %d items larger than threshold size %d, to external definitions", items, externalSizeThreshold);
-            ForEachItemIn(i, treeMaker.convertQueue)
-                SDSManager->writeExternal(treeMaker.convertQueue.item(i), true);
-            saveNeeded = true;
-        }
-        if (saveNeeded)
-        {
-            LOG(MCdebugInfo, unknownJob, "Saving converted store");
-            SDSManager->saveStore();
-        }
     }
     catch (IException *e)
     {
-        OERRLOG(e, "Exception - Failed to load main store");
+        DISLOG(e, "Exception - Failed to load main store");
         throw;
     }
     catch (DALI_CATCHALL)
     {
-        OERRLOG("Unknown exception - Failed to load main store");
+        DISLOG("Unknown exception - Failed to load main store");
         throw;
     }
+
+    deltaWriter.init(iStoreHelper);
 
     if (!root)
     {
@@ -6398,7 +6874,7 @@ void CCovenSDSManager::loadStore(const char *storeName, const bool *abort)
     if (remoteBackupLocation.length())
     {
         try { validateBackup(); }
-        catch (IException *e) { LOG(MCoperatorError, unknownJob, e, "Validating backup"); e->Release(); }
+        catch (IException *e) { OERRLOG(e, "Validating backup"); e->Release(); }
 
         StringBuffer deltaFilename(dataPath);
         iStoreHelper->getCurrentDeltaFilename(deltaFilename);
@@ -6419,19 +6895,34 @@ void CCovenSDSManager::loadStore(const char *storeName, const bool *abort)
     }
     Owned<IRemoteConnection> conn = connect("/", 0, RTM_INTERNAL, INFINITE);
     initializeInternals(conn->queryRoot());
+    clearStaleMeteData(conn->queryRoot());
     conn.clear();
-    bool forceGroupUpdate = config.getPropBool("DFS/@forceGroupUpdate");
-    initClusterAndStoragePlaneGroups(forceGroupUpdate, oldEnvironment);
+    initializeStorageGroups(oldEnvironment);
 }
 
-void CCovenSDSManager::saveStore(const char *storeName, bool currentEdition)
+void CCovenSDSManager::saveStore(const char *storeName, SaveStoreFlags flags)
 {
-    struct CIgnore
+    if (hasMask(flags, ssf_stop))
     {
-        CIgnore() { SDSManager->ignoreExternals=true; }
-        ~CIgnore() { SDSManager->ignoreExternals=false; }
-    } ignore;
-    iStoreHelper->saveStore(root, NULL, currentEdition);
+        // Dali is stopping, we don't care about any inflight transactions any more, we're about to save and quit
+        // Wait for delta writer thread to finish, to ensure no dangling writes after we've saved
+        deltaWriter.stop();
+    }
+    else if (hasMask(flags, ssf_flush))
+    {
+        // lock blockedSaveCrit after flush, since deltaWriter itself blocks on blockedSaveCrit
+        deltaWriter.flush(); // transactions will be blocked at this stage, no new deltas will be added to writer
+    }
+
+    if (ignoreExternals.exchange(true)) // NB: This is set during save to prevent serialization of externals during the save
+    {
+        Owned<IException> exception = makeStringException(0, "Save already in progress");
+        EXCLOG(exception);
+        throw exception.getClear();
+    }
+    COnScopeExit resetIgnoreExternals([&]() { ignoreExternals = false; });
+    CHECKEDCRITICALBLOCK(blockedSaveCrit, fakeCritTimeout);
+    iStoreHelper->saveStore(root, NULL);
     unsigned initNodeTableSize = allNodes.maxElements()+OVERFLOWSIZE;
     queryCoven().setInitSDSNodes(initNodeTableSize>INIT_NODETABLE_SIZE?initNodeTableSize:INIT_NODETABLE_SIZE);
 }
@@ -6488,29 +6979,15 @@ StringBuffer &transformToAbsolute(StringBuffer &result, const char *xpath, unsig
     return result;
 }
 
-void cleanChangeTree(IPropertyTree &tree)
+void CCovenSDSManager::serializeDelta(const char *path, IPropertyTree *changeTree)
 {
-    tree.removeProp("@id");
-    Owned<IPropertyTreeIterator> iter = tree.getElements(RENAME_TAG);
-    ForEach (*iter)
-        iter->query().removeProp("@id");
-    iter.setown(tree.getElements(DELETE_TAG));
-    ForEach (*iter)
-        iter->query().removeProp("@id");
-    iter.setown(tree.getElements(RESERVED_CHANGE_NODE));
-    ForEach (*iter)
-        cleanChangeTree(iter->query());
-}
-
-void CCovenSDSManager::saveDelta(const char *path, IPropertyTree &changeTree)
-{
-    CHECKEDCRITICALBLOCK(saveIncCrit, fakeCritTimeout);
+    Owned<IPropertyTree> ownedChangeTree = changeTree;
     // translate changeTree to inc format (e.g. remove id's)
     if (externalEnvironment)
     {
         // don't save any changed to /Environment if external
 
-        if (startsWith(path, "/Environment") || (streq(path, "/") && changeTree.hasProp("*[@name=\"Environment\"]")))
+        if (startsWith(path, "/Environment") || (streq(path, "/") && changeTree->hasProp("*[@name=\"Environment\"]")))
         {
             Owned<IMPServer> mpServer = getMPServer();
             IAllowListHandler *allowListHandler = mpServer->queryAllowListCallback();
@@ -6520,101 +6997,7 @@ void CCovenSDSManager::saveDelta(const char *path, IPropertyTree &changeTree)
             return;
         }
     }
-    cleanChangeTree(changeTree);
-    // write out with header details (e.g. path)
-    Owned<IPropertyTree> header = createPTree("Header");
-    header->setProp("@path", path);
-    IPropertyTree *delta = header->addPropTree("Delta", createPTree());
-    delta->addPropTree(changeTree.queryName(), LINK(&changeTree));
-
-    StringBuffer fname(dataPath);
-    OwnedIFile deltaIPIFile = createIFile(fname.append(DELTAINPROGRESS).str());
-    OwnedIFileIO deltaIPIFileIO = deltaIPIFile->open(IFOcreate);
-    deltaIPIFileIO.clear();
-    struct RemoveDIPBlock
-    {
-        IFile &iFile;
-        bool done;
-        void doit() { done = true; iFile.remove(); }
-        RemoveDIPBlock(IFile &_iFile) : iFile(_iFile), done(false) { }
-        ~RemoveDIPBlock () { if (!done) doit(); }
-    } removeDIP(*deltaIPIFile);
-    StringBuffer detachIPStr(dataPath);
-    OwnedIFile detachIPIFile = createIFile(detachIPStr.append(DETACHINPROGRESS).str());
-    if (detachIPIFile->exists()) // very small window where this can happen.
-    {
-        // implies other operation about to access current delta
-        // CHECK session is really alive, otherwise it has been orphaned, so remove it.
-        try
-        {
-            SessionId sessId = 0;
-            OwnedIFileIO detachIPIO = detachIPIFile->open(IFOread);
-            if (detachIPIO)
-            {
-                size_t s = detachIPIO->read(0, sizeof(sessId), &sessId);
-                detachIPIO.clear();
-                if (sizeof(sessId) == s)
-                {
-                    // double check session is really alive
-                    if (querySessionManager().sessionStopped(sessId, 0))
-                        detachIPIFile->remove();
-                    else
-                    {
-                        // *cannot block* because other op (sasha) accessing remote dali files, can access dali.
-                        removeDIP.doit();
-                        PROGLOG("blocked");
-                        toXML(header, blockedDelta);
-                        return;
-                    }
-                }
-            }
-        }
-        catch (IException *e) { EXCLOG(e, NULL); e->Release(); }
-    }
-    bool first = false;
-    try
-    {
-        StringBuffer deltaFilename(dataPath);
-        iStoreHelper->getCurrentDeltaFilename(deltaFilename);
-        toXML(header, blockedDelta);
-        OwnedIFile iFile = createIFile(deltaFilename.str());
-        first = !iFile->exists() || 0 == iFile->size();
-        writeDelta(blockedDelta, *iFile);
-    }
-    catch (IException *e)
-    {
-        // NB: writeDelta retries a few times before giving up.
-        VStringBuffer errMsg("saveDelta: failed to save delta data, blockedDelta size=%d", blockedDelta.length());
-        OWARNLOG(e, errMsg.str());
-        e->Release();
-        return;
-    }
-    if (remoteBackupLocation.length())
-    {
-        try
-        {
-            if (backupOutOfSync) // true if there was previously an exception during synchronously writing delta to backup.
-            {
-                OWARNLOG("Backup delta is out of sync due to a prior backup write error, attempting to resync");
-                // catchup - check and copy primary delta to backup
-                validateDeltaBackup();
-                backupOutOfSync = false;
-                OWARNLOG("Backup delta resynchronized");
-            }
-            else
-                backupHandler.addDelta(blockedDelta, iStoreHelper->queryCurrentEdition(), first);
-        }
-        catch (IException *e)
-        {
-            OERRLOG(e, "saveDelta: failed to save backup delta data");
-            e->Release();
-            backupOutOfSync = true;
-        }
-    }
-    if (blockedDelta.length() > 0x100000)
-        blockedDelta.kill();
-    else
-        blockedDelta.clear();
+    deltaWriter.addDelta(strdup(path), ownedChangeTree.getClear());
 }
 
 CSubscriberContainerList *CCovenSDSManager::getSubscribers(const char *xpath, CPTStack &stack)
@@ -6623,15 +7006,17 @@ CSubscriberContainerList *CCovenSDSManager::getSubscribers(const char *xpath, CP
 }
 
 inline void serverToClientTree(CServerRemoteTree &src, CClientRemoteTree &dst)
-{       
+{
     if (src.getPropInt64(EXT_ATTR))
     {
         MemoryBuffer mb;
         src.serializeSelfRT(mb, false);
-        dst.deserializeSelfRT(mb);
+        Owned<IBufferedSerialInputStream> mbStream(createMemoryBufferSerialStream(mb));
+        PTreeDeserializeContext ctx;
+        dst.deserializeSelfRT(*mbStream, ctx);
     }
     else
-        dst.clone(src, true, false);
+        dst.cloneIntoSelf(src, false);
     dst.setServerId(src.queryServerId());
     if (src.hasChildren()) dst.addServerTreeInfo(STI_HaveChildren);
 }
@@ -6649,8 +7034,8 @@ public:
     {
         unsigned c;
         src.read(c);
-        xpaths.ensure(c);
-        modes.ensure(c);
+        xpaths.ensureCapacity(c);
+        modes.ensureCapacity(c);
         while (c--)
         {
             StringAttr xpath;
@@ -6810,17 +7195,65 @@ bool CCovenSDSManager::removeNotifyHandler(const char *handlerKey)
     return nodeNotifyHandlers.remove(handlerKey);
 }
 
+// The store read-lock is a shared (multiple-reader) lock, so several threads may hold it
+// concurrently; each records its own acquisition timestamp in thread-local storage.
+// lock/unlock are strictly paired per thread and no recursion
+static thread_local cycle_t storeReadLockStartCycles = 0;
+
+void CCovenSDSManager::updateStoreReadLockAcquireStats(unsigned __int64 blockedNs) const
+{
+    CriticalBlock b(storeReadLockStatsCrit);
+    ++storeReadLockStats.count;
+    storeReadLockStats.blockedNs += blockedNs;
+    if (blockedNs > storeReadLockStats.maxBlockedNs)
+        storeReadLockStats.maxBlockedNs = blockedNs;
+}
+
+bool CCovenSDSManager::updateStoreReadLockReleaseStats(unsigned __int64 heldNs, StoreReadLockStats &snapshot) const
+{
+    CriticalBlock b(storeReadLockStatsCrit);
+    storeReadLockStats.holdNs += heldNs;
+    if (heldNs > storeReadLockStats.maxHoldNs)
+        storeReadLockStats.maxHoldNs = heldNs;
+
+    if (storeReadLockStats.count && storeReadLockReportTimer.elapsedMs() >= storeReadLockTraceIntervalMs)
+    {
+        storeReadLockReportTimer.reset();
+        snapshot = storeReadLockStats;
+        return true;
+    }
+    return false;
+}
+
 IPropertyTree *CCovenSDSManager::lockStoreRead() const
 {
-    PROGLOG("lockStoreRead() called");
+    dbgassertex(storeReadLockStartCycles == 0);
+    const cycle_t waitStartCycles = get_cycles_now();
     CHECKEDREADLOCKENTER(dataRWLock, readWriteTimeout);
+    const cycle_t acquiredCycles = get_cycles_now();
+    const unsigned __int64 blockedNs = (unsigned __int64) cycle_to_nanosec(acquiredCycles - waitStartCycles);
+    storeReadLockStartCycles = acquiredCycles;
+    updateStoreReadLockAcquireStats(blockedNs);
     return root;
 }
 
 void CCovenSDSManager::unlockStoreRead() const
 {
-    PROGLOG("unlockStoreRead() called");
+    const cycle_t endCycles = get_cycles_now();
     dataRWLock.unlockRead();
+
+    const cycle_t startCycles = storeReadLockStartCycles;
+    dbgassertex(startCycles != 0); // Contract: unlockStoreRead() must be paired with a prior lockStoreRead() on this thread.
+    storeReadLockStartCycles = 0;
+
+    const unsigned __int64 heldNs = (unsigned __int64) cycle_to_nanosec(endCycles - startCycles);
+    StoreReadLockStats snapshot;
+    if (updateStoreReadLockReleaseStats(heldNs, snapshot))
+    {
+        PROGLOG("TIMING(SDS store read-lock): %" I64F "u acquisitions, %.2fms blocked entering, max blocked %.2fms, %.2fms total held, max held %.2fms",
+            snapshot.count, (double) snapshot.blockedNs / 1000000.0, (double) snapshot.maxBlockedNs / 1000000.0,
+            (double) snapshot.holdNs / 1000000.0, (double) snapshot.maxHoldNs / 1000000.0);
+    }
 }
 
 bool CCovenSDSManager::setSDSDebug(StringArray &params, StringBuffer &reply)
@@ -6923,7 +7356,7 @@ void CCovenSDSManager::commit(CRemoteConnection &connection, bool *disconnectDel
         { // something commited, if RTM_Create was used need to remember this.
             StringBuffer path;
             serverConnection->queryPTreePath().getAbsolutePath(path);
-            saveDelta(path.str(), *changeTree);
+            serializeDelta(path.str(), changeTree.getClear());
             bool lazyFetch = connection.setLazyFetch(false);
             tree->clearCommitChanges(&newIds);
             assertex(newIds.getPos() == newIds.length()); // must have read it all
@@ -7155,7 +7588,7 @@ void CCovenSDSManager::getExternalValueFromServerId(__int64 serverId, MemoryBuff
 
 IPropertyTreeIterator *CCovenSDSManager::getElementsRaw(const char *xpath,INode *remotedali, unsigned timeout)
 {
-    assertex(!remotedali); // only client side 
+    assertex(!remotedali); // only client side
     CHECKEDDALIREADLOCKBLOCK(dataRWLock, readWriteTimeout);
     return root->getElements(xpath);
 }
@@ -7182,11 +7615,11 @@ unsigned CCovenSDSManager::queryCount(const char *xpath)
 
 void CCovenSDSManager::start()
 {
-    server.start();
+    server.start(false);
     if (coalesce) coalesce->start();
 }
 
-void CCovenSDSManager::stop() 
+void CCovenSDSManager::stop()
 {
     server.stop();
     PROGLOG("waiting for coalescer to stop");
@@ -7203,7 +7636,7 @@ void CCovenSDSManager::restart(IException * e)
     connections.kill();
     DBGLOG("-------: stopped");
     DBGLOG("-------: saving current store . . . . . .");
-    saveStore();
+    saveStore(nullptr, ssf_flush);
     DBGLOG("-------: store saved.");
     DBGLOG("-------: restarting SDS server restart");
     start();
@@ -7236,7 +7669,7 @@ CServerConnection *CCovenSDSManager::createConnectionInstance(CRemoteTreeBase *r
         {
             try
             {
-                parent = createPropBranch(root, head.str(), true, &created, &createdParent); 
+                parent = createPropBranch(root, head.str(), true, &created, &createdParent);
                 if (created)
                     newNode = true;
             }
@@ -7253,7 +7686,7 @@ CServerConnection *CCovenSDSManager::createConnectionInstance(CRemoteTreeBase *r
             {
                 Owned<IPropertyTreeIterator> iter = parent->getElements(prop);
                 if (iter->first())
-                {           
+                {
                     uProp.append(prop).append('-');
                     unsigned l = uProp.length();
                     unsigned n=1;
@@ -7328,7 +7761,7 @@ CServerConnection *CCovenSDSManager::createConnectionInstance(CRemoteTreeBase *r
     ConnectionId connectionId = _connectionId;
     if (!connectionId)
         connectionId = coven.getUniqueId();
-    
+
     CServerConnection *connection = new CServerConnection(*this, connectionId, _xpath, sessionId, mode, timeout, parent, connInfoFlags);
     Owned<LinkingCriticalBlock> b;
     if (!RTM_MODE(mode, RTM_INTERNAL))
@@ -7376,8 +7809,8 @@ CServerConnection *CCovenSDSManager::createConnectionInstance(CRemoteTreeBase *r
             CBranchChange *topChange = branchChange;
             // iterate remaining stack, iterate marking as 'new'
             for (;s<connection->queryPTreePath().ordinality();s++)
-            {   
-                
+            {
+
                 IPropertyTree &tree = connection->queryPTreePath().item(s);
                 IPropertyTree *n = tail->addPropTree(RESERVED_CHANGE_NODE, createPTree());
                 n->setProp("@name", tree.queryName());
@@ -7527,7 +7960,7 @@ void CCovenSDSManager::lock(CServerRemoteTree &tree, const char *xpath, Connecti
     __int64 treeId = tree.queryServerId();
     CHECKEDCRITICALBLOCK(lockCrit, fakeCritTimeout);
     lock = lockTable.find(&treeId);
-    
+
     if (!lock)
     {
         IdPath idPath;
@@ -7596,7 +8029,7 @@ void CCovenSDSManager::createConnection(SessionId sessionId, unsigned mode, unsi
     {
         struct LockUnblock
         {
-            LockUnblock(ReadWriteLock &_rWLock) : rWLock(_rWLock)
+            LockUnblock(TimedReadWriteLock &_rWLock) : rWLock(_rWLock)
             {
                 lockedForWrite = rWLock.queryWriteLocked();
                 if (lockedForWrite) rWLock.unlockWrite();
@@ -7604,7 +8037,7 @@ void CCovenSDSManager::createConnection(SessionId sessionId, unsigned mode, unsi
             }
             ~LockUnblock() { if (lockedForWrite) rWLock.lockWrite(); else rWLock.lockRead(); }
             bool lockedForWrite;
-            ReadWriteLock &rWLock;
+            TimedReadWriteLock &rWLock;
         };
         bool locked = false;
         class CConnectExistingLockCallback : implements IUnlockCallback
@@ -7745,8 +8178,8 @@ void CCovenSDSManager::createConnection(SessionId sessionId, unsigned mode, unsi
         {
             if (deltaChange.get())
             {
-                PROGLOG("Exception on RTM_CREATE caused call to saveDelta, xpath=%s", xpath);
-                saveDelta(deltaPath, *deltaChange);
+                PROGLOG("Exception on RTM_CREATE caused call to serializeDelta, xpath=%s", xpath);
+                serializeDelta(deltaPath, deltaChange.getClear());
             }
             throw;
         }
@@ -7765,8 +8198,8 @@ void CCovenSDSManager::createConnection(SessionId sessionId, unsigned mode, unsi
             stack.popn(additions);
             connection->notify();
             SDSManager->startNotification(*deltaChange, stack, *branchChange);
-            
-            saveDelta(deltaPath, *deltaChange);
+
+            serializeDelta(deltaPath, deltaChange.getClear());
         }
 
         connectionId = connection->queryConnectionId();
@@ -7775,7 +8208,7 @@ void CCovenSDSManager::createConnection(SessionId sessionId, unsigned mode, unsi
             locked = true;
             freeExistingLocks.remove(*(CServerRemoteTree *)_tree);
             connectCritBlock.clear();
-        }               
+        }
 
         { CHECKEDCRITICALBLOCK(cTableCrit, fakeCritTimeout);
             connections.replace(*LINK(connection));
@@ -7904,7 +8337,7 @@ void CCovenSDSManager::disconnect(ConnectionId id, bool deleteRoot, CLCLockBlock
             /* If it was last and deleteRoot was triggered, check again (now that have exclusive read write lock),
              * that I am last, i.e. that no-one else has established a lock in the changeToWrite window.
              * If they have, do not deleteRoot, as others are using it.
-             * 
+             *
              * NB: that will mean the write lock was not actually needed.
              * The lock will be released by the caller (of disconnect()), when 'lockBlock' goes out of scope.
              */
@@ -7944,9 +8377,8 @@ void CCovenSDSManager::disconnect(ConnectionId id, bool deleteRoot, CLCLockBlock
 
                 StringBuffer head;
                 const char *tail = splitXPath(path.str(), head);
-                CHECKEDCRITICALBLOCK(blockedSaveCrit, fakeCritTimeout);
                 if (NotFound != index)
-                    saveDelta(head.str(), *changeTree);
+                    serializeDelta(head.str(), changeTree.getClear());
                 else
                 { // NB: don't believe this can happen, but last thing want to do is save duff delete delta.
                     IERRLOG("** CCovenSDSManager::disconnect - index position lost **");
@@ -8147,15 +8579,15 @@ MemoryBuffer &CCovenSDSManager::collectSubscribers(MemoryBuffer &out)
 void CCovenSDSManager::blockingSave(unsigned *writeTransactions)
 {
     CHECKEDDALIREADLOCKBLOCK(SDSManager->dataRWLock, readWriteTimeout); // block all write actions whilst saving
-    CHECKEDCRITICALBLOCK(blockedSaveCrit, fakeCritTimeout);
     if (writeTransactions)
         *writeTransactions = SDSManager->writeTransactions;
     // JCS - could in theory, not block, but abort save.
-    SDSManager->saveStore();
+    SDSManager->saveStore(nullptr, ssf_flush);
 }
 
 bool CCovenSDSManager::updateEnvironment(IPropertyTree *newEnv, bool forceGroupUpdate, StringBuffer &response)
 {
+    // for BM only
     Owned<IRemoteConnection> conn = querySDS().connect("/",myProcessSession(),0, INFINITE);
     if (conn)
     {
@@ -8171,7 +8603,7 @@ bool CCovenSDSManager::updateEnvironment(IPropertyTree *newEnv, bool forceGroupU
         conn->commit();
         conn->close();
         StringBuffer messages;
-        initClusterGroups(forceGroupUpdate, messages, oldEnvironment);
+        initClusterAndStoragePlaneGroups(messages, forceGroupUpdate, oldEnvironment);
         response.append(messages);
         PROGLOG("Environment and node groups updated");
     }
@@ -8282,7 +8714,7 @@ void CCovenSDSManager::handleNotify(CSubscriberContainerBase *_subscriber, Memor
     if (!notifyPool)
     {
         CNotifyPoolFactory *factory = new CNotifyPoolFactory;
-        notifyPool.setown(createThreadPool("SDS Notification Pool", factory, this, SUBNTFY_POOL_SIZE));
+        notifyPool.setown(createThreadPool("SDS Notification Pool", factory, false, this, SUBNTFY_POOL_SIZE));
         factory->Release();
     }
 
@@ -8324,7 +8756,7 @@ public:
         ~PushPop() { stack.pop(); }
         CPTStack &stack;
     };
-    CSubscriberNotifyScanner(IPropertyTree &_changeTree, CPTStack &_stack, CBranchChange &_rootChanges) : changeTree(&_changeTree), rootChanges(&_rootChanges), stack(_stack)
+    CSubscriberNotifyScanner(IPropertyTree &_changeTree, CPTStack &_stack, CBranchChange &_rootChanges) : stack(_stack), changeTree(&_changeTree), rootChanges(&_rootChanges)
     {
         INIT_NAMEDCOUNT;
         SDSManager->querySubscriberTable().getSubscribers(subs);
@@ -8364,7 +8796,7 @@ public:
                     return subCommitNone;
                 return subCommitBelow; // e.g. change=/a/b/c, subscriber=/a/b
             }
-            else 
+            else
             {
                 if ('\0' == *head)
                     return subCommitAbove; // e.g. change=/a/b, subscriber=/a/b/c - not matched yet, but returning true keeps it from being pruned
@@ -8372,12 +8804,12 @@ public:
         }
     }
 
-    void scan() 
+    void scan()
     {
         xpath.clear();
         stack.toString(xpath);
         if (stack.ordinality() && (rootChanges->tree == &(stack.tos()))) stack.pop();
-        CSubscriberArray pruned; 
+        CSubscriberArray pruned;
         scan(*rootChanges, stack, pruned);
     }
 
@@ -8614,7 +9046,7 @@ void CCovenSDSManager::startNotification(IPropertyTree &changeTree, CPTStack &st
     if (!scanNotifyPool)
     {
         CScanNotifyPoolFactory *factory = new CScanNotifyPoolFactory;
-        scanNotifyPool.setown(createThreadPool("SDS Scan-Notification Pool", factory, this, SUBSCAN_POOL_SIZE));
+        scanNotifyPool.setown(createThreadPool("SDS Scan-Notification Pool", factory, false, this, SUBSCAN_POOL_SIZE));
         factory->Release();
     }
 
@@ -8663,9 +9095,11 @@ void CCovenSDSManager::writeExternal(CServerRemoteTree &tree, bool direct, __int
     IExternalHandler *extHandler = queryExternalHandler(EF_BinaryValue);
     assertex(extHandler);
     tree.removeProp(EXT_ATTR);
+    tree.removeProp(COMPRESS_ATTR);
     StringBuffer name(EXTERNAL_NAME_PREFIX);
     extHandler->write(name.append(index).str(), tree);
-    tree.setPropInt64(EXT_ATTR, index); 
+    tree.setPropInt64(EXT_ATTR, index);
+    tree.setPropInt(COMPRESS_ATTR, tree.getCompressionType());
     extHandler->resetAsExternal(tree);
     // setPropInt64(EXT_ATTR, index); // JCSMORE not necessary
 }
@@ -8686,11 +9120,11 @@ void CCovenSDSManager::remove(SubscriptionId id)
 // IExceptionHandler
 static bool processingUnhandled = false;
 static bool handled = false;
-static CheckedCriticalSection unhandledCrit;
+static CheckedCriticalSection unhandledCrit{SYNC_LOCATION};
 bool CCovenSDSManager::fireException(IException *e)
 {
-    //This code is rather dodgy (and causes more problems than it solves) 
-    // so ignore unhandled exceptions for the moment! 
+    //This code is rather dodgy (and causes more problems than it solves)
+    // so ignore unhandled exceptions for the moment!
     IERRLOG(e, "Caught unhandled exception!");
     return true;
 
@@ -8700,7 +9134,7 @@ bool CCovenSDSManager::fireException(IException *e)
         {
             if (handled)
             {
-                LOG(MCdisaster, unknownJob, e, "FATAL, too many exceptions");
+                DISLOG(e, "FATAL, too many exceptions");
                 return false; // did not successfully handle.
             }
             IERRLOG(e, "Exception while restarting or shutting down");
@@ -8733,11 +9167,11 @@ bool CCovenSDSManager::fireException(IException *e)
                     msg.append("Unhandled exception, shutting down: ").append(e->errorCode()).append(": ");
                     e->errorMessage(msg);
                     manager.stop();
-                    manager.saveStore();
+                    manager.saveStore(nullptr, ssf_stop);
                 }
                 manager.unhandledThread.clear();
             }
-            catch (IException *_e) { LOG(MCoperatorError, unknownJob, _e, "Exception while restarting or shutting down"); _e->Release(); }
+            catch (IException *_e) { OERRLOG(_e, "Exception while restarting or shutting down"); _e->Release(); }
             catch (DALI_CATCHALL) { IERRLOG("Unknown exception while restarting or shutting down"); }
             if (!restart)
             {
@@ -8797,12 +9231,178 @@ void CCovenSDSManager::notifyNode(CServerRemoteTree &node, PDState state)
 
 ///////////////////////
 
+bool CDeltaWriter::save(std::queue<Owned<CTransactionItem>> &todo)
+{
+    StringBuffer fname(dataPath);
+    OwnedIFile deltaIPIFile = createIFile(fname.append(DELTAINPROGRESS).str());
+    struct RemoveDIPBlock
+    {
+        IFile &iFile;
+        bool done;
+        void doit(bool throwEx)
+        {
+            // If remove() ultimately fails, 'done' remains false so a later explicit call
+            // to doit() (or the destructor's implicit call) will retry.
+            if (done)
+                return;
+            // retry loop. remove() should not fail, but if it does retry with small delay
+            unsigned attempts = 5;
+            while (true)
+            {
+                Owned<IException> e;
+                try
+                {
+                    iFile.remove();
+                    done = true;
+                    break;
+                }
+                catch (IException *_e)
+                {
+                    e.setown(_e); // deliberately keep most recent
+                }
+                bool last = 0 == --attempts;
+                const LogMsgCategory &cat = last ? MCoperatorDisaster : MCoperatorWarning;
+                VStringBuffer msg("save: failed to remove delta in progress file: %s", iFile.queryFilename());
+                LOG(cat, e, msg.str());
+
+                if (last)
+                {
+                    // NB: done remains set to false
+                    if (!throwEx)
+                        break;
+                    throw e.getClear();
+                }
+                MilliSleep(100);
+            }
+        }
+        RemoveDIPBlock(IFile &_iFile) : iFile(_iFile), done(false) { }
+        ~RemoveDIPBlock () { doit(false); }
+    } removeDIP(*deltaIPIFile);
+
+    while (true)
+    {
+        try
+        {
+            touchFile(deltaIPIFile);
+            StringBuffer detachIPStr(dataPath);
+            OwnedIFile detachIPIFile = createIFile(detachIPStr.append(DETACHINPROGRESS).str());
+            if (detachIPIFile->exists()) // very small window where this can happen.
+            {
+                // implies other operation about to access current delta
+                // CHECK session is really alive, otherwise it has been orphaned, so remove it.
+                SessionId sessId = 0;
+                OwnedIFileIO detachIPIO = detachIPIFile->open(IFOread);
+                if (detachIPIO)
+                {
+                    size_t s = detachIPIO->read(0, sizeof(sessId), &sessId);
+                    detachIPIO.clear();
+                    if (sizeof(sessId) == s)
+                    {
+                        // double check session is really alive
+                        if (querySessionManager().sessionStopped(sessId, 0))
+                            detachIPIFile->remove();
+                        else
+                        {
+                            // *cannot block* because other op (sasha) accessing remote dali files, can access dali.
+                            removeDIP.doit(true);
+                            PROGLOG("blocked");
+                            return false;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        catch (IException *e)
+        {
+            DISLOG(e, "save: failure whilst checking detach in progress file");
+            e->Release();
+        }
+        // here if exception only
+        MilliSleep(1000);
+    }
+
+    bool forceBlockingSave = false;
+    // NB: once we reach this point, this function must complete
+    try
+    {
+        std::vector<std::string> pendingExtDeletes;
+        while (!todo.empty())
+        {
+            CTransactionItem *item = todo.front();
+            if (CTransactionItem::f_delta == item->type)
+            {
+                Owned<IPropertyTree> changeTree = item->deltaTree;
+                item->deltaTree = nullptr;
+                cleanChangeTree(*changeTree);
+
+                // write out with header details (i.e. path)
+                deltaXml.appendf("<Header path=\"%s\">\n  <Delta>\n", item->name);
+                toXML(changeTree, deltaXml, 4);
+                deltaXml.append("  </Delta>\n</Header>");
+            }
+            else
+            {
+                // external file
+
+                if (CTransactionItem::f_addext == item->type)
+                {
+                    // NB: the XML referring to these externals will not be written until the pending xml is built up and saved,
+                    // meaning if there's a cold restart at this point, there will be unreferenced ext files on disk (and ensuing warnings)
+                    // However, that is better than committing the xml that references externals, before they exist in the event of
+                    // a cold restart between the two.
+                    // NB2: It is also important to ensure that these externals are committed to disk, in the event of a Dali saveStore
+                    // because the saved in-memory store has been altered at this point, i.e. it depends on the external file (see flush())
+                    writeExt(dataPath, item->name, item->ext.dataLength, item->ext.data, 1, INFINITE);
+                    if (backupPath.length())
+                        writeExt(backupPath, item->name, item->ext.dataLength, item->ext.data, 1, 10); // backup is less critical - will be synched at startup
+                    item->ext.pendingWrite = false;
+                }
+                else
+                {
+                    // track externals to delete / don't delete until xml is committed. See below.
+                    dbgassertex(CTransactionItem::f_delext == item->type);
+                    pendingExtDeletes.push_back(item->name);
+                }
+            }
+            todo.pop();
+        }
+        if (deltaXml.length())
+            writeXml();
+        for (auto &ext : pendingExtDeletes)
+        {
+            deleteExt(dataPath, ext.c_str(), 1, INFINITE);
+            if (backupPath.length())
+                deleteExt(backupPath, ext.c_str(), 1, 10); // backup is less critical - will be synched at startup
+        }
+    }
+    catch (IException *e)
+    {
+        DISLOG(e, "save: failure whilst committing deltas to disk! Remedial action must be taken");
+        e->Release();
+        // this is really an attempt at disaster recovery at this point
+        forceBlockingSave = true;
+    }
+    if (forceBlockingSave)
+    {
+        DISLOG("Due to earlier failures, attempting forced/blocking save of Dali store");
+        while (todo.size())
+            todo.pop();
+        SDSManager->saveStore(nullptr, ssf_none);
+    }
+    if (thresholdDuration)
+        lastSaveTime = get_cycles_now();
+    return true;
+}
+
+///////////////////////
+
 class CDaliSDSServer: implements IDaliServer, public CInterface
 {
 public:
     IMPLEMENT_IINTERFACE;
 
-    CDaliSDSServer(IPropertyTree *_config) : config(_config)
+    CDaliSDSServer()
     {
         manager = NULL;
         cancelLoad = false;
@@ -8819,22 +9419,15 @@ public:
         CriticalBlock b(crit);
         ICoven  &coven=queryCoven();
         assertex(coven.inCoven()); // must be member of coven
-        if (config)
-            sdsConfig.setown(config->getPropTree("SDS"));
-        if (!sdsConfig)
-            sdsConfig.setown(createPTree());
-        manager = new CCovenSDSManager(coven, *sdsConfig, config?config->queryProp("@dataPath"):NULL, config?config->queryProp("@name"):NULL);
+        manager = new CCovenSDSManager(coven, getComponentConfigSP()->queryProp("@dataPath"), getComponentConfigSP()->queryProp("@name"));
         SDSManager = manager;
         addThreadExceptionHandler(manager);
-        try { manager->loadStore(NULL, &cancelLoad); }
+        try { manager->loadStore(&cancelLoad); }
         catch (IException *)
         {
-            LOG(MCdebugInfo, unknownJob, "Failed to load main store");
+            LOG(MCdebugInfo, "Failed to load main store");
             throw;
         }
-        // In nas/non-local storage mode, create a published named group for 1-way files to use
-        if (isContainerized())
-            queryNamedGroupStore().ensureNasGroup(1);
         storeLoaded = true;
         manager->start();
     }
@@ -8884,7 +9477,7 @@ public:
         if (storeLoaded)
         {
             manager->stop();
-            manager->saveStore();
+            manager->saveStore(nullptr, ssf_stop);
         }
         removeThreadExceptionHandler(manager);
         ::Release(manager);
@@ -8898,10 +9491,8 @@ public:
 
 private:
     CCovenSDSManager *manager;
-    Linked<IPropertyTree> config;
-    Owned<IPropertyTree> sdsConfig;
     bool cancelLoad, storeLoaded;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
 };
 
 unsigned SDSLockTimeoutCount = 0;
@@ -8928,9 +9519,9 @@ ISDSException *MakeSDSException(int errorCode, const char *errorMsg, ...)
     return ret;
 }
 
-IDaliServer *createDaliSDSServer(IPropertyTree *config)
+IDaliServer *createDaliSDSServer()
 {
-    return new CDaliSDSServer(config);
+    return new CDaliSDSServer();
 }
 
 //////////////////////
@@ -8950,7 +9541,7 @@ bool applyXmlDeltas(IPropertyTree &root, IIOStream &stream, bool stopOnError)
 
         bool hadError;
 
-        CDeltaProcessor(IPropertyTree &_store, bool _stopOnError) : store(_store), stopOnError(_stopOnError), level(0)
+        CDeltaProcessor(IPropertyTree &_store, bool _stopOnError) : level(0), store(_store), stopOnError(_stopOnError)
         {
             sectionEndOffset = 0;
             hadError = false;

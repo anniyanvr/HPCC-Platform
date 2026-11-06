@@ -39,7 +39,7 @@ public:
   {
     m_pTask->copyFile( m_pTask->getFlags() );
 
-    static Mutex m;
+    static Mutex m{SYNC_LOCATION};
     m.lock();
     try
     {
@@ -80,11 +80,11 @@ private:
 
 CWsDeployEngine::CWsDeployEngine( CWsDeployExCE& service, IEspContext* ctx, IConstDeployInfo& deployInfo, const char* selComps, short version)
 : m_service(service),
+m_depInfo(deployInfo),
 m_bAbort(false),
 m_bEnvUpdated(false),
-m_errorCount(0),
 m_version(version),
-m_depInfo(deployInfo),
+m_errorCount(0),
 m_pDeploy(createPTreeFromXMLString(selComps))
 {
   m_pResponseXml.setown( createPTreeFromXMLString(selComps) );
@@ -111,7 +111,7 @@ m_pDeploy(createPTreeFromXMLString(selComps))
       key += ':';
       IPropertyTree* pInstance = &itInstances->query();
       key += pInstance->queryProp("@name");
-      m_comp2TasksMap.insert( pair<string, IPropertyTree*>(key, pTasks) );
+      m_comp2TasksMap.insert( std::pair<string, IPropertyTree*>(key, pTasks) );
     }
   }
 }
@@ -122,8 +122,8 @@ CWsDeployEngine::CWsDeployEngine( CWsDeployExCE& service, IConstDeployInfo& depl
 m_depInfo(deployInfo),
 m_bAbort(false),
 m_bEnvUpdated(false),
-m_errorCount(0),
-m_version(1)
+m_version(1),
+m_errorCount(0)
 {
   //init our cache
   //
@@ -159,7 +159,7 @@ m_version(1)
     key += pComp->queryProp("Name");
     key += ':';
     key += pComp->queryProp("Instance");
-    m_comp2TasksMap.insert( pair<string, IPropertyTree*>(key, pTasks) );
+    m_comp2TasksMap.insert( std::pair<std::string, IPropertyTree*>(key, pTasks) );
   }
 
   //prepare xml needed for actual deployment

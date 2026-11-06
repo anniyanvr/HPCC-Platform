@@ -190,7 +190,7 @@
       </xs:annotation>
     </xs:attribute>
 
-    <xs:attribute name="fieldTranslationEnabled" use="optional" default="payload">
+    <xs:attribute name="fieldTranslationEnabled" use="optional" default="payloadRemoveOnly">
       <xs:annotation>
         <xs:appinfo>
           <tooltip>Enables translation (where possible) of mismatched file layouts on-the-fly. Specify 'payload' to attempt to translate payload fields only</tooltip>
@@ -201,6 +201,7 @@
           <xs:enumeration value="false"/>
           <xs:enumeration value="true"/>
           <xs:enumeration value="payload"/>
+          <xs:enumeration value="payloadRemoveOnly"/>
         </xs:restriction>
       </xs:simpleType>
     </xs:attribute>
@@ -283,6 +284,27 @@
       <xs:annotation>
         <xs:appinfo>
           <tooltip>HTTP Header field to use for sending and receiving GlobalId</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="mapHttpCallUrlsToSecrets" type="xs:boolean" use="optional" default="false">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>In SOAPCALL and HTTPCALL check if URLs have been mapped to secrets</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="warnIfUrlNotMappedToSecret" type="xs:boolean" use="optional" default="false">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>In SOAPCALL and HTTPCALL warn if URLs not mapped to secrets</tooltip>
+        </xs:appinfo>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="requireUrlsMappedToSecrets" type="xs:boolean" use="optional" default="false">
+      <xs:annotation>
+        <xs:appinfo>
+          <tooltip>Require SOAPCALL and HTTPCALL URLs are secrets or mapped to secrets</tooltip>
         </xs:appinfo>
       </xs:annotation>
     </xs:attribute>

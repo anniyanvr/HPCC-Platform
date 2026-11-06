@@ -53,6 +53,7 @@ struct IHThorInput : public IInputBase
     virtual void updateProgress(IStatisticGatherer &progress) const = 0;
     virtual bool gatherConjunctions(ISteppedConjunctionCollector & collector) { return false; }
     virtual void resetEOF() { }
+    virtual stat_type queryTotalCycles() const = 0;
 
     // HThor is not going to support parallel streams
     virtual IEngineRowStream &queryStream() = 0;
@@ -88,7 +89,7 @@ struct IHThorActivity : implements IActivityBase
 };
 
 
-extern HTHOR_API IHThorActivity *createDiskWriteActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorDiskWriteArg &arg, ThorActivityKind kind, EclGraph & _graph);
+extern HTHOR_API IHThorActivity *createDiskWriteActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorGenericDiskWriteArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree *_node);
 extern HTHOR_API IHThorActivity *createIterateActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorIterateArg &arg, ThorActivityKind kind, EclGraph & _graph);
 extern HTHOR_API IHThorActivity *createGroupActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorGroupArg &arg, ThorActivityKind kind, EclGraph & _graph);
 extern HTHOR_API IHThorActivity *createFilterActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorFilterArg &arg, ThorActivityKind kind, EclGraph & _graph);
@@ -124,8 +125,8 @@ extern HTHOR_API IHThorActivity *createChooseSetsEnthActivity(IAgentContext &, u
 extern HTHOR_API IHThorActivity *createWorkunitReadActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorWorkunitReadArg &arg, ThorActivityKind kind, EclGraph & _graph);
 extern HTHOR_API IHThorActivity *createPipeReadActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorPipeReadArg &arg, ThorActivityKind kind, EclGraph & _graph);
 extern HTHOR_API IHThorActivity *createPipeWriteActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorPipeWriteArg &arg, ThorActivityKind kind, EclGraph & _graph);
-extern HTHOR_API IHThorActivity *createCsvWriteActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorCsvWriteArg &arg, ThorActivityKind kind, EclGraph & _graph);
-extern HTHOR_API IHThorActivity *createXmlWriteActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorXmlWriteArg &arg, ThorActivityKind kind, EclGraph & _graph);
+extern HTHOR_API IHThorActivity *createCsvWriteActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorCsvWriteArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree *_node);
+extern HTHOR_API IHThorActivity *createXmlWriteActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorXmlWriteArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree *_node);
 extern HTHOR_API IHThorActivity *createPipeThroughActivity(IAgentContext &, unsigned _activityId, unsigned _subgraphId, IHThorPipeThroughArg &arg, ThorActivityKind kind, EclGraph & _graph);
 extern HTHOR_API IHThorActivity *createFetchActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorFetchArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree *_node);
 extern HTHOR_API IHThorActivity *createKeyedJoinActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorKeyedJoinArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree *_node);
@@ -136,7 +137,7 @@ extern HTHOR_API IHThorActivity *createNullActivity(IAgentContext &_agent, unsig
 extern HTHOR_API IHThorActivity *createSideEffectActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorSideEffectArg &arg, ThorActivityKind kind, EclGraph & _graph);
 extern HTHOR_API IHThorActivity *createActionActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorActionArg &arg, ThorActivityKind kind, EclGraph & _graph);
 extern HTHOR_API IHThorActivity *createSelectNActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorSelectNArg &arg, ThorActivityKind kind, EclGraph & _graph);
-extern HTHOR_API IHThorActivity *createSpillActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorSpillArg &arg, ThorActivityKind kind, EclGraph & _graph);
+extern HTHOR_API IHThorActivity *createSpillActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorSpillArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree * _node);
 extern HTHOR_API IHThorActivity *createLimitActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorLimitArg &arg, ThorActivityKind kind, EclGraph & _graph);
 extern HTHOR_API IHThorActivity *createSkipLimitActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorLimitArg &arg, ThorActivityKind kind, EclGraph & _graph);
 extern HTHOR_API IHThorActivity *createCatchActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorCatchArg &arg, ThorActivityKind kind, EclGraph & _graph);
@@ -173,6 +174,7 @@ extern HTHOR_API IHThorActivity *createDiskCountActivity(IAgentContext &_agent, 
 extern HTHOR_API IHThorActivity *createDiskGroupAggregateActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorDiskGroupAggregateArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree *node);
 
 extern HTHOR_API IHThorActivity *createNewDiskReadActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorNewDiskReadArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree *node);
+extern HTHOR_API IHThorActivity *createGenericDiskReadActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorNewDiskReadArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree * node);
 
 extern HTHOR_API IHThorActivity *createIndexReadActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorIndexReadArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree *_node);
 extern HTHOR_API IHThorActivity *createIndexNormalizeActivity(IAgentContext &_agent, unsigned _activityId, unsigned _subgraphId, IHThorIndexNormalizeArg &arg, ThorActivityKind kind, EclGraph & _graph, IPropertyTree *_node);

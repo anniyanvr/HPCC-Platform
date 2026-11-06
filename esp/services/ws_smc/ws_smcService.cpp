@@ -17,7 +17,7 @@
 
 #pragma warning (disable : 4786)
 
-#include "build-config.h"
+#include "jcontainerized.hpp"
 
 #ifdef _USE_OPENLDAP
 #include "ldapsecurity.ipp"
@@ -33,6 +33,9 @@
 
 #include "roxiecontrol.hpp"
 #include "workunit.hpp"
+#include "junicode.hpp"
+#include "jstats.h"
+#include "dastats.hpp"
 
 #define STATUS_SERVER_THOR "ThorMaster"
 #define STATUS_SERVER_HTHOR "HThorServer"
@@ -84,9 +87,9 @@ void AccessFailure(IEspContext& context, char const * msg,...)
 struct QueueLock
 {
     QueueLock(IJobQueue* q): queue(q) { queue->lock(); }
-    ~QueueLock() 
-    { 
-        queue->unlock(); 
+    ~QueueLock()
+    {
+        queue->unlock();
     }
 
     Linked<IJobQueue> queue;
@@ -128,6 +131,7 @@ void CWsSMCEx::init(IPropertyTree *cfg, const char *process, const char *service
         throw MakeStringException(-1, "No Dali Connection Active. Please Specify a Dali to connect to in you configuration file");
     }
 
+    espInstance.set(process);
     m_BannerAction = 0;
     m_EnableChatURL = false;
     m_BannerSize = "4";
@@ -140,6 +144,12 @@ void CWsSMCEx::init(IPropertyTree *cfg, const char *process, const char *service
     if (portalURL && *portalURL)
         m_PortalURL.append(portalURL);
 
+#ifdef _CONTAINERIZED
+    initContainerRoxieTargets(roxieConnMap);
+#else
+    initBareMetalRoxieTargets(roxieConnMap);
+#endif
+
     xpath.setf("Software/EspProcess[@name=\"%s\"]/EspService[@name=\"%s\"]/ActivityInfoCacheSeconds", process, service);
     unsigned activityInfoCacheSeconds = cfg->getPropInt(xpath.str(), defaultActivityInfoCacheForceBuildSecond);
     xpath.setf("Software/EspProcess[@name=\"%s\"]/EspService[@name=\"%s\"]/LogDaliConnection", process, service);
@@ -149,6 +159,7 @@ void CWsSMCEx::init(IPropertyTree *cfg, const char *process, const char *service
     xpath.setf("Software/EspProcess[@name=\"%s\"]/EspService[@name=\"%s\"]/ActivityInfoCacheAutoRebuildSeconds", process, service);
     unsigned activityInfoCacheAutoRebuildSeconds = cfg->getPropInt(xpath.str(), defaultActivityInfoCacheAutoRebuildSecond);
     activityInfoCacheReader.setown(new CActivityInfoCacheReader("Activity Reader", activityInfoCacheAutoRebuildSeconds, activityInfoCacheSeconds));
+    activityInfoCacheReader->init();
 }
 
 struct CActiveWorkunitWrapper: public CActiveWorkunit
@@ -237,12 +248,16 @@ struct CActiveWorkunitWrapper: public CActiveWorkunit
 
 void CActivityInfo::createActivityInfo(IEspContext& context)
 {
+    CConstWUClusterInfoArray clusters;
+#ifndef _CONTAINERIZED
     Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
     Owned<IConstEnvironment> env = factory->openEnvironment();
 
-    CConstWUClusterInfoArray clusters;
     Owned<IPropertyTree> envRoot= &env->getPTree();
     getEnvironmentClusterInfo(envRoot, clusters);
+#else
+    getContainerWUClusterInfo(clusters);
+#endif
 
     try
     {
@@ -261,7 +276,11 @@ void CActivityInfo::createActivityInfo(IEspContext& context)
     IPropertyTree* serverStatusRoot = connStatusServers->queryRoot();
 
     readTargetClusterInfo(clusters, serverStatusRoot);
+#ifndef _CONTAINERIZED
     readActiveWUsAndQueuedWUs(context, envRoot, serverStatusRoot);
+#else
+    readActiveWUsAndQueuedWUs(context, nullptr, serverStatusRoot);
+#endif
 
     timeCached.setNow();
 }
@@ -271,6 +290,9 @@ void CActivityInfo::readTargetClusterInfo(CConstWUClusterInfoArray& clusters, IP
     ForEachItemIn(c, clusters)
     {
         IConstWUClusterInfo &cluster = clusters.item(c);
+        if (cluster.onlyPublishedQueries()) //"publish-only" roxie not in SDS /JobQueues.
+            continue;
+
         Owned<CWsSMCTargetCluster> targetCluster = new CWsSMCTargetCluster();
         readTargetClusterInfo(cluster, serverStatusRoot, targetCluster);
         if (cluster.getPlatform() == ThorLCRCluster)
@@ -322,9 +344,13 @@ void CActivityInfo::readTargetClusterInfo(IConstWUClusterInfo& cluster, IPropert
 
     if (serverStatusRoot)
     {
+#ifndef _CONTAINERIZED
         smcQueue->foundQueueInStatusServer = findQueueInStatusServer(serverStatusRoot, statusServerName.str(), targetCluster->queueName.get());
         if (!smcQueue->foundQueueInStatusServer)
             targetCluster->clusterStatusDetails.appendf("Cluster %s not listening for workunits; ", clusterName.str());
+#else
+        smcQueue->foundQueueInStatusServer = true; //Server is launched dynamically.
+#endif
     }
 
     targetCluster->serverQueue.notFoundInJobQueues = !readJobQueue(targetCluster->serverQueue.queueName.str(), targetCluster->wuidsOnServerQueue, targetCluster->serverQueue.queueState, targetCluster->serverQueue.queueStateDetails);
@@ -418,8 +444,11 @@ void CActivityInfo::readActiveWUsAndQueuedWUs(IEspContext& context, IPropertyTre
     readRunningWUsAndJobQueueforOtherStatusServers(context, serverStatusRoot);
     //TODO: add queued WUs for ECLCCServer/ECLServer here. Right now, they are under target clusters.
 
+#ifndef _CONTAINERIZED
     getDFUServersAndWUs(context, envRoot, serverStatusRoot);
     getDFURecoveryJobs();
+    //For containerized HPCC, we do not know how to find out DFU Server queues, as well as running DFU WUs, for now.
+#endif
 }
 
 void CActivityInfo::readRunningWUsOnStatusServer(IEspContext& context, IPropertyTree* serverStatusRoot, WsSMCStatusServerType statusServerType)
@@ -959,7 +988,7 @@ void CActivityInfo::readServerJobQueueDetails(IEspContext &context, const char* 
             hasPaused =  true;
         else if (strieq(status.str(), "stopped"))
             hasStopped =  true;
-    
+
         if (details && *details)
             queueStateDetails.appendf("%s: queue %s; %s;", queueName, status.str(), details.str());
         else
@@ -983,7 +1012,7 @@ void CActivityInfo::readServerJobQueueDetails(IEspContext &context, const char* 
         {
             jobQueue->setQueueStatus("running");
         }
-    
+
         if (details && *details)
         {
             queueStateDetails.appendf("%s: queue %s; %s;", queueName, status.str(), details.str());
@@ -1005,23 +1034,158 @@ bool CWsSMCEx::onIndex(IEspContext &context, IEspSMCIndexRequest &req, IEspSMCIn
     return true;
 }
 
+// Output encoding to include in a Javascript block.
+// Follows OWASP guidance: keep [A-Za-z0-9], escape other printable ASCII as \uXXXX,
+// properly escape non-ASCII by decoding UTF-8 first. Also drop ASCII control chars
+// to maintain existing behavior.
+StringBuffer& encodeJavascript(const char* value, StringBuffer& encoded)
+{
+    if (isEmptyString(value))
+        return encoded;
+
+    const byte *p = reinterpret_cast<const byte *>(value);
+    const byte *end = p + strlen(value);
+
+    while (p < end)
+    {
+        UTF32 cp = readUtf8Character((unsigned)(end - p), p); // advances p safely
+
+        if (cp == sourceIllegal)
+        {
+            encoded.append("\\uFFFD");
+            p++;
+            continue;
+        }
+
+        if (cp < 0x80)
+        {
+            // ASCII branch: preserve alnum, escape other printable ASCII, drop controls
+            unsigned char ch = static_cast<unsigned char>(cp);
+            if (isalnum(ch))
+                encoded.append(ch);
+            else if (isprint(ch))
+                encoded.appendf("\\u%04X", ch);
+            // else: non-printable ASCII -> omit
+        }
+        else if (cp <= 0xFFFF)
+        {
+            // BMP: escape as \uXXXX, but avoid lone surrogates
+            if (cp >= 0xD800 && cp <= 0xDFFF)
+                encoded.append("\\uFFFD");
+            else
+                encoded.appendf("\\u%04X", static_cast<unsigned>(cp));
+        }
+        else if (cp <= 0x10FFFF)
+        {
+            // Supplementary planes: escape as UTF-16 surrogate pair
+            unsigned u = static_cast<unsigned>(cp - 0x10000);
+            unsigned high = 0xD800 + (u >> 10);
+            unsigned low  = 0xDC00 + (u & 0x3FF);
+            encoded.appendf("\\u%04X\\u%04X", high, low);
+        }
+        else
+        {
+            // Out of Unicode range
+            encoded.append("\\uFFFD");
+        }
+
+        if (cp == sourceExhausted)
+            break;
+    }
+
+    return encoded;
+}
+
+
+#ifdef _USE_CPPUNIT
+
+#include "unittests.hpp"
+
+class EncodeJavascriptTest : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE( EncodeJavascriptTest );
+        CPPUNIT_TEST(testAsciiAlnum);
+        CPPUNIT_TEST(testAsciiPrintableEscaped);
+        CPPUNIT_TEST(testAsciiControlDropped);
+        CPPUNIT_TEST(testUtf8Bmp);
+        CPPUNIT_TEST(testUtf8Supplementary);
+        CPPUNIT_TEST(testInvalidUtf8);
+        CPPUNIT_TEST(testOutOfRange);
+    CPPUNIT_TEST_SUITE_END();
+
+    static void assertEncoded(const char *input, const char *expected)
+    {
+        StringBuffer out;
+        encodeJavascript(input, out);
+        ASSERT_EQUAL(std::string(out.str()), std::string(expected));
+    }
+
+    void testAsciiAlnum()
+    {
+        assertEncoded("Az09", "Az09");
+    }
+
+    void testAsciiPrintableEscaped()
+    {
+        // space, dash, underscore, dot should be escaped
+        assertEncoded(" -_.", "\\u0020\\u002D\\u005F\\u002E");
+    }
+
+    void testAsciiControlDropped()
+    {
+        StringBuffer in;
+        in.append('A').append((char)0x0A).append('B').append((char)0x09).append('C'); // A\nB\tC
+        assertEncoded(in.str(), "ABC");
+    }
+
+    void testUtf8Bmp()
+    {
+        // U+00E9 (é) -> \u00E9; U+4E2D (中) -> \u4E2D
+        StringBuffer in;
+        in.append(" "); // leading space to ensure escaping of ASCII printable
+        in.append((char)0xC3).append((char)0xA9); // é
+        in.append(" ");
+        in.append((char)0xE4).append((char)0xB8).append((char)0xAD); // 中
+        assertEncoded(in.str(), "\\u0020\\u00E9\\u0020\\u4E2D");
+    }
+
+    void testUtf8Supplementary()
+    {
+        // U+1F600 GRINNING FACE -> surrogate pair \uD83D\uDE00
+        StringBuffer in;
+        in.append((char)0xF0).append((char)0x9F).append((char)0x98).append((char)0x80);
+        assertEncoded(in.str(), "\\uD83D\\uDE00");
+    }
+
+    void testInvalidUtf8()
+    {
+        // Lone continuation byte 0x80 and truncated sequence 0xC2 at end -> each becomes \uFFFD
+        StringBuffer in;
+        in.append((char)0x80).append('X').append((char)0xC2);
+        assertEncoded(in.str(), "\\uFFFDX\\uFFFD");
+    }
+
+    void testOutOfRange()
+    {
+        // U+10FFFF is the highest Unicode code point
+        StringBuffer in;
+        in.append((char)0xF4).append((char)0x90).append((char)0x80).append((char)0x80); // U+110000
+        assertEncoded(in.str(), "\\uFFFD\\uFFFD\\uFFFD\\uFFFD");
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( EncodeJavascriptTest );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( EncodeJavascriptTest, "EncodeJavascriptTest" );
+
+#endif // _USE_CPPUNIT
+
 void CWsSMCEx::readBannerAndChatRequest(IEspContext& context, IEspActivityRequest &req, IEspActivityResponse& resp)
 {
     StringBuffer chatURLStr, bannerStr;
     const char* chatURL = req.getChatURL();
     const char* banner = req.getBannerContent();
-    //Filter out invalid chars
-    if (chatURL && *chatURL)
-    {
-        const char* pStr = chatURL;
-        unsigned len = strlen(chatURL);
-        for (unsigned i = 0; i < len; i++)
-        {
-            if (isprint(*pStr))
-                chatURLStr.append(*pStr);
-            pStr++;
-        }
-    }
+    //Filter out invalid chars and encode for safe assignment to javascript variable
+    encodeJavascript(chatURL, chatURLStr);
     if (banner && *banner)
     {
         const char* pStr = banner;
@@ -1176,11 +1340,19 @@ bool CWsSMCEx::onActivity(IEspContext &context, IEspActivityRequest &req, IEspAc
 
         double version = context.getClientVersion();
 
-        bool isSuperUser = true;
+        bool isSuperUser = false; // deny by default
 #ifdef _USE_OPENLDAP
-        CLdapSecManager* secmgr = dynamic_cast<CLdapSecManager*>(context.querySecManager());
-        if(secmgr && !secmgr->isSuperUser(context.queryUser()))
-            isSuperUser =  false;
+        ILdapSecManager* secmgr = dynamic_cast<ILdapSecManager*>(context.querySecManager());
+
+        // If an LDAP security manager is in use, superuser status can be queried;
+        // otherwise the user is a superuser by default
+        if(secmgr)
+            isSuperUser = secmgr->isSuperUser(context.queryUser());
+        else
+            isSuperUser = true;
+#else
+        // User is a superuser by default if not compiled with OPEN LDAP support
+        isSuperUser = true;
 #endif
         if(isSuperUser && req.getFromSubmitBtn())
             readBannerAndChatRequest(context, req, resp);
@@ -1211,7 +1383,7 @@ void CWsSMCEx::addWUsToResponse(IEspContext &context, const IArrayOf<IEspActiveW
     {
         IEspActiveWorkunit& wu = aws.item(i);
         const char* wuid = wu.getWuid();
-        if (wuid[0] == 'D')//DFU WU
+        if (toupper(wuid[0]) == 'D')//DFU WU
         {
             awsReturned.append(*LINK(&wu));
             continue;
@@ -1240,6 +1412,7 @@ void CWsSMCEx::addWUsToResponse(IEspContext &context, const IArrayOf<IEspActiveW
                 cw->setInstance(instanceName); // JCSMORE In thor case at least, if queued it is unknown which instance it will run on..
             if (targetClusterName && *targetClusterName)
                 cw->setTargetClusterName(targetClusterName);
+            cw->setNoAccess(true);
             awsReturned.append(*cw.getClear());
 
             e->Release();
@@ -1254,6 +1427,10 @@ void CWsSMCEx::setActivityResponse(IEspContext &context, CActivityInfo* activity
     double version = context.getClientVersion();
     const char* sortBy = req.getSortBy();
     bool descending = req.getDescending();
+
+    if (!isEmptyString(sortBy) && !(strieq(sortBy, "name") || strieq(sortBy, "size")))
+        throw makeStringException(ECLWATCH_INVALID_INPUT, "Invalid SortBy value- must be 'Name' or 'Size'");
+
     if (version >= 1.22)
     {
         StringBuffer s;
@@ -1362,7 +1539,7 @@ void CWsSMCEx::setESPTargetClusters(IEspContext& context, const CIArrayOf<CWsSMC
     }
 }
 
-void CWsSMCEx::addCapabilities(IPropertyTree* pFeatureNode, const char* access, 
+void CWsSMCEx::addCapabilities(IPropertyTree* pFeatureNode, const char* access,
                                          IArrayOf<IEspCapability>& capabilities)
 {
     StringBuffer xpath(access);
@@ -1404,7 +1581,7 @@ bool CWsSMCEx::onMoveJobDown(IEspContext &context, IEspSMCJobRequest &req, IEspS
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1433,7 +1610,7 @@ bool CWsSMCEx::onMoveJobUp(IEspContext &context, IEspSMCJobRequest &req, IEspSMC
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1479,7 +1656,7 @@ bool CWsSMCEx::onMoveJobBack(IEspContext &context, IEspSMCJobRequest &req, IEspS
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1526,7 +1703,7 @@ bool CWsSMCEx::onMoveJobFront(IEspContext &context, IEspSMCJobRequest &req, IEsp
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1538,7 +1715,8 @@ bool CWsSMCEx::onRemoveJob(IEspContext &context, IEspSMCJobRequest &req, IEspSMC
     {
         context.ensureFeatureAccess(THORQUEUE_FEATURE, SecAccess_Full, ECLWATCH_THOR_QUEUE_ACCESS_DENIED, QUEUE_ACCESS_DENIED);
 
-        abortWorkUnit(req.getWuid(), context.querySecManager(), context.queryUser());
+        const char *abortReason = (context.getClientVersion() >= 1.31) ? req.getAbortReason() : nullptr;
+        abortWorkUnit(req.getWuid(), context.querySecManager(), context.queryUser(), abortReason);
 
         {
             Owned<IJobQueue> queue = createJobQueue(req.getQueueName());
@@ -1556,7 +1734,7 @@ bool CWsSMCEx::onRemoveJob(IEspContext &context, IEspSMCJobRequest &req, IEspSMC
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1582,7 +1760,7 @@ bool CWsSMCEx::onStopQueue(IEspContext &context, IEspSMCQueueRequest &req, IEspS
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1608,7 +1786,7 @@ bool CWsSMCEx::onResumeQueue(IEspContext &context, IEspSMCQueueRequest &req, IEs
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1624,7 +1802,11 @@ const char* CWsSMCEx::createQueueActionInfo(IEspContext &context, const char* st
     CDateTime now;
     now.setNow();
     now.getString(currentTime);
-    info.appendf("%s by <%s> at <%s> from <%s>", state, userId, currentTime.str(), peer.str());
+    // Containerized deployments see an internal proxy address here, not the user's source IP.
+    if (isContainerized())
+        info.appendf("%s by <%s> at <%s>", state, userId, currentTime.str());
+    else
+        info.appendf("%s by <%s> at <%s> from <%s>", state, userId, currentTime.str(), peer.str());
     const char* comment = req.getComment();
     if (comment && *comment)
         info.append(": ' ").append(comment).append("'");
@@ -1651,7 +1833,7 @@ bool CWsSMCEx::onPauseQueue(IEspContext &context, IEspSMCQueueRequest &req, IEsp
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1662,13 +1844,21 @@ bool CWsSMCEx::onClearQueue(IEspContext &context, IEspSMCQueueRequest &req, IEsp
     try
     {
         context.ensureFeatureAccess(THORQUEUE_FEATURE, SecAccess_Full, ECLWATCH_THOR_QUEUE_ACCESS_DENIED, QUEUE_ACCESS_DENIED);
+        const char *abortReason = (context.getClientVersion() >= 1.31) ? req.getAbortReason() : nullptr;
         {
             Owned<IJobQueue> queue = createJobQueue(req.getQueueName());
             QueueLock lock(queue);
             for(unsigned i=0;i<queue->ordinality();i++)
             {
                 Owned<IJobQueueItem> item = queue->getItem(i);
-                abortWorkUnit(item->queryWUID(), context.querySecManager(), context.queryUser());
+                StringAttr wuid;
+                const char *wuidGraph = item->queryWUID();
+                const char *sep = strchr(wuidGraph, '/');
+                if (sep)
+                    wuid.set(wuidGraph, sep-wuidGraph);
+                else
+                    wuid.set(wuidGraph);
+                abortWorkUnit(wuid, context.querySecManager(), context.queryUser(), abortReason);
             }
             queue->clear();
         }
@@ -1681,7 +1871,7 @@ bool CWsSMCEx::onClearQueue(IEspContext &context, IEspSMCQueueRequest &req, IEsp
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1746,7 +1936,7 @@ bool CWsSMCEx::onSetJobPriority(IEspContext &context, IEspSMCPriorityRequest &re
         resp.setRedirectUrl("/WsSMC/");
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1758,16 +1948,16 @@ bool CWsSMCEx::onGetThorQueueAvailability(IEspContext &context, IEspGetThorQueue
     {
         context.ensureFeatureAccess(FEATURE_URL, SecAccess_Read, ECLWATCH_THOR_QUEUE_ACCESS_DENIED, QUEUE_ACCESS_DENIED);
 
-        StringArray thorNames, groupNames, targetNames, queueNames;
-        getEnvironmentThorClusterNames(thorNames, groupNames, targetNames, queueNames);
+        StringArray targetNames, queueNames;
+        getThorClusterNames(targetNames, queueNames);
 
         IArrayOf<IEspThorCluster> ThorClusters;
-        ForEachItemIn(x, thorNames)
+        ForEachItemIn(x, targetNames)
         {
             const char* targetName = targetNames.item(x);
             const char* queueName = queueNames.item(x);
             IEspThorCluster* returnCluster = new CThorCluster("","");
-                
+
             returnCluster->setClusterName(targetName);
             returnCluster->setQueueName(queueName);
 
@@ -1794,7 +1984,7 @@ bool CWsSMCEx::onGetThorQueueAvailability(IEspContext &context, IEspGetThorQueue
         resp.setThorClusters(ThorClusters);
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1805,7 +1995,7 @@ bool CWsSMCEx::onSetBanner(IEspContext &context, IEspSetBannerRequest &req, IEsp
     try
     {
 #ifdef _USE_OPENLDAP
-        CLdapSecManager* secmgr = dynamic_cast<CLdapSecManager*>(context.querySecManager());
+        ILdapSecManager* secmgr = dynamic_cast<ILdapSecManager*>(context.querySecManager());
         if(secmgr && !secmgr->isSuperUser(context.queryUser()))
         {
             context.setAuthStatus(AUTH_STATUS_NOACCESS);
@@ -1875,7 +2065,29 @@ bool CWsSMCEx::onSetBanner(IEspContext &context, IEspSetBannerRequest &req, IEsp
         resp.setRedirectUrl("/WsSMC/Activity");
     }
     catch(IException* e)
-    {   
+    {
+        FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
+    }
+    return true;
+}
+
+bool CWsSMCEx::onGetBanner(IEspContext &context, IEspGetBannerRequest &req, IEspGetBannerResponse& resp)
+{
+    context.ensureFeatureAccess(FEATURE_URL, SecAccess_Read, ECLWATCH_SMC_ACCESS_DENIED, SMC_ACCESS_DENIED);
+
+    try
+    {
+        // Similar to setBannerAndChatData, return the banner information stored in member variables
+        resp.setShowBanner(m_BannerAction);
+        resp.setShowChatURL(m_EnableChatURL);
+        resp.setBannerContent(m_Banner.str());
+        resp.setBannerSize(m_BannerSize.str());
+        resp.setBannerColor(m_BannerColor.str());
+        resp.setBannerScroll(m_BannerScroll.str());
+        resp.setChatURL(m_ChatURL.str());
+    }
+    catch(IException* e)
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return true;
@@ -1894,23 +2106,22 @@ bool CWsSMCEx::onBrowseResources(IEspContext &context, IEspBrowseResourcesReques
 
         double version = context.getClientVersion();
 
-        Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
-        Owned<IConstEnvironment> constEnv = factory->openEnvironment();
-
         //The resource files will be downloaded from the same box of ESP (not dali)
-        StringBuffer ipStr;
-        IpAddress ipaddr = queryHostIP();
-        ipaddr.getIpText(ipStr);
-        if (ipStr.length() > 0)
+        if (version >= 1.27)
+            resp.setESPInstance(espInstance);
+        else
         {
-            resp.setNetAddress(ipStr.str());
-            Owned<IConstMachineInfo> machine = constEnv->getMachineByAddress(ipStr.str());
-            if (machine)
-            {
-                int os = machine->getOS();
-                resp.setOS(os);
-            }
+            StringBuffer ipStr;
+            IpAddress ipaddr = queryHostIP();
+            ipaddr.getHostText(ipStr);
+            if (!ipStr.isEmpty())
+                resp.setNetAddress(ipStr.str());
         }
+#ifdef _WIN32
+        resp.setOS(MachineOsW2K);
+#else
+        resp.setOS(MachineOsLinux);
+#endif
 
         if (m_PortalURL.length() > 0)
             resp.setPortalURL(m_PortalURL.str());
@@ -1925,18 +2136,11 @@ bool CWsSMCEx::onBrowseResources(IEspContext &context, IEspBrowseResourcesReques
         //Now, get a list of resources stored inside the ESP box
         IArrayOf<IEspHPCCResourceRepository> resourceRepositories;
 
-        Owned<IPropertyTree> pEnvRoot = &constEnv->getPTree();
-        const char* ossInstall = pEnvRoot->queryProp("EnvSettings/path");
-        if (!ossInstall || !*ossInstall)
-        {
-            OWARNLOG("Failed to get EnvSettings/Path in environment settings.");
-            return true;
-        }
-
-        StringBuffer path;
-        path.appendf("%s/componentfiles/files/downloads", ossInstall);
+        StringBuffer path(getCFD());
+        const char sepChar = getPathSepChar(path);
+        addPathSepChar(path, sepChar).append("files").append(sepChar).append("downloads");
         Owned<IFile> f = createIFile(path.str());
-        if(!f->exists() || !f->isDirectory())
+        if (!f->exists() || (f->isDirectory() != fileBool::foundYes))
         {
             OWARNLOG("Invalid resource folder");
             return true;
@@ -2162,7 +2366,7 @@ int CWsSMCSoapBindingEx::onGetForm(IEspContext &context, CHttpRequest* request, 
         }
     }
     catch(IException* e)
-    {   
+    {
         FORWARDEXCEPTION(context, e,  ECLWATCH_INTERNAL_ERROR);
     }
     return onGetForm(context, request, response, service, method);
@@ -2182,26 +2386,125 @@ inline const char *controlCmdMessage(int cmd)
         return "<control:reload forceRetry='1' />";
     case CRoxieControlCmdType_STATE:
         return "<control:state/>";
+    case CRoxieControlCmdType_MEMLOCK:
+        return "<control:memlock/>";
+    case CRoxieControlCmdType_MEMUNLOCK:
+        return "<control:memunlock/>";
+    case CRoxieControlCmdType_GETMEMLOCKED:
+        return "<control:getmemlocked/>";
     default:
         throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Unknown Roxie Control Command.");
     }
     return NULL;
 }
 
-bool CWsSMCEx::onRoxieControlCmd(IEspContext &context, IEspRoxieControlCmdRequest &req, IEspRoxieControlCmdResponse &resp)
+bool CWsSMCEx::onRoxieXrefCmd(IEspContext &context, IEspRoxieXrefCmdRequest &req, IEspRoxieXrefCmdResponse &resp)
 {
     context.ensureFeatureAccess(ROXIE_CONTROL_URL, SecAccess_Full, ECLWATCH_SMC_ACCESS_DENIED, SMC_ACCESS_DENIED);
 
-    const char *process = req.getProcessCluster();
-    if (!process || !*process)
-        throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Process cluster not specified.");
-    const char *controlReq = controlCmdMessage(req.getCommand());
+    StringBuffer controlReq;
+    if (0==req.getQueryIds().length())
+        controlReq.append("<control:getQueryXrefInfo/>");
+    else
+    {
+        controlReq.append("<control:getQueryXrefInfo>");
+        ForEachItemIn(i, req.getQueryIds())
+        {
+            const char *id = req.getQueryIds().item(i);
+            if (!isEmptyString(id))
+                controlReq.appendf("<Query id='%s'/>", id);
+        }
+        controlReq.append("</control:getQueryXrefInfo>");
+    }
+
+#ifndef _CONTAINERIZED
+    const char *process = req.getRoxieCluster();
+    if (isEmptyString(process))
+        throw makeStringException(ECLWATCH_MISSING_PARAMS, "Process cluster not specified.");
 
     SocketEndpointArray addrs;
     getRoxieProcessServers(process, addrs);
     if (!addrs.length())
-        throw MakeStringException(ECLWATCH_CANNOT_GET_ENV_INFO, "Process cluster not found.");
-    Owned<IPropertyTree> controlResp = sendRoxieControlAllNodes(addrs.item(0), controlReq, true, req.getWait());
+        throw makeStringException(ECLWATCH_CANNOT_GET_ENV_INFO, "Process cluster not found.");
+    Owned<IPropertyTree> controlResp;
+    if (req.getCheckAllNodes())
+        controlResp.setown(sendRoxieControlAllNodes(addrs.item(0), controlReq, true, req.getWait()));
+    else
+        controlResp.setown(sendRoxieControlQuery(addrs.item(0), controlReq, req.getWait()));
+#else
+    const char *target = req.getRoxieCluster();
+    if (isEmptyString(target))
+        throw makeStringException(ECLWATCH_MISSING_PARAMS, "Target cluster not specified.");
+
+    ISmartSocketFactory *conn = roxieConnMap.getValue(target);
+    if (!conn)
+        throw makeStringExceptionV(ECLWATCH_CANNOT_GET_ENV_INFO, "roxie target cluster not mapped: %s", target);
+    if (!k8s::isActiveService(target))
+        throw makeStringExceptionV(ECLWATCH_CANNOT_GET_ENV_INFO, "roxie target cluster has no active servers: %s", target);
+    Owned<IPropertyTree> controlResp;
+    if (req.getCheckAllNodes())
+        controlResp.setown(sendRoxieControlAllNodes(conn->nextEndpoint(), controlReq, true, req.getWait()));
+    else
+        controlResp.setown(sendRoxieControlQuery(conn->nextEndpoint(), controlReq, req.getWait()));
+#endif
+
+    if (!controlResp)
+        throw MakeStringException(ECLWATCH_INTERNAL_ERROR, "Failed to get control:getQueryXrefInfo response from roxie.");
+
+    //can only rename a ptree in context.  It prevents inconsistencies but in some cases is inconvenient
+    Owned<IPropertyTree> parent = createPTree();
+    const IPropertyTree *resultTree = parent->setPropTree("QueryXrefInfo", controlResp.getLink());
+
+    StringBuffer result;
+    switch (context.getResponseFormat())
+    {
+        case ESPSerializationANY:
+        case ESPSerializationXML:
+            toXML(resultTree, result);
+            break;
+        case ESPSerializationJSON:
+            toJSON(resultTree, result);
+            break;
+        default:
+            throw MakeStringException(ECLWATCH_INTERNAL_ERROR, "Unsupported RoxieXref output format requested.");
+            break;
+    }
+    resp.setResult(result);
+
+    return false;
+}
+
+bool CWsSMCEx::onRoxieControlCmd(IEspContext &context, IEspRoxieControlCmdRequest &req, IEspRoxieControlCmdResponse &resp)
+{
+    context.ensureFeatureAccess(ROXIE_CONTROL_URL, SecAccess_Full, ECLWATCH_SMC_ACCESS_DENIED, SMC_ACCESS_DENIED);
+
+    const char *controlReq = controlCmdMessage(req.getCommand());
+
+#ifndef _CONTAINERIZED
+    const char *process = req.getProcessCluster();
+    if (isEmptyString(process))
+        throw makeStringException(ECLWATCH_MISSING_PARAMS, "Process cluster not specified.");
+
+    ISmartSocketFactory *conn = roxieConnMap.getValue(process);
+    if (!conn)
+        throw makeStringExceptionV(ECLWATCH_CANNOT_GET_ENV_INFO, "Connection info for '%s' process cluster not found.", process);
+
+    Owned<IPropertyTree> controlResp = sendRoxieControlAllNodes(conn, controlReq, true, req.getWait(), ROXIECONNECTIONTIMEOUT);
+#else
+    const char *target = req.getTargetCluster();
+    if (isEmptyString(target))
+        target = req.getProcessCluster(); //backward compatible
+    if (isEmptyString(target))
+        throw makeStringException(ECLWATCH_MISSING_PARAMS, "Target cluster not specified.");
+
+    ISmartSocketFactory *conn = roxieConnMap.getValue(target);
+    if (!conn)
+        throw makeStringExceptionV(ECLWATCH_CANNOT_GET_ENV_INFO, "roxie target cluster not mapped: %s", target);
+    if (!k8s::isActiveService(target))
+        throw makeStringExceptionV(ECLWATCH_CANNOT_GET_ENV_INFO, "roxie target cluster has no active servers: %s", target);
+
+    Owned<IPropertyTree> controlResp = sendRoxieControlAllNodes(conn, controlReq, true, req.getWait(), ROXIECONNECTIONTIMEOUT);
+#endif
     if (!controlResp)
         throw MakeStringException(ECLWATCH_INTERNAL_ERROR, "Failed to get control response from roxie.");
 
@@ -2217,6 +2520,8 @@ bool CWsSMCEx::onRoxieControlCmd(IEspContext &context, IEspRoxieControlCmdReques
             respEndpoint->setAttached(roxieEndpoint.getPropBool("Dali/@connected"));
         if (roxieEndpoint.hasProp("State/@hash"))
             respEndpoint->setStateHash(roxieEndpoint.queryProp("State/@hash"));
+        if (roxieEndpoint.hasProp("heapLockMemory/@locked"))
+            respEndpoint->setMemLocked(roxieEndpoint.getPropBool("heapLockMemory/@locked"));
         respEndpoints.append(*respEndpoint.getClear());
     }
     resp.setEndpoints(respEndpoints);
@@ -2415,7 +2720,7 @@ void CWsSMCEx::setActiveWUs(IEspContext &context, IEspActiveWorkunit& wu, IEspAc
             wuToSet->setInstance(instanceName); // JCSMORE In thor case at least, if queued it is unknown which instance it will run on..
         if (targetClusterName && *targetClusterName)
             wuToSet->setTargetClusterName(targetClusterName);
-
+        wuToSet->setNoAccess(true);
         e->Release();
     }
 }
@@ -2616,6 +2921,15 @@ bool CWsSMCEx::onGetBuildInfo(IEspContext &context, IEspGetBuildInfoRequest &req
             namedValue->setValue("ON");
             buildInfo.append(*namedValue.getClear());
         }
+        Owned<IPropertyTree> costPT = getGlobalConfigSP()->getPropTree("cost");
+        if (costPT)
+        {
+            Owned<IEspNamedValue> namedValue = createNamedValue();
+            namedValue->setName("currencyCode");
+            const char * currencyCode = costPT->queryProp("@currencyCode");
+            namedValue->setValue(isEmptyString(currencyCode)?"USD":currencyCode);
+            buildInfo.append(*namedValue.getClear());
+        }
         resp.setBuildInfo(buildInfo);
     }
     catch(IException* e)
@@ -2625,3 +2939,437 @@ bool CWsSMCEx::onGetBuildInfo(IEspContext &context, IEspGetBuildInfoRequest &req
 
     return true;
 }
+
+
+// ---- Global Metrics migration (from ws_machine) ----
+class CArrayGlobalMetricRecorder : implements IGlobalMetricRecorder
+{
+public:
+    CArrayGlobalMetricRecorder(IArrayOf<IEspGlobalMetric> & _target) : target(_target) {}
+    void processGlobalStatistics(const char * category, const MetricsDimensionList & dimensions, const char * startTime, const char * endTime, const GlobalStatisticsList & stats) override
+    {
+        Owned<IEspGlobalMetric> targetMetric = createGlobalMetric();
+        targetMetric->setCategory(category);
+        targetMetric->updateDateTimeRange().setStart(startTime);
+        targetMetric->updateDateTimeRange().setEnd(endTime);
+        for (const auto & dimension : dimensions)
+        {
+            Owned<IEspDimension> targetDimension = createDimension();
+            targetDimension->setName(dimension.first);
+            targetDimension->setValue(dimension.second);
+            targetMetric->getDimensions().append(*targetDimension.getClear());
+        }
+        for (const auto & stat : stats)
+        {
+            Owned<IEspStat> targetStat = createStat();
+            targetStat->setName(queryStatisticName(stat.first));
+            targetStat->setValue(std::to_string(stat.second).c_str());
+            targetMetric->getStats().append(*targetStat.getClear());
+        }
+        target.append(*targetMetric.getClear());
+    }
+private:
+    IArrayOf<IEspGlobalMetric> & target;
+};
+
+static void handleGetGlobalMetrics(IEspGetGlobalMetricsRequest &req, IEspGetGlobalMetricsResponse &resp)
+{
+    const char* category = req.getCategory();
+    MetricsDimensionList dimensions;
+    ForEachItemIn(i, req.getDimensions())
+    {
+        IConstDimension& dim = req.getDimensions().item(i);
+        if (!isEmptyString(dim.getName()))
+            dimensions.push_back({dim.getName(), dim.getValue()});
+    }
+    if (isEmptyString(category) || strieq(category, "All"))
+        category = nullptr;
+
+    CDateTime start, end;
+    const char * startStr = req.getDateTimeRange().getStart();
+    const char * endStr = req.getDateTimeRange().getEnd();
+
+    if (isEmptyString(startStr) || isEmptyString(endStr))
+        throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Missing complete DateTimeRange- Start and End required");
+
+    start.setString(startStr, NULL, false);
+    end.setString(endStr, NULL, false);
+    IArrayOf<IEspGlobalMetric> metricsResponse;
+    CArrayGlobalMetricRecorder metricRecorder(metricsResponse);
+    gatherGlobalMetrics(category, dimensions, start, end, metricRecorder);
+    resp.setGlobalMetrics(metricsResponse);
+}
+
+static void handleRecordGlobalMetrics(IEspRecordGlobalMetricsRequest &req, IEspRecordGlobalMetricsResponse &resp)
+{
+    const char* category = req.getCategory();
+    if (isEmptyString(category))
+        throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Category is required for recording global metrics");
+
+    // Build dimensions list
+    MetricsDimensionList dimensions;
+    ForEachItemIn(i, req.getDimensions())
+    {
+        IConstDimension& dim = req.getDimensions().item(i);
+        if (!isEmptyString(dim.getName()))
+            dimensions.push_back({dim.getName(), dim.getValue()});
+    }
+
+    // Build statistics collection for recording
+    CRuntimeStatisticCollection stats(allStatistics);
+    unsigned validStatCount = 0;
+    StringArray unknownStatNames;
+
+    ForEachItemIn(j, req.getStats())
+    {
+        IConstStat& stat = req.getStats().item(j);
+        const char* statName = stat.getName();
+        const char* statValue = stat.getValue();
+
+        if (isEmptyString(statName) || isEmptyString(statValue))
+            continue;
+
+        StatisticKind kind = queryStatisticKind(statName, StKindNone);
+        if (kind == StKindNone)
+        {
+            // Collect unknown statistic names in a unique list
+            if (NotFound == unknownStatNames.find(statName))
+                unknownStatNames.append(statName);
+            continue;
+        }
+
+        stat_type value = _atoi64(statValue);
+        stats.queryStatistic(kind).set(value);
+        validStatCount++;
+    }
+
+    if (validStatCount == 0)
+        throw MakeStringException(ECLWATCH_MISSING_PARAMS, "No valid statistics provided for recording");
+
+    recordGlobalMetrics(category, dimensions, stats, &allStatistics);
+
+    // Generate appropriate response message
+    if (unknownStatNames.ordinality() == 0)
+    {
+        resp.setResult("All global metrics recorded successfully");
+    }
+    else
+    {
+        StringBuffer resultMsg("Some global metrics not recorded. Names: ");
+        ForEachItemIn(k, unknownStatNames)
+        {
+            if (k > 0)
+                resultMsg.append(", ");
+            resultMsg.append(unknownStatNames.item(k));
+        }
+        resp.setResult(resultMsg.str());
+    }
+}
+
+bool CWsSMCEx::onGetGlobalMetrics(IEspContext &context, IEspGetGlobalMetricsRequest &req, IEspGetGlobalMetricsResponse &resp)
+{
+    try
+    {
+        context.ensureFeatureAccess(FEATURE_URL, SecAccess_Read, ECLWATCH_SMC_ACCESS_DENIED, "Failed to get global metrics. Permission denied.");
+        handleGetGlobalMetrics(req, resp);
+    }
+    catch (IException *e)
+    {
+        FORWARDEXCEPTION(context, e, ECLWATCH_INTERNAL_ERROR);
+    }
+    return true;
+}
+
+bool CWsSMCEx::onRecordGlobalMetrics(IEspContext &context, IEspRecordGlobalMetricsRequest &req, IEspRecordGlobalMetricsResponse &resp)
+{
+    try
+    {
+        context.ensureFeatureAccess(FEATURE_URL, SecAccess_Write, ECLWATCH_SMC_ACCESS_DENIED, "Failed to record global metrics. Permission denied.");
+        handleRecordGlobalMetrics(req, resp);
+    }
+    catch (IException *e)
+    {
+        FORWARDEXCEPTION(context, e, ECLWATCH_INTERNAL_ERROR);
+    }
+    return true;
+}
+
+#ifdef _USE_CPPUNIT
+//---------------------------------------------------------------------------
+// Unit test for handleGetGlobalMetrics() local helper.
+// Name prefixed with 'Dali' to indicate it needs a locally-running dali
+// and therefore automatically excluded from automated tests.
+//---------------------------------------------------------------------------
+
+#include "mpbase.hpp"
+#include "mpcomm.hpp"
+#include "daclient.hpp"
+#include "dasds.hpp"
+#include "dautils.hpp"
+#include <cppunit/extensions/HelperMacros.h>
+#include <algorithm>
+#include <vector>
+#include <set>
+#include <string>
+
+// copy daliClientInit/daliClientEnd approach from testing/unittests/dalitests.cpp
+static unsigned localDaliInitCounter = 0;
+static Owned<IUserDescriptor> testUser;
+
+static void daliClientInit()
+{
+    if (localDaliInitCounter != 0)
+        return;
+    InitModuleObjects();
+    testUser.setown(createUserDescriptor());
+    testUser->set("user", "passwd");
+    SocketEndpoint ep;
+    ep.set(".", 7070); // local dali (standard test harness port)
+    SocketEndpointArray epa;
+    epa.append(ep);
+    Owned<IGroup> group = createIGroup(epa);
+    initClientProcess(group, DCR_Testing);
+    localDaliInitCounter++;
+}
+
+static void daliClientEnd()
+{
+    if (!localDaliInitCounter)
+        return;
+    else if (localDaliInitCounter == 1)
+    {
+        releaseAtoms();
+        closedownClientProcess();
+        setNodeCaching(false);
+        testUser.clear();
+        localDaliInitCounter = 0;
+    }
+    else
+        localDaliInitCounter--;
+}
+
+static const std::vector<const char*> expectedCategories = { "categoryOne", "categoryTwo" };
+
+class DaliWsSMCGlobalMetricsTest : public CppUnit::TestFixture {
+    CPPUNIT_TEST_SUITE(DaliWsSMCGlobalMetricsTest);
+    CPPUNIT_TEST(doStart);
+    CPPUNIT_TEST(testAllCategoriesExplicit);
+    CPPUNIT_TEST(testAllCategoriesImplicit);
+    CPPUNIT_TEST(testSingleCategoryAndDimensions);
+    CPPUNIT_TEST(testDimensionAcrossCategories);
+    CPPUNIT_TEST(testRecordMetricsNoCategoryException);
+    CPPUNIT_TEST(testRecordMetricsNoValidStatsException);
+    CPPUNIT_TEST(testRecordMetricsAllKnownSuccess);
+    CPPUNIT_TEST(testRecordMetricsUnknownStatKind);
+    CPPUNIT_TEST(doStop);
+    CPPUNIT_TEST_SUITE_END();
+public:
+    void doStart() {
+        daliClientInit();
+        // Reset removes all Instances of a category. A category
+        // with no instances is not returned in the response.
+        // So these calls help ensure the test is starting from a clean slate.
+        resetGlobalMetrics("categoryOne", MetricsDimensionList());
+        resetGlobalMetrics("categoryTwo", MetricsDimensionList());
+        setGlobalMetricNowTime("1999-07-01T12:00:00");
+        prepareSampleMetrics();
+    }
+    void doStop() {
+        // Remove our test data from dali to avoid polluting other tests.
+        resetGlobalMetrics("categoryOne", MetricsDimensionList());
+        resetGlobalMetrics("categoryTwo", MetricsDimensionList());
+        daliClientEnd();
+    }
+    void prepareSampleMetrics() {
+        recordGlobalMetrics("categoryOne", MetricsDimensionList{}, { StTimeLocalExecute }, { 111 });
+        recordGlobalMetrics("categoryOne", MetricsDimensionList{{"user","alice"}}, { StTimeLocalExecute, StCostExecute }, { 222, 5 });
+        recordGlobalMetrics("categoryOne", MetricsDimensionList{{"user","bob"},{"cluster","thor1"}}, { StTimeLocalExecute }, { 333 });
+        recordGlobalMetrics("categoryTwo", MetricsDimensionList{}, { StTimeLocalExecute }, { 444 });
+        recordGlobalMetrics("categoryTwo", MetricsDimensionList{{"user","alice"}}, { StTimeLocalExecute, StCostExecute }, { 555, 7 });
+        recordGlobalMetrics("categoryTwo", MetricsDimensionList{{"user","bob"},{"cluster","thor1"}}, { StTimeLocalExecute }, { 666 });
+    }
+    static Owned<IEspGetGlobalMetricsRequest> createRequestFromXML(const char * xml) {
+        Owned<IPropertyTree> t = createPTreeFromXMLString(xml);
+        Owned<IEspGetGlobalMetricsRequest> req = createGetGlobalMetricsRequest();
+        if (const char *cat = t->queryProp("Category"))
+            req->setCategory(cat);
+        if (IPropertyTree * rng = t->queryPropTree("DateTimeRange")) {
+            if (const char *s = rng->queryProp("Start"))
+                req->updateDateTimeRange().setStart(s);
+            if (const char *e = rng->queryProp("End"))
+                req->updateDateTimeRange().setEnd(e);
+        }
+        Owned<IPropertyTreeIterator> dims = t->getElements("Dimensions/Dimension");
+        ForEach(*dims) {
+            IPropertyTree &d = dims->query();
+            const char *name = d.queryProp("Name");
+            if (isEmptyString(name)) continue;
+            Owned<IEspDimension> dim = createDimension();
+            dim->setName(name);
+            dim->setValue(d.queryProp("Value"));
+            req->getDimensions().append(*dim.getClear());
+        }
+        return req.getClear();
+    }
+    static void serializeResponse(IEspGetGlobalMetricsResponse &resp, StringBuffer &out) {
+        CGetGlobalMetricsResponse *impl = dynamic_cast<CGetGlobalMetricsResponse *>(&resp);
+        CPPUNIT_ASSERT_MESSAGE("Response object type unexpected", impl != nullptr);
+        CGetGlobalMetricsResponse::serializer(nullptr, *impl, out, true);
+    }
+
+    void assertResponseMatchesExpected(IEspGetGlobalMetricsResponse &resp, const char * expected) {
+        StringBuffer out;
+        serializeResponse(resp, out);
+        Owned<IPropertyTree> responseTree = createPTreeFromXMLString(out.str());
+        Owned<IPropertyTree> expectedTree = createPTreeFromXMLString(expected);
+        VStringBuffer message("Response XML does not match expected. \nExpected:\n%s\nActual:\n%s", expected, out.str());
+        CPPUNIT_ASSERT_MESSAGE(message.str(), areMatchingPTrees(responseTree, expectedTree));
+    }
+
+    // Ensure all the categories _this test_ added are present in the response.
+    // Ignore others to allow for the possibility that other categories may be present
+    // from other tests.
+    static void assertResponseIncludesCategories(IEspGetGlobalMetricsResponse &resp, const std::vector<const char*>& expectedCategories)
+    {
+        std::set<std::string> responseCategories;
+
+        // Collect all categories from the response
+        const IArrayOf<IConstGlobalMetric>& metrics = resp.getGlobalMetrics();
+        ForEachItemIn(i, metrics)
+        {
+            IConstGlobalMetric& metric = metrics.item(i);
+            const char* category = metric.getCategory();
+            if (category && *category)
+                responseCategories.insert(category);
+        }
+
+        // Collect all missing categories
+        std::vector<std::string> missingCategories;
+        for (const char* expectedCategory : expectedCategories)
+        {
+            if (responseCategories.find(expectedCategory) == responseCategories.end())
+                missingCategories.push_back(expectedCategory);
+        }
+
+        // Report missing categories if any
+        if (!missingCategories.empty())
+        {
+            VStringBuffer message("Missing categories in response: ");
+            bool first = true;
+            for (const std::string& missing : missingCategories)
+            {
+                if (!first)
+                    message.append(", ");
+                message.append("'").append(missing.c_str()).append("'");
+                first = false;
+            }
+
+            // Add serialized response for debugging
+            StringBuffer serializedResp;
+            serializeResponse(resp, serializedResp);
+            message.append(". Response: ").append(serializedResp.str());
+
+            CPPUNIT_FAIL(message.str());
+        }
+    }
+
+    void testAllCategoriesExplicit() {
+        static const char * requestXML = "<GetGlobalMetricsRequest><Category>All</Category><DateTimeRange><Start>1999-01-01T00:00:00</Start><End>2099-01-01T00:00:00</End></DateTimeRange></GetGlobalMetricsRequest>";
+        Owned<IEspGetGlobalMetricsRequest> req = createRequestFromXML(requestXML);
+        Owned<IEspGetGlobalMetricsResponse> resp = createGetGlobalMetricsResponse();
+        handleGetGlobalMetrics(*req, *resp);
+        assertResponseIncludesCategories(*resp, expectedCategories);
+    }
+    void testAllCategoriesImplicit() {
+        static const char * requestXML = "<GetGlobalMetricsRequest><DateTimeRange><Start>1999-01-01T00:00:00</Start><End>2099-01-01T00:00:00</End></DateTimeRange></GetGlobalMetricsRequest>";
+        Owned<IEspGetGlobalMetricsRequest> req = createRequestFromXML(requestXML);
+        Owned<IEspGetGlobalMetricsResponse> resp = createGetGlobalMetricsResponse();
+        handleGetGlobalMetrics(*req, *resp);
+        assertResponseIncludesCategories(*resp, expectedCategories);
+    }
+    void testSingleCategoryAndDimensions() {
+        static const char * requestXML = "<GetGlobalMetricsRequest><Category>categoryOne</Category><Dimensions><Dimension><Name>user</Name><Value>bob</Value></Dimension></Dimensions><DateTimeRange><Start>1999-01-01T00:00:00</Start><End>2099-01-01T00:00:00</End></DateTimeRange></GetGlobalMetricsRequest>";
+        Owned<IEspGetGlobalMetricsRequest> req = createRequestFromXML(requestXML);
+        Owned<IEspGetGlobalMetricsResponse> resp = createGetGlobalMetricsResponse();
+        handleGetGlobalMetrics(*req, *resp);
+        static const char * expected = "<GetGlobalMetricsResponse><GlobalMetrics><GlobalMetric><Category>categoryOne</Category><Dimensions><Dimension><Name>user</Name><Value>bob</Value></Dimension><Dimension><Name>cluster</Name><Value>thor1</Value></Dimension></Dimensions><DateTimeRange><Start>1999070112</Start><End>1999070112</End></DateTimeRange><Stats><Stat><Name>TimeLocalExecute</Name><Value>333</Value></Stat></Stats></GlobalMetric></GlobalMetrics></GetGlobalMetricsResponse>";
+        assertResponseMatchesExpected(*resp, expected);
+    }
+    void testDimensionAcrossCategories() {
+        static const char * requestXML = "<GetGlobalMetricsRequest><Dimensions><Dimension><Name>user</Name><Value>alice</Value></Dimension></Dimensions><DateTimeRange><Start>1999-01-01T00:00:00</Start><End>2099-01-01T00:00:00</End></DateTimeRange></GetGlobalMetricsRequest>";
+        Owned<IEspGetGlobalMetricsRequest> req = createRequestFromXML(requestXML);
+        Owned<IEspGetGlobalMetricsResponse> resp = createGetGlobalMetricsResponse();
+        handleGetGlobalMetrics(*req, *resp);
+        static const char * expected = "<GetGlobalMetricsResponse><GlobalMetrics><GlobalMetric><Category>categoryTwo</Category><Dimensions><Dimension><Name>user</Name><Value>alice</Value></Dimension></Dimensions><DateTimeRange><Start>1999070112</Start><End>1999070112</End></DateTimeRange><Stats><Stat><Name>TimeLocalExecute</Name><Value>555</Value></Stat><Stat><Name>CostExecute</Name><Value>7</Value></Stat></Stats></GlobalMetric><GlobalMetric><Category>categoryOne</Category><Dimensions><Dimension><Name>user</Name><Value>alice</Value></Dimension></Dimensions><DateTimeRange><Start>1999070112</Start><End>1999070112</End></DateTimeRange><Stats><Stat><Name>TimeLocalExecute</Name><Value>222</Value></Stat><Stat><Name>CostExecute</Name><Value>5</Value></Stat></Stats></GlobalMetric></GlobalMetrics></GetGlobalMetricsResponse>";
+        assertResponseMatchesExpected(*resp, expected);
+    }
+    static Owned<IEspRecordGlobalMetricsRequest> createRecordRequestFromXML(const char * xml) {
+        Owned<IPropertyTree> t = createPTreeFromXMLString(xml);
+        Owned<IEspRecordGlobalMetricsRequest> req = createRecordGlobalMetricsRequest();
+        if (const char *cat = t->queryProp("Category"))
+            req->setCategory(cat);
+        Owned<IPropertyTreeIterator> dims = t->getElements("Dimensions/Dimension");
+        ForEach(*dims) {
+            IPropertyTree &d = dims->query();
+            const char *name = d.queryProp("Name");
+            if (isEmptyString(name)) continue;
+            Owned<IEspDimension> dim = createDimension();
+            dim->setName(name);
+            dim->setValue(d.queryProp("Value"));
+            req->getDimensions().append(*dim.getClear());
+        }
+        Owned<IPropertyTreeIterator> stats = t->getElements("Stats/Stat");
+        ForEach(*stats) {
+            IPropertyTree &s = stats->query();
+            const char *name = s.queryProp("Name");
+            if (isEmptyString(name)) continue;
+            Owned<IEspStat> stat = createStat();
+            stat->setName(name);
+            stat->setValue(s.queryProp("Value"));
+            req->getStats().append(*stat.getClear());
+        }
+        return req.getClear();
+    }
+    void testRecordMetricsNoCategoryException() {
+        static const char * requestXML = "<RecordGlobalMetricsRequest><Stats><Stat><Name>TimeLocalExecute</Name><Value>100</Value></Stat></Stats></RecordGlobalMetricsRequest>";
+        Owned<IEspRecordGlobalMetricsRequest> req = createRecordRequestFromXML(requestXML);
+        Owned<IEspRecordGlobalMetricsResponse> resp = createRecordGlobalMetricsResponse();
+        try {
+            handleRecordGlobalMetrics(*req, *resp);
+            CPPUNIT_FAIL("Expected exception for missing category");
+        } catch (IException *e) {
+            CPPUNIT_ASSERT(e->errorCode() == ECLWATCH_MISSING_PARAMS);
+            e->Release();
+        }
+    }
+    void testRecordMetricsNoValidStatsException() {
+        static const char * requestXML = "<RecordGlobalMetricsRequest><Category>testCategory</Category></RecordGlobalMetricsRequest>";
+        Owned<IEspRecordGlobalMetricsRequest> req = createRecordRequestFromXML(requestXML);
+        Owned<IEspRecordGlobalMetricsResponse> resp = createRecordGlobalMetricsResponse();
+        try {
+            handleRecordGlobalMetrics(*req, *resp);
+            CPPUNIT_FAIL("Expected exception for no valid statistics");
+        } catch (IException *e) {
+            CPPUNIT_ASSERT(e->errorCode() == ECLWATCH_MISSING_PARAMS);
+            e->Release();
+        }
+    }
+    void testRecordMetricsAllKnownSuccess() {
+        static const char * requestXML = "<RecordGlobalMetricsRequest><Category>testCategory</Category><Dimensions><Dimension><Name>testUser</Name><Value>alice</Value></Dimension></Dimensions><Stats><Stat><Name>TimeLocalExecute</Name><Value>100</Value></Stat><Stat><Name>CostExecute</Name><Value>5</Value></Stat></Stats></RecordGlobalMetricsRequest>";
+        Owned<IEspRecordGlobalMetricsRequest> req = createRecordRequestFromXML(requestXML);
+        Owned<IEspRecordGlobalMetricsResponse> resp = createRecordGlobalMetricsResponse();
+        handleRecordGlobalMetrics(*req, *resp);
+        CPPUNIT_ASSERT_EQUAL(std::string("All global metrics recorded successfully"), std::string(resp->getResult()));
+    }
+    void testRecordMetricsUnknownStatKind() {
+        static const char * requestXML = "<RecordGlobalMetricsRequest><Category>testCategory</Category><Stats><Stat><Name>TimeLocalExecute</Name><Value>100</Value></Stat><Stat><Name>UnknownStatKind</Name><Value>50</Value></Stat></Stats></RecordGlobalMetricsRequest>";
+        Owned<IEspRecordGlobalMetricsRequest> req = createRecordRequestFromXML(requestXML);
+        Owned<IEspRecordGlobalMetricsResponse> resp = createRecordGlobalMetricsResponse();
+        handleRecordGlobalMetrics(*req, *resp);
+        CPPUNIT_ASSERT_EQUAL(std::string("Some global metrics not recorded. Names: UnknownStatKind"), std::string(resp->getResult()));
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION(DaliWsSMCGlobalMetricsTest);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(DaliWsSMCGlobalMetricsTest, "DaliWsSMCGlobalMetricsTest");
+#endif

@@ -25,6 +25,7 @@
 #include "jlib.hpp"
 #include "jptree.hpp"
 #include "junicode.hpp"
+#include "jsecrets.hpp"
 #include "eclrtl.hpp"
 #include "rtlbcd.hpp"
 #include "eclhelper.hpp"
@@ -50,7 +51,7 @@
 #define UTF8_MAXSIZE     4
 
 IRandomNumberGenerator * random_;
-static CriticalSection random_Sect;
+static CriticalSection random_Sect{SYNC_LOCATION};
 
 MODULE_INIT(INIT_PRIORITY_ECLRTL_ECLRTL)
 {
@@ -278,7 +279,7 @@ private:
 
 typedef MapStringTo<RTLLocale, char const *> MapStrToLocale;
 MapStrToLocale *localeMap;
-CriticalSection localeCrit;
+CriticalSection localeCrit{SYNC_LOCATION};
 MODULE_INIT(INIT_PRIORITY_STANDARD)
 {
     localeMap = new MapStrToLocale;
@@ -483,7 +484,7 @@ static void multimemset(char * out, size_t outlen, char const * in, size_t inlen
 
 typedef MapStringTo<MemoryAttr, size32_t> MemoryAttrMapping;
 MemoryAttrMapping *unicodeBlankCache;
-CriticalSection ubcCrit;
+CriticalSection ubcCrit{SYNC_LOCATION};
 
 MODULE_INIT(INIT_PRIORITY_STANDARD)
 {
@@ -560,9 +561,26 @@ NO_SANITIZE("undefined") __int64 rtlRound(double x)
     //coded rather oddly as microsoft's optimizer has a habit of throwing it away otherwise...
     volatile double tt = x * kk;
     x += tt;
+
+#if defined(__APPLE__) || defined(__aarch64__)
+    // On architectures where float->int out-of-bounds doesn't saturate to x86 indefinite integer
+    if (!isfinite(x))
+        return LLONG_MIN;
+    if (x >= 0.0)
+    {
+        if (x > (double)LLONG_MAX - 0.5)
+            return LLONG_MIN;
+    }
+    else
+    {
+        if (x < (double)LLONG_MIN + 0.5)
+            return LLONG_MIN;
+    }
+#endif
+
     if (x >= 0.0)
         return (__int64)(x + 0.5);
-    return -(__int64)(-x + 0.5);
+    return (__int64)(x - 0.5);
 }
 
 double rtlRoundTo(const double x, int places)
@@ -2810,8 +2828,8 @@ int rtlCompareEStrEStr(unsigned l1, const char * p1, unsigned l2, const char * p
     return diff;
 }
 
-const static UChar nullUStr = 0;
 #ifdef _USE_ICU
+const static UChar nullUStr = 0;
 int rtlCompareUnicodeUnicode(unsigned l1, UChar const * p1, unsigned l2, UChar const * p2, char const * locale)
 {
     while(l1 && (p1[l1-1] == ' ')) l1--;
@@ -3662,7 +3680,7 @@ bool rtlCodepageToCodepageX(unsigned & outlen, char * & out, unsigned maxoutlen,
     else
     {
         out = (char *)rtlRealloc(tempBuffer, len);
-        if (!out)
+        if (!out && len)
             out = tempBuffer;
     }
     return U_SUCCESS(err) != FALSE;
@@ -4210,7 +4228,7 @@ ECLRTL_API unsigned rtlSleep(unsigned delay)
 
 ECLRTL_API unsigned rtlDisplay(unsigned len, const char * src)
 {
-    LOG(MCprogress, unknownJob, "%.*s", len, src);
+    LOG(MCprogress, "%.*s", len, src);
     return 0;
 }
 
@@ -4959,6 +4977,19 @@ unsigned rtlUtf8Size(unsigned len, const void * _data)
     return offset;
 }
 
+unsigned rtlUtf8Length(const void * _data)
+{
+    const byte * data = (const byte *)_data;
+    size32_t length = 0;
+    unsigned offset = 0;
+    while (data[offset])
+    {
+        offset += readUtf8Size(data+offset);
+        length++;
+    }
+    return length;
+}
+
 unsigned rtlUtf8Length(unsigned size, const void * _data)
 {
     const byte * data = (const byte *)_data;
@@ -5149,6 +5180,7 @@ void rtlStrToUtf8X(size32_t & outlen, char * & out, size32_t inlen, const char *
     outlen = rtlUtf8Length(outsize, out);
 }
 
+#ifdef _USE_ICU
 #if U_ICU_VERSION_MAJOR_NUM<53
 static int rtlCompareUtf8Utf8ViaUnicode(size32_t llen, const char * left, size32_t rlen, const char * right, const char * locale)
 {
@@ -5160,7 +5192,6 @@ static int rtlCompareUtf8Utf8ViaUnicode(size32_t llen, const char * left, size32
 }
 #endif
 
-#ifdef _USE_ICU
 int rtlCompareUtf8Utf8(size32_t llen, const char * left, size32_t rlen, const char * right, const char * locale)
 {
 #if U_ICU_VERSION_MAJOR_NUM>=53
@@ -6052,7 +6083,7 @@ void rtlAddExceptionTag(StringBuffer & errorText, const char * tag, const char *
 void rtlSubstituteEmbeddedScript(size32_t &__lenResult, char * &__result, size32_t scriptChars, const char *script, size32_t outFieldsChars, const char *outFields, size32_t searchChars, const char *search)
 {
     StringBuffer result;
-    ::replaceString(result, rtlUtf8Size(scriptChars, script), script, rtlUtf8Size(searchChars, search), search, rtlUtf8Size(outFieldsChars, outFields), outFields);
+    ::replaceString(result, rtlUtf8Size(scriptChars, script), script, rtlUtf8Size(searchChars, search), search, rtlUtf8Size(outFieldsChars, outFields), outFields, false);
     __lenResult = result.lengthUtf8();
     __result = result.detach();
 }
@@ -6207,8 +6238,10 @@ size32_t rtlGetPackedSizeFromFirst(byte first)
     return numExtraBytesFromFirst(first)+1;
 }
 
-
-
+size32_t rtlGetPackedSize(unsigned __int64 value)
+{
+    return numExtraBytesFromValue(value) + 1;
+}
 
 //Store signed by moving the sign to the bottom bit, and inverting if negative.
 //so small positive and negative numbers are stored compactly.
@@ -6234,14 +6267,14 @@ IAtom * rtlCreateFieldNameAtom(const char * name)
     return createAtom(name);
 }
 
-void rtlBase64Encode(size32_t & tlen, char * & tgt, size32_t slen, const void * src)
+void rtlBase64EncodeV2(size32_t & tlen, char * & tgt, size32_t slen, const void * src, bool addLineBreaks)
 {
     tlen = 0;
     tgt = NULL;
     if (slen)
     {
         StringBuffer out;
-        JBASE64_Encode(src, slen, out, true);
+        JBASE64_Encode(src, slen, out, addLineBreaks);
         tlen = out.length();
         if (tlen)
         {
@@ -6250,6 +6283,11 @@ void rtlBase64Encode(size32_t & tlen, char * & tgt, size32_t slen, const void * 
             tgt = data;
         }
     }
+}
+
+void rtlBase64Encode(size32_t & tlen, char * & tgt, size32_t slen, const void * src)
+{
+    rtlBase64EncodeV2(tlen, tgt, slen, src, true);
 }
 
 void rtlBase64Decode(size32_t & tlen, void * & tgt, size32_t slen, const char * src)
@@ -6269,13 +6307,33 @@ void rtlBase64Decode(size32_t & tlen, void * & tgt, size32_t slen, const char * 
     }
 }
 
+void rtlGetEclUserSecret(size32_t & outlen, void * & out, const char *name, const char *key)
+{
+    Owned<const IPropertyTree> secret = getSecret("eclUser", name);
+    if (secret)
+    {
+        MemoryBuffer data;
+        if (secret->getPropBin(key, data))
+        {
+            outlen = data.length();
+            out = data.detach();
+            return;
+        }
+    }
+    out = nullptr;
+    outlen = 0;
+}
 
 //---------------------------------------------------------------------------
 
-void RtlCInterface::Link() const            { atomic_inc(&xxcount); }
+void RtlCInterface::Link() const
+{
+    xxcount++;
+}
+
 bool RtlCInterface::Release(void) const
 {
-    if (atomic_dec_and_test(&xxcount))
+    if (--xxcount == 0)
     {
         delete this;
         return true;
@@ -6533,6 +6591,11 @@ protected:
     {
         class RegexTestThread : public Thread
         {
+        public:
+            RegexTestThread() : Thread("RegexTestThread")
+            {
+            }
+
             virtual int run()
             {
                 for (int i = 0; i < 100000; i++)
@@ -6553,9 +6616,9 @@ protected:
         RegexTestThread t1;
         RegexTestThread t2;
         RegexTestThread t3;
-        t1.start();
-        t2.start();
-        t3.start();
+        t1.start(false);
+        t2.start(false);
+        t3.start(false);
         t1.join();
         t2.join();
         t3.join();

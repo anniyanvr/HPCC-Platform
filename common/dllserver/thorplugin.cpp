@@ -23,19 +23,21 @@
 #include "jdebug.hpp"
 #include "jregexp.hpp"
 #include "jlzw.hpp"
+#include "jevent.hpp"
+
 #include "eclrtl.hpp"
-#include "build-config.h"
+#include <ctype.h>
 #if defined(__APPLE__)
-#include <mach-o/getsect.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #elif !defined(_WIN32)
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <elf.h>
 #endif
 
 #include "thorplugin.hpp"
+
+static constexpr CompressionMethod defaultResourceCompression = COMPRESS_METHOD_ZSTD3;
 
 void * SimplePluginCtx::ctxMalloc(size_t size)
 { 
@@ -68,115 +70,294 @@ const char * SimplePluginCtx::ctxQueryProp(const char *propName) const
 
 //-------------------------------------------------------------------------------------------------------------------
 
-static bool getResourceFromMappedFile(const char * filename, const byte * start_addr, size32_t & lenData, const void * & data, const char * type, unsigned id)
+static constexpr uint32_t mach64SegmentCommand = 0x19;
+
+struct Elf64Header
 {
-#if defined(_WIN32)
-    throwUnexpected();
-#elif defined(__APPLE__)
-    VStringBuffer sectname("%s_%u", type, id);
-    // The first bytes are the Mach-O header
-    const struct mach_header_64 *mh = (const struct mach_header_64 *) start_addr;
-    if (mh->magic != MH_MAGIC_64)
-    {
-        DBGLOG("Failed to extract resource %s: Does not appear to be a Mach-O 64-bit binary", filename);
-        return false;
-    }
+    byte ident[16];
+    uint16_t type;
+    uint16_t machine;
+    uint32_t version;
+    uint64_t entry;
+    uint64_t programHeaderOffset;
+    uint64_t sectionHeaderOffset;
+    uint32_t flags;
+    uint16_t headerSize;
+    uint16_t programHeaderEntrySize;
+    uint16_t programHeaderCount;
+    uint16_t sectionHeaderEntrySize;
+    uint16_t sectionHeaderCount;
+    uint16_t sectionNameIndex;
+};
 
-    unsigned long len = 0;
-    data = getsectiondata(mh, "__TEXT", sectname.str(), &len);
-    lenData = (size32_t)len;
-    return true;
-#elif defined (__64BIT__)
-    // The first bytes are the ELF header
-    const Elf64_Ehdr * hdr = (const Elf64_Ehdr *) start_addr;
-    if (memcmp(hdr->e_ident, ELFMAG, SELFMAG) != 0)
-    {
-        DBGLOG("Failed to extract resource %s: Does not appear to be a ELF binary", filename);
-        return false;
-    }
-    if (hdr->e_ident[EI_CLASS] != ELFCLASS64)
-    {
-        DBGLOG("Failed to extract resource %s: Does not appear to be a ELF 64-bit binary", filename);
-        return false;
-    }
+struct Elf64SectionHeader
+{
+    uint32_t name;
+    uint32_t type;
+    uint64_t flags;
+    uint64_t address;
+    uint64_t offset;
+    uint64_t size;
+    uint32_t link;
+    uint32_t info;
+    uint64_t addressAlign;
+    uint64_t entrySize;
+};
 
-    //Check that there is a symbol table for the sections.
-    if (hdr->e_shstrndx == SHN_UNDEF)
-    {
-        DBGLOG("Failed to extract resource %s: Does not include a section symbol table", filename);
-        return false;
-    }
+struct Elf32Header
+{
+    byte ident[16];
+    uint16_t type;
+    uint16_t machine;
+    uint32_t version;
+    uint32_t entry;
+    uint32_t programHeaderOffset;
+    uint32_t sectionHeaderOffset;
+    uint32_t flags;
+    uint16_t headerSize;
+    uint16_t programHeaderEntrySize;
+    uint16_t programHeaderCount;
+    uint16_t sectionHeaderEntrySize;
+    uint16_t sectionHeaderCount;
+    uint16_t sectionNameIndex;
+};
 
-    //Now walk the sections comparing the section names
-    Elf64_Half numSections = hdr->e_shnum;
-    const Elf64_Shdr * sectionHeaders = reinterpret_cast<const Elf64_Shdr *>(start_addr + hdr->e_shoff);
-    const Elf64_Shdr & symbolTableSection = sectionHeaders[hdr->e_shstrndx];
-    const char * symbolTable = (const char *)start_addr + symbolTableSection.sh_offset;
-    VStringBuffer sectname("%s_%u", type, id);
-    for (unsigned iSect= 0; iSect < numSections; iSect++)
-    {
-        const Elf64_Shdr & section = sectionHeaders[iSect];
-        const char * sectionName = symbolTable + section.sh_name;
-        if (streq(sectionName, sectname))
-        {
-            lenData = (size32_t)section.sh_size;
-            data = start_addr + section.sh_offset;
-            return true;
-        }
-    }
+struct Elf32SectionHeader
+{
+    uint32_t name;
+    uint32_t type;
+    uint32_t flags;
+    uint32_t address;
+    uint32_t offset;
+    uint32_t size;
+    uint32_t link;
+    uint32_t info;
+    uint32_t addressAlign;
+    uint32_t entrySize;
+};
 
-    return false;
-#else
-    // The first bytes are the ELF header
-    const Elf32_Ehdr * hdr = (const Elf32_Ehdr *) start_addr;
-    if (memcmp(hdr->e_ident, ELFMAG, SELFMAG) != 0)
-    {
-        DBGLOG("Failed to extract resource %s: Does not appear to be a ELF binary", filename);
-        return false;
-    }
-    if (hdr->e_ident[EI_CLASS] != ELFCLASS32)
-    {
-        DBGLOG("Failed to extract resource %s: Does not appear to be a ELF 32-bit binary", filename);
-        return false;
-    }
+struct Mach64Header
+{
+    uint32_t magic;
+    uint32_t cpuType;
+    uint32_t cpuSubtype;
+    uint32_t fileType;
+    uint32_t commandCount;
+    uint32_t commandSize;
+    uint32_t flags;
+    uint32_t reserved;
+};
 
-    //Check that there is a symbol table for the sections.
-    if (hdr->e_shstrndx == SHN_UNDEF)
-    {
-        DBGLOG("Failed to extract resource %s: Does not include a section symbol table", filename);
-        return false;
-    }
+struct MachLoadCommand
+{
+    uint32_t command;
+    uint32_t size;
+};
 
-    //Now walk the sections comparing the section names
-    Elf32_Half numSections = hdr->e_shnum;
-    const Elf32_Shdr * sectionHeaders = reinterpret_cast<const Elf32_Shdr *>(start_addr + hdr->e_shoff);
-    const Elf32_Shdr & symbolTableSection = sectionHeaders[hdr->e_shstrndx];
-    const char * symbolTable = (const char *)start_addr + symbolTableSection.sh_offset;
-    VStringBuffer sectname("%s_%u", type, id);
-    for (unsigned iSect= 0; iSect < numSections; iSect++)
-    {
-        const Elf32_Shdr & section = sectionHeaders[iSect];
-        const char * sectionName = symbolTable + section.sh_name;
-        if (streq(sectionName, sectname))
-        {
-            lenData = (size32_t)section.sh_size;
-            data = start_addr + section.sh_offset;
-            return true;
-        }
-    }
+struct Mach64SegmentCommand
+{
+    uint32_t command;
+    uint32_t size;
+    char segmentName[16];
+    uint64_t virtualAddress;
+    uint64_t virtualSize;
+    uint64_t fileOffset;
+    uint64_t fileSize;
+    uint32_t maximumProtection;
+    uint32_t initialProtection;
+    uint32_t sectionCount;
+    uint32_t flags;
+};
 
-    return false;
-#endif
+struct Mach64Section
+{
+    char sectionName[16];
+    char segmentName[16];
+    uint64_t address;
+    uint64_t size;
+    uint32_t offset;
+    uint32_t align;
+    uint32_t relocationOffset;
+    uint32_t relocationCount;
+    uint32_t flags;
+    uint32_t reserved1;
+    uint32_t reserved2;
+    uint32_t reserved3;
+};
+
+static bool rangeIsValid(size_t offset, size_t length, size_t bufferLength)
+{
+    return offset <= bufferLength && length <= bufferLength - offset;
 }
 
-static bool getResourceFromMappedFile(const char * filename, const byte * start_addr, MemoryBuffer & result, const char * type, unsigned id)
+template <class STRUCT>
+static bool readStruct(const byte *startAddress, size_t bufferLength, size_t offset, STRUCT &value)
+{
+    if (!rangeIsValid(offset, sizeof(value), bufferLength))
+        return false;
+    memcpy(&value, startAddress + offset, sizeof(value));
+    return true;
+}
+
+static bool calculateArraySize(size_t elementSize, size_t count, size_t &totalSize)
+{
+    if (count && elementSize > SIZE_MAX / count)
+        return false;
+    totalSize = elementSize * count;
+    return true;
+}
+
+static bool fixedStringMatches(const char *fixed, size_t fixedLength, const char *value)
+{
+    size_t valueLength = strlen(value);
+    return valueLength <= fixedLength && memcmp(fixed, value, valueLength) == 0 && (valueLength == fixedLength || fixed[valueLength] == 0);
+}
+
+static bool getElf64Resource(const byte *startAddress, size_t bufferLength, size32_t &length, const void *&data, const char *sectionName)
+{
+    Elf64Header header;
+    if (!readStruct(startAddress, bufferLength, 0, header))
+        return false;
+    if (memcmp(header.ident, "\x7f" "ELF", 4) != 0 || header.ident[4] != 2 || header.ident[5] != 1)
+        return false;
+    if (header.sectionHeaderEntrySize < sizeof(Elf64SectionHeader) || header.sectionNameIndex >= header.sectionHeaderCount)
+        return false;
+    size_t sectionTableSize;
+    if (!calculateArraySize(header.sectionHeaderEntrySize, header.sectionHeaderCount, sectionTableSize) || !rangeIsValid(header.sectionHeaderOffset, sectionTableSize, bufferLength))
+        return false;
+
+    Elf64SectionHeader nameSection;
+    if (!readStruct(startAddress, bufferLength, header.sectionHeaderOffset + static_cast<size_t>(header.sectionNameIndex) * header.sectionHeaderEntrySize, nameSection))
+        return false;
+    if (!rangeIsValid(nameSection.offset, nameSection.size, bufferLength))
+        return false;
+    const char *names = reinterpret_cast<const char *>(startAddress + nameSection.offset);
+    for (unsigned index = 0; index < header.sectionHeaderCount; index++)
+    {
+        Elf64SectionHeader section;
+        if (!readStruct(startAddress, bufferLength, header.sectionHeaderOffset + static_cast<size_t>(index) * header.sectionHeaderEntrySize, section))
+            return false;
+        if (section.name >= nameSection.size || !memchr(names + section.name, 0, nameSection.size - section.name))
+            continue;
+        if (streq(names + section.name, sectionName) && rangeIsValid(section.offset, section.size, bufferLength) && section.size <= UINT_MAX)
+        {
+            length = static_cast<size32_t>(section.size);
+            data = startAddress + section.offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool getElf32Resource(const byte *startAddress, size_t bufferLength, size32_t &length, const void *&data, const char *sectionName)
+{
+    Elf32Header header;
+    if (!readStruct(startAddress, bufferLength, 0, header))
+        return false;
+    if (memcmp(header.ident, "\x7f" "ELF", 4) != 0 || header.ident[4] != 1 || header.ident[5] != 1)
+        return false;
+    if (header.sectionHeaderEntrySize < sizeof(Elf32SectionHeader) || header.sectionNameIndex >= header.sectionHeaderCount)
+        return false;
+    size_t sectionTableSize;
+    if (!calculateArraySize(header.sectionHeaderEntrySize, header.sectionHeaderCount, sectionTableSize) || !rangeIsValid(header.sectionHeaderOffset, sectionTableSize, bufferLength))
+        return false;
+
+    Elf32SectionHeader nameSection;
+    if (!readStruct(startAddress, bufferLength, header.sectionHeaderOffset + static_cast<size_t>(header.sectionNameIndex) * header.sectionHeaderEntrySize, nameSection) || !rangeIsValid(nameSection.offset, nameSection.size, bufferLength))
+        return false;
+    const char *names = reinterpret_cast<const char *>(startAddress + nameSection.offset);
+    for (unsigned index = 0; index < header.sectionHeaderCount; index++)
+    {
+        Elf32SectionHeader section;
+        if (!readStruct(startAddress, bufferLength, header.sectionHeaderOffset + static_cast<size_t>(index) * header.sectionHeaderEntrySize, section))
+            return false;
+        if (section.name >= nameSection.size || !memchr(names + section.name, 0, nameSection.size - section.name))
+            continue;
+        if (streq(names + section.name, sectionName) && rangeIsValid(section.offset, section.size, bufferLength))
+        {
+            length = section.size;
+            data = startAddress + section.offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool getMach64Resource(const byte *startAddress, size_t bufferLength, size32_t &length, const void *&data, const char *sectionName)
+{
+    Mach64Header header;
+    if (!readStruct(startAddress, bufferLength, 0, header))
+        return false;
+    if (memcmp(startAddress, "\xcf\xfa\xed\xfe", 4) != 0 || !rangeIsValid(sizeof(header), header.commandSize, bufferLength))
+        return false;
+
+    size_t commandOffset = sizeof(header);
+    size_t commandEnd = commandOffset + header.commandSize;
+    for (unsigned index = 0; index < header.commandCount; index++)
+    {
+        MachLoadCommand command;
+        if (!rangeIsValid(commandOffset, sizeof(command), commandEnd) || !readStruct(startAddress, bufferLength, commandOffset, command))
+            return false;
+        if (command.size < sizeof(command) || !rangeIsValid(commandOffset, command.size, commandEnd))
+            return false;
+        if (command.command == mach64SegmentCommand && command.size >= sizeof(Mach64SegmentCommand))
+        {
+            Mach64SegmentCommand segment;
+            if (!readStruct(startAddress, bufferLength, commandOffset, segment))
+                return false;
+            size_t sectionsSize;
+            if (!calculateArraySize(sizeof(Mach64Section), segment.sectionCount, sectionsSize) || sectionsSize > command.size - sizeof(segment))
+                return false;
+            for (unsigned sectionIndex = 0; sectionIndex < segment.sectionCount; sectionIndex++)
+            {
+                Mach64Section section;
+                if (!readStruct(startAddress, bufferLength, commandOffset + sizeof(segment) + static_cast<size_t>(sectionIndex) * sizeof(section), section))
+                    return false;
+                if (fixedStringMatches(section.segmentName, sizeof(section.segmentName), "__TEXT") && fixedStringMatches(section.sectionName, sizeof(section.sectionName), sectionName) && rangeIsValid(section.offset, section.size, bufferLength) && section.size <= UINT_MAX)
+                {
+                    length = static_cast<size32_t>(section.size);
+                    data = startAddress + section.offset;
+                    return true;
+                }
+            }
+        }
+        commandOffset += command.size;
+    }
+    return false;
+}
+
+static bool getResourceFromMappedFile(const char *filename, const byte *startAddress, size_t bufferLength, size32_t &length, const void *&data, const char *type, unsigned id)
+{
+    VStringBuffer sectionName("%s_%u", type, id);
+    if (bufferLength >= 16)
+    {
+        if (memcmp(startAddress, "\x7f" "ELF", 4) == 0)
+        {
+            if (startAddress[4] == 2)
+                return getElf64Resource(startAddress, bufferLength, length, data, sectionName.str());
+            if (startAddress[4] == 1)
+                return getElf32Resource(startAddress, bufferLength, length, data, sectionName.str());
+        }
+        if (memcmp(startAddress, "\xcf\xfa\xed\xfe", 4) == 0)
+            return getMach64Resource(startAddress, bufferLength, length, data, sectionName.str());
+    }
+    DBGLOG("Failed to extract resource %s: unrecognized or unsupported executable format", filename);
+    return false;
+}
+
+static bool getResourceFromMappedFile(const char *filename, const byte *startAddress, size_t bufferLength, MemoryBuffer &result, const char *type, unsigned id)
 {
     size32_t len = 0;
     const void * data = nullptr;
-    bool ok = getResourceFromMappedFile(filename, start_addr, len, data, type, id);
+    bool ok = getResourceFromMappedFile(filename, startAddress, bufferLength, len, data, type, id);
     if (ok)
         result.append(len, data);
     return ok;
+}
+
+extern DLLSERVER_API bool getResourceFromBuffer(const void *buffer, size32_t bufferLength, MemoryBuffer &data, const char *type, unsigned id)
+{
+    return getResourceFromMappedFile("memory buffer", static_cast<const byte *>(buffer), bufferLength, data, type, id);
 }
 
 extern bool getResourceFromFile(const char *filename, MemoryBuffer &data, const char * type, unsigned id)
@@ -219,7 +400,7 @@ extern bool getResourceFromFile(const char *filename, MemoryBuffer &data, const 
         }
         else
         {
-            ok = getResourceFromMappedFile(filename, start_addr, data, type, id);
+            ok = getResourceFromMappedFile(filename, start_addr, size, data, type, id);
             munmap((void *)start_addr, size);
         }
     }
@@ -288,7 +469,7 @@ class HelperDll : implements ILoadedDllEntry, public CInterface
     Linked<const IFileIO> dllFile;
     Owned<IMemoryMappedFile> mappedDll;
     mutable std::atomic<IPropertyTree *> manifest {nullptr};
-    mutable CriticalSection manifestLock;
+    mutable CriticalSection manifestLock{SYNC_LOCATION};
     mutable StringMapOf<ManifestFileList> manifestFiles;
 
 protected:
@@ -308,7 +489,7 @@ public:
     virtual const byte * getResource(unsigned id) const;
     virtual bool getResource(size32_t & len, const void * & data, const char * type, unsigned id, bool trace) const;
     virtual IPropertyTree &queryManifest() const override;
-    virtual const StringArray &queryManifestFiles(const char *type, const char *wuid) const override;
+    virtual const StringArray &queryManifestFiles(const char *type, const char *wuid, const char *tempRoot) const override;
     bool load(bool isGlobal, bool raiseOnError);
     bool loadCurrentExecutable();
     bool loadResources();
@@ -331,7 +512,7 @@ public:
 };
 
 HelperDll::HelperDll(const char *_name, const IFileIO *_dllFile)
-: name(_name), dllFile(_dllFile), manifestFiles(false)
+: dllFile(_dllFile), manifestFiles(false), name(_name)
 {
     logLoad = false;
 }
@@ -484,7 +665,7 @@ bool HelperDll::getResource(size32_t & len, const void * & data, const char * ty
 #endif
         if (!mappedDll)
             return false;
-        return getResourceFromMappedFile(name, mappedDll->base(), len, data, type, id);
+        return getResourceFromMappedFile(name, mappedDll->base(), mappedDll->length(), len, data, type, id);
     }
 }
 
@@ -493,7 +674,7 @@ IPropertyTree &HelperDll::queryManifest() const
     return *querySingleton(manifest, manifestLock, [this]{ return getEmbeddedManifestPTree(this); });
 }
 
-const StringArray &HelperDll::queryManifestFiles(const char *type, const char *wuid) const
+const StringArray &HelperDll::queryManifestFiles(const char *type, const char *wuid, const char *tempRoot) const
 {
     CriticalBlock b(manifestLock);
     Linked<ManifestFileList> list = manifestFiles.find(type);
@@ -501,47 +682,71 @@ const StringArray &HelperDll::queryManifestFiles(const char *type, const char *w
     {
         // The temporary path we unpack to is based on so file's current location and workunit
         // MORE - this is good for deployed cases, may not be so good for standalone executables.
+        // Doesn't really work for cloud either - it needs to be in ephemeral there
         StringBuffer tempDir;
-        splitFilename(name, &tempDir, &tempDir, &tempDir, nullptr);
+        if (!isEmptyString(tempRoot))
+        {
+            tempDir.append(tempRoot);
+            addPathSepChar(tempDir);
+            splitFilename(name, nullptr, nullptr, &tempDir, nullptr);
+        }
+        else
+        {
+            splitFilename(name, &tempDir, &tempDir, &tempDir, nullptr);
+        }
         list.setown(new ManifestFileList(type, tempDir));
         tempDir.append(".tmp").append(PATHSEPCHAR).append(wuid);
         VStringBuffer xpath("Resource[@type='%s']", type);
         Owned<IPropertyTreeIterator> resourceFiles = queryManifest().getElements(xpath.str());
         ForEach(*resourceFiles)
         {
+            unsigned start = msTick();
             IPropertyTree &resourceFile = resourceFiles->query();
-            unsigned id = resourceFile.getPropInt("@id", 0);
-            size32_t len = 0;
-            const void *data = nullptr;
-            if (!getResource(len, data, type, id, false))
-                throwUnexpected();
-            MemoryBuffer decompressed;
-            if (resourceFile.getPropBool("@compressed"))
+            if (resourceFile.hasProp("@jfrogUser"))
             {
-                // MORE - would be better to try to spot files that are not worth recompressing (like jar files)?
-                decompressResource(len, data, decompressed);
-                data = decompressed.toByteArray();
-                len = decompressed.length();
+                StringBuffer localpath(tempDir.append(PATHSEPCHAR).append(resourceFile.queryProp("@filename")));
+                getResourceFromJfrog(localpath, resourceFile);
+                list->append(localpath);
             }
             else
             {
-                // Data is preceded by the resource header
-                // MORE - does this depend on whether @header is set? is that what @header means?
-                data = ((const byte *) data) + resourceHeaderLength;
-                len -= resourceHeaderLength;
+                unsigned id = resourceFile.getPropInt("@id", 0);
+                size32_t len = 0;
+                const void *data = nullptr;
+                if (!getResource(len, data, type, id, false))
+                    throwUnexpected();
+                MemoryBuffer decompressed;
+                if (resourceFile.getPropBool("@compressed"))
+                {
+                    // MORE - would be better to try to spot files that are not worth recompressing (like jar files)?
+                    decompressResource(len, data, decompressed);
+                    data = decompressed.toByteArray();
+                    len = decompressed.length();
+                }
+                else
+                {
+                    // Data is preceded by the resource header
+                    // MORE - does this depend on whether @header is set? is that what @header means?
+                    data = ((const byte *) data) + resourceHeaderLength;
+                    len -= resourceHeaderLength;
+                }
+                StringBuffer extractName(tempDir);
+                extractName.append(PATHSEPCHAR);
+                if (resourceFile.hasProp("@filename"))
+                    resourceFile.getProp("@filename", extractName);
+                else
+                    extractName.append(id).append('.').append(type);
+                recursiveCreateDirectoryForFile(extractName);
+                OwnedIFile f = createIFile(extractName);
+                OwnedIFileIO o = f->open(IFOcreate);
+                assertex(o.get() != nullptr);
+                o->write(0, len, data);
+                o->close();
+
+                list->append(extractName);
+                if (doTrace(traceJava) && streq(type, "jar"))
+                    DBGLOG("Extracted jar resource %u size %u to %s in %u ms", id, len, extractName.str(), msTick() - start);
             }
-            StringBuffer extractName(tempDir);
-            extractName.append(PATHSEPCHAR);
-            if (resourceFile.hasProp("@filename"))
-                resourceFile.getProp("@filename", extractName);
-            else
-                extractName.append(id).append('.').append(type);
-            recursiveCreateDirectoryForFile(extractName);
-            OwnedIFile f = createIFile(extractName);
-            OwnedIFileIO o = f->open(IFOcreaterw);
-            assertex(o.get() != nullptr);
-            o->write(0, len, data);
-            list->append(extractName);
         }
         manifestFiles.replaceOwn(*list.getLink());
     }
@@ -610,6 +815,8 @@ void PluginDll::logLoaded()
 
 extern DLLSERVER_API ILoadedDllEntry * createDllEntry(const char *path, bool isGlobal, const IFileIO *dllFile, bool resourcesOnly)
 {
+    ProTraceTaskScopeTracker tracker(EventTask::DllLoading);
+
     Owned<HelperDll> result = new HelperDll(path, dllFile);
     bool ok;
     if (!resourcesOnly)
@@ -664,13 +871,79 @@ extern DLLSERVER_API bool decompressResource(size32_t len, const void *data, Str
     return true;
 }
 
+static const char *skipArchiveResourceWhitespace(MemoryBuffer &archive, const char *&archiveEnd)
+{
+    if (!archive.length())
+    {
+        archiveEnd = nullptr;
+        return nullptr;
+    }
+    const char *archiveText = static_cast<const char *>(archive.toByteArray());
+    archiveEnd = archiveText + archive.length();
+    while (archiveText != archiveEnd && isspace(static_cast<unsigned char>(*archiveText)))
+        archiveText++;
+    return archiveText;
+}
+
+static IPropertyTree *createArchiveResourcePTree(MemoryBuffer &archive)
+{
+    const char *archiveEnd = nullptr;
+    const char *archiveText = skipArchiveResourceWhitespace(archive, archiveEnd);
+    try
+    {
+        if (archiveText != archiveEnd && *archiveText == '<')
+        {
+            size32_t textOffset = archiveText - static_cast<const char *>(archive.toByteArray());
+            archive.append((char)0);
+            return createPTreeFromXMLString(static_cast<const char *>(archive.toByteArray()) + textOffset, ipt_caseInsensitive|ipt_lowmem);
+        }
+        return createPTree(archive, ipt_caseInsensitive|ipt_lowmem);
+    }
+    catch (IException *e)
+    {
+        e->Release();
+        return nullptr;
+    }
+}
+
+static IPropertyTree *decompressArchiveResourcePTree(size32_t len, const void *data)
+{
+    MemoryBuffer archive;
+    if (!decompressResource(len, data, archive))
+        return nullptr;
+    return createArchiveResourcePTree(archive);
+}
+
+static bool decompressArchiveResourceXML(size32_t len, const void *data, StringBuffer &xml)
+{
+    MemoryBuffer archive;
+    if (!decompressResource(len, data, archive))
+        return false;
+
+    xml.clear();
+    // Archive resources may be stored as XML text or serialized binary PTree data. Prefer the
+    // text path when the decompressed bytes look like XML; otherwise assume binary and parse it.
+    const char *archiveEnd = nullptr;
+    const char *archiveText = skipArchiveResourceWhitespace(archive, archiveEnd);
+    if (archiveText != archiveEnd && *archiveText == '<')
+        xml.append(archive.length(), static_cast<const char *>(archive.toByteArray()));
+    else
+    {
+        Owned<IPropertyTree> archiveTree = createArchiveResourcePTree(archive);
+        if (!archiveTree)
+        {
+            xml.clear();
+            return false;
+        }
+        toXML(archiveTree, xml);
+    }
+    return true;
+}
+
 extern DLLSERVER_API void appendResource(MemoryBuffer & mb, size32_t len, const void *data, bool compress)
 {
     mb.append((byte)0x80).append(resourceHeaderVersion);
-    if (compress)
-        compressToBuffer(mb, len, data);
-    else
-        appendToBuffer(mb, len, data);
+    compressToBuffer(mb, len, data, compress ? defaultResourceCompression : COMPRESS_METHOD_NONE);
 }
 
 extern DLLSERVER_API void compressResource(MemoryBuffer & compressed, size32_t len, const void *data)
@@ -682,9 +955,18 @@ extern DLLSERVER_API bool getEmbeddedWorkUnitXML(ILoadedDllEntry *dll, StringBuf
 {
     size32_t len = 0;
     const void * data = NULL;
-    if (!dll->getResource(len, data, "WORKUNIT", 1000))
+    if (!dll->getResource(len, data, "WORKUNIT", 1000, false))
         return false;
     return decompressResource(len, data, xml);
+}
+
+extern DLLSERVER_API bool getEmbeddedWorkUnitBinary(ILoadedDllEntry *dll, MemoryBuffer &result)
+{
+    size32_t len = 0;
+    const void * data = NULL;
+    if (!dll->getResource(len, data, "BINWORKUNIT", 1000, false))
+        return false;
+    return decompressResource(len, data, result);
 }
 
 extern DLLSERVER_API bool getEmbeddedManifestXML(const ILoadedDllEntry *dll, StringBuffer &xml)
@@ -702,7 +984,20 @@ extern DLLSERVER_API bool getEmbeddedArchiveXML(ILoadedDllEntry *dll, StringBuff
     const void * data = NULL;
     if (!dll->getResource(len, data, "ARCHIVE", 1000))
         return false;
-    return decompressResource(len, data, xml);
+    return decompressArchiveResourceXML(len, data, xml);
+}
+
+extern DLLSERVER_API IPropertyTree *getEmbeddedArchivePTree(ILoadedDllEntry *dll)
+{
+    size32_t len = 0;
+    const void * data = NULL;
+    if (!dll->getResource(len, data, "ARCHIVE", 1000))
+        return createPTree();
+
+    Owned<IPropertyTree> archiveTree = decompressArchiveResourcePTree(len, data);
+    if (!archiveTree)
+        return createPTree();
+    return archiveTree.getClear();
 }
 
 extern DLLSERVER_API IPropertyTree *getEmbeddedManifestPTree(const ILoadedDllEntry *dll)
@@ -711,11 +1006,12 @@ extern DLLSERVER_API IPropertyTree *getEmbeddedManifestPTree(const ILoadedDllEnt
     return getEmbeddedManifestXML(dll, xml) ? createPTreeFromXMLString(xml.str()) : createPTree();
 }
 
-extern DLLSERVER_API bool checkEmbeddedWorkUnitXML(ILoadedDllEntry *dll)
+extern DLLSERVER_API bool containsEmbeddedWorkUnit(ILoadedDllEntry *dll)
 {
     size32_t len = 0;
     const void * data = NULL;
-    return dll->getResource(len, data, "WORKUNIT", 1000, false);
+    return dll->getResource(len, data, "BINWORKUNIT", 1000, false) ||
+           dll->getResource(len, data, "WORKUNIT", 1000, false);
 }
 
 extern DLLSERVER_API bool getResourceXMLFromFile(const char *filename, const char *type, unsigned id, StringBuffer &xml)
@@ -733,13 +1029,25 @@ extern DLLSERVER_API bool getWorkunitXMLFromFile(const char *filename, StringBuf
 
 extern DLLSERVER_API bool getArchiveXMLFromFile(const char *filename, StringBuffer &xml)
 {
-    return getResourceXMLFromFile(filename, "ARCHIVE", 1000, xml);
+    MemoryBuffer data;
+    if (!getResourceFromFile(filename, data, "ARCHIVE", 1000))
+        return false;
+    return decompressArchiveResourceXML(data.length(), data.toByteArray(), xml);
 }
 
 extern DLLSERVER_API bool getManifestXMLFromFile(const char *filename, StringBuffer &xml)
 {
     return getResourceXMLFromFile(filename, "MANIFEST", 1000, xml);
 }
+
+extern DLLSERVER_API bool getWorkunitBinaryFromFile(const char *filename, MemoryBuffer &result)
+{
+    MemoryBuffer data;
+    if (!getResourceFromFile(filename, data, "BINWORKUNIT", 1000))
+        return false;
+    return decompressResource(data.length(), data.toByteArray(), result);
+}
+
 
 //-------------------------------------------------------------------------------------------------------------------
 
@@ -753,6 +1061,9 @@ extern DLLSERVER_API void getAdditionalPluginsPath(StringBuffer &pluginsPath, co
     defaultLocation.append(PATHSEPSTR "plugins");
     StringArray paths;
     paths.appendList(pluginsPath, ENVSEPSTR);
+#ifdef _CONTAINERIZED
+    //MORE: No place to provide additional plugins...
+#else
     if (paths.contains(defaultLocation))
     {
         const char *additional = queryEnvironmentConf().queryProp("additionalPlugins");
@@ -770,15 +1081,37 @@ extern DLLSERVER_API void getAdditionalPluginsPath(StringBuffer &pluginsPath, co
             }
         }
     }
+#endif
 }
 
 bool SafePluginMap::addPlugin(const char *path, const char *dllname)
 {
+    StringBuffer fullpath;
     if (!endsWithIgnoreCase(path, SharedObjectExtension))
     {
-        if (trace)
-            DBGLOG("Ecl plugin %s ignored", path);
-        return false;
+        //Check to see if the plugin name was the name of the plugin without the shared object extension
+        //If the tail of the path does not contain an extension then check if the corresponding plugin exists.
+        bool ok = false;
+        StringBuffer tail;
+        splitFilename(path, &fullpath, &fullpath, &tail, &tail);
+
+        if (!strchr(tail, '.'))
+        {
+            fullpath.appendf("%s%s%s", SharedObjectPrefix, tail.str(), SharedObjectExtension);
+            Owned<IFile> cur = createIFile(fullpath);
+            if (cur->isFile() == fileBool::foundYes)
+            {
+                path = fullpath;
+                ok = true;
+            }
+       }
+
+        if (!ok)
+        {
+            if (trace)
+                DBGLOG("Ecl plugin %s ignored", path);
+            return false;
+        }
     }
 
     try
@@ -845,6 +1178,40 @@ void SafePluginMap::loadFromList(const char * pluginsList)
             addPlugin(thisPlugin, tail.str());
         }
     }
+}
+
+bool SafePluginMap::loadNamed(const char * pluginDirectories, const char * plugin)
+{
+    const char *pluginDir = pluginDirectories;
+    for (;*pluginDir;)
+    {
+        StringBuffer thisFile;
+        while (*pluginDir && *pluginDir != ENVSEPCHAR)
+            thisFile.append(*pluginDir++);
+        if(*pluginDir)
+            pluginDir++;
+
+        if(!thisFile.length())
+            continue;
+        Owned<IFile> dir = createIFile(thisFile);
+        if (dir->isDirectory() == fileBool::foundYes)
+        {
+            Owned<IFile> file = createIFile(addPathSepChar(thisFile).append(plugin));
+            if (file->exists())
+            {
+                if (addPlugin(thisFile, plugin))
+                    return true;
+            }
+        }
+        else if (dir->isFile() == fileBool::foundYes)
+        {
+            StringBuffer tail;
+            splitFilename(thisFile, NULL, NULL, &tail, &tail);
+            if (streq(tail, plugin) && addPlugin(thisFile, plugin))
+                return true;
+        }
+    }
+    return false;
 }
 
 void SafePluginMap::loadFromDirectory(const char * pluginDirectory)

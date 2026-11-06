@@ -95,7 +95,7 @@ void CThorKeyArray::expandFPos()
     if (!filepos)
     {
         filepos.setown(new Int64Array);
-        filepos->ensure(keys.ordinality());
+        filepos->ensureCapacity(keys.ordinality());
         for (unsigned i=0;i<keys.ordinality();i++)
             filepos->append(getFixedFilePos(i));
         filerecsize = 0;
@@ -163,7 +163,7 @@ void CThorKeyArray::add(const void *row)
     else if (serialrowsize!=keySz)
     {
         sizes.setown(new UnsignedArray);
-        sizes->ensure(keys.ordinality()+1);
+        sizes->ensureCapacity(keys.ordinality()+1);
         for (unsigned i=0;i<keys.ordinality();i++)
             sizes->append(serialrowsize);
         sizes->append(keySz);
@@ -267,7 +267,7 @@ void CThorKeyArray::deserialize(MemoryBuffer &mb,bool append)
 
 
 
-static CriticalSection kcsect;
+static CriticalSection kcsect{SYNC_LOCATION};
 static CThorKeyArray * kcthis;
 static int keyCompare(const void *a,const void *b)
 {
@@ -290,7 +290,7 @@ void CThorKeyArray::sort()
     if (sizes)
     {
         OwnedPtr<UnsignedArray> newsizes(new UnsignedArray);
-        newsizes->ensure(n);
+        newsizes->ensureCapacity(n);
         for (i = 0; i<n; i++)
             newsizes->append(sizes->item(ra[i]));
         sizes.setown(newsizes.getClear());
@@ -324,7 +324,7 @@ void CThorKeyArray::createSortedPartition(unsigned pn)
     if (sizes)
     {
         OwnedPtr<UnsignedArray> newsizes(new UnsignedArray);
-        newsizes->ensure(pn);
+        newsizes->ensureCapacity(pn);
         for (i = 1; i<pn; i++) {
             unsigned p = i*n/pn;
             newsizes->append(sizes->item(ra[p]));
@@ -341,6 +341,7 @@ void CThorKeyArray::createSortedPartition(unsigned pn)
     keys.swap(newrows);
 }
 
+#define VALIDATE_KEY_BOUNDARIES
 int CThorKeyArray::binchopPartition(const void * row,bool lt)
 {
     int n = (int)ordinality();
@@ -349,7 +350,7 @@ int CThorKeyArray::binchopPartition(const void * row,bool lt)
     int a = 0;
     int b = n;
     int cmp = 0;
-#ifdef _TESTING
+#ifdef VALIDATE_KEY_BOUNDARIES
 try {
 #endif
     while (a<b)
@@ -362,7 +363,7 @@ try {
         {
             if (cmp==0)
             {
-#ifdef _TESTING
+#ifdef VALIDATE_KEY_BOUNDARIES
                 a = m;
                 while ((a<n)&&(keyCompare(m,a)==0))
                     a++;
@@ -371,7 +372,7 @@ try {
 #endif
                 while ((m>0)&&(keyCompare(m-1,m)==0))
                     m--;
-#ifdef _TESTING
+#ifdef VALIDATE_KEY_BOUNDARIES
                 if (m>0) 
                     assertex(keyRowCompare((unsigned)m-1,row)<0);
 #endif
@@ -382,7 +383,7 @@ try {
             a = m+1;
         }
     }
-#ifdef _TESTING
+#ifdef VALIDATE_KEY_BOUNDARIES
     if (lt)
     {
         if (a<n) 
@@ -400,24 +401,24 @@ try {
 }
 catch (IException *e)
 {
-    EXCLOG(e,"binchopPartition");
+    IERRLOG(e,"binchopPartition");
     StringBuffer s("row: ");
     unsigned i;
     for (i=0;i<10;i++)
         s.appendf(" %02x",(int)*((const byte *)row+i));
-    PROGLOG("%s",s.str());
+    DBGLOG("%s",s.str());
     for (i=0;i<(unsigned)n;i++)
     {
         s.clear().appendf("k%d:",i);
         const byte *k=(const byte *)queryKey(i);
         for (unsigned j=0;j<10;j++) 
             s.appendf(" %02x",(int)*(k+j));
-        PROGLOG("%s",s.str());
+        DBGLOG("%s",s.str());
     }
-    PROGLOG("a=%d, b=%d, cmp=%d",a,b,cmp);
+    DBGLOG("a=%d, b=%d, cmp=%d",a,b,cmp);
     throw;
 }
-#endif
+#endif // VALIDATE_KEY_BOUNDARIES
     while (lt&&a&&(keyRowCompare((unsigned)a-1,row)==0))
         a--;
     return a-1;
@@ -443,12 +444,12 @@ offset_t CThorKeyArray::findLessRowPos(const void * row)
     return getFixedFilePos(p);
 }
 
-void CThorKeyArray::calcPositions(IFile *file,CThorKeyArray &sample)
+void CThorKeyArray::calcPositions(IFile *file, CThorKeyArray &sample, unsigned rwFlags)
 {
     // calculates positions based on sample
     // not fast!
     filepos.setown(new Int64Array);
-    filepos->ensure(ordinality());
+    filepos->ensureCapacity(ordinality());
     for (unsigned i0=0;i0<ordinality();i0++)
         filepos->append(-1);
     filerecsize = 0;
@@ -459,7 +460,10 @@ void CThorKeyArray::calcPositions(IFile *file,CThorKeyArray &sample)
         if (pos==(offset_t)-1) 
             pos = 0;
         // should do bin-chop for fixed length but initially do sequential search
-        Owned<IRowStream> s = createRowStreamEx(file, rowif, pos);
+        FileRowStreamOptions options;
+        options.offset = pos;
+        options.rwFlags = rwFlags;
+        Owned<IRowStream> s = createRowStream(file, rowif, options);
         for (;;)
         {
             OwnedConstThorRow rowcmp = s->nextRow();
@@ -472,7 +476,7 @@ void CThorKeyArray::calcPositions(IFile *file,CThorKeyArray &sample)
             rowif->queryRowSerializer()->serialize(ssz,(const byte *)rowcmp.get());
             pos += ssz.size();
         }
-        //PROGLOG("CThorKeyArray::calcPositions %d: initpos = %" I64F "d pos = %" I64F "d",i,initpos,pos);
+        //DBGLOG("CThorKeyArray::calcPositions %d: initpos = %" I64F "d pos = %" I64F "d",i,initpos,pos);
         filepos->replace(pos,i);
     }
     totalfilesize = sample.totalfilesize;
@@ -519,12 +523,12 @@ void CThorKeyArray::split()
     if (sizes)
     {
         newSizes.setown(new UnsignedArray);
-        newSizes->ensure(n);
+        newSizes->ensureCapacity(n);
     }
     if (filepos)
     {
         newFilePos.setown(new Int64Array);
-        newFilePos->ensure(n);
+        newFilePos->ensureCapacity(n);
     }
     unsigned newss = 0;
     for (unsigned i=0;i<n;i+=2)
@@ -561,7 +565,7 @@ void traceKey(IOutputRowSerializer *serializer, const char *prefix,const void *k
 {
     StringBuffer out;
     getRecordString(key, serializer, prefix, out);
-    PROGLOG("%s",out.str());
+    DBGLOG("%s",out.str());
 }
 
 void CThorKeyArray::traceKey(const char *prefix,unsigned idx)

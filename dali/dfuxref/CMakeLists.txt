@@ -46,14 +46,15 @@ ADD_DEFINITIONS ( -D_CONSOLE -DMAIN_DFUXREF )
 
 HPCC_ADD_EXECUTABLE ( dfuxref ${SRCS} )
 install ( TARGETS dfuxref RUNTIME DESTINATION ${EXEC_DIR} )
-target_link_libraries ( dfuxref 
+target_link_libraries ( dfuxref PRIVATE 
          jlib
          mp 
-         hrpc 
          dafsclient
          dalibase 
-         environment 
          dfuXRefLib 
     )
 
+if (NOT CONTAINERIZED)
+    target_link_libraries ( dfuxref PRIVATE environment )
+endif()
 

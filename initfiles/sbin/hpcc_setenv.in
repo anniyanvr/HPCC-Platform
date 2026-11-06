@@ -55,7 +55,7 @@ function pidwait_fn () {
     local PID=$1
     local WATCH_PID=$( cat $PID )
     local PROCESS=$2
-    local TIMEOUT=$(($3*1000))
+    local OTIMEOUT=$(($3*1000))
     local FORCE=$4
 
     if ps -p $WATCH_PID -o command= | grep -v "${PROCESS}" &>/dev/null ; then
@@ -63,9 +63,11 @@ function pidwait_fn () {
     fi
 
     kill $WATCH_PID > /dev/null 2>&1
+
+    local TIMEOUT=$OTIMEOUT
     while [[ -d /proc/$WATCH_PID ]] && [[ $TIMEOUT -gt 0 ]]; do
       sleep 0.2
-      local TIMEOUT=$(($TIMEOUT-200))
+      TIMEOUT=$(($TIMEOUT-200))
     done
 
     if [[ $TIMEOUT -le 0 ]] && ps -p $WATCH_PID -o command= | grep "${PROCESS}" &>/dev/null ; then
@@ -73,6 +75,11 @@ function pidwait_fn () {
       if [[ $FORCE -eq 1 ]]; then
         kill -SIGKILL $WATCH_PID > /dev/null 2>&1
         log "killing ${PROCESS} (pid: $WATCH_PID) with SIGKILL"
+        TIMEOUT=$OTIMEOUT
+        while [[ -d /proc/$WATCH_PID ]] && [[ $TIMEOUT -gt 0 ]]; do
+          sleep 0.2
+          TIMEOUT=$(($TIMEOUT-200))
+        done
         rm -f $PID > /dev/null 2>&1
         return 0
       fi
@@ -114,30 +121,75 @@ umask ${OUMASK}
 
 # use less heap when threaded
 # but if set too low it can affect performance significantly
-num_arenas=$num_cpus
-if [ -z "$num_arenas" ] ; then
-    num_arenas=8
-elif [ $num_arenas -lt 8 ] ; then
-    num_arenas=8
-elif [ $num_arenas -gt 32 ] ; then
-    num_arenas=32
+if [ -z "$MALLOC_ARENA_MAX" ]; then
+    if [ $num_cpus -gt 8 ]; then
+        num_arenas=8
+    else
+        num_arenas=$num_cpus
+    fi
+    export MALLOC_ARENA_MAX=$num_arenas
 fi
-export MALLOC_ARENA_MAX=$num_arenas
+
+# search env or conf file for useJemalloc=true/false setting and if true, add libjemalloc to LD_PRELOAD
+HPCC_XMLFILE=${HPCC_XMLFILE:-${CONFIG_DIR}/${ENV_XML_FILE}}
+
+usejem=""
+jemline=$(sed -n '/\<envsettings/I,/\/envsettings/I{//!p;}' "${HPCC_XMLFILE}" 2>/dev/null | grep -i '<usejemalloc>')
+if [[ "$jemline" != "" ]] ; then
+    usejem=$(echo "$jemline" | awk -F '[<>]' 'tolower($0)~/usejemalloc/{print $3}' 2>/dev/null)
+fi
+if [[ "$usejem" == "" ]] ; then
+    jemline=$(grep -i usejemalloc "${HPCC_CONFIG}" 2>/dev/null)
+    if [[ "$jemline" != "" ]] ; then
+        item1=$(echo $jemline 2>/dev/null | awk '{print $1}' | cut -c 1)
+        if [[ "$item1" != '#' ]] ; then
+            usejem=$(echo $jemline 2>/dev/null | awk -F= '{print $2}' 2>/dev/null)
+        fi
+    fi
+fi
+
+if [[ "$usejem" != "" ]] ; then
+    usejem=$(echo "$usejem" | tr -d "[:blank:]" | tr "[:upper:]" "[:lower:]")
+fi
+
+if [[ "$usejem" == "" || "$usejem" == "true" ]] ; then # i.e. "" defaults to true
+    if [[ -s ${INSTALL_DIR}/lib/libjemalloc.so ]] ; then
+        if [[ ! "${LD_PRELOAD}" =~ .*libjemalloc.* ]] ; then
+            export LD_PRELOAD="${INSTALL_DIR}/lib/libjemalloc.so${LD_PRELOAD:+:${LD_PRELOAD}}"
+        fi
+    fi
+fi
 
 PATH_PREFIX=`cat ${HPCC_CONFIG} | sed -n "/\[${SECTION}\]/,/\[/p" | grep "^path *= *" | sed -e 's/^path *= *//'`
 
 export PID=`cat ${HPCC_CONFIG} | sed -n "/\[${SECTION}\]/,/\[/p" | grep "^pid *= *" | sed -e 's/^pid *= *//'`
 export LD_PRELOAD=`cat ${HPCC_CONFIG} | sed -n "/\[${SECTION}\]/,/\[/p" | grep "^JNI_PATH *= *" | sed -e 's/^JNI_PATH *= *//'`:$LD_PRELOAD
 
-NEW_PATH="${PATH_PREFIX}/bin"
-for D in ${PATH//:/ } ; do
-    if [ "${D}" = "${NEW_PATH}" ]; then
-        unset NEW_PATH
-        break
+HPCC_PATH_LIST="${PATH_PREFIX}/bin ${PATH_PREFIX}/sbin ${PATH_PREFIX}/etc/init.d ${PATH_PREFIX}/testing/regress"
+FILTERED_PATH=""
+IFS=':' read -r -a PATH_ENTRIES <<< "${PATH}"
+for D in "${PATH_ENTRIES[@]}" ; do
+    if [ -z "${D}" ]; then
+        continue
+    fi
+    SKIP=0
+    for HPCC_D in ${HPCC_PATH_LIST}; do
+        if [ "${D}" = "${HPCC_D}" ]; then
+            SKIP=1
+            break
+        fi
+    done
+    if [ ${SKIP} -eq 0 ]; then
+        if [ -n "${FILTERED_PATH}" ]; then
+            FILTERED_PATH="${FILTERED_PATH}:${D}"
+        else
+            FILTERED_PATH="${D}"
+        fi
     fi
 done
-if [ -n "${NEW_PATH}" ]; then
-    NEW_PATH="${NEW_PATH}:${PATH_PREFIX}/sbin:${PATH_PREFIX}/etc/init.d:${PATH_PREFIX}/testing/regress"
+NEW_PATH="${PATH_PREFIX}/bin:${PATH_PREFIX}/sbin:${PATH_PREFIX}/etc/init.d:${PATH_PREFIX}/testing/regress"
+if [ -n "${FILTERED_PATH}" ]; then
+    NEW_PATH="${NEW_PATH}:${FILTERED_PATH}"
 fi
 
 if [[ $platform == 'linux' ]]; then
@@ -184,11 +236,7 @@ if [ `basename -- "$0"` = "hpcc_setenv" ]; then
         exit 1
     fi
     # Not being sourced directly, so echo out commands to do so to the caller
-    if [ -n "${NEW_PATH}" ]; then
-        echo "export PATH=${PATH:+${PATH}:}${NEW_PATH}"
-    else
-        echo "# \$PATH already contains ${PATH_PREFIX}/bin"
-    fi
+    echo "export PATH=${NEW_PATH}"
     if [[ $platform == 'linux' ]]; then
         if [ -n "${NEW_LIB}" ]; then
             echo "export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${NEW_LIB}"
@@ -220,9 +268,7 @@ else
         return
     fi
     # being sourced - can set environment vars directly
-    if [ -n "${NEW_PATH}" ]; then
-        export PATH=${PATH:+${PATH}:}${NEW_PATH}
-    fi
+    export PATH=${NEW_PATH}
     if [[ $platform == 'linux' ]]; then
         if [ -n "${NEW_LIB}" ]; then
             export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${NEW_LIB}

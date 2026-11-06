@@ -27,16 +27,16 @@ int compareIssuesCostOrder(CInterface * const * _l, CInterface * const * _r)
 
 int PerformanceIssue::compareCost(const PerformanceIssue & other) const
 {
-    if (cost == other.cost)
+    if (timePenalty == other.timePenalty)
         return 0;
     else
-        return cost > other.cost ? -1 : +1;
+        return timePenalty > other.timePenalty ? -1 : +1;
 }
 
 void PerformanceIssue::print() const
 {
     StringBuffer out;
-    formatStatistic(out, cost, SMeasureTimeNs);
+    formatStatistic(out, timePenalty, SMeasureTimeNs);
     printf("[%s] E%d \"%s\" %s ", out.str(), errorCode,  comment.str(), scope.str());
     if (filename.length()>0)
         printf("%s", filename.str());
@@ -55,7 +55,7 @@ void PerformanceIssue::createException(IWorkUnit * wu)
     we->setExceptionCode(errorCode);
     we->setSeverity(mappedSeverity);
     we->setScope(scope.str());
-    we->setPriority((unsigned) statUnits2msecs(cost));
+    we->setPriority((unsigned) statUnits2msecs(timePenalty));
     if (line>0 && column>0)
     {
         we->setExceptionLineNo(line);
@@ -66,12 +66,15 @@ void PerformanceIssue::createException(IWorkUnit * wu)
     StringBuffer s(comment);        // Append scope to comment as scope column is not visible in ECLWatch
     s.appendf(" (%s)", scope.str());
     we->setExceptionMessage(s.str());
-    we->setExceptionSource("Workunit Analyzer");
+    if (costPenalty!=0)
+        we->setCost(cost_type2money(costPenalty));
+    we->setExceptionSource(CostOptimizerName);
 }
 
-void PerformanceIssue::set(AnalyzerErrorCode _errorCode, stat_type _cost, const char * msg, ...)
+void PerformanceIssue::set(AnalyzerErrorCode _errorCode, stat_type _timePenalty, cost_type _costPenalty, const char * msg, ...)
 {
-    cost = _cost;
+    timePenalty = _timePenalty;
+    costPenalty = _costPenalty;
     errorCode = _errorCode;
     va_list args;
     va_start(args, msg);

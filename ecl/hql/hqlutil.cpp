@@ -71,7 +71,7 @@ MODULE_INIT(INIT_PRIORITY_STANDARD)
 {
     sizetType = makeIntType(sizeof(size32_t), false);
     signedType = makeIntType(sizeof(signed), true);
-    sizetCacheCs = new CriticalSection;
+    sizetCacheCs = new CriticalSection(SYNC_LOCATION);
     constUnknownVarStringType = makeConstantModifier(makeVarStringType(UNKNOWN_LENGTH));
     defaultMaxRecordLengthExpr = createQuoted("<default-max-length>", makeIntType(sizeof(size32_t), false));
     cacheAlignedAttr = createAttribute(_propAligned_Atom);
@@ -345,8 +345,15 @@ IHqlExpression * convertIndexPhysical2LogicalValue(IHqlExpression * cur, IHqlExp
     if (cur->hasAttribute(blobAtom))
     {
         if (cur->isDataset())
-            return createDataset(no_id2blob, LINK(physicalSelect), getSerializedForm(cur->queryRecord(), diskAtom));
-        else if (cur->isDatarow())
+        {
+            IHqlExpression * record = cur->queryRecord();
+            OwnedHqlExpr serializedRecord = getSerializedForm(record, diskAtom);
+            OwnedHqlExpr extracted = createDataset(no_id2blob, LINK(physicalSelect), LINK(serializedRecord));
+            if (record != serializedRecord)
+                return ensureDeserialized(extracted, cur->queryType(), diskAtom);
+            return extracted.getClear();
+        }
+        if (cur->isDatarow())
             return createRow(no_id2blob, LINK(physicalSelect), getSerializedForm(cur->queryRecord(), diskAtom));
         else
             return createValue(no_id2blob, cur->getType(), LINK(physicalSelect));
@@ -1151,7 +1158,7 @@ IHqlExpression * JoinOrderSpotter::doTraverseStripSelect(IHqlExpression * expr, 
         if (max != 0)
         {
             HqlExprArray args;
-            args.ensure(max);
+            args.ensureCapacity(max);
 
             unsigned idx;
             bool same = true;
@@ -2096,6 +2103,12 @@ void unwindHintAttrs(HqlExprArray & args, IHqlExpression * expr)
     }
 }
 
+bool getHintBool(IHqlExpression * expr, IAtom * name, bool dft)
+{
+    IHqlExpression * match = queryHint(expr, name);
+    return getBoolAttributeValue(match, dft);
+}
+
 //---------------------------------------------------------------------------
 
 IHqlExpression * createCompare(node_operator op, IHqlExpression * l, IHqlExpression * r)
@@ -2294,9 +2307,19 @@ unsigned getNumActivityArguments(IHqlExpression * expr)
     case no_compound:
     case no_addfiles:
     case no_map:
-        return expr->numChildren();
+        {
+            unsigned max = expr->numChildren();
+            while (max && expr->queryChild(max-1)->isAttribute())
+                max--;
+            return max;
+        }
     case no_case:
-        return expr->numChildren()-1;
+    {
+        unsigned max = expr->numChildren();
+        while (max > 1 && expr->queryChild(max-1)->isAttribute())
+            max--;
+        return max-1;
+    }
     case no_forcelocal:
         return 0;
     default:
@@ -2573,7 +2596,7 @@ void gatherRecordStats(HqlRecordStats & stats, IHqlExpression * expr)
                 break;
             default:
                 stats.fields++;
-                //HPCC-17606 add: if (type->getSize() == UNKNOWN_LENGTH) stats.unknownSizeFields++;
+                //HPCC-17606 add: if (isUnknownLength(type->getSize())) stats.unknownSizeFields++;
                 break;
             }
             break;
@@ -3259,6 +3282,7 @@ bool isDependentOnParameter(IHqlExpression * expr)
     return checker.isDependent(expr);
 }
 
+// Returns true only when we need to build timing mechanisms around the calls
 bool isTimed(IHqlExpression * expr)
 {
     switch (expr->getOperator())
@@ -4117,7 +4141,7 @@ unsigned getBestLengthEstimate(IHqlExpression * expr)
 {
     ITypeInfo * exprType = expr->queryType();
     unsigned len = exprType->getStringLen();
-    if (len != UNKNOWN_LENGTH)
+    if (!isUnknownLength(len))
         return len;
 
     switch (expr->getOperator())
@@ -4129,7 +4153,7 @@ unsigned getBestLengthEstimate(IHqlExpression * expr)
             IHqlExpression * uncast = expr->queryChild(0);
             ITypeInfo * uncastType = uncast->queryType();
 
-            if ((uncastType->getSize() != UNKNOWN_LENGTH) && (isStringType(uncastType) || isUnicodeType(uncastType)))
+            if (!isUnknownLength(uncastType->getSize()) && (isStringType(uncastType) || isUnicodeType(uncastType)))
                 return uncastType->getStringLen();
         }
         break;
@@ -4225,7 +4249,7 @@ void SubStringHelper::init(IHqlExpression * _src, IHqlExpression * range)
     bool isUnicode = srcType->getTypeCode() == type_unicode;
     if (isStringOrData)
     {
-        if (srcType->getSize() == UNKNOWN_LENGTH)
+        if (isUnknownLength(srcType->getSize()))
         {
             if ((src->getOperator() == no_cast) || (src->getOperator() == no_implicitcast))
             {
@@ -4253,7 +4277,7 @@ void SubStringHelper::init(IHqlExpression * _src, IHqlExpression * range)
             }
         }
 
-        if (srcType->getSize() != UNKNOWN_LENGTH)
+        if (!isUnknownLength(srcType->getSize()))
             if (knownStart() && knownEnd())
                 special = true;
     }
@@ -4518,17 +4542,40 @@ IHqlExpression * createNullTransform(IHqlExpression * record)
 }
 
 
-static bool foundDifference()
+static bool foundDifference(const char * reason)
 {
-    return false;
+    DBGLOG("--- %s ---", reason);
+    //Place a breakpoint in a debugger in this function to allow you to examine the difference between two expressions
+    return true;
 }
 
-bool debugFindFirstDifference(IHqlExpression * left, IHqlExpression * right)
+static void traceExpr(StringBuffer & out, IHqlExpression * expr)
+{
+    out.appendf("%p:%s", expr, expr ? getOpString(expr->getOperator()) : "<nullptr>");
+    if (expr && querySeqId(expr))
+        out.appendf("(%llu)", querySeqId(expr)); // sequence number is useful for reproducibly identifying an expression
+    if (expr && expr->queryName())
+        out.appendf(" [%s]", str(expr->queryName()));
+}
+
+//return true if there was a difference, false if the expressions are identical
+static bool traceFindFirstDifference(IHqlExpression * left, IHqlExpression * right, unsigned indent, unsigned arg)
 {
     if (left == right)
-        return true;
+        return false;
+    StringBuffer msg;
+    msg.pad(indent);
+    if (arg != UINT_MAX)
+        msg.appendf("@%u", arg);
+    msg.append("{");
+    traceExpr(msg,left);
+    msg.append(" .. ");
+    traceExpr(msg,right);
+    msg.append("}");
+    DBGLOG("%s", msg.str());
+
     if (!left || !right)
-        return foundDifference();
+        return foundDifference("null");
     if (left->queryBody() == right->queryBody())
     {
         if ((left->getOperator() == no_call) && (right->getOperator() == no_call))
@@ -4537,10 +4584,10 @@ bool debugFindFirstDifference(IHqlExpression * left, IHqlExpression * right)
             IHqlExpression * rightDefinition = right->queryDefinition();
             if ((left != leftDefinition) || (right != rightDefinition))
             {
-                if (debugFindFirstDifference(left->queryDefinition(), right->queryDefinition()))
+                if (traceFindFirstDifference(left->queryDefinition(), right->queryDefinition(), indent+1, UINT_MAX))
                     return false;
             }
-            return foundDifference();       // break point here.
+            return foundDifference("Call annotations");
         }
 
         IHqlExpression * leftBody = left->queryBody(true);
@@ -4550,30 +4597,47 @@ bool debugFindFirstDifference(IHqlExpression * left, IHqlExpression * right)
         if (leftBody != rightBody)
         {
             if ((left == leftBody) || (right == rightBody))
-                return foundDifference();  // one side has an annotation, the other doesn't
-            return debugFindFirstDifference(leftBody, rightBody);
+                return foundDifference("Mismatched annotations");  // one side has an annotation, the other doesn't
+            return traceFindFirstDifference(leftBody, rightBody, indent+1, UINT_MAX);
         }
         if (leftAK != rightAK)
-            return foundDifference();  // different annotation
-        return foundDifference();  // some difference in the annotation details
+            return foundDifference("Different annotation");  // different annotation
+        return foundDifference("Detail of annotation");  // some difference in the annotation details
     }
     if (left->getOperator() != right->getOperator())
-        return foundDifference();
-    if (left->queryName() != right->queryName())
-        return foundDifference();
+    {
+        foundDifference("Different operator");
+        bool differ = true;
+        if (left->getOperator() == no_split)
+            differ = traceFindFirstDifference(left->queryChild(0), right, indent, arg);
+        else if (right->getOperator() == no_split)
+            differ = traceFindFirstDifference(left, right->queryChild(0), indent, arg);
+        else if (left->getOperator() == no_preservemeta)
+            differ = traceFindFirstDifference(left->queryChild(0), right, indent, arg);
+        else if (right->getOperator() == no_preservemeta)
+            differ = traceFindFirstDifference(left, right->queryChild(0), indent, arg);
+        if (!differ)
+            DBGLOG("--- same after skipping ---");
+        return true;
+    }
     ForEachChild(i, left)
     {
-        if (!debugFindFirstDifference(left->queryChild(i), right->queryChild(i)))
-            return false;
+        if (traceFindFirstDifference(left->queryChild(i), right->queryChild(i), indent+1, i))
+        {
+            //Return otherwise a difference in a selector sequence can cause very large numbers of differences
+            return true;
+        }
     }
+    if (left->queryName() != right->queryName())
+        return foundDifference("Different same argument");
     if (left->getOperator() != no_record)
     {
         IHqlExpression * leftRecord = queryOriginalRecord(left);
         IHqlExpression * rightRecord = queryOriginalRecord(right);
-        if (leftRecord || rightRecord)
+        if ((leftRecord || rightRecord) && (leftRecord != rightRecord))
         {
-            if (!debugFindFirstDifference(leftRecord, rightRecord))
-                return false;
+            if (traceFindFirstDifference(leftRecord, rightRecord, indent+1, UINT_MAX))
+                return true;
         }
     }
     if (left->queryType() != right->queryType())
@@ -4582,18 +4646,23 @@ bool debugFindFirstDifference(IHqlExpression * left, IHqlExpression * right)
         IHqlExpression * rTypeExpr = queryExpression(right->queryType());
         if (((left != lTypeExpr) || (right != rTypeExpr)) &&
             (lTypeExpr && rTypeExpr && lTypeExpr != rTypeExpr))
-            return debugFindFirstDifference(lTypeExpr, rTypeExpr);
-        return foundDifference();
+            return traceFindFirstDifference(lTypeExpr, rTypeExpr, indent+1, UINT_MAX);
+        return foundDifference("Type mismatch");
     }
 
-    return foundDifference();//something else
+    return foundDifference("Unknown difference");//something else
+}
+
+bool traceFindFirstDifference(IHqlExpression * left, IHqlExpression * right)
+{
+    return traceFindFirstDifference(left, right, 0, UINT_MAX);
 }
 
 void debugTrackDifference(IHqlExpression * expr)
 {
     static IHqlExpression * prev;
     if (prev && prev != expr)
-        debugFindFirstDifference(prev, expr);
+        traceFindFirstDifference(prev, expr);
     prev = expr;
 }
 
@@ -4601,6 +4670,9 @@ void debugTrackDifference(IHqlExpression * expr)
 
 static IHqlExpression * expandConditions(IHqlExpression * expr, DependenciesUsed & dependencies, HqlExprArray & conds, HqlExprArray & values)
 {
+    while (expr->getOperator() == no_alias_scope)
+        expr = expr->queryChild(0);
+
     if (expr->getOperator() != no_if)
         return expr;
 
@@ -4949,6 +5021,35 @@ bool containsExpression(IHqlExpression * expr, IHqlExpression * search)
 {
     TransformMutexBlock lock;
     return doContainsExpression(expr, search);
+}
+
+static IHqlExpression * doContainedSeqId(IHqlExpression * expr, unsigned __int64 search)
+{
+    for (;;)
+    {
+        if (expr->queryTransformExtra())
+            return nullptr;
+        if (querySeqId(expr) == search)
+            return expr;
+        expr->setTransformExtraUnlinked(expr);
+        IHqlExpression * body = expr->queryBody(true);
+        if (body == expr)
+            break;
+        expr = body;
+    }
+    ForEachChild(i, expr)
+    {
+        IHqlExpression * match = doContainedSeqId(expr->queryChild(i), search);
+        if (match)
+            return match;
+    }
+    return nullptr;
+}
+
+IHqlExpression * containedSeqId(IHqlExpression * expr, unsigned __int64 search)
+{
+    TransformMutexBlock lock;
+    return doContainedSeqId(expr, search);
 }
 
 static bool doContainsOperator(IHqlExpression * expr, node_operator search)
@@ -6081,7 +6182,7 @@ extern HQL_API bool containsVirtualField(IHqlExpression * record, IAtom * kind)
 IHqlExpression * removeVirtualFields(IHqlExpression * record)
 {
     HqlExprArray args;
-    args.ensure(record->numChildren());
+    args.ensureCapacity(record->numChildren());
     ForEachChild(i, record)
     {
         IHqlExpression * cur = record->queryChild(i);
@@ -6293,9 +6394,9 @@ static bool isSimpleTransformToMergeWith(IHqlExpression * expr, int & varSizeCou
                 //Want to take note of whether it reduces the number of variable size fields, if it makes many variable sized into fixed size then it won't be good to remove
                 ITypeInfo * srcType = queryUncastExpr(rhs)->queryType();
                 ITypeInfo * tgtType = cur->queryChild(0)->queryType();
-                if (tgtType->getSize() == UNKNOWN_LENGTH)
+                if (isUnknownLength(tgtType->getSize()))
                     varSizeCount--;
-                if (srcType->getSize() == UNKNOWN_LENGTH)
+                if (isUnknownLength(srcType->getSize()))
                     varSizeCount++;
                 break;
             }
@@ -6499,7 +6600,7 @@ IHqlExpression * extractCppBodyAttrs(unsigned lenBuffer, const char * buffer)
             ignore = true; // allow whitespace in front of #option
             break;
         case '#':
-            if (prev == '\n')
+            if (iseol(prev))
             {
                 if ((i + 1 + 6 < lenBuffer) && memicmp(buffer+i+1, "option", 6) == 0)
                 {
@@ -6537,6 +6638,8 @@ IHqlExpression * extractCppBodyAttrs(unsigned lenBuffer, const char * buffer)
                         OwnedHqlExpr arg = createConstant(restOfLine.getClear());
                         attrs.setown(createComma(attrs.getClear(), createAttribute(linkAtom, arg.getClear())));
                     }
+                    // end is pointing at an end of line character - ensure prev is set correctly
+                    next = '\n';
                 }
             }
         }
@@ -7335,14 +7438,14 @@ int compareLibraryParameterOrder(IHqlExpression * left, IHqlExpression * right)
     }
 
     //Then fixed size fields - to minimize the code generated to access them
-    if (left->queryType()->getSize() == UNKNOWN_LENGTH)
+    if (isUnknownLength(left->queryType()->getSize()))
     {
-        if (right->queryType()->getSize() != UNKNOWN_LENGTH)
+        if (!isUnknownLength(right->queryType()->getSize()))
             return +1;
     }
     else
     {
-        if (right->queryType()->getSize() == UNKNOWN_LENGTH)
+        if (isUnknownLength(right->queryType()->getSize()))
             return -1;
     }
 
@@ -8330,7 +8433,7 @@ protected:
         case type_string:
         case type_qstring:
         case type_utf8:
-            if (type->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(type->getSize()))
                 result.append("j");
             result.append(lookupRepeat(hasConst ? "PKc" : "Pc"));
             return true;
@@ -8338,12 +8441,12 @@ protected:
             result.append(lookupRepeat(hasConst ? "PKc" : "Pc"));
             return true;
         case type_data:
-            if (type->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(type->getSize()))
                 result.append("j");
             result.append(lookupRepeat(hasConst ? "PKv" : "Pv"));
             return true;
         case type_unicode:
-            if (type->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(type->getSize()))
                 result.append("j");
             result.append(lookupRepeat(hasConst ? "PKt" : "Pt"));
             return true;
@@ -8426,13 +8529,13 @@ protected:
         switch (tc)
         {
         case type_varstring:
-            if (retType->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(retType->getSize()))
                 returnType.append(lookupRepeat("Pc"));    // char *
             else
                 params.append(lookupRepeat("Pc"));        // char *
             break;
         case type_varunicode:
-            if (retType->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(retType->getSize()))
                 returnType.append(lookupRepeat("Pt"));    // ushort *
             else
                 params.append(lookupRepeat("Pt"));        // ushort *
@@ -8440,7 +8543,7 @@ protected:
         case type_qstring:
         case type_string:
         case type_utf8:
-            if (retType->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(retType->getSize()))
             {
                 params.append(lookupRepeat("Rj"));    // size32_t &
                 params.append(lookupRepeat("RPc"));   // char * &
@@ -8449,7 +8552,7 @@ protected:
                 params.append(lookupRepeat("Pc"));    // char *
             break;
         case type_data:
-            if (retType->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(retType->getSize()))
             {
                 params.append(lookupRepeat("Rj"));    // size32_t &
                 params.append(lookupRepeat("RPv"));   // void * &
@@ -8458,7 +8561,7 @@ protected:
                 params.append(lookupRepeat("Pv"));    // void *
             break;
         case type_unicode:
-            if (retType->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(retType->getSize()))
             {
                 params.append(lookupRepeat("Rj"));    // size32_t &
                 params.append(lookupRepeat("RPt"));   // UChar * &
@@ -8610,7 +8713,7 @@ protected:
         case type_string:
         case type_qstring:
         case type_utf8:
-            if (type->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(type->getSize()))
                 result.append("I");
             appendPtr(result, hasConst).append("D");
             return true;
@@ -8618,12 +8721,12 @@ protected:
             appendPtr(result, hasConst).append("D");
             return true;
         case type_data:
-            if (type->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(type->getSize()))
                 result.append("I");
             appendPtr(result, hasConst).append("X");
             return true;
         case type_unicode:
-            if (type->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(type->getSize()))
                 result.append("I");
             appendPtr(result, hasConst).append("G");
             return true;
@@ -8678,7 +8781,7 @@ protected:
         switch (tc)
         {
         case type_varstring:
-            if (retType->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(retType->getSize()))
             {
                 appendPtr(returnType, hasConst).append("D");    // char *
             }
@@ -8689,7 +8792,7 @@ protected:
             }
             break;
         case type_varunicode:
-            if (retType->getSize() == UNKNOWN_LENGTH)
+            if (isUnknownLength(retType->getSize()))
             {
                 appendPtr(returnType, hasConst).append("G");    // char *
             }
@@ -8742,7 +8845,7 @@ protected:
 
     StringBuffer & appendString(StringBuffer & params, ITypeInfo * type, const char * suffix)
     {
-        if (type->getSize() == UNKNOWN_LENGTH)
+        if (isUnknownLength(type->getSize()))
         {
             appendRef(params, false).append("I");   // size32_t &
             appendRef(params, false);
@@ -8766,6 +8869,7 @@ bool createMangledFunctionName(StringBuffer & mangled, IHqlExpression * funcdef,
     switch (compiler)
     {
     case GccCppCompiler:
+    case ClangCppCompiler:
         {
             GccCppNameMangler mangler;
             return mangler.mangleFunctionName(mangled, funcdef);
@@ -9382,7 +9486,7 @@ bool ConstantRowCreator::processFieldValue(IHqlExpression * optLhs, ITypeInfo * 
         }
     }
 
-    if ((lenLhs != UNKNOWN_LENGTH) && (lenLhs > maxSensibleInlineElementSize))
+    if ((!isUnknownLength(lenLhs)) && (lenLhs > maxSensibleInlineElementSize))
         return false;
 
     OwnedHqlExpr castRhs = ensureExprType(rhs, lhsType);
@@ -9395,7 +9499,7 @@ bool ConstantRowCreator::processFieldValue(IHqlExpression * optLhs, ITypeInfo * 
 
     ITypeInfo * castValueType = castValue->queryType();
     size32_t lenValue = castValueType->getStringLen();
-    assertex(lenLhs == UNKNOWN_LENGTH || lenLhs == lenValue);
+    assertex(isUnknownLength(lenLhs) || lenLhs == lenValue);
 
     switch (lhsType->getTypeCode())
     {
@@ -9412,14 +9516,14 @@ bool ConstantRowCreator::processFieldValue(IHqlExpression * optLhs, ITypeInfo * 
     case type_data:
     case type_string:
         {
-            if (lenLhs == UNKNOWN_LENGTH)
+            if (isUnknownLength(lenLhs))
                 rtlWriteInt4(out.reserve(sizeof(size32_t)), lenValue);
             castValue->toMem(out.reserve(lenValue));
             return true;
         }
     case type_varunicode:
     {
-        if (sizeLhs == UNKNOWN_LENGTH)
+        if (isUnknownLength(sizeLhs))
         {
             void * target = out.reserve((lenValue+1)*sizeof(UChar));
             castValue->toMem(target);
@@ -9436,7 +9540,7 @@ bool ConstantRowCreator::processFieldValue(IHqlExpression * optLhs, ITypeInfo * 
     case type_varstring:
         {
             //Move to else
-            if (sizeLhs == UNKNOWN_LENGTH)
+            if (isUnknownLength(sizeLhs))
             {
                 void * target = out.reserve(lenValue+1);
                 castValue->toMem(target);
@@ -9453,7 +9557,7 @@ bool ConstantRowCreator::processFieldValue(IHqlExpression * optLhs, ITypeInfo * 
     case type_unicode:
     case type_qstring:
         {
-            if (lenLhs == UNKNOWN_LENGTH)
+            if (isUnknownLength(lenLhs))
                 rtlWriteInt4(out.reserve(sizeof(size32_t)), lenValue);
             castValue->toMem(out.reserve(castValue->getSize()));
             return true;
@@ -9760,7 +9864,7 @@ IHqlExpression * expandMacroDefinition(IHqlExpression * expr, HqlLookupContext &
     else
         macroBodyExpr = expr;
 
-    IFileContents * macroContents = static_cast<IFileContents *>(macroBodyExpr->queryUnknownExtra());
+    IFileContents * macroContents = static_cast<IFileContents *>(macroBodyExpr->queryUnknownExtra(0));
     size32_t len = macroContents->length();
 
     //Strangely some macros still have the ENDMACRO on the end, and others don't.  This should be removed really.
@@ -10109,6 +10213,15 @@ IHqlExpression * convertSetToExpression(bool isAll, size32_t len, const void * p
                 presult += numUChars;
             };
             break;
+        case type_utf8:
+            while (presult < presult_end)
+            {
+                const size32_t numUChars = *((size32_t *) presult);
+                presult += sizeof(size32_t);
+                results.append(*createConstant(createUtf8Value((unsigned)numUChars, (const char*)presult, makeUtf8Type(numUChars, NULL))));
+                presult += rtlUtf8Size(numUChars, presult);
+            };
+            break;
         default:
             UNIMPLEMENTED;
     }
@@ -10127,7 +10240,7 @@ void getFieldTypeInfo(FieldTypeInfoStruct &out, ITypeInfo *type)
     if (tc == type_alien)
     {
         ITypeInfo * physicalType = queryAlienType(type)->queryPhysicalType();
-        if (physicalType->getSize() != UNKNOWN_LENGTH)
+        if (!isUnknownLength(physicalType->getSize()))
         {
             //Don't use the generated class for xml generation since it will generate physical rather than logical
             out.fieldType |= (RFTMalien|RFTMcannotinterpret|RFTMnoserialize);
@@ -10142,14 +10255,21 @@ void getFieldTypeInfo(FieldTypeInfoStruct &out, ITypeInfo *type)
             //until the alien field type is supported
         }
     }
+
+    size32_t originalSize = type->getSize();
     out.fieldType |= tc;
-    out.length = type->getSize();
+    out.length = originalSize;
     out.locale = nullptr;
     out.className = nullptr;
-    if (out.length == UNKNOWN_LENGTH)
+    bool unknownLength = isUnknownLength(originalSize);
+    if (unknownLength)
     {
         out.fieldType |= RFTMunknownsize;
-        out.length = 0;
+        unsigned lengthBytes = getLengthSizeBytes(out.length);
+        if (lengthBytes == 4)
+            out.length = 0;
+        else
+            out.length = lengthBytes;
     }
 
     switch (tc)
@@ -10205,7 +10325,9 @@ void getFieldTypeInfo(FieldTypeInfoStruct &out, ITypeInfo *type)
         break;
     case type_qstring:
         out.className = "RtlQStringTypeInfo";
-        out.length = type->getStringLen();
+        //NOTE: This is updating from length, not from size - retain special values for unknown length
+        if (!unknownLength || (originalSize == UNKNOWN_LENGTH))
+            out.length = type->getStringLen();
         break;
     case type_varstring:
         out.className = "RtlVarStringTypeInfo";
@@ -10257,6 +10379,10 @@ void getFieldTypeInfo(FieldTypeInfoStruct &out, ITypeInfo *type)
                 out.fieldType |= RFTMlinkcounted;
                 out.fieldType &= ~RFTMunknownsize;
             }
+
+            // DATASET(record, COUNT()/SIZEOF) cannot currently be serialized/deserialized
+            if (queryAttributeModifier(type, _childAttr_Atom))
+                out.fieldType |= RFTMnoserialize;
             break;
         }
     case type_dictionary:
@@ -10275,7 +10401,9 @@ void getFieldTypeInfo(FieldTypeInfoStruct &out, ITypeInfo *type)
     case type_unicode:
         out.className = "RtlUnicodeTypeInfo";
         out.locale = str(type->queryLocale());
-        out.length = type->getStringLen();
+        //NOTE: This is updating from length, not from size - retain special values for unknown length
+        if (!unknownLength || (originalSize == UNKNOWN_LENGTH))
+            out.length = type->getStringLen();
         break;
     case type_varunicode:
         out.className = "RtlVarUnicodeTypeInfo";
@@ -10285,7 +10413,9 @@ void getFieldTypeInfo(FieldTypeInfoStruct &out, ITypeInfo *type)
     case type_utf8:
         out.className = "RtlUtf8TypeInfo";
         out.locale = str(type->queryLocale());
-        out.length = type->getStringLen();
+        //NOTE: This is updating from length, not from size - retain special values for unknown length
+        if (!unknownLength || (originalSize == UNKNOWN_LENGTH))
+            out.length = type->getStringLen();
         break;
     case type_alien:
         out.className = "RtlAlienTypeInfo";
@@ -10324,7 +10454,7 @@ static IFieldFilter * createIfBlockFilter(IRtlFieldTypeDeserializer &deserialize
     OwnedHqlExpr mappedCondition = replaceSelector(cond, querySelfReference(), dummyDataset);
     Owned <IErrorReceiver> errorReceiver = createThrowingErrorReceiver();
 
-    FilterExtractor extractor(*errorReceiver, dummyDataset, rowRecord->numChildren(), true, true);
+    FilterExtractor extractor(*errorReceiver, dummyDataset, rowRecord->numChildren(), true, true, false);
     OwnedHqlExpr extraFilter;
     extractor.extractFilters(mappedCondition, extraFilter);
 
@@ -10569,4 +10699,198 @@ const RtlTypeInfo *buildRtlType(IRtlFieldTypeDeserializer &deserializer, ITypeIn
         info.fieldType |= info.childType->fieldType & RFTMinherited;
 
     return deserializer.addType(info, type);
+}
+
+
+IHqlExpression * queryAttributeModifier(ITypeInfo * type, IAtom * name)
+{
+    ITypeInfo * cur = type;
+    for(;;)
+    {
+        typemod_t mod = cur->queryModifier();
+        if (mod == typemod_none)
+            break;
+        if (mod == typemod_attr)
+        {
+            IHqlExpression * attr = (IHqlExpression *)cur->queryModifierExtra();
+            if (!name || (name == attr->queryName()))
+                return attr;
+        }
+
+        cur = cur->queryTypeBase();
+    }
+    return nullptr;
+}
+
+
+IException * checkRegexSyntax(IHqlExpression * expr)
+{
+    if (expr)
+    {
+        IValue * value = expr->queryValue();
+        if (value)
+        {
+            try
+            {
+                if (isUTF8Type(expr->queryType()))
+                {
+                    rtlSyntaxCheckU8StrRegExpr(rtlUtf8Length(value->getSize(), value->queryValue()), (const char *)value->queryValue());
+                }
+                else if (isUnicodeType(expr->queryType()))
+                {
+                    Owned<ITypeInfo> unknownVarUnicodeType = makeVarUnicodeType(UNKNOWN_LENGTH, nullptr);
+                    Owned<IValue> castValue = value->castTo(unknownVarUnicodeType);
+                    rtlSyntaxCheckUStrRegExpr((const UChar *)castValue->queryValue());
+                }
+                else
+                {
+                    Owned<ITypeInfo> unknownVarStringType = makeVarStringType(UNKNOWN_LENGTH);
+                    Owned<IValue> castValue = value->castTo(unknownVarStringType);
+                    rtlSyntaxCheckStrRegExpr((const char *)castValue->queryValue());
+                }
+            }
+            catch (IException * e)
+            {
+                return e;
+            }
+        }
+    }
+    return nullptr;
+}
+
+
+size32_t getMaxLength(IHqlExpression * expr)
+{
+    ITypeInfo * type = expr->queryType();
+    size32_t typeLength = type->getStringLen();
+    if (!isUnknownLength(typeLength))
+        return type->getStringLen();
+
+    switch (expr->getOperator())
+    {
+    case no_trim:
+        return getMaxLength(expr->queryChild(0));
+
+    case no_concat:
+        {
+            size32_t max = 0;
+            ForEachChild(i, expr)
+            {
+                size32_t len = getMaxLength(expr->queryChild(i));
+                if (isUnknownLength(len))
+                    return UNKNOWN_LENGTH;
+                max += len;
+            }
+            return max;
+        }
+    }
+
+    switch (typeLength)
+    {
+    case UNKNOWN_LENGTH1:
+        return 0xFF;
+    case UNKNOWN_LENGTH2:
+        return 0xFFFF;
+    }
+
+    return UNKNOWN_LENGTH;
+}
+
+bool isTrimSupported(ITypeInfo * type)
+{
+    switch (type->getTypeCode())
+    {
+    case type_string:
+    case type_qstring:
+    case type_unicode:
+    case type_utf8:
+    case type_varstring:
+    case type_varunicode:
+        return true;
+    default:
+        return false;
+    }
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+interface IFieldTransformer
+{
+    virtual IHqlExpression * transform(IHqlExpression * expr) = 0;
+};
+
+// A function for applying an arbitrary transformation to each field in a row.
+// If the callback returns non-null the value is used
+// if the callback returns null and it is a datarow, then the callback is applied recursively
+// otherwise the value is used unchanged
+
+static IHqlExpression * applyTransformationToRow(IHqlExpression * expr, IFieldTransformer & callback);
+static void applyTransformationToRow(HqlExprArray & args, bool & anyMapped, IHqlExpression * self, IHqlExpression * right, IHqlExpression * record, IFieldTransformer & callback)
+{
+    ForEachChild(i, record)
+    {
+        IHqlExpression * cur = record->queryChild(i);
+        switch (cur->getOperator())
+        {
+        case no_record:
+            applyTransformationToRow(args, anyMapped, self, right, cur, callback);
+            break;
+        case no_ifblock:
+            applyTransformationToRow(args, anyMapped, self, right, cur->queryChild(1), callback);
+            break;
+        case no_field:
+            {
+                OwnedHqlExpr target = createSelectExpr(LINK(self), LINK(cur));
+                OwnedHqlExpr value = createSelectExpr(LINK(right), LINK(cur));
+                OwnedHqlExpr mapped = callback.transform(value);
+                if (mapped)
+                {
+                    anyMapped = true;
+                    value.setown(mapped.getClear());
+                }
+                else if (cur->isDatarow())
+                {
+                    IHqlExpression * transform = applyTransformationToRow(value, callback);
+                    if (transform)
+                        value.setown(createRow(no_createrow, transform));
+                }
+
+                args.append(*createAssign(target.getClear(), value.getClear()));
+                break;
+            }
+        }
+    }
+}
+
+static IHqlExpression * applyTransformationToRow(IHqlExpression * expr, IFieldTransformer & callback)
+{
+    IHqlExpression * record = expr->queryRecord();
+    OwnedHqlExpr self = createSelector(no_self, record, NULL);
+    HqlExprArray args;
+    bool anyMapped = false;
+    applyTransformationToRow(args, anyMapped, self, expr, record, callback);
+    if (!anyMapped)
+        return nullptr;
+
+    // If the expression is a dataset, then this will be used to create a no_newusertable, which needs a no_newtransform
+    // everything else will use a no_transform
+    node_operator op = expr->isDataset() ? no_newtransform : no_transform;
+    return createValue(op, makeTransformType(record->getType()), args);
+}
+
+
+IHqlExpression * queryCreateTrimTransform(IHqlExpression * expr)
+{
+    class TrimFieldTransformer : public CInterfaceOf<IFieldTransformer>
+    {
+    public:
+        virtual IHqlExpression * transform(IHqlExpression * expr)
+        {
+            ITypeInfo * type = expr->queryType();
+            //It is only necessary to trim fields with unknown size - fixed length fields will either be truncated or space padded
+            if (isUnknownSize(type) && isTrimSupported(type))
+                return createValue(no_trim, expr->getType(), LINK(expr));
+            return nullptr;
+        }
+    } transformer;
+    return applyTransformationToRow(expr, transformer);
 }

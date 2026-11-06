@@ -120,7 +120,7 @@ public:
         try {
 
             StringBuffer epstr;
-            ActPrintLog(activity, thorDetailedLogLevel, "Connect to %s:%d",endpoint.getIpText(epstr).str(),(unsigned)mpport);
+            ActPrintLog(activity, thorDetailedLogLevel, "Connect to %s:%d",endpoint.getHostText(epstr).str(),(unsigned)mpport);
             SocketEndpoint ep = endpoint;
             ep.port = mpport;
             Owned<INode> node = createINode(ep);
@@ -179,27 +179,18 @@ inline byte *dupb(byte *b,size32_t l)
 
 struct PartitionInfo
 {
-    size32_t guard;
-    Linked<IThorRowInterfaces> prowif;
     PartitionInfo(CActivityBase *_activity, IThorRowInterfaces *rowif)
         : splitkeys(*_activity, rowif, ers_allow), prowif(rowif)
     {
-        nodes = NULL;
-        mpports = NULL;
         guard = rowif?rowif->queryRowMetaData()->getMinRecordSize():(size32_t)-1;
     }
 
     ~PartitionInfo()
     {
-        free(nodes);
+        delete [] nodes;
         free(mpports);
     }
 
-    unsigned        numnodes;
-    SocketEndpoint  *nodes;
-    unsigned short  *mpports;
-    mptag_t mpTagRPC;
-    CThorExpandingRowArray splitkeys;
     void init() 
     {
         nodes = NULL;
@@ -209,7 +200,7 @@ struct PartitionInfo
     }
     void kill()
     {
-        free(nodes);
+        delete [] nodes;
         free(mpports);
         init();
     }
@@ -218,6 +209,15 @@ struct PartitionInfo
         // should be more defensive here
         return (numnodes!=0)&&(splitkeys.ordinality()!=0);
     }
+
+
+    Linked<IThorRowInterfaces> prowif;
+    size32_t guard;
+    unsigned        numnodes;
+    SocketEndpoint  *nodes = nullptr;
+    unsigned short  *mpports = nullptr;
+    mptag_t mpTagRPC;
+    CThorExpandingRowArray splitkeys;
 };
 
 
@@ -241,13 +241,20 @@ public:
     ISortKeySerializer *keyserializer;  // used on partition calculation
     PartitionInfo *partitioninfo;
     bool resultorderset;
-    Mutex slavemutex;
+    Mutex slavemutex{SYNC_LOCATION};
     char *cosortfilenames;
     size32_t estrecsize;            // serialized
     size32_t maxdeviance;
     Linked<IThorRowInterfaces> rowif;
     Linked<IThorRowInterfaces> auxrowif;
     Linked<IThorRowInterfaces> keyIf;
+    Owned<roxiemem::IVariableRowHeap> partitionHeap;
+
+    class SortSemaphore : public Semaphore
+    {
+    public:
+        SortSemaphore(unsigned initialCount=0) : Semaphore(SYNC_LOCATION, initialCount) {}
+    };
 
     int AddSlave(ICommunicator *comm,rank_t rank,SocketEndpoint &endpoint,mptag_t mpTagRPC)
     {
@@ -262,13 +269,13 @@ public:
         class casyncfor: public CAsyncFor
         {
         public:
-            casyncfor(CSortMaster &_owner, NodeArray &_slaves) : owner(_owner), slaves(_slaves) { }
+            casyncfor(CSortMaster &_owner, NodeArray &_slaves) : CAsyncFor(SYNC_LOCATION), owner(_owner), slaves(_slaves) { }
             void Do(unsigned i)
             {
                 CSortNode &slave = slaves.item(i);
                 if (!slave.doConnect(i,slaves.ordinality())) {
                     char url[100];
-                    slave.endpoint.getUrlStr(url,sizeof(url));
+                    slave.endpoint.getEndpointHostText(url,sizeof(url));
                     throw MakeActivityException(owner.activity,TE_CannotConnectToSlave,"CSortMaster::ConnectSlaves: Could not connect to %s",url);
                 }
             }
@@ -284,7 +291,7 @@ public:
         class casyncfor: public CAsyncFor
         {
         public:
-            casyncfor(NodeArray &_slaves) : slaves(_slaves) { }
+            casyncfor(NodeArray &_slaves) : CAsyncFor(SYNC_LOCATION), slaves(_slaves) { }
             void Do(unsigned i)
             {
                 CSortNode &slave = slaves.item(i);          
@@ -353,10 +360,10 @@ public:
         estrecsize = 100;
         if (!partitioninfo)
             partitioninfo = new PartitionInfo(activity, keyIf);
-        free(partitioninfo->nodes);
+        delete [] partitioninfo->nodes;
         free(partitioninfo->mpports);
         partitioninfo->numnodes=numnodes;
-        partitioninfo->nodes=(SocketEndpoint *)malloc(numnodes*sizeof(SocketEndpoint));
+        partitioninfo->nodes = new SocketEndpoint[numnodes];
         partitioninfo->mpports=(unsigned short *)malloc(numnodes*sizeof(unsigned short));
         partitioninfo->mpTagRPC = slaves.item(0).mpTagRPC;  // NB all same
 
@@ -405,7 +412,7 @@ public:
         {
             CActivityBase &activity;
         public:
-            casyncfor(CActivityBase &_activity, NodeArray &_slaves) : activity(_activity), slaves(_slaves) { wait = false; }
+            casyncfor(CActivityBase &_activity, NodeArray &_slaves) : CAsyncFor(SYNC_LOCATION), activity(_activity), slaves(_slaves) { wait = false; }
             void Do(unsigned i)
             {
                 if (activity.queryAbortSoon())
@@ -512,7 +519,7 @@ public:
         }
         unsigned averagesamples = OVERSAMPLE*numnodes;  
         rowcount_t averagerecspernode = (rowcount_t)(total/numnodes);
-        CriticalSection asect;
+        CriticalSection asect{SYNC_LOCATION};
         CThorExpandingRowArray sample(*activity, keyIf, ers_allow);
         class casyncfor1: public CAsyncFor
         {
@@ -522,9 +529,10 @@ public:
             CriticalSection &asect;
             unsigned averagesamples;
             rowcount_t averagerecspernode;
+            roxiemem::IVariableRowHeap *heap;
         public:
-            casyncfor1(CSortMaster &_owner, NodeArray &_slaves, CThorExpandingRowArray &_sample, unsigned _averagesamples, rowcount_t _averagerecspernode, CriticalSection &_asect)
-                : owner(_owner), slaves(_slaves), sample(_sample), asect(_asect)
+            casyncfor1(CSortMaster &_owner, NodeArray &_slaves, CThorExpandingRowArray &_sample, unsigned _averagesamples, rowcount_t _averagerecspernode, CriticalSection &_asect, roxiemem::IVariableRowHeap *_heap)
+                : CAsyncFor(SYNC_LOCATION), owner(_owner), slaves(_slaves), sample(_sample), asect(_asect), heap(_heap)
             { 
                 averagesamples = _averagesamples;
                 averagerecspernode = _averagerecspernode;
@@ -537,13 +545,28 @@ public:
                 if (slavesamples)
                 {
                     size32_t samplebufsize;
-                    void *samplebuf=NULL;
-                    slave.GetMultiNthRow(slavesamples, samplebufsize, samplebuf);
-                    MemoryBuffer mb;
-                    fastLZDecompressToBuffer(mb, samplebuf);
-                    free(samplebuf);
+                    OwnedMalloc<void> samplebuf;
+                    void *p;
+                    slave.GetMultiNthRow(slavesamples, samplebufsize, p);
+                    samplebuf.setown(p);
+                    size32_t expandedSz;
+                    const void *expandedPtr = nullptr;
+                    MemoryBuffer expandedSampleMb;
+                    OwnedConstThorRow expandedSample;
+                    if (heap)
+                    {
+                        expandedSample.setown(fastLZDecompressToRoxieMem(*heap, samplebuf, expandedSz));
+                        expandedPtr = expandedSample;
+                    }
+                    else
+                    {
+                        fastLZDecompressToBuffer(expandedSampleMb, samplebuf);
+                        expandedSz = expandedSampleMb.length();
+                        expandedPtr = expandedSampleMb.toByteArray();
+                    }
+                    samplebuf.clear();
                     CriticalBlock block(asect);
-                    CThorStreamDeserializerSource d(mb.length(), mb.toByteArray());
+                    CThorStreamDeserializerSource d(expandedSz, expandedPtr);
                     while (!d.eos())
                     {
                         RtlDynamicRowBuilder rowBuilder(owner.keyIf->queryRowAllocator());
@@ -552,7 +575,7 @@ public:
                     }
                 }
             }
-        } afor1(*this, slaves,sample,averagesamples,averagerecspernode,asect);
+        } afor1(*this, slaves,sample,averagesamples,averagerecspernode,asect,partitionHeap);
         afor1.For(numnodes, 20, true);
 #ifdef TRACE_PARTITION2
         {
@@ -604,7 +627,7 @@ public:
             const byte *mdp;
         public:
             casyncfor2(NodeArray &_slaves,size32_t _mdl,const byte *_mdp)
-                : slaves(_slaves)
+                : CAsyncFor(SYNC_LOCATION), slaves(_slaves)
             { 
                 mdl = _mdl;
                 mdp = _mdp;
@@ -625,7 +648,7 @@ public:
             unsigned numsplits;
         public:
             casyncfor3(NodeArray &_slaves,rowcount_t *_splitmap,unsigned _numnodes,unsigned _numsplits)
-                : slaves(_slaves)
+                : CAsyncFor(SYNC_LOCATION), slaves(_slaves)
             { 
                 splitmap = _splitmap;
                 numnodes = _numnodes;
@@ -654,7 +677,6 @@ public:
 #endif
         return splitMap.getClear();
     }
-
 
     rowcount_t *CalcPartition(bool logging)
     {
@@ -705,7 +727,7 @@ public:
                     const MemoryBuffer &mbmx;
                 public:
                     casyncfor(NodeArray &_slaves,const MemoryBuffer &_mbmn,const MemoryBuffer &_mbmx) 
-                        : slaves(_slaves),mbmn(_mbmn), mbmx(_mbmx)
+                        : CAsyncFor(SYNC_LOCATION), slaves(_slaves),mbmn(_mbmn), mbmx(_mbmx)
                     { 
                     }
                     void Do(unsigned i)
@@ -716,8 +738,8 @@ public:
                     }
                 } afor(slaves,mbmn,mbmx);
                 afor.For(numnodes, 20, true);
-                Semaphore *nextsem = new Semaphore[numnodes];
-                CriticalSection nextsect;
+                SortSemaphore *nextsem = new SortSemaphore[numnodes];
+                CriticalSection nextsect{SYNC_LOCATION};
 
                 totmid.kill();
                 class casyncfor2: public CAsyncFor
@@ -727,9 +749,10 @@ public:
                     Semaphore *nextsem;
                     unsigned numsplits;
                     IThorRowInterfaces *keyIf;
+                    roxiemem::IVariableRowHeap *heap;
                 public:
-                    casyncfor2(NodeArray &_slaves, CThorExpandingRowArray &_totmid, unsigned _numsplits, Semaphore *_nextsem, IThorRowInterfaces *_keyIf)
-                        : slaves(_slaves), totmid(_totmid), keyIf(_keyIf)
+                    casyncfor2(NodeArray &_slaves, CThorExpandingRowArray &_totmid, unsigned _numsplits, Semaphore *_nextsem, IThorRowInterfaces *_keyIf, roxiemem::IVariableRowHeap *_heap)
+                        : CAsyncFor(SYNC_LOCATION), slaves(_slaves), totmid(_totmid), keyIf(_keyIf), heap(_heap)
                     { 
                         nextsem = _nextsem;
                         numsplits = _numsplits;
@@ -737,21 +760,40 @@ public:
                     void Do(unsigned i)
                     {
                         CSortNode &slave = slaves.item(i);
-                        void *p = NULL;
                         size32_t retlen=0;
-                        if (slave.numrecs!=0) 
-                            slave.GetMultiMidPointStop(retlen,p);
+                        OwnedMalloc<void> midPoints;
+                        if (slave.numrecs!=0)
+                        {
+                            // if the rows this SORT is based are large, these midpoints (nodes-1) could be large (but compressed)
+                            // could consider serializing and deserializnig them in chunks..
+                            void *p;
+                            slave.GetMultiMidPointStop(retlen, p);
+                            midPoints.setown(p);
+                        }
                         if (i)
                             nextsem[i-1].wait();
                         try
                         {
                             unsigned base = totmid.ordinality();
-                            if (p)
+                            if (midPoints)
                             {
-                                MemoryBuffer mb;
-                                fastLZDecompressToBuffer(mb, p);
-                                free(p);
-                                CThorStreamDeserializerSource d(mb.length(), mb.toByteArray());
+                                size32_t expandedSz;
+                                const void *expandedPtr = nullptr;
+                                MemoryBuffer expandedMidPointsMb;
+                                OwnedConstThorRow expandedMidPoints;
+                                if (heap)
+                                {
+                                    expandedMidPoints.setown(fastLZDecompressToRoxieMem(*heap, midPoints, expandedSz));
+                                    expandedPtr = expandedMidPoints;
+                                }
+                                else
+                                {
+                                    fastLZDecompressToBuffer(expandedMidPointsMb, midPoints);
+                                    expandedSz = expandedMidPointsMb.length();
+                                    expandedPtr = expandedMidPointsMb.toByteArray();
+                                }
+                                midPoints.clear();
+                                CThorStreamDeserializerSource d(expandedSz, expandedPtr);
                                 while (!d.eos())
                                 {
                                     RtlDynamicRowBuilder rowBuilder(keyIf->queryRowAllocator());
@@ -777,7 +819,7 @@ public:
                         }
                         nextsem[i].signal();
                     }
-                } afor2(slaves, totmid, numsplits, nextsem, keyIf);
+                } afor2(slaves, totmid, numsplits, nextsem, keyIf, partitionHeap);
                 afor2.For(numnodes, 20);
 
                 delete [] nextsem;
@@ -1096,6 +1138,12 @@ public:
         }
         ActPrintLog(activity, "Sort: canoptimizenullcolumns=%s, usepartitionrow=%s, betweensort=%s skewWarning=%f skewError=%f minisortthreshold=%" I64F "d",canoptimizenullcolumns?"true":"false",usepartitionrow?"true":"false",betweensort?"true":"false",skewWarning,skewError,(__int64)minisortthreshold);
         assertex(partitioninfo);
+
+        constexpr byte AT_SortPartition=1;
+        activity_id actId = createCompoundActSeqId(activity->queryId(), AT_SortPartition);
+        if (activity->getOptBool(THOROPT_ROXIEMEM_GLOBALSORT_PARTITION, true))
+            partitionHeap.setown(activity->queryRowManager()->createVariableRowHeap(actId | ACTIVITY_FLAG_ISREGISTERED, roxiemem::RoxieHeapFlags::RHFvariable));
+
         maxdeviance = _maxdeviance;
         unsigned i;
         bool overflowed = false;
@@ -1175,11 +1223,13 @@ public:
                             splitMap.setown(CalcPartitionUsingSampling());
                         else
 #endif
+                        {
 #ifdef TRACE_PARTITION
                             splitMap.setown(CalcPartition(true));
 #else
                             splitMap.setown(CalcPartition(false));
 #endif
+                        }
                     }
                     if (!partitioninfo->splitkeys.checkSorted(icompare))
                     {
@@ -1189,8 +1239,8 @@ public:
                 }
                 timer.stop("Calculating split map");
             }
-            OwnedMalloc<SocketEndpoint> endpoints(numnodes);
-            SocketEndpoint *epp = endpoints;
+            std::unique_ptr<SocketEndpoint[]> endpoints(new SocketEndpoint[numnodes]);
+            SocketEndpoint *epp = endpoints.get();
             for (i=0;i<numnodes;i++)
             {
                 CSortNode &slave = slaves.item(i);
@@ -1233,7 +1283,7 @@ public:
                         if (slave.scale!=mostspilt+1)
                         {
                             char url[100];
-                            slave.endpoint.getUrlStr(url,sizeof(url));
+                            slave.endpoint.getEndpointHostText(url,sizeof(url));
                             ActPrintLog(activity, "Gather - node %s spilled %d times to disk",url,slave.scale-1);
                         }
                     }
@@ -1303,7 +1353,7 @@ public:
                     {
                         CSortNode &slave = slaves.item(i);
                         char url[100];
-                        slave.endpoint.getUrlStr(url,sizeof(url));
+                        slave.endpoint.getEndpointHostText(url,sizeof(url));
                         ActPrintLog(activity, thorDetailedLogLevel, "Split point %d: %" RCPF "d rows on %s", i, tot[i], url);
                     }
                 }
@@ -1329,11 +1379,11 @@ public:
                 {
                     CSortNode &slave = slaves.item(i);
                     char url[100];
-                    slave.endpoint.getUrlStr(url,sizeof(url));
+                    slave.endpoint.getEndpointHostText(url,sizeof(url));
                     if (splitMapUpper)
-                        slave.MultiMergeBetween(total, numnodes*numnodes,splitMap,splitMapUpper,numnodes,endpoints);
+                        slave.MultiMergeBetween(total, numnodes*numnodes,splitMap,splitMapUpper,numnodes,endpoints.get());
                     else
-                        slave.MultiMerge(total, numnodes*numnodes,splitMap,numnodes,endpoints);
+                        slave.MultiMerge(total, numnodes*numnodes,splitMap,numnodes,endpoints.get());
     //              ActPrintLog(activity, "Merge %d started: %d rows on %s",i,tot[i],url);
                 }
             }
@@ -1355,7 +1405,7 @@ public:
             rowcount_t totalrows;
         public:
             casyncfor1(NodeArray &_slaves,rowcount_t _totalrows) 
-                : slaves(_slaves) 
+                : CAsyncFor(SYNC_LOCATION), slaves(_slaves) 
             { 
                 totalrows = _totalrows;
             }
@@ -1374,7 +1424,7 @@ public:
 
 CThorExpandingRowArray *CSortMaster::ECFarray;
 ICompare *CSortMaster::ECFcompare;
-CriticalSection CSortMaster::ECFcrit; 
+CriticalSection CSortMaster::ECFcrit{SYNC_LOCATION};
 
 
 IThorSorterMaster *CreateThorSorterMaster(CActivityBase *activity)

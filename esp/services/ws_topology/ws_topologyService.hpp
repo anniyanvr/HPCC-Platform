@@ -69,7 +69,7 @@ public:
 
     virtual void getNavigationData(IEspContext &context, IPropertyTree & data)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
         {
             CHttpSoapBinding::getNavigationData(context, data);
             return;
@@ -85,6 +85,8 @@ public:
 
 class CWsTopologyEx : public CWsTopology
 {
+    friend class WsTopologyTests;
+
 private:
 
     CTpWrapper m_TpWrapper;
@@ -132,6 +134,7 @@ private:
     bool readLogDateTimeFromLogLine(const char* lineStart, const unsigned lineLength, ReadLog& readLogReq,
         CDateTime& dt, StringBuffer& logFieldTime);
     void readLastNRowsToArray(const char* logName, OwnedIFileIO rIO, ReadLog& readLogReq, StringArray& returnBuf);
+    void validateFilePath(const char *file, const char *fileType, const char *compType, const char *compName);
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -160,6 +163,8 @@ public:
 
     bool onTpSwapNode(IEspContext &context,IEspTpSwapNodeRequest  &req, IEspTpSwapNodeResponse &resp);
 
+    bool onTpListLogFiles(IEspContext &context, IEspTpListLogFilesRequest &req, IEspTpListLogFilesResponse &resp);
+
     bool onTpXMLFile(IEspContext &context,IEspTpXMLFileRequest  &req, IEspTpXMLFileResponse &resp);
 
     bool onTpLogFile(IEspContext &context,IEspTpLogFileRequest  &req, IEspTpLogFileResponse &resp);
@@ -173,6 +178,9 @@ public:
     bool onTpGetComponentFile(IEspContext &context, IEspTpGetComponentFileRequest &req, IEspTpGetComponentFileResponse &resp);
 
     bool onTpThorStatus(IEspContext &context, IEspTpThorStatusRequest &req, IEspTpThorStatusResponse &resp);
+
+    bool onTpConfiguredComponents(IEspContext &context, IEspTpConfiguredComponentsRequest &req, IEspTpConfiguredComponentsResponse &resp);
+    bool onTpComponentConfiguration(IEspContext &context, IEspTpComponentConfigurationRequest &req, IEspTpComponentConfigurationResponse &resp);
 };
 
 

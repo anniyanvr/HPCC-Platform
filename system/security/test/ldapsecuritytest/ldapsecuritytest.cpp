@@ -31,7 +31,7 @@
 #include <unistd.h>
 #endif
 
-Mutex m_mutex;
+Mutex m_mutex{SYNC_LOCATION};
 
 void usage()
 {
@@ -115,9 +115,8 @@ class CPermissionCheckThread : public Thread
     SecResourceType m_rtype;
     int m_rounds;
 public:
-    IMPLEMENT_IINTERFACE;
-
     CPermissionCheckThread(ISecManager* secmgr, const char* user, const char* passwd, const char* r, SecResourceType rtype, int rounds)
+        : Thread("CPermissionCheckThread")
     {
         m_secmgr = secmgr;
         m_user.set(user);
@@ -307,7 +306,7 @@ int main(int argc, char* argv[])
                 for(int i = 0; i < numthrds; i++)   
                     thrds[i] = new CPermissionCheckThread(secmgr, username, passwd, resource, rtype, numrounds);
                 for(int j = 0; j < numthrds; j++)
-                    thrds[j]->start();
+                    thrds[j]->start(false);
                 for(int k = 0; k < numthrds; k++)
                     thrds[k]->join();
             }

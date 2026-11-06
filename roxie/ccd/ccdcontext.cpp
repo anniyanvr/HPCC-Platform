@@ -17,6 +17,8 @@
 
 #include "platform.h"
 #include "jlib.hpp"
+#include "jevent.hpp"
+#include "jprotrace.hpp"
 
 #include "environment.hpp"
 #include "workunit.hpp"
@@ -39,6 +41,8 @@
 #include "ccdstate.hpp"
 #include "roxiehelper.hpp"
 #include "enginecontext.hpp"
+#include "ws_dfsclient.hpp"
+#include "wfcontext.hpp"
 
 #include <list>
 #include <string>
@@ -71,7 +75,7 @@ class CAgentDebugContext : public CBaseDebugContext
     memsize_t parentActivity;
     unsigned channel;
     int debugSequence;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     const IRoxieContextLogger &logctx; // hides base class definition with more derived class pointer
 
 public:
@@ -151,9 +155,6 @@ public:
                 if (callback->wait(5000))
                     break;
             }
-            if (traceLevel > 6)
-                { StringBuffer s; DBGLOG("Processing information from Roxie server in response to %s", newHeader.toString(s).str()); }
-
             MemoryBuffer &serverData = callback->queryData();
             deserialize(serverData);
         }
@@ -198,22 +199,11 @@ public:
 };
 
 //=======================================================================================================================
-#define DEFAULT_PERSIST_COPIES (-1)
 #define PERSIST_LOCK_TIMEOUT 10000
 #define PERSIST_LOCK_SLEEP 5000
 
 class CRoxieWorkflowMachine : public WorkflowMachine
 {
-    class PersistVersion : public CInterface
-    {
-    public:
-        PersistVersion(char const * _logicalName, unsigned _eclCRC, unsigned __int64 _allCRC, bool _isFile) : logicalName(_logicalName), eclCRC(_eclCRC), allCRC(_allCRC), isFile(_isFile) {}
-        StringAttr logicalName;
-        unsigned eclCRC;
-        unsigned __int64 allCRC;
-        bool isFile;
-    };
-
 public:
     CRoxieWorkflowMachine(IPropertyTree *_workflowInfo, IConstWorkUnit *_wu, bool _doOnce, bool _parallelWorkflow, unsigned _numWorkflowThreads, const IRoxieContextLogger &_logctx)
     : WorkflowMachine(_logctx)
@@ -461,7 +451,7 @@ private:
 
     inline bool fileExists(const char *lfn)
     {
-        Owned<IDistributedFile> f = queryDistributedFileDirectory().lookup(lfn, queryUserDescriptor(), false, false, false, nullptr, defaultPrivilegedUser);
+        Owned<IDistributedFile> f = wsdfs::lookup(lfn, queryUserDescriptor(), AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser, INFINITE);
         if (f)
             return true;
         return false;
@@ -594,8 +584,7 @@ private:
         StringBuffer s;
         s.append("Waiting for persist ").append(logicalName);
         WorkunitUpdate w(&workunit->lock());
-        w->setState(WUStateBlocked);
-        w->setStateEx(s.str());
+        setBlockedState(w, s.str());
     }
 
     bool isPersistUptoDate(Owned<IRemoteConnection> &persistLock, IRuntimeWorkflowItem & item, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC, bool isFile)
@@ -647,7 +636,7 @@ private:
         return false;
     }
 
-    void updatePersist(IRemoteConnection *persistLock, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC)
+    virtual void updatePersist(IRemoteConnection *persistLock, const char * logicalName, unsigned eclCRC, unsigned __int64 allCRC)
     {
         StringBuffer lfn, crcName, eclName, whenName;
         expandLogicalFilename(lfn, logicalName, workunit, false, false);
@@ -663,7 +652,7 @@ private:
         changePersistLockMode(persistLock, RTM_LOCK_READ, logicalName, true);
     }
 
-    IRemoteConnection *startPersist(const char * logicalName)
+    virtual IRemoteConnection *startPersist(const char * logicalName)
     {
         setBlockedOnPersist(logicalName);
         IRemoteConnection *persistLock = getPersistReadLock(logicalName);
@@ -671,7 +660,32 @@ private:
         w->setState(WUStateRunning);
         return persistLock;
     }
-
+    virtual void finishPersist(const char * persistName, IRemoteConnection *persistLock)
+    {
+        //this protects lock array from race conditions
+        CriticalBlock block(finishPersistCritSec);
+        logctx.CTXLOG("Finished persists - add to read lock list");
+        persistReadLocks.append(*persistLock);
+    }
+    virtual bool checkFreezePersists(const char *logicalName, unsigned eclCRC)
+    {
+        bool freeze = (workunit->getDebugValueInt("freezepersists", 0) != 0);
+        if (freeze)
+            checkPersistMatches(logicalName, eclCRC);
+        return freeze;
+    }
+    virtual void checkPersistSupported()
+    {
+        if (!workunit)
+        {
+            throw MakeStringException(0, "PERSIST not supported when running predeployed queries");
+        }
+    }
+    virtual bool isPersistAlreadyLocked(const char * logicalName)
+    {
+        //Note: if workunits are restarted, then the engine should check to verify that the persist has not already been calculated
+        return false;
+    }
     void checkPersistMatches(const char * logicalName, unsigned eclCRC)
     {
         StringBuffer lfn, eclName;
@@ -716,7 +730,7 @@ private:
         head.append("p*");                                  // Multi-mode persist names end with __pNNNNNNN
         restart:     // If things change beneath us as we are deleting, repeat the process
         IArrayOf<IPropertyTree> persists;
-        Owned<IDFAttributesIterator> iter = queryDistributedFileDirectory().getDFAttributesIterator(head,queryUserDescriptor(),false,false,NULL);
+        Owned<IPropertyTreeIterator> iter = queryDistributedFileDirectory().getDFAttributesIterator(head,queryUserDescriptor(), false, false, nullptr);
         ForEach(*iter)
         {
             IPropertyTree &pt = iter->query();
@@ -755,7 +769,7 @@ private:
                     MilliSleep(PERSIST_LOCK_SLEEP + (getRandom()%PERSIST_LOCK_SLEEP));
                     persistLock.setown(getPersistReadLock(goer));
                 }
-                Owned<IDistributedFile> f = queryDistributedFileDirectory().lookup(goer, queryUserDescriptor(), true, false, false, nullptr, defaultPrivilegedUser);
+                Owned<IDistributedFile> f = wsdfs::lookup(goer, queryUserDescriptor(), AccessMode::writeSequential, false, false, nullptr, defaultPrivilegedUser, INFINITE);
                 if (!f)
                     goto restart; // Persist has been deleted since last checked - repeat the whole process
                 const char *newAccessTime = f->queryAttributes().queryProp("@accessed");
@@ -782,7 +796,6 @@ private:
     IConstWorkUnit *workunit;
     IPropertyTree *workflowInfo;
     Owned<IWorkflowScheduleConnection> wfconn;
-    Owned<PersistVersion> persist;
     IArray persistReadLocks;
     bool doOnce;
     bool parallelWorkflow;
@@ -837,7 +850,7 @@ class CDeserializedResultStore : implements IDeserializedResultStore, public CIn
     PointerArrayOf<row_t> stored;
     UnsignedArray counts;
     IPointerArrayOf<IOutputMetaData> metas;
-    mutable SpinLock lock;
+    mutable SpinLock lock{SYNC_LOCATION};
 public:
     IMPLEMENT_IINTERFACE;
     ~CDeserializedResultStore()
@@ -940,7 +953,7 @@ protected:
     const IRoxieContextLogger &logctx;
     byte *bufferBase;
     MemoryBuffer blockBuffer;
-    Owned<ISerialStream> bufferStream;
+    Owned<IBufferedSerialInputStream> bufferStream;
     CThorStreamDeserializerSource rowSource;
     bool eof;
     bool eogPending;
@@ -1000,7 +1013,6 @@ public:
         size32_t size = rowDeserializer->deserialize(rowBuilder, rowSource);
         if (isGrouped)
             rowSource.read(sizeof(bool), &eogPending);
-        rowsIn++;
         return rowBuilder.finalizeRowClear(size);
     }
 };
@@ -1168,38 +1180,39 @@ public:
 
 //---------------------------------------------------------------------------------------
 
-static const StatisticsMapping graphStatistics({});
+static const StatisticsMapping graphStatistics(std::initializer_list<StatisticKind>{});
 class CRoxieContextBase : implements IRoxieAgentContext, implements ICodeContext, implements roxiemem::ITimeLimiter, implements IRowAllocatorMetaActIdCacheCallback, public CInterface
 {
 protected:
     Owned<IWUGraphStats> graphStats;   // This needs to be destroyed very late (particularly, after the childgraphs)
     mutable Owned<IRowAllocatorMetaActIdCache> allocatorMetaCache;
-    Owned<IRowManager> rowManager; // NOTE: the order of destruction here is significant. For leak check to work destroy this BEFORE allAllocators, but after most other things
+    mutable AtomicShared<IRowManager> privateRowManager; // NOTE: the order of destruction here is significant. For leak check to work destroy this BEFORE allAllocators, but after most other things
     Owned <IDebuggableContext> debugContext;
     const IQueryFactory *factory;
     Owned<IProbeManager> probeManager; // must be destroyed after childGraphs
     MapXToMyClass<unsigned, unsigned, IActivityGraph> childGraphs;
     Owned<IActivityGraph> graph;
     StringBuffer authToken;
-    Owned<IPropertyTree> probeQuery;
     unsigned lastWuAbortCheck;
     unsigned startTime;
-    unsigned totAgentsReplyLen;
+    std::atomic<unsigned> totAgentsReplyLen = {0};
+    std::atomic<unsigned> totAgentsDuplicates = {0};
+    std::atomic<unsigned> totAgentsResends = {0};
     CCycleTimer elapsedTimer;
 
     QueryOptions options;
     Owned<IConstWorkUnit> workUnit;
+    Owned<IConstWorkUnit> statsWu;
     Owned<IRoxieDaliHelper> daliHelperLink;
     Owned<IDistributedFileTransaction> superfileTransaction;
+    IArrayOf<IQueryFactory> loadedLibraries;
 
-    mutable CriticalSection statsCrit;
     const IRoxieContextLogger &logctx;
-
 
 protected:
     bool exceptionLogged;
-    bool aborted;
-    CriticalSection abortLock; // NOTE: we don't bother to get lock when just reading to see whether to abort
+    std::atomic<bool> aborted{false};
+    mutable CriticalSection abortLock{SYNC_LOCATION}; // NOTE: we don't bother to get lock when just reading to see whether to abort
     Owned<IException> exception;
 
     static void _toXML(IPropertyTree *tree, StringBuffer &xgmml, unsigned indent)
@@ -1250,6 +1263,35 @@ protected:
         }
     }
 
+    IRowManager * ensureRowManager() const
+    {
+        //Reuse the abort lock critical section because it is unlikely to cause unrelated contention
+        CriticalBlock b(abortLock);
+        IRowManager * result = privateRowManager.query();
+        if (result)
+            return result;
+
+        //This interface should really be passed as const... but cast to non-const
+        const roxiemem::ITimeLimiter * castThis = this;
+        roxiemem::ITimeLimiter * timeLimiter = const_cast<roxiemem::ITimeLimiter *>(castThis);
+        result = roxiemem::createRowManager(options.memoryLimit, timeLimiter, logctx, allocatorMetaCache, false);
+        privateRowManager.setownNonAtomic(result);
+        return result;
+    }
+
+    inline IRowManager * queryEnsureRowManager() const
+    {
+        IRowManager * result = privateRowManager.query();
+        if (likely(result))
+            return result;
+        return ensureRowManager();
+    }
+
+    inline bool createdRowManager() const
+    {
+        return privateRowManager.isSet();
+    }
+
 public:
     IMPLEMENT_IINTERFACE;
     CRoxieContextBase(const IQueryFactory *_factory, const IRoxieContextLogger &_logctx)
@@ -1261,12 +1303,12 @@ public:
         deserializedResultStore = NULL;
         rereadResults = NULL;
         xmlStoredDatasetReadFlags = ptr_none;
-        aborted = false;
         exceptionLogged = false;
         totAgentsReplyLen = 0;
+        totAgentsDuplicates = 0;
+        totAgentsResends = 0;
 
         allocatorMetaCache.setown(createRowAllocatorCache(this));
-        rowManager.setown(roxiemem::createRowManager(options.memoryLimit, this, logctx, allocatorMetaCache, false));
         //MORE: If checking heap required then should have
         //rowManager.setown(createCheckingHeap(rowManager)) or something similar.
     }
@@ -1279,19 +1321,29 @@ public:
     }
 
     // interface IRoxieServerContext
-    virtual bool collectingDetailedStatistics() const
+    virtual bool collectingDetailedStatistics() const override
     {
-        return (workUnit != nullptr);
+        return (workUnit != nullptr) || (statsWu != nullptr);
     }
 
-    virtual void noteStatistic(StatisticKind kind, unsigned __int64 value) const
+    virtual unsigned getElapsedMs() const override
+    {
+        return msTick() - startTime;
+    }
+
+    virtual void noteStatistic(StatisticKind kind, unsigned __int64 value) const override
     {
         logctx.noteStatistic(kind, value);
     }
 
-    virtual void mergeStats(const CRuntimeStatisticCollection &from) const
+    virtual void setStatistic(StatisticKind kind, unsigned __int64 value) const override
     {
-        logctx.mergeStats(from);
+        logctx.setStatistic(kind, value);
+    }
+
+    virtual void mergeStats(unsigned activityId, const CRuntimeStatisticCollection &from) const override
+    {
+        logctx.mergeStats(activityId, from);
     }
 
     virtual void gatherStats(CRuntimeStatisticCollection & merged) const override
@@ -1299,9 +1351,17 @@ public:
         logctx.gatherStats(merged);
     }
 
-    virtual void CTXLOGa(TracingCategory category, const char *prefix, const char *text) const
+    virtual StringBuffer &getStats(StringBuffer &ret) const override
     {
-        logctx.CTXLOGa(category, prefix, text);
+        return logctx.getStats(ret);
+    }
+    virtual void recordStatistics(IStatisticGatherer &progress) const override
+    {
+        globalStats.recordStatistics(progress, false);
+    }
+    virtual void CTXLOGa(TracingCategory category, const LogMsgCategory & cat, LogMsgCode code, const char *prefix, const char *text) const override
+    {
+        logctx.CTXLOGa(category, cat, code, prefix, text);
     }
 
     virtual void CTXLOGaeva(IException *E, const char *file, unsigned line, const char *prefix, const char *format, va_list args) const
@@ -1350,15 +1410,31 @@ public:
     {
         return logctx.queryTraceLevel();
     }
-    virtual void setGlobalId(const char *id, SocketEndpoint &ep, unsigned pid) override
+    virtual ISpan * queryActiveSpan() const override
     {
-        const_cast<IRoxieContextLogger&>(logctx).setGlobalId(id, ep, pid);
+        return logctx.queryActiveSpan();
     }
-    virtual void setCallerId(const char *id) override
+    virtual void setActiveSpan(ISpan * span) override
     {
-        const_cast<IRoxieContextLogger&>(logctx).setCallerId(id);
+        const_cast<IRoxieContextLogger&>(logctx).setActiveSpan(span);
     }
-    virtual const char *queryGlobalId() const
+    virtual IProperties * getClientHeaders() const override
+    {
+        return logctx.getClientHeaders();
+    }
+    virtual IProperties * getSpanContext() const override
+    {
+        return logctx.getSpanContext();
+    }
+    virtual void setSpanAttribute(const char *name, const char *value) const override
+    {
+        logctx.setSpanAttribute(name, value);
+    }
+    virtual void setSpanAttribute(const char *name, __uint64 value) const override
+    {
+        logctx.setSpanAttribute(name, value);
+    }
+    virtual const char *queryGlobalId() const override
     {
         return logctx.queryGlobalId();
     }
@@ -1366,31 +1442,21 @@ public:
     {
         return logctx.queryCallerId();
     }
-    virtual const char *queryLocalId() const
+    virtual const char *queryLocalId() const override
     {
         return logctx.queryLocalId();
     }
-    virtual void setHttpIdHeaders(const char *global, const char *caller)
+    virtual const CRuntimeStatisticCollection & queryStats() const override
     {
-        const_cast<IRoxieContextLogger&>(logctx).setHttpIdHeaders(global, caller);
+        return logctx.queryStats();
     }
-    virtual const char *queryGlobalIdHttpHeader() const
+    virtual void noteLibrary(IQueryFactory *library)
     {
-        return logctx.queryGlobalIdHttpHeader();
+        loadedLibraries.appendUniq(*LINK(library));
     }
-    virtual const char *queryCallerIdHttpHeader() const
-    {
-        return logctx.queryCallerIdHttpHeader();
-    }
-
-
-    virtual void checkAbort()
+    virtual void checkAbort() override
     {
         // MORE - really should try to apply limits at agent end too
-#ifdef __linux__
-        if (linuxYield)
-            sched_yield();
-#endif
         if (aborted) // NOTE - don't bother getting lock before reading this (for speed) - a false read is very unlikely and not a problem
         {
             CriticalBlock b(abortLock);
@@ -1441,7 +1507,7 @@ public:
         return interval;
     }
 
-    virtual void notifyAbort(IException *E)
+    virtual void notifyAbort(IException *E) override
     {
         CriticalBlock b(abortLock);
         if (!aborted && QUERYINTERFACE(E, InterruptedSemaphoreException) == NULL)
@@ -1450,6 +1516,22 @@ public:
             exception.set(E);
             setWUState(WUStateAborting);
         }
+    }
+
+    virtual void notifyException(IException *E) override
+    {
+        CriticalBlock b(abortLock);
+        if (!exception && QUERYINTERFACE(E, InterruptedSemaphoreException) == NULL)
+        {
+            exception.set(E);
+        }
+    }
+
+    virtual void throwPendingException() override
+    {
+        CriticalBlock b(abortLock);
+        if (exception)
+            throw exception.getClear();
     }
 
     virtual void setWUState(WUState state)
@@ -1471,6 +1553,11 @@ public:
         return options;
     }
 
+    virtual cycle_t queryElapsedCycles() const
+    {
+        return elapsedTimer.elapsedCycles();
+    }
+
     const char *queryAuthToken()
     {
         return authToken.str();
@@ -1478,8 +1565,6 @@ public:
 
     virtual void noteChildGraph(unsigned id, IActivityGraph *childGraph)
     {
-        if (queryTraceLevel() > 10)
-            CTXLOG("CAgentContext %p noteChildGraph %d=%p", this, id, childGraph);
         childGraphs.setValue(id, childGraph);
     }
 
@@ -1493,6 +1578,7 @@ public:
         {
             Owned<IQueryFactory> libraryQuery = factory->lookupLibrary(extra.libraryName, extra.interfaceHash, *this);
             assertex(libraryQuery);
+            parentActivity->noteLibrary(libraryQuery);
             IActivityGraph *ret = libraryQuery->lookupGraph(this, "graph1", probeManager, *this, parentActivity);
             ret->setPrefix(libraryQuery->queryQueryName());
             return ret;
@@ -1507,17 +1593,27 @@ public:
             probeManager.setown(createDebugManager(debugContext, graphName));
             debugContext->checkBreakpoint(DebugStateGraphCreate, NULL, graphName);
         }
-        else if (probeAllRows || probeQuery != NULL)
-            probeManager.setown(createProbeManager());
         graph.setown(factory->lookupGraph(this, graphName, probeManager, *this, NULL));
         graph->onCreate(NULL);  // MORE - is that right
         if (debugContext)
             debugContext->checkBreakpoint(DebugStateGraphStart, NULL, graphName);
-        if (collectingDetailedStatistics())
-            graphStats.setown(workUnit->updateStats(graph->queryName(), SCTroxie, queryStatisticsComponentName(), graph->queryWorkflowId(), 0));
+        if (workUnit)
+            graphStats.setown(workUnit->updateStats(graph->queryName(), SCTroxie, queryStatisticsComponentName(), graph->queryWorkflowId(), 0, false));
+        else if (statsWu)
+            graphStats.setown(statsWu->updateStats(graph->queryName(), SCTroxie, queryStatisticsComponentName(), graph->queryWorkflowId(), 0, true));
     }
 
-    virtual void endGraph(unsigned __int64 startTimeStamp, cycle_t startCycles, bool aborting)
+    IWorkUnit *updateStatsWorkUnit() const
+    {
+        if (workUnit)
+            return &workUnit->lock();
+        else if (statsWu)
+            return &statsWu->lock();
+        else
+            return nullptr;
+    }
+
+    virtual void endGraph(const ProcessInfo & startProcessInfo, unsigned __int64 startTimeStamp, cycle_t startCycles, bool aborting)
     {
         if (graph)
         {
@@ -1529,17 +1625,25 @@ public:
                     debugContext->checkBreakpoint(aborting ? DebugStateGraphAbort : DebugStateGraphEnd, NULL, graph->queryName());
                 if (aborting)
                     graph->abort();
-                if (workUnit)
+                if (workUnit || statsWu)
                 {
                     const char * graphName = graph->queryName();
                     StringBuffer graphDesc;
                     formatGraphTimerLabel(graphDesc, graphName);
-                    WorkunitUpdate progressWorkUnit(&workUnit->lock());
+                    WorkunitUpdate progressWorkUnit(updateStatsWorkUnit());
                     StringBuffer graphScope;
                     graphScope.append(WorkflowScopePrefix).append(graph->queryWorkflowId()).append(":").append(graphName);
                     progressWorkUnit->setStatistic(queryStatisticsComponentType(), queryStatisticsComponentName(), SSTgraph, graphScope, StWhenStarted, NULL, startTimeStamp, 1, 0, StatsMergeAppend);
                     updateWorkunitStat(progressWorkUnit, SSTgraph, graphScope, StTimeElapsed, graphDesc, elapsedTime);
                     addTimeStamp(progressWorkUnit, SSTgraph, graphName, StWhenFinished, graph->queryWorkflowId());
+
+                    ProcessInfo endProcessInfo(ReadAllInfo);
+                    SystemProcessInfo delta = endProcessInfo - startProcessInfo;
+                    updateWorkunitStat(progressWorkUnit, SSTgraph, graphScope, StTimeUser, graphDesc, delta.getUserNs());
+                    updateWorkunitStat(progressWorkUnit, SSTgraph, graphScope, StTimeSystem, graphDesc, delta.getSystemNs());
+                    updateWorkunitStat(progressWorkUnit, SSTgraph, graphScope, StNumContextSwitches, graphDesc, delta.getNumContextSwitches());
+                    updateWorkunitStat(progressWorkUnit, SSTgraph, graphScope, StSizeMemory, graphDesc, endProcessInfo.getActiveResidentMemory());
+                    updateWorkunitStat(progressWorkUnit, SSTgraph, graphScope, StSizePeakMemory, graphDesc, endProcessInfo.getPeakResidentMemory());
                 }
                 graph->reset();
             }
@@ -1563,52 +1667,36 @@ public:
         if (graph)
             graph->gatherStatistics(builder);
 
-        SuperHashIteratorOf<decltype(childGraphs)::ELEMENT> iter(childGraphs);
-        ForEach(iter)
-        {
-            IActivityGraph * curChildGraph = static_cast<IActivityGraph *>(iter.query().getValue());
-            curChildGraph->gatherStatistics(builder);
-        }
-
         graph.clear();
         childGraphs.kill();
     }
 
     void runGraph()
     {
-        try
-        {
-            graph->execute();
-
-            if (probeQuery)
-                graph->getProbeResponse(probeQuery);
-
-        }
-        catch(...)
-        {
-            if (probeQuery)
-                graph->getProbeResponse(probeQuery);
-            throw;
-        }
+        graph->execute();
     }
 
     virtual void executeGraph(const char * name, bool realThor, size32_t parentExtractSize, const void * parentExtract)
     {
         assertex(parentExtractSize == 0);
-        if (queryTraceLevel() > 8)
-            CTXLOG("Executing graph %s", name);
-
         if (realThor)
         {
-            executeThorGraph(name, *workUnit, queryComponentConfig());
+            Owned<IPropertyTree> compConfig = getComponentConfig();
+            executeThorGraph(name, *workUnit, *compConfig);
         }
         else
         {
+            OwnedActiveSpanScope graphScope = queryThreadedActiveSpan()->createInternalSpan(name);
+            ProcessInfo startProcessInfo;
+            if (workUnit || statsWu)
+                startProcessInfo.update(ReadAllInfo);
             bool created = false;
             cycle_t startCycles = get_cycles_now();
             unsigned __int64 startTimeStamp = getTimeStampNowValue();
             try
             {
+                TaskScopeTracker task(EventTask::Graph);
+
                 beginGraph(name);
                 created = true;
                 runGraph();
@@ -1623,7 +1711,7 @@ public:
                     CTXLOG("Exception thrown in query - cleaning up: %d: %s", e->errorCode(), e->errorMessage(s).str());
                 }
                 if (created)  // Partially-created graphs are liable to crash if you call abort() on them...
-                    endGraph(startTimeStamp, startCycles, true);
+                    endGraph(startProcessInfo, startTimeStamp, startCycles, true);
                 else
                 {
                     // Bit of a hack... needed to avoid pure virtual calls if these are left to the CRoxieContextBase destructor
@@ -1636,7 +1724,7 @@ public:
             {
                 CTXLOG("Exception thrown in query - cleaning up");
                 if (created)
-                    endGraph(startTimeStamp, startCycles, true);
+                    endGraph(startProcessInfo, startTimeStamp, startCycles, true);
                 else
                 {
                     // Bit of a hack... needed to avoid pure virtual calls if these are left to the CRoxieContextBase destructor
@@ -1645,14 +1733,12 @@ public:
                 CTXLOG("Done cleaning up");
                 throw;
             }
-            endGraph(startTimeStamp, startCycles, false);
+            endGraph(startProcessInfo, startTimeStamp, startCycles, false);
         }
     }
 
     virtual IActivityGraph * queryChildGraph(unsigned  id)
     {
-        if (queryTraceLevel() > 10)
-            CTXLOG("CAgentContext %p resolveChildGraph %d", this, id);
         if (id == 0)
             return graph;
         IActivityGraph *childGraph = childGraphs.getValue(id);
@@ -1673,13 +1759,16 @@ public:
 
     virtual IRowManager &queryRowManager()
     {
-        return *rowManager;
+        return *queryEnsureRowManager();
     }
 
-    virtual void addAgentsReplyLen(unsigned len)
+    virtual void addAgentsReplyLen(unsigned len, unsigned duplicates, unsigned resends)
     {
-        CriticalBlock b(statsCrit); // MORE: change to atomic_add, or may not need it at all?
         totAgentsReplyLen += len;
+        if (duplicates)
+            totAgentsDuplicates += duplicates;
+        if (resends)
+            totAgentsResends += resends;
     }
 
     virtual const char *loadResource(unsigned id)
@@ -1722,8 +1811,6 @@ public:
     }
     virtual IEngineContext *queryEngineContext() { return NULL; }
     virtual char *getDaliServers() { throwUnexpected(); }
-    virtual unsigned getWorkflowId() { return 0; } // this is a virtual which is implemented in IGlobalContext
-
     // The following from ICodeContext should never be executed in agent activity. If we are on Roxie server, they will be implemented by more derived CRoxieServerContext class
     virtual void setResultBool(const char *name, unsigned sequence, bool value) { throwUnexpected(); }
     virtual void setResultData(const char *name, unsigned sequence, int len, const void * data) { throwUnexpected(); }
@@ -1743,6 +1830,7 @@ public:
     virtual void printResults(IXmlWriter *output, const char *name, unsigned sequence) { throwUnexpected(); }
 
     virtual char *getWuid() { throwUnexpected(); }
+    virtual unsigned getWorkflowId() const override { return graph->queryWorkflowId(); }
     virtual void getExternalResultRaw(unsigned & tlen, void * & tgt, const char * wuid, const char * stepname, unsigned sequence, IXmlToRowTransformer * xmlTransformer, ICsvToRowTransformer * csvTransformer) { throwUnexpected(); }
 
     virtual char * getExpandLogicalName(const char * logicalName) { throwUnexpected(); }
@@ -1785,12 +1873,12 @@ public:
 
     virtual const char *cloneVString(const char *str) const
     {
-        return rowManager->cloneVString(str);
+        return queryEnsureRowManager()->cloneVString(str);
     }
 
     virtual const char *cloneVString(size32_t len, const char *str) const
     {
-        return rowManager->cloneVString(len, str);
+        return queryEnsureRowManager()->cloneVString(len, str);
     }
 
     virtual void getRowXML(size32_t & lenResult, char * & result, IOutputMetaData & info, const void * row, unsigned flags)
@@ -1819,9 +1907,9 @@ public:
     virtual IEngineRowAllocator *createAllocator(IRowAllocatorMetaActIdCache * cache, IOutputMetaData *meta, unsigned activityId, unsigned id, roxiemem::RoxieHeapFlags flags) const
     {
         if (options.checkingHeap)
-            return createCrcRoxieRowAllocator(cache, *rowManager, meta, activityId, id, flags);
+            return createCrcRoxieRowAllocator(cache, *queryEnsureRowManager(), meta, activityId, id, flags);
         else
-            return createRoxieRowAllocator(cache, *rowManager, meta, activityId, id, flags);
+            return createRoxieRowAllocator(cache, *queryEnsureRowManager(), meta, activityId, id, flags);
     }
 
     virtual void getResultRowset(size32_t & tcount, const byte * * & tgt, const char * stepname, unsigned sequence, IEngineRowAllocator * _rowAllocator, bool isGrouped, IXmlToRowTransformer * xmlTransformer, ICsvToRowTransformer * csvTransformer) override
@@ -1870,15 +1958,6 @@ public:
         return useContext(sequence).getPropBool(name);
     }
 
-    static unsigned hex2digit(char c)
-    {
-        // MORE - what about error cases?
-        if (c >= 'a')
-            return (c - 'a' + 10);
-        else if (c >= 'A')
-            return (c - 'A' + 10);
-        return (c - '0');
-    }
     virtual void getResultData(unsigned & tlen, void * & tgt, const char * name, unsigned sequence)
     {
         MemoryBuffer result;
@@ -1903,32 +1982,31 @@ public:
     }
     virtual void getResultDecimal(unsigned tlen, int precision, bool isSigned, void * tgt, const char * stepname, unsigned sequence)
     {
-        if (isSpecialResultSequence(sequence))
+        memset(tgt, 0, tlen);
+        CriticalBlock b(contextCrit);
+        IPropertyTree &ctx = useContext(sequence);
+        if (ctx.hasProp(stepname))
         {
-            MemoryBuffer m;
-            CriticalBlock b(contextCrit);
-            useContext(sequence).getPropBin(stepname, m);
-            if (m.length())
+            if (ctx.isBinary(stepname))
             {
-                assertex(m.length() == tlen);
-                m.read(tlen, tgt);
+                MemoryBuffer m;
+                ctx.getPropBin(stepname, m);
+                if (m.length())
+                {
+                    assertex(m.length() == tlen);
+                    m.read(tlen, tgt);
+                }
             }
             else
-                memset(tgt, 0, tlen);
-        }
-        else
-        {
-            StringBuffer x;
             {
-                CriticalBlock b(contextCrit);
-                useContext(sequence).getProp(stepname, x);
+                const char *val = ctx.queryProp(stepname);
+                Decimal d;
+                d.setCString(val);
+                if (isSigned)
+                    d.getDecimal(tlen, precision, tgt);
+                else
+                    d.getUDecimal(tlen, precision, tgt);
             }
-            Decimal d;
-            d.setString(x.length(), x.str());
-            if (isSigned)
-                d.getDecimal(tlen, precision, tgt);
-            else
-                d.getUDecimal(tlen, precision, tgt);
         }
     }
     virtual __int64 getResultInt(const char * name, unsigned sequence)
@@ -2072,17 +2150,23 @@ public:
     virtual UChar *getResultVarUnicode(const char * name, unsigned sequence)
     {
         StringBuffer x;
-        CriticalBlock b(contextCrit);
-        useContext(sequence).getProp(name, x);
+        {
+            CriticalBlock b(contextCrit);
+            useContext(sequence).getProp(name, x);
+        }
         return rtlVCodepageToVUnicodeX(x.str(), "utf-8");
     }
     virtual ISectionTimer * registerTimer(unsigned activityId, const char * name)
     {
-        CriticalBlock b(contextCrit);
+        return registerStatsTimer(activityId, name, 0);
+    }
+    virtual ISectionTimer * registerStatsTimer(unsigned activityId, const char * name, unsigned int statsOption)
+    {
+        CriticalBlock b(timerCrit);
         ISectionTimer *timer = functionTimers.getValue(name);
         if (!timer)
         {
-            timer = ThorSectionTimer::createTimer(globalStats, name);
+            timer = ThorSectionTimer::createTimer(globalStats, name, static_cast<ThorStatOption>(statsOption));
             functionTimers.setValue(name, timer);
             timer->Release(); // Value returned is not linked
         }
@@ -2091,7 +2175,9 @@ public:
     virtual void addWuExceptionEx(const char * text, unsigned code, unsigned severity, unsigned audience, const char * source) override { throwUnexpected(); }
 
 protected:
-    mutable CriticalSection contextCrit;
+    mutable CriticalSection contextCrit{SYNC_LOCATION};
+    CriticalSection timerCrit{SYNC_LOCATION};
+    CriticalSection resolveCrit{SYNC_LOCATION};
     Owned<IPropertyTree> context;
     IPropertyTree *persists;
     IPropertyTree *temporaries;
@@ -2113,7 +2199,7 @@ protected:
                 throw MakeStringException(ROXIE_CODEGEN_ERROR, "Code generation error - attempting to access stored variable on agent");
         case ResultSequencePersist:
             {
-                CriticalBlock b(contextCrit);
+                contextCrit.assertLocked();
                 if (!persists)
                     persists = createPTree(ipt_fast);
                 return *persists;
@@ -2126,14 +2212,14 @@ protected:
             //fall through
         case ResultSequenceInternal:
             {
-                CriticalBlock b(contextCrit);
+                contextCrit.assertLocked();
                 if (!temporaries)
                     temporaries = createPTree(ipt_fast);
                 return *temporaries;
             }
         default:
             {
-                CriticalBlock b(contextCrit);
+                contextCrit.assertLocked();
                 if (!rereadResults)
                     rereadResults = createPTree(ipt_fast);
                 return *rereadResults;
@@ -2319,7 +2405,9 @@ public:
     {
         // NOTE: This is needed to ensure that owned activities are destroyed BEFORE I am,
         // to avoid pure virtual calls when they come to call noteProcessed()
-        logctx.mergeStats(globalStats);
+        logctx.mergeStats(0, globalStats);
+        if (factory)
+            factory->mergeStats(logctx);
         childGraphs.releaseAll();
     }
 
@@ -2334,7 +2422,7 @@ public:
         return queryAgentDynamicFileCache()->lookupDynamicFile(*this, filename, cacheDate, 0, header, isOpt, false);
     }
 
-    virtual IRoxieWriteHandler *createLFN(const char *filename, bool overwrite, bool extend, const StringArray &clusters, bool isPrivilegedUser)
+    virtual IRoxieWriteHandler *createWriteHandler(const char *filename, bool overwrite, bool extend, const StringArray &clusters, bool isPrivilegedUser)
     {
         throwUnexpected(); // only support writing on the server
     }
@@ -2518,18 +2606,21 @@ public:
 
 };
 
+enum LogActReset { LogResetSkip=0, LogResetOK, LogResetInit };
+static constexpr char hexchar[] = "0123456789ABCDEF";
+
 class CRoxieServerContext : public CRoxieContextBase, implements IRoxieServerContext, implements IGlobalCodeContext, implements IEngineContext
 {
     const IQueryFactory *serverQueryFactory = nullptr;
     IHpccProtocolResponse *protocol = nullptr;
     IHpccProtocolResultsWriter *results = nullptr;
     IHpccNativeProtocolResponse *nativeProtocol = nullptr;
-    CriticalSection daliUpdateCrit;
+    CriticalSection daliUpdateCrit{SYNC_LOCATION};
     StringAttr querySetName;
 
     bool isRaw;
     bool sendHeartBeats;
-    unsigned lastSocketCheckTime;
+    std::atomic<unsigned> lastSocketCheckTime;
     unsigned lastHeartBeat;
 
 protected:
@@ -2542,46 +2633,44 @@ protected:
     bool isBlocked;
     bool isNative;
     bool trim;
+    LogActReset actResetLogState = LogResetInit;
 
     void doPostProcess()
     {
-        if (workUnit)
+        logctx.mergeStats(0, globalStats);
+        unsigned __int64 elapsed = elapsedTimer.elapsedNs();
+        unsigned __int64 minTime = milliToNano(options.minTimeLimit);
+        if (minTime && (nanoToMilli(elapsed) < minTime))
         {
-            WorkunitUpdate w(&workUnit->lock());
-            Owned<IStatisticGatherer> builder = createGlobalStatisticGatherer(w);
-            globalStats.recordStatistics(*builder);
+            unsigned __int64 delay = minTime - elapsed;
+            NanoSleep(delay);
+            logctx.noteStatistic(StTimeDelayed, delay);
         }
-        logctx.mergeStats(globalStats);
+        logctx.setStatistic(StTimeTotalExecute, elapsed);  // Should this include delay?
+        if (factory)
+        {
+            factory->mergeStats(logctx);
+        }
         globalStats.reset();
         if (!protocol)
             return;
 
         if (!isRaw && !isBlocked)
             protocol->flush();
-
-        if (probeQuery)
-        {
-            // loop through all of the graphs and create a _Probe to output each xgmml
-            Owned<IPropertyTreeIterator> graphs = probeQuery->getElements("Graph");
-            ForEach(*graphs)
-            {
-                IPropertyTree &graph = graphs->query();
-
-                StringBuffer xgmml;
-                _toXML(&graph, xgmml, 0);
-                protocol->appendProbeGraph(xgmml.str());
-            }
-        }
     }
     void addWuException(IException *E)
     {
         if (workUnit)
             ::addWuException(workUnit, E);
+        else if (statsWu)
+            ::addWuException(statsWu, E);
     }
 
     void init()
     {
         totAgentsReplyLen = 0;
+        totAgentsDuplicates = 0;
+        totAgentsResends = 0;
         isRaw = false;
         isBlocked = false;
         isNative = true;
@@ -2637,11 +2726,12 @@ protected:
             WorkunitUpdate wu(&workUnit->lock());
             wu->setDebugAgentListenerPort(debugEndpoint.port); //tells debugger what port to write commands to
             StringBuffer sb;
-            debugEndpoint.getIpText(sb);
+            debugEndpoint.getHostText(sb);
             wu->setDebugAgentListenerIP(sb); //tells debugger what IP to write commands to
         }
         options.timeLimit = 0;
         options.warnTimeLimit = 0;
+        options.minTimeLimit = 0;
     }
 
 public:
@@ -2651,7 +2741,6 @@ public:
         : CRoxieContextBase(_factory, _logctx), serverQueryFactory(_factory), results(NULL)
     {
         init();
-        rowManager->setMemoryLimit(options.memoryLimit);
         workflow.setown(_factory->createWorkflowMachine(workUnit, true, logctx, options));
         context.setown(createPTree(ipt_caseInsensitive|ipt_fast));
     }
@@ -2661,12 +2750,12 @@ public:
     {
         init();
         workUnit.set(_workUnit);
-        rowManager->setMemoryLimit(options.memoryLimit);
         workflow.setown(_factory->createWorkflowMachine(workUnit, false, logctx, options));
         context.setown(createPTree(ipt_caseInsensitive|ipt_fast));
 
         //MORE: Use various debug settings to override settings:
-        rowManager->setActivityTracking(workUnit->getDebugValueBool("traceRoxiePeakMemory", false));
+        if (workUnit->getDebugValueBool("traceRoxiePeakMemory", false))
+            queryEnsureRowManager()->setActivityTracking(true);
 
         startWorkUnit();
     }
@@ -2691,14 +2780,21 @@ public:
         sendHeartBeats = enableHeartBeat && isRaw && isBlocked && options.priority==0;
 
         const char *wuid = context->queryProp("@wuid");
-        if (wuid)
+        if (options.statsToWorkunit)
         {
             IRoxieDaliHelper *daliHelper = checkDaliConnection();
-            assertex(daliHelper );
-            workUnit.setown(daliHelper->attachWorkunit(wuid, _factory->queryDll()));
-            if (!workUnit)
-                throw MakeStringException(ROXIE_DALI_ERROR, "Failed to open workunit %s", wuid);
-            startWorkUnit();
+            if (daliHelper->connected())
+            {
+                statsWu.setown(daliHelper->createStatsWorkUnit(wuid, _factory->queryDll()->queryName()));
+                WorkunitUpdate wu(&statsWu->lock());
+                wu->setState(WUStateRunning);
+                VStringBuffer jobname("Stats for %s", _factory->queryQueryName());
+                const char *statsID = context->queryProp("@statsId");
+                if (!isEmptyString(statsID))
+                    jobname.appendf(" (%s)", statsID);
+                wu->setJobName(jobname);
+                logctx.CTXLOG("Created wu %s for query statistics", statsWu->queryWuid());
+            }
         }
         else if (context->getPropBool("@debug", false))
         {
@@ -2707,19 +2803,22 @@ public:
             if (debugUID && *debugUID)
                 initDebugMode(breakAtStart, debugUID);
         }
-        else if (context->getPropBool("_Probe", false))
-            probeQuery.setown(_factory->cloneQueryXGMML());
 
         // MORE some of these might be appropriate in wu case too?
-        rowManager->setActivityTracking(context->getPropBool("_TraceMemory", false));
-        rowManager->setMemoryLimit(options.memoryLimit);
+        if (context->hasProp("_TraceMemory"))
+            queryEnsureRowManager()->setActivityTracking(context->getPropBool("_TraceMemory", false));
 
         workflow.setown(_factory->createWorkflowMachine(workUnit, false, logctx, options));
     }
 
-    virtual roxiemem::IRowManager &queryRowManager()
+    virtual roxiemem::IRowManager &queryRowManager() final override
     {
-        return *rowManager;
+        return *queryEnsureRowManager();
+    }
+
+    virtual IRowAllocatorMetaActIdCache & queryAllocatorCache() override
+    {
+        return *allocatorMetaCache;
     }
 
     virtual IRoxieDaliHelper *checkDaliConnection()
@@ -2751,12 +2850,18 @@ public:
         {
             if (socketCheckInterval)
             {
-                if (ticksNow - lastSocketCheckTime > socketCheckInterval)
+                if ((ticksNow - lastSocketCheckTime) >= socketCheckInterval)
                 {
                     CriticalBlock b(abortLock);
-                    if (!protocol->checkConnection())
-                        throw MakeStringException(ROXIE_CLIENT_CLOSED, "Client socket closed");
-                    lastSocketCheckTime = ticksNow;
+                    if ((ticksNow - lastSocketCheckTime) >= socketCheckInterval)
+                    {
+                        if (!protocol->checkConnection())
+                        {
+                            DBGLOG("Client socket close detected");
+                            throw MakeStringException(ROXIE_CLIENT_CLOSED, "Client socket closed");
+                        }
+                        lastSocketCheckTime = ticksNow;
+                    }
                 }
             }
             if (sendHeartBeats)
@@ -2789,12 +2894,24 @@ public:
     }
     virtual memsize_t getMemoryUsage()
     {
-        return rowManager->getMemoryUsage();
+        if (!createdRowManager())
+            return 0;
+        return queryEnsureRowManager()->getMemoryUsage();
     }
 
-    virtual unsigned getAgentsReplyLen()
+    virtual unsigned getAgentsReplyLen() const
     {
         return totAgentsReplyLen;
+    }
+
+    virtual unsigned getAgentsDuplicates() const
+    {
+        return totAgentsDuplicates;
+    }
+
+    virtual unsigned getAgentsResends() const
+    {
+        return totAgentsResends;
     }
 
     virtual void process()
@@ -2810,7 +2927,10 @@ public:
             if (workflow)
                 workflow->perform(this, p);
             else
-                p->perform(this, 0);
+            {
+                GlobalCodeContextExtra gctx(this, 0);
+                p->perform(&gctx, 0);
+            }
         }
         catch(WorkflowException *E)
         {
@@ -2845,40 +2965,53 @@ public:
         doPostProcess();
     }
 
-    virtual void done(bool failed)
+    void setWuStats(IWorkUnit *w, bool failed)
+    {
+        if (aborted)
+            w->setState(WUStateAborted);
+        else if (failed)
+            w->setState(WUStateFailed);
+        else if (workflow && workflow->hasItemsWaiting())
+            w->setState(WUStateWait);
+        else
+            w->setState(WUStateCompleted);
+        addTimeStamp(w, SSTglobal, NULL, StWhenFinished);
+        updateWorkunitTimings(w, myTimer);
+        Owned<IStatisticGatherer> gatherer = createGlobalStatisticGatherer(w);
+        CRuntimeStatisticCollection merged(accumulatedStatistics);
+        logctx.gatherStats(merged);
+        merged.recordStatistics(*gatherer, false);
+
+        //MORE: If executed more than once (e.g., scheduled), then TimeElapsed isn't particularly correct.
+        gatherer->updateStatistic(StTimeElapsed, elapsedTimer.elapsedNs(), StatsMergeReplace);
+
+        WuStatisticTarget statsTarget(w, "roxie");
+        if (createdRowManager())
+            queryEnsureRowManager()->reportPeakStatistics(statsTarget, 0);
+    }
+
+    virtual void done(bool failed) override
     {
         if (debugContext)
             debugContext->debugTerminate();
         if (workUnit)
         {
-#ifdef _CONTAINERIZED
-            // signal to any lingering Thor's that job is complete and they can quit before timeout.
-            executeGraphOnLingeringThor(*workUnit, nullptr, nullptr);
-#endif
-
             if (options.failOnLeaks && !failed)
             {
                 cleanupGraphs();
                 probeManager.clear();
                 ::Release(deserializedResultStore);
                 deserializedResultStore = nullptr;
-                if (rowManager && rowManager->allocated())
+                if (createdRowManager() && queryEnsureRowManager()->allocated())
                 {
-                    rowManager->reportLeaks();
+                    queryEnsureRowManager()->reportLeaks();
                     failed = true;
                     Owned <IException> E = makeStringException(ROXIE_INTERNAL_ERROR, "Row leaks detected");
                     ::addWuException(workUnit, E);
                 }
             }
             WorkunitUpdate w(&workUnit->lock());
-            if (aborted)
-                w->setState(WUStateAborted);
-            else if (failed)
-                w->setState(WUStateFailed);
-            else if (workflow && workflow->hasItemsWaiting())
-                w->setState(WUStateWait);
-            else
-                w->setState(WUStateCompleted);
+            setWuStats(w, failed);
             if(w->queryEventScheduledCount() > 0 && w->getState() != WUStateWait)
             {
                 try
@@ -2897,18 +3030,11 @@ public:
             }
             while (clusterNames.ordinality())
                 restoreCluster();
-            addTimeStamp(w, SSTglobal, NULL, StWhenFinished);
-            updateWorkunitTimings(w, myTimer);
-            Owned<IStatisticGatherer> gatherer = createGlobalStatisticGatherer(w);
-            CRuntimeStatisticCollection merged(allStatistics);
-            logctx.gatherStats(merged);
-            merged.recordStatistics(*gatherer);
-
-            //MORE: If executed more than once (e.g., scheduled), then TimeElapsed isn't particularly correct.
-            gatherer->updateStatistic(StTimeElapsed, elapsedTimer.elapsedNs(), StatsMergeReplace);
-
-            WuStatisticTarget statsTarget(w, "roxie");
-            rowManager->reportPeakStatistics(statsTarget, 0);
+        }
+        else if (statsWu)
+        {
+            WorkunitUpdate w(&statsWu->lock());
+            setWuStats(w, failed);
         }
     }
 
@@ -2979,6 +3105,10 @@ public:
         Owned<IRoxieDaliHelper> dali = ::connectToDali();
         return dali != nullptr;
     }
+    virtual bool allowSashaAccess() const
+    {
+        return nullptr != workUnit; // allow if dynamic query only
+    }
     virtual StringBuffer &getQueryId(StringBuffer &result, bool isShared) const
     {
         if (workUnit)
@@ -2993,15 +3123,30 @@ public:
             logctx.getLogPrefix(result);
         return result;
     }
-    virtual const StringArray &queryManifestFiles(const char *type) const override
+    virtual void getManifestFiles(const char *type, StringArray &files) const override
     {
         ILoadedDllEntry *dll = factory->queryDll();
         StringBuffer id;
-        return dll->queryManifestFiles(type, getQueryId(id, true).str());
+        const StringArray &dllFiles = dll->queryManifestFiles(type, getQueryId(id, true).str(), tempDirectory);
+        ForEachItemIn(idx, dllFiles)
+            files.append(dllFiles.item(idx));
+        ForEachItemIn(lidx, loadedLibraries)
+        {
+            IQueryFactory &lfactory = loadedLibraries.item(lidx);
+            ILoadedDllEntry *ldll = lfactory.queryDll();
+            // Libraries share the same copy of the jar (and the classloader) for all queries that use the library
+            StringBuffer lid;
+            lid.append('Q').append(lfactory.queryHash());
+            const StringArray &ldllFiles = ldll->queryManifestFiles(type, lid.str(), tempDirectory);
+            if (ldllFiles.length())
+                files.append(nullptr);
+            ForEachItemIn(ldidx, ldllFiles)
+                files.append(ldllFiles.item(ldidx));
+        }
     }
 
     mutable CIArrayOf<TerminationCallbackInfo> callbacks;
-    mutable CriticalSection callbacksCrit;
+    mutable CriticalSection callbacksCrit{SYNC_LOCATION};
 
     virtual void onTermination(QueryTermCallback callback, const char *key, bool isShared) const
     {
@@ -3050,7 +3195,6 @@ public:
     }
     virtual void setResultData(const char *name, unsigned sequence, int len, const void * data)
     {
-        static char hexchar[] = "0123456789ABCDEF";
         if (isSpecialResultSequence(sequence))
         {
             StringBuffer s;
@@ -3221,8 +3365,9 @@ public:
     }
     virtual void setResultXml(const char *name, unsigned sequence, const char *xml)
     {
+        Owned<IPropertyTree> tree = createPTreeFromXMLString(xml, ipt_caseInsensitive|ipt_fast);
         CriticalBlock b(contextCrit);
-        useContext(sequence).setPropTree(name, createPTreeFromXMLString(xml, ipt_caseInsensitive|ipt_fast));
+        useContext(sequence).setPropTree(name, tree.getClear());
     }
 
     virtual void setResultDecimal(const char *name, unsigned sequence, int len, int precision, bool isSigned, const void *val)
@@ -3466,9 +3611,10 @@ public:
 
     virtual const IResolvedFile *resolveLFN(const char *fileName, bool isOpt, bool isPrivilegedUser)
     {
-        CriticalBlock b(contextCrit);
         StringBuffer expandedName;
         expandLogicalFilename(expandedName, fileName, workUnit, false, false);
+
+        CriticalBlock b(resolveCrit);
         Linked<const IResolvedFile> ret = fileCache.getValue(expandedName);
         if (!ret)
         {
@@ -3482,15 +3628,15 @@ public:
         return ret.getClear();
     }
 
-    virtual IRoxieWriteHandler *createLFN(const char *filename, bool overwrite, bool extend, const StringArray &clusters, bool isPrivilegedUser)
+    virtual IRoxieWriteHandler *createWriteHandler(const char *filename, bool overwrite, bool extend, const StringArray &clusters, bool isPrivilegedUser)
     {
-        return factory->queryPackage().createFileName(filename, overwrite, extend, clusters, workUnit, isPrivilegedUser);
+        return factory->queryPackage().createWriteHandler(filename, overwrite, extend, clusters, workUnit, isPrivilegedUser);
     }
 
-    virtual void endGraph(unsigned __int64 startTimeStamp, cycle_t startCycles, bool aborting) override
+    virtual void endGraph(const ProcessInfo & startProcessInfo, unsigned __int64 startTimeStamp, cycle_t startCycles, bool aborting) override
     {
         fileCache.kill();
-        CRoxieContextBase::endGraph(startTimeStamp, startCycles, aborting);
+        CRoxieContextBase::endGraph(startProcessInfo, startTimeStamp, startCycles, aborting);
     }
 
     virtual void onFileCallback(const RoxiePacketHeader &header, const char *lfn, bool isOpt, bool isLocal, bool isPrivilegedUser)
@@ -3517,7 +3663,7 @@ public:
         Owned <IRoxieDaliHelper> daliHelper = connectToDali();
         if (daliHelper && daliHelper->connected())
         {
-            Owned<IConstWorkUnit> externalWU = daliHelper->attachWorkunit(wuid, NULL);
+            Owned<IConstWorkUnit> externalWU = daliHelper->attachWorkunit(wuid);
             if (externalWU)
             {
                 externalWU->remoteCheckAccess(queryUserDescriptor(), false);
@@ -3556,9 +3702,9 @@ public:
         if (severity > SeverityInformation)
             LOG(mapToLogMsgCategory(severity, (MessageAudience)audience), "%d - %s", code, text);
 
-        if (workUnit)
+        if (workUnit || statsWu)
         {
-            WorkunitUpdate wu(&workUnit->lock());
+            WorkunitUpdate wu(updateStatsWorkUnit());
             addExceptionToWorkunit(wu, severity, source, code, text, NULL, 0 ,0, 0);
         }
     }
@@ -3566,9 +3712,9 @@ public:
     {
         CTXLOG("%s", text);
         OERRLOG("%d - %s", code, text);
-        if (workUnit)
+        if (workUnit || statsWu)
         {
-            WorkunitUpdate wu(&workUnit->lock());
+            WorkunitUpdate wu(updateStatsWorkUnit());
             addExceptionToWorkunit(wu, SeverityError, "user", code, text, filename, lineno, column, 0);
         }
         if (isAbort)
@@ -3592,7 +3738,7 @@ public:
         CriticalBlock b(contextCrit);
         return useContext(sequence).hasProp(name);
     }
-
+    virtual unsigned getWorkflowIdDeprecated() override { throwUnexpected(); }
     virtual char *getClusterName()
     {
         if (workUnit)
@@ -3610,7 +3756,7 @@ public:
 #ifdef _CONTAINERIZED
         // in a containerized setup, the group is moving..
         return strdup("unknown");
-#endif
+#else
         StringBuffer groupName;
         if (workUnit && clusterNames.length())
         {
@@ -3651,6 +3797,7 @@ public:
             }
         }
         return groupName.detach();
+#endif
     }
     virtual char *queryIndexMetaData(char const * lfn, char const * xpath) { throwUnexpected(); }
     virtual char *getEnv(const char *name, const char *defaultValue) const
@@ -3730,12 +3877,6 @@ public:
         addWuExceptionEx(text, code, 2, MSGAUD_user, "user");
     }
 
-    virtual unsigned getWorkflowId()
-    {
-        logctx.CTXLOG("Trying to access WFID from workflow");
-        throwUnexpected();
-    }
-
     void doNotify(char const * name, char const * text)
     {
         doNotify(name, text, NULL);
@@ -3753,37 +3894,16 @@ public:
             throw MakeStringException(ROXIE_DALI_ERROR, "doNotify: no dali connection available");
     }
 
-    static unsigned __int64 crcLogicalFileTime(IDistributedFile * file, unsigned __int64 crc, const char * filename)
-    {
-        CDateTime dt;
-        file->getModificationTime(dt);
-        unsigned __int64 modifiedTime = dt.getSimple();
-        return rtlHash64Data(sizeof(modifiedTime), &modifiedTime, crc);
-    }
-
     virtual unsigned __int64 getDatasetHash(const char * logicalName, unsigned __int64 crc)
     {
         StringBuffer fullname;
         expandLogicalFilename(fullname, logicalName, workUnit, false, false);
-        Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(fullname.str(),queryUserDescriptor(),false,false,false,nullptr,defaultPrivilegedUser);
+        Owned<IDistributedFile> file = wsdfs::lookup(fullname.str(),queryUserDescriptor(),AccessMode::readLogicalMeta,false,false,nullptr,defaultPrivilegedUser,INFINITE);
         if (file)
         {
             WorkunitUpdate wu = updateWorkUnit();
             wu->noteFileRead(file);
-            IDistributedSuperFile * super = file->querySuperFile();
-            if (super)
-            {
-                Owned<IDistributedFileIterator> iter = super->getSubFileIterator(true);
-                ForEach(*iter)
-                {
-                    IDistributedFile & cur = iter->query();
-                    const char * name = cur.queryLogicalName();
-                    crc = rtlHash64Data(strlen(name), name, crc);
-                    crc = crcLogicalFileTime(&cur, crc, name);
-                }
-            }
-            else
-                crc = crcLogicalFileTime(file, crc, fullname.str());
+            crc = crcLogicalFileTime(file, crc, fullname);
         }
         return crc;
     }
@@ -3856,7 +3976,7 @@ public:
 
     virtual IDistributedFileTransaction *querySuperFileTransaction()
     {
-        CriticalBlock b(contextCrit);
+        CriticalBlock b(resolveCrit);
         if (!superfileTransaction.get())
             superfileTransaction.setown(createDistributedFileTransaction(queryUserDescriptor(), queryCodeContext()));
         return superfileTransaction.get();
@@ -3869,6 +3989,7 @@ public:
     }
     virtual unsigned getPriority() const { return options.priority; }
     virtual IConstWorkUnit *queryWorkUnit() const { return workUnit; }
+    virtual const char *queryStatsWuid() const override { return statsWu ? statsWu->queryWuid() : nullptr; }
     virtual bool outputResultsToSocket() const { return protocol != NULL; }
 
     virtual void selectCluster(const char * newCluster)
@@ -3881,7 +4002,7 @@ public:
             if (targetClusterType==RoxieCluster)
             {
                 if (!streq(oldCluster, newCluster))
-                    throw MakeStringException(-1, "Error - cannot switch cluster if not targetting thor jobs");
+                    throw MakeStringException(-1, "Error - cannot switch cluster if targeting roxie");
             }
             clusterNames.append(oldCluster);
             WorkunitUpdate wu = updateWorkUnit();
@@ -3897,6 +4018,37 @@ public:
             wu->setClusterName(clusterNames.item(clusterNames.length()-1));
         clusterNames.pop();
         clusterWidth = -1;
+    }
+
+    virtual bool okToLogStartStopError()
+    {
+        if (!actResetLogPeriod)
+            return false;
+        // Each query starts with actResetLogState set to LogResetInit
+        // State is changed to LogResetOK and a timer is started
+        // If same query runs again then time since last logged is checked
+        // If two of the same query run at the same time and it is
+        // past the logging skip period then both will log activity reset msgs
+        if (actResetLogState == LogResetInit)
+        {
+            unsigned timeNow = msTick();
+            unsigned timePrev = serverQueryFactory->getTimeActResetLastLogged();
+            if ((timeNow - timePrev) > (actResetLogPeriod*1000))
+            {
+                serverQueryFactory->setTimeActResetLastLogged(timeNow);
+                actResetLogState = LogResetOK;
+                return true;
+            }
+            else
+            {
+                actResetLogState = LogResetSkip;
+                return false;
+            }
+        }
+        else if (actResetLogState == LogResetOK)
+            return true;
+        else
+            return false;
     }
 };
 
@@ -3921,7 +4073,11 @@ public:
         if (workflow)
             workflow->perform(this, p);
         else
-            p->perform(this, 0);
+        {
+            GlobalCodeContextExtra gctx(this, 0);
+            p->perform(&gctx, 0);
+        }
+        doPostProcess();
     }
 };
 

@@ -173,7 +173,7 @@ void PermissionProcessor::getCachedSid(const char* name, MemoryBuffer& sid)
     StringBuffer buf;
     if(toXpath(name, buf))
     {
-        synchronized block(m_monitor);
+        MonitorBlock block(m_monitor);
         try
         {
             m_sidcache->getPropBin(buf.str(), sid);
@@ -200,7 +200,7 @@ void PermissionProcessor::cacheSid(const char* name, int len, const void* sidbuf
     StringBuffer buf;
     if(toXpath(name, buf))
     {
-        synchronized block(m_monitor);
+        MonitorBlock block(m_monitor);
         try
         {
             if(!m_sidcache->hasProp(buf.str()))
@@ -222,7 +222,12 @@ void PermissionProcessor::cacheSid(const char* name, int len, const void* sidbuf
     }
 }
 
-void PermissionProcessor::lookupSid(const char* act_name, MemoryBuffer& act_sid, ACT_TYPE act_type)
+void PermissionProcessor::lookupSid(const char* act_name, MemoryBuffer& act_sid, ACT_TYPE acttype)
+{
+    lookupSid(act_name, act_sid, acttype, nullptr);
+}
+
+void PermissionProcessor::lookupSid(const char* act_name, MemoryBuffer& act_sid, ACT_TYPE act_type, LDAP* ld)
 {
     act_sid.clear();
 
@@ -262,7 +267,7 @@ void PermissionProcessor::lookupSid(const char* act_name, MemoryBuffer& act_sid,
 #else
         if(m_ldap_client != NULL)
         {
-            m_ldap_client->lookupSid(act_name, act_sid, act_type);
+            m_ldap_client->lookupSid(act_name, act_sid, act_type, ld);
             if(act_sid.length() > 0)
                 cacheSid(act_name, act_sid.length(), (const void*)act_sid.toByteArray());
         }
@@ -774,7 +779,8 @@ bool MakeAbsoluteSD(PSECURITY_DESCRIPTOR pSelfRelativeSecurityDescriptor,
     if(*lpdwAbsoluteSecurityDescriptorSize < sizeof(SECURITY_DESCRIPTOR))
     {
         ok = false;
-        DBGLOG("MakeAbsoluteSD : pdwAbsoluteSecurityDescriptorSize < sizeof(SECURITY_DESCRIPTOR)");
+        if (*lpdwAbsoluteSecurityDescriptorSize > 0)
+            DBGLOG("MakeAbsoluteSD : pdwAbsoluteSecurityDescriptorSize(%d) < sizeof(SECURITY_DESCRIPTOR)",*lpdwAbsoluteSecurityDescriptorSize);
         *lpdwAbsoluteSecurityDescriptorSize = sizeof(SECURITY_DESCRIPTOR);
     }
 
@@ -787,7 +793,8 @@ bool MakeAbsoluteSD(PSECURITY_DESCRIPTOR pSelfRelativeSecurityDescriptor,
         if(*lpdwOwnerSize < owner_size)
         {
             ok = false;
-            DBGLOG("MakeAbsoluteSD : *lpdwOwnerSize < owner_size");
+            if (*lpdwOwnerSize > 0)
+                DBGLOG("MakeAbsoluteSD : *lpdwOwnerSize(%d) < owner_size", *lpdwOwnerSize);
             *lpdwOwnerSize = owner_size;
         }
     }
@@ -801,7 +808,8 @@ bool MakeAbsoluteSD(PSECURITY_DESCRIPTOR pSelfRelativeSecurityDescriptor,
         if(*lpdwPrimaryGroupSize < group_size)
         {
             ok = false;
-            DBGLOG("MakeAbsoluteSD : *lpdwPrimaryGroupSize < group_size");
+            if (*lpdwPrimaryGroupSize > 0)
+                DBGLOG("MakeAbsoluteSD : *lpdwPrimaryGroupSize(%d) < group_size", *lpdwPrimaryGroupSize);
             *lpdwPrimaryGroupSize = group_size;
         }
     }
@@ -815,7 +823,8 @@ bool MakeAbsoluteSD(PSECURITY_DESCRIPTOR pSelfRelativeSecurityDescriptor,
         if(*lpdwDaclSize < DaclSizeInfo.AclBytesInUse)
         {
             ok = false;
-            DBGLOG("MakeAbsoluteSD : *lpdwDaclSize < DaclSizeInfo.AclBytesInUse");
+            if (*lpdwDaclSize > 0)
+                DBGLOG("MakeAbsoluteSD : *lpdwDaclSize(%d) < DaclSizeInfo.AclBytesInUse", *lpdwDaclSize);
             *lpdwDaclSize = DaclSizeInfo.AclBytesInUse;
         }
     }
@@ -829,7 +838,8 @@ bool MakeAbsoluteSD(PSECURITY_DESCRIPTOR pSelfRelativeSecurityDescriptor,
         if(*lpdwSaclSize < SaclSizeInfo.AclBytesInUse)
         {
             ok = false;
-            DBGLOG("MakeAbsoluteSD : *lpdwSaclSize < SaclSizeInfo.AclBytesInUse");
+            if (*lpdwSaclSize > 0)
+                DBGLOG("MakeAbsoluteSD : *lpdwSaclSize(%d) < SaclSizeInfo.AclBytesInUse", *lpdwSaclSize);
             *lpdwSaclSize = SaclSizeInfo.AclBytesInUse;
         }
     }
@@ -970,6 +980,12 @@ bool DeleteAce(PACL pAcl, DWORD dwAceIndex)
     if(pAcl == NULL)
     {
         DBGLOG("DeleteAce: PACL is NULL");
+        return false;
+    }
+
+    if(dwAceIndex >= pAcl->AceCount)
+    {
+        DBGLOG("DeleteAce : dwAceIndex is out of range");
         return false;
     }
 
@@ -1242,6 +1258,11 @@ bool PermissionProcessor::getPermissionsArray(CSecurityDescriptor *sd, IArrayOf<
 
 CSecurityDescriptor* PermissionProcessor::changePermission(CSecurityDescriptor* initialsd, CPermissionAction& action)
 {
+#ifdef _DEBUG
+    DBGLOG("changePermission- Action:%s, BaseDN:%s, ResType:%d, ResName:%s, AcctName:%s, AcctType:%d, Allows:%d, Denies:%d",
+        action.m_action.str(), action.m_basedn.str(), action.m_rtype, action.m_rname.str(), action.m_account_name.str(),
+        action.m_account_type, action.m_allows, action.m_denies);
+#endif
     const char* initial_buf = initialsd->getDescriptor().toByteArray();
     PSECURITY_DESCRIPTOR pisd = (PSECURITY_DESCRIPTOR)initial_buf;
 
@@ -1307,6 +1328,7 @@ CSecurityDescriptor* PermissionProcessor::changePermission(CSecurityDescriptor* 
 #endif
     }
 
+    //Remove all existing ACE from ACL, if they exist
     bool done = false;
     while(!done)
     {
@@ -1317,18 +1339,20 @@ CSecurityDescriptor* PermissionProcessor::changePermission(CSecurityDescriptor* 
         unsigned iAce;
 
         done = true;
-        for(iAce = 0; iAce < ASizeInfo.AceCount; iAce++)
+        for(iAce = 0; iAce < ASizeInfo.AceCount; iAce++)//For all ACE entries in the ACL
         {
-            GetAce(pdacl, iAce, (void**)&pAce);
+            GetAce(pdacl, iAce, (void**)&pAce);         //Get indexed ACE entry from ACL
             PSID cursid = (PSID)&(pAce->SidStart);
 
-            if(EqualSid(cursid, act_psid))
+            if(EqualSid(cursid, act_psid))              //Check for ACE to be replaced
             {
+#ifdef _DEBUG
                 if(stricmp(action.m_action.str(), "add") == 0)
-                    throw MakeStringException(-1, "Permission for account %s already exists", action.m_account_name.str());
-                DeleteAce(pdacl, iAce);
+                    DBGLOG("Permission for account %s already exists", action.m_account_name.str());
+#endif
+                DeleteAce(pdacl, iAce);                 //Delete existing ACE
                 if(iAce < ASizeInfo.AceCount - 1)
-                    done = false;
+                    done = false;                       //continue until all ACE within ACL processed
                 break;
             }
         }
@@ -1440,10 +1464,15 @@ CSecurityDescriptor* PermissionProcessor::changePermission(CSecurityDescriptor* 
 
 CSecurityDescriptor* PermissionProcessor::createDefaultSD(ISecUser * const user, ISecResource* resource, SecPermissionType ptype)
 {
-    return createDefaultSD(user, resource->getName(), ptype);   
+    return createDefaultSD(user, resource->getName(), ptype);
 }
 
 CSecurityDescriptor* PermissionProcessor::createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype)
+{
+    return createDefaultSD(user, name, ptype, nullptr);
+}
+
+CSecurityDescriptor* PermissionProcessor::createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype, LDAP* ld)
 {
     SECURITY_DESCRIPTOR sd;
     unsigned char aclBuffer[1024];
@@ -1459,7 +1488,7 @@ CSecurityDescriptor* PermissionProcessor::createDefaultSD(ISecUser * const user,
     if (m_ldap_client->getLdapConfig()->isAzureAD() && DEFAULT_ADMINISTRATORS_PERMISSION != SecAccess_None)
     {
         MemoryBuffer gmb;
-        lookupSid(AAD_ADMINISTRATORS_GROUP, gmb, GROUP_ACT);
+        lookupSid(AAD_ADMINISTRATORS_GROUP, gmb, GROUP_ACT, ld);
         psid = (PSID)(gmb.toByteArray());
         if (psid != nullptr)
         {
@@ -1475,7 +1504,7 @@ CSecurityDescriptor* PermissionProcessor::createDefaultSD(ISecUser * const user,
         if(user && DEFAULT_OWNER_PERMISSION != SecAccess_None)
         {
             //Add SD for given user
-            lookupSid(user->getName(), umb);
+            lookupSid(user->getName(), umb, USER_ACT, ld);
             psid = (PSID)(umb.toByteArray());
             if(psid != NULL)
             {
@@ -1616,7 +1645,7 @@ CSecurityDescriptor::CSecurityDescriptor(const char* name)
 {
     if(name == NULL || name[0] == '\0')
         throw MakeStringException(-1, "name can't be empty for CSecurityDescriptor");
-    
+
     const char* resourcename = name;
     if(resourcename[0] == '/')
         resourcename = resourcename + 1;

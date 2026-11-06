@@ -15,7 +15,6 @@
     limitations under the License.
 ############################################################################## */
 
-#define da_decl DECL_EXPORT
 #include "platform.h"
 #include "jlib.hpp"
 #include "jexcept.hpp"
@@ -28,8 +27,10 @@
 #include "daserver.hpp"
 #include "dacsds.ipp"
 #include "dautils.hpp"
+#include "daaudit.hpp"
 
 #include "daclient.hpp"
+#include "sysinfologger.hpp"
 
 extern bool registerClientProcess(ICommunicator *comm, IGroup *& retcoven,unsigned timeout,DaliClientRole role);
 extern void stopClientProcess();
@@ -87,6 +88,44 @@ IDaliClient_Exception *createClientException(DaliClientError err, const char *ms
 }
 
 
+// Based on client type, auto-install a SDS subscriber on /Environment that,
+// detects changes and executes the config update hooks (as installed by installConfigUpdateHook)
+// This is to ensure that any [cached] config that is based on environment settings, e.g.
+// the dropzones returned by getDropZonePlanesIterator(), or the queues listened to by eclccserver,
+// are auto-updated based on the hooks.
+static std::atomic<bool> watchEnvHookInstalled{false};
+static Owned<ISDSSubscription> envConfigUpdater;
+static SubscriptionId envConfigUpdaterSubId = 0;
+void installEnvConfigMonitor()
+{
+    bool expected = false;
+    if (watchEnvHookInstalled.compare_exchange_strong(expected, true))
+    {
+        class CEnvConfigUpdater : public CInterfaceOf<ISDSSubscription>
+        {
+        public:
+            // ISDSSubscription impl.
+            virtual void notify(SubscriptionId id, const char *xpath, SDSNotifyFlags flags, unsigned valueLen=0, const void *valueData=nullptr) override
+            {
+                refreshConfiguration();
+            }
+        };
+
+        envConfigUpdater.setown(new CEnvConfigUpdater);
+        envConfigUpdaterSubId = querySDS().subscribe("/Environment", *envConfigUpdater);
+    }
+}
+
+void uninstallEnvConfigMonitor()
+{
+    if (envConfigUpdaterSubId)
+    {
+        querySDS().unsubscribe(envConfigUpdaterSubId);
+        envConfigUpdaterSubId = 0;
+        envConfigUpdater.clear();
+        watchEnvHookInstalled = false;
+    }
+}
 
 bool initClientProcess(IGroup *servergrp, DaliClientRole role, unsigned mpport, const char *clientVersion, const char *minServerVersion, unsigned timeout, bool listen)
 {
@@ -103,6 +142,35 @@ bool initClientProcess(IGroup *servergrp, DaliClientRole role, unsigned mpport, 
     initCoven(covengrp,NULL,clientVersion, minServerVersion);
     covengrp->Release();
     queryLogMsgManager()->setSession(myProcessSession());
+
+    if (getComponentConfigSP()->getPropBool("logging/@enableGlobalSysLog"))
+        useDaliForOperatorMessages(true);
+
+    if (!isContainerized()) // The Environment is bare-metal only
+    {
+        registerDaliAuditLogQueryFn();
+
+        // auto install environment monitor for server roles
+        // causes any config update hooks (installed by installConfigUpdateHook() to trigger on an env. change)
+        switch (role)
+        {
+            case DCR_EclServer:
+            case DCR_EclAgent:
+            case DCR_SashaServer:
+            case DCR_DfuServer:
+            case DCR_EspServer:
+            case DCR_Roxie:
+            case DCR_AgentExec:
+            case DCR_EclScheduler:
+            case DCR_EclCCServer:
+                installEnvConfigMonitor();
+                break;
+            // Thor does not monitor because a fixed configuration is serialized to the slaves
+            case DCR_ThorMaster:
+            default:
+                break;
+        }
+    }
     return true;
 }
 
@@ -118,6 +186,7 @@ void removeShutdownHook(IDaliClientShutdown &shutdown)
 
 void closedownClientProcess()
 {
+    useDaliForOperatorMessages(false);
     if (!daliClientIsActive)
         return;
     while (shutdownHooks.ordinality())
@@ -126,6 +195,8 @@ void closedownClientProcess()
         c->clientShutdown();
     }
     clearPagedElementsCache(); // has connections
+    if (!isContainerized()) // The Environment is bare-metal only
+        uninstallEnvConfigMonitor();
     closeSDS();
     closeSubscriptionManager();
     stopClientProcess();
@@ -170,7 +241,7 @@ CSDSServerStatus::CSDSServerStatus(const char *servername)
         IPropertyTree &root = *conn->queryRoot();
         root.setProp("@name",servername);
         StringBuffer node;
-        queryMyNode()->endpoint().getIpText(node);
+        queryMyNode()->endpoint().getHostText(node);
         root.setProp("@node",node.str());
         root.setPropInt("@mpport",queryMyNode()->endpoint().port);
         CDateTime dt;
@@ -199,6 +270,8 @@ void CSDSServerStatus::stop()
 
 void connectLogMsgManagerToDali()
 {
+    if (isContainerized())
+        return; // we do not redirect logging between components in containerized environments (this is used for audit->dali in BM)
     IGroup & servers = queryCoven().queryGroup();
     unsigned parentRank = getRandom() % servers.ordinality();    // PG: Not sure if logging to random parent is best?
     daliClientLoggingParent = &servers.queryNode(parentRank);
@@ -207,6 +280,8 @@ void connectLogMsgManagerToDali()
 
 void disconnectLogMsgManagerFromDali()
 {
+    if (isContainerized())
+        return; // we do not redirect logging between components in containerized environments (this is used for audit->dali in BM)
     disconnectLogMsgManagerFromParentOwn(daliClientLoggingParent);
     daliClientLoggingParent = 0;
 }
@@ -275,7 +350,7 @@ bool updateDaliEnv(IPropertyTree *env, bool forceGroupUpdate, const char *daliIp
     if (querySDS().updateEnvironment(env, forceGroupUpdate, response))
     {
         StringBuffer tmp;
-        PROGLOG("Environment and node groups updated in dali at %s",daliep.getUrlStr(tmp).str());
+        PROGLOG("Environment and node groups updated in dali at %s",daliep.getEndpointHostText(tmp).str());
     }
     else
         ret = false;

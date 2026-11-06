@@ -20,15 +20,11 @@
 #include "jargv.hpp"
 #include "jprop.hpp"
 
-#include "build-config.h"
-
 #include "eclcmd.hpp"
 #include "eclcmd_core.hpp"
 
 #define INIFILE "ecl.ini"
-#define SYSTEMCONFDIR CONFIG_DIR
 #define DEFAULTINIFILE "ecl.ini"
-#define SYSTEMCONFFILE ENV_CONF_FILE
 
 //=========================================================================================
 
@@ -134,7 +130,7 @@ int EclCMDShell::run()
                 optIniFilename.set(INIFILE);
             else if (getHomeDir(fn) && checkFileExists(addPathSepChar(fn).append(INIFILE)))
                 optIniFilename.set(fn);
-            else if (fn.set(SYSTEMCONFDIR).append(PATHSEPSTR).append(DEFAULTINIFILE))
+            else if (fn.set(hpccBuildInfo.configDir).append(PATHSEPSTR).append(DEFAULTINIFILE))
                 optIniFilename.set(fn);
         }
 
@@ -184,7 +180,7 @@ bool EclCMDShell::parseCommandLineOptions(ArgvIterator &iter)
         }
         if (iter.matchFlag(boolValue, "--version"))
         {
-            fprintf(stdout, "%s\n", BUILD_TAG);
+            fprintf(stdout, "%s\n", hpccBuildInfo.buildTag);
             return false;
         }
         StringAttr tempArg;
@@ -209,24 +205,25 @@ void EclCMDShell::usage()
     fprintf(stdout,"\nUsage:\n"
         "    ecl [--version] <command> [<args>]\n\n"
            "Commonly used commands:\n"
-           "   deploy      create a workunit from an ecl file, archive, or dll\n"
-           "   publish     add a workunit to a query set\n"
-           "   unpublish   remove a query from a query set\n"
-           "   run         run the given ecl file, archive, dll, wuid, or query\n"
-           "   results     retrieve the results for an existing workunit\n"
-           "   activate    activate a published query\n"
-           "   deactivate  deactivate the given query alias name\n"
-           "   queries     show or manipulate queries and querysets\n"
-           "   packagemap  manage HPCC packagemaps\n"
-           "   bundle      manage ECL bundles\n"
-           "   roxie       commands specific to roxie clusters\n"
-           "   abort       abort workunit(s) for WUID or job name\n"
-           "   status      show workunit(s) current status for WUID or job name\n"
-           "   getname     provide job name from WUID\n"
-           "   getwuid     provide WUID from job name\n"
-           "   zapgen      provide ZAP file from WUID\n"
-           "   sign        add digital signature to an ecl file or a text file\n"
-           "   listkeyuid  lists all the key user IDs that can be used in the sign command\n"
+           "   deploy           create a workunit from an ecl file, archive, or dll\n"
+           "   publish          add a workunit to a query set\n"
+           "   unpublish        remove a query from a query set\n"
+           "   run              run the given ecl file, archive, dll, wuid, or query\n"
+           "   results          retrieve the results for an existing workunit\n"
+           "   activate         activate a published query\n"
+           "   deactivate       deactivate the given query alias name\n"
+           "   queries          show or manipulate queries and querysets\n"
+           "   packagemap       manage HPCC packagemaps\n"
+           "   bundle           manage ECL bundles\n"
+           "   roxie            commands specific to roxie clusters\n"
+           "   abort            abort workunit(s) for WUID or job name\n"
+           "   status           show workunit(s) current status for WUID or job name\n"
+           "   getname          provide job name from WUID\n"
+           "   getwuid          provide WUID from job name\n"
+           "   zapgen           provide ZAP file from WUID\n"
+           "   sign             add digital signature to an ecl file or a text file\n"
+           "   listkeyuid       lists all the key user IDs that can be used in the sign command\n"
+           "   url-secret-name  Generate a secret name from a url for automatic url mapping\n"
            "\nRun 'ecl help <command>' for more information on a specific command\n\n"
     );
 }

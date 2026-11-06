@@ -24,6 +24,8 @@
 
 project( gitfile )
 
+find_package(libgit2 CONFIG REQUIRED)
+
 set (    SRCS
          gitfile.cpp
          gitfile.hpp
@@ -37,8 +39,9 @@ include_directories (
 ADD_DEFINITIONS( -D_USRDLL -DGITFILE_EXPORTS )
 
 HPCC_ADD_LIBRARY( gitfile SHARED ${SRCS}  )
-install ( TARGETS gitfile DESTINATION filehooks )
+install ( TARGETS gitfile DESTINATION filehooks CALC_DEPS)
 
-target_link_libraries ( gitfile
+target_link_libraries ( gitfile PRIVATE
     jlib
-    )
+    libgit2::libgit2package
+)

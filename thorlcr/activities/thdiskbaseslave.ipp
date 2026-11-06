@@ -33,14 +33,14 @@ class CDiskPartHandlerBase : public CPartHandler, implements IThorDiskCallback
 protected:
     OwnedIFile iFile;
     Owned<IPartDescriptor> partDesc;
-    bool compressed, blockCompressed, firstInGroup, checkFileCrc;
+    bool compressed, blockCompressed, firstInGroup;
     unsigned storedCrc, which;
     StringAttr filename, logicalFilename;
     unsigned __int64 fileBaseOffset;
     const char *kindStr;
-    CRuntimeStatisticCollection fileStats;
+    CRuntimeStatisticCollection closedPartFileStats;
     CDiskReadSlaveActivityBase &activity;
-    CriticalSection inputCs; // Prevent input from being changed while mergeStats() or other functions are executing
+    CriticalSection inputCs{SYNC_LOCATION}; // Prevent input from being changed while mergeStats() or other functions are executing
 
     bool eoi;
 public:
@@ -54,9 +54,8 @@ public:
     virtual const void *nextRow() = 0;
     virtual void gatherStats(CRuntimeStatisticCollection & merged)
     {
-        merged.merge(fileStats);
+        merged.merge(closedPartFileStats);
     }
-    virtual unsigned __int64 queryProgress() { return 0; }
 
 // IThorDiskCallback
     virtual offset_t getFilePosition(const void * row);
@@ -86,23 +85,24 @@ protected:
     StringArray subfileLogicalFilenames;
     IArrayOf<IPartDescriptor> partDescs;
     IHThorDiskReadBaseArg *helper;
-    bool checkFileCrc, crcCheckCompressed, markStart;
+    bool markStart;
+    bool checkFileDates = false;
     mutable bool gotMeta;
     mutable ThorDataLinkMetaInfo cachedMetaInfo;
     Owned<CDiskPartHandlerBase> partHandler;
     Owned<IExpander> eexp;
-    rowcount_t diskProgress = 0;
-
+    unsigned fileTableStart = NotFound;
 public:
     CDiskReadSlaveActivityBase(CGraphElementBase *_container, IHThorArg *_helper);
     const char *queryLogicalFilename(unsigned index);
     IThorRowInterfaces * queryProjectedDiskRowInterfaces();
+    void mergeFileStats(IPartDescriptor *partDesc, IExtRowStream *partStream);
     virtual void start() override;
 
-    
 // IThorSlaveActivity
     virtual void init(MemoryBuffer &data, MemoryBuffer &slaveData);
     virtual void kill();
+    virtual void gatherActiveStats(CRuntimeStatisticCollection &activeStats) const;
     virtual void serializeStats(MemoryBuffer &mb);
 friend class CDiskPartHandlerBase;
 };
@@ -114,30 +114,31 @@ class CDiskWriteSlaveActivityBase : public ProcessSlaveActivity, implements ICop
 protected:
     IHThorDiskWriteArg *diskHelperBase;
     Owned<IFileIO> outputIO;
-    Owned<IExtRowWriter> out;
+    Owned<ILogicalRowWriter> out;
     Owned<IFileIOStream> outraw;
     Owned<IPartDescriptor> partDesc;
     StringAttr fName;
-    CRC32 fileCRC;
-    bool compress, grouped, calcFileCrc, rfsQueryParallel;
+    bool compress, grouped, rfsQueryParallel;
     offset_t uncompressedBytesWritten;
+    offset_t partDiskSize;
     unsigned replicateDone;
     Owned<ICompressor> ecomp;
     unsigned usageCount;
     CDfsLogicalFileName dlfn;
     StringBuffer tempExternalName;
-    CriticalSection outputCs;  // Ensure outputIO remains valid for the duration of mergeStats()
+    CFileUsageEntry * tmpUsage = nullptr;
+    CompressionMethod compMethod = COMPRESS_METHOD_NONE;
 
     void open();
     void removeFiles();
     void close();
     virtual void write() = 0;
+    virtual void gatherActiveStats(CRuntimeStatisticCollection &activeStats) const;
 
 public:
     CDiskWriteSlaveActivityBase(CGraphElementBase *container);
     virtual void init(MemoryBuffer &data, MemoryBuffer &slaveData);
     virtual void abort();
-    virtual void serializeStats(MemoryBuffer &mb);
 
 // ICopyFileProgress
     virtual CFPmode onProgress(unsigned __int64 sizeDone, unsigned __int64 totalSize);

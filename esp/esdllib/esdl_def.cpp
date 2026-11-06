@@ -93,7 +93,7 @@ protected:
     IEsdlDefObjectIterator* baseIterator;
 
 public:
-    EsdlDefObjectWrapper( IEsdlDefObject& _obj, unsigned _flags = 0 ) : object(_obj), flags(_flags), baseIterator(NULL)
+    EsdlDefObjectWrapper( IEsdlDefObject& _obj, unsigned _flags = 0 ) : flags(_flags), object(_obj), baseIterator(NULL)
     {
     }
 
@@ -201,7 +201,7 @@ public:
         ForEach(*it)
         {
             const char *name = it->getPropKey();
-            const char *val = props->queryProp(name);
+            const char *val = it->queryPropValue();
             xml.appendf(" %s=\"", name);
             encodeUtf8XML(val, xml);
             xml.append('\"');
@@ -1027,7 +1027,10 @@ public:
         }
     }
 
-
+    virtual const char * queryMethodNamespace() override
+    {
+        return props->queryProp("method-namespace");
+    }
 };
 
 class EsdlDefService : public EsdlDefObject, implements IEsdlDefService
@@ -1057,9 +1060,17 @@ public:
         }
     }
 
-    const char * queryStaticNamespace()
+    virtual const char * queryServiceNamespace() override
     {
-        return props->queryProp("staticnamespace");
+        const char* ns = props->queryProp("service-namespace");
+        if (!ns)
+            ns = props->queryProp("staticnamespace");
+        return ns;
+    }
+
+    virtual const char* queryMethodsNamespace() override
+    {
+        return props->queryProp("methods-namespace");
     }
 
     virtual EsdlDefTypeId getEsdlType(){return EsdlTypeService;}
@@ -1264,6 +1275,25 @@ public:
 
 };
 
+class EsdlDefServiceArrayIterator : public CInterface, implements IEsdlDefServiceIterator
+{
+private:
+    ESDLServiceArray &   array;
+    aindex_t             cur = NotFound;
+
+public:
+    IMPLEMENT_IINTERFACE;
+
+    EsdlDefServiceArrayIterator(ESDLServiceArray &a) : array(a)
+    {
+    }
+
+    virtual bool        first(void)   override { cur = 0; return isValid(); }
+    virtual bool        isValid(void) override { return array.isItem(cur); }
+    virtual IEsdlDefService &query()  override { assertex(isValid()); return array.item(cur); }
+    virtual bool        next(void)    override { ++cur; return isValid(); }
+};
+
 typedef MapStringTo<bool> AddedHash;
 
 class EsdlDefinition : public CInterface, implements IEsdlDefinition
@@ -1314,6 +1344,12 @@ public:
                     edo->Release(); //ForceRelease();
             }
         }
+    }
+
+    EsdlDefServiceArrayIterator* getServiceIterator()
+    {
+        return new EsdlDefServiceArrayIterator(services);
+
     }
 
     void setReporter(IEsdlDefReporter* _reporter) override
@@ -1658,7 +1694,7 @@ unsigned EsdlDefinition::walkChildrenDepthFirst( AddedObjs& foundByName, EsdlDef
                 children->next();
             }
         } //else { DBGLOG("%s<%s> no Children", StringBuffer(level*2, " ").str(), esdlObj->queryName()); }
-    }  //else { DBGLOG("%s<%s> is not Struct",  StringBuffer(level*2, " ").str(), esdlObj->queryName()); }
+    }  //else { DBGLOG("%s<%s> is not Struct", StringBuffer(level*2, " ").str(), esdlObj->queryName()); }
 
     return stateOut;
 }
@@ -2216,7 +2252,7 @@ static EsdlTypeList esdlTypeList;
 
 void init_type_list(EsdlTypeList &list)
 {
-    static CriticalSection crit;
+    static CriticalSection crit{SYNC_LOCATION};
     CriticalBlock block(crit);
     if (!type_list_inited)
     {

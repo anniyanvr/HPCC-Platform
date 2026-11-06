@@ -10,12 +10,18 @@ define([
 
     "hpcc/GridDetailsWidget",
     "src/ws_access",
-    "src/ESPUtil"
+    "src/ESPUtil",
+    "src/Utility",
+
+    "dijit/Dialog",
+    "dijit/form/TextBox",
+
+    "hpcc/TableContainer"
 
 ], function (declare, nlsHPCCMod,
     registry, CheckBox,
     tree, editor,
-    GridDetailsWidget, WsAccess, ESPUtil) {
+    GridDetailsWidget, WsAccess, ESPUtil, Utility) {
 
     var nlsHPCC = nlsHPCCMod.default;
     return declare("PermissionsWidget", [GridDetailsWidget], {
@@ -47,7 +53,7 @@ define([
                     DisplayName: tree({
                         label: this.i18n.Resource,
                         formatter: function (_name, row) {
-                            return _name;
+                            return Utility.encodeHTML(_name);
                         }
                     }),
                     allow_access: editor({
@@ -56,9 +62,9 @@ define([
                         editorArgs: { value: true },
                         className: "hpccCentered",
                         autoSave: true,
-                        canEdit: function (object, value) { return object.__hpcc_type !== "Permission"; },
+                        canEdit: function (object, value) { return object.__hpcc_type !== "Permission" && object.__hpcc_type !== "ScopeFolder"; },
                         renderHeaderCell: function (node) {
-                            node.innerHTML = context.i18n.AllowAccess;
+                            node.innerHTML = Utility.wrapStringWithTag(context.i18n.AllowAccess, "center").split(" ").join("<br />");
                         }
                     }, CheckBox),
                     allow_read: editor({
@@ -67,9 +73,9 @@ define([
                         editorArgs: { value: true },
                         className: "hpccCentered",
                         autoSave: true,
-                        canEdit: function (object, value) { return object.__hpcc_type !== "Permission"; },
+                        canEdit: function (object, value) { return object.__hpcc_type !== "Permission" && object.__hpcc_type !== "ScopeFolder"; },
                         renderHeaderCell: function (node) {
-                            node.innerHTML = context.i18n.AllowRead;
+                            node.innerHTML = Utility.wrapStringWithTag(context.i18n.AllowRead, "center").split(" ").join("<br />");
                         }
                     }, CheckBox),
                     allow_write: editor({
@@ -78,9 +84,9 @@ define([
                         editorArgs: { value: true },
                         className: "hpccCentered",
                         autoSave: true,
-                        canEdit: function (object, value) { return object.__hpcc_type !== "Permission"; },
+                        canEdit: function (object, value) { return object.__hpcc_type !== "Permission" && object.__hpcc_type !== "ScopeFolder"; },
                         renderHeaderCell: function (node) {
-                            node.innerHTML = context.i18n.AllowWrite;
+                            node.innerHTML = Utility.wrapStringWithTag(context.i18n.AllowWrite, "center").split(" ").join("<br />");
                         }
                     }, CheckBox),
                     allow_full: editor({
@@ -89,9 +95,9 @@ define([
                         editorArgs: { value: true },
                         className: "hpccCentered",
                         autoSave: true,
-                        canEdit: function (object, value) { return object.__hpcc_type !== "Permission"; },
+                        canEdit: function (object, value) { return object.__hpcc_type !== "Permission" && object.__hpcc_type !== "ScopeFolder"; },
                         renderHeaderCell: function (node) {
-                            node.innerHTML = context.i18n.AllowFull;
+                            node.innerHTML = Utility.wrapStringWithTag(context.i18n.AllowFull, "center").split(" ").join("<br />");
                         }
                     }, CheckBox),
                     padding: {
@@ -105,13 +111,13 @@ define([
                         className: "hpccCentered",
                         autoSave: true,
                         canEdit: function (object, value) {
-                            if (object.__hpcc_type === "Permission" || object.AccountName === "Administrators") {
+                            if (object.__hpcc_type === "Permission" || object.__hpcc_type === "ScopeFolder" || object.AccountName === "Administrators") {
                                 return false;
                             }
                             return true;
                         },
                         renderHeaderCell: function (node) {
-                            node.innerHTML = context.i18n.DenyAccess;
+                            node.innerHTML = Utility.wrapStringWithTag(context.i18n.DenyAccess, "center").split(" ").join("<br />");
                         }
                     }, CheckBox),
                     deny_read: editor({
@@ -121,13 +127,13 @@ define([
                         className: "hpccCentered",
                         autoSave: true,
                         canEdit: function (object, value) {
-                            if (object.__hpcc_type === "Permission" || object.AccountName === "Administrators") {
+                            if (object.__hpcc_type === "Permission" || object.__hpcc_type === "ScopeFolder" || object.AccountName === "Administrators") {
                                 return false;
                             }
                             return true;
                         },
                         renderHeaderCell: function (node) {
-                            node.innerHTML = context.i18n.DenyRead;
+                            node.innerHTML = Utility.wrapStringWithTag(context.i18n.DenyRead, "center").split(" ").join("<br />");
                         }
                     }, CheckBox),
                     deny_write: editor({
@@ -137,13 +143,13 @@ define([
                         className: "hpccCentered",
                         autoSave: true,
                         canEdit: function (object, value) {
-                            if (object.__hpcc_type === "Permission" || object.AccountName === "Administrators") {
+                            if (object.__hpcc_type === "Permission" || object.__hpcc_type === "ScopeFolder" || object.AccountName === "Administrators") {
                                 return false;
                             }
                             return true;
                         },
                         renderHeaderCell: function (node) {
-                            node.innerHTML = context.i18n.DenyWrite;
+                            node.innerHTML = Utility.wrapStringWithTag(context.i18n.DenyWrite, "center").split(" ").join("<br />");
                         }
                     }, CheckBox),
                     deny_full: editor({
@@ -153,13 +159,13 @@ define([
                         className: "hpccCentered",
                         autoSave: true,
                         canEdit: function (object, value) {
-                            if (object.__hpcc_type === "Permission" || object.AccountName === "Administrators") {
+                            if (object.__hpcc_type === "Permission" || object.__hpcc_type === "ScopeFolder" || object.AccountName === "Administrators") {
                                 return false;
                             }
                             return true;
                         },
                         renderHeaderCell: function (node) {
-                            node.innerHTML = context.i18n.DenyFull;
+                            node.innerHTML = Utility.wrapStringWithTag(context.i18n.DenyFull, "center").split(" ").join("<br />");
                         }
                     }, CheckBox)
                 }

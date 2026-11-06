@@ -18,10 +18,12 @@
 #include "jliball.hpp"
 #include "jhtree.hpp"
 #include "ctfile.hpp"
+#include "keybuild.hpp"
 #include "rtlrecord.hpp"
 #include "rtlformat.hpp"
 #include "rtldynfield.hpp"
 #include "eclhelper_dyn.hpp"
+#include "eclhelper_base.hpp"
 #include "hqlexpr.hpp"
 #include "hqlutil.hpp"
 
@@ -43,7 +45,27 @@ bool optHex = false;
 bool optRaw = false;
 bool optFullHeader = false;
 bool optHeader = false;
+bool optFetchBranch = false;
+bool optPatch = false;
+bool optOverwrite = false;
+bool optNoSeek = false;
 StringArray files;
+
+static void printHeaderOffset(const char *name, offset_t value, unsigned nodeSize)
+{
+    if (value == (offset_t)-1)
+        printf("%s=-1\n", name);
+    else
+        printf("%s=%" I64F "d[%" I64F "d]\n", name, value, value/nodeSize);
+}
+
+static void printHeaderUnsignedShort(const char *name, unsigned short value)
+{
+    if (value == 0xffff)
+        printf("%s=-1\n", name);
+    else
+        printf("%s=%u\n", name, value);
+}
 
 void usage()
 {
@@ -52,12 +74,20 @@ void usage()
         "  node=[n]            - dump node n (0 = just header)\n"
         "  fpos=[n]            - dump node at offset fpos\n"
         "  recs=[n]            - output n rows\n"
+        "  recode=[compression-options]\n"
         "  fields=[fieldnames] - output specified fields only\n"
         "  filter=[filter]     - filter rows\n"
         "  -H                  - hex display\n"
         "  -R                  - raw output\n"
-        "  -fullheader         - output full header info for each file\n"
-        "  -header             - output minimal header info for each file\n"
+        "  --fullheader        - output full header info for each file\n"
+        "  --fetchbranch       - calculate missing first branch offsets\n"
+        "  --patch             - patch calculated first branch offsets into the key header\n"
+        "  --header            - output minimal header info for each file\n"
+        "\n"
+        "Options when recode specified:\n"
+        "  --noseek\n"
+        "  --overwrite\n"
+        "  outfile=filename\n"
                     );
     fflush(stderr);
     releaseAtoms();
@@ -71,13 +101,50 @@ void doOption(const char *opt)
         optHex = true;
     else if (streq(opt, "-R"))
         optRaw = true;
-    else if (streq(opt, "-header"))
+    else if (streq(opt, "-header") || streq(opt, "--header"))
         optHeader = true;
-    else if (streq(opt, "-fullheader"))
+    else if (streq(opt, "-fullheader") || streq(opt, "--fullheader"))
         optFullHeader = true;
+    else if (streq(opt, "--fetchbranch"))
+        optFetchBranch = true;
+    else if (streq(opt, "--patch"))
+        optPatch = true;
+    else if (streq(opt, "-overwrite") || streq(opt, "--overwrite"))
+        optOverwrite = true;
+    else if (streq(opt, "-noseek") || streq(opt, "--noseek"))
+        optNoSeek = true;
     else
         usage();
 }
+
+
+class MyIndexWriteArg : public CThorIndexWriteArg
+{
+public:
+    MyIndexWriteArg(const char * _filename, const char * _compression, IOutputMetaData * _meta)
+     : filename(_filename), compression(_compression), meta(_meta)
+    {
+    }
+
+    virtual const char * getFileName() { return filename; }
+    virtual int getSequence() { return 0; }
+    virtual IOutputMetaData * queryDiskRecordSize() { return meta; }
+    virtual const char * queryRecordECL() { return nullptr; }
+    virtual unsigned getFlags() { return compression ? TIWcompressdefined : 0; }
+    virtual size32_t transform(ARowBuilder & rowBuilder, const void * src, IBlobCreator * blobs, unsigned __int64 & filepos)
+    {
+        throwUnexpected();
+    }
+    virtual unsigned getKeyedSize() { throwUnexpected(); }
+    virtual unsigned getMaxKeySize() { throwUnexpected(); }
+    virtual unsigned getFormatCrc() { throwUnexpected(); }
+    virtual const char * queryCompression() { return compression; }
+
+public:
+    const char * filename = nullptr;
+    const char * compression = nullptr;
+    IOutputMetaData * meta = nullptr;
+};
 
 class MyIndexVirtualFieldCallback : public CInterfaceOf<IVirtualFieldCallback>
 {
@@ -100,15 +167,57 @@ public:
     virtual const byte * lookupBlob(unsigned __int64 id) override
     {
         size32_t blobSize;
-        return manager->loadBlob(id, blobSize);
+        return manager->loadBlob(id, blobSize, nullptr);
     }
 private:
     Linked<IKeyManager> manager;
 };
 
+class DummyFileIOStream : public CInterfaceOf<IFileIOStream>
+{
+public:
+    virtual size32_t read(size32_t max_len, void * data) override { throwUnexpected(); }
+    virtual void flush() override { }
+    virtual size32_t write(size32_t len, const void * data) override 
+    {
+        stats.ioWriteBytes.fetch_add(len);
+        ++stats.ioWrites;
+        if (len+offset > hwm) 
+            hwm = offset+len;
+        offset += len;
+        return len; 
+    }
+    virtual void seek(offset_t pos, IFSmode origin) override 
+    { 
+        switch (origin)
+        {
+        case IFScurrent:
+            offset += pos;
+            break;
+        case IFSend:
+            offset = hwm + pos;
+            break;
+        case IFSbegin:
+            offset = pos;
+            break;
+        }
+        if (offset > hwm) 
+            hwm = offset;
+    }
+    virtual offset_t size() override { return hwm; }
+    virtual offset_t tell() override { return offset; }
+    virtual unsigned __int64 getStatistic(StatisticKind kind) { return stats.getStatistic(kind); }
+    virtual void close() override { }
+private:
+    offset_t offset = 0;
+    offset_t hwm = 0;
+    FileIOStats         stats;
+};
+
 int main(int argc, const char **argv)
 {
     InitModuleObjects();
+    initNullConfiguration();
 #ifdef _WIN32
     _setmode( _fileno( stdout ), _O_BINARY );
     _setmode( _fileno( stdin ), _O_BINARY );
@@ -142,32 +251,99 @@ int main(int argc, const char **argv)
     {
         try
         {
-            Owned <IKeyIndex> index;
             const char * keyName = files.item(idx);
-            index.setown(createKeyIndex(keyName, 0, false, false));
-            size32_t key_size = index->keySize();  // NOTE - in variable size case, this is 32767
+            if (!isIndexFile(keyName))
+            {
+                printf("%s does not appear to be an index file\n", keyName);
+                continue;
+            }
+            Owned<IFile> in = createIFile(keyName);
+            bool canPatch = false;
+            Owned<IFileIO> io;
+            if (optPatch)
+            {
+                io.setown(in->open(IFOreadwrite));
+                if (io)
+                    canPatch = true;
+                else
+                    fprintf(stderr, "WARNING: Could not open file %s in read/write mode; opening read only\n", keyName);
+            }
+
+            if (!io)
+                io.setown(in->open(IFOread));
+            if (!io)
+                throw MakeStringException(999, "Failed to open file %s", keyName);
+
+            //read with a buffer size of 4MB - for optimal speed, and minimize azure read costs
+            Owned <IKeyIndex> index(createKeyIndex(keyName, 0, *io, 1, false, { 0x400000, 0x400000 }));
+            size32_t key_size = index->keySize();  // NOTE - in variable size case, this may be 32767 + sizeof(offset_t)
             size32_t keyedSize = index->keyedSize();
             unsigned nodeSize = index->getNodeSize();
+            bool isTLK = index->isTopLevelKey();
             if (optFullHeader)
             {
-                Owned<IFile> in = createIFile(keyName);
-                Owned<IFileIO> io = in->open(IFOread);
-                if (!io)
-                    throw MakeStringException(999, "Failed to open file %s", keyName);
-                Owned<CKeyHdr> header = new CKeyHdr;
+                Owned<CKeyHdr> header = new CKeyHdr(index->queryId());
                 MemoryAttr block(sizeof(KeyHdr));
                 io->read(0, sizeof(KeyHdr), (void *)block.get());
                 header->load(*(KeyHdr*)block.get());
                 if (header->getKeyType() & USE_TRAILING_HEADER)
                 {
+                    printf("Reading trailing header at position %" I64F "d\n", in->size() - header->getNodeSize());
                     if (io->read(in->size() - header->getNodeSize(), sizeof(KeyHdr), (void *)block.get()) != sizeof(KeyHdr))
                         throw MakeStringException(4, "Invalid key %s: failed to read trailing key header", keyName);
                     header->load(*(KeyHdr*)block.get());
                 }
 
+                KeyHdr * headerStruct = header->getHdrStruct();
+
                 printf("Key '%s'\nkeySize=%d keyedSize = %d NumParts=%x, Top=%d\n", keyName, key_size, keyedSize, index->numParts(), index->isTopLevelKey());
-                printf("File size = %" I64F "d, nodes = %" I64F "d\n", in->size(), in->size() / nodeSize - 1);
-                printf("rootoffset=%" I64F "d[%" I64F "d]\n", header->getRootFPos(), header->getRootFPos()/nodeSize);
+                printHeaderOffset("File size", in->size(), nodeSize);
+                printHeaderOffset("rootoffset", header->getRootFPos(), nodeSize);
+                printf("branchDepth=%" I64F "d\n", headerStruct->branchDepth);
+                printHeaderOffset("firstleafoffset", header->getFirstLeafPos(), nodeSize);
+                std::vector<offset_t> fetchedFirstBranches;
+                bool useFetchedFirstBranches = false;
+                if (optFetchBranch)
+                {
+                    offset_t firstBranch = header->getFirstBranchPos(0);
+                    if (firstBranch == 0 && headerStruct->branchDepth > 0)
+                    {
+                        printf("WARNING: firstbranchoffset[0] is 0, but branchDepth is %" I64F "d; recalculating branch offsets\n", headerStruct->branchDepth);
+                        index->getFirstBranchOffsets(fetchedFirstBranches);
+                        useFetchedFirstBranches = true;
+                    }
+                    else if (firstBranch == (offset_t)-1)
+                    {
+                        index->getFirstBranchOffsets(fetchedFirstBranches);
+                        useFetchedFirstBranches = true;
+                    }
+                    if (useFetchedFirstBranches)
+                    {
+                        for (unsigned i=0; i < fetchedFirstBranches.size(); i++)
+                            headerStruct->firstBranch[i] = fetchedFirstBranches[i];
+                        if (canPatch)
+                        {
+                            KeyHdr patchedHeader;
+                            header->save(patchedHeader);
+                            if (!(header->getKeyType() & TRAILING_HEADER_ONLY) && io->write(0, sizeof(patchedHeader), &patchedHeader) != sizeof(patchedHeader))
+                                throw MakeStringException(4, "Invalid key %s: failed to write leading key header", keyName);
+                            if ((header->getKeyType() & USE_TRAILING_HEADER) && io->write(in->size() - header->getNodeSize(), sizeof(patchedHeader), &patchedHeader) != sizeof(patchedHeader))
+                                throw MakeStringException(4, "Invalid key %s: failed to write trailing key header", keyName);
+                        }
+                    }
+                }
+                for (unsigned i=0; i < _elements_in(headerStruct->firstBranch); i++)
+                {
+                    StringBuffer name;
+                    name.appendf("firstbranchoffset[%u]", i);
+                    printHeaderOffset(name.str(), header->getFirstBranchPos(i), nodeSize);
+                }
+                printHeaderOffset("maxbranchoffset", header->queryMaxBranch(), nodeSize);
+                printf("leafCount=%" I64F "d\n", header->getLeafCount());
+                printf("blobCount=%" I64F "d\n", header->getBlobCount());
+                printHeaderUnsignedShort("minRowsPerLeafExceptLast", header->getMinRowsPerLeafExceptLast());
+                printHeaderOffset("bloomoffset", header->queryBloomHead(), nodeSize);
+                printHeaderOffset("metadataoffset", headerStruct->metadataHead, nodeSize);
                 Owned<IPropertyTree> metadata = index->getMetadata();
                 if (metadata)
                 {
@@ -190,14 +366,14 @@ int main(int argc, const char **argv)
                 }
                 else
                 {
-                    int node = globals->getPropInt("node");
+                    offset_t node = globals->getPropInt64("node");
                     if (node != 0)
                         index->dumpNode(stdout, node * nodeSize, globals->getPropInt("recs", 0), optRaw);
                 }
             }
             else if (globals->hasProp("fpos"))
             {
-                index->dumpNode(stdout, globals->getPropInt("fpos"), globals->getPropInt("recs", 0), optRaw);
+                index->dumpNode(stdout, globals->getPropInt64("fpos"), globals->getPropInt("recs", 0), optRaw);
             }
             else
             {
@@ -211,7 +387,9 @@ int main(int argc, const char **argv)
                 Owned<IXmlWriterExt> writer;
                 Owned<const IDynamicTransform> translator;
                 RowFilter rowFilter;
-                unsigned __int64 count = globals->getPropInt("recs", 1);
+                bool recode = globals->hasProp("recode");
+                unsigned __int64 count = recode ?(unsigned __int64) -1 : 1;
+                count = globals->getPropInt("recs", count);
                 const RtlRecordTypeInfo *outRecType = nullptr;
                 if (metadata && metadata->hasProp("_rtlType"))
                 {
@@ -264,6 +442,10 @@ int main(int argc, const char **argv)
                             fields.append(field);
                             minRecSize += field->type->getMinSize();
                         }
+                        fields.append(nullptr);
+                        outRecType = new RtlRecordTypeInfo(type_record, minRecSize, fields.getArray(0));
+                        outmeta.setown(new CDynamicOutputMetaData(*outRecType));
+                        translator.setown(createRecordTranslator(outmeta->queryRecordAccessor(true), inrec));
                     }
                     else
                     {
@@ -274,6 +456,8 @@ int main(int argc, const char **argv)
                             const RtlFieldInfo *field = inrec.queryOriginalField(idx);
                             if (field->type->getType() == type_blob)
                             {
+                                if (index->isTopLevelKey())
+                                    continue;  // blob IDs in TLK are not valid
                                 // See above - blob field in source needs special treatment
                                 field = new RtlFieldStrInfo(field->name, field->xpath, field->type->queryChildType());
                                 deleteFields.append(field);
@@ -281,11 +465,9 @@ int main(int argc, const char **argv)
                             fields.append(field);
                             minRecSize += field->type->getMinSize();
                         }
+                        fields.append(nullptr);
+                        outmeta.set(diskmeta);
                     }
-                    fields.append(nullptr);
-                    outRecType = new RtlRecordTypeInfo(type_record, minRecSize, fields.getArray(0));
-                    outmeta.setown(new CDynamicOutputMetaData(*outRecType));
-                    translator.setown(createRecordTranslator(outmeta->queryRecordAccessor(true), inrec));
                     if (filters.ordinality())
                     {
                         ForEachItemIn(idx, filters)
@@ -307,13 +489,86 @@ int main(int argc, const char **argv)
                 }
                 manager->finishSegmentMonitors();
                 manager->reset();
+                Owned<IFile> outFile;
+                Owned<IFileIO> outFileIO;
+                Owned<IFileIOStream> outFileStream;
+                Owned<IKeyBuilder> keyBuilder;
+                if (recode)
+                {
+                    const char *filename = globals->queryProp("outfile");
+                    if (filename)
+                    {
+                        outFile.setown(createIFile(filename));
+                        if(outFile->isFile() != fileBool::notFound && !optOverwrite)
+                            throw MakeStringException(0, "Found preexisting index file %s (overwrite not selected)", filename);
+                        
+                        outFileIO.setown(outFile->openShared(IFOcreate, IFSHfull));
+                        if(!outFileIO)
+                            throw MakeStringException(0, "Could not write index file %s", filename);
+                        outFileStream.setown(createBufferedIOStream(outFileIO, 0x200000));
+                    }
+                    else
+                        outFileStream.setown(new DummyFileIOStream);
+                    if (optNoSeek)
+                        outFileStream.setown(createNoSeekIOStream(outFileStream));
+
+                    unsigned flags = COL_PREFIX | HTREE_FULLSORT_KEY | HTREE_COMPRESSED_KEY | USE_TRAILING_HEADER;
+                    if (optNoSeek)
+                        flags |= TRAILING_HEADER_ONLY;
+                    if (!outmeta->isFixedSize())
+                        flags |= HTREE_VARSIZE;
+                    //if (quickCompressed)
+                    //    flags |= HTREE_QUICK_COMPRESSED_KEY;
+                    // MORE - other global options
+                    bool isVariable = outmeta->isVariableSize();
+                    size32_t fileposSize = hasTrailingFileposition(outmeta->queryTypeInfo()) ? sizeof(offset_t) : 0;
+                    size32_t maxDiskRecordSize;
+                    if (isTLK)
+                        maxDiskRecordSize = keyedSize;
+                    else if (isVariable)
+                        maxDiskRecordSize = KEYBUILD_MAXLENGTH;
+                    else
+                        maxDiskRecordSize = outmeta->getFixedSize()-fileposSize;
+                    const RtlRecord &indexRecord = outmeta->queryRecordAccessor(true);
+                    size32_t keyedSize = indexRecord.getFixedOffset(indexRecord.getNumKeyedFields());
+                    MyIndexWriteArg helper(filename, globals->queryProp("recode"), outmeta);  // MORE - is lifetime ok? Bloom support? May need longer lifetime once we add bloom support...
+                    KeyBuilderOptions options(flags, maxDiskRecordSize, nodeSize, keyedSize, &helper);
+                    options.enforceOrder = false;
+                    options.isTLK = index->isTopLevelKey();
+                    keyBuilder.setown(createKeyBuilder(outFileStream, options));
+                }
                 MyIndexVirtualFieldCallback callback(manager);
+                size32_t maxSizeSeen = 0;
                 while (manager->lookup(true) && count--)
                 {
                     byte const * buffer = manager->queryKeyBuffer();
                     size32_t size = manager->queryRowSize();
                     unsigned __int64 seq = manager->querySequence();
-                    if (optRaw)
+                    if (recode)
+                    {
+                        if (translator)
+                        {
+                            MemoryBuffer buf;
+                            MemoryBufferBuilder aBuilder(buf, 0);
+                            size = translator->translate(aBuilder, callback, buffer);
+                            if (size)
+                            {
+                                // MORE - think about fpos
+                                keyBuilder->processKeyData((const char *) aBuilder.getSelf(), 0, size);
+                            }
+                            else
+                                count++;  // Row was postfiltered
+                        }
+                        else
+                        {
+                            if (hasTrailingFileposition(outmeta->queryTypeInfo()))
+                                size -= sizeof(offset_t);
+                            keyBuilder->processKeyData((const char *) buffer, manager->queryFPos(), size);
+                            if (size > maxSizeSeen)
+                                maxSizeSeen = size;
+                        }
+                    }
+                    else if (optRaw)
                     {
                         fwrite(buffer, 1, size, stdout);
                     }
@@ -339,6 +594,14 @@ int main(int argc, const char **argv)
                     else
                         printf("%.*s  :%" I64F "u\n", size, buffer, seq);
                     manager->releaseBlobs();
+                }
+                if (keyBuilder)
+                {
+                    keyBuilder->finish(metadata, nullptr, maxSizeSeen, nullptr);
+                    printf("New key has %" I64F "u leaves, %" I64F "u branches, %" I64F "u duplicates\n", keyBuilder->getStatistic(StNumLeafCacheAdds), keyBuilder->getStatistic(StNumNodeCacheAdds), keyBuilder->getStatistic(StNumDuplicateKeys));
+                    printf("Original key size: %" I64F "u bytes\n", const_cast<IFileIO *>(index->queryFileIO())->size());
+                    printf("New key size: %" I64F "u bytes (%" I64F "u bytes written in %" I64F "u writes)\n", outFileStream->size(), outFileStream->getStatistic(StSizeDiskWrite), outFileStream->getStatistic(StNumDiskWrites));
+                    keyBuilder.clear();
                 }
                 if (outRecType)
                     outRecType->doDelete();

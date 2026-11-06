@@ -144,6 +144,28 @@ EXPORT TestDate := MODULE
     ASSERT( Date.ISOWeekDate(20100102, TRUE) = '2009-W53-6', CONST);
     ASSERT( Date.ISOWeekDate(20100103, TRUE) = '2009-W53-7', CONST);
 
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(20240309), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(20240310), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(20241102), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(20241103), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(19870404), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(19870405), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(19871024), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(19871025), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(19740105), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(19740106), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(19750222), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(19750223), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(19420207), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(19420208), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(19450929), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(19450930), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(19460428), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(19180330), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(19180331), CONST);
+    ASSERT(Date.IsUSDaylightSavingsInEffect(19181026), CONST);
+    ASSERT(NOT Date.IsUSDaylightSavingsInEffect(19181027), CONST);
+
     ASSERT(EXISTS(Date.TimeZone.TZ_Data), CONST);
 
     ASSERT(TRUE, CONST)
@@ -152,6 +174,11 @@ EXPORT TestDate := MODULE
   EXPORT TestDynamicFunctions := [
     ASSERT(Date.SecondsFromParts(1999,2,1,12,34,56,FALSE) = 917872496);     // UTC
     ASSERT(Date.SecondsFromParts(1965,2,17,0,0,0,FALSE) = -153705600);      // UTC
+
+    // HPCC-23685
+    ASSERT(Date.SecondsFromParts(2020,3,8,1,0,0,FALSE) = 1583629200);
+    ASSERT(Date.SecondsFromParts(2020,3,8,2,0,0,FALSE) = 1583632800);
+    ASSERT(Date.SecondsFromParts(2020,3,8,3,0,0,FALSE) = 1583636400);
 
     // UTC vs. local round-trip testing
     ASSERT(ROW(Std.Date.CreateDateTimeFromSeconds(Std.Date.SecondsFromParts(1999,2,1,12,34,56,FALSE),FALSE)).year = ROW(Std.Date.CreateDateTimeFromSeconds(Std.Date.SecondsFromParts(1999,2,1,12,34,56,TRUE),TRUE)).year);
@@ -435,10 +462,10 @@ EXPORT TestDate := MODULE
     END;
 
     x := LOOP(firstDate, 1000000, processNextDate(ROWS(LEFT)));
-
-    EXPORT Test01 := OUTPUT(x);
+    isDayOk := x[1].day = 1000001;
+    isGregorianOK := x[1].gregorian.year = 2738 AND x[1].gregorian.month = 11 AND x[1].gregorian.day = 29;
+    isJulianOK := x[1].julian.year = 2738 AND x[1].julian.month = 11 AND x[1].julian.day = 8;
+    EXPORT Test01 := ASSERT( isDayOK AND isGregorianOK AND isJulianOK, 'Failed') ;
   END;
-
-  EXPORT Main := [EVALUATE(TestConstant), EVALUATE(TestDynamicFunctions), EVALUATE(TestDynamic)];
 
 END;

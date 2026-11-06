@@ -156,7 +156,7 @@ public:
         PARENT::start();
 
         if (ensureStartFTLookAhead(0))
-            setLookAhead(0, createRowStreamLookAhead(this, inputStream, queryRowInterfaces(input), CHOOSESETS_SMART_BUFFER_SIZE, ::canStall(input), false, RCUNBOUND, NULL, &container.queryJob().queryIDiskUsage()), false);
+            setLookAhead(0, createRowStreamLookAhead(this, inputStream, queryRowInterfaces(input), CHOOSESETS_SMART_BUFFER_SIZE, ::canStall(input), false, RCUNBOUND, NULL), false);
 
         first = true;
         done = false;
@@ -276,7 +276,7 @@ public:
     {
         PARENT::setInputStream(index, _input, consumerOrdered);
         inputCounter->setInputStream(inputStream);
-        setLookAhead(0, createRowStreamLookAhead(this, inputCounter.get(), queryRowInterfaces(input), CHOOSESETSPLUS_SMART_BUFFER_SIZE, true, false, RCUNBOUND, this, &container.queryJob().queryIDiskUsage()), true); // read all input
+        setLookAhead(0, createRowStreamLookAhead(this, inputCounter.get(), queryRowInterfaces(input), CHOOSESETSPLUS_SMART_BUFFER_SIZE, true, false, RCUNBOUND, this), true); // read all input
     }
     virtual void start() override
     {
@@ -289,10 +289,10 @@ public:
             free(limits);
         }
         numSets = helper->getNumSets();
-        counts = (rowcount_t *)calloc(sizeof(rowcount_t), numSets);
-        priorCounts = (rowcount_t *)calloc(sizeof(rowcount_t), numSets);
-        totalCounts = (rowcount_t *)calloc(sizeof(rowcount_t), numSets);
-        limits = (__int64 *)calloc(sizeof(__int64), numSets);
+        counts = (rowcount_t *)calloc(numSets, sizeof(rowcount_t));
+        priorCounts = (rowcount_t *)calloc(numSets, sizeof(rowcount_t));
+        totalCounts = (rowcount_t *)calloc(numSets, sizeof(rowcount_t));
+        limits = (__int64 *)calloc(numSets, sizeof(__int64));
         helper->getLimits(limits);
         done = false;
         first = true;
@@ -308,7 +308,6 @@ public:
     virtual void getMetaInfo(ThorDataLinkMetaInfo &info) const override
     {
         initMetaInfo(info);
-        info.buffersInput = true;
         info.isSequential = true;
         info.canReduceNumRows = true;
         info.canBufferInput = true;
@@ -402,8 +401,8 @@ public:
             free(numToSkip);
             free(numToReturn);
         }
-        numToSkip = (unsigned *)calloc(sizeof(unsigned), numSets);
-        numToReturn = (unsigned *)calloc(sizeof(unsigned), numSets);
+        numToSkip = (unsigned *)calloc(numSets, sizeof(unsigned));
+        numToReturn = (unsigned *)calloc(numSets, sizeof(unsigned));
     }
     CATCH_NEXTROW()
     {
@@ -482,7 +481,7 @@ public:
         ChooseSetsPlusActivity::start();
         if (counter)
             free(counter);
-        counter = (rowcount_t*)calloc(sizeof(rowcount_t), numSets);
+        counter = (rowcount_t*)calloc(numSets, sizeof(rowcount_t));
     }
     CATCH_NEXTROW()
     {

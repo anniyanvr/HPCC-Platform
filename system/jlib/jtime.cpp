@@ -23,8 +23,7 @@
 #include "jexcept.hpp"
 #include "jerror.hpp"
 
-#ifndef __GNUC__
-
+#if !defined(__GNUC__) || defined(__EMSCRIPTEN__)
 #if _WIN32 //this appears to be the best way of controlling timezone information used by mktime
 
 void setUtcTZ()
@@ -70,17 +69,17 @@ StringBuffer localTZ;
 void setUtcTZ()
 {
     localTZ.clear().append(getenv("TZ"));
-    setenv("TZ", "UTC");
+    setenv("TZ", "UTC", true);
 }
 
 void setLocalTZ()
 {
-    setenv("TZ", localTZ.str());
+    setenv("TZ", localTZ.str(), true);
 }
 
 #endif //_WIN32
 
-Mutex timeMutex;
+Mutex timeMutex(SYNC_LOCATION);
 
 struct tm * gmtime_r(time_t const * simple, struct tm * utc)
 {
@@ -116,19 +115,6 @@ time_t timelocal(struct tm * local)
 }
 
 #endif //__GNUC__
-
-static unsigned readDigits(char const * & str, unsigned numDigits)
-{
-    unsigned ret = 0;
-    while(numDigits--)
-    {
-        char c = *str++;
-        if(!isdigit(c))
-            throwError1(JLIBERR_BadlyFormedDateTime, str);
-        ret  = ret * 10 + (c - '0');
-    }
-    return ret;
-}
 
 static void checkChar(char const * & str, char required)
 {
@@ -222,22 +208,32 @@ void CDateTime::set(time_t simple)
 
 void CDateTime::setString(char const * str, char const * * end, bool local)
 {
+    char const * beginstr = str; // save for error message
     if (!str||!*str) {
         clear();
         return;
     }
-    unsigned year = readDigits(str, 4);
-    checkChar(str, '-');
-    unsigned month = readDigits(str, 2);
-    checkChar(str, '-');
-    unsigned day = readDigits(str, 2);
-    checkChar(str, 'T');
-    unsigned hour = readDigits(str, 2);
-    checkChar(str, ':');
-    unsigned minute = readDigits(str, 2);
-    checkChar(str, ':');
-    unsigned sec = readDigits(str, 2);
-    unsigned nano = 0;
+    unsigned year = 0, month = 0, day = 0, hour = 0, minute = 0, sec = 0, nano = 0;
+    try
+    {
+        year = readDigits(str, 4);
+        checkChar(str, '-');
+        month = readDigits(str, 2);
+        checkChar(str, '-');
+        day = readDigits(str, 2);
+        checkChar(str, 'T');
+        hour = readDigits(str, 2);
+        checkChar(str, ':');
+        minute = readDigits(str, 2);
+        checkChar(str, ':');
+        sec = readDigits(str, 2);
+    }
+    catch (IException * e)
+    {
+        e->Release();
+        throwError1(JLIBERR_BadlyFormedDateTime, beginstr);
+    }
+
     if(*str == '.')
     {
         unsigned digits;
@@ -256,26 +252,44 @@ void CDateTime::setString(char const * str, char const * * end, bool local)
 
 void CDateTime::setDateString(char const * str, char const * * end)
 {
-    unsigned year = readDigits(str, 4);
-    checkChar(str, '-');
-    unsigned month = readDigits(str, 2);
-    checkChar(str, '-');
-    unsigned day = readDigits(str, 2);
+    char const * beginstr = str; // save for error message
+    unsigned year = 0, month = 0, day = 0;
+    try
+    {
+        year = readDigits(str, 4);
+        checkChar(str, '-');
+        month = readDigits(str, 2);
+        checkChar(str, '-');
+        day = readDigits(str, 2);
+    }
+    catch (IException * e)
+    {
+        e->Release();
+        throwError1(JLIBERR_BadlyFormedDateTime, beginstr);
+    }
     if(end) *end = str;
     set(year, month, day, 0, 0, 0, 0, false);
 }
 
 void CDateTime::setTimeString(char const * str, char const * * end, bool local)
 {
-    unsigned year;
-    unsigned month;
-    unsigned day;
+    char const * beginstr = str; // save for error message
+    unsigned year = 0, month = 0, day = 0, hour = 0, minute = 0, sec = 0;
     getDate(year, month, day, false);
-    unsigned hour = readDigits(str, 2);
-    checkChar(str, ':');
-    unsigned minute = readDigits(str, 2);
-    checkChar(str, ':');
-    unsigned sec = readDigits(str, 2);
+
+    try
+    {
+        hour = readDigits(str, 2);
+        checkChar(str, ':');
+        minute = readDigits(str, 2);
+        checkChar(str, ':');
+        sec = readDigits(str, 2);
+    }
+    catch (IException * e)
+    {
+        e->Release();
+        throwError1(JLIBERR_BadlyFormedDateTime, beginstr);
+    }
     unsigned nano = 0;
     if(*str == '.')
     {
@@ -307,7 +321,7 @@ void CDateTime::set(unsigned year, unsigned month, unsigned day, unsigned hour, 
         local.tm_isdst = -1;
         local.tm_wday = 0;
         local.tm_yday = 0;
-        time_t simple = timelocal(&local);
+        time_t simple = mktime(&local);
         set(simple);
     }
     else
@@ -356,6 +370,12 @@ void CDateTime::setTimeStamp(timestamp_type ts)
 {
     set((time_t)(ts / 1000000));
     nanosec = (ts % 1000000) * 1000;
+}
+
+void CDateTime::setTimeStampNs(timestamp_type ts)
+{
+    set((time_t)(ts / 1000000000));
+    nanosec = (ts % 1000000000);
 }
 
 void CDateTime::adjustTime(int deltaMins)
@@ -423,55 +443,56 @@ unsigned __int64 CDateTime::getTimeStamp() const
     return (unsigned __int64)getSimple() * 1000000 + (nanosec / 1000);
 }
 
-StringBuffer & CDateTime::getString(StringBuffer & str, bool local) const
+unsigned __int64 CDateTime::getTimeStampNs() const
 {
-    if(isNull()) return str;
-    char buff[64]; // allow extra for invalid dates
-    char * finger = buff;
-    if(local)
-    {
-        time_t simple = getSimple();
-        struct tm local;
-        localtime_r(&simple, &local);
-        finger += sprintf(finger, "%04d-%02d-%02dT%02d:%02d:%02d", local.tm_year+1900, local.tm_mon+1, local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec);
-    }
-    else
-        finger += sprintf(finger, "%04d-%02d-%02dT%02d:%02d:%02d", utc_year+1900, utc_mon+1, utc_mday, utc_hour, utc_min, utc_sec);
-    if(nanosec) finger += sprintf(finger, ".%06u", nanosec/1000);
-    return str.append(buff);
+    return (unsigned __int64)getSimple() * 1000000000 + nanosec;
 }
 
-StringBuffer & CDateTime::getDateString(StringBuffer & str, bool local) const
+StringBuffer & CDateTime::getDateTimeString(StringBuffer & str, bool includeDate, bool includeTime, unsigned precision, bool local) const
 {
-    if(isNull()) return str;
-    char buff[64]; // allow extra for invalid dates
-    if(local)
-    {
-        time_t simple = getSimple();
-        struct tm local;
-        localtime_r(&simple, &local);
-        sprintf(buff, "%04d-%02d-%02d", local.tm_year+1900, local.tm_mon+1, local.tm_mday);
-    }
-    else
-        sprintf(buff, "%04d-%02d-%02d", utc_year+1900, utc_mon+1, utc_mday);
-    return str.append(buff);
-}
+    // If neither date nor time is requested, return the string unchanged
+    if (!includeDate && !includeTime)
+        return str;
+    // If the date/time is null, return the string unchanged
+    if (isNull())
+        return str;
 
-StringBuffer & CDateTime::getTimeString(StringBuffer & str, bool local) const
-{
-    if(isNull()) return str;
-    char buff[64];  // allow extra for invalid dates
-    char * finger = buff;
-    if(local)
+    struct tm tm;
+    if (local)
     {
         time_t simple = getSimple();
-        struct tm local;
-        localtime_r(&simple, &local);
-        finger += sprintf(finger, "%02d:%02d:%02d", local.tm_hour, local.tm_min, local.tm_sec);
+        localtime_r(&simple, &tm);
     }
     else
-        finger += sprintf(finger, "%02d:%02d:%02d", utc_hour, utc_min, utc_sec);
-    if(nanosec) finger += sprintf(finger, ".%06u", nanosec/1000);
+        getToUtcTm(tm);
+
+    char buff[64];
+    buff[0] = 0;
+    char *finger = buff;
+
+    if (includeDate)
+        finger += sprintf(finger, "%04d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
+
+    if (includeTime)
+    {
+        if (includeDate)
+            *finger++ = 'T';
+        finger += sprintf(finger, "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+        if (DTP_MaybeMicros == precision) // backwards compatible default to microseconds only if fractional seconds are present
+            precision = (nanosec ? DTP_Micros : DTP_Seconds);
+        else if (precision > DTP_Nanos)
+            precision = DTP_Nanos;
+        if (precision != DTP_Seconds)
+        {
+            // divisors does not include an entry for DTP_Seconds, since the prior precision checks
+            // ensure that precision will be between 1 and DTP_Nanos.
+            static constexpr unsigned divisors[DTP_Nanos] = { 100'000'000U, 10'000'000U, 1'000'000U, 100'000U, 10'000U, 1'000U, 100U, 10U, 1U };
+            static_assert(DTP_Seconds == 0 && _elements_in(divisors) == DTP_Nanos, "divisors array must have an entry for each precision level except DTP_Seconds");
+            finger += sprintf(finger, ".%0*u", static_cast<int>(precision), nanosec / divisors[precision - 1]);
+        }
+    }
+
     return str.append(buff);
 }
 
@@ -511,7 +532,7 @@ int CDateTime::queryUtcToLocalDelta() const
     struct tm ts;
     getToUtcTm(ts);
     time_t correct = timegm(&ts);
-    time_t shifted = timelocal(&ts);
+    time_t shifted = mktime(&ts);
     return ((int)(correct - shifted))/60;
 }
 
@@ -668,10 +689,18 @@ void CScmDateTime::setString(const char * pstr)
     else if ((sign == '-') || (sign == '+'))
     {
         end++;
-        int delta = readDigits(end, 2);
-        if (*end++ != ':')
+        int delta = 0;
+        try
+        {
+            delta = readDigits(end, 2);
+            checkChar(end, ':');
+            delta = delta * 60 + readDigits(end, 2);
+        }
+        catch (IException * e)
+        {
+            e->Release();
             throwError1(JLIBERR_BadlyFormedDateTime, pstr);
-        delta = delta * 60 + readDigits(end, 2);
+        }
         if (sign == '-')
             delta = -delta;
         utcToLocalDelta = delta;
@@ -791,7 +820,7 @@ static unsigned daysInMonth(unsigned y, unsigned m)
     if ((m==2)&&isLeapYear(y))
         return 29;
     if(m < 1 || m > 12)
-        throw MakeStringException(0, "month should between 1 and 12");
+        throw MakeStringException(JLIBERR_SystemMonthShouldBetween1And12, "month should between 1 and 12");
     return days[m - 1];
 }
 
@@ -1104,7 +1133,7 @@ public:
     {
         char const * specend = cron.set(spec);
         if (*specend)
-            throw MakeStringException(0, "Bad cron spec %s", spec);
+            throw MakeStringException(JLIBERR_SystemBadCronSpecS, "Bad cron spec %s", spec);
     }
     CronTableItem * prev;
     CronTableItem * next;
@@ -1352,7 +1381,7 @@ private:
     friend class XFrame;
     CronTableItem * head;
     CronTableItem * tail;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     bool hasframe;
 };
 

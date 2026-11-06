@@ -1,0 +1,73 @@
+/*##############################################################################
+
+    Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#pragma once
+
+#ifdef _USE_CPPUNIT
+
+#include "eventconsumption.h"
+#include "eventvisitor.h"
+#include "eventiterator.h"
+#include "unittests.hpp"
+
+struct EventFileProperties;
+extern const EventFileProperties& queryTestEventFileProperties();
+
+// Event visiting endpoint used by unit tests to verify that visitation links processing known
+// input produce expected results.
+//
+// The class is constructed with an expected events iterator. For each event visited, the actual
+// event is compared to the next expected event in the iterator. Any deviation results in a test
+// failure. The final test comes in `departFile`, where the expected iterator must not reference
+// additional events.
+class CEventVisitationLinkTester : public CInterfaceOf<IEventVisitor>
+{
+public:
+    virtual bool visitFile(const EventFileProperties& properties) override;
+    virtual bool visitEvent(CEvent& actualEvent, const EventFileProperties& properties) override;
+    virtual void departFile(const EventFileProperties& properties) override;
+    CEventVisitationLinkTester(interface IEventIterator& expect);
+private:
+    bool hasNoRemainingEvents();
+    Linked<IEventIterator> expect;
+    unsigned fileVisitDepth{0};
+};
+
+// Extracts `input`, `expect`, and `link` property tree sections from `testData`, passing them to
+// `testEventVisitationLinks(input, expect, links)` for processing. The markup may be XML, JSON,
+// or YAML format.
+extern void testEventVisitationLinks(const char* testData, unsigned flags);
+inline void testEventVisitationLinks(const char* testData) { testEventVisitationLinks(testData, PTEFnone); }
+
+// Returns true if processing the supplied testData throws an IException.
+// This uses the same visitation pipeline as testEventVisitationLinks but avoids
+// relying on assertion-failure side effects in tests that need to verify throws.
+extern bool testEventVisitationLinksThrowsIException(const char* testData, unsigned flags);
+inline bool testEventVisitationLinksThrowsIException(const char* testData) { return testEventVisitationLinksThrowsIException(testData, PTEFnone); }
+
+// Uses a `CEventVisitationLinkTester` instance to iterate over the `input` events, verifying that
+// the events received by the tester match the `expected` events after modification by visitation
+// links configured by the `links` iterator.
+//
+// Multiple links may be configured. Within the iteration, the first link is closest to the tester
+// and the last link receives the input events.
+extern void testEventVisitationLinks(const IPropertyTree& input, const IPropertyTree& expect, IPropertyTreeIterator& links, unsigned flags, bool disablePreScan);
+inline void testEventVisitationLinks(const IPropertyTree& input, const IPropertyTree& expect, IPropertyTreeIterator& links, unsigned flags) { testEventVisitationLinks(input, expect, links, flags, false); }
+
+extern IPropertyTree* createTestConfiguration(const char* configText);
+
+#endif

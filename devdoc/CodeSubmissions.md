@@ -1,0 +1,70 @@
+# Code Submission Guidelines
+
+We welcome submissions to the platform especially in the form of pull requests into the HPCC-Systems github repository.  The following describes some of processes for merging PRs.
+
+## Pull requests
+There are a few things that should be considered when creating a PR to increase the likelihood that they can be accepted quickly.
+
+* Write a good commit message\
+  The format should follow Conventional Commits (e.g., `fix(dfu): ...`). The commit title should not start with an HPCC-XXXXX prefix. The text should make sense in a change log by itself - without reference to the GitHub issue or the contents of the PR. We should aim to increase the information that is included as part of the commit message - not rely on the GitHub issue. We should keep in mind the audience could be developers, testers, and any other users of the system.
+* Try to keep your top level commit message to max length of 80 characters.
+* If more detail is required, use the extended message section available through the Github UI on a browser or through commandline.
+  - You'll be able to provide more details.
+  - Use bullet points to help keep your information organized and easy to read.
+  - If adding detailed commit messages from commandline, the user can do the following:\
+    git commit -m "fix(dfu): top level commit message" -m " - detailed commit message line 1: `<press Enter>`
+    1)  - this is the continuation of my detailed commit message `<press Enter>`
+    2)  - this is the next line in the detailed commit message."
+    - the final quotation mark will end the detailed commit message.
+* If the component name (when applicable) can fit into the top level commit message, it would help clarify information.
+* Ensure the reviewer has enough information to review the change.\
+  The code reviewer only has the linked GitHub issue(s) and the PR to go on.  The issue (or associated documentation) should contain enough details to review the PR - e.g. the purpose, main aim, why the change was made etc.. If the scope of the issue has changed then the issue should be updated to reflect that.\
+  If the submission requires changes to the documentation then the linked issue should contain all the details needed to document it, and the PR should either contain the documentation changes, or a documentation GitHub issue should be created.
+* Fill in the checklist\
+  The check boxes are there to remind you to consider different aspects of the PR.  Not all of them apply to every submission, but if you tick a box and have not really thought about the item then prepare to be embarrassed!
+* Prefer small submissions\
+  It isn't always possible, but several smaller PRs are much easier to review than one large change.  If your submission includes semi-automatic/mechanical changes (e.g. renaming large numbers of function calls, or adding an extra parameter) please keep it as a separate commit.  This makes it much easier to review the PR - since the reviewer will be looking for different errors in the different types of changes.
+* Check for silly mistakes\
+  Review your own code in github, after creating the PR to check for silly mistakes.  It doesn't take long, and often catches trivial issues.  It may avoid the need for a cycle of code-review/fixes.  It may be helpful to add some notes to specific changes e.g. "this change is mainly or solely refactoring method A into method B and C. ".  Some common examples of trivial issues to look for include:
+  - Inconsistent indentation, or using tabs rather than spaces to indent.
+  - Lines of tracing left in.
+  - Lines of code commented out that should be deleted.
+  - TBD reminders of work that need implementing or removing.
+  - Unrelated files that have been accidentally modified.
+  - Accidental changes to submodule versions.
+  - Typos in error messages, tracing or comments, or in the commit message.
+  - Incomplete edits when copy and pasting code.
+  - Check subtractions are the right way around, and potential for overflow.
+  - New files with the wrong copyright date
+* Check the target branch (see below)
+* Request one or more reviewers.  For relatively simple changes a single reviewer is normally enough.
+* For more suggestions, please refer to https://github.com/hpcc-systems/HPCC-Platform/wiki/Git-commit-message-guidelines 
+* examples of Pull Requests that can be improved\
+  - fix: Fix some issues with spill stats in smart join activity
+    - This could mention affected component (e.g., `fix(thor): ...`).
+    - This PR did have a very detailed explanation of everything that got worked on.
+    - It's just missing a bit more info in the top level summary commit message.
+  - feat: Allow lookahead below blocking splitter
+    - A bit cryptic if you're unfamililar with the code.
+    - Naming the file explicitly or affected component might be helpful (e.g., `feat(roxie): ...`)
+* example of Pull Request that follows most if not all suggestions\
+  - fix(dfu): Ensure that dfuserver closes files cleanly so errors are reported
+    - This commit message has clean information and tells the reader which component is affected. 
+    - This is also under 80 characters long without sacrificing information.
+  - feat(agent): Add statistic for number/size of agent requests
+    - Efficient use of punctuation and symbols for clarity.
+    - Full stops aren't necessary for commit messages so it would save 1 character.
+
+
+## Reviewers
+
+All pull requests should be reviewed by someone who is not the author before merging.  Complex changes, changes that require input from multiple experts, or that have implications throughout the system should be reviewed by multiple reviewers.  This should include someone who is responsible for merging changes for that part of the system.  (Unless it is a simple change written by someone with review rights.)
+
+Contributors should use the github reviewers section on the PR to request reviews.  After a contributor has pushed a set of changes in response to a review, they should refresh the github review status, so the users are notified it is ready for re-review.  When the review is complete, a person with responsibility for merging changes to that part of the system should be added as a reviewer (or refreshed), with a comment that it is ready to merge.
+
+Reviewers should check for PRs that are ready for their review via github's webpage (filter `review-requested:<reviewer-id>`) or via the github CLI (e.g. gh pr status). Contributors should similarly ensure they stay up to date with any comments on requests for change on their submissions.
+
+## Target branch
+The [Version support](VersionSupport.md) document contains details of the different versions that are supported, and which version should be targetted for different kinds of changes.  Occasionally earlier branches will be chosen, (e.g. security fixes to even older versions) but they should always be carefully discussed (and documented).
+
+Changes will always be upmerged into the next point release for all the more recent major and minor versions (and master).

@@ -44,9 +44,17 @@
 #include "espcfg.ipp"
 #include "esplog.hpp"
 #include "espcontext.hpp"
-#include "build-config.h"
 #include "rmtfile.hpp"
 #include "dafdesc.hpp"
+
+#include "jmetrics.hpp"
+#include "workunit.hpp"
+#include "esptrace.h"
+#include "jevent.hpp"
+
+#include "configmaskingconfig.hpp"
+
+using namespace hpccMetrics;
 
 void CEspServer::sendSnmpMessage(const char* msg) { throwUnexpected(); }
 
@@ -118,6 +126,16 @@ bool CEspServer::isSubscribedToDali()
     return m_config->isSubscribedToDali();
 }
 
+void CEspServer::initializeDataMaskingEngine(const char* dataMaskingConfig)
+{
+    if (!isEmptyString(dataMaskingConfig))
+    {
+        dataMaskEngine.setown(new DataMasking::CEngine());
+        Owned<IPTree> maskTree = createPTreeFromYAMLString(dataMaskingConfig);
+        dataMaskEngine->loadProfiles(*maskTree.get());
+    }
+}
+
 
 #ifdef _WIN32
 /*******************************************
@@ -141,53 +159,53 @@ int start_init_main(int argc, const char** argv, int (*init_main_func)(int,const
 #define RESET_ESP_SIGNAL_HANDLER(sig, handler)
 
 int start_init_main(int argc, const char** argv, int (*init_main_func)(int, const char**))
-{ 
-    if(argc > 1 && !strcmp(argv[1], "work")) 
-    { 
+{
+    if(argc > 1 && !strcmp(argv[1], "work"))
+    {
         const char** newargv = new const char*[argc - 1];
-        newargv[0] = argv[0]; 
-        for(int i = 2; i < argc; i++) 
-        { 
-            newargv[i - 1] = argv[i]; 
-        } 
-        int rtcode = init_main_func(argc - 1, newargv); 
+        newargv[0] = argv[0];
+        for(int i = 2; i < argc; i++)
+        {
+            newargv[i - 1] = argv[i];
+        }
+        int rtcode = init_main_func(argc - 1, newargv);
         delete[] newargv;
         return rtcode;
-    } 
-    else 
-    { 
-        StringBuffer command; 
-        command.append(argv[0]); 
-        command.append(" work "); 
-        for(int i = 1; i < argc; i++) 
-        { 
-            command.append(argv[i]); 
-            command.append(" "); 
-        } 
-        DWORD exitcode = 0; 
-        while(true) 
-        { 
-            PROGLOG("Starting working process: %s", command.str()); 
-            PROCESS_INFORMATION process; 
-            STARTUPINFO si; 
-            GetStartupInfo(&si); 
-            if(!CreateProcess(NULL, (char*)command.str(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &process)) 
-            { 
-                IERRLOG("Process failed: %d\r\n",GetLastError()); 
-                exit(-1); 
-            } 
-            WaitForSingleObject(process.hProcess,INFINITE); 
-            GetExitCodeProcess(process.hProcess, &exitcode); 
-            PROGLOG("Working process exited, exitcode=%d", exitcode); 
-            if(exitcode == TERMINATE_EXITCODE) 
-            { 
-                DBGLOG("This is telling the monitoring process to exit too. Exiting once and for all...."); 
-                exit(exitcode); 
-            } 
-            CloseHandle(process.hProcess); 
-            CloseHandle(process.hThread); 
+    }
+    else
+    {
+        StringBuffer command;
+        command.append(argv[0]);
+        command.append(" work ");
+        for(int i = 1; i < argc; i++)
+        {
+            command.append(argv[i]);
+            command.append(" ");
+        }
+        DWORD exitcode = 0;
+        while(true)
+        {
+            PROGLOG("Starting working process: %s", command.str());
+            PROCESS_INFORMATION process;
+            STARTUPINFO si;
+            GetStartupInfo(&si);
+            if(!CreateProcess(NULL, (char*)command.str(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &process))
+            {
+                IERRLOG("Process failed: %d\r\n",GetLastError());
+                exit(-1);
+            }
+            WaitForSingleObject(process.hProcess,INFINITE);
+            GetExitCodeProcess(process.hProcess, &exitcode);
+            PROGLOG("Working process exited, exitcode=%d", exitcode);
+            if(exitcode == TERMINATE_EXITCODE)
+            {
+                DBGLOG("This is telling the monitoring process to exit too. Exiting once and for all....");
+                exit(exitcode);
+            }
+            CloseHandle(process.hProcess);
+            CloseHandle(process.hThread);
             Sleep(1000);
-        } 
+        }
     }
 }
 
@@ -210,35 +228,35 @@ int start_init_main(int argc, const char** argv, int (*init_main_func)(int, cons
 int work_main(CEspConfig& config, CEspServer& server);
 int do_work_main(CEspConfig& config, CEspServer& server)
 {
-   int result; 
-   int numchildren = 0; 
-   pid_t childpid=0; 
+   int result;
+   int numchildren = 0;
+   pid_t childpid=0;
 
-createworker: 
-   childpid = fork(); 
-   if(childpid < 0) 
-   { 
-      IERRLOG("Unable to create new process"); 
-      result = -1; 
-   } 
-   else if(childpid == 0) 
+createworker:
+   childpid = fork();
+   if(childpid < 0)
+   {
+      IERRLOG("Unable to create new process");
+      result = -1;
+   }
+   else if(childpid == 0)
    {
         result = work_main(config, server);
-   } 
-   else 
-   { 
-      DBGLOG("New process generated, pid=%d", childpid); 
-      numchildren++; 
-      if(numchildren < MAX_CHILDREN) 
-         goto createworker; 
-      
-      int status; 
-      childpid = wait3(&status, 0, NULL); 
-      DBGLOG("Attention: child process exited, pid = %d", childpid); 
-      numchildren--; 
-      DBGLOG("Bringing up a new process..."); 
-      sleep(1); 
-      goto createworker; 
+   }
+   else
+   {
+      DBGLOG("New process generated, pid=%d", childpid);
+      numchildren++;
+      if(numchildren < MAX_CHILDREN)
+         goto createworker;
+
+      int status;
+      childpid = wait3(&status, 0, NULL);
+      DBGLOG("Attention: child process exited, pid = %d", childpid);
+      numchildren--;
+      DBGLOG("Bringing up a new process...");
+      sleep(1);
+      goto createworker;
    }
 
    return result;
@@ -304,14 +322,13 @@ void openEspLogFile(IPropertyTree* envpt, IPropertyTree* procpt)
 
     if (procpt->getPropBool("@enableSysLog", false))
         UseSysLogForOperatorMessages();
-}   
+}
 
 
 static constexpr const char * defaultYaml = R"!!(
 version: "1.0"
 esp:
   name: myesp
-  daliServers: dali
 )!!";
 
 static Owned<IPropertyTree> espConfig;
@@ -351,18 +368,99 @@ static void usage()
 
 IPropertyTree *buildApplicationLegacyConfig(const char *application, const char* argv[]);
 
+//
+// Initialize trace settings
+void initializeTraceFlags(CEspConfig* config)
+{
+    IPropertyTree* pEspTree = config->queryConfigPTree();
+    Owned<IPropertyTree> pTraceTree = pEspTree->getPropTree(propTraceFlags);
+    if (!pTraceTree)
+    {
+        pTraceTree.setown(getComponentConfigSP()->getPropTree(propTraceFlags));
+    }
+#ifdef _DEBUG
+    if (!pTraceTree)
+    {
+        static const char * defaultTraceFlagsYaml = R"!!(
+traceDetail: max
+)!!";
+        pTraceTree.setown(createPTreeFromYAMLString(defaultTraceFlagsYaml));
+    }
+#endif
+
+    if (pTraceTree)
+    {
+        TraceFlags defaults = loadTraceFlags(pTraceTree, mapTraceOptions(pEspTree), queryDefaultTraceFlags());
+        updateTraceFlags(defaults, true);
+    }
+}
+
+//
+// Initialize metrics
+void initializeMetrics(CEspConfig* config)
+{
+    //
+    // Initialize metrics
+    Owned<IPropertyTree> pMetricsTree = config->queryConfigPTree()->getPropTree("metrics");
+    if (pMetricsTree == nullptr)
+    {
+        pMetricsTree.setown(getComponentConfigSP()->getPropTree("metrics"));
+    }
+
+#ifdef _DEBUG
+    if (!pMetricsTree)
+    {
+        const char * defaultMetricsYaml = R"!!(
+sinks:
+  - type: log
+    name: loggingsink
+    settings:
+      period: 60
+)!!";
+        pMetricsTree.setown(createPTreeFromYAMLString(defaultMetricsYaml));
+    }
+#endif
+
+    if (pMetricsTree != nullptr)
+    {
+        PROGLOG("Metrics initializing...");
+        MetricsManager &metricsManager = queryMetricsManager();
+        metricsManager.init(pMetricsTree);
+        metricsManager.startCollecting();
+    }
+}
+
+static void copyTree(IPropertyTree * to, const IPropertyTree * from, const char * xpath)
+{
+    IPropertyTree * match = from->queryPropTree(xpath);
+    if (match)
+        to->setPropTree(xpath, LINK(match));
+}
+
+static IPropertyTree * extractLegacyOptions(IPropertyTree * legacyOptions)
+{
+    IPropertyTree * legacyProcessConfig = legacyOptions->queryPropTree("Software/EspProcess[1]");
+    Owned<IPropertyTree> extractedOptions = createPTree();
+    copyTree(extractedOptions, legacyProcessConfig, "tracing");
+    copyTree(extractedOptions, legacyProcessConfig, "vaults");
+    return extractedOptions.getClear();
+}
+
+bool startEspEventRecording(const char * options, const char * filename)
+{
+    return startComponentRecording("esp", options, filename, 0, 0, false);
+}
+
+bool stopEspEventRecording(EventRecordingSummary * optSummary)
+{
+    return queryRecorder().stopRecording(optSummary, false);
+}
 
 int init_main(int argc, const char* argv[])
 {
-    for (unsigned i=0;i<(unsigned)argc;i++) {
-        if (streq(argv[i],"--daemon") || streq(argv[i],"-d")) {
-            if (daemon(1,0) || write_pidfile(argv[++i])) {
-                perror("Failed to daemonize");
-                return EXIT_FAILURE;
-            }
-            break;
-        }
-    }
+    if (!checkCreateDaemon(argc, argv))
+        return EXIT_FAILURE;
+
     InitModuleObjects();
 
     Owned<IProperties> inputs = createProperties(true);
@@ -391,7 +489,7 @@ int init_main(int argc, const char* argv[])
 
     int result = -1;
 
-#ifdef _WIN32 
+#ifdef _WIN32
     if (!interactive)
         ::SetErrorMode(SEM_NOGPFAULTERRORBOX|SEM_FAILCRITICALERRORS);
 #endif
@@ -437,11 +535,14 @@ int init_main(int argc, const char* argv[])
         else
         {
             envpt.setown(createPTreeFromXMLFile(cfgfile, ipt_caseInsensitive));
-            espConfig.setown(loadConfiguration(defaultYaml, argv, "esp", "ESP", nullptr, nullptr));
+
+            // NB: esp has no standard component config in bare-metal, this is loading defaultYaml only
+            espConfig.setown(loadConfiguration(defaultYaml, argv, "esp", "ESP", cfgfile, extractLegacyOptions));
         }
         Owned<IPropertyTree> procpt = NULL;
         if (envpt)
         {
+            workunitGraphCacheEnabled = envpt->getPropBool("expert/@workunitGraphCacheEnabled", workunitGraphCacheEnabled);
             envpt->addProp("@config", cfgfile);
             StringBuffer xpath;
             if (procname==NULL || strcmp(procname, ".")==0)
@@ -459,21 +560,21 @@ int init_main(int argc, const char* argv[])
 
 #ifdef _CONTAINERIZED
         // TBD: Some esp services read daliServers from it's legacy config file
-        procpt->setProp("@daliServers", queryComponentConfig().queryProp("@daliServers"));
+        procpt->setProp("@daliServers", getComponentConfigSP()->queryProp("@daliServers"));
 #endif
 
-        const char* build_ver = BUILD_TAG;
+        const char* build_ver = hpccBuildInfo.buildTag;
         setBuildVersion(build_ver);
-
-        const char* build_level = BUILD_LEVEL;
-        setBuildLevel(build_level);
 
         const char * processName = procpt->queryProp("@name");
         setStatisticsComponentName(SCTesp, processName, true);
 
         openEspLogFile(envpt.get(), procpt.get());
 
-        DBGLOG("Esp starting %s", BUILD_TAG);
+        DBGLOG("Esp starting %s", hpccBuildInfo.buildTag);
+#ifndef _USE_OPENSSL
+        UWARNLOG("OpenSSL not in use. ESP Session ID generation is less secure. To use OpenSSL, build ESP with OpenSSL support.");
+#endif
 
         StringBuffer componentfilesDir;
         if(procpt->hasProp("@componentfilesDir"))
@@ -499,6 +600,16 @@ int init_main(int argc, const char* argv[])
             config.setown(cfg);
             abortHandler.setConfig(cfg);
         }
+
+        if (procpt->getPropBool("expert/@recordEvents", false))
+        {
+            const char * recordEventOptions = procpt->queryProp("expert/@recordEventOptions");
+            const char * optRecordEventFilename = procpt->queryProp("expert/@recordEventFilename");
+            startEspEventRecording(recordEventOptions, optRecordEventFilename);
+        }
+
+        // The configuration for esp is strange - this will not have been performed in the loadConfig
+        protraceInitialize("esp", procpt);
     }
     catch(IException* e)
     {
@@ -527,9 +638,16 @@ int init_main(int argc, const char* argv[])
             abortHandler.setServer(srv);
             setEspContainer(server.get());
 
+            // init before loadAll allows InfoCache threads to use trace flags
+            initializeTraceFlags(config);
+
             config->loadAll();
-            config->bindServer(*server.get(), *server.get()); 
+            config->bindServer(*server.get(), *server.get());
             config->checkESPCache(*server.get());
+
+            initializeMetrics(config);        
+            initializeStoragePlanes(daliClientActive(), true);
+            srv->initializeDataMaskingEngine(configMaskerConfig);
         }
         catch(IException* e)
         {
@@ -547,17 +665,19 @@ int init_main(int argc, const char* argv[])
         writeSentinelFile(sentinelFile);
 
         result = work_main(*config, *server.get());
+
+        (void)stopEspEventRecording(nullptr);
     }
     else
     {
         OERRLOG("!!! Unable to load ESP configuration.");
     }
-    
+
     return result;
 }
 
 //command line arguments:
-// [pre] if "work", special init behavior, but removed before init_main  
+// [pre] if "work", special init behavior, but removed before init_main
 // [1] process name
 // [2] config location - local file name or dali address
 // [3] config location type - "dali" or ""
@@ -565,9 +685,9 @@ int init_main(int argc, const char* argv[])
 int main(int argc, const char* argv[])
 {
     start_init_main(argc, argv, init_main);
+    queryMetricsManager().stopCollecting();
     stopPerformanceMonitor();
     UseSysLogForOperatorMessages(false);
     releaseAtoms();
     return 0;
 }
-

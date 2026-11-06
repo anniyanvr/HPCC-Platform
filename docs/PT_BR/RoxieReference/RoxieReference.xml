@@ -7,7 +7,7 @@
 
     <mediaobject>
       <imageobject>
-        <imagedata fileref="images/redswooshWithLogo3.jpg"/>
+        <imagedata fileref="images/redswooshWithLogo3.jpg" />
       </imageobject>
     </mediaobject>
 
@@ -28,8 +28,8 @@
       <para>LexisNexis e o logotipo Knowledge Burst são marcas comerciais
       registradas da Reed Elsevier Properties Inc., usadas sob licença.</para>
 
-      <para>SSystems<superscript>®</superscript> HPCC Systems® é uma marca
-      registrada da LexisNexis Risk Data Management Inc.</para>
+      <para>HPCC Systems<superscript>®</superscript> é uma marca registrada
+      da LexisNexis Risk Data Management Inc.</para>
 
       <para>Os demais produtos, logotipos e serviços podem ser marcas
       comerciais ou registradas de suas respectivas empresas.</para>
@@ -38,26 +38,26 @@
       fictícios. Qualquer semelhança com pessoas reais, vivas ou mortas, é
       mera coincidência.</para>
 
-      <para/>
+      <para></para>
     </legalnotice>
 
     <xi:include href="common/Version.xml"
                 xpointer="xpointer(//*[@id='FooterInfo'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
 
     <xi:include href="common/Version.xml"
                 xpointer="xpointer(//*[@id='DateVer'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
 
-    <corpname>SSystems<superscript>®</superscript></corpname>
+    <corpname>HPCC Systems<superscript>®</superscript></corpname>
 
     <xi:include href="common/Version.xml"
                 xpointer="xpointer(//*[@id='Copyright'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
 
     <mediaobject role="logo">
       <imageobject>
-        <imagedata fileref="images/LN_Rightjustified.jpg"/>
+        <imagedata fileref="images/LN_Rightjustified.jpg" />
       </imageobject>
     </mediaobject>
   </bookinfo>
@@ -143,7 +143,7 @@
           <para>Fornecimento do acesso a essas consultas para interfaces
           voltadas para clientes através do SOAP ou HTTP.</para>
 
-          <para/>
+          <para></para>
         </listitem>
       </itemizedlist>
 
@@ -250,9 +250,9 @@
       estiver respondendo, as solicitações nesse canal são processadas por
       outros nós agentes pares responsáveis pelo canal.</para>
 
-      <para/>
+      <para></para>
 
-      <para><graphic fileref="images/RM-02.jpg"/></para>
+      <para><graphic fileref="images/RM-02.jpg" /></para>
 
       <para>Esse exemplo mostra um cluster Roxie de 5 nós com cada um
       configurado para ser tanto um <emphasis role="bold">servidor </emphasis>
@@ -292,7 +292,7 @@
 
       <xi:include href="RoxieReference/RoxieRefMods/RoxieCopySettings.xml"
                   xpointer="element(/1)"
-                  xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                  xmlns:xi="http://www.w3.org/2001/XInclude" />
     </sect1>
 
     <sect1 id="Roxie-Data-Backup">
@@ -333,9 +333,9 @@
       procedimentos de backup tradicionais para arquivos de dados
       Roxie.</para>
 
-      <para><graphic fileref="images/RM-03.jpg"/></para>
+      <para><graphic fileref="images/RM-03.jpg" /></para>
 
-      <para/>
+      <para></para>
     </sect1>
 
     <sect1>
@@ -353,11 +353,11 @@
 
       <para><informaltable colsep="1" frame="all" rowsep="1">
           <tgroup cols="3">
-            <colspec colwidth="178.45pt"/>
+            <colspec colwidth="178.45pt" />
 
-            <colspec colwidth="65.60pt"/>
+            <colspec colwidth="65.60pt" />
 
-            <colspec/>
+            <colspec />
 
             <tbody>
               <row>
@@ -431,7 +431,7 @@
         </listitem>
       </orderedlist>
 
-      <para/>
+      <para></para>
 
       <para><emphasis role="bold">Observação</emphasis> : Essas etapas são
       detalhadas no Tutorial de Dados e no Guia do Programador do HPCC
@@ -480,30 +480,112 @@
       <sect2 id="Direct-Socket-Connection-TCP-IP">
         <title>Conexão Direta com Socket (TCP/IP)<?dbfo-need height="3in"?></title>
 
-        <para><graphic fileref="images/RM-04.jpg"/></para>
+        <para><graphic fileref="images/RM-04.jpg" /></para>
 
-        <beginpage/>
+        <beginpage />
       </sect2>
 
       <sect2 id="SOAPCALL_via_ECL">
         <title><emphasis>SOAPCALL via ECL</emphasis></title>
 
-        <para><graphic fileref="images/RM-05.jpg"/></para>
+        <para><graphic fileref="images/RM-05.jpg" /></para>
 
-        <para/>
+        <para></para>
 
-        <para/>
+        <para></para>
       </sect2>
 
       <sect2 id="SOAP-or-HTTP-HTTPS">
         <title>SOAP ou HTTP/HTTPS<?dbfo-need height="6in"?></title>
 
         <para><graphic fileref="images/RM-06.PNG" scale="90"
-        scalefit="1"/></para>
+        scalefit="1" /></para>
 
-        <para/>
+        <para></para>
 
-        <beginpage/>
+        <beginpage />
+      </sect2>
+
+      <sect2>
+        <title>Limites de tempo de queries Roxie</title>
+
+        <para>Há várias maneiras de gerenciar o limite de tempo de uma query
+        (em ordem de precedência):</para>
+
+        <itemizedlist>
+          <listitem>
+            <para>Especifique um valor no atributo <emphasis
+            role="bold">timeLimit</emphasis> na solicitação da query. Por
+            exemplo:</para>
+
+            <para><programlisting>&lt;myQuery timeLimit="2000"&gt;
+  ...
+&lt;/myQuery&gt;</programlisting></para>
+          </listitem>
+
+          <listitem>
+            <para>Especifique um valor no elemento <emphasis
+            role="bold">_timeLimit</emphasis> dentro da solicitação da query.
+            Por exemplo:</para>
+
+            <para><programlisting>&lt;myQuery&gt;
+  &lt;_timeLimit&gt;2000&lt;_timeLimit&gt;
+  ...
+&lt;/myQuery&gt;</programlisting></para>
+          </listitem>
+
+          <listitem>
+            <para>Especifique o valor do atributo <emphasis
+            role="bold">timeLimit</emphasis> na definição do package para a
+            query.</para>
+
+            <para><programlisting>&lt;RoxiePackages&gt;
+   &lt;!-- Begin Queries --&gt;
+     &lt;Package id="MyQuery" timeLimit="2000"&gt;
+     &lt;Base id="thor::MyData_Key"/&gt;
+    &lt;/Package&gt;
+  &lt;!-- End Queries --&gt;
+  ...
+&lt;/RoxiePackages&gt;</programlisting></para>
+          </listitem>
+
+          <listitem>
+            <para>Especifique um valor no código ECL da query usando <emphasis
+            role="bold">#OPTION</emphasis>. Por exemplo,</para>
+
+            <para><programlisting>#OPTION('timeLimit', 2000);
+</programlisting></para>
+          </listitem>
+
+          <listitem>
+            <para>Especifique um valor na linha de comando usando <emphasis
+            role="bold">eclcc </emphasis>por meio do argumento <emphasis
+            role="bold">-f</emphasis>. Por exemplo,</para>
+
+            <para><programlisting>eclcc MyQuery.ecl -ftimeLimit="2000" 
+</programlisting></para>
+          </listitem>
+
+          <listitem>
+            <para>Especifique um valor usando a interface de linha de comando
+            <emphasis role="bold">ecl </emphasis>por meio do argumento
+            <emphasis role="bold">--timeLimit=&lt;sec&gt;</emphasis>. Por
+            exemplo,</para>
+
+            <para><programlisting>ecl publish roxie MyQuery.ecl --name=MyQuery --timeLimit=2000 -A 
+ecl queries config roxie MyQuery --timeLimit=2000
+ecl queries recreate roxie MyQuery --timeLimit=2000
+</programlisting></para>
+          </listitem>
+
+          <listitem>
+            <para>Use a configuração padrão na configuração do seu cluster
+            Roxie. Há valores padrão separados para níveis de prioridade:
+            <emphasis role="bold">defaultLowPriorityTimeLimit</emphasis>,
+            <emphasis role="bold">defaultHighPriorityTimeLimit</emphasis> e
+            <emphasis role="bold">defaultSLAPriorityTimeLimit</emphasis>.</para>
+          </listitem>
+        </itemizedlist>
       </sect2>
     </sect1>
   </chapter>
@@ -612,11 +694,11 @@
 
   <xi:include href="RoxieReference/RoxieRefMods/Packages.xml"
               xpointer="element(/1)"
-              xmlns:xi="http://www.w3.org/2001/XInclude"/>
+              xmlns:xi="http://www.w3.org/2001/XInclude" />
 
   <xi:include href="RoxieReference/RoxieRefMods/directAccessToRoxie.xml"
               xpointer="element(/1)"
-              xmlns:xi="http://www.w3.org/2001/XInclude"/>
+              xmlns:xi="http://www.w3.org/2001/XInclude" />
 
   <chapter id="Deploying-Data-to-a-Cluster-using-DFU">
     <title>Disponibilizando Dados para um Cluster Roxie utilizando DFU</title>
@@ -655,7 +737,7 @@
             a caixa de seleção à esquerda.</para>
 
             <para><graphic fileref="images/RDDE_DFUcopy.jpg"
-            vendor="eclwatchSS"/></para>
+            vendor="eclwatchSS" /></para>
           </listitem>
 
           <listitem>
@@ -663,13 +745,13 @@
             role="bold">informações </emphasis> Group, Target Name <emphasis
             role="bold"> e </emphasis> Options.</para>
 
-            <para/>
+            <para></para>
 
             <para><informaltable colsep="0" frame="none" rowsep="0">
                 <tgroup cols="2">
-                  <colspec colwidth="122.40pt"/>
+                  <colspec colwidth="122.40pt" />
 
-                  <colspec colwidth="333.00pt"/>
+                  <colspec colwidth="333.00pt" />
 
                   <tbody>
                     <row>
@@ -779,13 +861,13 @@
             informações.</para>
 
             <para><graphic fileref="images/RDDE_DFUremotecopy.jpg"
-            vendor="eclwatchSS"/></para>
+            vendor="eclwatchSS" /></para>
 
             <para><informaltable colsep="0" frame="none" rowsep="0">
                 <tgroup cols="2">
-                  <colspec colwidth="122.40pt"/>
+                  <colspec colwidth="122.40pt" />
 
-                  <colspec colwidth="333.00pt"/>
+                  <colspec colwidth="333.00pt" />
 
                   <tbody>
                     <row>
@@ -900,7 +982,7 @@
           </listitem>
         </orderedlist></para>
 
-      <para/>
+      <para></para>
     </sect1>
   </chapter>
 
@@ -909,7 +991,7 @@
 
     <xi:include href="RoxieReference/RoxieRefMods/RoxieCapacityPlanning.xml"
                 xpointer="xpointer(//*[@id='Capacity_Planning'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
   </chapter>
 
   <chapter id="PreFlight_and_Roxie_Metrics">
@@ -929,10 +1011,10 @@
 
     <xi:include href="HPCCCertify/Cert-Mods/CertPreflight.xml"
                 xpointer="xpointer(//*[@id='Preflight_Roxie'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
 
     <xi:include href="ECLWatch/ECLWa_mods/ECLWatchQueries.xml"
                 xpointer="xpointer(//*[@id='Queries_Page'])"
-                xmlns:xi="http://www.w3.org/2001/XInclude"/>
+                xmlns:xi="http://www.w3.org/2001/XInclude" />
   </chapter>
 </book>

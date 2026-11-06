@@ -1,15 +1,16 @@
-import * as declare from "dojo/_base/declare";
-import * as Observable from "dojo/store/Observable";
-import * as topic from "dojo/topic";
+import { Observable, topic } from "src-dojo/index";
 
 import * as ESPRequest from "./ESPRequest";
 
-const NagiosStore = declare([ESPRequest.Store], {
-    service: "ws_machine",
-    action: "GetComponentStatus",
-    responseQualifier: "GetComponentStatusResponse.ComponentStatusList.ComponentStatus",
-    idProperty: "__hpcc_id"
-});
+class NagiosStore extends ESPRequest.Store {
+
+    service = "ws_machine";
+    action = "GetComponentStatus";
+    responseQualifier = "GetComponentStatusResponse.ComponentStatusList.ComponentStatus";
+    responseTotalQualifier = undefined;
+    idProperty = "__hpcc_id";
+
+}
 
 let monitorHandle;
 export function GetComponentStatus(params) {
@@ -45,7 +46,7 @@ export function MonitorComponentStatus(params) {
     return prevResponse;
 }
 
-export function CreateNagiosStore(options) {
-    const store = new NagiosStore(options);
-    return Observable(store);
+export function CreateNagiosStore() {
+    const store = new NagiosStore();
+    return new Observable(store);
 }

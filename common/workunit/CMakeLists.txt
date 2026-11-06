@@ -28,18 +28,13 @@ set (    SRCS
          workunit.cpp
          wuattr.cpp
          wujobq.cpp
-         package.cpp
          workflow.cpp
-         referencedfilelist.cpp
-                 
+
          workunit.hpp
          wuattr.hpp
          wuerror.hpp
          wujobq.hpp
-         package.h
          workflow.hpp
-         pkgimpl.hpp
-         referencedfilelist.hpp
     )
 
 include_directories ( 
@@ -55,6 +50,7 @@ include_directories (
          ./../../system/jlib
          ./../../system/security/shared 
          ./../../system/security/cryptohelper
+         ./../../system/security/securesocket
          ./../../common/thorhelper 
          ./../../rtl/eclrtl 
          ./../../rtl/nbcd
@@ -74,15 +70,19 @@ if(NOT PLUGIN)
         RUNTIME DESTINATION ${EXEC_DIR}
         LIBRARY DESTINATION ${LIB_DIR})
     target_link_libraries(
-        workunit 
+        workunit PRIVATE
         jlib 
+        mp
         dalibase 
         dllserver 
         nbcd 
         eclrtl 
         deftype
         )
+    if (USE_OPENSSL)
+        target_link_libraries(workunit PRIVATE securesocket)
+    endif()
     if (NOT CONTAINERIZED)
-        target_link_libraries(workunit environment)
+        target_link_libraries(workunit PRIVATE environment)
     endif()
 endif()

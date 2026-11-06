@@ -1,0 +1,89 @@
+/*##############################################################################
+
+    HPCC SYSTEMS software Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#ifndef __THORWRITE_HPP_
+#define __THORWRITE_HPP_
+
+#ifdef THORHELPER_EXPORTS
+  #define THORHELPER_API DECL_EXPORT
+#else
+  #define THORHELPER_API DECL_IMPORT
+#endif
+
+#include "jrowstream.hpp"
+#include "rtlkey.hpp"
+#include "thorread.hpp"
+
+interface IRowInterfaces;
+
+//--------------------------------------------------------------------------------------------------------------------
+
+// IWriteFormatMapping interface represents the mapping when outputting a stream to a destination.
+//
+//  @expectedMeta - the format that rows have in memory (rename?)
+//  @projectedMeta - the format that should be written to disk.
+//  @formatOptions - which options are applied to the format
+//
+// if expectedMeta->querySerializedMeta() != projectedMeta then the transformation will lose
+// fields from the dataset as it is written.  Reordering may be supported later, but fields
+// will never be added.
+interface IRowWriteFormatMapping : public IInterface
+{
+public:
+    virtual const char * queryFormat() const = 0;
+    virtual unsigned getExpectedCrc() const = 0;
+    virtual unsigned getProjectedCrc() const = 0;
+    virtual IOutputMetaData * queryExpectedMeta() const = 0;
+    virtual IOutputMetaData * queryProjectedMeta() const = 0;
+    virtual const IPropertyTree * queryFormatOptions() const = 0;
+    virtual RecordTranslationMode queryTranslationMode() const = 0;
+    virtual bool matches(const IRowWriteFormatMapping * other) const = 0;
+};
+THORHELPER_API IRowWriteFormatMapping * createRowWriteFormatMapping(RecordTranslationMode mode, const char * format, IOutputMetaData & projected, unsigned expectedCrc, IOutputMetaData & expected, unsigned projectedCrc, const IPropertyTree * formatOptions);
+
+THORHELPER_API void getDefaultWritePlane(StringBuffer & plane, unsigned helperFlags);
+
+//MORE: These should probably move into jlib
+THORHELPER_API IBufferedSerialOutputStream * createBufferedOutputStream(IFileIO * io, const IPropertyTree * providerOptions);
+THORHELPER_API bool createBufferedOutputStream(Shared<IBufferedSerialOutputStream> & outputStream, Shared<IFileIO> & outputfileio, IFile * outputFile, const IPropertyTree * providerOptions);
+
+//--------------------------------------------------------------------------------------------------------------------
+
+// IDiskRowWriter is the write-side counterpart to IDiskRowReader.
+// An implementation owns its file handle; HThor provides an IFile* via setOutputFile().
+//
+// Lifecycle: construct -> setOutputFile -> putRow (repeatedly) -> flush -> close
+// Group boundary: putRow(nullptr) marks a group separator (formats that do not support grouping must throw).
+// A non-null putRow() transfers ownership to the writer, including when serialization throws.
+//
+interface IDiskRowWriter : extends IInterface
+{
+    virtual bool matches(const IRowWriteFormatMapping * mapping, const IPropertyTree * providerOptions) const = 0;
+    virtual void setOutputFile(IFile * outputFile) = 0;
+    virtual void putRow(const void * row) = 0;
+    virtual void flush() = 0;
+    virtual offset_t getPosition() = 0;
+    virtual void close() = 0;
+    virtual stat_type getStatistic(StatisticKind kind) = 0;
+};
+
+// Create a generic disk writer for the given format.  rowIf is required so the writer can construct its serializer.
+// Unknown or disabled formats throw rather than returning nullptr.
+// The caller owns the returned writer. The writer retains references to mapping, providerOptions and rowIf.
+THORHELPER_API IDiskRowWriter * createDiskWriter(const char * format, IRowWriteFormatMapping * mapping, const IPropertyTree * providerOptions, IRowInterfaces * rowIf);
+
+#endif // __THORWRITE_HPP_

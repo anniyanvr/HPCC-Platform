@@ -18,8 +18,8 @@
 #include "platform.h"
 
 #include "jio.hpp"
-#include "jio.hpp"
 #include "jlzw.hpp"
+#include "jstream.hpp"
 #include "jtime.hpp"
 #include "jsort.hpp"
 
@@ -32,6 +32,7 @@
 #include "thactivityutil.ipp"
 #include "csvsplitter.hpp"
 #include "thdiskbaseslave.ipp"
+#include "thorcommon.hpp"
 
 class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
 {
@@ -39,7 +40,7 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
 
     IHThorCsvReadArg *helper;
     StringAttr csvQuote, csvSeparate, csvTerminate, csvEscape;
-    Owned<IRowStream> out;
+    Owned<CSeqPartHandler> out;
     rowcount_t limit;
     rowcount_t stopAfter;
     unsigned headerLines;
@@ -47,21 +48,29 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
     Owned<IBitSet> gotHeaderLines, sentHeaderLines;
     ISuperFileDescriptor *superFDesc;
     unsigned subFiles;
+    /* Per subfile (index 0 if not a superfile): the local part index that owns the header.
+     * Determined once by the master (which has full visibility of all part sizes) and conveyed
+     * here, since a worker only ever sees the parts assigned to it and cannot reliably determine
+     * this itself - different parts of the same subfile can be processed by different workers,
+     * in any order.
+     */
+    OwnedMalloc<unsigned> headerOwnerPart;
 
     class CCsvPartHandler : public CDiskPartHandlerBase
     {
         Linked<IEngineRowAllocator> allocator;
         CCsvReadSlaveActivity &activity;
-        Owned<ISerialStream> inputStream;
+        Owned<IBufferedSerialInputStream> inputStream;
         OwnedIFileIO iFileIO;
         CSVSplitter csvSplitter;
         CRC32 inputCRC;
-        bool readFinished;
         offset_t localOffset;
+        unsigned __int64 progress = 0;
         size32_t maxRowSize;
+        bool readFinished;
         bool processHeaderLines = false;
 
-        unsigned splitLine(ISerialStream *inputStream, size32_t maxRowSize)
+        unsigned splitLine(IBufferedSerialInputStream *inputStream, size32_t maxRowSize)
         {
             if (processHeaderLines)
             {
@@ -76,7 +85,9 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
                     pnum = lnum;
                 }
                 unsigned &headerLinesRemaining = activity.getHeaderLines(subFile);
-                if (headerLinesRemaining)
+                // The master determined which local part owns the header (see CCsvReadActivityMaster::calcFirstNonEmptyPart).
+                bool partOwnsHeader = (pnum == activity.headerOwnerPart[subFile]);
+                if (headerLinesRemaining && partOwnsHeader)
                 {
                     do
                     {
@@ -114,12 +125,13 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
             readFinished = false;
 
             OwnedIFileIO partFileIO;
+            ICompressedFileIO *compressedIO = nullptr;
             if (compressed)
             {
-                partFileIO.setown(createCompressedFileReader(iFile, activity.eexp));
+                compressedIO = createCompressedFileReader(iFile, activity.eexp, useDefaultIoBufferSize, false, IFEnone);
+                partFileIO.setown(compressedIO);
                 if (!partFileIO)
                     throw MakeActivityException(&activity, 0, "Failed to open block compressed file '%s'", filename.get());
-                checkFileCrc = false;
             }
             else
                 partFileIO.setown(iFile->open(IFOread));
@@ -129,9 +141,27 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
                 iFileIO.setown(partFileIO.getClear());
             }
 
-            inputStream.setown(createFileSerialStream(iFileIO));
+            unsigned numThreads;
+            size32_t chunkSize;
+            getPlaneReadAheadSizing(activity, iFile->queryFilename(), numThreads, chunkSize);
+            Owned<IBufferedSerialInputStream> csvStream;
+            if (compressedIO && numThreads>1)
+                csvStream.setown(compressedIO->createParallelReadStream(numThreads, chunkSize));
+            if (!csvStream)
+            {
+                if (compressed)
+                    csvStream.setown(createFileSerialStream(iFileIO));  // row-diff compressed: sequential decompression
+                else
+                {
+                    // NB: createParallelRowInputStream falls back to createBufferedInputStream if numThreads is 1
+                    // CSV rows can exceed one read-ahead chunk, so CSVSplitter needs arbitrary-size contiguous peeks.
+                    csvStream.setown(createParallelRowInputStream(iFileIO, numThreads, chunkSize, ParallelReadAheadArbitraryPeek));
+                }
+            }
+            inputStream.setown(csvStream.getClear());
             if (activity.headerLines)
                 processHeaderLines = true;
+            progress = 0;
         }
         virtual void close(CRC32 &fileCRC)
         {
@@ -140,9 +170,14 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
                 CriticalBlock block(inputCs);
                 partFileIO.setown(iFileIO.getClear());
             }
-            mergeStats(fileStats, partFileIO);
-            partFileIO.clear();
-            inputStream.clear();
+            if (partFileIO)
+            {
+                mergeStats(closedPartFileStats, partFileIO);
+                closedPartFileStats.mergeStatistic(StNumDiskRowsRead, progress);
+                progress = 0;
+                partFileIO.clear();
+                inputStream.clear();
+            }
             fileCRC = inputCRC;
         }
         const void *nextRow()
@@ -160,7 +195,7 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
                 if (res != 0)
                 {
                     localOffset += lineLength;
-                    ++activity.diskProgress;
+                    ++progress;
                     return row.finalizeRowClear(res);
                 }
             }
@@ -171,6 +206,7 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
             CriticalBlock block(inputCs); // Ensure iFileIO remains valid for the duration of mergeStats()
             CDiskPartHandlerBase::gatherStats(merged);
             mergeStats(merged, iFileIO);
+            merged.mergeStatistic(StNumDiskRowsRead, progress);
         }
     };
 
@@ -202,7 +238,7 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
                         for (;;)
                         {
                             msgMb.read(which);
-                            assertex(!gotHeaderLines->testSet(which));
+                            verifyex(!gotHeaderLines->testSet(which));
                             msgMb.read(headerLinesRemaining[which]);
                             if (subFile == which)
                             {
@@ -240,24 +276,42 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
         {
             if (sentHeaderLines->testSet(subFile))
                 return;
-            unsigned which = gotHeaderLines->scan(0, false);
-            if (which == subFiles) // all received
+
+            /* NB: we are here because this worker has consumed all remaining header lines for this subfile.
+             * It must now inform the next worker so it can make progress on this subfile asap.
+             *
+             * The other subfile header line info. will be communicated as this worker makes progress
+             * through the subfiles, or when it stops (see sendRemainingHeaderLines()).
+             */
+
+            // JCSMORE: only left in for testing, should be removed (see HPCC-31160)
+            if (getOptBool("csvWaitAllSubs"))
             {
-                bool someLeft=false;
-                unsigned hL=0;
-                for (; hL<subFiles; hL++)
+                // This causes this worker to block until the previous worker has processed the headerlines for all subfiles.
+                // In effect, causing workers to process the csv read sequentially, massively slowing down throughput.
+                while (true)
                 {
-                    if (headerLinesRemaining[hL])
-                    {
-                        someLeft = true;
+                    unsigned which = gotHeaderLines->scan(0, false);
+                    if (which >= subFiles) // all received
                         break;
-                    }
+                    getHeaderLines(which);
                 }
-                if (!someLeft)
+            }
+
+            bool someLeft=false;
+            unsigned hL=0;
+            for (; hL<subFiles; hL++)
+            {
+                if (headerLinesRemaining[hL])
                 {
-                    sendAllDone();
-                    return;
+                    someLeft = true;
+                    break;
                 }
+            }
+            if (!someLeft)
+            {
+                sendAllDone();
+                return;
             }
         }
         else
@@ -275,9 +329,11 @@ class CCsvReadSlaveActivity : public CDiskReadSlaveActivityBase
         {
             if (NotFound == localLastPart[s])
             {
-                sentHeaderLines->testSet(s);
-                msgMb.append(s);
-                msgMb.append(headerLinesRemaining[s]);
+                if (!sentHeaderLines->testSet(s)) // may have already sent on previous sendHeaderLines() call
+                {
+                    msgMb.append(s);
+                    msgMb.append(headerLinesRemaining[s]);
+                }
             }
         }
         queryJobChannel().queryJobComm().send(msgMb, queryJobChannel().queryMyRank()+1, mpTag);
@@ -342,6 +398,9 @@ public:
         {
             mpTag = container.queryJobChannel().deserializeMPTag(data);
             data.read(subFiles);
+            headerOwnerPart.allocateN(subFiles);
+            for (unsigned s=0; s<subFiles; s++)
+                data.read(headerOwnerPart[s]);
             superFDesc = partDescs.ordinality() ? partDescs.item(0).queryOwner().querySuperFileDescriptor() : NULL;
             localLastPart.allocateN(subFiles);
             for (unsigned llp=0; llp<subFiles; llp++)

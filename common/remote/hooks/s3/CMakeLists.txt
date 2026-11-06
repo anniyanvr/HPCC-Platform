@@ -23,7 +23,10 @@
 #####################################################
 
 project( s3file )
-set(AWS_SDK_CPP_SOURCE_DIR ${HPCC_SOURCE_DIR}/system/aws/aws-sdk-cpp)
+
+set(CRT_BUILD_SHARED_LIBS ON)
+find_package(aws-cpp-sdk-core REQUIRED)
+find_package(aws-cpp-sdk-s3 REQUIRED)
 
 set (    SRCS
          s3file.cpp
@@ -33,17 +36,40 @@ set (    SRCS
 include_directories (
          ${HPCC_SOURCE_DIR}/system/include
          ${HPCC_SOURCE_DIR}/system/jlib
-         ${AWS_SDK_CPP_SOURCE_DIR}/aws-cpp-sdk-core/include
-         ${AWS_SDK_CPP_SOURCE_DIR}/aws-cpp-sdk-s3/include
     )
 
 ADD_DEFINITIONS( -D_USRDLL -DS3FILE_EXPORTS )
 
 HPCC_ADD_LIBRARY( s3file SHARED ${SRCS}  )
-install ( TARGETS s3file DESTINATION filehooks )
+install ( TARGETS s3file DESTINATION filehooks CALC_DEPS)
 
 target_link_libraries ( s3file
     jlib
     aws-cpp-sdk-core
     aws-cpp-sdk-s3
 )
+
+# Export unit tests as shared library for automatic pickup by unittests
+if (USE_CPPUNIT)
+    set ( TEST_SRCS
+        s3fileTests.cpp
+    )
+
+    HPCC_ADD_LIBRARY( s3FileTests SHARED ${TEST_SRCS} )
+
+    target_link_libraries ( s3FileTests
+        jlib
+        s3file
+        ${CppUnit_LIBRARIES}
+    )
+
+    include_directories( ${HPCC_SOURCE_DIR}/testing/unittests )
+
+    # Set runtime path to find s3file library in filehooks directory
+    set_target_properties(s3FileTests PROPERTIES
+        INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/filehooks"
+    )
+
+    install ( TARGETS s3FileTests LIBRARY DESTINATION ${LIB_DIR} )
+
+endif()

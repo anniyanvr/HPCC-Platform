@@ -14,8 +14,9 @@
 #    limitations under the License.
 ################################################################################
 
-cmake_minimum_required(VERSION 2.8)
-PROJECT(lib2)
+PROJECT(lib2
+  VERSION ${HPCC_MAJOR}.${HPCC_MINOR}.${HPCC_POINT}.${HPCC_SEQUENCE}
+)
 
 if (APPLE)
     if ("${BOOST_REGEX_LIBRARIES}" STREQUAL "Boost::regex")
@@ -54,9 +55,9 @@ elseif (WIN32)
       list(APPEND DYLIBS ${CBLAS_DEPS_LIBS})
     else ()
       if (${ARCH64BIT} EQUAL 1)
-        find_file (ICU_DT_BIN "icudt57.dll" "${EXTERNALS_DIRECTORY}/icu/bin64" NO_DEFAULT_PATH)
-        find_file (ICU_IN_BIN "icuin57.dll" "${EXTERNALS_DIRECTORY}/icu/bin64" NO_DEFAULT_PATH)
-        find_file (ICU_UC_BIN "icuuc57.dll" "${EXTERNALS_DIRECTORY}/icu/bin64" NO_DEFAULT_PATH)
+        find_file (ICU_DT_BIN NAMES "icudt57.dll" "icudt67.dll" PATHS "${EXTERNALS_DIRECTORY}/icu/bin64" NO_DEFAULT_PATH)
+        find_file (ICU_IN_BIN NAMES "icuin57.dll" "icuin67.dll" PATHS "${EXTERNALS_DIRECTORY}/icu/bin64" NO_DEFAULT_PATH)
+        find_file (ICU_UC_BIN NAMES "icuuc57.dll" "icuuc67.dll" PATHS "${EXTERNALS_DIRECTORY}/icu/bin64" NO_DEFAULT_PATH)
         set (LIB_CRYPTO_DLL "libcrypto-1_1-x64.dll")
         find_file (OPENSSL_LIB_BIN "${LIB_CRYPTO_DLL}" "${EXTERNALS_DIRECTORY}/openssl/1.1/win64/lib" NO_DEFAULT_PATH)
         set (LIB_SSL_DLL "libssl-1_1-x64.dll")
@@ -66,9 +67,9 @@ elseif (WIN32)
         find_file (XERCES_C_BIN "xerces-c_3_1.dll" "${EXTERNALS_DIRECTORY}/xalan/xerces-c/win64/bin" NO_DEFAULT_PATH)
         find_file (ZLIB_BIN "zlib.dll" "${EXTERNALS_DIRECTORY}/zlib/1.2.8/lib/Win64" NO_DEFAULT_PATH)
       else()
-        find_file (ICU_DT_BIN "icudt57.dll" "${EXTERNALS_DIRECTORY}/icu/bin" NO_DEFAULT_PATH)
-        find_file (ICU_IN_BIN "icuin57.dll" "${EXTERNALS_DIRECTORY}/icu/bin" NO_DEFAULT_PATH)
-        find_file (ICU_UC_BIN "icuuc57.dll" "${EXTERNALS_DIRECTORY}/icu/bin" NO_DEFAULT_PATH)
+        find_file (ICU_DT_BIN NAMES "icudt57.dll" "icudt67.dll" PATHS "${EXTERNALS_DIRECTORY}/icu/bin" NO_DEFAULT_PATH)
+        find_file (ICU_IN_BIN NAMES "icuin57.dll" "icuin67.dll" PATHS "${EXTERNALS_DIRECTORY}/icu/bin" NO_DEFAULT_PATH)
+        find_file (ICU_UC_BIN NAMES "icuuc57.dll" "icuuc67.dll" PATHS "${EXTERNALS_DIRECTORY}/icu/bin" NO_DEFAULT_PATH)
         set (LIB_CRYPTO_DLL "libcrypto-1_1.dll")
         find_file (OPENSSL_LIB_BIN "${LIB_CRYPTO_DLL}" "${EXTERNALS_DIRECTORY}/openssl/1.1/win32/lib" NO_DEFAULT_PATH)
         set (LIB_SSL_DLL "libssl-1_1.dll")
@@ -79,9 +80,9 @@ elseif (WIN32)
         find_file (ZLIB_BIN "zlib.dll" "${EXTERNALS_DIRECTORY}/zlib/1.2.8/lib/Win32" NO_DEFAULT_PATH)
       endif()
     set(DYLIBS "")
-    if (NOT USE_NATIVE_LIBRARIES AND USE_BOOST_REGEX)
+    if (NOT USE_NATIVE_LIBRARIES)
         list(APPEND DYLIBS ${BOOST_REGEX_BIN})
-    endif (NOT USE_NATIVE_LIBRARIES AND USE_BOOST_REGEX)
+    endif (NOT USE_NATIVE_LIBRARIES)
     list(APPEND DYLIBS ${ICU_DT_BIN} ${ICU_IN_BIN} ${ICU_UC_BIN})
     list(APPEND DYLIBS ${OPENSSL_LIB_BIN} ${OPENSSL_SSL_BIN})
     list(APPEND DYLIBS ${XALAN_C_BIN} ${XALAN_MESSAGES_BIN})
@@ -106,6 +107,38 @@ if (WIN32)
   endif()
 endif ()
 
+if (APPLE)
+  set (update_dynamic_shared_lib_path  "execute_process (COMMAND bash \"-c\"  \"otool -L \\\"\${file}\\\" | egrep \\\"(\\\\s|/)\${dylib_name_only}(.[0-9]{1,})*.dylib\\\" | sed \\\"s/^[[:space:]]//g\\\" | cut -d' ' -f1\"
+                   OUTPUT_VARIABLE otoolOut
+                   ERROR_VARIABLE  otoolErr
+                   OUTPUT_STRIP_TRAILING_WHITESPACE
+                   )
+                   if (\"\${otoolOut}\" STREQUAL \"\")
+                       continue()
+                   endif()
+                   if (NOT \"\${otoolErr}\" STREQUAL \"\")
+                       message(FATAL_ERROR \"Failed to check dependent lib  \${dylib_name_only} for \${file}\")
+                   endif()
+
+                   set(original_dylib_path \${otoolOut})
+
+                   file(GLOB lib2_dylib \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/lib2/\${dylib_name_only}*.dylib\")
+                   if (\"\${lib2_dylib}\" STREQUAL \"\")
+                       message(FATAL_ERROR \"Cannot find \${dylib_name_only}*.dylib under \$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/lib2\")
+                   endif()
+
+                   get_filename_component(dylib_name_ext \"\${lib2_dylib}\" NAME)
+
+                   execute_process(
+                       COMMAND install_name_tool -change \"\${original_dylib_path}\" \"@loader_path/../lib2/\${dylib_name_ext}\" \"\${file}\"
+                       OUTPUT_VARIABLE out
+                       ERROR_VARIABLE  err
+                   )
+   ")
+
+endif()
+
+
 foreach(dylib ${DYLIBS})
     get_filename_component(dylib_path ${dylib} REALPATH)
     if (WIN32)
@@ -114,37 +147,33 @@ foreach(dylib ${DYLIBS})
         install(PROGRAMS "${dylib_path}" DESTINATION lib2)
         get_filename_component(dylib_name_ext ${dylib_path} NAME)
         get_filename_component(dylib_name_only ${dylib_name_ext} NAME_WE)
-
         install(CODE "
-           file(GLOB files \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${EXEC_DIR}/*\" \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${LIB_DIR}/*.dylib\" \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/plugins/*.dylib\" \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/lib2/*.dylib\")
+           set(dylib_name_only \"${dylib_name_only}\")
+           file(GLOB files \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${EXEC_DIR}/*\" \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${LIB_DIR}/*.dylib\" \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/plugins/*.dylib\")
            foreach(file \${files})
-               execute_process(COMMAND bash \"-c\"  \"otool -L \\\"\${file}\\\" | egrep \\\"(\\\\s|/)${dylib_name_only}(.[0-9]{1,})*.dylib\\\" | sed \\\"s/^[[:space:]]//g\\\" | cut -d' ' -f1\"
-                  OUTPUT_VARIABLE otoolOut
-                  ERROR_VARIABLE  otoolErr
-                  OUTPUT_STRIP_TRAILING_WHITESPACE
-               )
-               if (\"\${otoolOut}\" STREQUAL \"\")
-                  continue()
-               endif()
-               if (NOT \"\${otoolErr}\" STREQUAL \"\")
-                   message(FATAL_ERROR \"Failed to check dependent lib  ${dylib_name_only} for \${file}\")
-               endif()
-
-                  set(original_dylib_path \${otoolOut})
-
-                  file(GLOB lib2_dylib \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/lib2/${dylib_name_only}*.dylib\")
-                  if (\"\${otoolOut}\" STREQUAL \"\")
-                      message(FATAL_ERROR \"Cannot find ${dylib_name_only}*.dylib under lib2\")
-                  endif()
-                  get_filename_component(dylib_name_ext \"\${lib2_dylib}\" NAME)
-
-                  execute_process(
-                      COMMAND install_name_tool -change \"\${original_dylib_path}\" \"@loader_path/../lib2/\${dylib_name_ext}\" \"\${file}\"
-                      OUTPUT_VARIABLE out
-                     ERROR_VARIABLE  err
-                  )
-               endif()
+               ${update_dynamic_shared_lib_path}
            endforeach ()
         ")
    endif()
 endforeach(dylib)
+
+# Update dynamic shared library path for libraries under lib2/
+if (APPLE)
+  foreach(dylib ${DYLIBS})
+    get_filename_component(dylib_path ${dylib} REALPATH)
+    get_filename_component(dylib_name_ext ${dylib_path} NAME)
+    get_filename_component(dylib_name_only ${dylib_name_ext} NAME_WE)
+    install(CODE "
+      set(dylib_name_only \"${dylib_name_only}\")
+      file(GLOB files \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/lib2/*.dylib\")
+      foreach(file \${files})
+        get_filename_component(file_name_ext \${file} NAME)
+        get_filename_component(file_name_only \${file_name_ext} NAME_WE)
+        if (\"\${file_name_only}\" STREQUAL \"\${dylib_name_only}\" )
+          continue()
+        endif()
+        ${update_dynamic_shared_lib_path}
+      endforeach ()
+    ")
+  endforeach(dylib)
+endif()

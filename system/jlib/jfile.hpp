@@ -20,11 +20,17 @@
 #ifndef JFILE_HPP
 #define JFILE_HPP
 
+#if defined (__linux__)
+#include <sys/inotify.h>
+#endif
+
 #include "jiface.hpp"
 #include "jio.hpp"
 #include "jtime.hpp"
 #include "jsocket.hpp"
 #include "jstatcodes.h"
+#include "jstream.hpp"
+#include "jlib.hpp"
 
 interface IFile;
 interface IFileIO;
@@ -35,17 +41,19 @@ interface IMemoryMappedFile;
 
 class MemoryBuffer;
 class Semaphore;
+struct FileSystemProperties;
 
 enum IFOmode { IFOcreate, IFOread, IFOwrite, IFOreadwrite, IFOcreaterw };    // modes for open
 enum IFSHmode { IFSHnone, IFSHread=0x8, IFSHfull=0x10};   // sharing modes
 enum IFSmode { IFScurrent = FILE_CURRENT, IFSend = FILE_END, IFSbegin = FILE_BEGIN };    // seek mode
 enum CFPmode { CFPcontinue, CFPcancel, CFPstop };    // modes for ICopyFileProgress::onProgress return
-enum IFEflags { IFEnone=0x0, IFEnocache=0x1, IFEcache=0x2 };    // mask
-constexpr offset_t unknownFileSize = -1;
+enum IFEflags { IFEnone=0x0, IFEnocache=0x1, IFEcache=0x2, IFEsync=0x4, IFEsyncAtClose=0x8 }; // mask
+
+static constexpr offset_t unknownFileSize = (offset_t)-1;
 
 class CDateTime;
 
-interface IDirectoryIterator : extends IIteratorOf<IFile> 
+interface IDirectoryIterator : extends IIteratorOf<IFile>
 {
     virtual StringBuffer &getName(StringBuffer &buf)=0;
     virtual bool isDir()=0;
@@ -76,7 +84,7 @@ interface IDirectoryDifferenceIterator : extends IDirectoryIterator
 
 interface ICopyFileProgress
 {
-    virtual CFPmode onProgress(offset_t sizeDone, offset_t totalSize) = 0; 
+    virtual CFPmode onProgress(offset_t sizeDone, offset_t totalSize) = 0;
 };
 
 class RemoteFilename;
@@ -120,12 +128,14 @@ interface IFile :extends IInterface
     virtual bool getInfo(bool &isdir,offset_t &size,CDateTime &modtime) = 0; // return false if doesn't exist
                                                                             // size is undefined if directory
     virtual void copySection(const RemoteFilename &dest, offset_t toOfs=(offset_t)-1, offset_t fromOfs=0, offset_t size=(offset_t)-1, ICopyFileProgress *progress=NULL, CFflags copyFlags=CFnone) = 0;
-    // if toOfs is (offset_t)-1 then copies entire file 
+    // if toOfs is (offset_t)-1 then copies entire file
 
     virtual void copyTo(IFile *dest, size32_t buffersize=DEFAULT_COPY_BLKSIZE, ICopyFileProgress *progress=NULL, bool usetmp=false, CFflags copyFlags=CFnone)=0;
 
     virtual IMemoryMappedFile *openMemoryMapped(offset_t ofs=0, memsize_t len=(memsize_t)-1, bool write=false)=0;
 };
+
+extern jlib_decl void setRenameRetries(unsigned renameRetries, bool manualRenameChk);
 
 struct CDirectoryEntry: public CInterface
 { // for cloning IDirectoryIterator iterator
@@ -148,9 +158,9 @@ public:
 typedef enum { SD_nosort, SD_byname, SD_bynameNC, SD_bydate, SD_bysize }  SortDirectoryMode;
 
 
-extern jlib_decl unsigned sortDirectory( 
+extern jlib_decl unsigned sortDirectory(
                         CIArrayOf<CDirectoryEntry> &sortedfiles, // returns sorted directory
-                        IDirectoryIterator &iter, 
+                        IDirectoryIterator &iter,
                         SortDirectoryMode mode,
                         bool rev=false,                             // reverse sort
                         bool includedirs=false
@@ -170,13 +180,14 @@ interface IFileIO : public IInterface
     virtual size32_t read(offset_t pos, size32_t len, void * data) = 0;
     virtual offset_t size() = 0;
     virtual size32_t write(offset_t pos, size32_t len, const void * data) = 0;
-    virtual offset_t appendFile(IFile *file,offset_t pos=0,offset_t len=(offset_t)-1) =0;
     virtual void setSize(offset_t size) = 0;
     virtual void flush() = 0;
     virtual void close() = 0;       // no other access is allowed after this call
     virtual unsigned __int64 getStatistic(StatisticKind kind) = 0;
+    virtual IFile * queryFile() const = 0;
 };
 
+jlib_decl offset_t appendFile(IFileIO * target, IFile *file,offset_t pos=0,offset_t len=(offset_t)-1);
 interface IFileIOCache : extends IInterface
 {
     virtual IFileIO *addFile( RemoteFilename &filename, IFOmode mode ) = 0;
@@ -190,7 +201,7 @@ interface IMemoryMappedFile: extends IInterface
     virtual offset_t fileSize()=0;          // size of total file
     virtual int compareWithin(const void *p)=0;   // return 0 if pointer within mapped section -1 if lt +1 if gt
     virtual bool writeAccess()=0;           // true if write enabled map
-    virtual void flush()=0;                 // flushed written buffers 
+    virtual void flush()=0;                 // flushed written buffers
     virtual byte *nextPtr(const void *ptr,offset_t skip, memsize_t extent, memsize_t &got)=0; // used to move about in partially mapped file
     virtual void reinit(offset_t ofs, memsize_t len=(memsize_t)-1, bool write=false)=0; // move map
 };
@@ -213,6 +224,8 @@ interface IFileIOStream : extends IIOStream
     virtual void seek(offset_t pos, IFSmode origin) = 0;
     virtual offset_t size() = 0;
     virtual offset_t tell() = 0;
+    virtual unsigned __int64 getStatistic(StatisticKind kind) = 0;
+    virtual void close() = 0;
 };
 
 interface IDiscretionaryLock: extends IInterface
@@ -233,7 +246,7 @@ interface IDiscretionaryLock: extends IInterface
 void jlib_decl _splitpath(const char *path, char *drive, char *dir, char *fname, char *ext);
 #endif
 
-//-- Helper routines 
+//-- Helper routines
 
 
 extern jlib_decl size32_t read(IFileIO * in, offset_t pos, size32_t len, MemoryBuffer & buffer);
@@ -262,31 +275,28 @@ extern jlib_decl void createHardLink(const char* fileName, const char* existingF
 
 extern jlib_decl IFile * createIFile(const char * filename);
 extern jlib_decl IFile * createIFile(MemoryBuffer & buffer);
-extern jlib_decl IFileIO * createIFileIO(HANDLE handle,IFOmode=IFOreadwrite,IFEflags extraFlags=IFEnone);
+extern jlib_decl void touchFile(const char *filename);
+extern jlib_decl void touchFile(IFile *file);
+extern jlib_decl IFileIO * createIFileIO(IFile * creator, HANDLE handle,IFOmode mode,IFEflags extraFlags=IFEnone);
 extern jlib_decl IDirectoryIterator * createDirectoryIterator(const char * path = NULL, const char * wildcard = NULL, bool sub = false, bool includedirs = true);
 extern jlib_decl IDirectoryIterator * createNullDirectoryIterator();
 extern jlib_decl IFileIO * createIORange(IFileIO * file, offset_t header, offset_t length);     // restricts input/output to a section of a file.
+extern jlib_decl IFileIO * createDelayedFileIO(IFileIO * io, unsigned delayNs);
+extern jlib_decl IFileIO * createNullFileIO();
 
 extern jlib_decl IFileIOStream * createIOStream(IFileIO * file);        // links argument
 extern jlib_decl IFileIOStream * createNoSeekIOStream(IFileIOStream * stream);  // links argument
 extern jlib_decl IFileIOStream * createBufferedIOStream(IFileIO * file, unsigned bufsize=(unsigned)-1);// links argument
 extern jlib_decl IFileIOStream * createBufferedAsyncIOStream(IFileAsyncIO * file, unsigned bufsize=(unsigned)-1);// links argument
+extern jlib_decl IFileIOStream * createIOStreamFromFile(const char *fileNameWithPath, IFOmode mode);// links argument
+extern jlib_decl IFileIOStream * createBufferedIOStreamFromFile(const char *fileNameWithPath, IFOmode mode, unsigned bufsize=(unsigned)-1);// links argument
+extern jlib_decl IFileIOStream * createProgressIFileIOStream(IFileIOStream *iFileIOStream, offset_t totalSize, const char *msg, unsigned periodSecs);
+
 
 // Useful for commoning up file and string based processing
 extern jlib_decl IFileIO * createIFileI(unsigned len, const void * buffer);     // input only...
-extern jlib_decl IFileIO * createIFileIO(unsigned len, void * buffer);
-extern jlib_decl IFileIO * createIFileIO(StringBuffer & buffer);
-extern jlib_decl IFileIO * createIFileIO(MemoryBuffer & buffer);
 
 //-- Creation of routines to implement other interfaces on the interfaces above.
-
-interface IReadSeq;
-interface IWriteSeq;
-
-// NB the following are unbuffered 
-extern jlib_decl IReadSeq *createReadSeq(IFileIOStream * stream, offset_t _offset, size32_t size); // no buffering
-extern jlib_decl IWriteSeq *createWriteSeq(IFileIOStream * stream, size32_t size);                 // no buffering
-
 
 extern jlib_decl IDiscretionaryLock *createDiscretionaryLock(IFile *file);
 extern jlib_decl IDiscretionaryLock *createDiscretionaryLock(IFileIO *fileio);
@@ -294,57 +304,14 @@ extern jlib_decl IDiscretionaryLock *createDiscretionaryLock(IFileIO *fileio);
 
 
 
-// useful stream based reader 
-interface ISerialStream: extends IInterface
-{
-    virtual const void * peek(size32_t wanted,size32_t &got) = 0;   // try and ensure wanted bytes are available. 
-                                                                    // if got<wanted then approaching eof
-                                                                    // if got>wanted then got is size available in buffer
+// useful stream based reader
 
-    virtual void get(size32_t len, void * ptr) = 0;                 // exception if no data available
-    virtual bool eos() = 0;                                         // no more data
-    virtual void skip(size32_t sz) = 0;
-    virtual offset_t tell() const = 0;
-    virtual void reset(offset_t _offset,offset_t _flen=(offset_t)-1) = 0;       // input stream has changed - restart reading
-};
-
-/* example of reading a nul terminated string using ISerialStream peek and skip
-{
-    for (;;) {
-        const char *s = peek(1,got);
-        if (!s)
-            break;  // eof before nul detected;
-        const char *p = s;
-        const char *e = p+got;
-        while (p!=e) {
-            if (!*p) {
-                out.append(p-s,s);
-                skip(p-s+1); // include nul
-                return;
-            }
-            p++;
-        }
-        out.append(got,s);
-        skip(got);
-    }
-}
-*/
-
-
-
-interface IFileSerialStreamCallback  // used for CRC tallying
-{
-    virtual void process(offset_t ofs, size32_t sz, const void *buf) = 0;
-};
-
-
-extern jlib_decl ISerialStream *createSimpleSerialStream(ISimpleReadStream * in, size32_t bufsize = (size32_t)-1, IFileSerialStreamCallback *callback=NULL);
-extern jlib_decl ISerialStream *createSocketSerialStream(ISocket * in, unsigned timeoutms, size32_t bufsize = (size32_t)-1, IFileSerialStreamCallback *callback=NULL);
-extern jlib_decl ISerialStream *createFileSerialStream(IFileIOStream * in, size32_t bufsize = (size32_t)-1, IFileSerialStreamCallback *callback=NULL);
-extern jlib_decl ISerialStream *createFileSerialStream(IFileIO *fileio, offset_t ofs=0, offset_t flen=(offset_t)-1,size32_t bufsize = (size32_t)-1, IFileSerialStreamCallback *callback=NULL);
-extern jlib_decl ISerialStream *createFileSerialStream(IMemoryMappedFile *mmapfile, offset_t ofs=0, offset_t flen=(offset_t)-1, IFileSerialStreamCallback *callback=NULL);
-extern jlib_decl ISerialStream *createMemorySerialStream(const void *buffer, memsize_t len, IFileSerialStreamCallback *callback=NULL);
-extern jlib_decl ISerialStream *createMemoryBufferSerialStream(MemoryBuffer & buffer, IFileSerialStreamCallback *callback=NULL);
+extern jlib_decl ISerialInputStream *createSocketSerialStream(ISocket * in, unsigned timeoutms);
+extern jlib_decl IBufferedSerialInputStream *createSimpleSerialStream(ISimpleReadStream * in, size32_t bufsize = (size32_t)-1);
+extern jlib_decl IBufferedSerialInputStream *createFileSerialStream(IFileIO *fileio, offset_t ofs=0, offset_t flen=(offset_t)-1,size32_t bufsize = (size32_t)-1);
+extern jlib_decl IBufferedSerialInputStream *createFileSerialStream(IMemoryMappedFile *mmapfile, offset_t ofs=0, offset_t flen=(offset_t)-1);
+extern jlib_decl IBufferedSerialInputStream *createMemorySerialStream(const void *buffer, memsize_t len);
+extern jlib_decl IBufferedSerialInputStream *createMemoryBufferSerialStream(MemoryBuffer & buffer);
 
 
 typedef Linked<IFile> IFileAttr;
@@ -361,32 +328,34 @@ class jlib_decl RemoteFilename
     void badFilename(const char * filename);
 
     SocketEndpoint      ep;         // node for file (port is used for daliservix and user defined ports)
-    StringAttr          localhead;  // local base directory 
+    StringAttr          localhead;  // local base directory
     StringAttr          sharehead;  // remote share equvalent to localbase (always starts with separator if present)
     StringAttr          tailpath;   // tail directory and filename appended to one of the above (always starts with separator)
 public:
     void clear();
 
     StringBuffer & getTail(StringBuffer &name) const;       // Tail Name (e.g. "test.d00._1_of_3")
-    StringBuffer & getPath(StringBuffer & name) const;      // Either local or full depending on location 
+    StringBuffer & getPath(StringBuffer & name) const;      // Either local or full depending on location
     StringBuffer & getLocalPath(StringBuffer &name) const;  // Local Path (e.g. "c:\dfsdata\test.d00._1_of_3")
     StringBuffer & getRemotePath(StringBuffer &name) const; // Full Remote Path  (e.g. "\\192.168.0.123\c$\dfsdata\test.d00._1_of_3")
-    
+
+    const FileSystemProperties & queryFileSystemProperties() const;
     bool isLocal() const;                                   // on calling node
     bool isUnixPath() const;                                // a unix filename
+    bool isUrl() const;
     char getPathSeparator() const;                          // separator for this path
     const SocketEndpoint & queryEndpoint() const            { return ep; } // node containing file
     const IpAddress      & queryIP() const                  { return ep; }
     unsigned short getPort() const                          { return ep.port; }
-    bool isNull() const;                        
+    bool isNull() const;
 
     // the following overwrite previous contents
-    void set(const RemoteFilename & other);         
+    void set(const RemoteFilename & other);
     void setPath(const SocketEndpoint & _ep, const char * filename); // filename should be full windows or unix path (local)
     void setLocalPath(const char *name);                    // local path - can partial but on linux must be under \c$ or \d$
     void setRemotePath(const char * url,const char *local=NULL); // url should be full (share) path including ep
 
-    // the following modify existing 
+    // the following modify existing
     void setIp(const IpAddress & ip)                        { ep.ipset(ip); }
     void setEp(const SocketEndpoint & _ep)                  { ep.set(_ep); }
     void setPort(unsigned short port)                       { ep.port=port; }
@@ -395,7 +364,7 @@ public:
     void setTailPath(const char *name)                      { tailpath.set(name); }
     void setExtension(const char * newext);
 
-    void split(StringBuffer * drive, StringBuffer * path, StringBuffer * tail, StringBuffer * ext) const;   
+    void split(StringBuffer * drive, StringBuffer * path, StringBuffer * tail, StringBuffer * ext) const;
         // same buffer can be passed to several
         // note that this is for a *local* file
 
@@ -414,7 +383,7 @@ class jlib_decl RemoteMultiFilename: public RemoteFilenameArray
 public:
     static void expand(const char *mpath, StringArray &array);
     static void tostr(StringArray &array,StringBuffer &out);
-    void append(const char *path,const char *defaultdir=NULL);      
+    void append(const char *path,const char *defaultdir=NULL);
                                         // can be local or remote URL path (though urls must point at same machine)
                                         // can contain comma separated entries including wildcards
                                         // if no directory then uses defaultdir if present
@@ -456,11 +425,38 @@ extern jlib_decl void removeIFileCreateHook(IRemoteFileCreateHook *);
 
 extern jlib_decl IFile * createIFile(const RemoteFilename & filename);
 
-// Hook mechanism for accessing files inside containers (eg zipfiles)
+struct StorageApiConfig;
 
+interface IStorageApiInfo : implements IInterface
+{
+    virtual const char * getStorageType() const = 0;
+    virtual const char * queryStorageApiAccount(unsigned stripeNumber) const = 0;
+    virtual const char * queryStorageContainerName(unsigned stripeNumber) const = 0;
+    virtual const char * queryStorageApiSecret(unsigned stripeNumber, StringBuffer &account, StringBuffer &container) const = 0;
+    virtual StringBuffer & getSASToken(unsigned stripeNumber, StringBuffer &account, StringBuffer &container, StringBuffer & token) const = 0;
+    virtual bool useManagedIdentity() const = 0;
+    virtual const StorageApiConfig & queryAPIConfig() const = 0;
+};
+enum class ApiCopyStatus { NotStarted, Pending, Success, Failed, Aborted };
+interface IAPICopyClientOp : implements IInterface
+{
+    virtual void startCopy(const char *source) = 0;
+    virtual ApiCopyStatus getProgress(CDateTime & dateTime, int64_t & outputLength) = 0;
+    virtual ApiCopyStatus abortCopy() = 0;
+    virtual ApiCopyStatus getStatus() const = 0;
+};
+
+interface IAPICopyClient : implements IInterface
+{
+    virtual const char * name() const = 0;
+    virtual IAPICopyClientOp * startCopy(const char *srcPath, unsigned srcStripeNum,  const char *tgtPath, unsigned tgtStripeNum) const = 0;
+};
+
+// Hook mechanism for accessing files inside containers (eg zipfiles)
 interface IContainedFileHook: extends IInterface
 {
     virtual IFile * createIFile(const char *fileName) = 0;
+    virtual IAPICopyClient * getCopyApiClient(IStorageApiInfo * source, IStorageApiInfo * target) = 0;
 };
 extern jlib_decl void addContainedFileHook(IContainedFileHook *);
 extern jlib_decl void removeContainedFileHook(IContainedFileHook *);
@@ -469,7 +465,7 @@ extern jlib_decl void removeContainedFileHook(IContainedFileHook *);
 
 inline bool isPathSepChar(char sep)
 {
-    return (sep=='\\')||(sep=='/');     
+    return (sep=='\\')||(sep=='/');
 }
 
 inline const char *findPathSepChar(const char *s)
@@ -488,9 +484,25 @@ inline char getPathSepChar(const char *dir)
     return s?(*s):((*dir&&(dir[1]==':'))?'\\':PATHSEPCHAR);
 }
 
+inline char getPathSepCharEx(const char *s)
+{
+    if (!s)
+        return '/';
+
+    bool foundBackslash=false;
+    while (*s) {
+        if (s[0]=='/')
+            return '/';
+        if (s[0]=='\\')
+            foundBackslash=true;
+        s++;
+    }
+    return foundBackslash?'\\':'/';
+}
+
 inline bool containsPathSepChar(const char *s)
 {
-    return findPathSepChar(s)!=NULL;    
+    return findPathSepChar(s)!=NULL;
 }
 
 inline StringBuffer &addPathSepChar(StringBuffer &path,char sepchar=0)
@@ -513,6 +525,8 @@ inline StringBuffer &removeTrailingPathSepChar(StringBuffer &path)
     }
     return path;
 }
+
+extern jlib_decl bool isRootDirectory(const char * path);
 
 inline StringBuffer &addNonEmptyPathSepChar(StringBuffer &path,char sepchar=0)
 {
@@ -537,12 +551,13 @@ inline const char *splitDirTail(const char *path,StringBuffer &dir)
     const char *tail=pathTail(path);
     if (tail)
         dir.append((size32_t)(tail-path),path);
-    return tail;        
+    return tail;
 }
 
 extern jlib_decl bool isUrl(const char *path);
 extern jlib_decl bool isRemotePath(const char *path);
 extern jlib_decl bool isAbsolutePath(const char *path);
+extern jlib_decl bool containsRelPaths(const char *path);
 
 // NOTE - makeAbsolutePath also normalizes the supplied path to remove . and .. references
 extern jlib_decl StringBuffer &makeAbsolutePath(const char *relpath,StringBuffer &out,bool mustExist=false);
@@ -550,6 +565,7 @@ extern jlib_decl StringBuffer &makeAbsolutePath(StringBuffer &relpath,bool mustE
 extern jlib_decl StringBuffer &makeAbsolutePath(const char *relpath, const char *basedir, StringBuffer &out);
 extern jlib_decl StringBuffer &makePathUniversal(const char *path, StringBuffer &out);
 extern jlib_decl const char *splitRelativePath(const char *full,const char *basedir,StringBuffer &reldir); // removes basedir if matches, returns tail and relative dir
+extern jlib_decl const char *getRelativePath(const char *path, const char *leadingPath);
 extern jlib_decl const char *splitDirMultiTail(const char *multipath,StringBuffer &dir,StringBuffer &tail);
 extern jlib_decl StringBuffer &mergeDirMultiTail(const char *dir,const char *tail, StringBuffer &multipath);
 extern jlib_decl StringBuffer &removeRelativeMultiPath(const char *full,const char *dir,StringBuffer &reltail); // removes dir if matches, returns relative multipath
@@ -597,8 +613,8 @@ extern jlib_decl void extractBlobElements(const char * prefix, const RemoteFilen
 extern jlib_decl bool mountDrive(const char *drv,const RemoteFilename &rfn); // linux only currently
 extern jlib_decl bool unmountDrive(const char *drv); // linux only currently
 
-extern jlib_decl IFileIO *createUniqueFile(const char *dir, const char *prefix, const char *ext, StringBuffer &tmpName);
-
+extern jlib_decl IFileIO *createUniqueFile(const char *dir, const char *prefix, const char *ext, StringBuffer &tmpName, IFOmode mode=IFOcreate);
+extern jlib_decl IFile * writeToProtectedTempFile(const char * component, const char * prefix, size_t len, const void * data);
 
 // used by remote copy
 interface ICopyFileIntercept
@@ -613,12 +629,12 @@ extern jlib_decl bool containsFileWildcard(const char * path);
 extern jlib_decl bool isDirectory(const char * path);
 extern jlib_decl void removeFileTraceIfFail(const char * filename);
 extern jlib_decl IFileIOCache* createFileIOCache(unsigned max);
-extern jlib_decl IFile * createSentinelTarget();
+extern jlib_decl IFile * createSentinelTarget(const char *suffix = nullptr);
 extern jlib_decl void writeSentinelFile(IFile * file);
 extern jlib_decl void removeSentinelFile(IFile * file);
 extern jlib_decl StringBuffer & appendCurrentDirectory(StringBuffer & target, bool blankIfFails);
 extern jlib_decl timestamp_type getTimeStamp(IFile * file);
-
+extern jlib_decl IAPICopyClient * createApiCopyClient(IStorageApiInfo * source, IStorageApiInfo * target);
 #ifdef _WIN32
 const static bool filenamesAreCaseSensitive = false;
 #else
@@ -627,6 +643,9 @@ const static bool filenamesAreCaseSensitive = true;
 
 extern jlib_decl IDirectoryIterator *getSortedDirectoryIterator(IFile *directory, SortDirectoryMode mode = SD_byname, bool rev = false, const char *mask = nullptr, bool sub = false, bool includedirs = false);
 extern jlib_decl IDirectoryIterator *getSortedDirectoryIterator(const char *dirName, SortDirectoryMode mode = SD_byname, bool rev = false, const char *mask = nullptr, bool sub = false, bool includedirs = false);
+
+//Locally copy from the source to the target
+extern jlib_decl void copyFileSection(IFile * src, IFile * target, offset_t toOfs, offset_t fromOfs, offset_t size, ICopyFileProgress *progress, CFflags copyFlags);
 
 //--------------------------------------------------------------------------------------------------------------------
 
@@ -645,5 +664,88 @@ public:
     RelaxedAtomic<__uint64> ioWrites{0};
 };
 
+//--------------------------------------------------------------------------------------------------------------------
+
+// A structure that contains information about files on a file system.  Should be extended with any useful information.
+struct FileSystemProperties
+{
+public:
+    const bool canSeekWrite;
+    const bool preExtendOutput;
+};
+
+//Return information about files on a particular filesystem.  Objects returned will always remain valid.
+extern jlib_decl const FileSystemProperties & queryFileSystemProperties(const char * filename);
+inline bool canSeekWrite(const char * filename) { return queryFileSystemProperties(filename).canSeekWrite; }
+
+
+enum class FileWatchEvents
+{
+    none          = 0,
+#ifdef __linux__
+    // mapped directly for convenience, any other impl. will need to map to FileWatchEvents values
+    acessed       = IN_ACCESS,
+    modified      = IN_MODIFY,
+    metaModified  = IN_ATTRIB,
+    closed        = IN_CLOSE_NOWRITE,
+    closedWrite   = IN_CLOSE_WRITE,
+    opened        = IN_OPEN,
+    movedFrom     = IN_MOVED_FROM,
+    movedTo       = IN_MOVED_TO,
+    created       = IN_CREATE,
+    deleted       = IN_DELETE,
+#else
+    acessed       = 0x001,
+    modified      = 0x002,
+    closed        = 0x004,
+    closedWrite   = 0x008,
+    metaModified  = 0x010,
+    opened        = 0x020,
+    movedFrom     = 0x040,
+    movedTo       = 0x080,
+    created       = 0x100,
+    deleted       = 0x200,
+#endif
+    anyChange     = created | deleted | movedTo | movedFrom | closedWrite | modified | metaModified
+};
+BITMASK_ENUM(FileWatchEvents);
+
+inline bool containsFileWatchEvents(FileWatchEvents src, FileWatchEvents find)
+{
+    return FileWatchEvents::none != (src & find);
+}
+
+
+
+interface IFileEventWatcher : extends IInterface
+{
+    virtual void start() = 0;
+    virtual void stop() = 0;
+    virtual bool add(const char *filename, FileWatchEvents event) = 0; // returns false if file already monitored
+    virtual bool remove(const char *filename) = 0;                // returns false if file not being monitored
+};
+
+typedef std::function<void (const char *, FileWatchEvents)> FileWatchFunc;
+jlib_decl IFileEventWatcher *createFileEventWatcher(FileWatchFunc callback);
+
+extern jlib_decl IFileIO *createBlockedIO(IFileIO *base, size32_t blockSize);
+
+//---- Pluggable file type related functions ----------------------------------------------
+
+extern jlib_decl void addAvailableGenericFileTypeName(const char * name);
+extern jlib_decl bool hasGenericFiletypeName(const char * name);
+
+
+//MORE: These should move to jplane.hpp once more refactoring is done
+extern jlib_decl bool getFileSyncWriteCloseEnabled(const char *planeName);
+extern jlib_decl bool getConcurrentWriteSupported(const char *planeName);
+extern jlib_decl unsigned getWriteSyncMarginMs(const char * planeName);
+
+extern jlib_decl size32_t getBlockedSequentialIO(const char *filePath, size32_t defaultSize);
+extern jlib_decl size32_t getBlockedSequentialIO(IFile *file, size32_t defaultSize);
+extern jlib_decl size32_t getBlockedSequentialIO(IFileIO *fileio, size32_t defaultSize);
+extern jlib_decl size32_t getBlockedRandomIO(const char *filePath, size32_t defaultSize);
+extern jlib_decl size32_t getBlockedRandomIO(IFile *file, size32_t defaultSize);
+extern jlib_decl size32_t getBlockedRandomIO(IFileIO *fileio, size32_t defaultSize);
 
 #endif

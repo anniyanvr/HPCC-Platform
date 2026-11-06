@@ -1,0 +1,146 @@
+name: Build Clienttools windows-2022
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,read"
+  VCPKG_NUGET_REPOSITORY: "https://nuget.pkg.github.com/hpcc-systems/index.json"
+
+on:
+  workflow_call:
+    inputs:
+      upload-package:
+        type: boolean
+        description: 'Share asset for eclide build'
+        required: false
+        default: false
+      asset-name:
+        type: string
+        description: 'ECLIDE clienttools Asset name'
+        required: false
+        default: 'windows-2022-clienttools'
+      community-ref:
+        type: string
+        description: 'community_[semver]'
+        required: true
+      cmake-config-options:
+        type: string
+        description: 'CMake config options'
+        required: false
+        default: '-T host=x64 -A x64 -DUSE_OPTIONAL=OFF -DCLIENTTOOLS_ONLY=ON -DUSE_AZURE=OFF -DUSE_CASSANDRA=OFF -DUSE_PARQUET=OFF -DUSE_JAVA=OFF -DUSE_OPENLDAP=OFF'
+      cmake-build-options:
+        type: string
+        description: 'CMake build options'
+        required: false
+        default: '--config Release --parallel $NUMBER_OF_PROCESSORS'
+      make-latest:
+        type: boolean
+        description: 'Make Latest'
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  generate_windows_2022_clienttools:
+    name: Generate Windows Clienttools
+    runs-on: "windows-2022"
+
+    steps:
+      - name: Checkout HPCC-Platform
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.community-ref }}
+          submodules: recursive
+          path: ./HPCC-Platform
+
+      - name: Setup Certificate File
+        shell: "pwsh"
+        run: |
+          $base64 = "${{ secrets.SM_CLIENT_CERT_FILE_B64 }}"
+          if ([string]::IsNullOrEmpty($base64)) {
+            Write-Error "Secret SM_CLIENT_CERT_FILE_B64 is empty or not set."
+            exit 1
+          }
+          $bytes = [Convert]::FromBase64String($base64)
+          $outDir = "$env:RUNNER_TEMP"
+          $p12Path = Join-Path $outDir "sm_client_cert.p12"
+          [IO.File]::WriteAllBytes($p12Path, $bytes)
+          # Make sure the path is visible to subsequent steps
+          "SM_CLIENT_CERT_FILE=$p12Path" | Out-File -FilePath $env:GITHUB_ENV -Append
+          
+      - name: Setup Software Trust Manager
+        uses: digicert/code-signing-software-trust-action@v1.2.1
+        with:
+          simple-signing-mode: true
+          keypair-alias: "${{ vars.DIGICERT_KEYPAIR_ALIAS }}"
+        env:
+          SM_HOST: https://clientauth.one.digicert.com
+          SM_API_KEY: ${{ secrets.DIGICERT_API_KEY }}
+          SM_CLIENT_CERT_FILE: ${{ env.SM_CLIENT_CERT_FILE }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+
+      - name: vcpkg bootstrap
+        shell: "bash"
+        run: |
+          ./HPCC-Platform/vcpkg/bootstrap-vcpkg.sh
+
+      - name: "Setup NuGet credentials"
+        shell: "bash"
+        run: |
+          `./HPCC-Platform/vcpkg/vcpkg fetch nuget | tail -n 1` \
+          sources add \
+          -name "GitHub" \
+          -source "https://nuget.pkg.github.com/hpcc-systems/index.json" \
+          -storepasswordincleartext \
+          -username "${{ github.repository_owner }}" \
+          -password "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Setup Source Directory
+        id: setup_source
+        shell: "bash"
+        run: |
+          echo "Building community clienttools"
+          echo "source_dir=./HPCC-Platform" >> $GITHUB_OUTPUT
+
+      - name: Build Clienttools
+        id: build_clienttools
+        shell: "bash"
+        run: |
+          mkdir -p ./build
+          cmake -S ${{ steps.setup_source.outputs.source_dir }} -B ./build ${{ inputs.cmake-config-options }} -DDIGICERT_KEYPAIR_ALIAS=${{ vars.DIGICERT_KEYPAIR_ALIAS }}
+          if [ -d ./LN ]; then
+            cmake --build ./build ${{ inputs.cmake-build-options }} --target LN_SIGN
+          else
+            cmake --build ./build ${{ inputs.cmake-build-options }} --target SIGN
+          fi
+        env:
+          SM_HOST: https://clientauth.one.digicert.com
+          SM_API_KEY: ${{ secrets.DIGICERT_API_KEY }}
+          SM_CLIENT_CERT_FILE: ${{ env.SM_CLIENT_CERT_FILE }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+
+      - name: Release Community Clienttools
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          generateReleaseNotes: false
+          prerelease: ${{ contains(github.ref, '-rc') }}
+          makeLatest: ${{ inputs.make-latest }}
+          artifacts: "./build/hpccsystems-clienttools-community*.exe"
+
+      - name: Share Asset for ECLIDE build
+        if: ${{ inputs.upload-package }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.asset-name }}
+          path: ./build/hpccsystems-clienttools*.exe
+          compression-level: 0
+      
+      - name: Upload Error Logs
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-2022-clienttools-logs-${{ github.job }}-${{ github.run_number }}
+          path: ./build/**/*.log
+          retention-days: 1

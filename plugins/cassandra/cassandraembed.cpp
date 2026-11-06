@@ -127,7 +127,7 @@ void CassandraClusterSession::setOptions(const StringArray &options)
                 if (contact_points[0]=='.')
                 {
                     SocketEndpoint ep(contact_points);
-                    ep.getIpText(epText.clear());
+                    ep.getHostText(epText.clear());
                     contact_points = epText.str();
                 }
             }
@@ -143,7 +143,7 @@ void CassandraClusterSession::setOptions(const StringArray &options)
                 {
                     maxFutures=getUnsignedOption(val, "maxFutures");
                     if (maxFutures)
-                        semaphore = new Semaphore(maxFutures);
+                        semaphore = new Semaphore(SYNC_LOCATION, maxFutures);
                 }
             }
             else if (stricmp(optName, "maxRetries")==0)
@@ -175,38 +175,31 @@ void CassandraClusterSession::setOptions(const StringArray &options)
             }
             else if (stricmp(optName, "max_connections_per_host")==0)
             {
-                unsigned max_connections_per_host = getUnsignedOption(val, "max_connections_per_host");
-                checkSetOption(cass_cluster_set_max_connections_per_host(cluster, max_connections_per_host), "max_connections_per_host");
+                //Option is now deprecated and has no effect
             }
             else if (stricmp(optName, "max_concurrent_creation")==0)
             {
-                unsigned max_concurrent_creation = getUnsignedOption(val, "max_concurrent_creation");
-                checkSetOption(cass_cluster_set_max_concurrent_creation(cluster, max_concurrent_creation), "max_concurrent_creation");
+                //Option is now deprecated and has no effect
             }
             else if (stricmp(optName, "write_bytes_high_water_mark")==0)
             {
-                unsigned write_bytes_high_water_mark = getUnsignedOption(val, "write_bytes_high_water_mark");
-                checkSetOption(cass_cluster_set_write_bytes_high_water_mark(cluster, write_bytes_high_water_mark), "write_bytes_high_water_mark");
+                //Option is now deprecated and has no effect
             }
             else if (stricmp(optName, "write_bytes_low_water_mark")==0)
             {
-                unsigned write_bytes_low_water_mark = getUnsignedOption(val, "write_bytes_low_water_mark");
-                checkSetOption(cass_cluster_set_write_bytes_low_water_mark(cluster, write_bytes_low_water_mark), "write_bytes_low_water_mark");
+                //Option is now deprecated and has no effect
             }
             else if (stricmp(optName, "pending_requests_high_water_mark")==0)
             {
-                unsigned pending_requests_high_water_mark = getUnsignedOption(val, "pending_requests_high_water_mark");
-                checkSetOption(cass_cluster_set_pending_requests_high_water_mark(cluster, pending_requests_high_water_mark), "pending_requests_high_water_mark");
+                //Option is now deprecated and has no effect
             }
             else if (stricmp(optName, "pending_requests_low_water_mark")==0)
             {
-                unsigned pending_requests_low_water_mark = getUnsignedOption(val, "pending_requests_low_water_mark");
-                checkSetOption(cass_cluster_set_pending_requests_low_water_mark(cluster, pending_requests_low_water_mark), "pending_requests_low_water_mark");
+                //Option is now deprecated and has no effect
             }
             else if (stricmp(optName, "max_concurrent_requests_threshold")==0)
             {
-                unsigned max_concurrent_requests_threshold = getUnsignedOption(val, "max_concurrent_requests_threshold");
-                checkSetOption(cass_cluster_set_max_concurrent_requests_threshold(cluster, max_concurrent_requests_threshold), "max_concurrent_requests_threshold");
+                //Option is now deprecated and has no effect
             }
             else if (stricmp(optName, "connect_timeout")==0)
             {
@@ -366,7 +359,7 @@ void CassandraClusterSession::executeAsync(CIArrayOf<CassandraStatement> &batch,
 
 typedef CassandraClusterSession *CassandraClusterSessionPtr;
 typedef MapBetween<hash64_t, hash64_t, CassandraClusterSessionPtr, CassandraClusterSessionPtr> ClusterSessionMap;
-static CriticalSection clusterCacheCrit;
+static CriticalSection clusterCacheCrit{SYNC_LOCATION};
 static ClusterSessionMap cachedSessions;
 
 CassandraClusterSession *lookupCachedSession(hash64_t hash, const StringArray &opts)
@@ -435,7 +428,7 @@ void CassandraSession::set(CassSession *_session)
 //----------------------
 
 CassandraRetryingFuture::CassandraRetryingFuture(CassSession *_session, CassStatement *_statement, Semaphore *_limiter, unsigned _retries)
-: session(_session), statement(_statement), retries(_retries), limiter(_limiter), future(NULL)
+: future(NULL), session(_session), statement(_statement), retries(_retries), limiter(_limiter)
 {
     execute();
 }
@@ -500,13 +493,12 @@ void CassandraRetryingFuture::signaller(CassFuture *future, void *data)
 //----------------------
 
 CassandraStatementInfo::CassandraStatementInfo(CassandraSession *_session, CassandraPrepared *_prepared, unsigned _numBindings, OptionalCassBatchType _batchMode, unsigned pageSize, Semaphore *_semaphore, unsigned _maxRetries)
-    : session(_session), prepared(_prepared), numBindings(_numBindings), batchMode(_batchMode), semaphore(_semaphore), maxRetries(_maxRetries)
+    : session(_session), prepared(_prepared), numBindings(_numBindings), semaphore(_semaphore), maxRetries(_maxRetries), inBatch(false), batchMode(_batchMode)
 {
     assertex(prepared && *prepared);
     statement.setown(new CassandraStatement(cass_prepared_bind(*prepared)));
     if (pageSize)
         cass_statement_set_paging_size(*statement, pageSize);
-    inBatch = false;
 }
 CassandraStatementInfo::~CassandraStatementInfo()
 {
@@ -1026,7 +1018,7 @@ class CassandraRecordBinder : public CInterfaceOf<IFieldProcessor>
 {
 public:
     CassandraRecordBinder(const IContextLogger &_logctx, const RtlTypeInfo *_typeInfo, const CassandraStatementInfo *_stmtInfo, int _firstParam)
-      : logctx(_logctx), typeInfo(_typeInfo), stmtInfo(_stmtInfo), firstParam(_firstParam), dummyField("<row>", NULL, typeInfo), thisParam(_firstParam)
+      : typeInfo(_typeInfo), stmtInfo(_stmtInfo), collection(), logctx(_logctx), firstParam(_firstParam), dummyField("<row>", NULL, typeInfo), thisParam(_firstParam)
     {
     }
     int numFields()
@@ -1196,7 +1188,7 @@ public:
 protected:
     inline unsigned checkNextParam(const RtlFieldInfo * field)
     {
-        if (logctx.queryTraceLevel() > 4)
+        if (doTrace(traceCassandra))
             logctx.CTXLOG("Binding %s to %d", field->name, thisParam);
         return thisParam++;
     }
@@ -1221,7 +1213,7 @@ class CassandraDatasetBinder : public CassandraRecordBinder
 {
 public:
     CassandraDatasetBinder(const IContextLogger &_logctx, IRowStream * _input, const RtlTypeInfo *_typeInfo, const CassandraStatementInfo *_stmt, int _firstParam)
-      : input(_input), CassandraRecordBinder(_logctx, _typeInfo, _stmt, _firstParam)
+      : CassandraRecordBinder(_logctx, _typeInfo, _stmt, _firstParam), input(_input)
     {
     }
     bool bindNext()
@@ -1408,7 +1400,7 @@ public:
         {
             const CassValue *value = cass_iterator_get_value(iterator);
             assertex(value);
-            if (elemSize != UNKNOWN_LENGTH)
+            if (!isUnknownLength(elemSize))
             {
                 out.ensureAvailable(outBytes + elemSize);
                 outData = out.getbytes() + outBytes;
@@ -1440,7 +1432,7 @@ public:
                 rtlDataAttr str;
                 size32_t lenBytes;
                 cassandraembed::getStringResult(NULL, value, lenBytes, str.refstr());
-                if (elemSize == UNKNOWN_LENGTH)
+                if (isUnknownLength(elemSize))
                 {
                     if (elemType == type_string)
                     {
@@ -1477,7 +1469,7 @@ public:
                 size32_t lenBytes = rtlUtf8Size(lenChars, text);
                 if (elemType == type_utf8)
                 {
-                    assertex (elemSize == UNKNOWN_LENGTH);
+                    assertex (isUnknownLength(elemSize));
                     out.ensureAvailable(outBytes + lenBytes + sizeof(size32_t));
                     outData = out.getbytes() + outBytes;
                     * (size32_t *) outData = lenChars;
@@ -1486,7 +1478,7 @@ public:
                 }
                 else
                 {
-                    if (elemSize == UNKNOWN_LENGTH)
+                    if (isUnknownLength(elemSize))
                     {
                         // You can't assume that number of chars in utf8 matches number in unicode16 ...
                         size32_t numchars16;
@@ -1506,7 +1498,7 @@ public:
             default:
                 fail("type mismatch - unsupported return type");
             }
-            if (elemSize != UNKNOWN_LENGTH)
+            if (!isUnknownLength(elemSize))
                 outBytes += elemSize;
         }
         __isAllResult = false;
@@ -1629,7 +1621,7 @@ public:
         const byte *inData = (const byte *) setData;
         const byte *endData = inData + totalBytes;
         int numElems;
-        if (elemSize == UNKNOWN_LENGTH)
+        if (isUnknownLength(elemSize))
         {
             numElems = 0;
             // Will need 2 passes to work out how many elements there are in the set :(
@@ -1688,7 +1680,7 @@ public:
             case type_varstring:
             {
                 size32_t numChars = strlen((const char *) inData);
-                if (elemSize == UNKNOWN_LENGTH)
+                if (isUnknownLength(elemSize))
                     thisSize = numChars + 1;
                 size32_t utf8chars;
                 rtlDataAttr utfText;
@@ -1698,7 +1690,7 @@ public:
             }
             case type_string:
             {
-                if (elemSize == UNKNOWN_LENGTH)
+                if (isUnknownLength(elemSize))
                 {
                     thisSize = * (size32_t *) inData;
                     inData += sizeof(size32_t);
@@ -1721,7 +1713,7 @@ public:
                 break;
             case type_unicode:
             {
-                if (elemSize == UNKNOWN_LENGTH)
+                if (isUnknownLength(elemSize))
                 {
                     thisSize = (* (size32_t *) inData) * sizeof(UChar); // NOTE - it's in chars...
                     inData += sizeof(size32_t);
@@ -1735,7 +1727,7 @@ public:
             }
             case type_utf8:
             {
-                assertex (elemSize == UNKNOWN_LENGTH);
+                assertex (isUnknownLength(elemSize));
                 size32_t numChars = * (size32_t *) inData;
                 inData += sizeof(size32_t);
                 thisSize = rtlUtf8Size(numChars, inData);
@@ -1743,7 +1735,7 @@ public:
                 break;
             }
             case type_data:
-                if (elemSize == UNKNOWN_LENGTH)
+                if (isUnknownLength(elemSize))
                 {
                     thisSize = * (size32_t *) inData;
                     inData += sizeof(size32_t);

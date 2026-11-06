@@ -41,10 +41,13 @@ public:
     void *              ensure(size_t _len);
     void *              reallocate(size_t _len);
     inline const void * get() const         { return ptr; }
+    inline byte         getByte(size_t offset) const { return ((const byte *)ptr)[offset]; }
+    inline byte *       bytes() const       { return (byte *)ptr; }
     inline size_t       length() const      { return len; }
     inline void *       mem() const         { return ptr; }
     void                set(size_t _len, const void * _ptr);
     void                setOwn(size_t _len, void * _ptr);
+    void                swapWith(MemoryAttr & other);
     
     static int          compare(const MemoryAttr & m1, const MemoryAttr & m2);
 
@@ -65,10 +68,10 @@ protected:
     CLASS *ptr = nullptr;
 
 public:
-    OwnedPtrCustomFree<CLASS, FREE_FUNC>() { }
-    OwnedPtrCustomFree<CLASS, FREE_FUNC>(CLASS *_ptr) : ptr(_ptr) { }
-    OwnedPtrCustomFree<CLASS, FREE_FUNC>(SELF &&_ptr) { ptr = _ptr.getClear(); }
-    ~OwnedPtrCustomFree<CLASS, FREE_FUNC>() { safeFree(ptr); }
+    OwnedPtrCustomFree() { }
+    OwnedPtrCustomFree(CLASS *_ptr) : ptr(_ptr) { }
+    OwnedPtrCustomFree(SELF &&_ptr) { ptr = _ptr.getClear(); }
+    ~OwnedPtrCustomFree() { safeFree(ptr); }
 
     void operator = (CLASS * _ptr)
     {
@@ -125,7 +128,7 @@ private:
 class jlib_decl MemoryBuffer
 {
 public:
-    inline MemoryBuffer()  { init(); }
+    constexpr MemoryBuffer() = default;
     MemoryBuffer(size_t initial);
     MemoryBuffer(size_t len, const void * buffer);
     MemoryBuffer(MemoryBuffer & value) = delete;
@@ -136,6 +139,7 @@ public:
     MemoryBuffer &  append(unsigned char value);
     MemoryBuffer &  append(bool value);
     MemoryBuffer &  append(const char * value);
+    MemoryBuffer &  appendCStr(const char * value);
     MemoryBuffer &  append(const unsigned char * value);
     MemoryBuffer &  append(size32_t len, const void * value);
     MemoryBuffer &  append(double value);
@@ -176,6 +180,7 @@ public:
     const byte *    readDirect(size32_t len);                                       // for efficiency
     MemoryBuffer &  readPacked(unsigned & value);
     MemoryBuffer &  readPacked(unsigned __int64 & value);
+    MemoryBuffer &  readOpt(StringAttr & value);                // read but set to null if blank
 
     inline MemoryBuffer &  readMemSize(memsize_t & value) { __int64 val; read(val); value = (memsize_t)val; assertex(val == (__int64) value); return *this; }
     MemoryBuffer &  skip(unsigned len);
@@ -185,7 +190,7 @@ public:
     
     inline MemoryBuffer &  clear() { curLen = 0; readPos = 0; return *this; }
 
-    inline bool     needSwapEndian() { return swapEndian; }
+    inline bool     needSwapEndian() const { return swapEndian; }
     int             setEndian(int endian);          // pass __[BIG|LITTLE]_ENDIAN
     bool            setSwapEndian(bool swap);
     void            swapWith(MemoryBuffer & other);
@@ -193,6 +198,7 @@ public:
 
     inline size32_t capacity() { return (maxLen - curLen); }
     void *          ensureCapacity (unsigned max);
+    void *          ensureCapacity(size_t max, size_t & got);
     inline size32_t length() const { return curLen; }
     inline size32_t remaining() const { return curLen - readPos; }
 
@@ -213,6 +219,7 @@ public:
     inline const char * toByteArray() const { return curLen ? buffer : nullptr; }
     inline const byte * bytes() const { return curLen ? (const byte *)buffer : nullptr; }
 
+    void            replace(size_t offset, size_t len, const void * value);
 
 private:
     MemoryBuffer &  read(unsigned long & value);    // unimplemented
@@ -230,12 +237,12 @@ private:
     MemoryBuffer & _reverse();
     const char* _str();
     
-    mutable char *  buffer;
-    size32_t  curLen;
-    size32_t  maxLen;
-    size32_t  readPos;
-    bool    swapEndian;
-    bool    ownBuffer;
+    mutable char * buffer = nullptr;
+    size32_t curLen = 0;
+    size32_t maxLen = 0;
+    size32_t readPos = 0;
+    bool swapEndian= false;
+    bool ownBuffer = true;
 };
 
 // Utility class, to back patch a scalar into current position
@@ -545,7 +552,7 @@ class  jlib_decl CFixedSizeAllocator
 private:
     void *freelist;
     void *chunklist;
-    NonReentrantSpinLock lock;
+    NonReentrantSpinLock lock{SYNC_LOCATION};
     unsigned numalloc;
     unsigned numfree;
     size32_t allocsize;

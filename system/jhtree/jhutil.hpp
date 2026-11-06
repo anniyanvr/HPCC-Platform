@@ -19,8 +19,15 @@
 #define JHUTIL_HPP
 
 #include "jlib.hpp"
-#include "jqueue.tpp"
+#include "jqueue.hpp"
 #include "jhtree.hpp"
+
+//This interface can be used to record the mapping items that are being removed when making more space.
+//If the cache is checked within a critical section this allows the removed items to be released outside the critsec
+interface IRemovedMappingCallback
+{
+    virtual void noteRemoval(void * mapping) = 0;
+};
 
 // TABLE should be SuperHashTable derivative to contain MAPPING's
 // MAPPING should be something that constructs with (KEY, ENTRY) and impl. query returning ref. to ENTRY
@@ -36,15 +43,17 @@ protected:
         virtual void onAdd(void *mapping) { owner.elementAdded((MAPPING *)mapping); TABLE::onAdd(mapping); }
         virtual void onRemove(void *mapping) { owner.elementRemoved((MAPPING *)mapping); TABLE::onRemove(mapping); }
     } table;
-    QueueOf<MAPPING, false> mruList;
+    DListOf<MAPPING> mruList;
 
-    void clear(int count)
+    void clear(int count, IRemovedMappingCallback * callback)
     {
         for (;;)
         {
             MAPPING *tail = mruList.dequeueTail();
             if (!tail)
                 break;
+            if (callback)
+                callback->noteRemoval(tail);
             table.removeExact(tail);
             if ((-1 != count) && (0 == --count))
                 break;
@@ -53,24 +62,38 @@ protected:
 public:
     typedef SuperHashIteratorOf<MAPPING> CMRUIterator;
 
-    CMRUCacheOf<KEY, ENTRY, MAPPING, TABLE>() : table(*this) { }
-    void add(KEY key, ENTRY &entry, bool promoteIfAlreadyPresent=true)
+    CMRUCacheOf() : table(*this) { }
+    void replace(const KEY & key, ENTRY &entry)
     {
         if (full())
-            makeSpace();
+            makeSpace(nullptr);
 
-        MAPPING *mapping = table.find(key);
-        if (mapping)
-        {
-            if (promoteIfAlreadyPresent)
-                promote(mapping);
-        }
-        else
-        {
-            mapping = new MAPPING(key, entry); // owns entry
-            table.replace(*mapping);
-            mruList.enqueueHead(mapping);
-        }
+        MAPPING * mapping = new MAPPING(key, entry); // owns entry
+        table.replace(*mapping);
+        mruList.enqueueHead(mapping);
+    }
+    void replace(const KEY & key, ENTRY &entry, IRemovedMappingCallback * callback)
+    {
+        if (full())
+            makeSpace(callback);
+
+        MAPPING * mapping = new MAPPING(key, entry); // owns entry
+        table.replace(*mapping);
+        mruList.enqueueHead(mapping);
+    }
+    MAPPING * replace(const KEY & key, IRemovedMappingCallback * callback)
+    {
+        if (full())
+            makeSpace(callback);
+
+        MAPPING * mapping = new MAPPING(key); // owns entry
+        table.replace(*mapping);
+        mruList.enqueueHead(mapping);
+        return mapping;
+    }
+    unsigned getKeyHash(const KEY & key) const
+    {
+        return table.getHashFromFindParam(&key);
     }
     ENTRY *query(KEY key, bool doPromote=true)
     {
@@ -80,6 +103,24 @@ public:
         if (doPromote)
             promote(mapping);
         return &mapping->query(); // MAPPING must impl. query()
+    }
+    ENTRY *query(unsigned hashcode, KEY * key, bool doPromote=true)
+    {
+        MAPPING *mapping = table.find(hashcode, *key);
+        if (!mapping) return NULL;
+
+        if (doPromote)
+            promote(mapping);
+        return &mapping->query(); // MAPPING must impl. query()
+    }
+    MAPPING *queryMapping(unsigned hashcode, KEY * key, bool doPromote=true)
+    {
+        MAPPING *mapping = table.find(hashcode, *key);
+        if (!mapping) return NULL;
+
+        if (doPromote)
+            promote(mapping);
+        return mapping;
     }
     ENTRY *get(KEY key, bool doPromote=true)
     {
@@ -102,17 +143,29 @@ public:
         mruList.dequeue(mapping);
         return true;
     }
-    void kill() { clear(-1); }
+    void kill() { clear(-1, nullptr); }
     void promote(MAPPING *mapping)
     {
-        mruList.dequeue(mapping); // will still be linked in table
-        mruList.enqueueHead(mapping);
+        MAPPING * head = mruList.head();
+        dbgassertex(head); // If an items is being promoted within a list then there must be a head of the list
+        if (likely(head == mapping))
+            return;
+
+        // If an item is almost at the head of the list, then it may be worth avoiding moving it.
+        // There is a a trade off between the memory accessed by following pointers with the cost of moving the item
+        // Since head->next is likely to be in cache (from a previous update), it is likely to be worth avoiding moving
+        // the item if it is second.
+        MAPPING * headNext = head->next;
+        if (headNext == mapping)
+            return;
+
+        mruList.moveToHead(mapping);
     }
     CMRUIterator *getIterator()
     {
         return new SuperHashIteratorOf<MAPPING>(table);
     }
-    virtual void makeSpace() { }
+    virtual void makeSpace(IRemovedMappingCallback *) { }
     virtual bool full() { return false; }
     virtual void elementAdded(MAPPING *mapping) { }
     virtual void elementRemoved(MAPPING *mapping) { }
@@ -129,14 +182,14 @@ public:
     unsigned setCacheLimit(unsigned _cacheMax)
     {
         if (SELF::table.count() > _cacheMax)
-            this->clear(_cacheMax - SELF::table.count());
+            this->clear(_cacheMax - SELF::table.count(), nullptr);
         unsigned oldCacheMax = cacheMax;
         cacheMax = _cacheMax;
         return oldCacheMax;
     }
-    virtual void makeSpace()
+    virtual void makeSpace(IRemovedMappingCallback * callback)
     {
-        SELF::clear(cacheOverflow);
+        SELF::clear(cacheOverflow, callback);
     }
     virtual bool full()
     {

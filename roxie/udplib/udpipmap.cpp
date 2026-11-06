@@ -32,6 +32,7 @@ class IpMapTest : public CppUnit::TestFixture
         CPPUNIT_TEST(testIpMap);
         // CPPUNIT_TEST(testIpV6);
         CPPUNIT_TEST(testThread);
+        CPPUNIT_TEST(testMulti);
     CPPUNIT_TEST_SUITE_END();
 
     static unsigned *createMapEntry(const ServerIdentifier &)
@@ -42,10 +43,10 @@ class IpMapTest : public CppUnit::TestFixture
     void testIpMap()
     {
         unsigned five = 5;
-        auto createMapEntry = [five](const ServerIdentifier &ip)
+        auto createMapEntry = [five](const ServerIdentifier ip)
         {
             StringBuffer s;
-            printf("adding ip %s\n", ip.getTraceText(s).str());
+            DBGLOG("adding ip %s", ip.getTraceText(s).str());
             return new unsigned(five);
         };
         IpMapOf<unsigned> map(createMapEntry);
@@ -62,7 +63,7 @@ class IpMapTest : public CppUnit::TestFixture
             ASSERT(v == 5);
             entries++;
         }
-        printf("entries = %d\n", entries);
+        DBGLOG("entries = %d", entries);
         ASSERT(entries == 3);
     }
 #if 0
@@ -81,18 +82,20 @@ class IpMapTest : public CppUnit::TestFixture
     class IpEntry
     {
     public:
-        IpEntry()
+        IpEntry(const ServerIdentifier &_s) : s(_s)
         {
             numCreated++;
         }
+        ServerIdentifier s;
         static RelaxedAtomic<unsigned> numCreated;
     };
 
     void testThread()
     {
-        IpMapOf<IpEntry> map([](const ServerIdentifier &){return new IpEntry; });
+        IpEntry::numCreated = 0;
+        IpMapOf<IpEntry> map([](const ServerIdentifier s){return new IpEntry(s); });
         std::thread threads[100];
-        Semaphore ready;
+        Semaphore ready{SYNC_LOCATION};
         for (int i = 0; i < 100; i++)
         {
             threads[i] = std::thread([&]()
@@ -112,6 +115,20 @@ class IpMapTest : public CppUnit::TestFixture
             threads[i].join();
         }
         ASSERT(IpEntry::numCreated == 1000)
+        unsigned numInTable = 0;
+        for (auto &&i: map)
+        {
+            auto &entry = map[i.s];
+            ASSERT(&entry==&i);
+            numInTable++;
+        }
+        ASSERT(numInTable == 1000);
+    }
+
+    void testMulti()
+    {
+        for (unsigned i = 0; i < 1000; i++)
+            testThread();
     }
 };
 

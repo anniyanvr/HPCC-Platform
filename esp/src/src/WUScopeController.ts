@@ -1,10 +1,14 @@
-import { format as d3Format, Icon, Palette } from "@hpcc-js/common";
+import { Icon, Palette } from "@hpcc-js/common";
 import { BaseScope, ScopeEdge, ScopeGraph, ScopeSubgraph, ScopeVertex } from "@hpcc-js/comms";
-import { Edge, IEdge, IGraphData, IGraphData2, IHierarchy, ISubgraph, IVertex, Lineage, Subgraph, Vertex } from "@hpcc-js/graph";
+import { Edge, IGraphData, IGraphData2, Lineage, Subgraph, Vertex } from "@hpcc-js/graph";
 import { Edge as UtilEdge, Subgraph as UtilSubgraph, Vertex as UtilVertex } from "@hpcc-js/util";
-import { decodeHtml } from "./Utility";
+import { decodeHTML, format, formatNums, isSpill as _isSPill } from "./Utility";
 
-const formatNum = d3Format(",");
+function isSpill(edge: ScopeEdge) {
+    const sourceKind = edge.source._.attr("Kind").RawValue;
+    const targetKind = edge.target._.attr("Kind").RawValue;
+    return _isSPill(sourceKind, targetKind);
+}
 
 export type VertexType = Vertex | Icon;
 
@@ -204,58 +208,6 @@ export abstract class WUScopeControllerBase<ISubgraph, IVertex, IEdge, IGraphDat
 
     abstract graphGui(graphDB: ScopeGraph): IGraphData;
 
-    formatNum(str): string {
-        if (isNaN(str)) {
-            return str;
-        }
-        return formatNum(str);
-    }
-
-    formatNums(obj) {
-        for (const key in obj) {
-            obj[key] = this.formatNum(obj[key]);
-        }
-        return obj;
-    }
-
-    formatLine(labelTpl, obj): string {
-        let retVal = "";
-        let lpos = labelTpl.indexOf("%");
-        let rpos = -1;
-        let replacementFound = lpos >= 0 ? false : true;  //  If a line has no symbols always include it, otherwise only include that line IF a replacement was found  ---
-        while (lpos >= 0) {
-            retVal += labelTpl.substring(rpos + 1, lpos);
-            rpos = labelTpl.indexOf("%", lpos + 1);
-            if (rpos < 0) {
-                console.log("Invalid Label Template");
-                break;
-            }
-            const key = labelTpl.substring(lpos + 1, rpos);
-            replacementFound = replacementFound || !!obj[labelTpl.substring(lpos + 1, rpos)];
-            retVal += !key ? "%" : (obj[labelTpl.substring(lpos + 1, rpos)] || "");
-            lpos = labelTpl.indexOf("%", rpos + 1);
-        }
-        retVal += labelTpl.substring(rpos + 1, labelTpl.length);
-        return replacementFound ? retVal : "";
-    }
-
-    format(labelTpl, obj) {
-        labelTpl = labelTpl.split("\\n").join("\n");
-        return labelTpl
-            .split("\n")
-            .map(line => this.formatLine(line, obj))
-            .filter(d => d.trim().length > 0)
-            .map(decodeHtml)
-            .join("\n")
-            ;
-    }
-
-    isSpill(edge: ScopeEdge): boolean {
-        const sourceKind = edge.source._.attr("Kind").RawValue;
-        const targetKind = edge.target._.attr("Kind").RawValue;
-        return sourceKind === "2" || targetKind === "71";
-    }
-
     spansSubgraph(edge: ScopeEdge): boolean {
         return edge.source.parent._.Id !== edge.target.parent._.Id;
     }
@@ -272,7 +224,9 @@ export abstract class WUScopeControllerBase<ISubgraph, IVertex, IEdge, IGraphDat
                         ScopeType: "dummy-edge",
                         Properties: {
                             Property: [vertex._.attr("Label")]
-                        }
+                        },
+                        Notes: vertex._.Notes,
+                        SinkActivity: undefined
                     });
                 });
             }
@@ -324,9 +278,9 @@ export abstract class WUScopeControllerBase<ISubgraph, IVertex, IEdge, IGraphDat
         retVal["Id"] = item._.Id;
         for (const key in retVal) {
             //  TODO Move into BaseScope  ---
-            retVal[key] = decodeHtml(retVal[key]);
+            retVal[key] = decodeHTML(retVal[key]);
         }
-        retVal.__formatted = this.formatNums(item._.formattedAttrs());
+        retVal.__formatted = formatNums(item._.formattedAttrs());
         return retVal;
     }
 
@@ -372,15 +326,14 @@ export abstract class WUScopeControllerBase<ISubgraph, IVertex, IEdge, IGraphDat
             return _text;
         }
 
-        let label = "";
+        let label = scope.Id;
         const rows: string[] = [];
-        label = scope.Id;
         rows.push(`<tr><td class="key">ID:</td><td class="value">${highlightText("ID", scope.Id)}</td></tr>`);
         if (parentScope) {
             rows.push(`<tr><td class="key">Parent ID:</td><td class="value">${highlightText("Parent ID", parentScope.Id)}</td></tr>`);
         }
         rows.push(`<tr><td class="key">Scope:</td><td class="value">${highlightText("Scope", scope.ScopeName)}</td></tr>`);
-        const attrs = this.formatNums(scope.formattedAttrs());
+        const attrs = formatNums(scope.formattedAttrs());
         for (const key in attrs) {
             if (key === "Label") {
                 label = attrs[key];
@@ -514,7 +467,7 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
 
     createVertex(vertex: ScopeVertex): VertexType {
         const rawAttrs = vertex._.rawAttrs();
-        const formattedAttrs = this.formatNums(vertex._.formattedAttrs());
+        const formattedAttrs = formatNums(vertex._.formattedAttrs());
         formattedAttrs["ID"] = vertex._.Id;
         formattedAttrs["Parent ID"] = vertex.parent && vertex.parent._.Id;
         formattedAttrs["Scope"] = vertex._.ScopeName;
@@ -567,7 +520,7 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
         }
         this.scopeVerticesMap[v.id()] = vertex;
         if (v instanceof Vertex) {
-            const label = this.format(this.vertexLabelTpl(), formattedAttrs);
+            const label = format(this.vertexLabelTpl(), formattedAttrs);
             v
                 .icon_diameter(this.showIcon() ? 24 : 0)
                 .text(label)
@@ -580,14 +533,14 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
         const sourceV = this.verticesMap[edge.source._.Id];
         const targetV = this.verticesMap[edge.target._.Id];
         const rawAttrs = edge._.rawAttrs();
-        const formattedAttrs = this.formatNums(edge._.formattedAttrs());
+        const formattedAttrs = formatNums(edge._.formattedAttrs());
         formattedAttrs["ID"] = edge._.Id;
         formattedAttrs["Parent ID"] = edge.parent && edge.parent._.Id;
         formattedAttrs["Scope"] = edge._.ScopeName;
         let e = this.edgesMap[edge._.Id];
         if (!e) {
             if (sourceV && targetV) {
-                const isSpill = this.isSpill(edge);
+                const is_spill = isSpill(edge);
                 const spansSubgraph = this.spansSubgraph(edge);
 
                 let strokeDasharray = null;
@@ -597,7 +550,7 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
                     strokeDasharray = "1,2";
                 } else if (rawAttrs["_childGraph"]) {
                     strokeDasharray = "5,5";
-                } else if (isSpill) {
+                } else if (is_spill) {
                     weight = 25;
                     strokeDasharray = "5,5,10,5";
                 } else if (spansSubgraph) {
@@ -617,7 +570,7 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
         }
         if (e instanceof Edge) {
             this.scopeEdgesMap[e.id()] = edge;
-            const label = this.format(this.edgeLabelTpl(), formattedAttrs);
+            const label = format(this.edgeLabelTpl(), formattedAttrs);
             e.text(label);
             e.sourceVertex(sourceV);
             e.targetVertex(targetV);
@@ -649,7 +602,11 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
         const e = this.createEdge(edge);
         if (e) {
             const attrs = edge._.rawAttrs();
-            const numSlaves = edge.parent._.hasAttr("NumSlaves") ? parseInt(edge.parent._.attr("NumSlaves").RawValue) : Number.MAX_SAFE_INTEGER;
+            const numSlaves = edge._.hasAttr("NumSlaves") ?
+                parseInt(edge._.attr("NumSlaves").RawValue) :
+                edge.parent._.hasAttr("NumSlaves") ?
+                    parseInt(edge.parent._.attr("NumSlaves").RawValue) :
+                    Number.MAX_SAFE_INTEGER;
             const numStarts = parseInt(attrs["NumStarts"]);
             const numStops = parseInt(attrs["NumStops"]);
             if (!isNaN(numSlaves) && !isNaN(numStarts) && !isNaN(numStops)) {
@@ -685,7 +642,7 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
     filterPartial(graphDB: ScopeGraph) {
         for (const subgraph of graphDB.subgraphs) {
             const sg = this.subgraphsMap[subgraph._.Id];
-            switch (sg.minState()) {
+            switch (sg?.minState()) {
                 case "partial":
                     const childVertices: ReadonlyArray<ScopeVertex> = subgraph.vertices;
                     const vShow: ScopeVertex[] = [];
@@ -714,7 +671,9 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
                                     Creator: "",
                                     CreatorType: ""
                                 }]
-                            }
+                            },
+                            Notes: subgraph._.Notes,
+                            SinkActivity: undefined
                         };
                         const dummyScope = new BaseScope(dummyDetails);
                         const dummyVertex = subgraph.createVertex(dummyScope);
@@ -728,7 +687,9 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
                                         ScopeType: "dummy-in",
                                         Properties: {
                                             Property: []
-                                        }
+                                        },
+                                        Notes: edge.source._.Notes,
+                                        SinkActivity: undefined
                                     });
                                     console.log(dummyEdgeScope.Id);
                                     subgraph.createEdge(edge.source, dummyVertex, dummyEdgeScope);
@@ -742,7 +703,9 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
                                         ScopeType: "dummy-out",
                                         Properties: {
                                             Property: []
-                                        }
+                                        },
+                                        Notes: edge.target._.Notes,
+                                        SinkActivity: undefined
                                     });
                                     console.log(dummyEdgeScope.Id);
                                     subgraph.createEdge(dummyVertex, edge.target, dummyEdgeScope);
@@ -826,15 +789,21 @@ export class WUScopeController extends WUScopeControllerBase<Subgraph, VertexTyp
     }
 }
 
-export class WUScopeController8 extends WUScopeControllerBase<ISubgraph, IVertex, IEdge, IGraphData2> {
+export type GraphData2 = IGraphData2;
+export type ISubgraph = any;
+export type IVertex = any;
+export type IEdge = any;
+export type IHierarchy = any;
+
+export class WUScopeController8 extends WUScopeControllerBase<ISubgraph, IVertex, IEdge, GraphData2> {
 
     constructor() {
         super();
     }
 
     private collapsedOnce = false;
-    graphGui(graphDB: ScopeGraph): IGraphData2 {
-        const retVal: IGraphData2 = {
+    graphGui(graphDB: ScopeGraph): GraphData2 {
+        const retVal: GraphData2 = {
             subgraphs: [],
             vertices: [],
             edges: [],
@@ -914,7 +883,7 @@ export class WUScopeController8 extends WUScopeControllerBase<ISubgraph, IVertex
 
     private createVertex(vertex: ScopeVertex): IVertex {
         const rawAttrs = vertex._.rawAttrs();
-        const formattedAttrs = this.formatNums(vertex._.formattedAttrs());
+        const formattedAttrs = formatNums(vertex._.formattedAttrs());
         formattedAttrs["ID"] = vertex._.Id;
         formattedAttrs["Parent ID"] = vertex.parent && vertex.parent._.Id;
         formattedAttrs["Scope"] = vertex._.ScopeName;
@@ -959,7 +928,7 @@ export class WUScopeController8 extends WUScopeControllerBase<ISubgraph, IVertex
             this.verticesMap[vertex._.Id] = v;
         }
         this.scopeVerticesMap[v.id] = vertex;
-        const label = this.format(this.vertexLabelTpl(), formattedAttrs);
+        const label = format(this.vertexLabelTpl(), formattedAttrs);
         v.text = label;
         return v;
     }
@@ -968,14 +937,14 @@ export class WUScopeController8 extends WUScopeControllerBase<ISubgraph, IVertex
         const sourceV = this.verticesMap[edge.source._.Id];
         const targetV = this.verticesMap[edge.target._.Id];
         const rawAttrs = edge._.rawAttrs();
-        const formattedAttrs = this.formatNums(edge._.formattedAttrs());
+        const formattedAttrs = formatNums(edge._.formattedAttrs());
         formattedAttrs["ID"] = edge._.Id;
         formattedAttrs["Parent ID"] = edge.parent && edge.parent._.Id;
         formattedAttrs["Scope"] = edge._.ScopeName;
         let e = this.edgesMap[edge._.Id];
         if (!e) {
             if (sourceV && targetV) {
-                const isSpill = this.isSpill(edge);
+                const is_spill = isSpill(edge);
                 const spansSubgraph = this.spansSubgraph(edge);
 
                 let strokeDasharray;
@@ -985,7 +954,7 @@ export class WUScopeController8 extends WUScopeControllerBase<ISubgraph, IVertex
                     strokeDasharray = "1,2";
                 } else if (rawAttrs["_childGraph"]) {
                     strokeDasharray = "5,5";
-                } else if (isSpill) {
+                } else if (is_spill) {
                     weight = 25;
                     strokeDasharray = "5,5,10,5";
                 } else if (spansSubgraph) {
@@ -1004,7 +973,7 @@ export class WUScopeController8 extends WUScopeControllerBase<ISubgraph, IVertex
         }
         if (e) {
             this.scopeEdgesMap[e.id] = edge;
-            const label = this.format(this.edgeLabelTpl(), formattedAttrs);
+            const label = format(this.edgeLabelTpl(), formattedAttrs);
             e.label = label;
             e.source = sourceV;
             e.target = targetV;
@@ -1044,7 +1013,11 @@ export class WUScopeController8 extends WUScopeControllerBase<ISubgraph, IVertex
         const e = this.createEdge(edge);
         if (e) {
             const attrs = edge._.rawAttrs();
-            const numSlaves = edge.parent._.hasAttr("NumSlaves") ? parseInt(edge.parent._.attr("NumSlaves").RawValue) : Number.MAX_SAFE_INTEGER;
+            const numSlaves = edge._.hasAttr("NumSlaves") ?
+                parseInt(edge._.attr("NumSlaves").RawValue) :
+                edge.parent._.hasAttr("NumSlaves") ?
+                    parseInt(edge.parent._.attr("NumSlaves").RawValue) :
+                    Number.MAX_SAFE_INTEGER;
             const numStarts = parseInt(attrs["NumStarts"]);
             const numStops = parseInt(attrs["NumStops"]);
             if (!isNaN(numSlaves) && !isNaN(numStarts) && !isNaN(numStops)) {
@@ -1107,14 +1080,14 @@ export class WUScopeController8 extends WUScopeControllerBase<ISubgraph, IVertex
 
     scopeItem(_: string): ScopeSubgraph | ScopeVertex | ScopeEdge | undefined {
         const widget = this.item(_);
-        return widget ? this.rItem(widget.id) : undefined;
+        return widget ? this.rItem("" + widget.id) : undefined;
     }
 
     item(_: string): ISubgraph | IVertex | IEdge {
         return this.subgraphsMap[_] || this.verticesMap[_] || this.edgesMap[_];
     }
 
-    rItem(id: string): ScopeSubgraph | ScopeVertex | ScopeEdge {
+    rItem(id: string | number): ScopeSubgraph | ScopeVertex | ScopeEdge {
         return this.scopeSubgraphsMap[id] || this.scopeVerticesMap[id] || this.scopeEdgesMap[id];
     }
 

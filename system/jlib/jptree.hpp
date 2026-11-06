@@ -19,10 +19,14 @@
 #ifndef _PTREE_HPP
 #define _PTREE_HPP
 
+#include <vector>
+#include <functional>
+
 #include "jlib.hpp"
 #include "jexcept.hpp"
 #include "jiter.hpp"
 #include "jprop.hpp"
+#include "jlzw.hpp"
 
 #include <initializer_list>
 
@@ -57,6 +61,9 @@ interface IAttributeIterator : extends IInterface
 interface IPropertyTree;
 interface IPropertyTreeIterator : extends IIteratorOf<IPropertyTree> { };
 
+// Forward declaration for deserialization context
+class PTreeDeserializeContext;
+
 typedef unsigned IPTIteratorCodes;
 #define iptiter_null 0x00
 #define iptiter_sort 0x01
@@ -64,24 +71,42 @@ typedef unsigned IPTIteratorCodes;
 #define iptiter_remoteget 0x06
 #define iptiter_remotegetbranch 0x0e
 
+//typedef unsigned IPTIteratorCodes;
+//#define ipt_ext_null 0x00
+//#define ipt_ext_arrayitem 0x01
+//#define ipt_ext_is_escaped 0x02
+//#define ipt_ext_escape 0x04
+
 extern jlib_decl unsigned queryNumLocalTrees();
 extern jlib_decl unsigned queryNumAtomTrees();
+extern jlib_decl void dumpTopAtoms(unsigned topN, unsigned minLinkCount = 1);
 
+/**
+ * Note regarding IPropertyTree lifetime and safety:
+ * 1. It is not safe to query an attribute pointer without taking a copy (e.g. via StringBuffer)
+ *    and then set attributes within that same IPropertyTree. The act of setting an attribute
+ *    may cause internal memory allocations/expansions, potentially leaving any queried inline
+ *    attribute pointers dangling.
+ * 2. It is also not safe to query a property value or child tree and then overwrite or remove
+ *    that named property or tree. If a queried property value or child tree will be needed
+ *    whilst the parent IPropertyTree is being modified, a copy or linked copy must be taken first.
+ */
 interface jlib_decl IPropertyTree : extends serializable
 {
     virtual bool hasProp(const char *xpath) const = 0;
     virtual bool isBinary(const char *xpath=NULL) const = 0;
     virtual bool isCompressed(const char *xpath=NULL) const = 0; // needed for external/internal efficiency e.g. for clone
+    virtual CompressionMethod getCompressionType() const = 0;
     virtual bool renameProp(const char *xpath, const char *newName) = 0;
     virtual bool renameTree(IPropertyTree *tree, const char *newName) = 0;
 
     // string - all types can be converted to string
     virtual bool getProp(const char *xpath, StringBuffer &ret) const = 0;
-    virtual const char *queryProp(const char * xpath) const = 0;
+    virtual const char *queryProp(const char * xpath, const char * dft = nullptr) const = 0;
     virtual void setProp(const char *xpath, const char *val) = 0;
     virtual void addProp(const char *xpath, const char *val) = 0;
     virtual void appendProp(const char *xpath, const char *val) = 0;
-    
+
     virtual bool getPropBool(const char *xpath, bool dft=false) const = 0;
     virtual void setPropBool(const char *xpath, bool val) = 0;
     virtual void addPropBool(const char *xpath, bool val) = 0;
@@ -94,10 +119,12 @@ interface jlib_decl IPropertyTree : extends serializable
     virtual void setPropInt64(const char *xpath, __int64 val) = 0;
     virtual void addPropInt64(const char *xpath, __int64 val) = 0;
 
+    virtual void setPropReal(const char *xpath, double val) = 0;
+    virtual void addPropReal(const char *xpath, double val) = 0;
     virtual double getPropReal(const char *xpath, double dft=0.0) const = 0;
 
     virtual bool getPropBin(const char *xpath, MemoryBuffer &ret) const = 0;
-    virtual void setPropBin(const char *xpath, size32_t size, const void *data) = 0;
+    virtual void setPropBin(const char *xpath, size32_t size, const void *data, CompressionMethod preferredCompression = COMPRESS_METHOD_DEFAULT) = 0;
     virtual void addPropBin(const char *xpath, size32_t size, const void *data) = 0;
     virtual void appendPropBin(const char *xpath, size32_t size, const void *data) = 0;
 
@@ -125,12 +152,18 @@ interface jlib_decl IPropertyTree : extends serializable
     virtual unsigned numUniq() const = 0;
     virtual unsigned numChildren() const = 0;
     virtual bool isCaseInsensitive() const = 0;
+    virtual bool isLowMemory() const = 0;
     virtual bool IsShared() const = 0;
     virtual void localizeElements(const char *xpath, bool allTail=false) = 0;
     virtual unsigned getCount(const char *xpath) const = 0;
     virtual IPropertyTree *addPropTreeArrayItem(const char *xpath, IPropertyTree *val) = 0;
     virtual bool isArray(const char *xpath=NULL) const = 0;
     virtual unsigned getAttributeCount() const = 0;
+
+    virtual void serializeToStream(IBufferedSerialOutputStream &out) const = 0;
+    virtual void deserializeFromStream(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx) = 0;
+
+    virtual bool isOrphaned() const { return false; } // default: not orphaned; derivations (e.g. dali tree instances, can mark a tree as orphaned = no longer attached to a parent tree)
 
 private:
     void setProp(const char *, int); // dummy to catch accidental use of setProp when setPropInt() intended
@@ -157,7 +190,7 @@ interface jlib_thrown_decl IPTreeReadException : extends IException
 };
 extern jlib_decl IPTreeReadException *createPTreeReadException(int code, const char *msg, const char *context, unsigned line, offset_t offset);
 
-enum PTreeReaderOptions { ptr_none=0x00, ptr_ignoreWhiteSpace=0x01, ptr_noRoot=0x02, ptr_ignoreNameSpaces=0x04 };
+enum PTreeReaderOptions { ptr_none=0x00, ptr_ignoreWhiteSpace=0x01, ptr_noRoot=0x02, ptr_ignoreNameSpaces=0x04, ptr_encodeExtNames=0x08 };
 
 interface IPTreeReader : extends IInterface
 {
@@ -192,7 +225,7 @@ enum ipt_flags
     ipt_ordered = 0x04,   // Preserve element ordering
     ipt_fast    = 0x08,   // Prioritize speed over low memory usage
     ipt_lowmem  = 0x10,   // Prioritize low memory usage over speed
-    ipt_ext3    = 0x20,   // Unused
+    ipt_escaped = 0x20,   // Name is escaped to handle extended character set
     ipt_ext4    = 0x40,   // Used internally in Dali
     ipt_ext5    = 0x80    // Used internally in Dali
 };
@@ -218,7 +251,12 @@ jlib_decl void synchronizePTree(IPropertyTree *target, const IPropertyTree *sour
 jlib_decl IPropertyTree *ensurePTree(IPropertyTree *root, const char *xpath);
 jlib_decl bool areMatchingPTrees(const IPropertyTree * left, const IPropertyTree * right);
 
+//Similar to ptree->addProp(name, value) except it ensures the appended item is part of a list.  Ensures that YAML is regenerated correctly.
+jlib_decl void addPTreeItem(IPropertyTree *ptree, const char * name, const char * value);
+
 jlib_decl IPropertyTree *createPTree(MemoryBuffer &src, byte flags=ipt_none);
+jlib_decl IPropertyTree *createPTreeFromBinary(IBufferedSerialInputStream &src, byte flags);
+jlib_decl IPropertyTree *createPTreeFromBinary(IBufferedSerialInputStream &src, IPTreeNodeCreator *nodeCreator);
 
 jlib_decl IPropertyTree *createPTree(byte flags=ipt_none);
 jlib_decl IPropertyTree *createPTree(const char *name, byte flags=ipt_none);
@@ -239,6 +277,7 @@ jlib_decl bool checkParseUrlPathNodeValue(const char *s, StringBuffer &name, Str
 
 typedef int (*TreeCompareFunc)(IInterface * const *ll, IInterface * const *rr);
 jlib_decl IPropertyTreeIterator * createSortedIterator(IPropertyTreeIterator & iter, TreeCompareFunc compare);
+jlib_decl IPropertyTreeIterator * createSortedIterator(IArrayOf<IPropertyTree> & ownedElems, TreeCompareFunc compare);
 
 
 #define XML_SortTags 0x01
@@ -298,17 +337,52 @@ inline static bool isValidXPathChr(char c)
     return ('\0' != c && (isalnum(c) || strchr(validChrs, c)));
 }
 
-//export for unit test
-jlib_decl void mergeConfiguration(IPropertyTree & target, const IPropertyTree & source, const char *altNameAttribute=nullptr, bool overwriteAttr=true);
+// Merge source config into target. By default (5-arg form with mergeListItemContent=false),
+// arrays in target are replaced wholesale by source arrays.  Shorter overloads also use the
+// default replacement semantics; old identity-based list merging is opt-in via mergeListItemContent=true
+// or non-empty altNameAttribute, but it is unsafe (can silently collapse multiple items with
+// shared @name into one). See mergeConfiguration comment in jptree.cpp for full details and caveats.
+jlib_decl void mergeConfiguration(IPropertyTree & target, const IPropertyTree & source, const char *altNameAttribute=nullptr, bool overwriteAttr=true, bool mergeListItemContent=false);
 
-jlib_decl IPropertyTree * loadArgsIntoConfiguration(IPropertyTree *config, const char * * argv, std::initializer_list<const char *> ignoreOptions = {});
-jlib_decl IPropertyTree * loadConfiguration(IPropertyTree * defaultConfig, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute=nullptr);
-jlib_decl IPropertyTree * loadConfiguration(const char * defaultYaml, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute=nullptr);
-jlib_decl IPropertyTree * queryCostsConfiguration();
+jlib_decl IPropertyTree * loadArgsIntoConfiguration(IPropertyTree *config, const char * * argv, std::initializer_list<const std::string> ignoreOptions = {});
+jlib_decl IPropertyTree * loadConfiguration(IPropertyTree * defaultConfig, IPropertyTree * globalConfig, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute=nullptr, bool monitor=true);
+jlib_decl IPropertyTree * loadConfiguration(const char * defaultYaml, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute=nullptr, bool monitor=true);
+jlib_decl void replaceComponentConfig(IPropertyTree *newComponentConfig, IPropertyTree *newGlobalConfig);
+jlib_decl void initNullConfiguration();
 
 //The following can only be called after loadConfiguration has been called.  All components must call loadConfiguration().
-jlib_decl IPropertyTree & queryGlobalConfig();
-jlib_decl IPropertyTree & queryComponentConfig();
+jlib_decl IPropertyTree * getGlobalConfig();
+jlib_decl IPropertyTree * getComponentConfig();
+jlib_decl Owned<IPropertyTree> getGlobalConfigSP(); // get smart pointer
+jlib_decl Owned<IPropertyTree> getComponentConfigSP(); // get smart pointer
+jlib_decl const char * queryComponentName();
+
+// utility functions that check component configuration 1st, then global configuration, then default to the provided default value
+jlib_decl bool getConfigBool(const char *xpath, bool defaultValue=false);
+jlib_decl int getConfigInt(const char *xpath, int defaultValue=0);
+jlib_decl __int64 getConfigInt64(const char *xpath, __int64 defaultValue=0);
+jlib_decl bool getConfigString(const char *xpath, StringBuffer &result);
+jlib_decl double getConfigReal(const char *xpath, double defaultValue=0.0);
+
+
+// ConfigUpdateFunc calls are made in a mutex, but after new confis are swapped in
+typedef std::function<void (const IPropertyTree *oldComponentConfiguration, const IPropertyTree *oldGlobalConfiguration)> ConfigUpdateFunc;
+typedef std::function<void (IPropertyTree * newComponentConfiguration, IPropertyTree * newGlobalConfiguration)> ConfigModifyFunc;
+jlib_decl unsigned installConfigUpdateHook(ConfigUpdateFunc notifyFunc, bool callWhenInstalled);
+jlib_decl unsigned installConfigUpdateHook(ConfigModifyFunc notifyFunc);  // This function must be called before the configuration is loaded.
+jlib_decl void removeConfigUpdateHook(unsigned notifyFuncId);
+jlib_decl void refreshConfiguration();  // (Optionally) reload the configuration file, reapply changes, and derive cached information
+
+class jlib_decl CConfigUpdateHook
+{
+    std::atomic<unsigned> configCBId{(unsigned)-1};
+    CriticalSection crit{SYNC_LOCATION};
+public:
+    ~CConfigUpdateHook() { clear(); }
+    void clear();
+    void installOnce(ConfigUpdateFunc callbackFunc, bool callWhenInstalled);
+    void installModifierOnce(ConfigModifyFunc callbackFunc, bool threadSafe);
+};
 
 /*
  YAML to PTree support
@@ -343,6 +417,9 @@ jlib_decl IPropertyTree *createPTreeFromYAMLString(const char *yaml, byte flags=
 jlib_decl IPropertyTree *createPTreeFromYAMLString(unsigned len, const char *yaml, byte flags=ipt_none, PTreeReaderOptions readFlags=ptr_ignoreWhiteSpace, IPTreeMaker *iMaker=NULL);
 jlib_decl IPropertyTree *createPTreeFromYAMLFile(const char *filename, byte flags=ipt_none, PTreeReaderOptions readFlags=ptr_ignoreWhiteSpace, IPTreeMaker *iMaker=NULL);
 
+jlib_decl void applyProperties(IPropertyTree * target, const IProperties * source);
+jlib_decl void applyProperty(IPropertyTree * target, const char * source);              // Process name[=value]
+
 #define YAML_HideRootArrayObject 0x04
 #define YAML_SortTags XML_SortTags
 #define YAML_Sanitize XML_Sanitize
@@ -360,5 +437,63 @@ jlib_decl void dbglogYAML(const IPropertyTree *tree, unsigned indent = 0, unsign
 
 // Defines the threshold where attribute value maps are created for sibling ptrees for fast lookups
 jlib_decl void setPTreeMappingThreshold(unsigned threshold);
+
+jlib_decl void copyPropIfMissing(IPropertyTree & target, const char * targetName, IPropertyTree & source, const char * sourceName);
+jlib_decl void copyProp(IPropertyTree & target, IPropertyTree & source, const char * name);
+
+jlib_decl StringBuffer &encodePtreeName(StringBuffer &s, unsigned size, const char *value, const char *startEncoding=nullptr);
+jlib_decl StringBuffer &encodePTreeName(StringBuffer &s, const char *value, const char *startEncoding=nullptr);
+
+//Only encode the PTREE XPATH name if necessary. That matches the way internal PTREE names are stored allowing the resulting XPATH to be used directly
+jlib_decl StringBuffer &appendPTreeXPathName(StringBuffer &s, unsigned size, const char *value);
+jlib_decl StringBuffer &appendPTreeXPathName(StringBuffer &s, const char *value);
+
+jlib_decl void markPTreeNameEncoded(IPropertyTree *tree);
+jlib_decl bool isPTreeNameEncoded(const IPropertyTree *tree);
+jlib_decl void setPTreeAttribute(IPropertyTree *tree, const char *name, const char *value, bool markEncoded);
+jlib_decl bool isPTreeAttributeNameEncoded(const IPropertyTree *tree, const char *name);
+jlib_decl bool isNullPtreeName(const char * name, bool isEncoded);
+
+jlib_decl StringBuffer &decodePtreeName(StringBuffer &s, const char *name, unsigned len);
+jlib_decl StringBuffer &decodePtreeName(StringBuffer &s, const char *name);
+
+jlib_decl const char *findFirstInvalidPTreeNameChar(const char *ch, unsigned len);
+jlib_decl const char *findFirstInvalidPTreeNameChar(const char *ch);
+
+extern jlib_decl bool hasExpertOpt(const char *opt);
+extern jlib_decl StringBuffer &getExpertOptPath(const char *opt, StringBuffer &out);
+extern jlib_decl bool getExpertOptBool(const char *opt, bool dft=false);
+extern jlib_decl __int64 getExpertOptInt64(const char *opt, __int64 dft=0);
+extern jlib_decl double getExpertOptReal(const char *opt, double dft);
+extern jlib_decl StringBuffer &getExpertOptString(const char *opt, StringBuffer &out);
+extern jlib_decl void setExpertOpt(const char *opt, const char *value);
+
+
+//---------------------------------------------------------------------------------------------------------------------
+
+extern jlib_decl unsigned getPropertyTreeHash(const IPropertyTree & source, unsigned hashcode);
+
+//Interface for encapsulating an IPropertyTree that can be atomically updated.  The result of getTree() is guaranteed
+//to not be modified and to remain valid and consistent until it is released.
+interface ISyncedPropertyTree : extends IInterface
+{
+//The following functions check whether something is up to date before returning their values.
+    //Return a version-hash which changes whenever the property tree changes - so that a caller can determine whether it needs to update
+    virtual unsigned getVersion() const = 0;
+    virtual const IPropertyTree * getTree() const = 0;
+    virtual bool getProp(MemoryBuffer & result, const char * xpath) const = 0;
+    virtual bool getProp(StringBuffer & result, const char * xpath) const = 0;
+
+// The following functions return the current cached state - they do not force a check to see if the value is up to date
+    virtual bool isStale() const = 0; // An indication that the property tree may be out of date because it couldn't be resynchronized.
+    virtual bool isValid() const = 0; // Is the property tree non-null?  Typically called at startup to check configuration is provided.
+};
+
+extern jlib_decl ISyncedPropertyTree * createSyncedPropertyTree(IPropertyTree * tree);
+
+#ifdef _USE_CPPUNIT
+// test-only function to mark a tree as orphaned for unit test scenarios
+extern jlib_decl void cppunitMarkTreeOrphaned(IPropertyTree * tree);
+#endif
 
 #endif

@@ -42,6 +42,7 @@ unsigned CThorIndexWriteArg::getWidth() { return 0; }
 ICompare * CThorIndexWriteArg::queryCompare() { return NULL; }
 const IBloomBuilderInfo * const *CThorIndexWriteArg::queryBloomInfo() const { return nullptr; }
 __uint64 CThorIndexWriteArg::getPartitionFieldMask() const { return 0; }
+const char * CThorIndexWriteArg::queryCompression() { return nullptr; }
 
 //CBloomBuilderInfo
 __uint64 CBloomBuilderInfo::getBloomFields() const
@@ -74,6 +75,11 @@ unsigned CThorDiskWriteArg::getExpiryDays() { return 0; }
 void CThorDiskWriteArg::getUpdateCRCs(unsigned & eclCRC, unsigned __int64 & totalCRC) { }
 void CThorDiskWriteArg::getEncryptKey(size32_t & keyLen, void * & key) { keyLen = 0; key = 0; }
 const char * CThorDiskWriteArg::getCluster(unsigned idx) { return NULL; }
+unsigned CThorDiskWriteArg::getWidth() { return 0; }
+const char * CThorDiskWriteArg::queryFormat()                      { return nullptr; }
+void CThorDiskWriteArg::getFormatOptions(IXmlWriter & options)     { }
+const char * CThorDiskWriteArg::queryProvider()                    { return nullptr; }
+void CThorDiskWriteArg::getProviderOptions(IXmlWriter & options)   { }
 
 //CThorPipeReadArg
 unsigned CThorPipeReadArg::getPipeFlags() { return 0; }
@@ -187,6 +193,11 @@ unsigned CThorSpillArg::getExpiryDays() { return 0; }
 void CThorSpillArg::getUpdateCRCs(unsigned & eclCRC, unsigned __int64 & totalCRC) { }
 void CThorSpillArg::getEncryptKey(size32_t & keyLen, void * & key) { keyLen = 0; key = 0; }
 const char * CThorSpillArg::getCluster(unsigned idx) { return NULL; }
+unsigned CThorSpillArg::getWidth() { return 0; }
+const char * CThorSpillArg::queryFormat()                      { return nullptr; }
+void CThorSpillArg::getFormatOptions(IXmlWriter & options)     { }
+const char * CThorSpillArg::queryProvider()                    { return nullptr; }
+void CThorSpillArg::getProviderOptions(IXmlWriter & options)   { }
 
 //CThorRollupArg
 
@@ -493,6 +504,7 @@ ICompare * CThorHashDistributeArg::queryMergeCompare() { return NULL; }
 
 unsigned CThorNWayDistributeArg::getFlags() { return 0; }
 bool     CThorNWayDistributeArg::include(const byte * left, unsigned targetNode) { return true; }    // default to include all
+unsigned CThorNWayDistributeArg::getWidth() { return 0; }
 
 //CThorHashDedupArg
 
@@ -531,6 +543,7 @@ unsigned CThorCsvWriteArg::getExpiryDays() { return 0; }
 void CThorCsvWriteArg::getUpdateCRCs(unsigned & eclCRC, unsigned __int64 & totalCRC) { }
 void CThorCsvWriteArg::getEncryptKey(size32_t & keyLen, void * & key) { keyLen = 0; key = 0; }
 const char * CThorCsvWriteArg::getCluster(unsigned idx) { return NULL; }
+unsigned CThorCsvWriteArg::getWidth() { return 0; }
 
 //CThorXmlParseArg
 
@@ -584,6 +597,7 @@ unsigned CThorXmlWriteArg::getExpiryDays() { return 0; }
 void CThorXmlWriteArg::getUpdateCRCs(unsigned & eclCRC, unsigned __int64 & totalCRC) { }
 void CThorXmlWriteArg::getEncryptKey(size32_t & keyLen, void * & key) { keyLen = 0; key = 0; }
 const char * CThorXmlWriteArg::getCluster(unsigned idx) { return NULL; }
+unsigned CThorXmlWriteArg::getWidth() { return 0; }
 
 //CHThorXmlWriteExtra
 const char * CHThorXmlWriteExtra::getXmlIteratorPath() { return NULL; }             // supplies the prefix and suffix for a row
@@ -614,9 +628,12 @@ IXmlToRowTransformer * CThorSoapActionArg::queryInputTransformer() { return NULL
 const char * CThorSoapActionArg::getInputIteratorPath() { return NULL; }
 size32_t CThorSoapActionArg::onFailTransform(ARowBuilder & rowBuilder, const void * left, IException * e) { return 0; }
 void CThorSoapActionArg::getLogText(size32_t & lenText, char * & text, const void * left) { lenText =0; text = NULL; }
+void CThorSoapActionArg::getLogTailText(size32_t & lenText, char * & text, const void * left) { lenText =0; text = NULL; }
 const char * CThorSoapActionArg::getXpathHintsXml() { return nullptr;}
 const char * CThorSoapActionArg::getRequestHeader() { return nullptr; }
 const char * CThorSoapActionArg::getRequestFooter() { return nullptr; }
+unsigned CThorSoapActionArg::getPersistMaxRequests() { return 0; }
+unsigned CThorSoapActionArg::getPersistPoolSize() { return 0; }
 
 //CThorSoapCallArg
 
@@ -642,9 +659,12 @@ const char * CThorSoapCallArg::getInputIteratorPath() { return NULL; }
 const char * CThorSoapCallArg::getXpathHintsXml() { return nullptr; }
 const char * CThorSoapCallArg::getRequestHeader() { return nullptr; }
 const char * CThorSoapCallArg::getRequestFooter() { return nullptr; }
+unsigned CThorSoapCallArg::getPersistMaxRequests() { return 0; }
+unsigned CThorSoapCallArg::getPersistPoolSize() { return 0; }
 
 size32_t CThorSoapCallArg::onFailTransform(ARowBuilder & rowBuilder, const void * left, IException * e) { return 0; }
 void CThorSoapCallArg::getLogText(size32_t & lenText, char * & text, const void * left) { lenText =0; text = NULL; }
+void CThorSoapCallArg::getLogTailText(size32_t & lenText, char * & text, const void * left) { lenText =0; text = NULL; }
 
 //CThorParseArg
 
@@ -896,9 +916,10 @@ void CThorNewDiskReadArg::getEncryptKey(size32_t & keyLen, void * & key) { keyLe
 unsigned __int64 CThorNewDiskReadArg::getChooseNLimit()              { return I64C(0x7fffffffffffffff); }
 unsigned __int64 CThorNewDiskReadArg::getRowLimit()                  { return (unsigned __int64) -1; }
 void CThorNewDiskReadArg::onLimitExceeded()                          { }
-const char * CThorNewDiskReadArg::queryFormat()                      { return "flat"; }
+const char * CThorNewDiskReadArg::queryFormat()                      { return nullptr; }
 void CThorNewDiskReadArg::getFormatOptions(IXmlWriter & options)     { }
-void CThorNewDiskReadArg::getFormatDynOptions(IXmlWriter & options)  { }
+const char * CThorNewDiskReadArg::queryProvider()                    { return nullptr; }
+void CThorNewDiskReadArg::getProviderOptions(IXmlWriter & options)   { }
 
 bool CThorNewDiskReadArg::needTransform() { return false; }
 bool CThorNewDiskReadArg::transformMayFilter() { return false; }

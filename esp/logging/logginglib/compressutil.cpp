@@ -24,8 +24,8 @@ size32_t LZWCompress(const void* src, size32_t srcSz, void* dest, size32_t destS
     assertex(destSz>=srcSz+sizeof(size32_t));
     if (srcSz>=threshold)
     {
-        Owned<ICompressor> compressor = createLZWCompressor();
-        compressor->open((byte*)dest + sizeof(size32_t), srcSz * 4 / 5);
+        Owned<ICompressor> compressor = createLZWCompressor(false);
+        compressor->open((byte*)dest + sizeof(size32_t), srcSz * 4 / 5, 0, false);
         if(compressor->write(src, srcSz)==srcSz)
         {
             compressor->close();
@@ -71,7 +71,7 @@ size32_t LZWExpand(const void* src, size32_t srcSz, void* dest, size32_t destSz)
     byte* data = (byte*)src+sizeof(size32_t);
     if(ret)     // compressed
     {
-        Owned<IExpander> expander = createLZWExpander();
+        Owned<IExpander> expander = createLZWExpander(false);
         assertex(destSz >= ret);
         expander->init(data);
         expander->expand(dest);

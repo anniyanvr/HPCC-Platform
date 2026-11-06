@@ -1,22 +1,18 @@
-import * as arrayUtil from "dojo/_base/array";
-import * as config from "dojo/_base/config";
-import * as declare from "dojo/_base/declare";
-import * as Deferred from "dojo/_base/Deferred";
-import * as lang from "dojo/_base/lang";
-import * as cookie from "dojo/cookie";
-import * as QueryResults from "dojo/store/util/QueryResults";
-import * as topic from "dojo/topic";
+import { arrayUtil, config, Deferred, lang, cookie, QueryResults, topic } from "src-dojo/index";
 import * as ESPUtil from "./ESPUtil";
 
 import * as hpccComms from "@hpcc-js/comms";
+import { scopedLogger } from "@hpcc-js/util";
+
+const logger = scopedLogger("src/ESPRequest.ts");
 
 declare const dojo: any;
 declare const debugConfig: any;
 
 class RequestHelper {
 
-    serverIP: null;
-    timeOutSeconds: number;
+    readonly serverIP: null;
+    readonly timeOutSeconds: number;
 
     constructor() {
         this.serverIP = (typeof debugConfig !== "undefined") ? debugConfig.IP : this.getParamFromURL("ServerIP");
@@ -35,7 +31,7 @@ class RequestHelper {
         return config[key];
     }
 
-    getBaseURL(service) {
+    getBaseURL(service?) {
         if (service === undefined) {
             service = "WsWorkunits";
         }
@@ -102,14 +98,13 @@ class RequestHelper {
         }
         // var method = params.method ? params.method : "get";
 
-        let retVal = null;
+        let transport;
         if (this.isCrossSite()) {
-            const transport = new hpccComms.Connection({ baseUrl: this.getBaseURL(service), timeoutSecs: params.request.timeOutSeconds || this.timeOutSeconds, type: "jsonp" });
-            retVal = transport.send(action + postfix, params.request, handleAs === "text" ? "text" : "json");
+            transport = new hpccComms.Connection({ baseUrl: this.getBaseURL(service), timeoutSecs: params.request.timeOutSeconds || this.timeOutSeconds, type: "jsonp" });
         } else {
-            const transport = new hpccComms.Connection({ baseUrl: this.getBaseURL(service), timeoutSecs: params.request.timeOutSeconds || this.timeOutSeconds });
-            retVal = transport.send(action + postfix, params.request, handleAs === "text" ? "text" : "json");
+            transport = new hpccComms.Connection({ baseUrl: this.getBaseURL(service), timeoutSecs: params.request.timeOutSeconds || this.timeOutSeconds });
         }
+        const retVal = transport.send(action + postfix, params.request, handleAs === "text" ? "text" : "json");
 
         return retVal.then(function (response) {
             if (lang.exists("Exceptions.Exception", response)) {
@@ -119,7 +114,6 @@ class RequestHelper {
                             status: "DoIdle"
                         });
                     }
-                    cookie("Status", "Locked");
                     ESPUtil.LocalStorage.removeItem("Status");
                 }
             }
@@ -133,7 +127,7 @@ class RequestHelper {
 
     send(service, action, params?): Promise<any> {
         if (!this.isSessionCall(service, action) && (!this.hasServerSetCookie() || (this.hasAuthentication() && !this.isAuthenticated()))) {
-            // tslint:disable-next-line: deprecation
+            // @ts-expect-error
             window.location.reload(true);
             return new Promise((resolve, reject) => { });
         }
@@ -156,6 +150,7 @@ class RequestHelper {
                 if (lang.exists("Exceptions.Source", response) && !params.skipExceptions) {
                     let severity = params.suppressExceptionToaster ? "Info" : "Error";
                     const source = service + "." + action;
+                    let message = "";
                     if (lang.exists("Exceptions.Exception", response) && response.Exceptions.Exception.length === 1) {
                         switch (source) {
                             case "WsWorkunits.WUInfo":
@@ -189,12 +184,20 @@ class RequestHelper {
                                 }
                                 break;
                         }
+                        message = response.Exceptions.Exception[0].Message;
                     }
                     topic.publish("hpcc/brToaster", {
                         Severity: severity,
                         Source: source,
                         Exceptions: response.Exceptions.Exception
                     });
+                    if (message) {
+                        if (severity === "Error") {
+                            logger.error(message);
+                        } else {
+                            logger.info(message);
+                        }
+                    }
                 }
             }
             return response;
@@ -321,7 +324,7 @@ export function flattenMap(target, arrayName, _singularName?, supressAppName?, e
     return target;
 }
 
-export function getBaseURL(service) {
+export function getBaseURL(service?) {
     const helper = new RequestHelper();
     return helper.getBaseURL(service);
 }
@@ -331,42 +334,47 @@ export function send(service, action, params?) {
     return helper.send(service, action, params);
 }
 
-export const Store = declare(null, {
-    SortbyProperty: "Sortby",
-    DescendingProperty: "Descending",
-    useSingletons: true,
+export abstract class Store {
 
-    constructor(options) {
-        this.cachedArray = {};
+    abstract service: string;
+    abstract action: string;
+    abstract responseQualifier: string;
+    abstract responseTotalQualifier: string;
+    abstract idProperty: string;
 
-        if (!this.service) {
-            throw new Error("service:  Undefined - Missing service name (eg 'WsWorkunts').");
-        }
-        if (!this.action) {
-            throw new Error("action:  Undefined - Missing action name (eg 'WUQuery').");
-        }
-        if (!this.responseQualifier) {
-            throw new Error("responseQualifier:  Undefined - Missing action name (eg 'Workunits.ECLWorkunit').");
-        }
-        if (!this.idProperty) {
-            throw new Error("idProperty:  Undefined - Missing ID field (eg 'Wuid').");
-        }
-        if (options) {
-            declare.safeMixin(this, options);
-        }
-    },
+    startProperty: string;
+    countProperty: string;
+
+    SortbyProperty = "Sortby";
+    DescendingProperty = "Descending";
+
+    useSingletons = true;
+    cachedArray = {};
+
+    constructor() {
+    }
+
+    notify(itme, id) {
+        //  Overriden by Observable
+    }
+
+    preRequest(request: any) { }
+    preProcessFullResponse(response, request, query, options) { }
+    preProcessResponse(response, request, query, options) { }
+    preProcessRow(item, request, query, options) { }
+    postProcessResults(items) { }
 
     endsWith(str, suffix) {
         return str.indexOf(suffix, str.length - suffix.length) !== -1;
-    },
+    }
 
     getIdentity(item) {
         return item[this.idProperty];
-    },
+    }
 
     getCachedArray(create) {
         return this.useSingletons ? lang.getObject(this.service + "." + this.action, create, _StoreSingletons) : this.cachedArray;
-    },
+    }
 
     exists(id) {
         const cachedArray = this.getCachedArray(false);
@@ -374,9 +382,9 @@ export const Store = declare(null, {
             return cachedArray[id] !== undefined;
         }
         return false;
-    },
+    }
 
-    get(id, item) {
+    get(id, item?) {
         if (!this.exists(id)) {
             const cachedArray = this.getCachedArray(true);
             cachedArray[id] = this.create(id, item);
@@ -384,33 +392,33 @@ export const Store = declare(null, {
         }
         const cachedArray = this.getCachedArray(false);
         return cachedArray[id];
-    },
+    }
 
     create(id, item) {
         const retVal = {
         };
         retVal[this.idProperty] = id;
         return retVal;
-    },
+    }
 
     update(id, item) {
         lang.mixin(this.get(id), item);
-    },
+    }
 
     remove(id) {
         const cachedArray = this.getCachedArray(false);
         if (cachedArray) {
             delete cachedArray[id];
         }
-    },
+    }
 
     _hasResponseContent(response) {
         return lang.exists(this.responseQualifier, response);
-    },
+    }
 
     _getResponseContent(response) {
         return lang.getObject(this.responseQualifier, false, response);
-    },
+    }
 
     query(query, options) {
         const request = query;
@@ -469,4 +477,4 @@ export const Store = declare(null, {
         });
         return QueryResults(deferredResults);
     }
-});
+}

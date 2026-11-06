@@ -37,7 +37,9 @@
           the container of the current folder. Using a caret within the module
           specifier (such as, myModule.^) selects the container of that
           folder. A leading caret specifies the logical root of the file
-          tree.</entry>
+          tree. Within a MACRO or FUNCTIONMACRO, <link
+          linkend="_HASH_DOLLAR">#$</link> refers to the module and package
+          where the macro was defined.</entry>
         </row>
 
         <row>
@@ -102,7 +104,7 @@
 
   <para><?hard-pagebreak ?>Examples:</para>
 
-  <programlisting>IMPORT $;                      //makes all definitions from the same folder available
+  <programlisting lang="ECL">IMPORT $;                      //makes all definitions from the same folder available
 
 IMPORT $, Std;                 //makes the standard library functions available, also
 
@@ -119,7 +121,7 @@ IMPORT SomeFolder.SomeFile;    // make available a specific file
 
 IMPORT SomeReallyLongFolderName AS SN;  //alias the long name as "SN"
 
-IMPORT ^ as root;              //allows access to non-modules defined 
+IMPORT ^ AS root;              //allows access to non-modules defined 
                                //in the root of the repository
 
 IMPORT Def1,Def2 FROM Fred;    //makes Def1 and Def2 from Fred folder available, unqualified

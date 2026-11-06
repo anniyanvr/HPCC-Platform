@@ -25,7 +25,7 @@
 class CppCompiler : implements ICppCompiler, implements IThreadFactory, public CInterface, implements IExceptionHandler
 {
 public:
-    CppCompiler(const char * _coreName, const char * _sourceDir, const char * _targetDir, unsigned _targetCompiler, bool _verbose);
+    CppCompiler(const char * _coreName, const char * _sourceDir, const char * _targetDir, unsigned _targetCompiler, bool _verbose, const char * _compileBatchOut);
     IMPLEMENT_IINTERFACE
 
     virtual void addCompileOption(const char * option);
@@ -43,6 +43,7 @@ public:
     virtual void setOnlyCompile(bool _onlyCompile) { onlyCompile = _onlyCompile; }
     virtual void setCreateExe(bool _createExe); 
     virtual void setOptimizeLevel(unsigned level);
+    virtual void setStripSymbols(bool stripSymbols);
     virtual void setTargetBitLength(unsigned bitlength);
     virtual void setMaxCompileThreads(const unsigned max) { maxCompileThreads = max; }
     virtual IPooledThread *createNew();
@@ -51,6 +52,10 @@ public:
     virtual void setPrecompileHeader(bool _pch);
     virtual void setAbortChecker(IAbortRequestCallback * _abortChecker) {abortChecker = _abortChecker;}
     virtual bool fireException(IException *e);
+    virtual void removeTempDir(const char *fname);
+    virtual void removeTemporary(const char *fname);
+    virtual bool reportOnly() const;
+    virtual void finish();
 
 protected:
     void expandCompileOptions(StringBuffer & target, bool isC);
@@ -59,7 +64,7 @@ protected:
     void removeTemporaries();
     bool compileFile(IThreadPool * pool, const char * filename, const char *flags, Semaphore & finishedCompiling);
     bool doLink();
-    void writeLogFile(const char* filepath, StringBuffer& log);
+    void writeLogFile(const char* filepath, StringBuffer& log) ;
 
 public:
     std::atomic_uint numFailed;
@@ -68,11 +73,15 @@ protected:
     StringBuffer    compilerOptions;
     StringBuffer    linkerOptions;
     StringBuffer    linkerLibraries;
+    StringBuffer    batchOutText;
     StringAttr      sourceDir;
     StringAttr      targetDir;
+    StringAttr      compileBatchOut;
     StringArray     allSources;
     StringArray     allFlags;
     StringArray     logFiles;
+    StringArray     linkerLibPaths;
+    StringArray     linkerRPaths;
     StringAttr      ccLogPath;
     StringAttr      coreName;
     unsigned        targetCompiler;
@@ -87,7 +96,7 @@ protected:
     bool            precompileHeader;
     bool            linkFailed;
     IAbortRequestCallback * abortChecker;
-    CriticalSection cs;
+    CriticalSection cs{SYNC_LOCATION};
     IArrayOf<IException> exceptions;
 };
 

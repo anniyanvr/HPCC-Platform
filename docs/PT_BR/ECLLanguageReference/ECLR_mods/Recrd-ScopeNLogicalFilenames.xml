@@ -35,7 +35,7 @@
     em um cluster com nome de escopo padrão "Training", as duas ações OUTPUT a
     seguir resultarão no mesmo escopo:</para>
 
-    <programlisting>OUTPUT(SomeFile,,'SomeDir::SomeFileOut1');
+    <programlisting lang="ECL">OUTPUT(SomeFile,,'SomeDir::SomeFileOut1');
 OUTPUT(SomeFile,,'~Training::SomeDir::SomeFileOut2');</programlisting>
 
     <para>A presença de um til no início do nome do campo define apenas o nome
@@ -47,7 +47,7 @@ OUTPUT(SomeFile,,'~Training::SomeDir::SomeFileOut2');</programlisting>
         <primary>DATASET declaration</primary>
       </indexterm>s para esses arquivos pode ser parecida com:</para>
 
-    <programlisting>RecStruct := {STRING line};
+    <programlisting lang="ECL">RecStruct := {STRING line};
 ds1 := DATASET('SomeDir::SomeFileOut1',RecStruct,THOR);
 ds2 := DATASET('~Training::SomeDir::SomeFileOut2',RecStruct,THOR);</programlisting>
 
@@ -62,11 +62,17 @@ ds2 := DATASET('~Training::SomeDir::SomeFileOut2',RecStruct,THOR);</programlisti
     As duas definições de DATASET a seguir permitem acessar esses
     dados:</para>
 
-    <programlisting>FileX := DATASET('~Training::SomeDir::SomeFileOut1',RecStruct,THOR);
+    <programlisting lang="ECL">FileX := DATASET('~Training::SomeDir::SomeFileOut1',RecStruct,THOR);
 FileY := DATASET('~Training::SomeDir::SomeFileOut2',RecStruct,THOR);</programlisting>
 
     <para>Note a presença do nome do escopo nas duas definições. Isso é
     obrigatório porque os arquivos estão em outro escopo.</para>
+
+    <para>Você deve ser econômico no uso de escopos de arquivo. A profundidade
+    dos escopos de arquivo pode ter um custo de desempenho em sistemas com File
+    Scope Security ativado. Esse custo é ainda maior quando File Scope Scans
+    estão ativadas, porque o sistema precisa fazer uma chamada LDAP externa
+    para verificar todos os níveis no escopo, de cima para baixo.</para>
   </sect2>
 
   <sect2 id="Foreign_Files">
@@ -100,7 +106,7 @@ FileY := DATASET('~Training::SomeDir::SomeFileOut2',RecStruct,THOR);</programlis
 
     <para>Por exemplo,</para>
 
-    <programlisting>MyFile :=DATASET('~foreign::10.150.50.11::training::thor::myfile',
+    <programlisting lang="ECL">MyFile :=DATASET('~foreign::10.150.50.11::training::thor::myfile',
                  RecStruct,FLAT);</programlisting>
 
     <para>concede acesso somente leitura ao arquivo remoto
@@ -126,7 +132,7 @@ FileY := DATASET('~Training::SomeDir::SomeFileOut2',RecStruct,THOR);</programlis
 
     <para>Por exemplo,</para>
 
-    <programlisting>MyFile :=DATASET('~file::10.150.50.12::c$::training::import::myfile',RecStruct,FLAT);</programlisting>
+    <programlisting lang="ECL">MyFile :=DATASET('~file::10.150.50.12::c$::training::import::myfile',RecStruct,FLAT);</programlisting>
 
     <para>concede acesso ao arquivo remoto
     <emphasis>c$/AdvancedECL/myfile</emphasis> na zona de entrada de arquivos
@@ -140,7 +146,7 @@ FileY := DATASET('~Training::SomeDir::SomeFileOut2',RecStruct,THOR);</programlis
     caractere de escape circunflexo (^) ao início do nome, como neste
     exemplo:</para>
 
-    <programlisting>MyFile :=DATASET('~file::10.150.50.12::c$::^Advanced^E^C^L::myfile',RecStruct,FLAT);</programlisting>
+    <programlisting lang="ECL">MyFile :=DATASET('~file::10.150.50.12::c$::^Advanced^E^C^L::myfile',RecStruct,FLAT);</programlisting>
 
     <para>concede acesso ao arquivo remoto
     <emphasis>c$/AdvancedECL/myfile</emphasis> na zona de entrada de arquivos
@@ -162,7 +168,7 @@ FileY := DATASET('~Training::SomeDir::SomeFileOut2',RecStruct,THOR);</programlis
 
     <para>Por exemplo,</para>
 
-    <programlisting>MyFile :=DATASET(DYNAMIC('~training::import::myfile'),RecStruct,FLAT);</programlisting>
+    <programlisting lang="ECL">MyFile :=DATASET(DYNAMIC('~training::import::myfile'),RecStruct,FLAT);</programlisting>
 
     <para>Isso faz com que o arquivo seja resolvido na execução da query e não
     na implementação.</para>
@@ -198,7 +204,7 @@ FileY := DATASET('~Training::SomeDir::SomeFileOut2',RecStruct,THOR);</programlis
     <para>Por exemplo, supondo que o nome de escopo padrão é "thor", os
     exemplos a seguir definem o mesmo Super Arquivo:</para>
 
-    <programlisting>MyFile :=DATASET('{in::file1,
+    <programlisting lang="ECL">MyFile :=DATASET('{in::file1,
                    in::file2,
                   ~train::in::file3}'),
                  RecStruct,THOR);

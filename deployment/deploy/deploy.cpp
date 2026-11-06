@@ -45,9 +45,9 @@ public:
         IPropertyTree* pSelectedComponents)
         : m_environment(environment), 
         m_transform(NULL), 
-        m_abort(false),
         m_espModuleCount(0), 
         m_tempFileCount(0),
+        m_abort(false),
         m_bLinuxDeployment(false),
         m_bInteractiveMode(true)
     {
@@ -115,7 +115,17 @@ public:
         int i;
         for (i = 0; i < count; i++)
         {
-            if (!checkFileExists(m_tempFiles.item(i))) continue;
+            bool fExists = false;
+            try
+            {
+                fExists = checkFileExists(m_tempFiles.item(i));
+            }
+            catch (IException* e)
+            {
+                e->Release();
+            }
+            if (!fExists)
+                continue;
             if (!DeleteFile(m_tempFiles.item(i)))
                 WARNLOG("Couldn't delete file %s", m_tempFiles.item(i));
         }

@@ -18,6 +18,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <tuple>
+#include <algorithm>
+#include <vector>
+#include <utility>
 
 #include "platform.h"
 #include "jarray.hpp"
@@ -25,11 +29,13 @@
 #include "jhash.hpp"
 #include "jmutex.hpp"
 #include "jexcept.hpp"
+#include "jerror.hpp"
 #include "jlzw.hpp"
 #include "jregexp.hpp"
 #include "jstring.hpp"
 #include "jutil.hpp"
 #include "jmisc.hpp"
+#include "jprotrace.hpp"
 #include "yaml.h"
 
 #include <initializer_list>
@@ -40,25 +46,33 @@
     *(char *) (name+(length)) = '\0';
 
 #include "jfile.hpp"
-#include "jlog.hpp"
 #include "jptree.ipp"
+#include "jlog.hpp"
 
 #define WARNLEGACYCOMPARE
 #define XMLTAG_CONTENT "<>"
 
-#undef UNIMPLEMENTED
-#define UNIMPLEMENTED throw MakeIPTException(-1, "UNIMPLEMENTED")
+#define UNIMPLEMENTED_IPT throw MakeIPTException(-1, "UNIMPLEMENTED feature in function %s() at %s(%d)", __func__, sanitizeSourceFile(__FILE__), __LINE__)
+
+
 #define CHECK_ATTRIBUTE(X) if (X && isAttribute(X)) throw MakeIPTException(PTreeExcpt_XPath_Unsupported, "Attribute usage invalid here");
 #define AMBIGUOUS_PATH(X,P) { StringBuffer buf; buf.append(X": ambiguous xpath \"").append(P).append("\"");  throw MakeIPTException(PTreeExcpt_XPath_Ambiguity,"%s",buf.str()); }
 
 #define PTREE_COMPRESS_THRESHOLD (4*1024)    // i.e. only use compress if > threshold
 #define PTREE_COMPRESS_BOTHER_PECENTAGE (80) // i.e. if it doesn't compress to <80 % of original size don't bother
 
+constexpr CompressionMethod defaultBinaryCompressionMethod = COMPRESS_METHOD_ZSTD3;
+
+static const CCharacterSet xpathStartCharSet([](unsigned char c) { return isValidXPathStartChr(c); });
+static const CCharacterSet xpathCharSet([](unsigned char c) { return isValidXPathChr(c); });
+static const CCharacterSet validTagCharacters([](unsigned char c) { return (!isspace(c) && c != '>' && c != '/' && c != '<'); });
+static const CCharacterSet validAttrCharacters([](unsigned char c) { return (c && !isspace(c) && c != '=' && c != '>' && c != '/'); });
+static const CCharacterSet notSpaceNorGreater([](unsigned char c) { return (!isspace(c) && c != '>'); });
+static const CCharacterSet wsCharSet([](unsigned char c) { return isspace(c); });
 
 class NullPTreeIterator final : implements IPropertyTreeIterator
 {
 public:
-    virtual ~NullPTreeIterator() {}
     virtual void Link() const override {}
     virtual bool Release() const override { return true; }
 // IPropertyTreeIterator
@@ -74,17 +88,191 @@ IPropertyTreeIterator *createNullPTreeIterator() { return LINK(nullPTreeIterator
 //===================================================================
 
 #ifdef USE_READONLY_ATOMTABLE
-RONameTable *AttrStrUnionWithTable::roNameTable = nullptr;
-RONameTable *AttrStrUnionWithValueTable::roValueTable = nullptr;
+RONameTable *AtomStrUnionWithTable::roNameTable = nullptr;
+RONameTable *AtomStrUnionWithValueTable::roValueTable = nullptr;
+RONameTable *NodeNameStrUnion::roNameTable = nullptr;
 #endif
-static AtomRefTable *keyTable = nullptr;
-static AtomRefTable *keyTableNC = nullptr;
 
-static CriticalSection hashcrit;
-static CAttrValHashTable *attrHT = nullptr;
-static AttrValue **freelist = nullptr;
-static unsigned freelistmax = 0;
-static CLargeMemoryAllocator freeallocator((memsize_t)-1, 0x1000*sizeof(AttrValue), true);
+// Sharded node-name atom tables to reduce contention under parallel deserialization.
+constexpr unsigned kNameShards = 16;
+static_assert((kNameShards & (kNameShards - 1)) == 0 && kNameShards > 0, "kNameShards must be a power of two");
+
+template <class ATOM_TYPE>
+struct alignas(64) CAtomShard
+{
+    CriticalSection crit{SYNC_LOCATION};
+    CMinHashTable<ATOM_TYPE> ht;
+
+    inline AtomStr *add(const char *v, size32_t len, unsigned hash)
+    {
+        CriticalBlock block(crit);
+        ATOM_TYPE *ret = ht.findh(v, hash);
+        if (ret)
+        {
+            // If an existing atom is found and we successfully increment its refcount
+            // (i.e. it is not currently being destroyed), we can safely reuse it.
+            if (ret->link())
+                return ret->toAtomStr();
+
+            // If link() returned false, the atom's refcount is already 0. Another thread
+            // is actively destroying it but hasn't yet removed it from the hash table.
+            // We must detach this outgoing atom to make way for a newly allocated one.
+            ht.detach(ret);
+        }
+
+        // Create a new atom for this string, initializing its refcount to 1.
+        ret = ATOM_TYPE::createHash(v, len, hash);
+        ret->linkcount.store(1, std::memory_order_relaxed);
+        ht.add(ret);
+        return ret->toAtomStr();
+    }
+
+    inline void remove(AtomStrAtom *a)
+    {
+        // Decrement the atom's refcount lock-free; only the rare final-reference
+        // handoff needs the shard lock to unlink it from the hash table.
+        if (!a->unlink())
+            return;
+
+        CriticalBlock block(crit);
+
+        // Since link() strictly rejects 0->1 transitions, resurrection is impossible
+        // under the lock. We unconditionally finalize the removal. (If another thread
+        // concurrently added the same string, it detached this outgoing atom and
+        // created a new one).
+        ht.remove((ATOM_TYPE *)a);
+    }
+
+    // Collect all atoms with linkcount >= minLinkCount into items
+    void gatherTopAtoms(std::vector<std::pair<unsigned, std::string>> &items, unsigned minLinkCount)
+    {
+        CriticalBlock block(crit);
+        unsigned i = 0;
+        for (ATOM_TYPE *a = ht.first(i); a; a = ht.next(i))
+        {
+            unsigned count = a->linkcount.load(std::memory_order_relaxed);
+            if (count >= minLinkCount)
+                items.emplace_back(count, a->toAtomStr()->get());
+        }
+    }
+};
+
+static CAtomShard<AtomStrC>  nameShardsC[kNameShards];
+static CAtomShard<AtomStrNC> nameShardsNC[kNameShards];
+
+// Sharded attribute tables to reduce contention under parallel deserialization.
+constexpr unsigned kAttrShards = 16;
+static_assert((kAttrShards & (kAttrShards - 1)) == 0 && kAttrShards > 0, "kAttrShards must be a power of two");
+
+static CAtomShard<AtomStrC>  attrKeyShardsC[kAttrShards];
+static CAtomShard<AtomStrNC> attrKeyShardsNC[kAttrShards];
+static CAtomShard<AtomStrC>  attrValShards[kAttrShards];
+
+static inline AtomStr *ensureNodeName(const char *name, bool nc)
+{
+    size32_t len = strlen(name);
+    if (unlikely(nc))
+    {
+        unsigned hash = hashnc_fnv1a((const byte *)name, len, fnvInitialHash32);
+        return nameShardsNC[hash & (kNameShards - 1)].add(name, len, hash);
+    }
+    else
+    {
+        unsigned hash = hashc_fnv1a((const byte *)name, len, fnvInitialHash32);
+        return nameShardsC[hash & (kNameShards - 1)].add(name, len, hash);
+    }
+}
+
+static inline AtomStr *ensureAttributeName(const char *key, bool nc)
+{
+    size32_t len = strlen(key);
+    if (unlikely(nc))
+    {
+        unsigned hash = hashnc_fnv1a((const byte *)key, len, fnvInitialHash32);
+        return attrKeyShardsNC[hash & (kAttrShards - 1)].add(key, len, hash);
+    }
+    else
+    {
+        unsigned hash = hashc_fnv1a((const byte *)key, len, fnvInitialHash32);
+        return attrKeyShardsC[hash & (kAttrShards - 1)].add(key, len, hash);
+    }
+}
+
+static inline AtomStr *ensureAttributeValue(const char *val)
+{
+    size32_t len = strlen(val);
+    unsigned hash = hashc_fnv1a((const byte *)val, len, fnvInitialHash32);
+    return attrValShards[hash & (kAttrShards - 1)].add(val, len, hash);
+}
+
+// Fast-path shard selection for removal.  An interned atom already stores the
+// hash that was used to place it (computed with the same FNV-1a algorithm as
+// the ensure* helpers), so the shard can be recovered from the atom prefix
+// with a single load instead of re-hashing the whole string.  Only valid for a
+// genuine heap atom (isPtr()), never for inline/RO-table unions.
+static inline void removeNameByPtr(AtomStr *n, bool nc)
+{
+    AtomStrAtom *a = AtomStrAtom::toAtom(n);
+    if (unlikely(nc))
+        nameShardsNC[a->hash & (kNameShards - 1)].remove(a);
+    else
+        nameShardsC[a->hash & (kNameShards - 1)].remove(a);
+}
+
+static inline void removeAttrKeyByPtr(AtomStr *k, bool nc)
+{
+    AtomStrAtom *a = AtomStrAtom::toAtom(k);
+    if (unlikely(nc))
+        attrKeyShardsNC[a->hash & (kAttrShards - 1)].remove(a);
+    else
+        attrKeyShardsC[a->hash & (kAttrShards - 1)].remove(a);
+}
+
+static inline void removeAttrValByPtr(AtomStr *v)
+{
+    AtomStrAtom *a = AtomStrAtom::toAtom(v);
+    attrValShards[a->hash & (kAttrShards - 1)].remove(a);
+}
+
+template <class ATOM_TYPE, unsigned N>
+static void gatherShardsTopAtoms(CAtomShard<ATOM_TYPE> (&shards)[N], std::vector<std::pair<unsigned, std::string>> &items, unsigned minLinkCount)
+{
+    for (unsigned i = 0; i < N; i++)
+        shards[i].gatherTopAtoms(items, minLinkCount);
+}
+
+static void logTopAtoms(const char *tableName, std::vector<std::pair<unsigned, std::string>> &items, unsigned topN)
+{
+    std::sort(items.begin(), items.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    unsigned limit = std::min((unsigned)items.size(), topN);
+    DBGLOG("Top %u atoms in %s (%zu total qualifying):", limit, tableName, items.size());
+    for (unsigned i = 0; i < limit; i++)
+        DBGLOG("  [%u] count=%-8u \"%s\"", i + 1, items[i].first, items[i].second.c_str());
+}
+
+void dumpTopAtoms(unsigned topN, unsigned minLinkCount)
+{
+    std::vector<std::pair<unsigned, std::string>> items;
+
+    gatherShardsTopAtoms(nameShardsC, items, minLinkCount);
+    logTopAtoms("node-name (case-sensitive)", items, topN);
+
+    items.clear();
+    gatherShardsTopAtoms(nameShardsNC, items, minLinkCount);
+    logTopAtoms("node-name (case-insensitive)", items, topN);
+
+    items.clear();
+    gatherShardsTopAtoms(attrKeyShardsC, items, minLinkCount);
+    logTopAtoms("attribute-key (case-sensitive)", items, topN);
+
+    items.clear();
+    gatherShardsTopAtoms(attrKeyShardsNC, items, minLinkCount);
+    logTopAtoms("attribute-key (case-insensitive)", items, topN);
+
+    items.clear();
+    gatherShardsTopAtoms(attrValShards, items, minLinkCount);
+    logTopAtoms("attribute-value", items, topN);
+}
 
 #ifdef USE_READONLY_ATOMTABLE
 static const char * roAttributes[] =
@@ -97,76 +285,90 @@ static const char * roAttributeValues[] =
 #include "jptree-attrvalues.hpp"    // potentially auto-generated
     nullptr
 };
+static const char * roNodeNames[] =
+{
+#include "jptree-nodenames.hpp"    // potentially auto-generated
+    nullptr
+};
 
 void initializeRoTable()
 {
     for (const char **attr = roAttributes; *attr; attr++)
     {
-        AttrStrUnionWithTable::roNameTable->find(*attr, true);
+        AtomStrUnionWithTable::roNameTable->find(*attr, true);
     }
     for (const char **value = roAttributeValues; *value; value++)
     {
-        AttrStrUnionWithValueTable::roValueTable->find(*value, true);
+        AtomStrUnionWithValueTable::roValueTable->find(*value, true);
+    }
+    for (const char **nodeName = roNodeNames; *nodeName; nodeName++)
+    {
+        NodeNameStrUnion::roNameTable->find(*nodeName, true);
     }
     // also populate read-only value table by generating some common constants
     StringBuffer constStr;
     for (unsigned c=0; c<1000; c++) // common unsigned values in attributes
     {
         constStr.clear().append(c);
-        AttrStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
+        AtomStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
     }
     for (unsigned c=1; c<=400; c++) // outer graphs
     {
         constStr.clear().append("graph").append(c);
-        AttrStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
+        AtomStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
         constStr.clear().append("Graph graph ").append(c);
-        AttrStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
+        AtomStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
+        constStr.clear().append("Graph graph").append(c);
+        AtomStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
     }
-    for (unsigned c=1; c<=200; c++) // subgraphs
+    for (unsigned c=1; c<=50; c++) // result sets
     {
-        constStr.clear().append("sg").append(c);
-        AttrStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
-    }
-    for (unsigned c=1; c<=200; c++) // Edge 0
-    {
-        constStr.clear().append(c).append("_0");
-        AttrStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
+        constStr.clear().append("Result ").append(c);
+        AtomStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
     }
     for (unsigned c=0; c<35; c++)
     {
         char ch = c<9 ? ('1' + c) : ('A' + (c-9));
         constStr.clear().append("~spill::").append(ch); // spills
-        AttrStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
+        AtomStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
         constStr.clear().append("gl").append(ch); // graph results
-        AttrStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
+        AtomStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
         constStr.clear().append("mf").append(ch); // meta factories
-        AttrStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
+        AtomStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
     }
-    for (unsigned c=1; c<=10; c++) // global auto attributes
+    // generate graph10..graph255 as node names (graph1..graph9 fit inline at <=6 chars)
+    for (unsigned c=10; c<=255; c++)
     {
-        constStr.clear().append("auto").append(c);
-        AttrStrUnionWithValueTable::roValueTable->find(constStr.str(), true);
+        constStr.clear().append("graph").append(c);
+        NodeNameStrUnion::roNameTable->find(constStr.str(), true);
     }
 #ifdef TRACE_ATOM_SIZE
     // If you are wanting an idea of the savings from use of the RO hash table, it may be useful to reset
     // the counts here. But it's more correct to actually leave them in place.
-    //AttrStrAtom::totsize = 0;
-    //AttrStrAtom::maxsize = 0;
+    //AtomStrAtom::totsize = 0;
+    //AtomStrAtom::maxsize = 0;
 #endif
 #ifdef _DEBUG
     for (const char **a = roAttributes; *a; a++)
     {
         // sanity check
-        unsigned idx = AttrStrUnionWithTable::roNameTable->findIndex(*a, AttrStrC::getHash(*a));
-        AttrStrC *val = AttrStrUnionWithTable::roNameTable->getIndex(idx);
+        unsigned idx = AtomStrUnionWithTable::roNameTable->findIndex(*a, AtomStrC::getHash(*a));
+        AtomStrC *val = AtomStrUnionWithTable::roNameTable->getIndex(idx);
         assert(val && val->eq(*a));
     }
     for (const char **v = roAttributeValues; *v; v++)
     {
         // sanity check
-        unsigned idx = AttrStrUnionWithValueTable::roValueTable->findIndex(*v, AttrStrC::getHash(*v));
-        AttrStrC *val = AttrStrUnionWithValueTable::roValueTable->getIndex(idx);
+        unsigned idx = AtomStrUnionWithValueTable::roValueTable->findIndex(*v, AtomStrC::getHash(*v));
+        AtomStrC *val = AtomStrUnionWithValueTable::roValueTable->getIndex(idx);
         assert(val && val->eq(*v));
+    }
+    for (const char **n = roNodeNames; *n; n++)
+    {
+        // sanity check
+        unsigned idx = NodeNameStrUnion::roNameTable->findIndex(*n, AtomStrC::getHash(*n));
+        AtomStrC *val = NodeNameStrUnion::roNameTable->getIndex(idx);
+        assert(val && val->eq(*n));
     }
 #endif
 }
@@ -176,28 +378,22 @@ MODULE_INIT(INIT_PRIORITY_JPTREE)
 {
     nullPTreeIterator = new NullPTreeIterator;
 #ifdef USE_READONLY_ATOMTABLE
-    AttrStrUnionWithTable::roNameTable = new RONameTable(255);
-    AttrStrUnionWithValueTable::roValueTable = new RONameTable(4095);
+    AtomStrUnionWithTable::roNameTable = new RONameTable(255);
+    AtomStrUnionWithValueTable::roValueTable = new RONameTable(4095);
+    NodeNameStrUnion::roNameTable = new RONameTable(16383);
     initializeRoTable();
 #endif
-    keyTable = new AtomRefTable;
-    keyTableNC = new AtomRefTable(true);
-    attrHT = new CAttrValHashTable;
     return true;
 }
 
 MODULE_EXIT()
 {
     delete nullPTreeIterator;
-    delete attrHT;
-    keyTable->Release();
-    keyTableNC->Release();
 #ifdef USE_READONLY_ATOMTABLE
-    delete AttrStrUnionWithTable::roNameTable;
-    delete AttrStrUnionWithValueTable::roValueTable;
+    delete AtomStrUnionWithTable::roNameTable;
+    delete AtomStrUnionWithValueTable::roValueTable;
+    delete NodeNameStrUnion::roNameTable;
 #endif
-    free(freelist);
-    freelist = NULL;
 }
 
 static int comparePropTrees(IInterface * const *ll, IInterface * const *rr)
@@ -217,6 +413,11 @@ public:
             elems.append(iter.get());
         elems.sort(compare);
     }
+    CPTArrayIterator(IArrayOf<IPropertyTree> & ownedElems, TreeCompareFunc compare) : ArrayIIteratorOf<IArrayOf<IPropertyTree>, IPropertyTree, IPropertyTreeIterator>(elems)
+    {
+        elems.swapWith(ownedElems);
+        elems.sort(compare);
+    }
 };
 IPropertyTreeIterator * createSortedIterator(IPropertyTreeIterator & iter)
 {
@@ -225,6 +426,10 @@ IPropertyTreeIterator * createSortedIterator(IPropertyTreeIterator & iter)
 IPropertyTreeIterator * createSortedIterator(IPropertyTreeIterator & iter, TreeCompareFunc compare)
 {
     return new CPTArrayIterator(iter, compare);
+}
+IPropertyTreeIterator * createSortedIterator(IArrayOf<IPropertyTree> & ownedElems, TreeCompareFunc compare)
+{
+    return new CPTArrayIterator(ownedElems, compare);
 }
 //////////////////
 
@@ -271,6 +476,23 @@ IPropertyTreeIterator *ChildMap::getIterator(bool sort)
     if (!sort)
         return baseIter.getClear();
     return createSortedIterator(*baseIter);
+}
+
+void ChildMap::onRemove(void *e)
+{
+    PTree &elem = static_cast<PTree &>(*(IPropertyTree *)e);
+    IPTArrayValue *value = elem.queryValue();
+    if (value && value->isArray())
+    {
+        IPropertyTree **elems = value->getRawArray();
+        IPropertyTree **elemsEnd = elems+value->elements();
+        while (elems != elemsEnd)
+        {
+            PTree *pElem = static_cast<PTree *>(*elems++);
+            pElem->setOwner(nullptr);
+        }
+    }
+    elem.Release();
 }
 
 ///////////
@@ -614,7 +836,7 @@ public:
 class CQualifierMap
 {
     std::unordered_map<std::string, CValueMap *> attrValueMaps;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
 
 public:
     CQualifierMap()
@@ -813,7 +1035,7 @@ class CMapQualifierIterator : public CInterfaceOf<IPropertyTreeIterator>
 public:
     CMapQualifierIterator(CQualifierMap &_map, CValueMap::iterator _startRange, CValueMap::iterator _endRange)
         : startRange(_startRange), endRange(_endRange)
-    {        
+    {
     }
 
 // IPropertyTreeIterator
@@ -839,18 +1061,18 @@ IPropertyTreeIterator *checkMapIterator(const char *&xxpath, IPropertyTree &chil
     /*
     * NB: IPT's are not thread safe. It is up to the caller to ensure multiple writers do not contend.
     * ( Dali for example ensures writer threads are exclusive )
-    * 
+    *
     * That means multiple reader threads could be here concurrently.
     * >1 could be constructing the qualifier map for the 1st time.
     * For new attr updates (where map already exists), it will block on map::crit,
     * so that there is at most 1 thread updating the map. The underlying unordered_multiset
     * is thread safe if 1 writer, and multiple readers.
-    * 
+    *
     * On initial map creation, allow concurrency, but only 1 will succeed to swap in the new active map.
     * That could mean a new attr/prop. mapping is lost, until next used.
-    * NB: once the map is live, updates are write ops. and so, just as with the IPT 
+    * NB: once the map is live, updates are write ops. and so, just as with the IPT
     * itself, it is expected that something will keep it thread safe (as Dali does)
-    * 
+    *
     */
 
     // NB: only support simple @<attrname>=<value> qualifiers
@@ -979,10 +1201,10 @@ private:
 
 ///////////////////
 
-CPTValue::CPTValue(size32_t size, const void *data, bool binary, bool raw, bool _compressed)
+CPTValue::CPTValue(size32_t size, const void *data, bool binary, CompressionMethod currentCompressType, CompressionMethod preferredCompressType)
 {
-    compressed = _compressed;
-    if (!raw && binary && size > PTREE_COMPRESS_THRESHOLD)
+    compressType = currentCompressType;
+    if (binary && (currentCompressType == COMPRESS_METHOD_NONE) && (preferredCompressType != COMPRESS_METHOD_NONE) && (size > PTREE_COMPRESS_THRESHOLD))
     {
         unsigned newSize = size * PTREE_COMPRESS_BOTHER_PECENTAGE / 100;
         void *newData = NULL;
@@ -990,18 +1212,21 @@ CPTValue::CPTValue(size32_t size, const void *data, bool binary, bool raw, bool 
         try
         {
             newData = malloc(sizeof(size32_t) + newSize);
-            compressor = createLZWCompressor();
-            compressor->open(((char *)newData) + sizeof(size32_t), newSize);
+            CompressionMethod compressMethod = (preferredCompressType != COMPRESS_METHOD_DEFAULT) ? preferredCompressType : defaultBinaryCompressionMethod;
+            ICompressHandler * handler = queryCompressHandler(compressMethod);
+            compressor = handler->getCompressor();
+            compressor->open(((char *)newData) + sizeof(size32_t), newSize, 0, false);
             if (compressor->write(data, size)==size)
             {
                 compressor->close();
                 memcpy(newData, &size, sizeof(size32_t));
                 newSize = sizeof(size32_t) + compressor->buflen();
-                compressed = true;
+                compressType = handler->queryPersistMethod();
                 set(newSize, newData);
             }
             free(newData);
-            compressor->Release();  
+            newData = NULL;
+            compressor->Release();
         }
         catch (...)
         {
@@ -1011,19 +1236,24 @@ CPTValue::CPTValue(size32_t size, const void *data, bool binary, bool raw, bool 
             throw;
         }
     }
-    if (raw || !compressed)
+    if (size && !get())
         set(size, data);
 }
 
-static void *uncompress(const void *src, size32_t &sz)
+static void *uncompress(const void *src, size32_t &sz, byte compressType)
 {
+    dbgassertex(compressType != COMPRESS_METHOD_LZWLEGACY);
+    if (compressType == COMPRESS_METHOD_LZWLEGACY)
+        compressType = COMPRESS_METHOD_LZW_LITTLE_ENDIAN;
     IExpander *expander = NULL;
     void *uncompressedValue = NULL;
     try
     {
         memcpy(&sz, src, sizeof(size32_t));
         assertex(sz);
-        expander = createLZWExpander();
+
+        ICompressHandler * handler = queryCompressHandler((CompressionMethod)compressType);
+        expander = handler->getExpander();
         src = ((const char *)src) + sizeof(size32_t);
         uncompressedValue = malloc(sz);
         assertex(uncompressedValue);
@@ -1043,14 +1273,25 @@ static void *uncompress(const void *src, size32_t &sz)
 
 const void *CPTValue::queryValue() const
 {
-    if (compressed)
+    if (compressType)
     {
         size32_t sz;
-        void *uncompressedValue = uncompress(get(), sz);
+        void *uncompressedValue = uncompress(get(), sz, compressType);
         ((MemoryAttr *)this)->setOwn(sz, uncompressedValue);
-        compressed = false;
+        compressType = COMPRESS_METHOD_NONE;
     }
     return get();
+}
+
+void CPTValue::serializeToStream(IBufferedSerialOutputStream &out) const
+{
+    size32_t serialLen = (size32_t)length();
+    append(out, serialLen);
+    if (serialLen)
+    {
+        append(out, compressType);
+        out.put(serialLen, get());
+    }
 }
 
 void CPTValue::serialize(MemoryBuffer &tgt)
@@ -1060,7 +1301,7 @@ void CPTValue::serialize(MemoryBuffer &tgt)
     tgt.append(serialLen);
     if (serialLen)
     {
-        tgt.append(compressed);
+        tgt.append(compressType);
         tgt.append(serialLen, get());
     }
 }
@@ -1071,22 +1312,24 @@ void CPTValue::deserialize(MemoryBuffer &src)
     src.read(sz);
     if (sz)
     {
-        src.read(compressed);
+        src.read(compressType);
+        if (compressType == COMPRESS_METHOD_LZWLEGACY)
+            compressType = COMPRESS_METHOD_LZW_LITTLE_ENDIAN;
         set(sz, src.readDirect(sz));
     }
     else
     {
-        compressed = false;
+        compressType = COMPRESS_METHOD_NONE;
         clear();
     }
 }
 
 MemoryBuffer &CPTValue::getValue(MemoryBuffer &tgt, bool binary) const
 {
-    if (compressed)
+    if (compressType)
     {
         size32_t sz;
-        void *uncompressedValue = uncompress(get(), sz);
+        void *uncompressedValue = uncompress(get(), sz, compressType);
         if (!binary) sz -= 1;
         tgt.append(sz, uncompressedValue);
         if (uncompressedValue)
@@ -1105,13 +1348,13 @@ MemoryBuffer &CPTValue::getValue(MemoryBuffer &tgt, bool binary) const
 
 StringBuffer &CPTValue::getValue(StringBuffer &tgt, bool binary) const
 {
-    if (compressed)
+    if (compressType)
     {
         size32_t sz;
         void *uncompressedValue = NULL;
         try
         {
-            uncompressedValue = uncompress(get(), sz);
+            uncompressedValue = uncompress(get(), sz, compressType);
             if (!binary) sz -= 1;
             tgt.append(sz, (const char *)uncompressedValue);
             free(uncompressedValue);
@@ -1135,7 +1378,7 @@ StringBuffer &CPTValue::getValue(StringBuffer &tgt, bool binary) const
 
 size32_t CPTValue::queryValueSize() const
 {
-    if (compressed)
+    if (compressType)
     {
         size32_t sz;
         memcpy(&sz, get(), sizeof(size32_t));
@@ -1194,11 +1437,10 @@ void CPTArray::setElement(unsigned idx, IPropertyTree *tree)
 void CPTArray::removeElement(unsigned idx)
 {
     CQualifierMap *map = queryMap();
+    IPropertyTree *existing = &((IPropertyTree &)item(idx));
     if (map)
-    {
-        IPropertyTree *existing = &((IPropertyTree &)item(idx));
         map->removeMatchingValues(existing);
-    }
+    ((PTree *)existing)->setOwner(nullptr);
     remove(idx);
 }
 
@@ -1275,11 +1517,11 @@ ChildMap *PTree::checkChildren() const
     return children;
 }
 
-void PTree::setLocal(size32_t l, const void *data, bool _binary)
+void PTree::setLocal(size32_t l, const void *data, bool _binary, CompressionMethod compressType)
 {
     if (value) delete value;
     if (l)
-        value = new CPTValue(l, data, _binary);
+        value = new CPTValue(l, data, _binary, COMPRESS_METHOD_NONE, compressType);
     else
         value = NULL;
     if (_binary)
@@ -1299,12 +1541,12 @@ void PTree::appendLocal(size32_t l, const void *data, bool binary)
         value->getValue(mb, binary);
         mb.append(l, data);
         delete value;
-        
+
         l = mb.length();
         data = mb.toByteArray();
     }
     if (l)
-        value = new CPTValue(l, data, binary);
+        value = new CPTValue(l, data, binary, COMPRESS_METHOD_NONE, COMPRESS_METHOD_DEFAULT);
     else
         value = NULL;
     if (binary)
@@ -1340,22 +1582,21 @@ bool PTree::hasProp(const char * xpath) const
     }
     else
     {
-        IPropertyTreeIterator *iter = getElements(xpath);
+        Owned<IPropertyTreeIterator> iter = getElements(xpath);
         bool res = iter->first();
-        iter->Release();
         return res;
     }
 }
 
-const char *PTree::queryProp(const char *xpath) const
+const char *PTree::queryProp(const char *xpath, const char * dft) const
 {
     if (!xpath)
     {
-        if (!value) return NULL;
+        if (!value) return dft;
         return (const char *) value->queryValue();
     }
     else if (isAttribute(xpath))
-        return getAttributeValue(xpath);
+        return getAttributeValue(xpath, dft);
     else
     {
         const char *prop = splitXPathX(xpath);
@@ -1363,14 +1604,14 @@ const char *PTree::queryProp(const char *xpath) const
         {
             MAKE_LSTRING(path, xpath, prop-xpath);
             IPropertyTree *branch = queryPropTree(path);
-            if (!branch) return NULL;
-            return branch->queryProp(prop);
+            if (!branch) return dft;
+            return branch->queryProp(prop, dft);
         }
         else
         {
             IPropertyTree *branch = queryPropTree(xpath);
-            if (!branch) return NULL;
-            return branch->queryProp(NULL);
+            if (!branch) return dft;
+            return branch->queryProp(NULL, dft);
         }
     }
 }
@@ -1385,7 +1626,7 @@ bool PTree::getProp(const char *xpath, StringBuffer &ret) const
     }
     else if (isAttribute(xpath))
     {
-        const char *value = getAttributeValue(xpath);
+        const char *value = getAttributeValue(xpath, nullptr);
         if (!value) return false;
         ret.append(value);
         return true;
@@ -1427,7 +1668,7 @@ void PTree::setProp(const char *xpath, const char *val)
                 value = NULL;
             }
             else
-                setLocal(l+1, val);
+                setLocal(l+1, val, false, COMPRESS_METHOD_NONE);
         }
     }
     else if (isAttribute(xpath))
@@ -1435,7 +1676,7 @@ void PTree::setProp(const char *xpath, const char *val)
         if (!val)
             removeAttribute(xpath);
         else
-            setAttribute(xpath, val);
+            setAttribute(xpath, val, false);
     }
     else
     {
@@ -1463,8 +1704,10 @@ aindex_t PTree::getChildMatchPos(const char *xpath)
     if (!childIter->first())
         return (aindex_t)-1;
     IPropertyTree &childMatch = childIter->query();
+#ifdef _DEBUG
     if (childIter->next())
         AMBIGUOUS_PATH("addPropX", xpath);
+#endif
 
     if (value)
         if (value->isArray())
@@ -1501,7 +1744,9 @@ void PTree::resolveParentChild(const char *xpath, IPropertyTree *&parent, IPrope
         if (this != &pathIter->query())
         {
             IPropertyTree *currentPath = NULL;
+#ifdef _DEBUG
             bool multiplePaths = false;
+#endif
             bool multipleChildMatches = false;
             for (;;)
             {
@@ -1511,21 +1756,30 @@ void PTree::resolveParentChild(const char *xpath, IPropertyTree *&parent, IPrope
                 if (childIter->first())
                 {
                     child = &childIter->query();
+#ifdef _DEBUG
                     if (parent)
                         AMBIGUOUS_PATH("resolveParentChild", xpath);
+#endif
                     if (!multipleChildMatches && childIter->next())
                         multipleChildMatches = true;
 
                     parent = currentPath;
                 }
                 if (pathIter->next())
+                {
+#ifdef _DEBUG
                     multiplePaths = true;
-                else break;
+#endif
+                }
+                else
+                    break;
             }
             if (!parent)
             {
+#ifdef _DEBUG
                 if (multiplePaths) // i.e. no unique path to child found and multiple parent paths
                     AMBIGUOUS_PATH("resolveParentChild", xpath);
+#endif
                 parent = currentPath;
             }
             if (multipleChildMatches)
@@ -1566,7 +1820,7 @@ void PTree::addProp(const char *xpath, const char *val)
     if (!xpath || '\0' == *xpath)
         addLocal((size32_t)strlen(val)+1, val);
     else if (isAttribute(xpath))
-        setAttribute(xpath, val);
+        setAttribute(xpath, val, false);
     else if ('[' == *xpath)
     {
         aindex_t pos = getChildMatchPos(xpath);
@@ -1597,7 +1851,7 @@ void PTree::appendProp(const char *xpath, const char *val)
         StringBuffer newVal;
         getProp(xpath, newVal);
         newVal.append(val);
-        setAttribute(xpath, newVal.str());
+        setAttribute(xpath, newVal.str(), false);
     }
     else if ('[' == *xpath)
     {
@@ -1643,7 +1897,8 @@ __int64 PTree::getPropInt64(const char *xpath, __int64 dft) const
     }
     else if (isAttribute(xpath))
     {
-        const char *v = getAttributeValue(xpath);
+        // NOTE: Passing null rather than dft is deliberate - to deterimine if attribute exists
+        const char *v = getAttributeValue(xpath, nullptr);
         if (!v || !*v) // intentional return dft if attribute equals ""
             return dft;
         return _atoi64(v);
@@ -1673,13 +1928,13 @@ void PTree::setPropInt64(const char * xpath, __int64 val)
     {
         char buf[23];
         numtostr(buf, val);
-        setLocal((size32_t)strlen(buf)+1, buf);
+        setLocal((size32_t)strlen(buf)+1, buf, false, COMPRESS_METHOD_NONE);
     }
     else if (isAttribute(xpath))
     {
         char buf[23];
         numtostr(buf, val);
-        setAttribute(xpath, buf);
+        setAttribute(xpath, buf, false);
     }
     else
     {
@@ -1708,7 +1963,7 @@ void PTree::addPropInt64(const char *xpath, __int64 val)
     {
         char buf[23];
         numtostr(buf, val);
-        setAttribute(xpath, buf);
+        setAttribute(xpath, buf, false);
     }
     else if ('[' == *xpath)
     {
@@ -1730,6 +1985,67 @@ void PTree::addPropInt64(const char *xpath, __int64 val)
             child->addPropInt64(qualifier, val);
         else
             setPropInt64(path, val);
+    }
+}
+
+void PTree::setPropReal(const char * xpath, double val)
+{
+    if (!xpath || '\0' == *xpath)
+    {
+        std::string s = std::to_string(val);
+        setLocal((size32_t)s.length()+1, s.c_str(), false, COMPRESS_METHOD_NONE);
+    }
+    else if (isAttribute(xpath))
+    {
+        std::string s = std::to_string(val);
+        setAttribute(xpath, s.c_str(), false);
+    }
+    else
+    {
+        const char *prop;
+        IPropertyTree *branch = splitBranchProp(xpath, prop, true);
+
+        if (isAttribute(prop))
+            branch->setPropReal(prop, val);
+        else
+        {
+            IPropertyTree *propBranch = queryCreateBranch(branch, prop);
+            propBranch->setPropReal(NULL, val);
+        }
+    }
+}
+
+void PTree::addPropReal(const char *xpath, double val)
+{
+    if (!xpath || '\0' == *xpath)
+    {
+        std::string s = std::to_string(val);
+        addLocal((size32_t)s.length()+1, s.c_str());
+    }
+    else if (isAttribute(xpath))
+    {
+        std::string s = std::to_string(val);
+        setAttribute(xpath, s.c_str(), false);
+    }
+    else if ('[' == *xpath)
+    {
+        std::string s = std::to_string(val);
+        aindex_t pos = getChildMatchPos(xpath);
+        if ((aindex_t) -1 == pos)
+            throw MakeIPTException(-1, "addPropInt64: qualifier unmatched %s", xpath);
+        addLocal((size32_t)s.length()+1, s.c_str(), false, pos);
+    }
+    else
+    {
+        IPropertyTree *parent, *child;
+        StringAttr path, qualifier;
+        resolveParentChild(xpath, parent, child, path, qualifier);
+        if (parent != this)
+            parent->addPropReal(path, val);
+        else if (child)
+            child->addPropReal(qualifier, val);
+        else
+            setPropReal(path, val);
     }
 }
 
@@ -1773,6 +2089,11 @@ bool PTree::isCompressed(const char *xpath) const
     return false;
 }
 
+CompressionMethod PTree::getCompressionType() const
+{
+    return value ? value->getCompressionType() : COMPRESS_METHOD_NONE;
+}
+
 bool PTree::isBinary(const char *xpath) const
 {
     if (!xpath)
@@ -1807,12 +2128,12 @@ bool PTree::renameTree(IPropertyTree *child, const char *newName) // really here
 
 bool PTree::renameProp(const char *xpath, const char *newName)
 {
-    if (!xpath || '\0' == *xpath) 
+    if (!xpath || '\0' == *xpath)
         throw MakeIPTException(-1, "renameProp: cannot rename self, renameProp has to rename in context of a parent");
     if (strcmp(xpath,"/")==0)   // rename of self allowed assuming no parent
         setName(newName);
     else if ('[' == *xpath)
-        UNIMPLEMENTED;
+        UNIMPLEMENTED_IPT;
     else if (isAttribute(xpath))
     {
         StringBuffer val;
@@ -1832,8 +2153,10 @@ bool PTree::renameProp(const char *xpath, const char *newName)
             if (!iter->first())
                 return false;
             IPropertyTree &branch = iter->query();
+#ifdef _DEBUG
             if (iter->next())
                 AMBIGUOUS_PATH("renameProp", xpath);
+#endif
             return branch.renameProp(prop, newName);
         }
         else
@@ -1875,21 +2198,21 @@ bool PTree::getPropBin(const char *xpath, MemoryBuffer &ret) const
     }
 }
 
-void PTree::setPropBin(const char * xpath, size32_t size, const void *data)
+void PTree::setPropBin(const char * xpath, size32_t size, const void *data, CompressionMethod preferredCompression)
 {
     CHECK_ATTRIBUTE(xpath);
     if (!xpath || '\0' == *xpath)
-        setLocal(size, data, true);
+        setLocal(size, data, true, preferredCompression);
     else
     {
         const char *prop;
         IPropertyTree *branch = splitBranchProp(xpath, prop, true);
         if (isAttribute(prop))
-            branch->setPropBin(prop, size, data);
+            branch->setPropBin(prop, size, data, preferredCompression);
         else
         {
             IPropertyTree *propBranch = queryCreateBranch(branch, prop);
-            propBranch->setPropBin(NULL, size, data);
+            propBranch->setPropBin(NULL, size, data, preferredCompression);
         }
     }
 }
@@ -1916,7 +2239,7 @@ void PTree::addPropBin(const char *xpath, size32_t size, const void *data)
         else if (child)
             child->addPropBin(qualifier, size, data);
         else
-            setPropBin(path, size, data);
+            setPropBin(path, size, data, COMPRESS_METHOD_DEFAULT);
     }
 }
 
@@ -1942,7 +2265,7 @@ void PTree::appendPropBin(const char *xpath, size32_t size, const void *data)
         else if (child)
             child->appendPropBin(qualifier, size, data);
         else
-            setPropBin(path, size, data);
+            setPropBin(path, size, data, COMPRESS_METHOD_DEFAULT);
     }
 }
 
@@ -1959,8 +2282,11 @@ IPropertyTree *PTree::queryPropTree(const char *xpath) const
     if (iter->first())
     {
         element = &iter->query();
+#ifdef _DEBUG
+        //The following call can double the cost of finding a match from an IPropertyTree
         if (iter->next())
             AMBIGUOUS_PATH("getProp",xpath);
+#endif
     }
     return element;
 }
@@ -2007,7 +2333,7 @@ IPropertyTree *PTree::setPropTree(const char *xpath, IPropertyTree *val)
         IPropertyTree *branch, *child;
         resolveParentChild(xpath, branch, child, prop, qualifier);
         if (branch == this)
-        {   
+        {
             IPropertyTree *_val = ownPTree(val);
             dbgassertex(QUERYINTERFACE(_val, PTree));
             PTree *__val = static_cast<PTree *>(_val);
@@ -2041,8 +2367,10 @@ bool PTree::isArray(const char *xpath) const
                 if (!iter->first())
                     return false;
                 IPropertyTree &branch = iter->query();
+#ifdef _DEBUG
                 if (iter->next())
                     AMBIGUOUS_PATH("isArray", xpath);
+#endif
                 return branch.isArray(prop);
             }
             else
@@ -2098,6 +2426,38 @@ void PTree::addPTreeArrayItem(IPropertyTree *existing, const char *xpath, PTree 
         children->set(xpath, container);
     }
 }
+
+// Optimize addPropTree directly: during deserialization
+// 1. we own the child, so the connection lock in CClientRemoteTree::addPropTree is unnecessary.
+// 2. The xpath matches the name of the element so no need to set
+// 3. alwaysUseArray is false
+// 4. Don't call checkChildren() - that can cause a dependency issue when deserializing on Demand
+// 5. No need to check if it is shared
+IPropertyTree * PTree::deserializeAddPropTree(IPropertyTree * newChild)
+{
+    dbgassertex(isEquivalent(newChild) && !newChild->IsShared() && isCaseInsensitive() == newChild->isCaseInsensitive());
+
+    PTree * val = static_cast<PTree *>(newChild);
+
+    const char * xpath = val->queryName();
+
+    addingNewElement(*newChild, -1);
+    if (children)
+    {
+        IPropertyTree *child = children->query(xpath);
+        if (child)
+        {
+            addPTreeArrayItem(child, xpath, val);
+            return newChild;
+        }
+    }
+    else
+        createChildMap();
+
+    children->set(xpath, newChild);
+    return newChild;
+}
+
 
 IPropertyTree *PTree::addPropTree(const char *xpath, IPropertyTree *val, bool alwaysUseArray)
 {
@@ -2238,7 +2598,7 @@ bool PTree::removeProp(const char *xpath)
 
         if (!iter)
             return false;
-        
+
         bool res = false;
         if (iter->first())
         {
@@ -2552,7 +2912,7 @@ restart:
                         iter.setown(new SingleIdIterator(*this));
                 }
             }
-            else 
+            else
             {
                 if (checkPattern(xpath))
                     iter.setown(new SingleIdIterator(*this));
@@ -2603,7 +2963,7 @@ restart:
                                     while (_iter->next());
                                 }
                             }
-                            xpath = xxpath; 
+                            xpath = xxpath;
                         }
                         else
                         {
@@ -2745,7 +3105,7 @@ void getXPathMatchTree(IPropertyTree &parentContext, const char *xpath, IPropert
         case '[':
             if (inQualifier)
             {
-                if (!quote) 
+                if (!quote)
                     throw MakeXPathException(xpath, PTreeExcpt_XPath_ParseError, str-xpath, "Unclosed qualifier detected");
             }
             else
@@ -2856,6 +3216,118 @@ IPropertyTree *getXPathMatchTree(IPropertyTree &parent, const char *xpath)
     return matchTree;
 }
 
+void PTree::serializeAttributes(IBufferedSerialOutputStream &tgt) const
+{
+    AttrValue *attr = getNextAttribute(nullptr);
+    if (attr)
+    {
+        do
+        {
+            append(tgt, attr->key.get());
+            append(tgt, attr->value.get());
+            attr = getNextAttribute(attr);
+        } while (attr);
+    }
+    append(tgt, ""); // attribute terminator. i.e. blank attr name.
+}
+
+void PTree::serializeSelf(IBufferedSerialOutputStream &tgt) const
+{
+    append(tgt, queryName());
+    append(tgt, flags);
+    serializeAttributes(tgt);
+    if (value)
+        value->serializeToStream(tgt);
+    else
+        append(tgt, (size32_t)0);
+}
+
+void PTree::serializeCutOff(IBufferedSerialOutputStream &tgt, int cutoff, int depth) const
+{
+    serializeSelf(tgt);
+
+    if (-1 == cutoff || depth<cutoff)
+    {
+        Owned<IPropertyTreeIterator> iter = getElements("*");
+        if (iter->first())
+        {
+            do
+            {
+                IPropertyTree *_child = &iter->query();
+                PTree *child = QUERYINTERFACE(_child, PTree); assertex(child);
+                child->serializeCutOff(tgt, cutoff, depth+1);
+            }
+            while (iter->next());
+        }
+    }
+    append(tgt, ""); // element terminator. i.e. blank child name length.
+}
+
+void PTree::serializeToStream(IBufferedSerialOutputStream &tgt) const
+{
+    serializeCutOff(tgt, -1, 0);
+}
+
+void PTree::deserializeFromStream(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx)
+{
+    deserializeSelf(src, ctx);
+
+    for (;;)
+    {
+        switch (isNextByteZero(src))
+        {
+        case NextByteStatus::nextByteIsNonZero:
+        {
+            IPropertyTree *child = create(src, ctx);
+            deserializeAddPropTree(child);
+            break;
+        }
+        case NextByteStatus::nextByteIsZero:
+            src.skip(1); // Skip over null terminator.
+            return;
+        case NextByteStatus::endOfStream:
+            throwUnexpectedX("PTree deserialization error: end of stream, expected child tree name, or terminator");
+        default:
+            throwUnexpected();
+        }
+    }
+}
+
+void PTree::deserializeSelf(IBufferedSerialInputStream &src, PTreeDeserializeContext &ctx)
+{
+    size32_t skipLen{0};
+    const char *name = queryZeroTerminatedString(src, skipLen);
+    if (unlikely(!name))
+        throwUnexpectedX("PTree deserialization error: end of stream, expected name");
+    StringBuffer serializedName;
+    if (skipLen)
+        serializedName.append(skipLen, name);
+    src.skip(skipLen + 1); // Skip over name and null terminator
+
+    read(src, flags);
+    setName(skipLen ? serializedName.str() : nullptr);
+
+    // Peek the attribute name/value string list (paired entries) and record offsets until the terminator
+    ctx.matchOffsets.clear();
+    constexpr unsigned pairedNameAndValueStringGrouping = 2;
+    const char * base = peekStringList(ctx.matchOffsets, src, skipLen, pairedNameAndValueStringGrouping);
+    if (unlikely(!base))
+        throwUnexpectedX("PTree deserialization error: end of stream, expected attribute name");
+
+    deserializeAttributes(base, ctx);
+
+    src.skip(skipLen); // Skip over all attributes and the terminator
+
+    if (value)
+        delete value;
+    size32_t size{0};
+    ctx.readEndian(src, size);
+    if (size > 0)
+        value = new CPTValue(src, size);
+    else
+        value = nullptr;
+}
+
 void PTree::serializeAttributes(MemoryBuffer &tgt)
 {
     IAttributeIterator *aIter = getAttributes();
@@ -2934,7 +3406,7 @@ void PTree::deserializeSelf(MemoryBuffer &src)
     StringAttr _name;
     src.read(_name);
     src.read(flags);
-    if (_name[0]==0) 
+    if (_name[0]==0)
         setName(NULL);
     else
         setName(_name);
@@ -2954,52 +3426,53 @@ void PTree::deserializeSelf(MemoryBuffer &src)
     if (value) delete value;
     if (size)
     {
-        src.reset(pos); 
+        src.reset(pos);
         value = new CPTValue(src);
     }
     else value = NULL;
 }
 
-IPropertyTree *PTree::clone(IPropertyTree &srcTree, bool self, bool sub)
+IPropertyTree *PTree::clone(const IPropertyTree &srcTree, bool sub)
 {
-    IPropertyTree *_dstTree = self ? this : create(srcTree.queryName());
-    PTree *dstTree = QUERYINTERFACE(_dstTree, PTree);
-    dbgassertex(dstTree);
-    if (self)
-        dstTree->setName(srcTree.queryName());
-    clone(srcTree, *dstTree, sub);
-    return _dstTree;
+    Owned<IPropertyTree> _dstTree = create(srcTree.queryName());
+    PTree *dstTree = static_cast<PTree *>(_dstTree.get());
+    dstTree->cloneContents(srcTree, sub);
+    return _dstTree.getClear();
 }
 
-void PTree::clone(IPropertyTree &srcTree, IPropertyTree &dstTree, bool sub)
+void PTree::cloneIntoSelf(const IPropertyTree &srcTree, bool sub)
 {
-    PTree *_dstTree = QUERYINTERFACE((&dstTree), PTree); assertex(_dstTree); //JCSMORE
-    flags = _dstTree->flags;
-    if (srcTree.isBinary(NULL))
-    {
-        MemoryBuffer mb;
-        verifyex(srcTree.getPropBin(NULL, mb));
-        dstTree.setPropBin(NULL, mb.length(), mb.toByteArray());
-    }
-    else if (srcTree.isCompressed(NULL))
-    {
-        StringBuffer s;
-        verifyex(srcTree.getProp(NULL, s));
-        dstTree.setProp(NULL, s.str());
-    }
-    else
-        dstTree.setProp(NULL, srcTree.queryProp(NULL));
+    setName(srcTree.queryName());
+    cloneContents(srcTree, sub);
+}
 
-    IAttributeIterator *attrs = srcTree.getAttributes();
-    if (attrs->first())
-    {
-        do
-        {
-            dstTree.setProp(attrs->queryName(), attrs->queryValue());
-        }
-        while (attrs->next());
-    }
-    attrs->Release();
+AttrValue *PTree::rawCloneAttributes() const
+{
+    if (!numAttrs)
+        return nullptr;
+    AttrValue *cloned = static_cast<AttrValue *>(checked_malloc(sizeof(AttrValue) * numAttrs, -605));
+    memcpy(cloned, attrs, sizeof(AttrValue) * numAttrs);
+    return cloned;
+}
+
+IPTArrayValue * PTree::cloneValue() const
+{
+    IPTArrayValue *v = queryValue();
+    if (!v)
+        return nullptr;
+    return new CPTValue(v->queryValueRawSize(), v->queryValueRaw(), isBinary(nullptr), v->getCompressionType(), COMPRESS_METHOD_NONE);
+}
+
+void PTree::cloneContents(const IPropertyTree &srcTree, bool sub)
+{
+    //MORE: Should any flags be cloned from the srcTree?
+
+    const PTree &src = static_cast<const PTree &>(srcTree);
+    bool srcBinary = srcTree.isBinary(NULL);
+    //All implementations of IPropertyTree have PTree as a base class, therefore static cast is ok.
+    IPTArrayValue *v = src.cloneValue();
+    setValue(v, srcBinary);
+    cloneAttributes(src);
 
     if (sub)
     {
@@ -3009,8 +3482,8 @@ void PTree::clone(IPropertyTree &srcTree, IPropertyTree &dstTree, bool sub)
             do
             {
                 IPropertyTree &child = iter->query();
-                IPropertyTree *newChild = clone(child, false, sub);
-                dstTree.addPropTree(newChild->queryName(), newChild);
+                IPropertyTree *newChild = clone(child, sub);
+                addPropTree(newChild->queryName(), newChild);
             }
             while (iter->next());
         }
@@ -3021,7 +3494,7 @@ IPropertyTree *PTree::ownPTree(IPropertyTree *tree)
 {
     if (!isEquivalent(tree) || tree->IsShared() || isCaseInsensitive() != tree->isCaseInsensitive())
     {
-        IPropertyTree *newTree = clone(*tree);
+        IPropertyTree *newTree = clone(*tree, true);
         tree->Release();
         return newTree;
     }
@@ -3064,7 +3537,7 @@ IPropertyTree *_createPropBranch(IPropertyTree *tree, const char *xpath, bool cr
             throw MakeIPTException(-1, "createPropBranch: cannot create path : %s", xpath);
         if (!createIntermediates)
             throw MakeIPTException(-1, "createPropBranch: no path found for : %s", path.str());
-    
+
         if ('/' == path.charAt(path.length()-1))
             path.remove(path.length()-1, 1);
         branch = _createPropBranch(tree, path.str(), createIntermediates, created, createdParent);
@@ -3105,7 +3578,7 @@ IPropertyTree *createPropBranch(IPropertyTree *tree, const char *xpath, bool cre
 void PTree::addLocal(size32_t l, const void *data, bool _binary, int pos)
 {
     if (!l) return; // right thing to do on addProp("x", NULL) ?
-    IPTArrayValue *newValue = new CPTValue(l, data, _binary);
+    IPTArrayValue *newValue = new CPTValue(l, data, _binary, COMPRESS_METHOD_NONE, COMPRESS_METHOD_DEFAULT);
     Owned<IPropertyTree> tree = create(queryName(), newValue);
     PTree *_tree = QUERYINTERFACE(tree.get(), PTree); assertex(_tree);
 
@@ -3187,7 +3660,7 @@ bool PTree::checkPattern(const char *&xxpath) const
 {
     // Pattern is an additional filter at the current node level
     // It can be [condition], or it can be empty (we don't support anything else)
-    // supported conditions are: 
+    // supported conditions are:
     //    tag - must have child called tag
     //    @attr - must have attribute called attr
     //    tag="value" - must have child called tag with given value
@@ -3397,7 +3870,7 @@ bool PTree::checkPattern(const char *&xxpath) const
             for (;;)
             {
                 if (matchElem->isBinary(tProp))
-                    UNIMPLEMENTED;
+                    UNIMPLEMENTED_IPT;
                 const char *rhs;
                 unsigned rhslength;
                 if (quoteEnd)
@@ -3478,12 +3951,12 @@ AttrValue *PTree::findAttribute(const char *key) const
     return nullptr;
 }
 
-const char *PTree::getAttributeValue(const char *key) const
+const char *PTree::getAttributeValue(const char *key, const char * dft) const
 {
     AttrValue *e = findAttribute(key);
     if (e)
         return e->value.get();
-    return nullptr;
+    return dft;
 }
 
 unsigned PTree::getAttributeCount() const
@@ -3503,6 +3976,21 @@ AttrValue *PTree::getNextAttribute(AttrValue *cur) const
             return nullptr;
         return ++cur;
     }
+}
+
+static AttrValue *newAttrArray(unsigned n)
+{
+    return n ? static_cast<AttrValue *>(checked_malloc(sizeof(AttrValue) * n, -605)) : nullptr;
+}
+
+static AttrValue *resizeAttrArray(AttrValue *attrs, unsigned oldCount, unsigned newCount)
+{
+    return static_cast<AttrValue *>(checked_realloc(attrs, sizeof(AttrValue) * newCount, sizeof(AttrValue) * oldCount, -605));
+}
+
+static void freeAttrArray(AttrValue *attrs)
+{
+    free(attrs);
 }
 
 
@@ -3530,12 +4018,13 @@ LocalPTree::~LocalPTree()
     if (!attrs)
         return;
     AttrValue *a = attrs+numAttrs;
-    while (a--!=attrs)
+    while (a != attrs)
     {
+        --a;
         a->key.destroy();
         a->value.destroy();
     }
-    free(attrs);
+    freeAttrArray(attrs);
 }
 
 const char *LocalPTree::queryName() const
@@ -3547,11 +4036,11 @@ void LocalPTree::setName(const char *_name)
 {
     if (_name==name.get())
         return;
-    AttrStr *oname = name.getPtr();  // Don't free until after we copy - they could overlap
+    AtomStr *oname = name.getPtr();  // Don't free until after we copy - they could overlap
     if (!name.set(_name))
-        name.setPtr(AttrStr::create(_name));
+        name.setPtr(AtomStr::create(_name));
     if (oname)
-        AttrStr::destroy(oname);
+        AtomStr::destroy(oname);
 }
 
 bool LocalPTree::removeAttribute(const char *key)
@@ -3573,16 +4062,51 @@ bool LocalPTree::removeAttribute(const char *key)
     return true;
 }
 
-void LocalPTree::setAttribute(const char *key, const char *val)
+void LocalPTree::deserializeAttributes(const char *base, PTreeDeserializeContext &ctx)
 {
-    if (!key)
+    const unsigned newAttrPairs = ctx.matchOffsets.size() / 2;
+    if (!newAttrPairs)
         return;
+
+    // Expected to run on an empty tree.
+    // Qualifier map will never be set up during deserialization, so no need to update.
+    dbgassertex(!(numAttrs || arrayOwner || attrs));
+
+    // Allocate space for new attributes
+    attrs = resizeAttrArray(attrs, numAttrs, newAttrPairs);
+
+    // Process each name/value pair
+    for (unsigned i = 0; i < ctx.matchOffsets.size(); i += 2)
+    {
+        const char *attrName = base + ctx.matchOffsets[i];
+        const char *attrValue = base + ctx.matchOffsets[i + 1];
+        AttrValue *v = new (&attrs[numAttrs++]) AttrValue; // Initialize new AttrValue
+
+        if (!v->key.set(attrName)) // AtomStr will not return encoding marker when get() is called
+            v->key.setPtr(isnocase() ? AtomStr::createNC(attrName) : AtomStr::create(attrName));
+        if (!v->value.set(attrValue))
+            v->value.setPtr(AtomStr::create(attrValue));
+    }
+}
+
+void LocalPTree::setAttribute(const char *inputkey, const char *val, bool encoded)
+{
+    if (!inputkey)
+        return;
+    const char *key = inputkey;
+    if (encoded)
+    {
+        if (*key!='~')
+            encoded=false;
+        else
+            key++;
+    }
     if (!validateXMLTag(key+1))
         throw MakeIPTException(-1, "Invalid xml attribute: %s", key);
     if (!val)
         val = "";  // cannot have NULL value
     AttrValue *v = findAttribute(key);
-    AttrStr *goer = nullptr;
+    AtomStr *goer = nullptr;
     if (v)
     {
         if (streq(v->value.get(), val))
@@ -3591,10 +4115,10 @@ void LocalPTree::setAttribute(const char *key, const char *val)
     }
     else
     {
-        attrs = (AttrValue *)realloc(attrs, (numAttrs+1)*sizeof(AttrValue));
+        attrs = resizeAttrArray(attrs, numAttrs, numAttrs+1);
         v = new(&attrs[numAttrs++]) AttrValue;  // Initialize new AttrValue
-        if (!v->key.set(key))
-            v->key.setPtr(isnocase() ? AttrStr::createNC(key) : AttrStr::create(key));
+        if (!v->key.set(inputkey)) //AtomStr will not return encoding marker when get() is called
+            v->key.setPtr(isnocase() ? AtomStr::createNC(inputkey) : AtomStr::create(inputkey));
     }
     if (arrayOwner)
     {
@@ -3609,19 +4133,73 @@ void LocalPTree::setAttribute(const char *key, const char *val)
     }
 
     if (!v->value.set(val))
-        v->value.setPtr(AttrStr::create(val));
+        v->value.setPtr(AtomStr::create(val));
     if (goer)
-        AttrStr::destroy(goer);
+        AtomStr::destroy(goer);
+}
+
+void LocalPTree::cloneAttributes(const PTree &src)
+{
+    //This is only ever called when the target tree is empty
+    dbgassertex(!attrs);
+    const unsigned newNumAttrs = src.getAttributeCount();
+    if (!newNumAttrs)
+        return;
+
+    AttrValue *newAttrs = src.rawCloneAttributes();
+    const bool nc = isnocase();
+    unsigned curKeyAttr = 0;
+    unsigned curValueAttr = 0;
+    try
+    {
+        for (; curKeyAttr < newNumAttrs; curKeyAttr++)
+        {
+            if (newAttrs[curKeyAttr].key.isPtr())
+            {
+                const char *key = newAttrs[curKeyAttr].key.get();
+                newAttrs[curKeyAttr].key.setPtr(nc ? AtomStr::createNC(key) : AtomStr::create(key));
+            }
+        }
+
+        for (; curValueAttr < newNumAttrs; curValueAttr++)
+        {
+            if (newAttrs[curValueAttr].value.isPtr())
+            {
+                const char *value = newAttrs[curValueAttr].value.get();
+                newAttrs[curValueAttr].value.setPtr(AtomStr::create(value));
+            }
+        }
+    }
+    catch (...)
+    {
+        for (unsigned i = 0; i < curKeyAttr; i++)
+        {
+            AtomStr *k = newAttrs[i].key.getPtr();
+            if (k)
+                AtomStr::destroy(k);
+        }
+        for (unsigned i = 0; i < curValueAttr; i++)
+        {
+            AtomStr *v = newAttrs[i].value.getPtr();
+            if (v)
+                AtomStr::destroy(v);
+        }
+        freeAttrArray(newAttrs);
+        throw;
+    }
+
+    attrs = newAttrs;
+    numAttrs = newNumAttrs;
 }
 
 #ifdef TRACE_STRING_SIZE
-std::atomic<__int64> AttrStr::totsize { 0 };
-std::atomic<__int64> AttrStr::maxsize { 0 };
+std::atomic<__int64> AtomStr::totsize { 0 };
+std::atomic<__int64> AtomStr::maxsize { 0 };
 #endif
 
 #ifdef TRACE_ATOM_SIZE
-std::atomic<__int64> AttrStrAtom::totsize { 0 };
-std::atomic<__int64> AttrStrAtom::maxsize { 0 };
+std::atomic<__int64> AtomStrAtom::totsize { 0 };
+std::atomic<__int64> AtomStrAtom::maxsize { 0 };
 #endif
 
 ///////////////////
@@ -3643,76 +4221,44 @@ CAtomPTree::~CAtomPTree()
 {
     numAtomTrees--;
     bool nc = isnocase();
-    HashKeyElement *name_ptr = name.getPtr();
+    AtomStr *name_ptr = name.getPtr();
     if (name_ptr)
-    {
-        AtomRefTable *kT = nc?keyTableNC:keyTable;
-#ifdef TRACE_ATOM_SIZE
-        size_t gosize = sizeof(HashKeyElement)+strlen(name_ptr->get())+1;
-        if (kT->releaseKey(name_ptr))
-            AttrStrAtom::totsize -= gosize;
-#else
-        kT->releaseKey(name_ptr);
-#endif
-    }
+        removeNameByPtr(name_ptr, nc);
     if (!attrs)
         return;
     AttrValue *a = attrs+numAttrs;
+    while (a != attrs)
     {
-        CriticalBlock block(hashcrit);
-        while (a--!=attrs)
-        {
-            if (a->key.isPtr())
-                attrHT->removekey(a->key.getPtr(), nc);
-            if (a->value.isPtr())
-                attrHT->removeval(a->value.getPtr());
-        }
-        freeAttrArray(attrs, numAttrs);
+        --a;
+        AtomStr *k = a->key.getPtr();
+        if (k)
+            removeAttrKeyByPtr(k, nc);
+        AtomStr *valPtr = a->value.getPtr();
+        if (valPtr)
+            removeAttrValByPtr(valPtr);
     }
+    free(attrs);
 }
 
 void CAtomPTree::setName(const char *_name)
 {
-    AtomRefTable *kT = isnocase()?keyTableNC:keyTable;
-    HashKeyElement *oname = name.getPtr(); // NOTE - don't release yet as could overlap source name
+    AtomStr *oname = name.getPtr(); // NOTE - don't release yet as could overlap source name
     if (!_name)
         name.setPtr(nullptr);
     else
     {
         if (!validateXMLTag(_name))
             throw MakeIPTException(PTreeExcpt_InvalidTagName, ": %s", _name);
-        if (!name.set(_name))
+        if (!name.set(_name, isnocase()))
         {
 #ifdef TRACE_ALL_ATOM
             DBGLOG("TRACE_ALL_ATOM: %s", _name);
 #endif
-#ifdef TRACE_ATOM_SIZE
-            bool didCreate;
-            name.setPtr(kT->queryCreate(_name, didCreate));
-            if (didCreate)
-            {
-                AttrStrAtom::totsize += sizeof(HashKeyElement)+strlen(_name)+1;
-                if (AttrStrAtom::totsize > AttrStrAtom::maxsize)
-                {
-                    AttrStrAtom::maxsize.store(AttrStrAtom::totsize);
-                    DBGLOG("TRACE_ATOM_SIZE: total size now %" I64F "d", AttrStrAtom::maxsize.load());
-                }
-            }
-#else
-            name.setPtr(kT->queryCreate(_name));
-#endif
+            name.setPtr(ensureNodeName(_name, isnocase()));
         }
     }
     if (oname)
-    {
-#ifdef TRACE_ATOM_SIZE
-        size_t gosize = sizeof(HashKeyElement)+strlen(oname->get())+1;
-        if (kT->releaseKey(oname))
-            AttrStrAtom::totsize -= gosize;
-#else
-        kT->releaseKey(oname);
-#endif
-    }
+        removeNameByPtr(oname, isnocase());
 }
 
 const char *CAtomPTree::queryName() const
@@ -3724,49 +4270,64 @@ unsigned CAtomPTree::queryHash() const
 {
     if (name.isPtr())
     {
-        assert(name.getPtr());
-        return name.getPtr()->queryHash();
+        AtomStr *ptr = name.getPtr();
+        assert(ptr);
+        return AtomStrAtom::toAtom(ptr)->hash;
     }
-    else
-    {
-        const char *_name = name.get();
-        size32_t nl = strlen(_name);
-        return isnocase() ? hashnc((const byte *) _name, nl, 0): hashc((const byte *) _name, nl, 0);
-    }
+#ifdef USE_READONLY_ATOMTABLE
+    else if (name.flag == 3)
+        return NodeNameStrUnion::roNameTable->getIndex(name.idx2)->hash;
+#endif
+
+    const char *_name = name.get();
+    size32_t nl = strlen(_name);
+    return hash_fnv1a((const byte *)_name, nl, fnvInitialHash32, isnocase());
 }
 
-AttrValue *CAtomPTree::newAttrArray(unsigned n)
+void CAtomPTree::deserializeAttributes(const char *base, PTreeDeserializeContext &ctx)
 {
-    // NB crit must be locked
-    if (!n)
-        return nullptr;
-    if (freelistmax<=n)
+    const unsigned newAttrPairs = ctx.matchOffsets.size() / 2;
+    if (!newAttrPairs)
+        return;
+
+    // Expected to run on an empty tree.
+    // Qualifier map will never be set up during deserialization, so no need to update.
+    dbgassertex(!(numAttrs || arrayOwner || attrs));
+
+    // Allocate storage for all deserialized attributes in a single allocation.
+    AttrValue *newAttrs = newAttrArray(newAttrPairs);
+
+    // Process each name/value pair. Commit to members only after fully successful population.
+    // Each attr key/value is routed to its own shard lock when atomization is required.
+    const bool nc = isnocase();
+    try
     {
-        freelist = (AttrValue **)realloc(freelist, sizeof(AttrValue *)*(n+1));
-        while (freelistmax<=n)
-            freelist[freelistmax++] = nullptr;
+        for (unsigned i{0}; i < ctx.matchOffsets.size(); i += 2)
+        {
+            const char *attrName = base + ctx.matchOffsets[i];
+            const char *attrValue = base + ctx.matchOffsets[i + 1];
+            AttrValue *v = new (&newAttrs[i >> 1]) AttrValue;
+
+            const bool keySet = v->key.set(attrName);
+            const bool valueSet = v->value.set(attrValue);
+            if (!keySet)
+                v->key.setPtr(ensureAttributeName(attrName, nc));
+
+            if (!valueSet)
+                v->value.setPtr(ensureAttributeValue(attrValue));
+        }
     }
-    AttrValue *&p = freelist[n];
-    AttrValue *ret = p;
-    if (ret)
-        p = *(AttrValue **)ret;
-    else
-        ret = (AttrValue *)freeallocator.alloc(sizeof(AttrValue)*n);
-    return ret;
+    catch (...)
+    {
+        freeAttrArray(newAttrs);
+        throw;
+    }
+
+    attrs = newAttrs;
+    numAttrs = newAttrPairs;
 }
 
-void CAtomPTree::freeAttrArray(AttrValue *a, unsigned n)
-{
-    // NB crit must be locked
-    if (a)
-    {
-        AttrValue *&p = freelist[n];
-        *(AttrValue **)a = p;
-        p = a;
-    }
-}
-
-void CAtomPTree::setAttribute(const char *key, const char *val)
+void CAtomPTree::setAttribute(const char *key, const char *val, bool encoded)
 {
     if (!key)
         return;
@@ -3786,29 +4347,19 @@ void CAtomPTree::setAttribute(const char *key, const char *val)
                 map->replaceEntryIfMapped(key, v->value.get(), val, this);
         }
 
-        AttrStr * goer = v->value.getPtr();
+        AtomStr * goer = v->value.getPtr();
         if (!v->value.set(val))
         {
-            CriticalBlock block(hashcrit);
             if (goer)
-                attrHT->removeval(goer);
-            v->value.setPtr(attrHT->addval(val));
+                removeAttrValByPtr(goer);
+            v->value.setPtr(ensureAttributeValue(val));
         }
         else if (goer)
-        {
-            CriticalBlock block(hashcrit);
-            attrHT->removeval(goer);
-        }
+            removeAttrValByPtr(goer);
     }
     else
     {
-        CriticalBlock block(hashcrit);
-        AttrValue *newattrs = newAttrArray(numAttrs+1);
-        if (attrs)
-        {
-            memcpy(newattrs, attrs, numAttrs*sizeof(AttrValue));
-            freeAttrArray(attrs, numAttrs);
-        }
+        AttrValue *newattrs = resizeAttrArray(attrs, numAttrs, numAttrs+1);
         if (arrayOwner)
         {
             CQualifierMap *map = arrayOwner->queryMap();
@@ -3817,12 +4368,92 @@ void CAtomPTree::setAttribute(const char *key, const char *val)
         }
         v = &newattrs[numAttrs];
         if (!v->key.set(key))
-            v->key.setPtr(attrHT->addkey(key, isnocase()));
+            v->key.setPtr(ensureAttributeName(key, isnocase()));
+
+        //shared via atom table, may want to add this later... escaped and unescaped versions should be considered unique
+        //if (encoded)
+        //    v->key.setEncoded();
         if (!v->value.set(val))
-            v->value.setPtr(attrHT->addval(val));
+            v->value.setPtr(ensureAttributeValue(val));
         numAttrs++;
         attrs = newattrs;
     }
+}
+
+void CAtomPTree::cloneAttributes(const PTree &src)
+{
+    //This is only ever called when the target tree is empty
+    dbgassertex(!attrs);
+    const unsigned newNumAttrs = src.getAttributeCount();
+    if (!newNumAttrs)
+        return;
+
+    AttrValue *newAttrs = src.rawCloneAttributes();
+    const bool nc = isCaseInsensitive();
+    bool srcLowMemory = src.isLowMemory();
+    if (srcLowMemory && (src.isCaseInsensitive() != nc))
+        srcLowMemory = false; // fall back to resolving in the hash table
+
+    unsigned curKeyAttr = 0;
+    unsigned curValueAttr = 0;
+    try
+    {
+        for (; curKeyAttr < newNumAttrs; curKeyAttr++)
+        {
+            if (newAttrs[curKeyAttr].key.isPtr())
+            {
+                AtomStr *keyPtr = newAttrs[curKeyAttr].key.getPtr();
+                if (srcLowMemory)
+                {
+                    if (!AtomStrAtom::toAtom(keyPtr)->link())
+                        throw MakeIPTException(PTreeExcpt_InternalError, "CAtomPTree::cloneAttributes: failed to link attribute key atom");
+                }
+                else
+                {
+                    const char *key = newAttrs[curKeyAttr].key.get();
+                    newAttrs[curKeyAttr].key.setPtr(ensureAttributeName(key, nc));
+                }
+            }
+        }
+
+        for (; curValueAttr < newNumAttrs; curValueAttr++)
+        {
+            if (newAttrs[curValueAttr].value.isPtr())
+            {
+                AtomStr *valuePtr = newAttrs[curValueAttr].value.getPtr();
+                if (srcLowMemory)
+                {
+                    if (!AtomStrAtom::toAtom(valuePtr)->link())
+                        throw MakeIPTException(PTreeExcpt_InternalError, "CAtomPTree::cloneAttributes: failed to link attribute value atom");
+                }
+                else
+                {
+                    const char *value = newAttrs[curValueAttr].value.get();
+                    newAttrs[curValueAttr].value.setPtr(ensureAttributeValue(value));
+                }
+            }
+        }
+    }
+    catch (...)
+    {
+        for (unsigned i = 0; i < curKeyAttr; i++)
+        {
+            AtomStr *k = newAttrs[i].key.getPtr();
+            if (k)
+                removeAttrKeyByPtr(k, nc);
+        }
+        for (unsigned i = 0; i < curValueAttr; i++)
+        {
+            AtomStr *v = newAttrs[i].value.getPtr();
+            if (v)
+                removeAttrValByPtr(v);
+        }
+        freeAttrArray(newAttrs);
+        throw;
+    }
+
+    attrs = newAttrs;
+    numAttrs = newNumAttrs;
 }
 
 bool CAtomPTree::removeAttribute(const char *key)
@@ -3837,11 +4468,16 @@ bool CAtomPTree::removeAttribute(const char *key)
         if (map)
             map->removeEntryIfMapped(key, del->value.get(), this);
     }
-    CriticalBlock block(hashcrit);
     if (del->key.isPtr())
-        attrHT->removekey(del->key.getPtr(), isnocase());
+    {
+        AtomStr *k = del->key.getPtr();
+        removeAttrKeyByPtr(k, isnocase());
+    }
     if (del->value.isPtr())
-        attrHT->removeval(del->value.getPtr());
+    {
+        AtomStr *valPtr = del->value.getPtr();
+        removeAttrValByPtr(valPtr);
+    }
     AttrValue *newattrs = newAttrArray(numAttrs);
     if (newattrs)
     {
@@ -3849,7 +4485,7 @@ bool CAtomPTree::removeAttribute(const char *key)
         memcpy(newattrs, attrs, pos*sizeof(AttrValue));
         memcpy(newattrs+pos, attrs+pos+1, (numAttrs-pos)*sizeof(AttrValue));
     }
-    freeAttrArray(attrs, numAttrs+1);
+    freeAttrArray(attrs);
     attrs = newattrs;
     return true;
 }
@@ -3997,7 +4633,7 @@ bool SingleIdIterator::first()
         else
             return false;
     }
-    ++whichNext;            
+    ++whichNext;
     return true;
 }
 
@@ -4022,10 +4658,10 @@ bool SingleIdIterator::isValid()
 class StackElement
 {
 public:
-    void init(IPropertyTreeIterator *_iter, const char *_xpath) 
+    void init(IPropertyTreeIterator *_iter, const char *_xpath)
     {
         xpath = (char *)strdup(_xpath);
-        iter=LINK(_iter); 
+        iter=LINK(_iter);
     }
     void clear()
     {
@@ -4033,10 +4669,10 @@ public:
         if (xpath)
             free(xpath);
     }
-    IPropertyTreeIterator *get(StringAttr &str) 
-    { 
+    IPropertyTreeIterator *get(StringAttr &str)
+    {
         str.setown(xpath); return iter; // NB used in place of pop, as element invalid after call
-    } 
+    }
     IPropertyTreeIterator *iter;
     char * xpath;
 };
@@ -4072,7 +4708,7 @@ void PTStackIterator::setIterator(IPropertyTreeIterator *_iter)
 }
 
 // IIterator impl.
-bool PTStackIterator::first() 
+bool PTStackIterator::first()
 {
     while (stacklen)
         stack[--stacklen].clear();
@@ -4129,7 +4765,7 @@ bool PTStackIterator::next()
                     current = element;
                     return true;
                 case '.':
-                    if (separator) throw MakeXPathException(xpath, PTreeExcpt_XPath_ParseError, 0, "Syntax error");
+                    if (!separator) throw MakeXPathException(xpath, PTreeExcpt_XPath_ParseError, 0, "Syntax error");
                     separator=false;
                     ++xxpath;
                     if (*xpath && '/' != *xpath)
@@ -4140,7 +4776,7 @@ bool PTStackIterator::next()
                     if ('/' == *xxpath)
                     {
                         --xxpath;
-                        if (iter->isValid()) 
+                        if (iter->isValid())
                             pushToStack(iter, xxpath);
                         setIterator(element->getElements(xxpath));
                         xxpath = "";
@@ -4150,7 +4786,7 @@ bool PTStackIterator::next()
                     break;
                 default:
                     separator=false;
-                    if (iter->isValid()) 
+                    if (iter->isValid())
                         pushToStack(iter, xxpath);
 
                     bool wild, numeric;
@@ -4239,7 +4875,7 @@ void PTStackIterator::pushToStack(IPropertyTreeIterator *iter, const char *xpath
 
 IPropertyTreeIterator *PTStackIterator::popFromStack(StringAttr &path)
 {
-    if (!stacklen) 
+    if (!stacklen)
         return NULL;
     return stack[--stacklen].get(path);
 }
@@ -4250,15 +4886,37 @@ IPropertyTreeIterator *PTStackIterator::popFromStack(StringAttr &path)
 
 IPropertyTree *createPTree(MemoryBuffer &src, byte flags)
 {
-    IPropertyTree *tree = createPTree(nullptr, flags);
-    tree->deserialize(src);
-    return tree;
+    Owned<IBufferedSerialInputStream> stream = createBufferedSerialInputStream(src);
+    Owned<IPropertyTree> tree = createPTree(nullptr, flags);
+    PTreeDeserializeContext ctx(src);
+    tree->deserializeFromStream(*stream, ctx);
+    return tree.getClear();
 }
+
+IPropertyTree *createPTreeFromBinary(IBufferedSerialInputStream &src, byte flags)
+{
+    Owned<IPropertyTree> tree = createPTree(nullptr, flags);
+    PTreeDeserializeContext ctx;
+    tree->deserializeFromStream(src, ctx);
+    return tree.getClear();
+}
+
+IPropertyTree *createPTreeFromBinary(IBufferedSerialInputStream &src, IPTreeNodeCreator *nodeCreator)
+{
+    if (!nodeCreator)
+        return createPTreeFromBinary(src, ipt_none);
+
+    Owned<IPropertyTree> tree = nodeCreator->create(nullptr); // The nullptr is a dummy name value, it will be overwritten by deserializeFromStream
+    PTreeDeserializeContext ctx;
+    tree->deserializeFromStream(src, ctx);
+    return tree.getClear();
+}
+
 
 IPropertyTree *createPTreeFromIPT(const IPropertyTree *srcTree, ipt_flags flags)
 {
     Owned<PTree> tree = (PTree *)createPTree(NULL, flags);
-    return tree->clone(*srcTree->queryBranch(NULL));
+    return tree->clone(*srcTree->queryBranch(NULL), true);
 }
 
 void mergePTree(IPropertyTree *target, IPropertyTree *toMerge)
@@ -4313,7 +4971,7 @@ void _synchronizePTree(IPropertyTree *target, const IPropertyTree *source, bool 
         ForEachItemIn (a, targetAttrs)
             target->removeProp(targetAttrs.item(a));
     }
-    
+
     bool equal = true;
     MemoryBuffer srcMb;
     const char *src = NULL;
@@ -4341,11 +4999,11 @@ void _synchronizePTree(IPropertyTree *target, const IPropertyTree *source, bool 
     if (!equal)
     {
         if (target->isBinary())
-            target->setPropBin(NULL, srcMb.length(), srcMb.toByteArray());
+            target->setPropBin(NULL, srcMb.length(), srcMb.toByteArray(), COMPRESS_METHOD_DEFAULT);
         else
             target->setProp(NULL, src);
     }
-    
+
     ICopyArrayOf<IPropertyTree> toProcess;
     Owned<IPropertyTreeIterator> iter = source->getElements("*");
     ForEach (*iter)
@@ -4474,7 +5132,7 @@ IPTreeReadException *createPTreeReadException(int code, const char *msg, const c
             return str;
         }
         MessageAudience errorAudience() const { return MSGAUD_user; }
-    
+
         const char *queryDescription() { return msg; }
         unsigned queryLine() { return line; }
         offset_t queryOffset() { return offset; }
@@ -4483,14 +5141,14 @@ IPTreeReadException *createPTreeReadException(int code, const char *msg, const c
     return new CPTreeReadException(code, msg, context, line, offset);
 }
 
-template <typename T>
 class CommonReaderBase : public CInterface
 {
     Linked<ISimpleReadStream> lstream;
     ISimpleReadStream *stream;
     bool bufOwned, nullTerm;
-    byte *buf, *bufPtr;
+    byte *buf;
     size32_t bufSize, bufRemaining;
+    size32_t bufOffset = 0;
 protected:
     PTreeReaderOptions readerOptions;
     bool ignoreWhiteSpace, noRoot;
@@ -4507,9 +5165,11 @@ private:
     }
     void resetState()
     {
-        bufPtr = buf;
+        bufOffset = 0;
         nextChar = 0;
-        if (nullTerm || stream)
+        if (nullTerm)
+            bufRemaining = (size32_t)-1; // Set to the maximum value.  This avoids special casing updating buffer positions
+        else if (stream)
             bufRemaining = 0;
         curOffset = 0;
         line = 0;
@@ -4519,7 +5179,7 @@ public:
     CommonReaderBase(ISimpleReadStream &_stream, IPTreeNotifyEvent &_iEvent, PTreeReaderOptions _readerOptions, size32_t _bufSize=0) :
         bufSize(_bufSize), readerOptions(_readerOptions), iEvent(&_iEvent)
     {
-        if (!bufSize) bufSize = 0x8000;
+        if (!bufSize) bufSize = 0x20000;
         buf = new byte[bufSize];
         bufRemaining = 0;
         curOffset = 0;
@@ -4548,7 +5208,7 @@ public:
         bufSize = 0; // not used for direct reads
         stream = NULL;  // not used for direct reads
         curOffset = 0;
-        bufRemaining = 0;
+        bufRemaining = (size32_t)-1;
         nullTerm = true;
         buf = (byte *)_buf;
         bufOwned = false;
@@ -4570,15 +5230,12 @@ protected:
         assertex(curOffset >= n);
         if (!n) return;
         curOffset -= n;
-        size32_t d = (size32_t)(bufPtr-buf);
-        if (n > d) n = d;
-        if (!nullTerm)
-            bufRemaining += n;
+        if (n > bufOffset) n = bufOffset;
         for (;;)
         {
-            --bufPtr;
+            --bufOffset;
             if (!--n) break;
-            if (10 == *bufPtr) --line;
+            if (10 == buf[bufOffset]) --line;
         }
     }
     bool checkBOM()
@@ -4617,12 +5274,12 @@ protected:
             error("Unsupported utf16 format detected in BOM header", false);
         return false;
     }
-    inline void expecting(const char *str)
+    inline void expecting(const char *str) __attribute__((noreturn))
     {
         StringBuffer errorMsg("Expecting \"");
         error(errorMsg.append(str).append("\"").str());
     }
-    inline void eos()
+    inline void eos() __attribute__((noreturn))
     {
         error("String terminator hit");
     }
@@ -4647,20 +5304,20 @@ protected:
         StringBuffer context;
         if (giveContext)
         {
-            size32_t bufPos = (size32_t)(bufPtr-buf);
+            size32_t bufPos = bufOffset;
             unsigned preLen = std::min(40U, bufPos);
-            size32_t bR = bufRemaining;
+            size32_t bR = bufRemaining - bufOffset;
             if (nullTerm)
             {
-                byte *tPtr = bufPtr;
+                bR = 0;
                 while (bR<40)
                 {
-                    if ('\0' == *tPtr++) break;
+                    if ('\0' == buf[bufOffset + bR]) break;
                     bR++;
                 }
             }
             unsigned postLen = std::min(80-preLen, bR);
-            const char *bufferContext = (const char *)(bufPtr - preLen);
+            const char *bufferContext = (const char *)(buf + bufOffset - preLen);
             context.append(preLen, bufferContext);
             context.append("*ERROR*");
             context.append(postLen, bufferContext+preLen);
@@ -4686,66 +5343,225 @@ protected:
             return true;
         return readNextToken();
     }
-    inline bool readNextToken();
-    inline bool checkSkipWS()
+    inline bool readNextToken()
     {
-        while (isspace(nextChar)) if (!checkReadNext()) return false;
+        // do own buffering, to have reasonable error context.
+        if (unlikely(bufOffset >= bufRemaining))
+        {
+            if (stream)
+            {
+                bufRemaining = stream->read(bufSize, buf);
+                bufOffset = 0;
+            }
+            if (bufOffset >= bufRemaining)
+                return false;
+        }
+        nextChar = buf[bufOffset++];
+        if (unlikely((0 == nextChar) && nullTerm))
+        {
+            --bufOffset;
+            return false;
+        }
+        if (10 == nextChar)
+            line++;
         return true;
     }
+    inline bool doSkipWS()
+    {
+        if (!wsCharSet.includes(nextChar))
+            return true;
+
+        for (;;)
+        {
+            const byte *start = buf + bufOffset;
+            unsigned newlines = 0;
+
+            const byte *p = start;
+            if (nullTerm)
+            {
+                for (;;)
+                {
+                    char c = (char)*p;
+                    //the null character is not a whitespace character, so no need for an extra check
+                    if (!wsCharSet.includes(c))
+                        break;
+
+                    if (unlikely(10 == c))
+                        newlines++;
+
+                    p++;
+                }
+            }
+            else
+            {
+                const byte *end = buf + bufRemaining;
+                while (p < end)
+                {
+                    char c = (char)*p;
+                    if (!wsCharSet.includes(c))
+                        break;
+
+                    if (unlikely(10 == c))
+                        newlines++;
+
+                    p++;
+                }
+            }
+
+            size32_t numMatched = p - start;
+            if (unlikely(numMatched > 0))
+            {
+                bufOffset += numMatched;
+                line += newlines;
+                curOffset += numMatched;
+            }
+
+            if (!checkReadNext())
+                return false;
+
+            if (!wsCharSet.includes(nextChar))
+                break;
+        }
+        return true;
+    }
+
+    inline bool checkSkipWS() { return doSkipWS(); }
     inline void skipWS()
     {
-        while (isspace(nextChar)) readNext();
+        if (!doSkipWS())
+            error("End of stream encountered whilst parsing", true, PTreeRead_EOS);
+    }
+    bool readMatching(StringBuffer &out, const CCharacterSet & firstCharSet, const CCharacterSet & restCharSet)
+    {
+        if (!firstCharSet.includes(nextChar))
+            return false;
+
+        for (;;)
+        {
+            out.append(nextChar);
+
+            const byte *start = buf + bufOffset;
+            unsigned newlines = 0;
+
+            const byte *p = start;
+            if (nullTerm)
+            {
+                for (;;)
+                {
+                    char c = (char)*p;
+                    if (!restCharSet.includes(c))
+                        break;
+                    if (unlikely(0 == c))
+                        break;
+
+                    if (unlikely(10 == c))
+                        newlines++;
+
+                    p++;
+                }
+            }
+            else
+            {
+                const byte *end = buf + bufRemaining;
+                while (p < end)
+                {
+                    char c = (char)*p;
+                    if (!restCharSet.includes(c))
+                        break;
+
+                    if (unlikely(10 == c))
+                        newlines++;
+
+                    p++;
+                }
+            }
+
+            size32_t numMatched = p - start;
+            if (likely(numMatched > 0))
+            {
+                out.append(numMatched, (const char *)start);
+                bufOffset += numMatched;
+                line += newlines;
+                curOffset += numMatched;
+            }
+
+            readNext();
+            if (!restCharSet.includes(nextChar))
+                break;
+        }
+        return true;
+    }
+    void readUntil(StringBuffer *out, char targetChar)
+    {
+        if (nextChar == targetChar)
+            return;
+
+        for (;;)
+        {
+            if (unlikely(nextChar == 0 && nullTerm))
+                break;
+
+            if (out)
+                out->append(nextChar);
+
+            const byte *start = buf + bufOffset;
+            unsigned newlines = 0;
+
+            const byte *p = start;
+            if (nullTerm)
+            {
+                for (;;)
+                {
+                    char c = (char)*p;
+                    if (c == targetChar)
+                        break;
+                    if (unlikely(0 == c))
+                        break;
+
+                    if (unlikely(10 == c))
+                        newlines++;
+
+                    p++;
+                }
+            }
+            else
+            {
+                const byte *end = buf + bufRemaining;
+                while (p < end)
+                {
+                    char c = (char)*p;
+                    if (c == targetChar)
+                        break;
+
+                    if (unlikely(10 == c))
+                        newlines++;
+
+                    p++;
+                }
+            }
+
+            size32_t numMatched = p - start;
+            if (likely(numMatched > 0))
+            {
+                if (out)
+                    out->append(numMatched, (const char *)start);
+                bufOffset += numMatched;
+                line += newlines;
+                curOffset += numMatched;
+            }
+            if (!checkReadNext())
+                break;
+            if (nextChar == targetChar)
+                break;
+        }
+    }
+    inline void skipUntil(char targetChar)
+    {
+        readUntil(nullptr, targetChar);
     }
 };
 
-class CInstStreamReader { public: }; // only used to ensure different template definitions.
-class CInstBufferReader { public: };
-class CInstStringReader { public: };
-
-template <> inline bool CommonReaderBase<CInstStreamReader>::readNextToken()
-{
-    // do own buffering, to have reasonable error context.
-    if (0 == bufRemaining)
-    {
-        size32_t _bufRemaining = stream->read(bufSize, buf);
-        if (!_bufRemaining)
-            return false;
-        bufRemaining = _bufRemaining;
-        bufPtr = buf;
-    }
-    --bufRemaining;
-    nextChar = *bufPtr++;
-    if (10 == nextChar)
-        line++;
-    return true;
-}
-
-template <> inline bool CommonReaderBase<CInstBufferReader>::readNextToken()
-{
-    if (0 == bufRemaining)
-        return false;
-    --bufRemaining;
-    nextChar = *bufPtr++;
-    if (10 == nextChar)
-        line++;
-    return true;
-}
-
-template <> inline bool CommonReaderBase<CInstStringReader>::readNextToken()
-{
-    nextChar = *bufPtr++;
-    if ('\0' == nextChar)
-    {
-        --bufPtr;
-        return false;
-    }
-    if (10 == nextChar)
-        line++;
-    return true;
-}
-
-template <typename X>
-class CXMLReaderBase : public CommonReaderBase<X>, implements IEntityHelper
+class CXMLReaderBase : public CommonReaderBase, implements IEntityHelper
 {
     StringAttrMapping entityTable;
 protected:
@@ -4762,7 +5578,7 @@ private:
         hadXMLDecl = false;
     }
 public:
-    typedef CommonReaderBase<X> PARENT;
+    typedef CommonReaderBase PARENT;
     using PARENT::nextChar;
     using PARENT::readNext;
     using PARENT::expecting;
@@ -4773,19 +5589,19 @@ public:
     using PARENT::readerOptions;
 
     CXMLReaderBase(ISimpleReadStream &_stream, IPTreeNotifyEvent &_iEvent, PTreeReaderOptions _xmlReaderOptions, size32_t _bufSize=0)
-        : CommonReaderBase<X>(_stream, _iEvent, _xmlReaderOptions, _bufSize)
+        : CommonReaderBase(_stream, _iEvent, _xmlReaderOptions, _bufSize)
     {
         init();
         resetState();
     }
     CXMLReaderBase(const void *_buf, size32_t bufLength, IPTreeNotifyEvent &_iEvent, PTreeReaderOptions _xmlReaderOptions)
-        : CommonReaderBase<X>(_buf, bufLength, _iEvent, _xmlReaderOptions)
+        : CommonReaderBase(_buf, bufLength, _iEvent, _xmlReaderOptions)
     {
         init();
         resetState();
     }
     CXMLReaderBase(const void *_buf, IPTreeNotifyEvent &_iEvent, PTreeReaderOptions _xmlReaderOptions)
-        : CommonReaderBase<X>(_buf, _iEvent, _xmlReaderOptions)
+        : CommonReaderBase(_buf, _iEvent, _xmlReaderOptions)
     {
         init();
         resetState();
@@ -4798,25 +5614,21 @@ protected:
     }
     void readID(StringBuffer &id)
     {
-        if (isValidXPathStartChr(nextChar))
-        {
-            for (;;)
-            {
-                id.append(nextChar);
-                readNext();
-                if (!isValidXPathChr(nextChar)) break;
-            }
-        }
+        readMatching(id, xpathStartCharSet, xpathCharSet);
     }
     void skipString()
     {
         if ('"' == nextChar)
         {
-            do { readNext(); } while ('"' != nextChar);
+            readNext();
+            skipUntil('"');
+            if ('"' != nextChar) expecting("\"");
         }
         else if ('\'' == nextChar)
         {
-            do { readNext(); } while ('\'' != nextChar);
+            readNext();
+            skipUntil('\'');
+            if ('\'' != nextChar) expecting("'");
         }
         else expecting("\" or '");
     }
@@ -4838,7 +5650,7 @@ protected:
         readNext();
         skipWS();
         StringBuffer entityName;
-        if ('%' != nextChar) 
+        if ('%' != nextChar)
         {
             readID(entityName);
             skipWS();
@@ -4995,38 +5807,26 @@ protected:
     {
         try { match("CDATA["); }
         catch (const char *) { error("Bad CDATA syntax"); }
+        readNext();
         for (;;)
         {
+            readUntil(&text, ']');
             readNext();
             while (']' == nextChar)
             {
                 readNext();
-                while (']' == nextChar)
-                {
-                    readNext();
-                    if ('>' == nextChar)
-                        return;
-                    else
-                        text.append(']');
-                }
-                text.append(']');
+                if ('>' == nextChar)
+                    return;
+                text.append("]");
             }
-            text.append(nextChar);
-        }           
+            text.append(']');
+        }
     }
     void parsePI(StringBuffer &target)
     {
         readNext();
-        if (!isValidXPathStartChr(nextChar))
+        if (!readMatching(target, xpathStartCharSet, xpathCharSet))
             error("Invalid PI target");
-
-        for (;;)
-        {
-            target.append(nextChar);
-            readNext();
-            if (!isValidXPathChr(nextChar))
-                break;
-        }
         skipWS();
         unsigned closeTag=0;
         for (;;)
@@ -5077,7 +5877,7 @@ protected:
                 if (nextChar=='>')
                     return;
                 else if (nextChar != '-') // should be syntax error really.
-                    seen = 0; 
+                    seen = 0;
             }
             else if (nextChar=='-')
                 seen++;
@@ -5111,12 +5911,12 @@ protected:
 };
 
 
-template <class X>
-class CXMLReader : public CXMLReaderBase<X>, implements IPTreeReader
+class CXMLReader : public CXMLReaderBase, implements IPTreeReader
 {
     bool rootTerminated;
     StringBuffer attrName, attrval;
     StringBuffer tmpStr;
+    StringBuffer mark;
 
     void init()
     {
@@ -5128,7 +5928,7 @@ class CXMLReader : public CXMLReaderBase<X>, implements IPTreeReader
     }
 
 public:
-    typedef CXMLReaderBase<X> PARENT;
+    typedef CXMLReaderBase PARENT;
     using PARENT::nextChar;
     using PARENT::readNext;
     using PARENT::expecting;
@@ -5186,75 +5986,74 @@ public:
     void loadXML()
     {
         bool head=true;
-restart:
-        if (!checkReadNext()) return;
-        if (head)
+        while (checkReadNext())
         {
-            head = false;
-            if (checkBOM())
-                if (!checkReadNext()) return;
-        }
-        if (!checkSkipWS()) return;
-        if ('<' != nextChar)
-            expecting("<");
-        readNext();
-        if ('!' == nextChar)
-        {
+            if (head)
+            {
+                head = false;
+                if (checkBOM())
+                    if (!checkReadNext()) return;
+            }
+            if (!checkSkipWS()) return;
+            if ('<' != nextChar)
+                expecting("<");
             readNext();
-            parseOther();
-            goto restart;
+            if ('!' == nextChar)
+            {
+                readNext();
+                parseOther();
+                continue;
+            }
+            else if ('?' == nextChar)
+            {
+                parsePIOrDecl();
+                continue;
+            }
+            if (!noRoot && rootTerminated)
+            {
+                if (ignoreWhiteSpace)
+                    if (!checkSkipWS()) return;
+                error("Trailing xml after close of root tag");
+            }
+            _loadXML();
+            if (noRoot)
+            {
+                head = true;
+                hadXMLDecl = false;
+            }
+            else
+                rootTerminated = true;
         }
-        else if ('?' == nextChar)
-        {
-            parsePIOrDecl();
-            goto restart;
-        }
-        if (!noRoot && rootTerminated)
-        {
-            if (ignoreWhiteSpace)
-                if (!checkSkipWS()) return;
-            error("Trailing xml after close of root tag");
-        }
-        _loadXML();
-        if (noRoot)
-        {
-            head = true;
-            hadXMLDecl = false;
-        }
-        else
-            rootTerminated = true;
-        goto restart;
     }
     void _loadXML()
     {
-restart:
-        offset_t startOffset = curOffset-2;
-        if ('!' == nextChar) // not sure this branch can ever be hit.
+        offset_t startOffset;
+        for (;;)
         {
+            startOffset = curOffset-2;
+            if ('!' != nextChar)
+                break;
             parseComment();
             readNext();
             if ('<' != nextChar)
                 expecting("<");
-            goto restart;
         }
-        StringBuffer tagName;
         if (ignoreWhiteSpace)
             skipWS();
-        while (!isspace(nextChar) && nextChar != '>' && nextChar != '/')
-        {
-            tagName.append(nextChar);
-            readNext();
-            if ('<' == nextChar)
-                error("Unmatched close tag encountered");
-        }
-        StringBuffer completeTagname(tagName);
+        StringBuffer completeTagname;
+        readMatching(completeTagname, validTagCharacters, validTagCharacters);
+        if ('<' == nextChar)
+            error("Unmatched close tag encountered");
+
+        const char * tagName = completeTagname.str();
         if (ignoreNameSpaces)
         {
-            const char *colon;
-            if ((colon = strchr(tagName.str(), ':')) != NULL)
-                tagName.remove(0, (size32_t)(colon - tagName.str() + 1));
+            const char *colon = strchr(tagName, ':');
+            if (colon)
+                tagName = colon + 1;
         }
-        iEvent->beginNode(tagName.str(), false, startOffset);
+
+        iEvent->beginNode(tagName, false, startOffset);
         skipWS();
         bool endTag = false;
         bool base64 = false;
@@ -5272,35 +6071,17 @@ restart:
 
             attrName.setLength(1);
             attrval.clear();
-            while (nextChar && !isspace(nextChar) && nextChar != '=' && nextChar != '>' && nextChar != '/')
-            {
-                attrName.append(nextChar);
-                readNext();
-            }
+            readMatching(attrName, validAttrCharacters, validAttrCharacters);
             skipWS();
             if (nextChar == '=') readNext(); else expecting("=");
             skipWS();
-            if (nextChar == '"')
+            if ((nextChar == '"') || (nextChar == '\''))
             {
+                char quoteChar = nextChar;
                 readNext();
-                while (nextChar != '"')
-                {
-                    if (!nextChar)
-                        eos();
-                    attrval.append(nextChar);
-                    readNext();
-                }
+                readUntil(&attrval, quoteChar);
             }
-            else if (nextChar == '\'')
-            {
-                readNext();
-                while (nextChar != '\'')
-                {
-                    attrval.append(nextChar);
-                    readNext();
-                }
-            }
-            else 
+            else
                 error();
 
             _decodeXML(0, attrval.str(), tmpStr.clear());
@@ -5313,7 +6094,7 @@ restart:
             readNext();
             skipWS();
         }
-        iEvent->beginNodeContent(tagName.str());
+        iEvent->beginNodeContent(tagName);
         StringBuffer tagText;
         bool binary = base64;
         if (!endTag)
@@ -5329,8 +6110,8 @@ restart:
                             skipWS();
                         if ('\0' == nextChar)
                             eos();
-                        StringBuffer mark;
-                        while (nextChar && nextChar !='<') { mark.append(nextChar); readNext(); }
+                        mark.clear();
+                        readUntil(&mark, '<');
                         size32_t l = mark.length();
                         size32_t r = l+1;
                         if (l)
@@ -5369,14 +6150,14 @@ restart:
                             if (strlen(tagText.str()) != tagText.length())
                                 binary = true;
                         }
-                        break; // exit 
+                        break; // exit
                     }
                     else
                         _loadXML();
                 }
                 readNext();
                 unsigned i = 0;
-                while (!isspace(nextChar) && nextChar != '>')
+                while (notSpaceNorGreater.includes(nextChar))
                 {
                     if ((i >= completeTagname.length()) ||
                         (nextChar != completeTagname.charAt(i++)))
@@ -5390,14 +6171,13 @@ restart:
                     expecting(">");
             }
         }
-        iEvent->endNode(tagName.str(), tagText.length(), tagText.str(), binary, curOffset);
+        iEvent->endNode(tagName, tagText.length(), tagText.str(), binary, curOffset);
     }
 };
 
-template <class X>
-class CPullXMLReader : public CXMLReaderBase<X>, implements IPullPTreeReader
+class CPullXMLReader : public CXMLReaderBase, implements IPullPTreeReader
 {
-    typedef CXMLReaderBase<X> PARENT;
+    typedef CXMLReaderBase PARENT;
     using PARENT::nextChar;
     using PARENT::readNext;
     using PARENT::expecting;
@@ -5424,7 +6204,7 @@ class CPullXMLReader : public CXMLReaderBase<X>, implements IPullPTreeReader
     class CStateInfo : public CInterface
     {
     public:
-        CStateInfo() 
+        CStateInfo()
         {
             tag.ensureCapacity(15);
             binary = base64 = false;
@@ -5462,17 +6242,17 @@ public:
     IMPLEMENT_IINTERFACE;
 
     CPullXMLReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions, size32_t bufSize=0)
-        : CXMLReaderBase<X>(stream, iEvent, xmlReaderOptions, bufSize)
+        : CXMLReaderBase(stream, iEvent, xmlReaderOptions, bufSize)
     {
         resetState();
     }
     CPullXMLReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions)
-        : CXMLReaderBase<X>(buf, bufLength, iEvent, xmlReaderOptions)
+        : CXMLReaderBase(buf, bufLength, iEvent, xmlReaderOptions)
     {
         resetState();
     }
     CPullXMLReader(const void *buf, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions)
-        : CXMLReaderBase<X>(buf, iEvent, xmlReaderOptions)
+        : CXMLReaderBase(buf, iEvent, xmlReaderOptions)
     {
         resetState();
     }
@@ -5551,14 +6331,10 @@ public:
                 stack.append(*stateInfo);
                 if ('/' == nextChar)
                     error("Unmatched close tag encountered");
-                while (!isspace(nextChar) && nextChar != '>')
-                {
-                    stateInfo->tag.append(nextChar);
-                    readNext();
-                    if ('/' == nextChar) break;
-                    if ('<' == nextChar)
-                        error("Unmatched close tag encountered");
-                }
+                readMatching(stateInfo->tag, validTagCharacters, validTagCharacters);
+                if ('<' == nextChar)
+                    error("Unmatched close tag encountered");
+
                 stateInfo->wnsTag = stateInfo->tag.str();
                 if (ignoreNameSpaces)
                 {
@@ -5605,35 +6381,17 @@ public:
 
                     attrName.setLength(1);
                     attrval.clear();
-                    while (nextChar && !isspace(nextChar) && nextChar != '=' && nextChar != '>' && nextChar != '/')
-                    {
-                        attrName.append(nextChar);
-                        readNext();
-                    }
+                    readMatching(attrName, validAttrCharacters, validAttrCharacters);
                     skipWS();
                     if (nextChar == '=') readNext(); else expecting("=");
                     skipWS();
-                    if (nextChar == '"')
+                    if ((nextChar == '"') || (nextChar == '\''))
                     {
+                        char quoteChar = nextChar;
                         readNext();
-                        while (nextChar != '"')
-                        {
-                            if (!nextChar)
-                                eos();
-                            attrval.append(nextChar);
-                            readNext();
-                        }
+                        readUntil(&attrval, quoteChar);
                     }
-                    else if (nextChar == '\'')
-                    {
-                        readNext();
-                        while (nextChar != '\'')
-                        {
-                            attrval.append(nextChar);
-                            readNext();
-                        }
-                    }
-                    else 
+                    else
                         error();
 
                     _decodeXML(0, attrval.str(), tmpStr.clear());
@@ -5731,7 +6489,7 @@ public:
                         const char *m = mark.str();
                         const char *es = m+mark.length();
                         do
-                        { 
+                        {
                             if (!isspace(*m++))
                             {
                                 e->Release();
@@ -5760,7 +6518,7 @@ public:
                             stateInfo->binary = true;
                     }
                     state = tagClose;
-                    break; // exit 
+                    break; // exit
                 }
                 else
                 {
@@ -5817,65 +6575,35 @@ public:
 
 IPTreeReader *createXMLStreamReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions, size32_t bufSize)
 {
-    class CXMLStreamReader : public CXMLReader<CInstStreamReader>
-    {
-    public:
-        CXMLStreamReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions, size32_t bufSize=0) : CXMLReader<CInstStreamReader>(stream, iEvent, xmlReaderOptions, bufSize) { }
-    };
-    return new CXMLStreamReader(stream, iEvent, xmlReaderOptions, bufSize);
+    return new CXMLReader(stream, iEvent, xmlReaderOptions, bufSize);
 }
 
 IPTreeReader *createXMLStringReader(const char *xml, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions)
 {
-    class CXMLStringReader : public CXMLReader<CInstStringReader>
-    {
-    public:
-        CXMLStringReader(const void *xml, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions) : CXMLReader<CInstStringReader>(xml, iEvent, xmlReaderOptions) { }
-    };
     if (NULL == xml)
         throw createPTreeReadException(PTreeRead_syntax, "Null string passed to createXMLStringReader", NULL, 0, 0);
-    return new CXMLStringReader(xml, iEvent, xmlReaderOptions);
+    return new CXMLReader(xml, iEvent, xmlReaderOptions);
 }
 
 IPTreeReader *createXMLBufferReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions)
 {
-    class CXMLBufferReader : public CXMLReader<CInstBufferReader>
-    {
-    public:
-        CXMLBufferReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions) : CXMLReader<CInstBufferReader>(buf, bufLength, iEvent, xmlReaderOptions) { }
-    };
-    return new CXMLBufferReader(buf, bufLength, iEvent, xmlReaderOptions);
+    return new CXMLReader(buf, bufLength, iEvent, xmlReaderOptions);
 }
 
 
 IPullPTreeReader *createPullXMLStreamReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions, size32_t bufSize)
 {
-    class CXMLStreamReader : public CPullXMLReader<CInstStreamReader>
-    {
-    public:
-        CXMLStreamReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions, size32_t bufSize=0) : CPullXMLReader<CInstStreamReader>(stream, iEvent, xmlReaderOptions, bufSize) { }
-    };
-    return new CXMLStreamReader(stream, iEvent, xmlReaderOptions, bufSize);
+    return new CPullXMLReader(stream, iEvent, xmlReaderOptions, bufSize);
 }
 
 IPullPTreeReader *createPullXMLStringReader(const char *xml, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions)
 {
-    class CXMLStringReader : public CPullXMLReader<CInstStringReader>
-    {
-    public:
-        CXMLStringReader(const void *xml, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions) : CPullXMLReader<CInstStringReader>(xml, iEvent, xmlReaderOptions) { }
-    };
-    return new CXMLStringReader(xml, iEvent, xmlReaderOptions);
+    return new CPullXMLReader(xml, iEvent, xmlReaderOptions);
 }
 
 IPullPTreeReader *createPullXMLBufferReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions)
 {
-    class CXMLBufferReader : public CPullXMLReader<CInstBufferReader>
-    {
-    public:
-        CXMLBufferReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions xmlReaderOptions) : CPullXMLReader<CInstBufferReader>(buf, bufLength, iEvent, xmlReaderOptions) { }
-    };
-    return new CXMLBufferReader(buf, bufLength, iEvent, xmlReaderOptions);
+    return new CPullXMLReader(buf, bufLength, iEvent, xmlReaderOptions);
 }
 
 IPTreeMaker *createPTreeMaker(byte flags, IPropertyTree *root, IPTreeNodeCreator *nodeCreator)
@@ -5895,6 +6623,8 @@ IPTreeMaker *createRootLessPTreeMaker(byte flags, IPropertyTree *root, IPTreeNod
 static IPTreeMaker *createDefaultPTreeMaker(byte flags, PTreeReaderOptions readFlags)
 {
     bool noRoot = 0 != ((unsigned)readFlags & (unsigned)ptr_noRoot);
+    if (0 != ((unsigned)readFlags & (unsigned)ptr_encodeExtNames))
+        return new CPTreeEncodeNamesMaker(flags, NULL, NULL, noRoot);
     return new CPTreeMaker(flags, NULL, NULL, noRoot);
 }
 
@@ -5924,7 +6654,7 @@ IPropertyTree *createPTree(IFile &ifile, byte flags, PTreeReaderOptions readFlag
 {
     OwnedIFileIO ifileio = ifile.open(IFOread);
     if (!ifileio)
-        throw MakeStringException(0, "Could not locate filename: %s", ifile.queryFilename());
+        throw MakeStringException(JLIBERR_ParseCouldNotLocateFilenameS, "Could not locate filename: %s", ifile.queryFilename());
     return createPTree(*ifileio, flags, readFlags, iMaker);
 }
 
@@ -5958,6 +6688,12 @@ IPropertyTree *createPTreeFromXMLString(unsigned len, const char *xml, byte flag
     Owned<IPTreeReader> reader = createXMLBufferReader(xml, len, *iMaker, readFlags);
     reader->load();
     return LINK(iMaker->queryRoot());
+}
+
+
+void addPTreeItem(IPropertyTree *ptree, const char * name, const char * value)
+{
+    ptree->addPropTreeArrayItem(name, createPTree())->setProp(nullptr, value);
 }
 
 //////////////////////////
@@ -6128,7 +6864,7 @@ static void _toXML(const IPropertyTree *tree, IIOStream &out, unsigned indent, u
             {
                 const char *m = thislevel;
                 const char *p = m;
-                while (isspace(*p)) 
+                while (isspace(*p))
                     p++;
                 encodeXML(m, out, ENCODE_WHITESPACE, p-m, true);
                 if (*p) {   // check not all spaces
@@ -6162,7 +6898,7 @@ class CStringBufferMarkupIOAdapter : public CInterfaceOf<IIOStream>
 public:
     CStringBufferMarkupIOAdapter(StringBuffer &_out) : out(_out) { }
     virtual void flush() override { }
-    virtual size32_t read(size32_t len, void * data) override { UNIMPLEMENTED; return 0; }
+    virtual size32_t read(size32_t len, void * data) override { UNIMPLEMENTED_IPT; }
     virtual size32_t write(size32_t len, const void * data) override { out.append(len, (const char *)data); return len; }
 };
 
@@ -6202,8 +6938,9 @@ void saveXML(IFile &ifile, const IPropertyTree *tree, unsigned indent, unsigned 
 {
     OwnedIFileIO ifileio = ifile.open(IFOcreate);
     if (!ifileio)
-        throw MakeStringException(0, "saveXML: could not find %s to open", ifile.queryFilename());
+        throw MakeStringException(JLIBERR_ParseSavexmlCouldNotFindSToOpen, "saveXML: could not find %s to open", ifile.queryFilename());
     saveXML(*ifileio, tree, indent, flags);
+    ifileio->close(); // Ensure errors are reported
 }
 
 void saveXML(IFileIO &ifileio, const IPropertyTree *tree, unsigned indent, unsigned flags)
@@ -6229,7 +6966,7 @@ void checkWriteJSONDelimiter(IIOStream &out, bool &delimit)
 
 static void writeJSONNameToStream(IIOStream &out, const char *name, unsigned indent, bool &delimit)
 {
-    if (!name || !*name)
+    if (!name)
         return;
     checkWriteJSONDelimiter(out, delimit);
     if (indent)
@@ -6298,7 +7035,14 @@ static void _toJSON(const IPropertyTree *tree, IIOStream &out, unsigned indent, 
     {
         if (!name || !*name)
             name = "__unnamed__";
-        writeJSONNameToStream(out, name, (flags & JSON_Format) ? indent : 0, delimit);
+        if (!isPTreeNameEncoded(tree))
+            writeJSONNameToStream(out, name, (flags & JSON_Format) ? indent : 0, delimit);
+        else
+        {
+            StringBuffer decoded;
+            decodePtreeName(decoded, name);
+            writeJSONNameToStream(out, decoded.str(), (flags & JSON_Format) ? indent : 0, delimit);
+        }
     }
 
     checkWriteJSONDelimiter(out, delimit);
@@ -6328,7 +7072,14 @@ static void _toJSON(const IPropertyTree *tree, IIOStream &out, unsigned indent, 
                     const char *val = it->queryValue();
                     if (val)
                     {
-                        writeJSONNameToStream(out, key, (flags & JSON_Format) ? indent+1 : 0, delimit);
+                        if (!isPTreeAttributeNameEncoded(tree, key))
+                            writeJSONNameToStream(out, key, (flags & JSON_Format) ? indent+1 : 0, delimit);
+                        else
+                        {
+                            StringBuffer decoded;
+                            decodePtreeName(decoded, key);
+                            writeJSONNameToStream(out, decoded.str(), (flags & JSON_Format) ? indent+1 : 0, delimit);
+                        }
                         if (flags & JSON_SanitizeAttributeValues)
                             writeJSONValueToStream(out, val, delimit, isHiddenWhenSanitized(val));
                         else
@@ -6465,7 +7216,7 @@ void printJSON(const IPropertyTree *tree, unsigned indent, byte flags)
     printf("%s", json.str());
 }
 
-void dbglogJSON(const IPropertyTree *tree, unsigned indent, unsigned flags)
+void dbglogJSON(const IPropertyTree *tree, unsigned indent, byte flags)
 {
     StringBuffer json;
     toJSON(tree, json, indent, flags);
@@ -6587,7 +7338,7 @@ restart:
                     if (']' != *xpath)
                         throw MakeXPathException(_xpath, PTreeExcpt_XPath_ParseError, xpath-_xpath, "Qualifier brace unclosed");
                 }
-                else 
+                else
                     validateQualifier(xpath);
                 ++xpath;
                 break;
@@ -6615,7 +7366,7 @@ restart:
                             if (index)
                             {
                             }
-                            xpath = xxpath; 
+                            xpath = xxpath;
                         }
                     }
                 }
@@ -6695,7 +7446,7 @@ bool validateXMLParseXPath(const char *xpath, StringBuffer *error)
             {
                 if (error)
                 {
-                    Owned<IException> e = MakeStringException(0, "Invalid extract xml text '<>' usage, xpath cannot from be absolute: %s", xpath);
+                    Owned<IException> e = MakeStringException(JLIBERR_ParseInvalidExtractXmlTextUsageXpath, "Invalid extract xml text '<>' usage, xpath cannot from be absolute: %s", xpath);
                     e->errorMessage(*error);
                 }
                 return false;
@@ -6958,8 +7709,8 @@ class COrderedPTree : public BASE_PTREE
     public:
         IMPLEMENT_SUPERHASHTABLEOF_REF_FIND(IPropertyTree, constcharptr);
 
-        COrderedChildMap<BASECHILDMAP>() : BASECHILDMAP() { }
-        ~COrderedChildMap<BASECHILDMAP>() { SELF::kill(); }
+        COrderedChildMap() : BASECHILDMAP() { }
+        ~COrderedChildMap() { SELF::kill(); }
 
         virtual unsigned numChildren() const override { return order.ordinality(); }
         virtual IPropertyTreeIterator *getIterator(bool sort) override
@@ -7015,13 +7766,19 @@ class COrderedPTree : public BASE_PTREE
     };
 public:
     typedef COrderedPTree<BASE_PTREE> SELF;
-    COrderedPTree<BASE_PTREE>(const char *name=NULL, byte flags=ipt_none, IPTArrayValue *value=NULL, ChildMap *children=NULL)
+    COrderedPTree(const char *name=NULL, byte flags=ipt_none, IPTArrayValue *value=NULL, ChildMap *children=NULL)
         : BASE_PTREE(name, flags|ipt_ordered, value, children) { }
 
     virtual bool isEquivalent(IPropertyTree *tree) const override { return (NULL != QUERYINTERFACE(tree, COrderedPTree<BASE_PTREE>)); }
     virtual IPropertyTree *create(const char *name=NULL, IPTArrayValue *value=NULL, ChildMap *children=NULL, bool existing=false) override
     {
         return new COrderedPTree<BASE_PTREE>(name, SELF::flags, value, children);
+    }
+    virtual IPropertyTree *create(IBufferedSerialInputStream &in, PTreeDeserializeContext &ctx) override
+    {
+        Owned<IPropertyTree> tree = new COrderedPTree<BASE_PTREE>();
+        tree->deserializeFromStream(in, ctx);
+        return tree.getClear();
     }
     virtual IPropertyTree *create(MemoryBuffer &mb) override
     {
@@ -7076,16 +7833,13 @@ typedef enum _ptElementType
     elementTypeArray
 } ptElementType;
 
-template <typename X>
-class CJSONReaderBase : public CommonReaderBase<X>
+class CJSONReaderBase : public CommonReaderBase
 {
 public:
-    typedef CommonReaderBase<X> PARENT;
+    typedef CommonReaderBase PARENT;
     using PARENT::reset;
     using PARENT::nextChar;
-    using PARENT::readNextToken;
     using PARENT::checkReadNext;
-    using PARENT::checkStartReadNext;
     using PARENT::readNext;
     using PARENT::expecting;
     using PARENT::match;
@@ -7095,15 +7849,15 @@ public:
     using PARENT::ignoreWhiteSpace;
 
     CJSONReaderBase(ISimpleReadStream &_stream, IPTreeNotifyEvent &_iEvent, PTreeReaderOptions _readerOptions, size32_t _bufSize=0) :
-      CommonReaderBase<X>(_stream, _iEvent, _readerOptions, _bufSize)
+      CommonReaderBase(_stream, _iEvent, _readerOptions, _bufSize)
     {
     }
     CJSONReaderBase(const void *_buf, size32_t bufLength, IPTreeNotifyEvent &_iEvent, PTreeReaderOptions _readerOptions) :
-        CommonReaderBase<X>(_buf, bufLength, _iEvent, _readerOptions)
+        CommonReaderBase(_buf, bufLength, _iEvent, _readerOptions)
     {
     }
     CJSONReaderBase(const void *_buf, IPTreeNotifyEvent &_iEvent, PTreeReaderOptions _readerOptions) :
-        CommonReaderBase<X>(_buf, _iEvent, _readerOptions)
+        CommonReaderBase(_buf, _iEvent, _readerOptions)
     {
     }
     ~CJSONReaderBase()
@@ -7149,8 +7903,6 @@ protected:
         if ('\"'!=nextChar)
             expecting("\"");
         readString(name);
-        if (!name.length())
-            error("empty JSON id");
         readNext();
         skipWS();
         if (':'!=nextChar)
@@ -7243,10 +7995,9 @@ protected:
     }
 };
 
-template <class X>
-class CJSONReader : public CJSONReaderBase<X>, implements IPTreeReader
+class CJSONReader : public CJSONReaderBase, implements IPTreeReader
 {
-    typedef CJSONReaderBase<X> PARENT;
+    typedef CJSONReaderBase PARENT;
     using PARENT::checkBOM;
     using PARENT::rewind;
     using PARENT::readNext;
@@ -7299,18 +8050,22 @@ public:
             else if ('#'==*name)
             {
                 dbgassertex(retValue && isValueBinary);
-                *isValueBinary = false;
+                if (isValueBinary)
+                    *isValueBinary = false;
                 if (0 == strncmp(name+1, "value", 5)) // this is a special IPT JSON prop name, representing a 'complex' value
                 {
                     if ('\0' == *(name+6)) // #value
                     {
-                        retValue->swapWith(value);
+                        if (retValue)
+                            retValue->swapWith(value);
                         return;
                     }
                     else if (streq(name+6, "bin")) // #valuebin
                     {
-                        *isValueBinary = true;
-                        JBASE64_Decode(value.str(), *retValue);
+                        if (isValueBinary)
+                            *isValueBinary = true;
+                        if (retValue)
+                            JBASE64_Decode(value.str(), *retValue);
                         return;
                     }
                 }
@@ -7474,10 +8229,9 @@ public:
     virtual offset_t queryOffset() { return curOffset; }
 };
 
-template <class X>
-class CPullJSONReader : public CJSONReaderBase<X>, implements IPullPTreeReader
+class CPullJSONReader : public CJSONReaderBase, implements IPullPTreeReader
 {
-    typedef CJSONReaderBase<X> PARENT;
+    typedef CJSONReaderBase PARENT;
     using PARENT::checkBOM;
     using PARENT::rewind;
     using PARENT::readNext;
@@ -7551,17 +8305,17 @@ public:
     IMPLEMENT_IINTERFACE;
 
     CPullJSONReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions, size32_t bufSize=0)
-        : CJSONReaderBase<X>(stream, iEvent, readerOptions, bufSize)
+        : CJSONReaderBase(stream, iEvent, readerOptions, bufSize)
     {
         init();
     }
     CPullJSONReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions)
-        : CJSONReaderBase<X>(buf, bufLength, iEvent, readerOptions)
+        : CJSONReaderBase(buf, bufLength, iEvent, readerOptions)
     {
         init();
     }
     CPullJSONReader(const void *buf, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions)
-        : CJSONReaderBase<X>(buf, iEvent, readerOptions)
+        : CJSONReaderBase(buf, iEvent, readerOptions)
     {
         init();
     }
@@ -7897,65 +8651,35 @@ public:
 
 IPTreeReader *createJSONStreamReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions, size32_t bufSize)
 {
-    class CJSONStreamReader : public CJSONReader<CInstStreamReader>
-    {
-    public:
-        CJSONStreamReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions, size32_t bufSize=0) : CJSONReader<CInstStreamReader>(stream, iEvent, readerOptions, bufSize) { }
-    };
-    return new CJSONStreamReader(stream, iEvent, readerOptions, bufSize);
+    return new CJSONReader(stream, iEvent, readerOptions, bufSize);
 }
 
 IPTreeReader *createJSONStringReader(const char *json, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions)
 {
-    class CJSONStringReader : public CJSONReader<CInstStringReader>
-    {
-    public:
-        CJSONStringReader(const void *json, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions) : CJSONReader<CInstStringReader>(json, iEvent, readerOptions) { }
-    };
     if (NULL == json)
         throw createPTreeReadException(PTreeRead_syntax, "Null string passed to createJSONStringReader", NULL, 0, 0);
-    return new CJSONStringReader(json, iEvent, readerOptions);
+    return new CJSONReader(json, iEvent, readerOptions);
 }
 
 IPTreeReader *createJSONBufferReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions)
 {
-    class CJSONBufferReader : public CJSONReader<CInstBufferReader>
-    {
-    public:
-        CJSONBufferReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions) : CJSONReader<CInstBufferReader>(buf, bufLength, iEvent, readerOptions) { }
-    };
-    return new CJSONBufferReader(buf, bufLength, iEvent, readerOptions);
+    return new CJSONReader(buf, bufLength, iEvent, readerOptions);
 }
 
 
 IPullPTreeReader *createPullJSONStreamReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions, size32_t bufSize)
 {
-    class CJSONStreamReader : public CPullJSONReader<CInstStreamReader>
-    {
-    public:
-        CJSONStreamReader(ISimpleReadStream &stream, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions, size32_t bufSize=0) : CPullJSONReader<CInstStreamReader>(stream, iEvent, readerOptions, bufSize) { }
-    };
-    return new CJSONStreamReader(stream, iEvent, readerOptions, bufSize);
+    return new CPullJSONReader(stream, iEvent, readerOptions, bufSize);
 }
 
 IPullPTreeReader *createPullJSONStringReader(const char *json, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions)
 {
-    class CJSONStringReader : public CPullJSONReader<CInstStringReader>
-    {
-    public:
-        CJSONStringReader(const void *json, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions) : CPullJSONReader<CInstStringReader>(json, iEvent, readerOptions) { }
-    };
-    return new CJSONStringReader(json, iEvent, readerOptions);
+    return new CPullJSONReader(json, iEvent, readerOptions);
 }
 
 IPullPTreeReader *createPullJSONBufferReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions)
 {
-    class CJSONBufferReader : public CPullJSONReader<CInstBufferReader>
-    {
-    public:
-        CJSONBufferReader(const void *buf, size32_t bufLength, IPTreeNotifyEvent &iEvent, PTreeReaderOptions readerOptions) : CPullJSONReader<CInstBufferReader>(buf, bufLength, iEvent, readerOptions) { }
-    };
-    return new CJSONBufferReader(buf, bufLength, iEvent, readerOptions);
+    return new CPullJSONReader(buf, bufLength, iEvent, readerOptions);
 }
 
 IPropertyTree *createPTreeFromJSONString(const char *json, byte flags, PTreeReaderOptions readFlags, IPTreeMaker *iMaker)
@@ -7963,7 +8687,7 @@ IPropertyTree *createPTreeFromJSONString(const char *json, byte flags, PTreeRead
     Owned<IPTreeMaker> _iMaker;
     if (!iMaker)
     {
-        iMaker = createDefaultPTreeMaker(flags, readFlags);
+        iMaker = createDefaultPTreeMaker(flags, (PTreeReaderOptions)(readFlags|ptr_encodeExtNames));
         _iMaker.setown(iMaker);
     }
     Owned<IPTreeReader> reader = createJSONStringReader(json, *iMaker, readFlags);
@@ -7976,7 +8700,7 @@ IPropertyTree *createPTreeFromJSONString(unsigned len, const char *json, byte fl
     Owned<IPTreeMaker> _iMaker;
     if (!iMaker)
     {
-        iMaker = createDefaultPTreeMaker(flags, readFlags);
+        iMaker = createDefaultPTreeMaker(flags, (PTreeReaderOptions)(readFlags|ptr_encodeExtNames));
         _iMaker.setown(iMaker);
     }
     Owned<IPTreeReader> reader = createJSONBufferReader(json, len, *iMaker, readFlags);
@@ -8016,14 +8740,14 @@ static void ensureHttpParameter(IPropertyTree *pt, StringBuffer &tag, const char
     if ('@'==*tag)
     {
         if (path && *path)
-            throw MakeStringException(-1, "'@' not allowed in parent node of parameter path: %s", fullpath);
+            throw MakeStringException(JLIBERR_ParseNotAllowedInParentNodeOf, "'@' not allowed in parent node of parameter path: %s", fullpath);
         pt->setProp(tag, value);
         return;
     }
     if (tag.charAt(tag.length()-1)=='$')
     {
         if (path && *path)
-            throw MakeStringException(-1, "'$' not allowed in parent node of parameter path: %s", fullpath);
+            throw MakeStringException(JLIBERR_ParseNotAllowedInParentNodeOf_1, "'$' not allowed in parent node of parameter path: %s", fullpath);
         tag.setLength(tag.length()-1);
         StringArray values;
         values.appendList(value, "\r");
@@ -8097,7 +8821,7 @@ IPropertyTree *createPTreeFromHttpPath(const char *nameWithAttrs, IPropertyTree 
         StringBuffer name;
         StringAttr value;
         if (!checkParseUrlPathNodeValue(nameAttrList.item(pos), name, value))
-            throw MakeStringException(-1, "Invalid URL parameter format %s", nameAttrList.item(pos));
+            throw MakeStringException(JLIBERR_ParseInvalidUrlParameterFormatS, "Invalid URL parameter format %s", nameAttrList.item(pos));
         StringBuffer xpath("@");
         xpath.append(name.str());
         if (!value.get())
@@ -8115,7 +8839,7 @@ IPropertyTree *createPTreeFromHttpPath(const char *nameWithAttrs, IPropertyTree 
         {
             const char *tag = inputNodes.item(in);
             if (!validateXMLTag(tag))
-                throw MakeStringException(-1, "Invalid REST query input specifier %s", input);
+                throw MakeStringException(JLIBERR_ParseInvalidRestQueryInputSpecifierS, "Invalid REST query input specifier %s", input);
             parent = parent->addPropTree(tag, createPTree(tag, flags));
         }
     }
@@ -8158,7 +8882,7 @@ IPropertyTree *createPTreeFromHttpParameters(const char *nameWithAttrs, IPropert
             continue;
         if (skipLeadingDotParameters && key.charAt(0)=='.')
             continue;
-        const char *value = parameters->queryProp(key);
+        const char *value = iter->queryPropValue();
         if (!value || !*value)
             continue;
         ensureHttpParameter(content, key, value);
@@ -8195,12 +8919,31 @@ static constexpr const char * currentVersion = "1.0";
 
 //---------------------------------------------------------------------------------------------------------------------
 /*
- * Use source to overwrite any changes in target
- *   Attributes are replaced
- *   Singleton elements are replaced.
- *   Entire arrays of scalar elements are replaced.
- *   Entire arrays of elements with no name attribute are replaced.
- *   Elements with a name attribute are matched by name.  If there is a match it is merged.  If there is no match it is added.
+ * mergeConfiguration: Merge source into target.
+ *
+ * Default behaviour (mergeListItemContent=false, altNameAttribute=nullptr):
+ *   Attributes in target are overwritten by source (if overwriteAttr is true).
+ *   Scalar/single-value elements are overwritten by source; non-array subtrees are merged
+ *   recursively, so target-only child elements are preserved.
+ *   Entire arrays are replaced - the target list is removed and source items are added.
+ *
+ * Legacy behaviour (mergeListItemContent=true, or altNameAttribute is non-empty):
+ *   Providing a non-empty altNameAttribute implies mergeListItemContent=true.
+ *   As above for scalar arrays and arrays whose items have no @name attribute.
+ *   For arrays whose source items have a @name attribute (or altNameAttribute): the target
+ *   list is NOT deleted first.  Each source item is matched against the target by @name.
+ *   If a match is found the target item's content is merged recursively; if no match is found
+ *   the source item is appended to the target list.
+ *
+ *   NB: This matching is applied recursively at EVERY level of the tree — there is no way to
+ *   scope it to a specific subtree.  Any list item with a @name (or altNameAttribute) attribute
+ *   anywhere in the tree will be subject to identity-matching.  Callers should be aware that
+ *   adding @name attributes to list items at any depth will silently change merge behaviour.
+ *   Furthermore, if the source contains multiple list items with the same @name (or
+ *   altNameAttribute) value, each successive item will be merged on top of the same target
+ *   node, silently collapsing what should be N distinct items into one — losing data without
+ *   warning.
+ *   This legacy mode is retained for ESP application config layering and the @extends mechanism.
 */
 
 static bool checkInSequence(IPropertyTree & child, StringAttr &seqname, bool &first, bool &endprior)
@@ -8248,8 +8991,11 @@ static IPropertyTree *ensureMergeConfigTarget(IPropertyTree &target, const char 
     return match;
 }
 
-void mergeConfiguration(IPropertyTree & target, const IPropertyTree & source, const char *altNameAttribute, bool overwriteAttr)
+void mergeConfiguration(IPropertyTree & target, const IPropertyTree & source, const char *altNameAttribute, bool overwriteAttr, bool mergeListItemContent)
 {
+    if (altNameAttribute && *altNameAttribute)
+        mergeListItemContent = true;
+
     Owned<IAttributeIterator> aiter = source.getAttributes();
     ForEach(*aiter)
     {
@@ -8263,24 +9009,45 @@ void mergeConfiguration(IPropertyTree & target, const IPropertyTree & source, co
     {
         IPropertyTree & child = iter->query();
         const char * tag = child.queryName();
-        const char * name = child.queryProp("@name");
+        const char * name = nullptr;
         bool altname = false;
-
-        //Legacy support for old component configuration files that have repeated elements with no name tag but another unique id
-        if (!name && altNameAttribute && *altNameAttribute)
+        if (mergeListItemContent)
         {
-            name = child.queryProp(altNameAttribute);
-            altname = name!=nullptr;
+            //Legacy: match array items by @name (or altNameAttribute) so that identically-named
+            //items are merged rather than replaced.  Applied globally at every depth — see caveat above.
+            name = child.queryProp("@name");
+            if (!name && altNameAttribute && *altNameAttribute)
+            {
+                name = child.queryProp(altNameAttribute);
+                altname = name!=nullptr;
+            }
         }
 
         bool first = false;
         bool endprior = false;
         bool sequence = checkInSequence(child, seqname, first, endprior);
-        if (first && (!name || isScalarItem(child))) //arrays of unamed objects or scalars are replaced
-            target.removeProp(tag);
+        if (first && (!name || isScalarItem(child)))
+            target.removeProp(tag); //replace entire array (default), or scalars/unnamed items (mergeListItemContent mode)
 
-        IPropertyTree * match = ensureMergeConfigTarget(target, tag, altname ? altNameAttribute : "@name", name, sequence);
-        mergeConfiguration(*match, child, altNameAttribute, overwriteAttr);
+        IPropertyTree * match = nullptr;
+        if (!mergeListItemContent)
+        {
+            //Default path: arrays are replaced wholesale, singletons are overwritten.
+            if (sequence)
+                match = target.addPropTreeArrayItem(tag, createPTree(tag));
+            else
+            {
+                match = target.queryPropTree(tag);
+                if (!match)
+                    match = target.addPropTree(tag);
+            }
+        }
+        else
+        {
+            //Legacy path: find or create target node matched by @name/@altName identity.
+            match = ensureMergeConfigTarget(target, tag, altname ? altNameAttribute : "@name", name, sequence);
+        }
+        mergeConfiguration(*match, child, altNameAttribute, overwriteAttr, mergeListItemContent);
     }
 
     const char * sourceValue = source.queryProp("");
@@ -8289,13 +9056,15 @@ void mergeConfiguration(IPropertyTree & target, const IPropertyTree & source, co
 
 /*
  * Load a json/yaml configuration file.
- * If there is an extends tag in the root of the file then this file is applied as a delta to the base file
- * the configuration is the contents of the tag within the file that matches the component tag.
+ * If there is an @extends tag in the root of the file then this file is applied as a delta to the
+ * base file using mergeConfiguration.  If altNameAttribute is non-null it implies
+ * mergeListItemContent=true (legacy identity-matching behaviour — see mergeConfiguration comment).
+ * The returned configuration is the subtree matching componentTag.
 */
 static IPropertyTree * loadConfiguration(const char * filename, const char * componentTag, bool required, const char *altNameAttribute)
 {
     if (!checkFileExists(filename))
-        throw makeStringExceptionV(99, "Configuration file %s not found", filename);
+        throw makeStringExceptionV(JLIBERR_ParseConfigurationFileSNotFound, "Configuration file %s not found", filename);
 
     const char * ext = pathExtension(filename);
     Owned<IPropertyTree> configTree;
@@ -8310,20 +9079,20 @@ static IPropertyTree * loadConfiguration(const char * filename, const char * com
             StringBuffer msg;
             E->errorMessage(msg);
             ::Release(E);
-            throw makeStringExceptionV(99, "Error loading configuration file %s (invalid yaml): %s", filename, msg.str());
+            throw makeStringExceptionV(JLIBERR_ParseErrorLoadingConfigurationFileSInvalidYaml, "Error loading configuration file %s (invalid yaml): %s", filename, msg.str());
         }
     }
     else
-        throw makeStringExceptionV(99, "Unrecognised file extension %s", ext);
+        throw makeStringExceptionV(JLIBERR_ParseUnrecognisedFileExtensionS, "Unrecognised file extension %s", ext);
 
     if (!configTree)
-        throw makeStringExceptionV(99, "Error loading configuration file %s", filename);
+        throw makeStringExceptionV(JLIBERR_ParseErrorLoadingConfigurationFileS, "Error loading configuration file %s", filename);
 
     IPropertyTree * config = configTree->queryPropTree(componentTag);
     if (!config)
     {
         if (required)
-            throw makeStringExceptionV(99, "Section %s is missing from file %s", componentTag, filename);
+            throw makeStringExceptionV(JLIBERR_ParseSectionSIsMissingFromFileS, "Section %s is missing from file %s", componentTag, filename);
         return nullptr;
     }
     const char * base = configTree->queryProp("@extends");
@@ -8376,6 +9145,29 @@ static void applyEnvironmentConfig(IPropertyTree & target, const char * cptPrefi
     }
 }
 
+void applyProperties(IPropertyTree * target, const IProperties * source)
+{
+    Owned<IPropertyIterator> iter = source->getIterator();
+    ForEach(*iter)
+    {
+        const char * name = iter->getPropKey();
+        const char * value = iter->queryPropValue();
+        target->setProp(name, value);
+    }
+}
+
+void applyProperty(IPropertyTree * target, const char * source)
+{
+    const char * equals = strchr(source, '=');
+    if (equals)
+    {
+        StringBuffer prop(equals - source, source);
+        target->setProp(prop, equals + 1);
+    }
+    else
+        target->setPropBool(source, true);
+}
+
 IPropertyTree * createPTreeFromYAML(const char * yaml)
 {
     if (*yaml == '{')
@@ -8414,20 +9206,20 @@ static void applyCommandLineOption(IPropertyTree * config, const char * option, 
         {
             config = config->queryPropTree(elemName);
             if (!config)
-                throw makeStringExceptionV(99, "Cannot overriding scalar configuration element %s with structure", elemName.get());
+                throw makeStringExceptionV(JLIBERR_ParseCannotOverrideScalarConfigurationElementSWith, "Cannot override scalar configuration element %s with structure", elemName.get());
         }
         option = tail+1;
     }
 
     if (!validateXMLTag(option))
-        throw makeStringExceptionV(99, "Invalid option name '%s'", option);
+        throw makeStringExceptionV(JLIBERR_ParseInvalidOptionNameS, "Invalid option name '%s'", option);
 
     StringBuffer path;
     path.append('@').append(option);
     config->setProp(path, value);
 }
 
-static void applyCommandLineOption(IPropertyTree * config, const char * option, std::initializer_list<const char *> ignoreOptions)
+static void applyCommandLineOption(IPropertyTree * config, const char * option, std::initializer_list<const std::string> ignoreOptions)
 {
     const char * eq = strchr(option, '=');
     StringBuffer name;
@@ -8440,16 +9232,32 @@ static void applyCommandLineOption(IPropertyTree * config, const char * option, 
     }
     else
     {
-        //MORE: Support --x- and --x+?
-        val = "1";
+        unsigned len = strlen(option);
+        if (len == 0)
+            return;
+
+        //support --option+ as --option=1 and --option- as --option=0 for eclcc compatibility
+        char last = option[len-1];
+        if ((last == '+') || (last == '-'))
+        {
+            name.append(len-1, option);
+            option = name;
+            val = (last == '+') ? "1" : "0";
+        }
+        else
+            val = "1";
     }
     if (stdContains(ignoreOptions, option))
         return;
     applyCommandLineOption(config, option, val);
 }
 
+static CriticalSection configCS(SYNC_LOCATION);
 static Owned<IPropertyTree> componentConfiguration;
 static Owned<IPropertyTree> globalConfiguration;
+static Owned<IPropertyTree> nullConfiguration;
+static StringBuffer componentName;
+
 MODULE_INIT(INIT_PRIORITY_STANDARD)
 {
     return true;
@@ -8460,21 +9268,100 @@ MODULE_EXIT()
     globalConfiguration.clear();
 }
 
-IPropertyTree & queryComponentConfig()
+IPropertyTree * getComponentConfig()
 {
+    CriticalBlock b(configCS);
     if (!componentConfiguration)
-        throw makeStringException(99, "Configuration file has not yet been processed");
-    return *componentConfiguration;
+    {
+        if (!nullConfiguration)
+        {
+            PrintStackReport(); // deliberately emitting here, so only reported once per process
+            nullConfiguration.setown(createPTree());
+        }
+        IERRLOG(99, "getComponentConfig() called - configuration file has not yet been processed");
+        return nullConfiguration.getLink();
+    }
+    return componentConfiguration.getLink();
 }
 
-IPropertyTree & queryGlobalConfig()
+IPropertyTree * getGlobalConfig()
 {
+    CriticalBlock b(configCS);
     if (!globalConfiguration)
-        throw makeStringException(99, "Configuration file has not yet been processed");
-    return *globalConfiguration;
+    {
+        if (!nullConfiguration)
+        {
+            PrintStackReport(); // deliberately emitting here, so only reported once per process
+            nullConfiguration.setown(createPTree());
+        }
+        IERRLOG(99, "getGlobalConfig() called - configuration file has not yet been processed");
+        return nullConfiguration.getLink();
+    }
+    return globalConfiguration.getLink();
 }
 
-jlib_decl IPropertyTree * loadArgsIntoConfiguration(IPropertyTree *config, const char * * argv, std::initializer_list<const char *> ignoreOptions)
+void initNullConfiguration()
+{
+    CriticalBlock b(configCS);
+    if (componentConfiguration || globalConfiguration)
+        throw makeStringException(JLIBERR_ParseConfigurationHasAlreadyBeenInitialised, "Configuration has already been initialised");
+    if (!nullConfiguration)
+        nullConfiguration.setown(createPTree());
+    componentConfiguration.set(nullConfiguration);
+    globalConfiguration.set(nullConfiguration);
+}
+
+Owned<IPropertyTree> getComponentConfigSP()
+{
+    return getComponentConfig();
+}
+
+Owned<IPropertyTree> getGlobalConfigSP()
+{
+    return getGlobalConfig();
+}
+
+template <typename T>
+static T getConfigValue(const char *xpath, T defaultValue, T (IPropertyTree::*getPropFunc)(const char *, T) const)
+{
+    return (getComponentConfigSP()->*getPropFunc)(xpath, (getGlobalConfigSP()->*getPropFunc)(xpath, defaultValue));
+}
+
+bool getConfigBool(const char *xpath, bool defaultValue)
+{
+    return getConfigValue(xpath, defaultValue, &IPropertyTree::getPropBool);
+}
+
+int getConfigInt(const char *xpath, int defaultValue)
+{
+    return getConfigValue(xpath, defaultValue, &IPropertyTree::getPropInt);
+}
+
+__int64 getConfigInt64(const char *xpath, __int64 defaultValue)
+{
+    return getConfigValue(xpath, defaultValue, &IPropertyTree::getPropInt64);
+}
+
+double getConfigReal(const char *xpath, double defaultValue)
+{
+    return getConfigValue(xpath, defaultValue, &IPropertyTree::getPropReal);
+}
+
+bool getConfigString(const char *xpath, StringBuffer &result)
+{
+    if (getComponentConfigSP()->getProp(xpath, result))
+        return true;
+    else
+        return getGlobalConfigSP()->getProp(xpath, result);
+}
+
+const char * queryComponentName()
+{
+    //componentName is thread safe, since initialised when config is first loaded, and not modified afterwards
+    return componentName.str();
+}
+
+jlib_decl IPropertyTree * loadArgsIntoConfiguration(IPropertyTree *config, const char * * argv, std::initializer_list<const std::string> ignoreOptions)
 {
     for (const char * * pArg = argv; *pArg; pArg++)
     {
@@ -8495,12 +9382,317 @@ static void holdLoop()
 }
 #endif
 
-jlib_decl IPropertyTree * loadConfiguration(IPropertyTree *componentDefault, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute)
-{
-    if (componentConfiguration)
-        throw makeStringExceptionV(99, "Configuration for component %s has already been initialised", componentTag);
+static std::tuple<std::string, IPropertyTree *, IPropertyTree *> doLoadConfiguration(IPropertyTree *componentDefault, IPropertyTree *globalDefault, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute);
 
-    Linked<IPropertyTree> config(componentDefault);
+class CConfigUpdater : public CInterface
+{
+    StringAttr absoluteConfigFilename;
+    StringAttr configFilename;
+    Linked<IPropertyTree> componentDefault, globalDefault;
+    StringArray args;
+    StringAttr componentTag, envPrefix, legacyFilename;
+    IPropertyTree * (*mapper)(IPropertyTree *);
+    StringAttr altNameAttribute;
+    Owned<IFileEventWatcher> fileWatcher; // null if updates to the config file are not allowed
+    CriticalSection notifyFuncCS{SYNC_LOCATION};
+    unsigned notifyFuncId = 0;
+    std::unordered_map<unsigned, ConfigUpdateFunc> notifyConfigUpdates;
+    std::unordered_map<unsigned, ConfigModifyFunc> modifyConfigUpdates;
+
+public:
+    CConfigUpdater()
+    {
+    }
+    bool isInitialized() const
+    {
+        return args.ordinality(); // NB: null terminated, so always >=1 if initialized
+    }
+    void init(IPropertyTree *_componentDefault, IPropertyTree *_globalDefault, const char * * argv, const char * _componentTag, const char * _envPrefix, const char *_legacyFilename, IPropertyTree * (_mapper)(IPropertyTree *), const char *_altNameAttribute)
+    {
+        dbgassertex(!isInitialized());
+        componentDefault.set(_componentDefault);
+        globalDefault.set(_globalDefault);
+        componentTag.set(_componentTag);
+        envPrefix.set(_envPrefix);
+        legacyFilename.set(_legacyFilename);
+        mapper = _mapper;
+        altNameAttribute.set(_altNameAttribute);
+        while (const char *arg = *argv++)
+            args.append(arg);
+        args.append(nullptr);
+
+        refreshConfiguration(true, true);
+    }
+    bool startMonitoring()
+    {
+#if !defined(__linux__) // file moinitoring only supported in Linux (because createFileEventWatcher only implemented in Linux at the moment)
+        return false;
+#endif
+        if (absoluteConfigFilename.isEmpty() || (nullptr != fileWatcher.get()))
+            return false;
+
+        auto updateFunc = [&](const char *filename, FileWatchEvents events)
+        {
+            bool changed = containsFileWatchEvents(events, FileWatchEvents::closedWrite) && streq(filename, configFilename);
+
+            // NB: in k8s, it's a little strange, the config file is in a linked dir, a new dir is created and swapped in.
+            if (isContainerized())
+                changed = changed | containsFileWatchEvents(events, FileWatchEvents::movedTo) && streq(filename, "..data");
+
+            if (changed)
+                refreshConfiguration(false, false);
+        };
+
+        try
+        {
+            fileWatcher.setown(createFileEventWatcher(updateFunc));
+
+            // watch the path, not the filename, because the filename might not be seen if directories are moved, softlinks are changed..
+            StringBuffer path, filename;
+            splitFilename(absoluteConfigFilename, nullptr, &path, &filename, &filename);
+            configFilename.set(filename);
+            fileWatcher->add(path, FileWatchEvents::anyChange);
+            fileWatcher->start();
+        }
+        catch (IException * e)
+        {
+            OERRLOG(e, "Failed to start file watcher");
+            e->Release();
+        }
+        return true;
+    }
+
+    void refreshConfiguration(IPropertyTree * newComponentConfiguration, IPropertyTree * newGlobalConfiguration)
+    {
+        CriticalBlock b(notifyFuncCS);
+        //Ensure all modifications to the config take place before the config is updated, and the monitoring/caching functions are called.
+        executeModifyCallbacks(newComponentConfiguration, newGlobalConfiguration);
+
+        // NB: block calls to get*Config*() from other threads until callbacks notified and new swapped in, destroy old config outside the critical section
+        Owned<IPropertyTree> oldComponentConfiguration;
+        Owned<IPropertyTree> oldGlobalConfiguration;
+        {
+            CriticalBlock b(configCS);
+            oldComponentConfiguration.setown(componentConfiguration.getClear());
+            oldGlobalConfiguration.setown(globalConfiguration.getClear());
+
+            /* swapin before callbacks called, but before releasing crit.
+            * That way the CB can see the old/diffs and act on them, but any
+            * code calling e.g. getComponentConfig() will see new.
+            */
+            componentConfiguration.set(newComponentConfiguration);
+            globalConfiguration.set(newGlobalConfiguration);
+
+            /* NB: we are still holding 'configCS' at this point, blocking all other thread access.
+            However code in callbacks may call e.g. getComponentConfig() and re-enter the crit */
+            executeNotifyCallbacks(oldComponentConfiguration, oldGlobalConfiguration);
+        }
+    }
+
+    void refreshConfiguration(bool firstTime, bool avoidClone)
+    {
+        if (firstTime || fileWatcher)
+        {
+            auto result = doLoadConfiguration(componentDefault, globalDefault, args.getArray(), componentTag, envPrefix, legacyFilename, mapper, altNameAttribute);
+            IPropertyTree * newComponentConfiguration = std::get<1>(result);
+            IPropertyTree * newGlobalConfiguration = std::get<2>(result);
+            refreshConfiguration(newComponentConfiguration, newGlobalConfiguration);
+
+            if (firstTime)
+            {
+                absoluteConfigFilename.set(std::get<0>(result).c_str());
+                newGlobalConfiguration->getProp("@name", componentName);
+            }
+        }
+        else if (avoidClone)
+        {
+            //This is added during the initialiation phase, so no danger of other threads accesing the global information
+            //while it is updated.  Thor currently relies on the pointer not changing.
+            Owned<IPropertyTree> newComponentConfiguration = getComponentConfigSP();
+            Owned<IPropertyTree> newGlobalConfiguration = getGlobalConfigSP();
+            refreshConfiguration(newComponentConfiguration, newGlobalConfiguration);
+        }
+        else
+        {
+            // File monitor is disabled - no updates to the configuration files are supported.
+            //So clone the existing configuration and use that to refresh the config - update fucntions may perform differently.
+            Owned<IPropertyTree> newComponentConfiguration = createPTreeFromIPT(getComponentConfigSP());
+            Owned<IPropertyTree> newGlobalConfiguration = createPTreeFromIPT(getGlobalConfigSP());
+            refreshConfiguration(newComponentConfiguration, newGlobalConfiguration);
+        }
+    }
+
+    void executeNotifyCallbacks()
+    {
+        CriticalBlock notifyBlock(notifyFuncCS);
+        CriticalBlock configBlock(configCS);
+        executeNotifyCallbacks(componentConfiguration, globalConfiguration);
+    }
+
+    void executeNotifyCallbacks(IPropertyTree *oldComponentConfiguration, IPropertyTree *oldGlobalConfiguration)
+    {
+        for (const auto &item: notifyConfigUpdates)
+        {
+            try
+            {
+                item.second(oldComponentConfiguration, oldGlobalConfiguration);
+            }
+            catch (IException *e)
+            {
+                EXCLOG(e, "CConfigUpdater callback");
+                e->Release();
+            }
+        }
+    }
+
+    void executeModifyCallbacks(IPropertyTree * newComponentConfiguration, IPropertyTree * newGlobalConfiguration)
+    {
+        for (auto & modifyFunc : modifyConfigUpdates)
+        {
+            try
+            {
+                modifyFunc.second(newComponentConfiguration, newGlobalConfiguration);
+            }
+            catch (IException *e)
+            {
+                EXCLOG(e, "CConfigUpdater callback");
+                e->Release();
+            }
+        }
+    }
+
+    unsigned addNotifyFunc(ConfigUpdateFunc notifyFunc, bool callWhenInstalled)
+    {
+        CriticalBlock b(notifyFuncCS);
+        notifyFuncId++;
+        notifyConfigUpdates[notifyFuncId] = notifyFunc;
+        if (callWhenInstalled)
+        {
+            if (isInitialized())
+                notifyFunc(getComponentConfigSP(), getGlobalConfigSP());
+        }
+        return notifyFuncId;
+    }
+    unsigned addModifyFunc(ConfigModifyFunc notifyFunc, bool threadSafe)
+    {
+        CriticalBlock b(notifyFuncCS);
+        notifyFuncId++;
+        modifyConfigUpdates[notifyFuncId] = notifyFunc;
+        if (isInitialized())
+        {
+            //Force all cached values to be recalculated, do not reload the config
+            //This is only legal if no other threads are accessing the config yet - otherwise the reading thread
+            //could crash when the global configuration is updated.
+            refreshConfiguration(false, threadSafe);
+            DBGLOG("Modify functions should be registered before the configuration is loaded");
+        }
+        return notifyFuncId;
+    }
+    bool removeNotifyFunc(unsigned funcId)
+    {
+        CriticalBlock b(notifyFuncCS);
+        if (modifyConfigUpdates.erase(funcId) != 0)
+            return true;
+
+        auto it = notifyConfigUpdates.find(funcId);
+        if (it == notifyConfigUpdates.end())
+            return false;
+
+        ConfigUpdateFunc notifyFunc = it->second;
+        notifyConfigUpdates.erase(it);
+        return true;
+    }
+};
+
+static CConfigUpdater *configFileUpdater = nullptr;
+MODULE_INIT(INIT_PRIORITY_JPTREE)
+{
+    configFileUpdater = new CConfigUpdater();
+    return true;
+}
+
+MODULE_EXIT()
+{
+    ::Release(configFileUpdater);
+    configFileUpdater = nullptr;
+}
+
+unsigned installConfigUpdateHook(ConfigUpdateFunc notifyFunc, bool callWhenInstalled)
+{
+    if (!configFileUpdater) // NB: installConfigUpdateHook should always be called after configFileUpdater is initialized
+        return 0;
+    return configFileUpdater->addNotifyFunc(notifyFunc, callWhenInstalled);
+}
+
+jlib_decl unsigned installConfigUpdateHook(ConfigModifyFunc notifyFunc, bool threadSafe)  // This function must be called before the configuration is loaded.
+{
+    if (!configFileUpdater) // NB: installConfigUpdateHook should always be called after configFileUpdater is initialized
+        return 0;
+    return configFileUpdater->addModifyFunc(notifyFunc, threadSafe);
+}
+
+void removeConfigUpdateHook(unsigned notifyFuncId)
+{
+    if (0 == notifyFuncId)
+        return;
+    if (!configFileUpdater) // NB: removeConfigUpdateHook should always be called after configFileUpdater is initialized
+        return;
+    if (!configFileUpdater->removeNotifyFunc(notifyFuncId))
+        WARNLOG("removeConfigUpdateHook(): notifyFuncId %u not installed", notifyFuncId);
+}
+
+void refreshConfiguration()
+{
+    if (!configFileUpdater) // NB: refreshConfiguration() should always be called after configFileUpdater is initialized
+        return;
+    configFileUpdater->refreshConfiguration(false, false);
+}
+
+void CConfigUpdateHook::clear()
+{
+    unsigned id = configCBId.exchange((unsigned)-1);
+    if ((unsigned)-1 != id)
+        removeConfigUpdateHook(id);
+}
+
+void CConfigUpdateHook::installOnce(ConfigUpdateFunc callbackFunc, bool callWhenInstalled)
+{
+    unsigned id = configCBId.load(std::memory_order_acquire);
+    if ((unsigned)-1 == id) // avoid CS in common case
+    {
+        CriticalBlock b(crit);
+        // check again now in CS
+        id = configCBId.load(std::memory_order_acquire);
+        if ((unsigned)-1 == id)
+        {
+            id = installConfigUpdateHook(callbackFunc, callWhenInstalled);
+            configCBId.store(id, std::memory_order_release);
+        }
+    }
+}
+
+
+void CConfigUpdateHook::installModifierOnce(ConfigModifyFunc callbackFunc, bool threadSafe)
+{
+    unsigned id = configCBId.load(std::memory_order_acquire);
+    if ((unsigned)-1 == id) // avoid CS in common case
+    {
+        CriticalBlock b(crit);
+        // check again now in CS
+        id = configCBId.load(std::memory_order_acquire);
+        if ((unsigned)-1 == id)
+        {
+            id = installConfigUpdateHook(callbackFunc, threadSafe);
+            configCBId.store(id, std::memory_order_release);
+        }
+    }
+}
+
+static std::tuple<std::string, IPropertyTree *, IPropertyTree *> doLoadConfiguration(IPropertyTree *componentDefault, IPropertyTree *globalDefault, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute)
+{
+    Owned<IPropertyTree> newComponentConfig = createPTreeFromIPT(componentDefault);
+    Linked<IPropertyTree> newGlobalConfig = globalDefault ? createPTreeFromIPT(globalDefault) : nullptr;
+    StringBuffer absConfigFilename;
     const char * optConfig = nullptr;
     bool outputConfig = false;
 #ifdef _DEBUG
@@ -8537,113 +9729,173 @@ jlib_decl IPropertyTree * loadConfiguration(IPropertyTree *componentDefault, con
             matchConfig = extractOption("--componentTag", cur);
             if (matchConfig)
                 componentTag = matchConfig;
-#ifdef _DEBUG
             else
             {
-                const char *matchHold = extractOption("--hold", cur);
-                if (matchHold)
+                const char * legacy = extractOption("--legacyconfig", cur);
+                if (legacy)
+                    legacyFilename = legacy;
+#ifdef _DEBUG
+                else
                 {
-                    if (strToBool(matchHold))
+                    const char *matchHold = extractOption("--hold", cur);
+                    if (matchHold)
                     {
-                        held = true;
-                        holdLoop();
+                        if (strToBool(matchHold))
+                        {
+                            held = true;
+                            holdLoop();
+                        }
                     }
                 }
-            }
 #endif
+            }
         }
     }
 
+    const char *config = optConfig ? optConfig : legacyFilename;
+    if (!isEmptyString(config) && !isAbsolutePath(config))
+    {
+        appendCurrentDirectory(absConfigFilename, false);
+        addNonEmptyPathSepChar(absConfigFilename);
+    }
+    absConfigFilename.append(config);
+
+    Owned<IPropertyTree> configGlobal;
     Owned<IPropertyTree> delta;
     if (optConfig)
     {
         if (streq(optConfig, "1"))
-            throw makeStringExceptionV(99, "Name of configuration file omitted (use --config=<filename>)");
+            throw makeStringExceptionV(JLIBERR_ParseNameOfConfigurationFileOmittedUseConfigFilename, "Name of configuration file omitted (use --config=<filename>)");
 
         //--config= with no filename can be used to ignore the legacy configuration file
         if (!isEmptyString(optConfig))
         {
-            StringBuffer fullpath;
-            if (!isAbsolutePath(optConfig))
-            {
-                appendCurrentDirectory(fullpath, false);
-                addNonEmptyPathSepChar(fullpath);
-            }
-            fullpath.append(optConfig);
-            delta.setown(loadConfiguration(fullpath, componentTag, true, altNameAttribute));
-            globalConfiguration.setown(loadConfiguration(fullpath, "global", false, altNameAttribute));
+            delta.setown(loadConfiguration(absConfigFilename, componentTag, true, altNameAttribute));
+            configGlobal.setown(loadConfiguration(absConfigFilename, "global", false, altNameAttribute));
         }
     }
     else
     {
         if (legacyFilename && checkFileExists(legacyFilename))
+        {
             delta.setown(createPTreeFromXMLFile(legacyFilename, ipt_caseInsensitive));
+            configGlobal.set(delta->queryPropTree("global"));
+        }
 
         if (delta && mapper)
             delta.setown(mapper(delta));
     }
 
+    if (configGlobal)
+    {
+        if (newGlobalConfig)
+            mergeConfiguration(*newGlobalConfig, *configGlobal); //default: lists replaced
+        else
+            newGlobalConfig.setown(configGlobal.getClear());
+    }
+
     if (delta)
-        mergeConfiguration(*config, *delta, altNameAttribute);
+        mergeConfiguration(*newComponentConfig, *delta, altNameAttribute); //NB: if altNameAttribute is non-null, implies mergeListItemContent=true (legacy)
 
     const char * * environment = const_cast<const char * *>(getSystemEnv());
     for (const char * * cur = environment; *cur; cur++)
     {
-        applyEnvironmentConfig(*config, envPrefix, *cur);
+        applyEnvironmentConfig(*newComponentConfig, envPrefix, *cur);
     }
 
     if (outputConfig)
     {
-        loadArgsIntoConfiguration(config, argv, { "config", "outputconfig" });
+        loadArgsIntoConfiguration(newComponentConfig, argv, { "config", "outputconfig" });
 
         Owned<IPropertyTree> recreated = createPTree();
         recreated->setProp("@version", currentVersion);
-        recreated->addPropTree(componentTag, LINK(config));
-        if (globalConfiguration)
-            recreated->addPropTree("global", globalConfiguration.getLink());
+        recreated->addPropTree(componentTag, LINK(newComponentConfig));
+        if (newGlobalConfig)
+            recreated->addPropTree("global", newGlobalConfig.getLink());
         StringBuffer yamlText;
         toYAML(recreated, yamlText, 0, YAML_SortTags);
         printf("%s\n", yamlText.str());
         exit(0);
     }
     else
-        loadArgsIntoConfiguration(config, argv);
+        loadArgsIntoConfiguration(newComponentConfig, argv);
 
     //For legacy (and other weird cases) ensure there is a global section
-    if (!globalConfiguration)
-        globalConfiguration.setown(createPTree("global"));
+    if (!newGlobalConfig)
+        newGlobalConfig.setown(createPTree("global"));
 
 #ifdef _DEBUG
     // NB: don't re-hold, if CLI --hold already held.
-    if (!held && config->getPropBool("@hold"))
+    if (!held && newComponentConfig->getPropBool("@hold"))
+    {
         holdLoop();
+        held = true;
+    }
 #endif
 
-    unsigned ptreeMappingThreshold = globalConfiguration->getPropInt("@ptreeMappingThreshold", defaultSiblingMapThreshold);
+    unsigned ptreeMappingThreshold = newGlobalConfig->getPropInt("@ptreeMappingThreshold", defaultSiblingMapThreshold);
     setPTreeMappingThreshold(ptreeMappingThreshold);
 
-    componentConfiguration.set(config);
-    return config.getClear();
+    return std::make_tuple(std::string(absConfigFilename.str()), newComponentConfig.getClear(), newGlobalConfig.getClear());
 }
 
-jlib_decl IPropertyTree * loadConfiguration(const char * defaultYaml, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute)
+IPropertyTree * loadConfiguration(IPropertyTree *componentDefault, IPropertyTree *globalDefault, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute, bool monitor)
+{
+    assertex(configFileUpdater); // NB: loadConfiguration should always be called after configFileUpdater is initialized
+    if (configFileUpdater->isInitialized())
+        throw makeStringExceptionV(JLIBERR_ParseConfigurationForComponentSHasAlreadyBeen, "Configuration for component %s has already been initialised", componentTag);
+
+    /* In k8s, pods auto-restart by default on monitored ConfigMap settings/areas
+     * ConfigMap settings/areas deliberately not monitored will rely on this config updater mechanism,
+     * and if necessary, installed hooks that are called on an update, to perform updates of cached state.
+     * See installConfigUpdateHook()
+     *
+     * NB: most uses of config do not rely on being notified to update state, i.e. most query the config
+     * on-demand, which means this mechanism is sufficient to cover most cases.
+     *
+     * In bare-metal the monitoring mechanism will similarly spot any legacy config file changes, e.g.
+     * that would be refreshed during a 'service hpcc-init setup'.
+     * Some bare-metal code relies on directly interrogating the environment, for those situations, there is
+     * also a default triggering mechanism (see executeConfigUpdaterCallbacks in daclient.cpp) that will cause any
+     * installed config hooks to be called when an environment change is detected e.g when pushed to Dali)
+     */
+
+    configFileUpdater->init(componentDefault, globalDefault, argv, componentTag, envPrefix, legacyFilename, mapper, altNameAttribute);
+    if (monitor)
+        configFileUpdater->startMonitoring();
+
+    initTraceManager(componentTag, componentConfiguration.get(), globalConfiguration.get());
+    protraceInitialize(componentTag, componentConfiguration.get());
+    return componentConfiguration.getLink();
+}
+
+IPropertyTree * loadConfiguration(const char * defaultYaml, const char * * argv, const char * componentTag, const char * envPrefix, const char * legacyFilename, IPropertyTree * (mapper)(IPropertyTree *), const char *altNameAttribute, bool monitor)
 {
     if (componentConfiguration)
-        throw makeStringExceptionV(99, "Configuration for component %s has already been initialised", componentTag);
+        throw makeStringExceptionV(JLIBERR_ParseConfigurationForComponentSHasAlreadyBeen_1, "Configuration for component %s has already been initialised", componentTag);
 
     Owned<IPropertyTree> componentDefault;
+    Owned<IPropertyTree> defaultGlobalConfig;
     if (defaultYaml)
     {
         Owned<IPropertyTree> defaultConfig = createPTreeFromYAML(defaultYaml);
         componentDefault.set(defaultConfig->queryPropTree(componentTag));
         if (!componentDefault)
-            throw makeStringExceptionV(99, "Default configuration does not contain the tag %s", componentTag);
+            throw makeStringExceptionV(JLIBERR_ParseDefaultConfigurationDoesNotContainTheTag, "Default configuration does not contain the tag %s", componentTag);
+        defaultGlobalConfig.set(defaultConfig->queryPropTree("global"));
     }
     else
         componentDefault.setown(createPTree(componentTag));
 
-    return loadConfiguration(componentDefault, argv, componentTag, envPrefix, legacyFilename, mapper, altNameAttribute);
+    return loadConfiguration(componentDefault, defaultGlobalConfig, argv, componentTag, envPrefix, legacyFilename, mapper, altNameAttribute, monitor);
 }
+
+void replaceComponentConfig(IPropertyTree *newComponentConfig, IPropertyTree *newGlobalConfig)
+{
+    assertex (configFileUpdater); // NB: replaceComponentConfig should always be called after configFileUpdater is initialized
+    configFileUpdater->refreshConfiguration(newComponentConfig, newGlobalConfig);
+}
+
 
 class CYAMLBufferReader : public CInterfaceOf<IPTreeReader>
 {
@@ -8658,7 +9910,7 @@ public:
         iEvent(&_iEvent), readerOptions(_readerOptions)
     {
         if (!yaml_parser_initialize(&parser))
-            throw makeStringException(99, "Filed to initialize libyaml parser");
+            throw makeStringException(JLIBERR_ParseFailedToInitializeLibyamlParser, "Failed to initialize libyaml parser");
         yaml_parser_set_input_string(&parser, (const unsigned char *)buf, bufLength);
         noRoot = 0 != ((unsigned)readerOptions & (unsigned)ptr_noRoot);
     }
@@ -8670,16 +9922,16 @@ public:
     yaml_event_type_t nextEvent(yaml_event_t &event, yaml_event_type_t final=YAML_NO_EVENT, yaml_event_type_t expected=YAML_NO_EVENT, const char *error="")
     {
         if (!yaml_parser_parse(&parser, &event))
-            throw makeStringExceptionV(99, "libyaml parser error %s", parser.problem);
+            throw makeStringExceptionV(JLIBERR_ParseLibyamlParserErrorS, "libyaml parser error %s", parser.problem);
         if (event.type!=final && expected!=YAML_NO_EVENT && event.type!=expected)
-            throw makeStringExceptionV(99, "libyaml parser %s", error);
+            throw makeStringExceptionV(JLIBERR_ParseLibyamlParserS, "libyaml parser %s", error);
         return event.type;
     }
 
     virtual void loadSequence(const char *tagname)
     {
-        if (!tagname || !*tagname) //if unmapped (unnamed) sequences are possible have to decide how to name them in the ptree, later
-            throw makeStringException(99, "libyaml parser expected sequence name");
+        if (!tagname)
+            throw makeStringException(JLIBERR_ParseLibyamlParserExpectedSequenceName, "libyaml parser expected sequence name");
 
         yaml_event_t event;
         yaml_event_type_t eventType = YAML_NO_EVENT;
@@ -8701,6 +9953,12 @@ public:
                 iEvent->endNode(tagname, event.data.scalar.length, (const void *)event.data.scalar.value, false, parser.offset);
                 break;
             case YAML_ALIAS_EVENT: //reference to an anchor, ignore for now
+                // ***SECURITY NOTE: if alias resolution is ever implemented here, it MUST enforce limits on
+                // recursion depth / total expanded node count / output size. Naively substituting the
+                // referenced anchor's content on each alias reference (as some YAML libraries/parsers do)
+                // can be abused for a "billion laughs"-style exponential expansion denial-of-service attack
+                // (CWE-776 / CWE-400) if the YAML document originates from an untrusted or externally-supplied
+                // source. The current behaviour of ignoring aliases avoids this risk entirely.
                 iEvent->beginNode(tagname, true, parser.offset);
                 iEvent->endNode(tagname, 0, nullptr, false, parser.offset);
                 break;
@@ -8724,7 +9982,7 @@ public:
     {
         bool binaryContent = false;
         StringBuffer content;
-        if (tagname && *tagname)
+        if (tagname)
             iEvent->beginNode(tagname, sequence, parser.offset);
 
         yaml_event_t event;
@@ -8789,6 +10047,9 @@ public:
                 break;
             }
             case YAML_ALIAS_EVENT: //reference to an anchor, ignore for now
+                // ***SECURITY NOTE: see matching comment in loadSequence() above - any future implementation
+                // of alias resolution here must bound recursion depth/expanded size to avoid a "billion
+                // laughs"-style denial-of-service (CWE-776/CWE-400) against untrusted YAML input.
                 iEvent->beginNode(elname, false, parser.offset);
                 iEvent->endNode(elname, 0, nullptr, false, parser.offset);
                 break;
@@ -8826,14 +10087,14 @@ public:
             case YAML_MAPPING_START_EVENT:
                 //root content, the start of all mappings, should be only one at the root
                 if (content)
-                    throw makeStringException(99, "YAML: Currently only support one content section (map) per stream");
+                    throw makeStringException(JLIBERR_ParseYamlCurrentlyOnlySupportOneContentSection, "YAML: Currently only support one content section (map) per stream");
                 loadMap(noRoot ? nullptr : "__object__", false); //root map
                 content=true;
                 break;
             case YAML_SEQUENCE_START_EVENT:
                 //root content, sequence (array), should be only one at the root and can't mix with mappings
                 if (content)
-                    throw makeStringException(99, "YAML: Currently only support one content section (sequence) per stream");
+                    throw makeStringException(JLIBERR_ParseYamlCurrentlyOnlySupportOneContentSection_1, "YAML: Currently only support one content section (sequence) per stream");
                 if (!noRoot)
                     iEvent->beginNode("__array__", false, 0);
                 loadSequence("__item__");
@@ -8848,13 +10109,14 @@ public:
             case YAML_DOCUMENT_START_EVENT:
                 //should only support one?  multiple documents would imply an extra level of nesting (future flag?)
                 if (doc)
-                    throw makeStringException(99, "YAML: Currently only support one document per stream");
+                    throw makeStringException(JLIBERR_ParseYamlCurrentlyOnlySupportOneDocumentPer, "YAML: Currently only support one document per stream");
                 doc=true;
                 break;
             case YAML_DOCUMENT_END_EVENT:
                 break;
             case YAML_NO_EVENT:
-            case YAML_ALIAS_EVENT: //root alias?
+            case YAML_ALIAS_EVENT:  // root alias? - if handled in future, see security note on alias handling
+                                    // in loadMap()/loadSequence() above regarding "billion laughs" DoS risk
             case YAML_MAPPING_END_EVENT:
             case YAML_SCALAR_EVENT: //root unmapped (unnamed) scalars?
             case YAML_SEQUENCE_END_EVENT:
@@ -8886,7 +10148,7 @@ IPropertyTree *createPTreeFromYAMLString(unsigned len, const char *yaml, byte fl
     Owned<IPTreeMaker> _iMaker;
     if (!iMaker)
     {
-        iMaker = createDefaultPTreeMaker(flags, readFlags);
+        iMaker = createDefaultPTreeMaker(flags, (PTreeReaderOptions)(readFlags|ptr_encodeExtNames));
         _iMaker.setown(iMaker);
     }
     Owned<IPTreeReader> reader = createYAMLBufferReader(yaml, len, *iMaker, readFlags);
@@ -8937,7 +10199,7 @@ public:
     YAMLEmitter(IIOStream &ios, int indent) : out(ios)
     {
         if (!yaml_emitter_initialize(&emitter))
-            throw MakeStringException(0, "YAMLEmitter: failed to initialize");
+            throw MakeStringException(JLIBERR_ParseYamlemitterFailedToInitialize, "YAMLEmitter: failed to initialize");
         yaml_emitter_set_output(&emitter, yaml_write_iiostream, &out);
         yaml_emitter_set_canonical(&emitter, false);
         yaml_emitter_set_unicode(&emitter, true);
@@ -8967,7 +10229,7 @@ public:
     void checkInit(int success, const char *descr)
     {
         if (success==0)
-            throw MakeStringException(0, "YAMLEmitter: %s failed", descr);
+            throw MakeStringException(JLIBERR_ParseYamlemitterSFailed, "YAMLEmitter: %s failed", descr);
     }
     void writeValue(const char *value, bool element, bool hidden, bool binary)
     {
@@ -9044,18 +10306,31 @@ public:
 
 static void _toYAML(const IPropertyTree *tree, YAMLEmitter &yaml, byte flags, bool root=false, bool isArrayItem=false)
 {
-    const char *name = tree->queryName();
-    if (!root && !isArrayItem)
+    bool hiddenRootArrayObject = false;
+    //Having to decode is the uncommon case.  Keep overhead low by only using a StringAttr here, and if we do have to decode, take the hit then and use an adapter (StringAttrBuilder).
+    StringAttr decoded;
     {
-        if (!name || !*name)
-            name = "__unnamed__";
-        yaml.writeName(name);
+        const char *name = tree->queryName();
+        hiddenRootArrayObject = isRootArrayObjectHidden(root, name, flags);
+        if (!root && !isArrayItem)
+        {
+            if (!name || !*name)
+                name = "__unnamed__";
+            else if (isPTreeNameEncoded(tree))
+            {
+                {
+                    StringAttrBuilder decodedBuilder(decoded);
+                    decodePtreeName(decodedBuilder, name);
+                }
+                name = decoded.str();
+            }
+            yaml.writeName(name);
+        }
     }
 
     Owned<IAttributeIterator> it = tree->getAttributes(true);
     bool hasAttributes = it->first();
     bool complex = (hasAttributes || tree->hasChildren());
-    bool hiddenRootArrayObject = isRootArrayObjectHidden(root, name, flags);
 
     if (!hiddenRootArrayObject)
     {
@@ -9066,9 +10341,18 @@ static void _toYAML(const IPropertyTree *tree, YAMLEmitter &yaml, byte flags, bo
         {
             ForEach(*it)
             {
-                const char *key = it->queryName()+1;
+                const char *key = it->queryName();
+                if (isPTreeAttributeNameEncoded(tree, key))
+                {
+                    {
+                        decoded.clear();
+                        StringAttrBuilder decodedAtBuilder(decoded);
+                        decodePtreeName(decodedAtBuilder, key);
+                    }
+                    key = decoded.str();
+                }
                 const char *val = it->queryValue();
-                yaml.writeAttribute(key, val, isSanitizedAndHidden(val, flags, true));
+                yaml.writeAttribute(key+1, val, isSanitizedAndHidden(val, flags, true));
             }
         }
     }
@@ -9117,7 +10401,25 @@ static void _toYAML(const IPropertyTree *tree, YAMLEmitter &yaml, byte flags, bo
         if (endprior)
             yaml.endSequence();
         if (first)
-            yaml.beginSequence(hiddenRootArrayObject ? nullptr : element.queryName());
+        {
+            const char *name = nullptr;
+            if (!hiddenRootArrayObject)
+            {
+                if (!isPTreeNameEncoded(&element))
+                    name = element.queryName();
+                else
+                {
+                    {
+                        decoded.clear();
+                        StringAttrBuilder decodedBuilder(decoded);
+                        decodePtreeName(decodedBuilder, element.queryName());
+                    }
+                    name = decoded.str();
+                }
+            }
+
+            yaml.beginSequence(name);
+        }
 
         _toYAML(&element, yaml, flags, false, sequence);
     }
@@ -9179,8 +10481,9 @@ void saveYAML(IFile &ifile, const IPropertyTree *tree, unsigned indent, unsigned
 {
     OwnedIFileIO ifileio = ifile.open(IFOcreate);
     if (!ifileio)
-        throw MakeStringException(0, "saveXML: could not find %s to open", ifile.queryFilename());
+        throw MakeStringException(JLIBERR_ParseSavexmlCouldNotFindSToOpen_1, "saveXML: could not find %s to open", ifile.queryFilename());
     saveYAML(*ifileio, tree, indent, flags);
+    ifileio->close();
 }
 
 void saveYAML(IFileIO &ifileio, const IPropertyTree *tree, unsigned indent, unsigned flags)
@@ -9195,7 +10498,551 @@ void saveYAML(IIOStream &stream, const IPropertyTree *tree, unsigned indent, uns
     toYAML(tree, stream, indent, flags);
 }
 
-jlib_decl IPropertyTree * queryCostsConfiguration()
+
+void copyPropIfMissing(IPropertyTree & target, const char * targetName, IPropertyTree & source, const char * sourceName)
 {
-    return queryComponentConfig().queryPropTree("costs");
+    if (source.hasProp(sourceName) && !target.hasProp(targetName))
+    {
+        if (source.isBinary(sourceName))
+        {
+            MemoryBuffer value;
+            source.getPropBin(sourceName, value);
+            //MORE: Avoid decompression?
+            target.setPropBin(targetName, value.length(), value.toByteArray(), COMPRESS_METHOD_DEFAULT);
+        }
+        else
+            target.setProp(targetName, source.queryProp(sourceName));
+    }
 }
+
+void copyProp(IPropertyTree & target, IPropertyTree & source, const char * name)
+{
+    if (source.hasProp(name))
+    {
+        if (source.isBinary(name))
+        {
+            MemoryBuffer value;
+            source.getPropBin(name, value);
+            target.setPropBin(name, value.length(), value.toByteArray(), COMPRESS_METHOD_DEFAULT);
+        }
+        else
+            target.setProp(name, source.queryProp(name));
+    }
+}
+
+inline void checkEndHexSequence(StringBuffer &s, bool &hexSequence)
+{
+    if (hexSequence)
+    {
+        //close current hex stream sequence
+        s.append('_');
+        hexSequence = false;
+    }
+}
+inline bool isValidPTreeNameChar(const char *ch, unsigned remaining, unsigned &chlen, bool isatt, bool first)
+{
+    chlen = 0;
+    if (!ch || !*ch || !remaining)
+        return false;
+    chlen = utf8CharLen((const unsigned char *)ch, remaining);
+    if (0==chlen)
+    {
+        chlen=1;
+        return false;
+    }
+    if (chlen>1)
+        return !isatt;  //attributes do not seem to currently support multibyte characters in their names
+    if (first)
+        return isValidXPathStartChr(*ch);
+    return isValidXPathChr(*ch);
+}
+
+const char *findFirstInvalidPTreeNameChar(const char *ch, unsigned remaining)
+{
+    if (!ch)
+        return nullptr;
+    if (remaining==0 || *ch=='\0') //empty name still needs to trigger a special encoding
+        return ch;
+    bool isatt;
+    if ('@'==*ch)
+    {
+        isatt=true;
+        ch++;
+        remaining--;
+    }
+    else
+        isatt=false;
+
+    if (!remaining)
+        return nullptr;
+
+    unsigned chlen = 0;
+    if (!isValidPTreeNameChar(ch, remaining, chlen, isatt, true))
+        return ch;
+    if (remaining<chlen)
+        return nullptr;
+    ch += chlen;
+    remaining -= chlen;
+    while (remaining)
+    {
+        if (!isValidPTreeNameChar(ch, remaining, chlen, isatt, false))
+            return ch;
+        if (remaining<=chlen)
+            return nullptr;
+        ch += chlen;
+        remaining -= chlen;
+    }
+    return nullptr;
+}
+
+const char *findFirstInvalidPTreeNameChar(const char *ch)
+{
+    if (!ch)
+        return nullptr;
+    return findFirstInvalidPTreeNameChar(ch, strlen(ch));
+}
+
+static inline bool checkAppendValidPTreeNameChar(StringBuffer &s, const char *ch, unsigned remaining, unsigned &chlen, bool isatt, bool first, bool &hexSequence)
+{
+    if (!isValidPTreeNameChar(ch, remaining, chlen, isatt, first))
+        return false;
+    checkEndHexSequence(s, hexSequence);
+    s.append(chlen, ch);
+    return true;
+}
+
+inline void appendPTreeNameSpecialEncoding(StringBuffer &s, const char *enc, bool &hexSequence)
+{
+    checkEndHexSequence(s, hexSequence);
+    s.append('_');
+    s.append(enc);
+}
+
+inline StringBuffer &encodePTreeNameUtf8Char(StringBuffer &s, const char *&ch, unsigned &remaining, bool isatt, bool &hexSequence, bool &first)
+{
+    unsigned chlen = 1;
+    if (first && (*ch=='@'))
+    {
+        s.append('@');
+        ch++;
+        remaining--;
+        if (remaining==0 || *ch=='\0')
+            return s;
+    }
+    if (*ch!='_' && checkAppendValidPTreeNameChar(s, ch, remaining, chlen, isatt, first, hexSequence))
+    {
+        remaining -= chlen;
+        ch += chlen;
+        first = false;
+        return s;
+    }
+    switch (*ch)
+    {
+        case '_':
+            appendPTreeNameSpecialEncoding(s, "_", hexSequence);
+            break;
+        case ' ':
+            appendPTreeNameSpecialEncoding(s, "s", hexSequence);
+            break;
+        case '@':
+            appendPTreeNameSpecialEncoding(s, "a", hexSequence);
+            break;
+        case '\\':
+            appendPTreeNameSpecialEncoding(s, "b", hexSequence);
+            break;
+        case '/':
+            appendPTreeNameSpecialEncoding(s, "f", hexSequence);
+            break;
+        case '\n':
+            appendPTreeNameSpecialEncoding(s, "n", hexSequence);
+            break;
+        case '\"':
+            appendPTreeNameSpecialEncoding(s, "Q", hexSequence);
+            break;
+        case '\r':
+            appendPTreeNameSpecialEncoding(s, "r", hexSequence);
+            break;
+        case '\'':
+            appendPTreeNameSpecialEncoding(s, "q", hexSequence);
+            break;
+        case '\t':
+            appendPTreeNameSpecialEncoding(s, "t", hexSequence);
+            break;
+        default:
+            {
+                if (!hexSequence)
+                {
+                    s.append("_x");
+                    hexSequence = true;
+                }
+                appendDataAsHex(s, chlen, (const void *)ch);
+            }
+            break;
+    }
+    ch += chlen;
+    remaining -= chlen;
+    if (first)
+        first = false;
+    return s;
+}
+
+StringBuffer &encodePTreeName(StringBuffer &s, unsigned size, const char *value, const char *startEncoding)
+{
+    if (!value || !size)
+        return s.append("_0");
+    bool isattr = ('@'==*value);
+    if (isattr && size==1)
+        return s.append("@_0");
+    //preallocate some space, with expansion of characters to avoid constant reallocation while appending below
+    s.ensureCapacity(size + size/2);
+    if (startEncoding)
+    {
+        //see if we have any existing escape characters to expand ('_' ==> "__")
+        const void *realStart = memchr(value, '_', startEncoding - value);
+        if (realStart)
+            startEncoding = (const char *) realStart;
+        unsigned skipSize = startEncoding-value;
+        if (skipSize > size)
+            return s;
+        s.append(skipSize, value);
+        value = startEncoding;
+        size -= skipSize;
+    }
+    bool hexSequence = false;
+    bool first = true;
+    while (size)
+        encodePTreeNameUtf8Char(s, value, size, isattr, hexSequence, first);
+    checkEndHexSequence(s, hexSequence);
+    return s;
+}
+
+StringBuffer &encodePTreeName(StringBuffer &s, const char *value, const char *startEncoding)
+{
+    if (!value)
+        return s.append("_0");
+    return encodePTreeName(s, strlen(value), value, startEncoding);
+}
+
+//Only encode the PTREE XPATH name if necessary. That matches the way internal PTREE names are stored allowing the resulting XPATH to be used directly
+StringBuffer &appendPTreeXPathName(StringBuffer &s, unsigned size, const char *value)
+{
+    if (!size || !value)
+        return s.append("_0");
+    const char *startEncoding = findFirstInvalidPTreeNameChar(value, size);
+    if (!startEncoding)
+        return s.append(value);
+    return encodePTreeName(s, size, value, startEncoding);
+}
+
+StringBuffer &appendPTreeXPathName(StringBuffer &s, const char *value)
+{
+    if (isEmptyString(value))
+        return s;
+    return appendPTreeXPathName(s, strlen(value), value);
+}
+
+void markPTreeNameEncoded(IPropertyTree *tree)
+{
+    if (!tree)
+        return;
+    PTree *pt = static_cast<PTree*>(tree);
+    pt->markNameEncoded();
+}
+
+bool isPTreeNameEncoded(const IPropertyTree *tree)
+{
+    if (!tree)
+        return false;
+    const PTree *pt = static_cast<const PTree*>(tree);
+    return pt->isNameEncoded();
+}
+
+void setPTreeAttribute(IPropertyTree *tree, const char *name, const char *value, bool markEncoded)
+{
+    if (!tree || isEmptyString(name))
+        return;
+    PTree *pt = static_cast<PTree*>(tree);
+    pt->setAttribute(name, value, markEncoded);
+}
+
+bool isPTreeAttributeNameEncoded(const IPropertyTree *tree, const char *name)
+{
+    if (!tree || isEmptyString(name))
+        return false;
+    const PTree *pt = static_cast<const PTree*>(tree);
+    return pt->isAttributeNameEncoded(name);
+}
+
+bool isNullPtreeName(const char * name, bool isEncoded)
+{
+    if (isEmptyString(name))
+        return true;
+    return isEncoded && streq(name, "_0");
+}
+
+static void decodePTreeNameHexEncoding(StringBuffer &s, const char *&input, unsigned &_remaining)
+{
+    //use local variables to avoid indirect reference
+    unsigned remaining = _remaining;
+    byte ch = 0;
+    while (remaining >= 2 && *input!='_')
+    {
+        byte high = hex2num(*input++);
+        ch = (high << 4) | hex2num(*input++);
+        remaining -= 2;
+        s.append(ch);
+    }
+    if (remaining && (*input=='_'))
+    {
+        input++;
+        remaining--;
+    }
+    _remaining=remaining;
+}
+
+static void decodePTreeNameEncoding(StringBuffer &s, const char *&input, unsigned &_remaining)
+{
+    //use local variables to avoid indirect reference
+    unsigned remaining = _remaining;
+    if (*input!='_')
+        return;
+    input++;
+    remaining--;
+    if (remaining==0)
+    {
+        _remaining=remaining;
+        return;
+    }
+    if (*input=='x')
+    {
+        input++;
+        remaining--;
+        decodePTreeNameHexEncoding(s, input, remaining);
+        _remaining=remaining;
+        return;
+    }
+    switch (*input)
+    {
+        case '0': //we only currently use this for empy names (including "@" with no tail)
+            break;
+        case '_':
+            s.append('_');
+            break;
+        case 'a':
+            s.append('@');
+            break;
+        case 'b':
+            s.append('\\');
+            break;
+        case 'f':
+            s.append('/');
+            break;
+        case 'n':
+            s.append('\n');
+            break;
+        case 'Q':
+            s.append('\"');
+            break;
+        case 'r':
+            s.append('\r');
+            break;
+        case 's':
+            s.append(' ');
+            break;
+        case 'q':
+            s.append('\'');
+            break;
+        case 't':
+            s.append('\t');
+            break;
+        default: //shouldn't get here since encoding can't be done externally, but treat as if not encoded
+            s.append('_').append(*input);
+            break;
+    }
+    input++;
+    remaining--;
+    _remaining=remaining;
+}
+
+StringBuffer &decodePtreeName(StringBuffer &s, const char *input, unsigned remaining)
+{
+    if (!input || !remaining)
+        return s;
+    s.ensureCapacity(remaining); //preallocate for the multiple appends to follow.. decode should generally be less than or equal to number of input bytes
+    while (remaining)
+    {
+        if ('_'!=*input)
+        {
+            s.append(*input);
+            input++;
+            remaining--;
+        }
+        else
+            decodePTreeNameEncoding(s, input, remaining);
+    }
+    return s;
+}
+
+StringBuffer &decodePtreeName(StringBuffer &s, const char *name)
+{
+    if (isEmptyString(name))
+        return s;
+    return decodePtreeName(s, name, strlen(name));
+}
+
+// 'expert' config helper methods
+StringBuffer &getExpertOptPath(const char *opt, StringBuffer &out)
+{
+#ifdef _CONTAINERIZED
+    if (opt)
+        return out.append("expert/@").append(opt);
+    return out.append("expert");
+#else
+    if (opt)
+        return out.append("Debug/@").append(opt);
+    return out.append("Debug");
+#endif
+}
+
+bool hasExpertOpt(const char *opt)
+{
+    StringBuffer xpath;
+    getExpertOptPath(opt, xpath);
+    return getComponentConfigSP()->hasProp(xpath);
+}
+
+bool getExpertOptBool(const char *opt, bool dft)
+{
+    StringBuffer xpath;
+    getExpertOptPath(opt, xpath);
+    return getComponentConfigSP()->getPropBool(xpath, dft);
+}
+
+__int64 getExpertOptInt64(const char *opt, __int64 dft)
+{
+    StringBuffer xpath;
+    getExpertOptPath(opt, xpath);
+    return getComponentConfigSP()->getPropInt64(xpath, dft);
+}
+
+double getExpertOptReal(const char *opt, double dft)
+{
+    StringBuffer xpath;
+    getExpertOptPath(opt, xpath);
+    return getComponentConfigSP()->getPropReal(xpath, dft);
+}
+
+StringBuffer &getExpertOptString(const char *opt, StringBuffer &out)
+{
+    StringBuffer xpath;
+    getExpertOptPath(opt, xpath);
+    getComponentConfigSP()->getProp(xpath, out);
+    return out;
+}
+
+void setExpertOpt(const char *opt, const char *value)
+{
+    StringBuffer xpath;
+    getExpertOptPath(nullptr, xpath);
+    Owned<IPropertyTree> config = getComponentConfigSP();
+    if (!config->hasProp(xpath))
+        config->setPropTree(xpath);
+    getExpertOptPath(opt, xpath.clear());
+    config->setProp(xpath, value);
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+//HPCC-30752 This should move inside PTree to allow a more efficient hash calculation and possible caching.
+//Currently the values are not persisted so the implementation could change.  That may change in the future.
+unsigned getPropertyTreeHash(const IPropertyTree & source, unsigned hashcode)
+{
+    if (source.isBinary())
+    {
+        MemoryBuffer mb;
+        source.getPropBin(nullptr, mb);
+        hashcode = hashc((const byte *)mb.bufferBase(), mb.length(), hashcode);
+    }
+    else
+    {
+        const char * value = source.queryProp(nullptr);
+        if (value)
+            hashcode = hashcz((const byte *)value, hashcode);
+    }
+
+    Owned<IAttributeIterator> aiter = source.getAttributes();
+    ForEach(*aiter)
+    {
+        hashcode = hashcz((const byte *)aiter->queryName(), hashcode);
+        hashcode = hashcz((const byte *)aiter->queryValue(), hashcode);
+    }
+
+    Owned<IPropertyTreeIterator> iter = source.getElements("*");
+    ForEach(*iter)
+    {
+        IPropertyTree & child = iter->query();
+        hashcode = hashcz((const byte *)child.queryName(), hashcode);
+        hashcode = getPropertyTreeHash(child, hashcode);
+    }
+    return hashcode;
+}
+
+class SyncedPropertyTreeWrapper : extends CInterfaceOf<ISyncedPropertyTree>
+{
+public:
+    SyncedPropertyTreeWrapper(IPropertyTree * _tree) : tree(_tree)
+    {
+    }
+
+    virtual const IPropertyTree * getTree() const override
+    {
+        return LINK(tree);
+    }
+
+    virtual bool getProp(MemoryBuffer & result, const char * xpath) const override
+    {
+        if (!tree)
+            return false;
+        return tree->getPropBin(xpath, result);
+    }
+
+    virtual bool getProp(StringBuffer & result, const char * xpath) const override
+    {
+        if (!tree)
+            return false;
+        return tree->getProp(xpath, result);
+    }
+
+    virtual unsigned getVersion() const override
+    {
+        return 0;
+    }
+
+    virtual bool isStale() const override
+    {
+        return false;
+    }
+
+    virtual bool isValid() const override
+    {
+        return tree != nullptr;
+    }
+
+protected:
+    Linked<IPropertyTree> tree;
+};
+
+ISyncedPropertyTree * createSyncedPropertyTree(IPropertyTree * tree)
+{
+    return new SyncedPropertyTreeWrapper(tree);
+}
+
+#ifdef _USE_CPPUNIT
+// test-only function to mark a tree as orphaned for unit test scenarios
+void cppunitMarkTreeOrphaned(IPropertyTree * tree)
+{
+    PTree *ptree = QUERYINTERFACE(tree, PTree);
+    verifyex(ptree);
+    ptree->cppunitSetOrphaned();
+}
+#endif

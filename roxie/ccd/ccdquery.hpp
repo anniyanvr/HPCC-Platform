@@ -79,12 +79,15 @@ public:
     void setFromWorkUnit(IConstWorkUnit &wu, const IPropertyTree *stateInfo);
     void setFromContext(const IPropertyTree *ctx);
     void setFromAgentLoggingFlags(unsigned loggingFlags);
-
+    void updateDynPriority(int _priority);
 
     unsigned priority;
+    mutable std::atomic<int> dynPriority;
     unsigned timeLimit;
     unsigned warnTimeLimit;
+    unsigned minTimeLimit;
     unsigned traceLimit;
+    unsigned soapAuthTraceLevel;
 
     memsize_t memoryLimit;
 
@@ -110,6 +113,12 @@ public:
     bool collectFactoryStatistics;
     bool noSeekBuildIndex;
     bool parallelWorkflow;
+    bool statsToWorkunit = false;
+    bool executeDependenciesSequentially = false;
+    bool startInputsSequentially = false;
+    bool traceActivityCharacteristics = false;
+    SinkMode sinkMode;
+    ReadaheadMode readaheadMode;
     unsigned numWorkflowThreads;
 
 private:
@@ -119,6 +128,8 @@ private:
     static void updateFromWorkUnit(unsigned &value, IConstWorkUnit &wu, const char *name);
     static void updateFromWorkUnit(bool &value, IConstWorkUnit &wu, const char *name);
     static void updateFromWorkUnit(RecordTranslationMode &value, IConstWorkUnit &wu, const char *name);
+    static void updateFromWorkUnit(SinkMode &value, IConstWorkUnit &wu, const char *name);
+    static void updateFromWorkUnit(ReadaheadMode &value, IConstWorkUnit &wu, const char *name);
     static void updateFromContextM(memsize_t &val, const IPropertyTree *ctx, const char *name, const char *name2 = NULL); // Needs different name to ensure works in 32-bit where memsize_t and unsigned are same type
     static void updateFromContext(int &val, const IPropertyTree *ctx, const char *name, const char *name2 = NULL);
     static void updateFromContext(unsigned &val, const IPropertyTree *ctx, const char *name, const char *name2 = NULL);
@@ -134,10 +145,9 @@ interface IQueryFactory : extends IInterface
     virtual hash64_t queryHash() const = 0;
     virtual const char *queryQueryName() const = 0;
     virtual const char *queryErrorMessage() const = 0;
-    virtual void suspend(const char *errMsg) = 0;
+    virtual void setLoadFailed(const char *errMsg) = 0;
     virtual bool loadFailed() const = 0;
     virtual bool suspended() const = 0;
-    virtual void getStats(StringBuffer &reply, const char *graphName) const = 0;
     virtual void resetQueryTimings() = 0;
     virtual const QueryOptions &queryOptions() const = 0;
     virtual ActivityArray *lookupGraphActivities(const char *name) const = 0;
@@ -147,11 +157,15 @@ interface IQueryFactory : extends IInterface
     virtual ILoadedDllEntry *queryDll() const = 0;
     virtual IConstWorkUnit *queryWorkUnit() const = 0;
     virtual ISharedOnceContext *querySharedOnceContext() const = 0;
+    virtual void clearSharedOnceContext() = 0;
     virtual IDeserializedResultStore &queryOnceResultStore() const = 0;
     virtual IPropertyTree &queryOnceContext(const IRoxieContextLogger &logctx) const = 0;
 
     virtual const IRoxiePackage &queryPackage() const = 0;
     virtual void getActivityMetrics(StringBuffer &reply) const = 0;
+    virtual void gatherStats(IConstWorkUnit* statsWu, const char *graphName, int channel, bool reset) const = 0;
+    virtual void mergeStats(const CRuntimeStatisticCollection &from) const = 0;
+    virtual void mergeStats(const IRoxieContextLogger &from) const = 0;
 
     virtual IPropertyTree *cloneQueryXGMML() const = 0;
     virtual CRoxieWorkflowMachine *createWorkflowMachine(IConstWorkUnit *wu, bool isOnce, const IRoxieContextLogger &logctx, const QueryOptions & options) const = 0;
@@ -166,8 +180,11 @@ interface IQueryFactory : extends IInterface
     virtual IQueryFactory *lookupLibrary(const char *libraryName, unsigned expectedInterfaceHash, const IRoxieContextLogger &logctx) const = 0;
     virtual void getQueryInfo(StringBuffer &result, bool full, IArrayOf<IQueryFactory> *agentQueries,const IRoxieContextLogger &logctx) const = 0;
     virtual bool isDynamic() const = 0;
+    virtual unsigned getTimeActResetLastLogged() const = 0;
+    virtual void setTimeActResetLastLogged(unsigned _ntime) const = 0;
     virtual void checkSuspended() const = 0;
     virtual void onTermination(TerminationCallbackInfo *info) const= 0;
+    virtual void preloadOnce() = 0;
 };
 
 class ActivityArray : public CInterface
@@ -180,6 +197,8 @@ class ActivityArray : public CInterface
     bool sequential;
     unsigned libraryGraphId;
     unsigned wfid;
+
+    ActivityArray() = delete;
 
 public:
     ActivityArray(bool _multiInstance, bool _delayed, bool _library, bool _sequential, unsigned _wfid)
@@ -194,6 +213,7 @@ public:
     inline IRoxieServerActivityFactory &serverItem(unsigned idx) const { return (IRoxieServerActivityFactory &) activities.item(idx); }
     void append(IActivityFactory &item);
     void setLibraryGraphId(unsigned value) { libraryGraphId = value; }
+    void gatherStats(IStatisticGatherer &builder, int channel, bool reset);
 
     inline unsigned ordinality() const { return activities.ordinality(); }
     inline bool isMultiInstance() const { return multiInstance; }
@@ -226,13 +246,11 @@ protected:
     ActivityArrayArray childQueries;
     UnsignedArray childQueryIndexes;
     CachedOutputMetaData meta;
-    mutable CriticalSection statsCrit;
     mutable CRuntimeStatisticCollection mystats;
-    // MORE: Could be CRuntimeSummaryStatisticCollection to include derived stats, but stats are currently converted
-    // to IPropertyTrees.  Would need to serialize/deserialize and then merge/derived so that they merged properly
+    mutable CRuntimeStatisticCollection myedgestats;
 
 public:
-    CActivityFactory(unsigned _id, unsigned _subgraphId, IQueryFactory &_queryFactory, HelperFactory *_helperFactory, ThorActivityKind _kind, IPropertyTree &_graphNode);
+    CActivityFactory(unsigned _id, unsigned _subgraphId, IQueryFactory &_queryFactory, HelperFactory *_helperFactory, ThorActivityKind _kind, IPropertyTree &_graphNode, const StatisticsMapping &_factoryStats);
     ~CActivityFactory() 
     { 
         ForEachItemIn(idx, childQueries)
@@ -249,28 +267,19 @@ public:
 
     virtual void mergeStats(const CRuntimeStatisticCollection &from) const
     {
-        CriticalBlock b(statsCrit);
         mystats.merge(from);
-    }
-
-    virtual void getEdgeProgressInfo(unsigned idx, IPropertyTree &edge) const
-    {
-        // No meaningful edge info for remote agent activities...
-    }
-
-    virtual void getNodeProgressInfo(IPropertyTree &node) const
-    {
-        mystats.getNodeProgressInfo(node);
     }
 
     virtual void resetNodeProgressInfo()
     {
         mystats.reset();
+        myedgestats.reset();
     }
 
     virtual void getActivityMetrics(StringBuffer &reply) const
     {
-        mystats.toXML(reply);
+        mystats.toStr(reply);
+        myedgestats.toStr(reply);
     }
     virtual void getXrefInfo(IPropertyTree &reply, const IRoxieContextLogger &logctx) const
     {

@@ -51,14 +51,16 @@ ADD_DEFINITIONS( -D_USRDLL -DWORKUNITSERVICES_EXPORTS )
 
 HPCC_ADD_LIBRARY( workunitservices SHARED ${SRCS} )
 install ( TARGETS workunitservices DESTINATION plugins )
-target_link_LIBRARies ( workunitservices 
+target_link_LIBRARies ( workunitservices PRIVATE
          jlib
          mp 
-         hrpc 
          remote 
          dalibase 
-         environment 
          workunit 
+         thorhelper
     )
 
+if (NOT CONTAINERIZED)
+    target_link_libraries ( workunitservices PRIVATE environment )
+endif()
 

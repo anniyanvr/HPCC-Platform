@@ -1,0 +1,1051 @@
+/*##############################################################################
+
+    HPCC SYSTEMS software Copyright (C) 2023 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#include "platform.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#ifdef __linux__
+#include <strings.h>
+#include <alloca.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/file.h>
+#endif
+#include <algorithm>
+#include <array>
+#include <memory>
+
+#include <cmath>
+
+#include "jmisc.hpp"
+#include "jset.hpp"
+#include "jevent.hpp"
+#include "jplane.hpp"
+#include "hlzw.h"
+
+#include "ctfile.hpp"
+#include "jhinplace.hpp"
+#include "jstats.h"
+#include "jptree.hpp"
+#include "jhcache.hpp"
+#include "jthread.hpp"
+#include "jutil.hpp"
+
+byte * CCachedIndexRead::getBufferForUpdate(offset_t offset, size32_t writeSize)
+{
+    baseOffset = offset;
+    size = 0;
+    bufferSize = writeSize;
+#ifndef __linux__
+    void * base = data.ensure(writeSize);
+    return static_cast<byte *>(base);
+#else
+    // OPT: could we try to get next avail buffer from a pre allocated pool ?
+    if (writeSize > data.length())
+    {
+        size32_t mSize = writeSize;
+        if (mSize < 4096)
+            mSize = 4096;
+        byte *cdata;
+        int rc = posix_memalign((void **)&cdata, 4096, mSize);
+        if (rc != 0)
+            throw makeStringExceptionV(0, "getBufferForUpdate: unable to alloc mem for aligned buffer: %u %d", writeSize, rc);
+        // NB: any previous contents in data are not required
+        data.setOwn(mSize, cdata);
+    }
+    return (byte *)data.get();
+#endif
+}
+
+const byte * CCachedIndexRead::queryBuffer(offset_t offset, size32_t readSize) const
+{
+    if ((offset < baseOffset) || (offset + readSize > baseOffset + size))
+        return nullptr;
+    return static_cast<const byte *>(data.get()) + (offset - baseOffset);
+}
+
+const byte * CCachedIndexRead::queryFillBuffer(offset_t offset, size32_t size, IFileIO * io, size32_t readSize)
+{
+    const byte * match = queryBuffer(offset, size);
+    if (match)
+        return match;
+
+    byte * buffer = getBufferForUpdate(offset, readSize);
+    size32_t sizeRead = io->read(offset, readSize, buffer);
+    adjustSize(sizeRead);
+
+    return queryBuffer(offset, size);
+}
+
+#ifdef __linux__
+static constexpr int maxCriticalSections = 16381; // largest prime < 16k
+
+static unsigned cacheIndex(offset_t cacheVal, unsigned numCacheEntries)
+{
+    // murmur64 bit mix modified to use mix13 parameters
+    cacheVal ^= (cacheVal >> 30);
+    cacheVal *= 0xbf58476d1ce4e5b9;
+    cacheVal ^= (cacheVal >> 27);
+    cacheVal *= 0x94d049bb133111eb;
+    cacheVal ^= (cacheVal >> 31);
+    return cacheVal % numCacheEntries;
+}
+
+static bool isPrime(unsigned x)
+{
+    if (x <= 1)
+        return false;
+    else if (x == 2)
+        return true;
+    else if (x % 2 == 0)
+        return false;
+
+    unsigned t = std::sqrt(x) + 1;
+    unsigned i;
+    for (i=3; i<=t; i+=2)
+    {
+        if ((x % i) == 0)
+            return false;
+    }
+    return true;
+}
+
+static unsigned largestPrime(unsigned x)
+{
+    if (x <= 1)
+        return 0;
+    unsigned ix;
+    for (ix=x; ix>=1; ix--)
+    {
+        if (isPrime(ix))
+            return ix;
+    }
+    return 0;
+}
+#endif
+
+enum IOMethod { NORMAL, UNCACHED, DIRECT };
+
+struct alignas(CACHE_LINE_SIZE) PhaseStats
+{
+    std::atomic<unsigned long> count { 0 };
+    std::atomic<unsigned __int64> totalNs { 0 };
+    std::atomic<unsigned __int64> peak { 0 };
+};
+
+static_assert((sizeof(PhaseStats) % CACHE_LINE_SIZE) == 0);
+
+struct alignas(CACHE_LINE_SIZE) BucketCounter
+{
+    std::atomic<unsigned long> value { 0 };
+    char padding[CACHE_LINE_SIZE - sizeof(std::atomic<unsigned long>)];
+};
+
+static_assert(sizeof(BucketCounter) == CACHE_LINE_SIZE);
+static_assert(alignof(BucketCounter) == CACHE_LINE_SIZE);
+
+//--------------------------------------------------------------------------------------------------------------------
+
+class PageCacheCriticalSection : public CriticalSection
+{
+public:
+    PageCacheCriticalSection() : CriticalSection(SYNC_LOCATION) {}
+};
+
+class CDiskPageCache final : public CInterfaceOf<IPageCache>
+{
+public:
+    enum StatPhase : unsigned
+    {
+        StatReadCacheLookup = 0,
+        StatReadDiskIo,
+        StatWriteCacheLookup,
+        StatWriteDiskIo,
+        StatReadError,
+        StatWriteError,
+        NumStatPhases
+    };
+
+    static const char * queryStatPhaseName(unsigned phase)
+    {
+        switch (phase)
+        {
+        case StatReadCacheLookup: return "read lookup ";
+        case StatReadDiskIo: return "read diskio ";
+        case StatReadError: return "read ioerr  ";
+        case StatWriteCacheLookup: return "write lookup";
+        case StatWriteDiskIo: return "write diskio";
+        case StatWriteError: return "write ioerr ";
+        }
+        return "unknown";
+    }
+
+    static constexpr unsigned numBuckets = 10;
+
+    class PageCacheStatsThread : public Thread
+    {
+    public:
+        PageCacheStatsThread(CDiskPageCache & _parent, unsigned _intervalMs)
+            : Thread("PageCacheStatsThread"), parent(_parent), intervalMs(_intervalMs)
+        {
+        }
+
+        virtual int run() override
+        {
+            while (!stopping)
+            {
+                if (wakeSem.wait(intervalMs))
+                    continue;
+
+                parent.logAndResetStats();
+            }
+            return 0;
+        }
+
+        void stop()
+        {
+            stopping = true;
+            wakeSem.signal();
+        }
+
+    private:
+        CDiskPageCache & parent;
+        unsigned intervalMs;
+        std::atomic<bool> stopping { false };
+        Semaphore wakeSem{SYNC_LOCATION};
+    };
+
+    CDiskPageCache(const IPropertyTree * config)
+    {
+#ifdef __linux__
+        totSize = config->getPropInt64("@sizeMB", 100) * 0x100000;
+        pageSize = config->getPropInt("@pageSize", 0x10000);
+        readSize = config->getPropInt("@readSize", pageSize);
+        cacheMissPenalty = config->getPropInt("@debugCacheMissPenalty", 0);
+        int bucketCeilingNs = config->getPropInt("@bucketCeilingNs", 100000);
+        if (bucketCeilingNs < 10)
+            bucketCeilingNs = 10;
+        bucketRangeCeiling = (unsigned)bucketCeilingNs;
+        bucketStep = (bucketRangeCeiling + (numBuckets - 1)) / numBuckets;
+
+        if ( (config->getPropBool("@disable", false)) || (totSize == 0) )
+        {
+            DBGLOG("pageCache disabled");
+            return;
+        }
+
+        // throws means roxie will not start ...
+        if ((pageSize < 8192) || !isPowerOf2(pageSize))
+            throw makeStringExceptionV(0, "pageCache error invalid page size %u", pageSize);
+
+        // If read size is smaller than the page size, and a power of 2 then pageSize must be a multiple of readSize
+        if ((readSize > pageSize) || !isPowerOf2(readSize))
+            throw makeStringExceptionV(0, "pageCache error invalid read size %u for page %u", readSize, pageSize);
+
+        pageOffsetMask = ~(offset_t)(pageSize - 1);
+        readOffsetMask = ~(offset_t)(readSize - 1);
+        pageSizeExp = ffs(pageSize) - 1;
+
+        // adjust size so that number of entries is the largest possible prime ...
+
+        numEntries = largestPrime((totSize / pageSize) / numSets);
+        if (numEntries < 1)
+            numEntries = 1;
+        setSize = (offset_t)numEntries * (offset_t)pageSize;
+        totSize = setSize * numSets;
+
+        int openFlags = O_CREAT | O_RDWR;
+
+        ioMethod = NORMAL;
+        const char *ioMethodStr = config->queryProp("@ioMethod");
+        if (ioMethodStr)
+        {
+            if ( (strisame(ioMethodStr, "direct")) && ((readSize % 4096) == 0) )
+            {
+                ioMethod = DIRECT;
+                openFlags |= O_DIRECT;
+            }
+#ifdef RWF_UNCACHED
+            else if (strisame(ioMethodStr, "uncached"))
+                ioMethod = UNCACHED;
+#endif
+        }
+
+        // A "plane" setup is preferred - it will derive the base path from the plane prefix. @file overrides the base path. @fileSuffix (if set) is appended to whichever base path is used.
+        StringBuffer cacheFilePath(config->queryProp("@file"));
+        if (cacheFilePath.isEmpty())
+        {
+            StringBuffer planeName;
+            if (!config->getProp("@plane", planeName))
+                getDefaultSpillPlane(planeName);
+
+            if (planeName.length())
+            {
+                Owned<const IStoragePlane> plane = getStoragePlaneByName(planeName, true);
+                cacheFilePath.set(plane->queryPrefix());
+                addPathSepChar(cacheFilePath).append("pagecache");
+                if (!recursiveCreateDirectoryForFile(cacheFilePath))
+                    throw makeOsExceptionV(GetLastError(), "Failed to create directory for file: %s", cacheFilePath.str());
+            }
+            else
+                cacheFilePath.set("/tmp/roxiecache.tmp");
+        }
+
+        const char *fileSuffix = config->queryProp("@fileSuffix");
+        if (!isEmptyString(fileSuffix))
+            cacheFilePath.append('.').append(fileSuffix);
+
+        cache = std::make_unique<CacheEntry []>(numEntries);
+
+        numCrits = largestPrime(numEntries / 16);
+        if (numCrits < 1)
+            numCrits = 1;
+        if (numCrits > maxCriticalSections)
+            numCrits = maxCriticalSections;
+
+        fCrit = std::make_unique<PageCacheCriticalSection []>(numCrits);
+
+        openPageCacheFile(cacheFilePath, openFlags);
+
+        DBGLOG("pageCache readSize: %u pageSize %u", readSize, pageSize);
+        DBGLOG("pageCache num sets: %d file size: %llu MB critsecs: %d entries: %u", numSets, totSize / 1048576ULL, numCrits, numEntries);
+
+        StringBuffer ioMsg("pageCache i/o method: ");
+        if (ioMethod == NORMAL)
+            ioMsg.append("normal");
+        else if (ioMethod == DIRECT)
+            ioMsg.append("direct");
+        else if (ioMethod == UNCACHED)
+            ioMsg.append("uncached");
+        DBGLOG("%s", ioMsg.str());
+
+        size_t totMem = ((numCrits * sizeof(CriticalSection)) + (numEntries * sizeof(CacheEntry))) / 1024;
+        DBGLOG("pageCache memory size: %zu + %zu = %zu KB", (numCrits * sizeof(CriticalSection)), (numEntries * sizeof(CacheEntry)), totMem);
+
+        zeroStats();
+        statsIntervalMs = config->getPropInt("@statsIntervalMs", 0);
+        statsEnabled = (statsIntervalMs > 0);
+
+        cacheOK = true;
+
+        if (statsIntervalMs > 0)
+        {
+            if (statsIntervalMs < 5000)
+                statsIntervalMs = 5000;
+            startStatsThread((unsigned) statsIntervalMs);
+        }
+#endif
+    }
+
+    // NOTE: dtor/Release not called because MODULE_EXIT not called at _exit()
+    virtual ~CDiskPageCache()
+    {
+        stopStatsThread();
+        if (cacheFd >= 0)
+        {
+            close(cacheFd);
+            cacheFd = -1;
+        }
+        cacheOK = false;
+    }
+
+#ifdef __linux__
+    void openPageCacheFile(const char *cacheFile, unsigned openFlags)
+    {
+        cacheFd = open(cacheFile, openFlags, 0600);
+        if (cacheFd < 0)
+            throw makeStringExceptionV(0, "pageCache error opening file %s, errno %d", cacheFile, errno);
+
+        // prevent another HPCC process from accidentally using same file ...
+        // flock() has had issues with containers and zombie processes not unlocking
+        // instead use truncate to clear previous data
+        int rc = ftruncate(cacheFd, 0ULL);
+        if (rc != 0)
+        {
+            int errNum = errno;
+            close(cacheFd);
+            cacheFd = -1;
+            throw makeStringExceptionV(0, "pageCache error clearing file %s (size: %llu), errno %d", cacheFile, totSize, errNum);
+        }
+
+        rc = posix_fallocate(cacheFd, 0ULL, totSize);
+        if (rc != 0)
+        {
+            close(cacheFd);
+            cacheFd = -1;
+            throw makeStringExceptionV(0, "pageCache error allocating all space for file %s (size: %llu), errno %d", cacheFile, totSize, rc);
+        }
+
+        // if was previously larger ...
+        rc = ftruncate(cacheFd, totSize);
+        if (rc != 0)
+        {
+            int errNum = errno;
+            close(cacheFd);
+            cacheFd = -1;
+            throw makeStringExceptionV(0, "pageCache error setting size of file %s (size: %llu), errno %d", cacheFile, totSize, errNum);
+        }
+
+        // turn off read-ahead ...
+        posix_fadvise(cacheFd, 0ULL, totSize, POSIX_FADV_RANDOM);
+    }
+
+    void getCacheInfo(unsigned fileId, offset_t alignedPosShift, offset_t &cacheVal, unsigned &cacheKey, unsigned &critIndex)
+    {
+        cacheVal = fileId | (alignedPosShift << fileIdBits);
+        cacheKey = cacheIndex(cacheVal, numEntries);
+        critIndex = cacheKey % numCrits;
+    }
+
+    bool readCacheFile(offset_t cacheFileOffset, unsigned toRead, byte *data)
+    {
+        ProTraceTaskScopeTracker scope(EventTask::CacheReading, toRead);
+
+        // OPT: look into using io_uring or more iov entries, we know there will be many of these happening concurrently ...
+        struct iovec iov[1];
+        iov[0].iov_base = data;
+        iov[0].iov_len = toRead;
+
+        int pFlags = 0;
+# ifdef RWF_HIPRI
+        if (ioMethod == DIRECT)
+            pFlags |= RWF_HIPRI;
+# endif
+# ifdef RWF_UNCACHED
+        // GH NOTE: could still cache reads ...
+        if (ioMethod == UNCACHED)
+            pFlags |= RWF_UNCACHED;
+# endif
+
+        int rc = preadv2(cacheFd, iov, 1, cacheFileOffset, pFlags);
+
+        return ((unsigned)rc == toRead);
+    }
+
+    bool writeCacheFile(offset_t cacheFileOffset, const byte *data)
+    {
+        ProTraceTaskScopeTracker scope(EventTask::CacheWriting, pageSize);
+
+        struct iovec iov[1];
+        iov[0].iov_base = (void *)data;
+        iov[0].iov_len = pageSize;
+
+        int pFlags = 0;
+# ifdef RWF_HIPRI
+        if (ioMethod == DIRECT)
+            pFlags |= RWF_HIPRI;
+# endif
+# ifdef RWF_UNCACHED
+        if (ioMethod == UNCACHED)
+            pFlags |= RWF_UNCACHED;
+# endif
+
+        int rc = pwritev2(cacheFd, iov, 1, cacheFileOffset, pFlags);
+
+        return ((unsigned)rc == pageSize);
+    }
+#endif
+
+    virtual size32_t queryPageSize() const override
+    {
+        return pageSize;
+    }
+
+    virtual void noteUsed(unsigned fileId, offset_t offset) override { }
+
+    // Searching for a node in the disk node cache.  Return true if found, and ensure nodeData is populated
+    // if it returns false then the node is not in the cache.
+    virtual bool read(unsigned fileId, offset_t offset, size32_t size, CCachedIndexRead & nodeData) override
+    {
+#ifdef __linux__
+        dbgassertex(size <= pageSize);
+
+        CCycleTimer readTimer(statsEnabled);
+
+        offset_t alignedPos = offset & pageOffsetMask;
+        offset_t alignedPosShift = alignedPos >> pageSizeExp;
+
+        // strip off topmost bit (cache tracking code might set this) or should we just use lower fileIdBits ?
+        fileId &= ~(1U << 31);
+
+        if ( (fileId >= (1U << fileIdBits)) || (alignedPosShift >= (1ULL << offsetBits)) )
+            throw makeStringExceptionV(0, "pageCache error read: invalid fileId %u / offset %llu", fileId, alignedPos);
+
+        offset_t cacheVal;
+        unsigned cacheKey;
+        unsigned critIndex;
+        getCacheInfo(fileId, alignedPosShift, cacheVal, cacheKey, critIndex);
+
+        CriticalBlock b(fCrit[critIndex]);
+
+        CacheEntry & curCacheSet = cache[cacheKey];
+
+        uint8_t setIndex = curCacheSet.findInCacheSet(cacheVal);
+
+        if (statsEnabled)
+        {
+            updateStats(StatReadCacheLookup, readTimer.elapsedNs());
+            readTimer.reset();
+        }
+
+        if (setIndex == numSets)
+            return onCacheMiss(fileId, offset, size);
+
+        offset_t cacheFileOffset = (setIndex * setSize) + ((offset_t)cacheKey * pageSize);
+
+        if (readSize < pageSize)
+        {
+            offset_t readAlignedPos = offset & readOffsetMask;
+            offset_t deltaOffset = readAlignedPos - alignedPos;
+            alignedPos += deltaOffset;
+            cacheFileOffset += deltaOffset;
+        }
+
+        byte * data = nodeData.getBufferForUpdate(alignedPos, readSize);
+
+        bool ret = readCacheFile(cacheFileOffset, readSize, data);
+        if (ret)
+        {
+            nodeData.adjustSize(readSize);
+            curCacheSet.delegateIndexToMostRecentlyUsed(setIndex);
+            if (statsEnabled)
+            {
+                cacheHits.fetch_add(1, std::memory_order_relaxed);
+                updateStats(StatReadDiskIo, readTimer.elapsedNs());
+            }
+            return true;
+        }
+
+        if (statsEnabled)
+        {
+            cacheUsed.fetch_sub(1, std::memory_order_relaxed);
+            if (curCacheSet.isFull())
+                cacheFull.fetch_sub(1, std::memory_order_relaxed);
+        }
+
+        curCacheSet.setEntry(setIndex, invalidValue);
+        curCacheSet.promoteIndexToLeastRecentlyUsed(setIndex);
+        if (statsEnabled)
+            updateStats(StatReadError, readTimer.elapsedNs());
+#endif
+        return onCacheMiss(fileId, offset, size);
+    }
+
+    // Insert a block of data into the disk node cache.
+    // If reservation is non null, then it will match the value from a previous call to readNodeOrReserve
+    // If reservation is null the data is being preemptively added to the cache (e.g. at startup)
+    virtual void write(unsigned fileId, offset_t alignedPos, const byte * data) override
+    {
+#ifdef __linux__
+        CCycleTimer writeTimer(statsEnabled);
+
+        offset_t alignedPosShift = alignedPos >> pageSizeExp;
+
+        // strip off topmost bit (cache tracking code might set this) or should we just use lower fileIdBits ?
+        fileId &= ~(1U << 31);
+
+        if ( (fileId >= (1U << fileIdBits)) || (alignedPosShift >= (1ULL << offsetBits)) )
+            throw makeStringExceptionV(0, "pageCache error write: invalid fileId %u / offset %llu", fileId, alignedPos);
+
+        offset_t cacheVal;
+        unsigned cacheKey;
+        unsigned critIndex;
+        getCacheInfo(fileId, alignedPosShift, cacheVal, cacheKey, critIndex);
+
+        CriticalBlock b(fCrit[critIndex]);
+
+        CacheEntry & curCacheSet = cache[cacheKey];
+
+        uint8_t setIndex = curCacheSet.findInCacheSet(cacheVal);
+        if (setIndex != numSets)
+        {
+            curCacheSet.delegateIndexToMostRecentlyUsed(setIndex);
+            return;
+        }
+
+        setIndex = curCacheSet.getLeastRecentlyUsedIndex();
+        bool wasEmpty = curCacheSet.isEmpty(setIndex);
+
+        offset_t cacheFileOffset = (setIndex * setSize) + ((offset_t)cacheKey * pageSize);
+
+        if (statsEnabled)
+        {
+            updateStats(StatWriteCacheLookup, writeTimer.elapsedNs());
+            writeTimer.reset();
+        }
+
+        // OPT: possibly write async here ... (handling if another read happens when write is in flight)
+        bool ret = writeCacheFile(cacheFileOffset, data);
+        if (likely(ret))
+        {
+            curCacheSet.setEntry(setIndex, cacheVal);
+            curCacheSet.delegateIndexToMostRecentlyUsed(setIndex);
+            if (statsEnabled)
+            {
+                updateStats(StatWriteDiskIo, writeTimer.elapsedNs());
+                if (wasEmpty)
+                {
+                    cacheUsed.fetch_add(1, std::memory_order_relaxed);
+                    if (curCacheSet.isFull())
+                        cacheFull.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            return;
+        }
+
+        curCacheSet.setEntry(setIndex, invalidValue);
+        // setIndex is already at least recently used ...
+        if (statsEnabled)
+        {
+            if (!wasEmpty)
+            {
+                cacheUsed.fetch_sub(1, std::memory_order_relaxed);
+                cacheFull.fetch_sub(1, std::memory_order_relaxed);
+            }
+            updateStats(StatWriteError, writeTimer.elapsedNs());
+        }
+#endif
+    }
+
+    // Called to gather the current state of the cache - so it can be preserved for quick cache warming.
+    virtual void gatherState(ICacheInfoRecorder & recorder) override
+    {
+        CriticalBlock b(crit);
+        // TODO: MCK will need a global lock here and then check/pause readCacheFile/writeCacheFile
+        //       to get complete cache state ...
+    }
+
+    virtual bool isInitializedOK() const override
+    {
+        return cacheOK;
+    }
+
+    void updateStats(StatPhase phase, unsigned __int64 elapsedNs)
+    {
+        PhaseStats & curStats = cacheStats[phase];
+        curStats.count.fetch_add(1, std::memory_order_relaxed);
+        curStats.totalNs.fetch_add(elapsedNs, std::memory_order_relaxed);
+        unsigned __int64 currentPeak = curStats.peak.load(std::memory_order_relaxed);
+        while (elapsedNs > currentPeak &&
+               !curStats.peak.compare_exchange_weak(currentPeak, elapsedNs, std::memory_order_relaxed))
+            ;
+
+        unsigned __int64 bucket = elapsedNs / bucketStep;
+        if (bucket >= numBuckets)
+            bucket = numBuckets - 1;
+        bucketCnt[phase][(unsigned)bucket].value.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void zeroStats()
+    {
+        for (unsigned ix=0; ix<NumStatPhases; ix++)
+        {
+            PhaseStats & curStats = cacheStats[ix];
+            curStats.count.store(0, std::memory_order_relaxed);
+            curStats.totalNs.store(0, std::memory_order_relaxed);
+            curStats.peak.store(0, std::memory_order_relaxed);
+            for (unsigned jx=0; jx<numBuckets; jx++)
+            {
+                bucketCnt[ix][jx].value.store(0, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    void logHistogram(const char * prefix, unsigned phase, const unsigned long * buckets)
+    {
+        StringBuffer msg;
+        msg.appendf("pageCache stats: %s %s", prefix, queryStatPhaseName(phase));
+        for (unsigned j=0; j<numBuckets; j++)
+            msg.appendf(" %10lu", buckets[j]);
+        DBGLOG("%s", msg.str());
+    }
+
+    void logAndResetStats()
+    {
+        if (!statsEnabled)
+            return;
+
+        // Note: interval stats are approximate under concurrency and may be attributed to adjacent log periods.
+        unsigned long currentHits = cacheHits.exchange(0, std::memory_order_relaxed);
+        unsigned long currentMisses = cacheMisses.exchange(0, std::memory_order_relaxed);
+
+        unsigned long activeCount[NumStatPhases];
+        double activeAvg[NumStatPhases];
+        unsigned __int64 activePeakNs[NumStatPhases];
+        unsigned long activeBuckets[NumStatPhases][numBuckets];
+
+        bool hasRWActivity = false;
+        for (unsigned i=0; i<NumStatPhases; i++)
+        {
+            PhaseStats & curStats = cacheStats[i];
+            activeCount[i] = curStats.count.exchange(0, std::memory_order_relaxed);
+            // it is possible another thread has updated count and totalNs here
+            unsigned __int64 readTotal = curStats.totalNs.exchange(0, std::memory_order_relaxed);
+            activePeakNs[i] = curStats.peak.exchange(0, std::memory_order_relaxed);
+            // leading to a larger totalNs for the count we read above
+            // but if count is large then shouldn't affect avg too much
+            // could switch an epoch method for correctness ...
+            activeAvg[i] = activeCount[i] ? (double)readTotal / activeCount[i] : 0.0;
+
+            hasRWActivity = hasRWActivity || (activeCount[i] > 0);
+
+            for (unsigned j=0; j<numBuckets; j++)
+                activeBuckets[i][j] = bucketCnt[i][j].value.exchange(0, std::memory_order_relaxed);
+        }
+
+        if (currentHits > 0 || currentMisses > 0 || hasRWActivity)
+        {
+            unsigned long totalAccesses = currentHits + currentMisses;
+            double hitRate = (totalAccesses > 0) ?
+                        (100.0 * currentHits / totalAccesses) : 0.0;
+
+            DBGLOG("pageCache stats: hits=%lu, misses=%lu, total=%lu, HitRate=%.2f%% bucketCeilingNs=%u",
+                    currentHits, currentMisses, totalAccesses, hitRate, bucketRangeCeiling);
+
+            //Output some information about how full the cache is, and how many slots are completely full.
+            __uint64 used = cacheUsed.load(std::memory_order_relaxed);
+            __uint64 maxUsed = (offset_t)numEntries * numSets;
+            __uint64 full = cacheFull.load(std::memory_order_relaxed);
+            __uint64 maxFull = numEntries;
+
+            DBGLOG("pageCache stats: usage=%.2f%% (%llu/%llu) full=(%llu/%llu)",
+                    maxUsed ? (100.0 * used / maxUsed) : 0.0, used, maxUsed, full, maxFull);
+
+            for (unsigned i=StatReadCacheLookup; i<=StatWriteDiskIo; i++)
+            {
+                DBGLOG("pageCache stats: %s cnt=%10lu avg=%12.3lfns peak=%" I64F "uns", queryStatPhaseName(i), activeCount[i], activeAvg[i], activePeakNs[i]);
+                logHistogram("hist", i, activeBuckets[i]);
+            }
+
+            if ( (activeCount[StatReadError] > 0) || (activeCount[StatWriteError] > 0) )
+            {
+                // unusual errors ...
+                for (unsigned i=StatReadError; i<=StatWriteError; i++)
+                    DBGLOG("pageCache stats: %s cnt=%10lu avg=%12.3lfns peak=%" I64F "uns", queryStatPhaseName(i), activeCount[i], activeAvg[i], activePeakNs[i]);
+            }
+        }
+    }
+
+protected:
+    void startStatsThread(unsigned intervalMs)
+    {
+        try
+        {
+            statsThread.setown(new PageCacheStatsThread(*this, intervalMs));
+            statsThread->start(false);
+        }
+        catch (IException *e)
+        {
+            EXCLOG(e, "pageCache error failed to start PageCacheStatsThread");
+            e->Release();
+            statsThread.clear();
+            statsEnabled = false;
+        }
+    }
+
+    void stopStatsThread()
+    {
+        if (statsThread)
+        {
+            statsThread->stop();
+            statsThread->join();
+            statsThread.clear();
+        }
+    }
+
+    bool onCacheMiss(unsigned fileId, offset_t offset, size32_t size)
+    {
+        if (statsEnabled)
+        {
+            cacheMisses.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (cacheMissPenalty)
+            MilliSleep(cacheMissPenalty);
+        return false;
+    }
+
+protected:
+    static constexpr unsigned offsetBits = 40;
+    static constexpr unsigned fileIdBits = 64 - offsetBits;
+    static constexpr int numSets = 16; // 4, 8, 16 ...
+    static constexpr offset_t invalidValue = ~(offset_t)0;
+    int numCrits{0};
+    offset_t totSize{0};
+    offset_t setSize{0};
+    size32_t pageSize{0};
+    size32_t readSize{0};
+    offset_t pageOffsetMask{0};
+    offset_t readOffsetMask{0};
+    unsigned cacheMissPenalty{0};
+    bool statsEnabled{false};
+    unsigned bucketRangeCeiling{100000};
+    unsigned bucketStep{10000};
+    unsigned numEntries{1};
+    int statsIntervalMs{0};
+    int pageSizeExp{0};
+    int cacheFd{-1};
+    std::unique_ptr <PageCacheCriticalSection []> fCrit;
+    IOMethod ioMethod{NORMAL};
+    CriticalSection crit{SYNC_LOCATION};
+    bool cacheOK{false};
+    Owned<PageCacheStatsThread> statsThread;
+
+    alignas(CACHE_LINE_SIZE) std::atomic<unsigned long> cacheHits{0};
+    alignas(CACHE_LINE_SIZE) std::atomic<unsigned long> cacheMisses{0};
+    alignas(CACHE_LINE_SIZE) std::atomic<__uint64> cacheUsed{0}; // How many pages are in use
+    alignas(CACHE_LINE_SIZE) std::atomic<__uint64> cacheFull{0}; // How many of the cache sets are full
+    PhaseStats cacheStats[NumStatPhases];
+    BucketCounter bucketCnt[NumStatPhases][numBuckets];
+
+    struct CacheSet
+    {
+        offset_t value{invalidValue};
+    };
+    struct CacheEntry
+    {
+        CacheEntry()
+        {
+            for (uint8_t j=0; j<numSets; j++)
+            {
+                lruArray[j] = j;
+                cSet[j].value = invalidValue;
+            }
+        }
+
+        CacheSet cSet[numSets];
+
+        // array of cache set indexes in order from LRU (0) at the head to MRU (numSets-1) at the tail
+        uint8_t lruArray[numSets];
+
+        bool isEmpty(uint8_t indx) const
+        {
+            return (cSet[indx].value == invalidValue);
+        }
+
+        bool isFull() const
+        {
+            return !isEmpty(getLeastRecentlyUsedIndex());
+        }
+
+        void setEntry(uint8_t indx, offset_t val)
+        {
+            cSet[indx].value = val;
+        }
+
+        uint8_t findInCacheSet(offset_t cacheValue) const
+        {
+            for (uint8_t ix=0; ix<numSets; ix++)
+            {
+                if (cSet[ix].value == cacheValue)
+                    return ix;
+            }
+            return numSets;
+        }
+
+        uint8_t getLeastRecentlyUsedIndex() const
+        {
+            return lruArray[0];
+        }
+
+        void delegateIndexToMostRecentlyUsed(uint8_t indx)
+        {
+            // move index to MRU tail, shifting others before index
+            if (lruArray[numSets-1] == indx)
+                return;
+
+            unsigned cur = 0;
+            while (cur < numSets && lruArray[cur] != indx)
+                cur++;
+            while (cur < (numSets-1))
+            {
+                lruArray[cur] = lruArray[cur+1];
+                cur++;
+            }
+            lruArray[numSets-1] = indx;
+        }
+
+        void promoteIndexToLeastRecentlyUsed(uint8_t indx)
+        {
+            // move index to LRU head, shifting others after index
+            if (lruArray[0] == indx)
+                return;
+
+            unsigned cur = numSets-1;
+            while (cur > 0 && lruArray[cur] != indx)
+                cur--;
+            while (cur > 0)
+            {
+                lruArray[cur] = lruArray[cur-1];
+                cur--;
+            }
+            lruArray[0] = indx;
+        }
+
+    };
+    std::unique_ptr <CacheEntry []> cache;
+};
+
+//--------------------------------------------------------------------------------------------------------------------
+
+// A trivial (single page) cache as a demonstration of the interface
+class CDemoPageCache final : public CInterfaceOf<IPageCache>
+{
+public:
+    CDemoPageCache(const IPropertyTree * config)
+    {
+        size = config->getPropInt64("@sizeMB", 32) * 0x100000;
+        pageSize = config->getPropInt("@pageSize", 0x10000);
+        readSize = config->getPropInt("@readSize", pageSize);
+        cacheMissPenalty = config->getPropInt("@debugCacheMissPenalty", 0);
+        offsetMask = ~(offset_t)(pageSize-1);
+
+        if ((pageSize < 8192) || !isPowerOf2(pageSize))
+            throw makeStringExceptionV(0, "Invalid page size %u", pageSize);
+
+        // If read size is smaller than the page size, and a power of 2 then pageSize must be a multiple of readSize
+        if ((readSize > pageSize) || !isPowerOf2(readSize))
+            throw makeStringExceptionV(0, "Invalid read size %u for page %u", readSize, pageSize);
+        cache.data.allocate(pageSize);
+    }
+
+    virtual size32_t queryPageSize() const override
+    {
+        return pageSize;
+    }
+
+    // Called when the node has been hit in the memory cache - ensure LRU is updated
+    // The offset will need to be aligned to the page boundary
+    virtual void noteUsed(unsigned fileId, offset_t offset) override
+    {
+        CriticalBlock b(crit);
+        offset_t pageOffset = offset & offsetMask;
+        DBGLOG("CDemoPageCache::noteUsed (%u, %llu)", fileId, pageOffset);
+    }
+
+    // Searching for a node in the disk node cache.  Return true if found, and ensure nodeData is populated
+    // if it returns false then the node is not in the cache.
+    virtual bool read(unsigned fileId, offset_t offset, size32_t size, CCachedIndexRead & nodeData) override
+    {
+        dbgassertex(size <= pageSize);
+
+        CriticalBlock b(crit);
+        if ((fileId != cache.file) || (cache.offset == invalidOffset))
+            return onCacheMiss(fileId, offset, size);
+
+        if ((offset < cache.offset) || (offset + size > cache.offset + pageSize))
+            return onCacheMiss(fileId, offset, size);
+
+        // If the requested size to read is smaller than the recommended read size for this cache, read more.
+        size32_t sizeToRead = size;
+        if (sizeToRead < readSize)
+            sizeToRead = readSize;
+
+        //Read data starting at the requested offset, but if that extends beyond the page boundary, read the last
+        //sizeToRead bytes from the end of the page
+        size32_t offsetInPage = (size32_t)(offset - cache.offset);
+        if (offsetInPage + sizeToRead > pageSize)
+            offsetInPage = pageSize - sizeToRead;
+
+        byte * data = nodeData.getBufferForUpdate(cache.offset + offsetInPage, sizeToRead);
+        memcpy(data, cache.data.bytes() + offsetInPage, sizeToRead);
+        nodeData.adjustSize(sizeToRead);
+        DBGLOG("CDemoPageCache::read(%u, %llu, %u) - cache hit", fileId, offset, size);
+        return true;
+    }
+
+    // Insert a block of data into the disk node cache.
+    // If reservation is non null, then it will match the value from a previous call to readNodeOrReserve
+    // If reservation is null the data is being preemptively added to the cache (e.g. at startup)
+    virtual void write(unsigned fileId, offset_t offset, const byte * data) override
+    {
+        CriticalBlock b(crit);
+        //check to see if the data is already in the cache
+        if ((fileId == cache.file) && (offset == cache.offset))
+        {
+            // Keep a count of the number of times this occurs - if it is high we may need protection elsewhere
+            DBGLOG("CDemoPageCache::write(%u, %llu) - data is already in the cache", fileId, offset);
+            return;
+        }
+
+        cache.file = fileId;
+        cache.offset = offset;
+        memcpy(cache.data.mem(), data, pageSize);
+        DBGLOG("CDemoPageCache::write(%u, %llu) - update cache contents", fileId, offset);
+    }
+
+    // Called to gather the current state of the cache - so it can be preserved for quick cache warming.
+    virtual void gatherState(ICacheInfoRecorder & recorder) override
+    {
+        CriticalBlock b(crit);
+
+        DBGLOG("CDemoPageCache::gatherState");
+        if (cache.offset != invalidOffset)
+            recorder.noteWarm(cache.file, cache.offset, pageSize, NodeNone);
+    }
+
+protected:
+    bool onCacheMiss(unsigned fileId, offset_t offset, size32_t size)
+    {
+        DBGLOG("CDemoPageCache::read(%u, %llu, %u) - cache miss", fileId, offset, size);
+        if (cacheMissPenalty)
+            MilliSleep(cacheMissPenalty);
+        return false;
+    }
+
+    virtual bool isInitializedOK() const override
+    {
+        return true;
+    }
+
+protected:
+    CriticalSection crit{SYNC_LOCATION};
+    offset_t size;
+    size32_t pageSize{0};
+    size32_t readSize{0};
+    offset_t offsetMask{0};
+    unsigned cacheMissPenalty{0};
+
+    static constexpr offset_t invalidOffset = ~(offset_t)0;
+    struct
+    {
+        unsigned file{0};
+        offset_t offset{invalidOffset};
+        MemoryAttr data;
+    } cache;
+};
+
+IPageCache * createDemoPageCache(const IPropertyTree * config)
+{
+    return new CDemoPageCache(config);
+}
+
+IPageCache * createDiskPageCache(const IPropertyTree * config)
+{
+    IPageCache *pCache = new CDiskPageCache(config);
+    if (pCache->isInitializedOK())
+        return pCache;
+    pCache->Release();
+    return nullptr;
+}
+
+#ifdef _USE_CPPUNIT
+#include "unittests.hpp"
+#include "eclrtl.hpp"
+
+
+#endif

@@ -25,6 +25,7 @@
 #include "thmfilemanager.hpp"
 #include "eclhelper.hpp"
 #include "thexception.hpp"
+#include "jlzw.hpp"
 
 #include "eclhelper.hpp" // tmp for IHThorArg interface
 #include "thdiskbase.ipp"
@@ -40,65 +41,70 @@ void CDiskReadMasterBase::init()
 {
     CMasterActivity::init();
     IHThorDiskReadBaseArg *helper = (IHThorDiskReadBaseArg *) queryHelper();
-    bool mangle = 0 != (helper->getFlags() & (TDXtemporary|TDXjobtemp));
+    unsigned flags = helper->getFlags();
+    bool mangle = 0 != (flags & (TDXtemporary|TDXjobtemp));
     OwnedRoxieString helperFileName = helper->getFileName();
     StringBuffer expandedFileName;
     queryThorFileManager().addScope(container.queryJob(), helperFileName, expandedFileName, mangle);
     fileName.set(expandedFileName);
-    reInit = 0 != (helper->getFlags() & (TDXvarfilename|TDXdynamicfilename));
+    reInit = (flags & (TDXvarfilename|TDXdynamicfilename)) && !(flags & TDRinvariantfilename);
 
-    Owned<IDistributedFile> file = queryThorFileManager().lookup(container.queryJob(), helperFileName, 0 != ((TDXtemporary|TDXjobtemp) & helper->getFlags()), 0 != (TDRoptional & helper->getFlags()), true, container.activityIsCodeSigned());
-    if (file)
+    if (container.queryLocal() || helper->canMatchAny()) // if local, assume may match
     {
-        if (file->isExternal() && (helper->getFlags() & TDXcompress))
-            file->queryAttributes().setPropBool("@blockCompressed", true);
-        if (file->numParts() > 1)
-            fileDesc.setown(getConfiguredFileDescriptor(*file));
-        else
-            fileDesc.setown(file->getFileDescriptor());
-        validateFile(file);
-        if (container.queryLocal() || helper->canMatchAny()) // if local, assume may match
+        bool temp = 0 != (TDXtemporary & flags);
+        bool jobTemp = 0 != (TDXjobtemp & flags);
+        bool opt = 0 != (TDRoptional & flags);
+        file.setown(lookupReadFile(helperFileName, AccessMode::readSequential, jobTemp, temp, opt, reInit, diskReadRemoteStatistics, &fileStatsTableStart));
+        if (file)
         {
-            bool temp = 0 != (TDXtemporary & helper->getFlags());
+            if (file->isExternal() && (flags & TDXcompress))
+                file->queryAttributes().setPropBool("@blockCompressed", true);
+            if (file->numParts() > 1)
+                fileDesc.setown(getConfiguredFileDescriptor(*file));
+            else
+                fileDesc.setown(file->getFileDescriptor());
+            validateFile(file);
             bool local;
             if (temp)
                 local = false;
             else
                 local = container.queryLocal();
             mapping.setown(getFileSlaveMaps(file->queryLogicalName(), *fileDesc, container.queryJob().queryUserDescriptor(), container.queryJob().querySlaveGroup(), local, false, hash, file->querySuperFile()));
-            addReadFile(file, temp);
-        }
-        if (0 != (helper->getFlags() & TDRfilenamecallback)) // only get/serialize if using virtual file name fields
-        {
             IDistributedSuperFile *super = file->querySuperFile();
-            if (super)
+            unsigned numsubs = super?super->numSubFiles(true):0;
+            if (0 != (helper->getFlags() & TDRfilenamecallback)) // only get/serialize if using virtual file name fields
             {
-                unsigned numsubs = super->numSubFiles(true);
-                unsigned s=0;
-                for (; s<numsubs; s++)
+                subfileLogicalFilenames.kill();
+                for (unsigned s=0; s<numsubs; s++)
                 {
                     IDistributedFile &subfile = super->querySubFile(s, true);
                     subfileLogicalFilenames.append(subfile.queryLogicalName());
                 }
             }
-        }
-        void *ekey;
-        size32_t ekeylen;
-        helper->getEncryptKey(ekeylen,ekey);
-        bool encrypted = fileDesc->queryProperties().getPropBool("@encrypted");
-        if (0 != ekeylen)
-        {
-            memset(ekey,0,ekeylen);
-            free(ekey);
-            if (!encrypted)
+            void *ekey;
+            size32_t ekeylen;
+            helper->getEncryptKey(ekeylen,ekey);
+            bool encrypted = fileDesc->queryProperties().getPropBool("@encrypted");
+            if (0 != ekeylen)
             {
-                Owned<IException> e = MakeActivityWarning(&container, TE_EncryptionMismatch, "Ignoring encryption key provided as file '%s' was not published as encrypted", fileName.get());
-                queryJobChannel().fireException(e);
+                memset(ekey,0,ekeylen);
+                free(ekey);
+                if (!encrypted)
+                {
+                    Owned<IException> e = MakeActivityWarning(&container, TE_EncryptionMismatch, "Ignoring encryption key provided as file '%s' was not published as encrypted", fileName.get());
+                    queryJobChannel().fireException(e);
+                }
             }
+            else if (encrypted)
+                throw MakeActivityException(this, 0, "File '%s' was published as encrypted but no encryption key provided", fileName.get());
         }
-        else if (encrypted)
-            throw MakeActivityException(this, 0, "File '%s' was published as encrypted but no encryption key provided", fileName.get());
     }
+}
+
+void CDiskReadMasterBase::kill()
+{
+    CMasterActivity::kill();
+    file.clear();
 }
 
 void CDiskReadMasterBase::serializeSlaveData(MemoryBuffer &dst, unsigned slave)
@@ -110,12 +116,39 @@ void CDiskReadMasterBase::serializeSlaveData(MemoryBuffer &dst, unsigned slave)
         ForEachItemIn(s, subfileLogicalFilenames)
             dst.append(subfileLogicalFilenames.item(s));
     }
+    dst.append(fileStatsTableStart);
     if (mapping)
         mapping->serializeMap(slave, dst);
     else
         CSlavePartMapping::serializeNullMap(dst);
 }
 
+void CDiskReadMasterBase::getActivityStats(IStatisticGatherer & stats)
+{
+    CMasterActivity::getActivityStats(stats);
+    diskAccessCost = calcFileReadCostStats(false);
+    if (diskAccessCost)
+        stats.addStatistic(StCostFileAccess, diskAccessCost);
+}
+
+void CDiskReadMasterBase::done()
+{
+    diskAccessCost = calcFileReadCostStats(true);
+    CMasterActivity::done();
+}
+
+void CDiskReadMasterBase::deserializeStats(unsigned node, MemoryBuffer &mb)
+{
+    CMasterActivity::deserializeStats(node, mb);
+    if (mapping && (mapping->queryMapWidth(node)>0)) // there won't be any subfile stats. if worker was sent 0 parts
+    {
+        unsigned numFilesToRead;
+        mb.read(numFilesToRead);
+        assertex(numFilesToRead<=fileStats.size());
+        for (unsigned i=0; i<numFilesToRead; i++)
+            fileStats[i]->deserialize(node, mb);
+    }
+}
 /////////////////
 
 void CWriteMasterBase::init()
@@ -128,10 +161,11 @@ void CWriteMasterBase::init()
     queryThorFileManager().addScope(container.queryJob(), helperFileName, expandedFileName, mangle);
     fileName.set(expandedFileName);
     dlfn.set(fileName);
+    fileDesc.clear();
     if (diskHelperBase->getFlags() & TDWextend)
     {
         assertex(0 == (diskHelperBase->getFlags() & (TDXtemporary|TDXjobtemp)));
-        Owned<IDistributedFile> file = queryThorFileManager().lookup(container.queryJob(), helperFileName, false, true, false, container.activityIsCodeSigned());
+        Owned<IDistributedFile> file = queryThorFileManager().lookup(container.queryJob(), helperFileName, AccessMode::writeRandom | AccessMode::extend, false, true, false, container.activityIsCodeSigned());
         if (file.get())
         {
             fileDesc.setown(file->getFileDescriptor());
@@ -140,6 +174,8 @@ void CWriteMasterBase::init()
     }
     if (dlfn.isExternal())
         mpTag = container.queryJob().allocateMPTag(); // used
+    bool outputCompressionDefault = getOptBool(THOROPT_COMPRESS_ALLFILES, isContainerized());
+    bool outputPlaneCompressed = outputCompressionDefault;
     if (NULL == fileDesc.get())
     {
         bool overwriteok = 0!=(TDWoverwrite & diskHelperBase->getFlags());
@@ -152,17 +188,51 @@ void CWriteMasterBase::init()
                 break;
             clusters.append(cluster);
             idx++;
-        }
 
-        if (idx == 0)
-        {
-            const char * defaultCluster = queryDefaultStoragePlane();
-            if (defaultCluster)
-                clusters.append(defaultCluster);
+            if (1 == idx)
+            {
+                // establish default compression from 1st plane, but ECL compression attributes take precedence
+                Owned<const IPropertyTree> plane = getStoragePlaneConfig(cluster, false);
+                if (plane)
+                    outputPlaneCompressed = plane->getPropBool("@compressLogicalFiles", outputCompressionDefault);
+            }
         }
 
         IArrayOf<IGroup> groups;
-        fillClusterArray(container.queryJob(), fileName, clusters, groups);
+        if (idx == 0)
+        {
+            if (TDXtemporary & diskHelperBase->getFlags())
+            {
+                // NB: these temp IFileDescriptors are not published
+                // but we want to ensure they don't have the default data plane
+                // which would cause the paths to be manipulated if numDevices>1
+                StringBuffer planeName;
+                if (getDefaultSpillPlane(planeName))
+                {
+                    clusters.append(planeName);
+                    groups.append(*LINK(&queryLocalGroup()));
+                }
+            }
+            else
+            {
+                StringBuffer defaultCluster;
+                if (TDWpersist & diskHelperBase->getFlags())
+                    getDefaultPersistPlane(defaultCluster);
+                else if (TDXjobtemp & diskHelperBase->getFlags())
+                    getDefaultJobTempPlane(defaultCluster);
+                else
+                    getDefaultStoragePlane(defaultCluster);
+                if (defaultCluster.length())
+                {
+                    clusters.append(defaultCluster);
+                    Owned<const IPropertyTree> plane = getStoragePlaneConfig(defaultCluster, false);
+                    if (plane)
+                        outputPlaneCompressed = plane->getPropBool("@compressLogicalFiles", outputCompressionDefault);
+                }
+            }
+        }
+        if (0 == groups.ordinality()) // may be filled if temp (see above)
+            fillClusterArray(container.queryJob(), fileName, clusters, groups);
         fileDesc.setown(queryThorFileManager().create(container.queryJob(), fileName, clusters, groups, overwriteok, diskHelperBase->getFlags()));
         if (1 == groups.ordinality())
             targetOffset = getGroupOffset(groups.item(0), container.queryJob().querySlaveGroup());
@@ -187,8 +257,15 @@ void CWriteMasterBase::init()
             props.setPropBool("@encrypted", true);
             blockCompressed = true;
         }
-        else if (0 != (diskHelperBase->getFlags() & TDWnewcompress) || 0 != (diskHelperBase->getFlags() & TDXcompress))
-            blockCompressed = true;
+        else
+        {
+            if (0 == (diskHelperBase->getFlags() & TDWnocompress))
+            {
+                blockCompressed = (0 != (diskHelperBase->getFlags() & TDWnewcompress) || 0 != (diskHelperBase->getFlags() & TDXcompress));
+                if (!blockCompressed) // if ECL doesn't specify, default to plane definition
+                    blockCompressed = outputPlaneCompressed;
+            }
+        }
         if (blockCompressed)
             props.setPropBool("@blockCompressed", true);
         props.setProp("@kind", "flat");
@@ -224,6 +301,16 @@ void CWriteMasterBase::publish()
     }
     if (TDWrestricted & diskHelperBase->getFlags())
         props.setPropBool("restricted", true );
+
+    if (compMethod)
+    {
+        const char *compressionType = translateFromCompMethod(compMethod);
+        if (!isEmptyString(compressionType))
+            props.setProp("@compressionType", compressionType);
+    }
+
+    props.setPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskWrites), statsCollection.getStatisticSum(StNumDiskWrites));
+    props.setPropInt64(getDFUQResultFieldName(DFUQResultField::writeCost), diskAccessCost);
     container.queryTempHandler()->registerFile(fileName, container.queryOwner().queryGraphId(), diskHelperBase->getTempUsageCount(), TDXtemporary & diskHelperBase->getFlags(), getDiskOutputKind(diskHelperBase->getFlags()), &clusters);
     if (!dlfn.isExternal())
     {
@@ -231,34 +318,27 @@ void CWriteMasterBase::publish()
         if (!temporary && (queryJob().querySlaves() < fileDesc->numParts()))
         {
             // create empty parts for a fileDesc being published that is larger than this clusters
-            size32_t recordSize = 0;
-            IOutputMetaData *diskRowMeta = diskHelperBase->queryDiskRecordSize()->querySerializedDiskMeta();
-            if (diskRowMeta->isFixedSize() && ((TAKdiskwrite == container.getKind()) || (TAKspillwrite == container.getKind())))
-            {
-                recordSize = diskRowMeta->getMinRecordSize();
-                if (0 != (diskHelperBase->getFlags() & TDXgrouped))
-                    recordSize += 1;
-            }
             unsigned compMethod = COMPRESS_METHOD_LZ4;
-            // rowdiff used if recordSize > 0, else fallback to compMethod
+
             if (getOptBool(THOROPT_COMP_FORCELZW, false))
-            {
-                recordSize = 0; // by default if fixed length (recordSize set), row diff compression is used. This forces compMethod.
                 compMethod = COMPRESS_METHOD_LZW;
-            }
             else if (getOptBool(THOROPT_COMP_FORCEFLZ, false))
                 compMethod = COMPRESS_METHOD_FASTLZ;
             else if (getOptBool(THOROPT_COMP_FORCELZ4, false))
                 compMethod = COMPRESS_METHOD_LZ4;
             else if (getOptBool(THOROPT_COMP_FORCELZ4HC, false))
                 compMethod = COMPRESS_METHOD_LZ4HC;
+
             bool blockCompressed;
             bool compressed = fileDesc->isCompressed(&blockCompressed);
+
+            // NB: it would be far preferable to avoid this and have the file reference a group with the correct number of parts
+            // Possibly could use subgroup syntax: 'data[1..n]'
             for (unsigned clusterIdx=0; clusterIdx<fileDesc->numClusters(); clusterIdx++)
             {
                 StringBuffer clusterName;
                 fileDesc->getClusterGroupName(clusterIdx, clusterName, &queryNamedGroupStore());
-                LOG(MCthorDetailedDebugInfo, thorJob, "Creating blank parts for file '%s', cluster '%s'", fileName.get(), clusterName.str());
+                LOG(MCthorDetailedDebugInfo, "Creating blank parts for file '%s', cluster '%s'", fileName.get(), clusterName.str());
                 unsigned p=0;
                 while (p<fileDesc->numParts())
                 {
@@ -266,6 +346,7 @@ void CWriteMasterBase::publish()
                         p += queryJob().querySlaves();
                     IPartDescriptor *partDesc = fileDesc->queryPart(p);
                     CDateTime createTime, modifiedTime;
+                    offset_t compSize = 0;
                     for (unsigned c=0; c<partDesc->numCopies(); c++)
                     {
                         RemoteFilename rfn;
@@ -277,20 +358,24 @@ void CWriteMasterBase::publish()
                             ensureDirectoryForFile(path.str());
                             OwnedIFile iFile = createIFile(path.str());
                             Owned<IFileIO> iFileIO;
-                            if (compressed)
-                                iFileIO.setown(createCompressedFileWriter(iFile, recordSize, false, true, NULL, compMethod));
+                            if (compressed) // NB: this would not be necessary if all builds have the changes in HPCC-32651
+                            {
+                                size32_t compBlockSize = 0; // i.e. default
+                                size32_t blockedIoSize = -1; // i.e. default
+                                iFileIO.setown(createCompressedFileWriter(iFile, false, true, NULL, compMethod, compBlockSize, blockedIoSize, IFEnone));
+                            }
                             else
                                 iFileIO.setown(iFile->open(IFOcreate));
                             dbgassertex(iFileIO.get());
                             iFileIO.clear();
                             // ensure copies have matching datestamps, as they would do normally (backupnode expects it)
-                            if (partDesc->numCopies() > 1)
+                            if (0 == c)
                             {
-                                if (0 == c)
-                                    iFile->getTime(&createTime, &modifiedTime, NULL);
-                                else
-                                    iFile->setTime(&createTime, &modifiedTime, NULL);
+                                iFile->getTime(&createTime, &modifiedTime, NULL);
+                                compSize = iFile->size();
                             }
+                            else
+                                iFile->setTime(&createTime, &modifiedTime, NULL);
                         }
                         catch (IException *e)
                         {
@@ -302,7 +387,14 @@ void CWriteMasterBase::publish()
                             queryJob().fireException(e2);
                         }
                     }
-                    partDesc->queryProperties().setPropInt64("@size", 0);
+                    IPropertyTree &props = partDesc->queryProperties();
+                    StringBuffer timeStr;
+                    modifiedTime.getString(timeStr);
+                    props.setProp("@modified", timeStr.str());
+                    props.setPropInt64("@recordCount", 0);
+                    props.setPropInt64("@size", 0);
+                    if (compressed)
+                        props.setPropInt64("@compressedSize", compSize);
                     p++;
                 }
             }
@@ -315,7 +407,11 @@ CWriteMasterBase::CWriteMasterBase(CMasterGraphElement *info)
      : CMasterActivity(info, diskWriteActivityStatistics)
 {
     diskHelperBase = (IHThorDiskWriteArg *)queryHelper();
+    unsigned writeFlags = diskHelperBase->getFlags();
+    reInit = 0 != (writeFlags & (TDXvarfilename|TDXdynamicfilename));
     targetOffset = 0;
+    if (writeFlags & TDWhaswidth)
+        throwUnimplementedX("OUTPUT(WIDTH)");
 }
 
 void CWriteMasterBase::preStart(size32_t parentExtractSz, const byte *parentExtract)
@@ -326,7 +422,7 @@ void CWriteMasterBase::preStart(size32_t parentExtractSz, const byte *parentExtr
         if (0 == ((TDXvarfilename|TDXtemporary|TDXjobtemp) & diskHelperBase->getFlags()))
         {
             OwnedRoxieString fname(diskHelperBase->getFileName());
-            Owned<IDistributedFile> file = queryThorFileManager().lookup(container.queryJob(), fname, false, true, false, container.activityIsCodeSigned());
+            Owned<IDistributedFile> file = queryThorFileManager().lookup(container.queryJob(), fname, AccessMode::readLogicalMeta, false, true, false, container.activityIsCodeSigned());
             if (file)
             {
                 if (0 == ((TDWextend+TDWoverwrite) & diskHelperBase->getFlags()))
@@ -367,6 +463,14 @@ void CWriteMasterBase::done()
     }
 }
 
+void CWriteMasterBase::getActivityStats(IStatisticGatherer & stats)
+{
+    CMasterActivity::getActivityStats(stats);
+    diskAccessCost = calcDiskWriteCost(clusters, statsCollection.getStatisticSum(StNumDiskWrites));
+    if (diskAccessCost)
+        stats.addStatistic(StCostFileAccess, diskAccessCost);
+}
+
 void CWriteMasterBase::slaveDone(size32_t slaveIdx, MemoryBuffer &mb)
 {
     if (mb.length()) // if 0 implies aborted out from this slave.
@@ -381,8 +485,6 @@ void CWriteMasterBase::slaveDone(size32_t slaveIdx, MemoryBuffer &mb)
         mb.read(size);
         mb.read(physicalSize);
 
-        unsigned fileCrc;
-        mb.read(fileCrc);
         CDateTime modifiedTime(mb);
 
         IPartDescriptor *partDesc = fileDesc->queryPart(targetOffset+slaveIdx);
@@ -390,15 +492,23 @@ void CWriteMasterBase::slaveDone(size32_t slaveIdx, MemoryBuffer &mb)
         props.setPropInt64("@size", size);
         if (fileDesc->isCompressed())
             props.setPropInt64("@compressedSize", physicalSize);
-        props.setPropInt64("@fileCrc", fileCrc);
         StringBuffer timeStr;
         modifiedTime.getString(timeStr);
         props.setProp("@modified", timeStr.str());
         props.setPropInt64("@recordCount", slaveProcessed);
+
+        // Get compression method from slave (if available)
+        byte serializedCompMethod = 0;
+        if (mb.remaining())
+            mb.read(serializedCompMethod);
+        // It is possible that serializedCompMethod is not set if no file was created - so only set if non zero
+        if (serializedCompMethod)
+        {
+            dbgassertex(!compMethod || ((CompressionMethod)serializedCompMethod == compMethod));
+            compMethod = (CompressionMethod)serializedCompMethod;
+        }
     }
 }
-
-
 
 /////////////////
 rowcount_t getCount(CActivityBase &activity, unsigned partialResults, rowcount_t limit, mptag_t mpTag)

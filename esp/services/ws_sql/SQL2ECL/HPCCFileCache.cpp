@@ -23,8 +23,28 @@ HPCCFileCache * HPCCFileCache::createFileCache(const char * username, const char
     ESPLOG(LogMax, "WsSQL: Creating new HPCC FILE CACHE");
     return new HPCCFileCache(username,passwd);
 }
+void populateColums(IArrayOf<HPCCColumnMetaData> * cols, IArrayOf<IEspHPCCColumn> & pColumns)
+{
+    for (int i = 0; i < cols->length(); i++)
+    {
+       Owned<IEspHPCCColumn> pCol = createHPCCColumn();
+       HPCCColumnMetaData& currcol = cols->item(i);
 
-bool HPCCFileCache::populateTablesResponse(IEspGetDBMetaDataResponse & tablesrespstruct, const char * filterby)
+       IArrayOf<HPCCColumnMetaData> * ccols = currcol.getChildColumns();
+       if (ccols != nullptr && ccols->length() !=  0)
+       {
+           IArrayOf<IEspHPCCColumn> pCColumns;
+           populateColums(ccols, pCColumns);
+           pCol->setColumns(pCColumns);
+       }
+
+       pCol->setName(currcol.getColumnName());
+       pCol->setType(currcol.getColumnType());
+       pColumns.append(*pCol.getLink());
+    }
+}
+
+bool HPCCFileCache::populateTablesResponse(IEspGetDBMetaDataResponse & tablesrespstruct, const char * filterby, bool nestedcolumns=true)
 {
     bool success = false;
 
@@ -58,7 +78,18 @@ bool HPCCFileCache::populateTablesResponse(IEspGetDBMetaDataResponse & tablesres
                for (int i = 0; i < cols->length(); i++)
                {
                    Owned<IEspHPCCColumn> pCol = createHPCCColumn();
-                   HPCCColumnMetaData currcol = cols->item(i);
+                   HPCCColumnMetaData& currcol = cols->item(i);
+
+                   if (nestedcolumns)
+                   {
+                       IArrayOf<HPCCColumnMetaData> * ccols = currcol.getChildColumns();
+                       if (ccols->length() != 0)
+                       {
+                           IArrayOf<IEspHPCCColumn> pCColumns;
+                           populateColums(ccols, pCColumns);
+                           pCol->setColumns(pCColumns);
+                       }
+                   }
                    pCol->setName(currcol.getColumnName());
                    pCol->setType(currcol.getColumnType());
                    pColumns.append(*pCol.getLink());
@@ -79,7 +110,7 @@ bool HPCCFileCache::fetchHpccFilesByTableName(IArrayOf<SQLTable> * sqltables)
 
     ForEachItemIn(tableindex, *sqltables)
     {
-       SQLTable table = sqltables->item(tableindex);
+       SQLTable & table = sqltables->item(tableindex);
        const char * cachedKey = cacheHpccFileByName(table.getName());
        allFound &= (cachedKey && *cachedKey);
     }
@@ -96,7 +127,7 @@ bool HPCCFileCache::cacheAllHpccFiles(const char * filterby)
     else
         filter.append("*");
 
-    Owned<IDFAttributesIterator> fi = queryDistributedFileDirectory().getDFAttributesIterator(filter, userdesc.get(), true, true, NULL);
+    Owned<IPropertyTreeIterator> fi = queryDistributedFileDirectory().getDFAttributesIterator(filter, userdesc.get(), true, true, nullptr);
     if(!fi)
         throw MakeStringException(-1,"Cannot get information from file system.");
 
@@ -114,7 +145,6 @@ bool HPCCFileCache::cacheAllHpccFiles(const char * filterby)
        StringBuffer name(attr.queryProp("@name"));
 
        if (name.length()>0 && HPCCFile::validateFileName(name.str()))
-       //if (name.length()>0)
        {
            const char * cachedKey = cacheHpccFileByName(name.str(), true);
            success &= (cachedKey && *cachedKey);
@@ -133,7 +163,7 @@ bool HPCCFileCache::updateHpccFileDescription(const char * filename, const char 
 
         //queryDistributedFileDirectory returns singleton
         IDistributedFileDirectory & dfd = queryDistributedFileDirectory();
-        Owned<IDistributedFile> df = dfd.lookup(filename, userdesc, false, false, false, nullptr, defaultPrivilegedUser);
+        Owned<IDistributedFile> df = dfd.lookup(filename, userdesc, AccessMode::writeLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
 
         if(!df)
             return false;
@@ -171,7 +201,7 @@ HPCCFile * HPCCFileCache::fetchHpccFileByName(const char * filename, const char 
 
         //queryDistributedFileDirectory returns singleton
         IDistributedFileDirectory & dfd = queryDistributedFileDirectory();
-        Owned<IDistributedFile> df = dfd.lookup(filename, userdesc, false, false, false, nullptr, defaultPrivilegedUser);
+        Owned<IDistributedFile> df = dfd.lookup(filename, userdesc, AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser);
 
         if(!df)
             throw MakeStringException(-1,"Cannot find file %s.",filename);
@@ -284,7 +314,7 @@ HPCCFile * HPCCFileCache::fetchHpccFileByName(const char * filename, const char 
             file->setFormat(format);
         }
 
-        if (file && ( file->containsNestedColumns() || strncmp(file->getFormat(), "XML", 3)==0))
+        if (file && (strncmp(file->getFormat(), "XML", 3)==0))
             throw MakeStringException(-1,"Nested data files not supported: %s.",filename);
     }
 

@@ -10,25 +10,7 @@
       <primary>File.Copy</primary>
     </indexterm><indexterm>
       <primary>Copy</primary>
-    </indexterm>(</emphasis> <emphasis> sourceLogicalName,
-  destinationGroup</emphasis> <emphasis role="bold">, </emphasis>
-  <emphasis>destinationLogicalName, </emphasis> <emphasis role="bold">
-  [</emphasis> <emphasis>,sourceDali</emphasis> <emphasis role="bold">]
-  [</emphasis> <emphasis>,timeOut</emphasis> <emphasis role="bold">]
-  [</emphasis> <emphasis>,espServerIPPort </emphasis> <emphasis
-  role="bold">]</emphasis> <emphasis role="bold"> [</emphasis>
-  <emphasis>,maxConnections</emphasis> <emphasis role="bold">] [</emphasis>
-  <emphasis>,allowOverwrite</emphasis> <emphasis role="bold">]</emphasis>
-  <emphasis role="bold"> [</emphasis> <emphasis>,replicate</emphasis>
-  <emphasis role="bold">] [</emphasis> <emphasis>,asSuperfile</emphasis>
-  <emphasis role="bold">] [</emphasis> <emphasis>,compress</emphasis>
-  <emphasis role="bold">] [</emphasis> <emphasis>,forcePush</emphasis>
-  <emphasis role="bold">] [</emphasis>
-  <emphasis>,transferBufferSize</emphasis> <emphasis role="bold">]
-  [</emphasis> <emphasis>,preserveCompression</emphasis> <emphasis
-  role="bold">] [</emphasis> <emphasis>,noSplit</emphasis> <emphasis
-  role="bold">] [</emphasis> <emphasis>,expireDays</emphasis> <emphasis
-  role="bold">]);</emphasis></para>
+    </indexterm>(</emphasis> <emphasis>sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, wrap, keyCompression</emphasis> <emphasis role="bold">)</emphasis></para>
 
   <para><emphasis>dfuwuid</emphasis> <emphasis role="bold"> :=
   STD.File.fCopy<indexterm>
@@ -37,31 +19,13 @@
       <primary>File.fCopy</primary>
     </indexterm><indexterm>
       <primary>fCopy</primary>
-    </indexterm>(</emphasis> <emphasis> sourceLogicalName,
-  destinationGroup</emphasis> <emphasis role="bold">,</emphasis> <emphasis
-  role="bold"> </emphasis> <emphasis>destinationLogicalName, </emphasis>
-  <emphasis role="bold"> [</emphasis> <emphasis>,sourceDali</emphasis>
-  <emphasis role="bold">] [</emphasis> <emphasis>,timeOut</emphasis> <emphasis
-  role="bold">] [</emphasis> <emphasis>,espServerIPPort </emphasis> <emphasis
-  role="bold">]</emphasis> <emphasis role="bold"> [</emphasis>
-  <emphasis>,maxConnections</emphasis> <emphasis role="bold">] [</emphasis>
-  <emphasis>,allowOverwrite</emphasis> <emphasis role="bold">]</emphasis>
-  <emphasis role="bold"> [</emphasis> <emphasis>,replicate</emphasis>
-  <emphasis role="bold">] [</emphasis> <emphasis>,asSuperfile</emphasis>
-  <emphasis role="bold">] [</emphasis> <emphasis>,compress</emphasis>
-  <emphasis role="bold">] [</emphasis> <emphasis>,forcePush</emphasis>
-  <emphasis role="bold">] [</emphasis>
-  <emphasis>,transferBufferSize</emphasis> <emphasis role="bold">]
-  [</emphasis> <emphasis>,preserveCompression</emphasis> <emphasis
-  role="bold">] [</emphasis> <emphasis>,noSplit</emphasis> <emphasis
-  role="bold">] [</emphasis> <emphasis>,expireDays</emphasis> <emphasis
-  role="bold">]);</emphasis></para>
+    </indexterm>(</emphasis> <emphasis>sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, wrap, keyCompression</emphasis> <emphasis role="bold">)</emphasis></para>
 
   <informaltable colsep="1" frame="all" rowsep="1">
     <tgroup cols="2">
-      <colspec colwidth="80.50pt" />
+      <colspec colwidth="80.50pt"/>
 
-      <colspec />
+      <colspec/>
 
       <tbody>
         <row>
@@ -103,20 +67,23 @@
         </row>
 
         <row>
-          <entry><emphasis>espServerIPPort</emphasis></entry>
+          <entry><emphasis>espServerIpPort</emphasis></entry>
 
-          <entry>Optional. A null-terminated string containing the protocol,
-          IP, port, and directory, or the DNS equivalent, of the ESP server
-          program. This is usually the same IP and port as ECL Watch, with
-          "/FileSpray" appended. If omitted, the default is the value
-          contained in the lib_system.ws_fs_server attribute.</entry>
+          <entry>Optional. This should almost always be omitted, which then
+          defaults to the value contained in the lib_system.ws_fs_server
+          attribute. When not omitted, it should be a null-terminated string
+          containing the protocol, IP, port, and directory, or the DNS
+          equivalent, of the ESP server program. This is usually the same IP
+          and port as ECL Watch, with "/FileSpray" appended.</entry>
         </row>
 
         <row>
           <entry><emphasis>maxConnections</emphasis></entry>
 
           <entry>Optional. An integer specifying the maximum number of
-          connections. If omitted, the default is one (1).</entry>
+          connections. If omitted, the default is -1, which indicates the
+          system chooses a suitable default based on the size of the
+          cluster.</entry>
         </row>
 
         <row>
@@ -162,8 +129,9 @@
 
           <entry>Optional. A boolean TRUE or FALSE flag indicating whether to
           execute the copy process on the source nodes and push to the targets
-          instead of executing on the targets and pulling from the source. If
-          omitted, the default is FALSE.</entry>
+          instead of executing on the targets and pulling from the source.
+          This option is only valid within the same environment. If omitted,
+          the default is FALSE.</entry>
         </row>
 
         <row>
@@ -201,6 +169,24 @@
         </row>
 
         <row>
+          <entry><emphasis>ensure</emphasis></entry>
+
+          <entry>Optional. Copies logical file, but does not copy file parts
+          if they already exist. Default is FALSE.</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>wrap</emphasis></entry>
+
+          <entry>Optional. A boolean TRUE or FALSE flag indicating whether to
+          automatically wrap the file parts when copying to smaller sized
+          clusters. For example, copying from a 6-node cluster to a 3-node
+          cluster, two file parts will end up on each node; the difference is
+          whether node 1 gets parts 1 and 2 or parts 1 and 4. If omitted, the
+          default is FALSE.</entry>
+        </row>
+
+        <row>
           <entry><emphasis>dfuwuid</emphasis></entry>
 
           <entry>The attribute name to receive the null-terminated string
@@ -220,11 +206,23 @@
 
   <para>The <emphasis role="bold">Copy </emphasis>function takes a logical
   file and copies it to another logical file. This may be done within the same
-  cluster, or to another cluster, or to a cluster in a completely separate
-  Dali.</para>
+  cluster or to another cluster. The Destination cannot be foreign
+  file.</para>
 
   <para>Example:</para>
 
-  <programlisting format="linespecific">STD.File.Copy('OUT::MyFile',STD.System.Thorlib.Group(),'OUT::MyNewFile');
-</programlisting>
+  <para><emphasis role="bold">Note:</emphasis> In containerized HPCC Systems
+  deployments, the <emphasis>destinationGroup</emphasis> parameter should be a
+  named data plane (for example, <emphasis role="bold">'data'</emphasis>)
+  rather than <emphasis
+  role="bold">STD.System.Thorlib.Group()</emphasis>.</para>
+
+  <programlisting format="linespecific">// Recommended: explicit data plane name (containerized and bare-metal)
+STD.File.Copy('OUT::MyFile', 'data', 'OUT::MyNewFile');
+
+// Also valid in containerized: empty string uses the default data plane
+STD.File.Copy('OUT::MyFile', '', 'OUT::MyNewFile');
+
+// Bare-metal: specify a cluster/group name or use STD.System.Thorlib.Group()
+ STD.File.Copy('OUT::MyFile', STD.System.Thorlib.Group(), 'OUT::MyNewFile');</programlisting>
 </sect1>

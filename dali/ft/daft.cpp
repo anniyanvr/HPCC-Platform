@@ -29,9 +29,7 @@
 #include "fterror.hpp"
 #include "dadfs.hpp"
 #include "filecopy.ipp"
-#include "daftdir.hpp"
 #include "jptree.hpp"
-#include "dalienv.hpp"
 
 #include "daft.ipp"
 #include "daftmc.hpp"
@@ -158,64 +156,32 @@ void CDistributedFileSystem::transfer(IFileDescriptor * from, IFileDescriptor * 
     sprayer->spray();
 }
 
-void CDistributedFileSystem::directory(const char * directory, IGroup * machines, IPropertyTree * options, IPropertyTree * result)
-{
-    doDirectory(directory, machines, options, result);
-}
-
-void CDistributedFileSystem::physicalCopy(const char * source, const char * target, IPropertyTree * options, IDaftCopyProgress * progress)
-{
-    Owned<IPropertyTree> dirOptions = createPTree("options");
-    Owned<IPropertyTree> files = createPTree("files");
-
-    dirOptions->setPropBool("@time", false);
-    if (options)
-    {
-        dirOptions->setPropBool("@recurse", options->getPropBool("@recurse", false));
-    }
-
-    StringBuffer localSourceName;
-    RemoteFilename sourceName;
-    sourceName.setRemotePath(source);
-    sourceName.getLocalPath(localSourceName);
-    Owned<IGroup> sourceGroup = createIGroup(1, &sourceName.queryEndpoint());
-    directory(localSourceName.str(), sourceGroup, dirOptions, files);
-    physicalCopy(files, target, options, progress);
-}
-
-
-void CDistributedFileSystem::physicalCopy(IPropertyTree * source, const char * target, IPropertyTree * options, IDaftCopyProgress * progress)
-{
-    doPhysicalCopy(source, target, options, progress);
-}
-
 //-- operations on a single file. --
 
 offset_t CDistributedFileSystem::getSize(IDistributedFile * file, bool forceget, bool dontsetattr)
 {
     //MORE: Should this be done on multiple threads??? (NH: probably)
-    offset_t totalSize = forceget?-1:file->queryAttributes().getPropInt64("@size",-1);
-    if (totalSize == -1) {
+    offset_t totalSize = forceget?-1:file->queryAttributes().getPropInt64("@size", unknownFileSize);
+    if (totalSize == unknownFileSize) {
         unsigned numParts = file->numParts();
         totalSize = 0;
         for (unsigned idx=0; idx < numParts; idx++)
         {
             Owned<IDistributedFilePart> part = file->getPart(idx);
             offset_t partSize = getSize(part,forceget,dontsetattr);
-            if (partSize == (offset_t)-1)
+            if (partSize == unknownFileSize)
             {
-                totalSize = (offset_t)-1;
+                totalSize = unknownFileSize;
                 break;
             }
             totalSize += partSize;
         }
-        if (((totalSize != -1)||forceget) && !dontsetattr) // note forceget && !dontsetattr will reset attr if can't work out size
+        if (((totalSize != unknownFileSize)||forceget) && !dontsetattr) // note forceget && !dontsetattr will reset attr if can't work out size
         {
             DistributedFilePropertyLock lock(file);
             lock.queryAttributes().setPropInt64("@size", totalSize);
         }
     }
-    //LOG(MCdebugInfo(1000), unknownJob, "DFS: getSize(%s)=%" I64F "d", file->queryLogicalName(), totalSize);
     return totalSize;
 }
 
@@ -273,7 +239,7 @@ offset_t CDistributedFileSystem::getSize(IDistributedFilePart * part, bool force
         }
     }
 
-    //LOG(MCdebugInfo(2000), unknownJob, "DFS: getSize(%s)=%" I64F "d", part->queryPartName(), size);
+    //LOG(MCdebugInfo(2000), "DFS: getSize(%s)=%" I64F "d", part->queryPartName(), size);
     return size;
 }
 

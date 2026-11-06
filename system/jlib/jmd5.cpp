@@ -16,6 +16,7 @@
 ############################################################################## */
 
 
+//LNRSPII:LINES_53:NON_IDENTIFYING:EMAIL,PERSON,DL_OR_DOB:hallidgx_risk
 /*
   Copyright (C) 1999, 2000, 2002 Aladdin Enterprises.  All rights reserved.
 
@@ -68,7 +69,8 @@
   1999-10-18 lpd Fixed typo in header comment (ansi2knr rather than md5).
   1999-05-03 lpd Original version.
  */
-// Following added by Gavin 
+// Following added by Gavin
+
 #include "platform.h"               // GH modified
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 #define ARCH_IS_BIG_ENDIAN 0
@@ -79,6 +81,7 @@
 #include "jmd5.hpp"
 #include "jfile.hpp"
 #include "jlog.hpp"
+#include "jerror.hpp"
 #include <string.h>
 
 #undef BYTE_ORDER   /* 1 = big-endian, -1 = little-endian, 0 = unknown */
@@ -154,6 +157,7 @@
 #define T63    0x2ad7d2bb
 #define T64 /* 0xeb86d391 */ (T_MASK ^ 0x14792c6e)
 
+static_assert(sizeof(void *) <= sizeof(memsize_t), "Memsize_t too small to represent a pointer");
 
 static void
 md5_process(md5_state_t *pms, const md5_byte_t *data /*[64]*/)
@@ -188,7 +192,7 @@ md5_process(md5_state_t *pms, const md5_byte_t *data /*[64]*/)
          * On little-endian machines, we can process properly aligned
          * data without copying it.
          */
-        if (!((data - (const md5_byte_t *)0) & 3)) {
+        if (((memsize_t)data & 3) == 0) {
         /* data are properly aligned */
         X = (const md5_word_t *)data;
         } else {
@@ -221,7 +225,7 @@ md5_process(md5_state_t *pms, const md5_byte_t *data /*[64]*/)
 #endif
     }
 
-#define ROTATE_LEFT(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+#define ROTATE_LEFT_32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
 
     /* Round 1. */
     /* Let [abcd k s i] denote the operation
@@ -229,7 +233,7 @@ md5_process(md5_state_t *pms, const md5_byte_t *data /*[64]*/)
 #define F(x, y, z) (((x) & (y)) | (~(x) & (z)))
 #define SET(a, b, c, d, k, s, Ti)\
   t = a + F(b,c,d) + X[k] + Ti;\
-  a = ROTATE_LEFT(t, s) + b
+  a = ROTATE_LEFT_32(t, s) + b
     /* Do the following 16 operations. */
     SET(a, b, c, d,  0,  7,  T1);
     SET(d, a, b, c,  1, 12,  T2);
@@ -255,7 +259,7 @@ md5_process(md5_state_t *pms, const md5_byte_t *data /*[64]*/)
 #define G(x, y, z) (((x) & (z)) | ((y) & ~(z)))
 #define SET(a, b, c, d, k, s, Ti)\
   t = a + G(b,c,d) + X[k] + Ti;\
-  a = ROTATE_LEFT(t, s) + b
+  a = ROTATE_LEFT_32(t, s) + b
      /* Do the following 16 operations. */
     SET(a, b, c, d,  1,  5, T17);
     SET(d, a, b, c,  6,  9, T18);
@@ -281,7 +285,7 @@ md5_process(md5_state_t *pms, const md5_byte_t *data /*[64]*/)
 #define H(x, y, z) ((x) ^ (y) ^ (z))
 #define SET(a, b, c, d, k, s, Ti)\
   t = a + H(b,c,d) + X[k] + Ti;\
-  a = ROTATE_LEFT(t, s) + b
+  a = ROTATE_LEFT_32(t, s) + b
      /* Do the following 16 operations. */
     SET(a, b, c, d,  5,  4, T33);
     SET(d, a, b, c,  8, 11, T34);
@@ -307,7 +311,7 @@ md5_process(md5_state_t *pms, const md5_byte_t *data /*[64]*/)
 #define I(x, y, z) ((y) ^ ((x) | ~(z)))
 #define SET(a, b, c, d, k, s, Ti)\
   t = a + I(b,c,d) + X[k] + Ti;\
-  a = ROTATE_LEFT(t, s) + b
+  a = ROTATE_LEFT_32(t, s) + b
      /* Do the following 16 operations. */
     SET(a, b, c, d,  0,  6, T49);
     SET(d, a, b, c,  7, 10, T50);
@@ -349,13 +353,13 @@ md5_init(md5_state_t *pms)
 void
 md5_append(md5_state_t *pms, const md5_byte_t *data, int nbytes)
 {
+    if (nbytes <= 0)
+        return;
+
     const md5_byte_t *p = data;
     int left = nbytes;
     int offset = (pms->count[0] >> 3) & 63;
     md5_word_t nbits = (md5_word_t)(nbytes << 3);
-
-    if (nbytes <= 0)
-    return;
 
     /* Update the message length. */
     pms->count[1] += nbytes >> 29;
@@ -463,7 +467,7 @@ void md5_filesum(const char* filename, StringBuffer& outstring)
     Owned<IFileIO> io = file->openShared(IFOread, IFSHread);
 
     if (!io)
-        throw MakeStringException(1, "File %s could not be opened", file->queryFilename());
+        throw MakeStringException(JLIBERR_UtilFileSCouldNotBeOpened, "File %s could not be opened", file->queryFilename());
 
     offset_t size = io->size();
     offset_t readPos = 0;
@@ -473,7 +477,7 @@ void md5_filesum(const char* filename, StringBuffer& outstring)
         offset_t sizeRead = io->read(readPos, CHUNKSIZE, contents);
 
         if (0 == sizeRead)
-            throw MakeStringException(1, "File %s only read %llu of %llu bytes", file->queryFilename(), size-readPos, size);
+            throw MakeStringException(JLIBERR_UtilFileSOnlyReadLluOfLlu, "File %s only read %llu of %llu bytes", file->queryFilename(), size-readPos, size);
 
         readPos += sizeRead;
         md5_append(&context, (const unsigned char *)contents, (int)sizeRead);

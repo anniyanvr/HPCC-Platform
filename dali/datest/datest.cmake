@@ -34,6 +34,7 @@ include_directories (
          ${HPCC_SOURCE_DIR}/system/jlib
          ${HPCC_SOURCE_DIR}/system/security/shared
          ${HPCC_SOURCE_DIR}/esp/clients/wsdfuaccess
+         ${HPCC_SOURCE_DIR}/esp/clients/ws_dfsclient
          ${HPCC_SOURCE_DIR}/fs/dafsstream
          ${HPCC_SOURCE_DIR}/rtl/include
          ${HPCC_SOURCE_DIR}/rtl/eclrtl
@@ -41,16 +42,15 @@ include_directories (
 
 HPCC_ADD_EXECUTABLE ( datest ${SRCS} )
 set_target_properties (datest PROPERTIES COMPILE_FLAGS -D_CONSOLE)
-target_link_libraries ( datest 
+target_link_libraries ( datest PRIVATE 
          jlib
          mp 
-         hrpc 
          dafsclient
          dafsstream
          eclrtl
          wsdfuaccess 
          dalibase 
-         ${CPPUNIT_LIBRARIES}
+         ${CppUnit_LIBRARIES}
     )
 
 

@@ -1,0 +1,119 @@
+# PR Sign-Off Validation
+# ====================
+# Ensures pull requests are signed - may replace later
+#
+name: pr-sign-check
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+    branches:
+      - "master"
+      - "candidate-*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate-signature:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Check first commit message signature
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Getting first commit in PR..."
+
+          # Get the first commit in the PR
+          FIRST_COMMIT=$(git rev-list --reverse ${BASE_SHA}..${HEAD_SHA} | head -n 1)
+
+          if [ -z "$FIRST_COMMIT" ]; then
+            echo "✗ Could not determine first commit"
+            exit 1
+          fi
+
+          # Get the commit message (first line)
+          COMMIT_MSG=$(git log --format=%s -n 1 "$FIRST_COMMIT")
+          echo "First commit message: $COMMIT_MSG"
+
+          # Get the full commit message body
+          FULL_COMMIT_MSG=$(git log --format=%B -n 1 "$FIRST_COMMIT")
+
+          # ---- 1. DCO check ----
+          DCO_OK=false
+          if echo "$FULL_COMMIT_MSG" | grep -q -i "Signed-off-by: "; then
+            echo "✓ DCO sign-off found"
+            DCO_OK=true
+          fi
+
+          # ---- 2. Signature check (GPG/SSH/S-MIME, verified via GitHub API) ----
+          # git log --format=%G? only reports "G" when the signer's public key is present
+          # in the runner's own (always empty) GPG keyring, so it fails for any contributor's
+          # personal key regardless of validity, and it only understands GPG. Ask GitHub's
+          # API instead: it already knows about keys/certs registered to the committer's
+          # account (including EMU-issued signing keys) and performs the same check -- across
+          # GPG, SSH, and S/MIME -- shown as the "Verified" badge in the UI.
+          SIG_OK=false
+          API_ERR="$RUNNER_TEMP/gh_api_verification.err"
+          API_STATUS=0
+          VERIFIED=""
+          if VERIFIED=$(gh api "repos/${REPO}/commits/${FIRST_COMMIT}" --jq '.commit.verification.verified' 2>"$API_ERR"); then
+            if [ "$VERIFIED" = "true" ]; then
+              echo "✓ Commit signature verified (GitHub API)"
+              SIG_OK=true
+            else
+              echo "Commit signature not verified by GitHub (verification.verified=${VERIFIED})"
+            fi
+          else
+            API_STATUS=$?
+            echo "⚠ Could not query GitHub's signature-verification API for ${FIRST_COMMIT} (exit ${API_STATUS}):"
+            cat "$API_ERR"
+            echo "  Signature could not be confirmed this run; cryptographic-signature verification is required."
+          fi
+
+          # ---- Require BOTH ----
+          if [ "$DCO_OK" = "true" ] && [ "$SIG_OK" = "true" ]; then
+            echo "First commit is compliant (DCO sign-off and verified signature)"
+          else
+            echo "✗ First commit does not meet signature requirements"
+            echo ""
+            if [ "$API_STATUS" -ne 0 ]; then
+              echo "Note: GitHub's signature-verification API could not be reached, so a"
+              echo "genuinely signed commit may have been misreported here. Re-run this check"
+              echo "once the API is reachable."
+              echo ""
+            fi
+            if [ "$DCO_OK" != "true" ]; then
+              echo "Missing DCO sign-off ('Signed-off-by:' line in commit message)."
+            fi
+            if [ "$SIG_OK" != "true" ]; then
+              echo "Missing verified cryptographic signature (GPG/SSH/S-MIME)."
+            fi
+            echo ""
+            echo "You must include BOTH on the first commit:"
+            echo "  • DCO sign-off: add a 'Signed-off-by:' line  →  git commit -s"
+            echo "  • A cryptographic signature verified by GitHub  →  git commit -S"
+            echo ""
+            echo "To fix an existing commit:"
+            echo "  git rebase -i ${BASE_SHA}^"
+            echo "  Change 'pick' → 'edit' on the first commit, then:"
+            echo "    git commit --amend -s -S --no-edit   # add DCO + signature"
+            echo "  git rebase --continue"
+            exit 1
+          fi
+
+          exit 0

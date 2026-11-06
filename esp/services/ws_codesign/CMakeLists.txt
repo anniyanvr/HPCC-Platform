@@ -61,7 +61,7 @@ include_directories (
          ${HPCC_SOURCE_DIR}/system/codesigner
     )
 
-ADD_DEFINITIONS( -D_USRDLL )
+ADD_DEFINITIONS( -D_USRDLL -Dws_codesign_API_LOCAL -DESP_SERVICE_ws_codesign)
 
 HPCC_ADD_LIBRARY( ws_codesign SHARED ${SRCS}  )
 add_dependencies (ws_codesign espscm )
@@ -71,6 +71,10 @@ target_link_libraries ( ws_codesign
          xmllib
          esphttp
          dalibase
-         environment
          SMCLib
+         ${COMMON_ESP_SERVICE_LIBS}
     )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( ws_codesign environment )
+endif()

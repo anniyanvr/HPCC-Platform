@@ -98,10 +98,10 @@ public:
 
 class CDataPacketStore: private SuperHashTableOf<CDataPacket, const char>
 {
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
 protected: friend class CDataPacketTransaction;
-    CriticalSection lockingsect;
-    Semaphore lockingsem;
+    CriticalSection lockingsect{SYNC_LOCATION};
+    Semaphore lockingsem{SYNC_LOCATION};
     unsigned lockingwaiting;
 public:
 
@@ -152,7 +152,7 @@ protected:
 
     virtual unsigned getHashFromFindParam(const void *fp) const
     {
-        return hashc((const unsigned char *)fp, strlen((const char *)fp), 0);
+        return hashcz((const unsigned char *)fp, 0);
     }
 
     virtual const void *getFindParam(const void *e) const
@@ -377,10 +377,10 @@ public:
 class CPutTransactionQueue 
 {
     // orphans TBD
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     CIArrayOf<CDataPacketTransaction> queue;
     unsigned addwaiting;
-    Semaphore addwaitingsem;
+    Semaphore addwaitingsem{SYNC_LOCATION};
 
 
     unsigned dofind(SocketEndpoint &sender,unsigned transactionid)
@@ -416,7 +416,7 @@ public:
         CriticalBlock block(sect);
         if (doremove(sender,transactionid)) {
             StringBuffer s;
-            IERRLOG("Warning: duplicate transaction detected from %s", sender.getUrlStr(s).str());
+            IERRLOG("Warning: duplicate transaction detected from %s", sender.getEndpointHostText(s).str());
             exit(0);
         }
         p->setTransactionId(sender,transactionid);
@@ -466,7 +466,7 @@ class CPacketStoreServer: public CInterface
 {
     CDataPacketStore store;
     bool stopped;
-    CriticalSection lockingwritesect;       // only used when calling CDataPacketTransaction lock functions
+    CriticalSection lockingwritesect{SYNC_LOCATION};       // only used when calling CDataPacketTransaction lock functions
     Owned<ICommunicator> comm;
     CPutTransactionQueue putinprogress;
     unsigned numservers;
@@ -661,12 +661,12 @@ class CPacketStoreClient: implements IPacketStore, public CInterface
 {
     Owned<ICommunicator> comm;
     SocketEndpoint myep;
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
     unsigned nservers;
 
     unsigned nextTransactionId()
     {
-        static CriticalSection transactionsect;
+        static CriticalSection transactionsect{SYNC_LOCATION};
         CriticalBlock block(transactionsect);
         static unsigned nexttransactionid=0;
         return nexttransactionid++;

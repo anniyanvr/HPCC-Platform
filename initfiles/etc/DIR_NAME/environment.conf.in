@@ -30,7 +30,12 @@ mpStart=7101
 mpEnd=7500
 mpSoMaxConn=128
 mpTraceLevel=0
-# enable SSL for dafilesrv remote file access (SSLNone/false | SSLOnly/true | SSLFirst | UnsecureFirst)
+
+# enable jemalloc memory allocator in all HPCC components
+# which can help reduce process memory usage (and OOM kills) from system allocator fragmentation
+#useJemalloc=true # NB: enabled by default. Set to false to disable.
+
+# enable SSL for dafilesrv remote file access (SSLNone/false | SSLOnly/true | SSLFirst | UnsecureFirst | UnsecureAndSSL)
 # Enabling requires setting the HPCCPassPhrase, HPCCCertFile, and HPCCPrivateKeyFile values
 #dfsUseSSL=SSLNone
 
@@ -50,12 +55,6 @@ jvmoptions=-XX:-UsePerfData
 # In most cases, skipping the cleanup is harmless and avoids these lockups
 skipPythonCleanup=true
 
-# Although HPCC platform includes plugins for both Python2 and Python3, only one may be safely enabled at a time
-# as the Python libraries export the same symbols for both versions. Enabling both may lead to unpredicatable results
-# including segfaults or undefined symbol errors.
-#
-# If you would prefer to use python 2 and disable python3, change the line below to read
-#  additionalPlugins=python2
 #
 # Multiple paths can be specified (separate with :, or ; on Windows).
 # Relative paths are assumed to be relative to ${INSTALL_DIR}/versioned
@@ -76,3 +75,23 @@ useDropZoneRestriction=true
 # NB: for now this only applies to the last cached server 
 #dafsConnectFailRetrySeconds=10
 
+# Log4j Configuration for Java Embed Logging
+# By default, Java log redirection is disabled.
+#
+# To enable Java log redirection:
+#   1. Uncomment and set 'log4jLevel' to the desired log level.
+#   2. Optionally, customize 'log4jPattern' for log formatting.
+#
+# log4jLevel   : REQUIRED. Filters logs by level.
+#                Available options:
+#                  OFF, FATAL, ERROR, WARN, INFO, DEBUG, TRACE, ALL
+#                See: https://logging.apache.org/log4j/2.x/manual/customloglevels.html
+#
+# log4jPattern : OPTIONAL. Sets the log output format.
+#                *WARNING* An invalid pattern will cause log4j to silently fail to redirect logs to HPCC
+#                Default: [%t] - %msg%n
+#                See: https://logging.apache.org/log4j/2.x/manual/pattern-layout.html
+#
+# Example usage:
+# log4jLevel=WARN
+# log4jPattern=[%-5level] %msg%n

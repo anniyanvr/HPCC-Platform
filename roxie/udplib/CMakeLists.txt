@@ -25,7 +25,9 @@
 
 
 project (AllProjects)
+SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STRICT_CXX_FLAGS}")
 
 include ( udplib.cmake)
 include ( udptransport.cmake)
+include ( udpsim.cmake)
 

@@ -24,17 +24,64 @@
 #include "jfile.hpp"
 #include <stdio.h>
 
+enum CompressionMethod : byte 
+{
+    //These values are persisted - they should not be changed
+    COMPRESS_METHOD_NONE,
+    COMPRESS_METHOD_ROWDIF,
+    COMPRESS_METHOD_LZW,
+    COMPRESS_METHOD_FASTLZ,
+    COMPRESS_METHOD_LZMA,
+    COMPRESS_METHOD_LZ4,
+    COMPRESS_METHOD_LZ4HC,
+    COMPRESS_METHOD_RANDROW,
+    COMPRESS_METHOD_LZW_LITTLE_ENDIAN,
+    COMPRESS_METHOD_LZ4S,
+    COMPRESS_METHOD_LZ4SHC,
+    COMPRESS_METHOD_LZ4HC3,         // Actually an alias
+    COMPRESS_METHOD_ZSTDS,
+    COMPRESS_METHOD_ZSTD,
+    COMPRESS_METHOD_LAST_PERSISTED,
+
+    //The following values are NEVER persisted.  They provide aliases for compression methods with different levels of compression.
+    COMPRESS_METHOD_ZSTD3,
+    COMPRESS_METHOD_ZSTD6,
+    COMPRESS_METHOD_ZSTD9,
+    COMPRESS_METHOD_ZSTDS3,
+    COMPRESS_METHOD_ZSTDS6,
+    COMPRESS_METHOD_ZSTDS9,
+
+    // WARNING if a new real compression method is added it should be added after COMPRESS_METHOD_ZSTDS9.
+    // Some versions of 10.0.x incorrectly persisted the alias values so the values above should never change
+    // otherwise some files created with the incorrect values will fail to be read.
+    //  New methods need to be appended.  Cleanest would be to create new aliases and keep these as old placeholders.
+    COMPRESS_METHOD_LAST_ALIAS,
+
+
+    COMPRESS_METHOD_MASK = 0x7F,   // AES is added as an extra bit, remove it to get the compression method
+    COMPRESS_METHOD_AES = 0x80,
+    COMPRESS_METHOD_DEFAULT = 0xFF,
+    COMPRESS_METHOD_LZWLEGACY = 1,  // Matches value of boolean 'true' used to indicate LZW little endian compression by legacy compressToBuffer
+};
+
+
 interface jlib_decl ICompressor : public IInterface
 {
-    virtual void   open(MemoryBuffer &mb, size32_t initialSize=0)=0; // variable internally sized buffer
-    virtual void   open(void *blk, size32_t blksize)=0;              // fixed size output
+    virtual void   open(MemoryBuffer &mb, size32_t initialSize, size32_t fixedRowSize) = 0; // variable internally sized buffer
+    virtual void   open(void *blk, size32_t blksize, size32_t fixedRowSize, bool allowPartialWrites) = 0;              // fixed size output
     virtual void   close()=0;
-    virtual size32_t write(const void *buf,size32_t len)=0;             
+    virtual size32_t write(const void *buf,size32_t len)=0;
+    virtual size32_t compressBlock(size32_t destSize, void * dest, size32_t srcSize, const void * src) = 0;
+     // Like compressBlock, but adds no internal header.  If numCompressed is not null, compress as much as will fit
+    virtual size32_t compressDirect(size32_t destSize, void * dest, size32_t srcSize, const void * src, size32_t * numCompressed) = 0;
                                                                             
     virtual void * bufptr()=0;
     virtual size32_t buflen()=0;
-    virtual void   startblock()=0;                      // row based must call startblock/commitblock
-    virtual void   commitblock()=0;
+
+    virtual bool adjustLimit(size32_t newLimit) = 0;    // adjust the maximum size of a fixed size output buffer
+    virtual CompressionMethod getCompressionMethod() const = 0;
+    virtual bool supportsBlockCompression() const = 0;
+    virtual bool supportsIncrementalCompression() const = 0;
 };
 
 interface jlib_decl IExpander : public IInterface
@@ -43,6 +90,10 @@ interface jlib_decl IExpander : public IInterface
     virtual void   expand(void *target)=0;
     virtual void * bufptr()=0;
     virtual size32_t buflen()=0;
+    virtual size32_t expandFirst(MemoryBuffer & target, const void * src) = 0;
+    virtual size32_t expandNext(MemoryBuffer & target) = 0;
+    virtual size32_t expandDirect(size32_t destSize, void * dest, size32_t srcSize, const void * src) = 0;
+    virtual bool supportsBlockDecompression() const = 0;
 };
 
 
@@ -59,10 +110,19 @@ interface jlib_decl IRandRowExpander : public IInterface
 };
 
 
+class jlib_decl CExpanderBase : public CInterfaceOf<IExpander>
+{
+public:
+    //Provide default implementations
+    virtual size32_t expandFirst(MemoryBuffer & target, const void * src) override;
+    virtual size32_t expandNext(MemoryBuffer & target) override;
+    virtual size32_t expandDirect(size32_t destSize, void * dest, size32_t srcSize, const void * src) override;
+    virtual bool supportsBlockDecompression() const override;
+};
 
 
-extern jlib_decl ICompressor *createLZWCompressor(bool supportbigendian=false); // bigendiansupport required for cross platform with solaris
-extern jlib_decl IExpander *createLZWExpander(bool supportbigendian=false);
+extern jlib_decl ICompressor *createLZWCompressor(bool supportbigendian); // bigendiansupport required for cross platform with solaris
+extern jlib_decl IExpander *createLZWExpander(bool supportbigendian);
 
 #define RLEMAXOVERHEAD 2
 extern jlib_decl size32_t RLECompress(void *dst,const void *src,size32_t size);  // maximum will write is 2+size
@@ -71,7 +131,7 @@ extern jlib_decl size32_t RLEExpand(void *dst,const void *src,size32_t expsize);
 
 extern jlib_decl size32_t DiffCompressFirst(const void *src,void *dst,void *buff,size32_t rs);  // compress first row (actually make bigger, but in same format as compression)
                                                                                             // buf need not be initialized
-extern jlib_decl size32_t DiffCompress(const void *src,void *dst,void *buff,size32_t rs);       // compress subsequent rows (bufs set by previous DiffFirstCompress or DiffCompress
+extern jlib_decl size32_t DiffCompress(const void *src,void *dst, void *buff,size32_t rs);  // compress subsequent rows (bufs set by previous DiffFirstCompress or DiffCompress
 extern jlib_decl size32_t DiffCompress2(const void *src,void *dst,const void *prev,size32_t rs);// compress row (prev not updated)
 extern jlib_decl size32_t DiffExpand(const void *src,void *dst,const void *prev,size32_t rs);   // expand row, prev must be passed previous expanded row 
 extern jlib_decl size32_t DiffCompressedSize(const void *cmpressedsrc,size32_t rs);             // calculate compressed row size - rs is expanded size
@@ -85,38 +145,29 @@ extern jlib_decl ICompressor *createRandRDiffCompressor(); // similar to RDiffCo
 extern jlib_decl IRandRowExpander *createRandRDiffExpander(); // NB only supports fixed row size
 
 
-//Some helper functions to make it easy to compress/decompress to memorybuffers.
-extern jlib_decl void compressToBuffer(MemoryBuffer & out, size32_t len, const void * src);
-extern jlib_decl void decompressToBuffer(MemoryBuffer & out, const void * src);
-extern jlib_decl void decompressToBuffer(MemoryBuffer & out, MemoryBuffer & in);
-extern jlib_decl void decompressToAttr(MemoryAttr & out, const void * src);
-extern jlib_decl void decompressToBuffer(MemoryAttr & out, MemoryBuffer & in);
-extern jlib_decl void appendToBuffer(MemoryBuffer & out, size32_t len, const void * src); //format as failed compression
+// Helper functions to make it easy to compress/decompress to memorybuffers.
+extern jlib_decl void compressToBuffer(MemoryBuffer & out, size32_t len, const void * src, CompressionMethod method=COMPRESS_METHOD_ZSTD3, const char *options=nullptr);
+extern jlib_decl void decompressToBuffer(MemoryBuffer & out, MemoryBuffer & in, const char *options=nullptr);
 
-
-#define COMPRESS_METHOD_ROWDIF 1
-#define COMPRESS_METHOD_LZW    2
-#define COMPRESS_METHOD_FASTLZ 3
-#define COMPRESS_METHOD_LZMA   4
-#define COMPRESS_METHOD_LZ4    5
-#define COMPRESS_METHOD_LZ4HC  6
-
+interface ISerialOutputStream;
+interface IBufferedSerialInputStream;
 interface ICompressedFileIO: extends IFileIO
 {
     virtual unsigned dataCRC()=0;                   // CRC for data area (note total file CRC equals COMPRESSEDFILECRC)
     virtual size32_t recordSize()=0;                // 0 for lzw/fastlz, otherwise record length for row difference compression
     virtual size32_t blockSize()=0;                 // block size used
-    virtual void setBlockSize(size32_t size)=0;     // only callable before any writes
-    virtual bool readMode()=0;                      // true if created using createCompressedFileReader
     virtual unsigned method()=0;
+    virtual ISerialOutputStream * queryWriteStream() = 0; // stream for writing compressed data
+    virtual IBufferedSerialInputStream * createParallelReadStream(unsigned numThreads, size32_t chunkSize) = 0; // stream for reading decompressed data; 0 means let the implementation choose
 };
 
+constexpr size32_t useDefaultIoBufferSize = (size32_t)-1;
 extern jlib_decl bool isCompressedFile(const char *filename);
 extern jlib_decl bool isCompressedFile(IFile *file);
-extern jlib_decl ICompressedFileIO *createCompressedFileReader(IFile *file,IExpander *expander=NULL, bool memorymapped=false, IFEflags extraFlags=IFEnone);
-extern jlib_decl ICompressedFileIO *createCompressedFileReader(IFileIO *fileio,IExpander *expander=NULL);
-extern jlib_decl ICompressedFileIO *createCompressedFileWriter(IFile *file,size32_t recordsize,bool append=false,bool setcrc=true,ICompressor *compressor=NULL, unsigned compMethod=COMPRESS_METHOD_LZ4, IFEflags extraFlags=IFEnone);
-extern jlib_decl ICompressedFileIO *createCompressedFileWriter(IFileIO *fileio, bool append, size32_t recordsize,bool setcrc=true,ICompressor *compressor=NULL, unsigned compMethod=COMPRESS_METHOD_LZ4);
+extern jlib_decl ICompressedFileIO *createCompressedFileReader(IFile *file,IExpander *expander, size32_t ioBufferSize, bool memorymapped, IFEflags extraFlags);
+extern jlib_decl ICompressedFileIO *createCompressedFileReader(IFileIO *fileio,IExpander *expander, size32_t ioBufferSize);
+extern jlib_decl ICompressedFileIO *createCompressedFileWriter(IFileIO *fileio, bool append, bool setcrc=true, ICompressor *compressor=NULL, unsigned compMethod=COMPRESS_METHOD_LZ4, size32_t compressorBlockSize=0, size32_t bufferSize=(size32_t)-1);
+extern jlib_decl ICompressedFileIO *createCompressedFileWriter(IFile *file, bool append, bool setcrc, ICompressor *compressor, unsigned compMethod, size32_t compressorBlockSize, size32_t bufferSize, IFEflags extraFlags);
 
 #define COMPRESSEDFILECRC (~0U)
 
@@ -133,6 +184,8 @@ extern jlib_decl IPropertyTree *getBlockedFileDetails(IFile *file);
 interface ICompressHandler : extends IInterface
 {
     virtual const char *queryType() const = 0;
+    virtual CompressionMethod queryPersistMethod() const = 0;
+    virtual CompressionMethod queryAliasMethod() const = 0;
     virtual ICompressor *getCompressor(const char *options=NULL) = 0;
     virtual IExpander *getExpander(const char *options=NULL) = 0;
 };
@@ -140,6 +193,8 @@ typedef IIteratorOf<ICompressHandler> ICompressHandlerIterator;
 extern jlib_decl ICompressHandlerIterator *getCompressHandlerIterator();
 extern jlib_decl void setDefaultCompressor(const char *type);
 extern jlib_decl ICompressHandler *queryCompressHandler(const char *type);
+extern jlib_decl ICompressHandler *queryCompressHandler(CompressionMethod method);
+
 extern jlib_decl ICompressHandler *queryDefaultCompressHandler();
 extern jlib_decl bool addCompressorHandler(ICompressHandler *handler); // returns true if added, false if already registered
 extern jlib_decl bool removeCompressorHandler(ICompressHandler *handler); // returns true if present and removed
@@ -147,46 +202,11 @@ extern jlib_decl bool removeCompressorHandler(ICompressHandler *handler); // ret
 extern jlib_decl ICompressor *getCompressor(const char *type, const char *options=NULL);
 extern jlib_decl IExpander *getExpander(const char *type, const char *options=NULL);
 
-inline unsigned translateToCompMethod(const char *compStr)
-{
-    unsigned compMethod = COMPRESS_METHOD_LZ4;
-    if (!isEmptyString(compStr))
-    {
-        if (strieq("FLZ", compStr))
-            compMethod = COMPRESS_METHOD_FASTLZ;
-        else if (strieq("LZW", compStr))
-            compMethod = COMPRESS_METHOD_LZW;
-        else if (strieq("RDIFF", compStr))
-            compMethod = COMPRESS_METHOD_ROWDIF;
-        else if (strieq("LZMA", compStr))
-            compMethod = COMPRESS_METHOD_LZMA;
-        else if (strieq("LZ4HC", compStr))
-            compMethod = COMPRESS_METHOD_LZ4HC;
-        //else // default is LZ4
-    }
-    return compMethod;
-}
-
-inline const char *translateFromCompMethod(unsigned compMethod)
-{
-    switch (compMethod)
-    {
-        case COMPRESS_METHOD_ROWDIF:
-            return "RDIFF";
-        case COMPRESS_METHOD_LZW:
-            return "LZW";
-        case COMPRESS_METHOD_FASTLZ:
-            return "FLZ";
-        case COMPRESS_METHOD_LZ4:
-            return "LZ4";
-        case COMPRESS_METHOD_LZ4HC:
-            return "LZ4HC";
-        case COMPRESS_METHOD_LZMA:
-            return "LZMA";
-        default:
-            return ""; // none
-    }
-}
+extern jlib_decl CompressionMethod translateToCompMethod(const char *compStr, CompressionMethod defaultMethod = COMPRESS_METHOD_LZ4);
+extern jlib_decl const char *translateFromCompMethod(unsigned compMethod);
 
 #define MIN_ROWCOMPRESS_RECSIZE 8
+
+constexpr unsigned defaultMaxCompressionFactor = 100;
+
 #endif

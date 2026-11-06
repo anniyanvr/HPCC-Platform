@@ -1,0 +1,35 @@
+.eclwatch_MetricGraphWidget .node.warning > path,
+.eclwatch_MetricGraphWidget .node.warning > polygon,
+.eclwatch_MetricGraphWidget .node.warning > ellipse,
+.eclwatch_MetricGraphWidget .node.warning > rect {
+	stroke: var(--colorStatusWarningForeground1);
+	stroke-width: 2.5px;
+}
+
+.eclwatch_MetricGraphWidget .node.error > path,
+.eclwatch_MetricGraphWidget .node.error > polygon,
+.eclwatch_MetricGraphWidget .node.error > ellipse,
+.eclwatch_MetricGraphWidget .node.error > rect {
+	stroke: var(--colorStatusDangerForeground1);
+	stroke-width: 2.5px;
+}
+
+.eclwatch_MetricGraphWidget .node.warning > text {
+	fill: var(--colorStatusWarningForeground1);
+}
+
+.eclwatch_MetricGraphWidget .node.error > text {
+	fill: var(--colorStatusDangerForeground1);
+}
+
+.eclwatch_MetricGraphWidget .cluster.warning > polygon,
+.eclwatch_MetricGraphWidget .cluster.warning > path {
+	stroke: var(--colorStatusWarningForeground1);
+	stroke-width: 2.5px;
+}
+
+.eclwatch_MetricGraphWidget .cluster.error > polygon,
+.eclwatch_MetricGraphWidget .cluster.error > path {
+	stroke: var(--colorStatusDangerForeground1);
+	stroke-width: 2.5px;
+}

@@ -24,22 +24,20 @@
 
 project (sasha)
 
-INCLUDE(CheckLibraryExists) 
-
-if (NOT WIN32 AND NOT WIN64)
-CHECK_LIBRARY_EXISTS(crypt crypt "" HAVE_LIBCRYPT) 
-endif ()
+include (saruncmd.cmake)
 
 set (    SRCS 
          saarch.cpp 
          sacmd.cpp 
          sacoalescer.cpp 
+         saglobalmsg.cpp
          salds.cpp 
          saqmon.cpp 
-         saserver.cpp 
          sautil.cpp 
          saverify.cpp 
          saxref.cpp 
+         sadbghk.cpp
+         wuarchivepublisher.cpp
     )
 
 include_directories ( 
@@ -68,25 +66,53 @@ if (WIN32)
     endif ()
 endif()
 
-HPCC_ADD_EXECUTABLE ( saserver ${SRCS} )
-install ( TARGETS saserver RUNTIME DESTINATION ${EXEC_DIR})
+HPCC_ADD_LIBRARY ( sashalib SHARED ${SRCS} )
 
+target_compile_definitions ( sashalib PRIVATE SASHALIB_EXPORTS _USRDLL )
 
-if ( ${HAVE_LIBCRYPT} )
-target_link_libraries ( saserver crypt)
-endif ( ${HAVE_LIBCRYPT} )
-
-target_link_libraries ( saserver 
+target_link_libraries ( sashalib PRIVATE
          jlib 
+         mp
          dafsclient 
          dalibase 
-         environment 
          dllserver 
          nbcd 
          eclrtl 
          deftype 
          workunit 
+         ${CppUnit_LIBRARIES}
     )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( sashalib PRIVATE environment )
+endif()
+
+install ( TARGETS sashalib RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
+
+
+set (    SRCS
+         saserver.cpp
+    )
+
+HPCC_ADD_EXECUTABLE ( saserver ${SRCS} )
+install ( TARGETS saserver RUNTIME DESTINATION ${EXEC_DIR})
+
+target_link_libraries ( saserver PRIVATE
+         sashalib
+         jlib
+        dllserver
+        dalibase
+        dafsclient
+        mp
+    )
+
+if (NOT CONTAINERIZED)
+    target_link_libraries ( saserver PRIVATE environment )
+endif()
+
+if (USE_CPPUNIT)
+    target_link_libraries ( saserver PRIVATE ${CppUnit_LIBRARIES} )
+endif()
 
 set (    SRCS 
          sacmd.cpp 
@@ -106,12 +132,9 @@ ADD_DEFINITIONS ( -D_CONSOLE )
 HPCC_ADD_EXECUTABLE ( sasha ${SRCS} )
 install ( TARGETS sasha RUNTIME DESTINATION ${EXEC_DIR})
 
-target_link_libraries ( sasha 
+target_link_libraries ( sasha PRIVATE
          ${XALAN_LIBRARIES} ${XERCES_LIBRARIES}
          jlib
-         mp 
+         mp
+         saruncmdlib
     )
-
-
-
-

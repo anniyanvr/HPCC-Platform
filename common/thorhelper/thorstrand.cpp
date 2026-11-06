@@ -41,7 +41,7 @@ public:
     {
         CThreaded * thread = new CThreaded("Strand", &strand);
         threads.append(*thread);
-        thread->start();
+        thread->start(true);
     }
 
     virtual void waitForStrands()
@@ -66,8 +66,8 @@ protected:
     }
 
 protected:
-    Semaphore producerStopSem;
-    CIArrayOf<CThreaded> threads;
+    Semaphore producerStopSem{SYNC_LOCATION};
+    IArrayOf<CThreaded> threads;
 };
 
 
@@ -82,7 +82,7 @@ class CStrandJunction : public CInterfaceOf<IStrandJunction>
 {
 public:
     explicit CStrandJunction(unsigned _numProducers, unsigned _numStrands)
-    : numProducers(_numProducers), numStrands(_numStrands), stopping(false), started(false)
+    : numStrands(_numStrands), numProducers(_numProducers), stopping(false), started(false)
     {
         assertex(numProducers);
     }
@@ -109,7 +109,7 @@ public:
     {
         CThreaded * thread = new CThreaded("ReadAheadThread", &mainthread);
         threads.append(*thread);
-        thread->start();
+        thread->start(true);
     }
 
     void processConsumerStop()
@@ -172,9 +172,9 @@ protected:
 
 private:
     const unsigned numProducers;
-    Semaphore producerStopSem;
-    Semaphore producerStoppedSem;
-    CIArrayOf<CThreaded> threads;
+    Semaphore producerStopSem{SYNC_LOCATION};
+    Semaphore producerStoppedSem{SYNC_LOCATION};
+    IArrayOf<CThreaded> threads;
     std::atomic<bool> stopping;
     bool started;
 };
@@ -219,7 +219,7 @@ RoxieRowBlock::~RoxieRowBlock()
 
 bool RoxieRowBlock::empty() const
 {
-    return (readPos >= writePos) && !exception;
+    return (readPos >= writePos) && !exception && !endOfChunk;
 }
 
 bool RoxieRowBlock::readFromStream(IRowStream * stream)
@@ -312,7 +312,7 @@ class StreamToBlockQueueThread : public CInterface, implements IThreaded
 {
 public:
     StreamToBlockQueueThread(CStrandJunction & _junction, IRowQueue * _queue, RowBlockAllocator & _allocator)
-    : junction(_junction), queue(_queue), stream(NULL), allocator(_allocator) {}
+    : junction(_junction), allocator(_allocator), stream(NULL), queue(_queue) {}
 
     virtual void threadmain() override
     {
@@ -554,7 +554,9 @@ protected:
 class SingleItemBlockQueue
 {
 public:
-    SingleItemBlockQueue() : avail(0U), space(1U)
+    SingleItemBlockQueue()
+    : space(SYNC_LOCATION, 1U),
+      avail(SYNC_LOCATION, 0U)
     {
     }
 
@@ -650,7 +652,7 @@ class OrderedReadAheadThread : public CInterface, implements IThreaded
 {
     //friend class OrderedManyToOneJunction;
 public:
-    OrderedReadAheadThread(CStrandJunction & _junction, RowBlockAllocator & _allocator) : junction(_junction), stream(NULL), allocator(_allocator)
+    OrderedReadAheadThread(CStrandJunction & _junction, RowBlockAllocator & _allocator) : junction(_junction), allocator(_allocator), stream(NULL)
     {
         finished = false;
         alive = true;
@@ -727,8 +729,9 @@ class OrderedManyToOneJunction : public CStrandJunction, implements IEngineRowSt
 public:
     IMPLEMENT_IINTERFACE_USING(CStrandJunction)
 
+    //NOTE: Pass blockSize+1 to the allocator, so that the endOfChunk can fit in the same block as the rows.
     OrderedManyToOneJunction(roxiemem::IRowManager & _rowManager, unsigned _numStrands, unsigned blockSize)
-    : CStrandJunction(_numStrands, _numStrands), allocator(_rowManager, blockSize)
+    : CStrandJunction(_numStrands, _numStrands), allocator(_rowManager, blockSize+1)
     {
         producers = new OrderedReadAheadThread * [numStrands];
         for (unsigned i=0; i < numStrands; i++)
@@ -1542,7 +1545,7 @@ extern THORHELPER_API IStrandBranch * createStrandBranch(roxiemem::IRowManager &
 //---------------------------------------------------------------------------------------------------------------------
 
 
-class BlockedRowStreamWriter : public CInterfaceOf<IRowWriterEx>
+class BlockedRowStreamWriter : public CInterfaceOf<IRowWriter>
 {
 public:
     BlockedRowStreamWriter(IRowQueue * _queue, RowBlockAllocator & _allocator) : queue(_queue), allocator(_allocator)
@@ -1560,6 +1563,14 @@ public:
                 curBlock->releaseBlock();
             curBlock = NULL;
         }
+    }
+
+    virtual void writeRow(const void *row)
+    {
+#ifdef _DEBUG
+        PrintStackReport();
+#endif
+        UNIMPLEMENTED_X("Caller should use putRow() instead");
     }
 
     virtual void flush()
@@ -1645,7 +1656,7 @@ public:
             curBlock = (RoxieRowBlock *)next;
         }
     }
-    virtual IRowWriterEx * getWriter(unsigned n)
+    virtual IRowWriter * getWriter(unsigned n)
     {
         return LINK(producers[n]);
     }

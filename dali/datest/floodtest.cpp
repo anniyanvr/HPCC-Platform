@@ -122,7 +122,7 @@ StringBuffer &getShortNodeName(IGroup* grp,unsigned i,StringBuffer &buf)
     return buf;
 }
 
-static CriticalSection recvsect;
+static CriticalSection recvsect{SYNC_LOCATION};
 
 class CRecvThread: public Thread
 {
@@ -646,9 +646,9 @@ bool runSlaves(IGroup *grp,const char *progname,const char *daliserver,const cha
     public:
         IGroup *grp;
         bool error;
-        CriticalSection statesect;
+        CriticalSection statesect{SYNC_LOCATION};
         casyncfor(IGroup *_grp,const char *_remoteexe,const char *_params)
-            : remoteexe(_remoteexe), params(_params)
+            : CAsyncFor(SYNC_LOCATION), remoteexe(_remoteexe), params(_params)
         {
             grp = _grp;
             error = false;
@@ -731,7 +731,7 @@ class CLoopbackServer: public Thread
 {
     bool stopping;
     Owned<ICommunicator> comm;
-    Semaphore sem;
+    Semaphore sem{SYNC_LOCATION};
     IGroup *grp;
     __int64 &total;
 
@@ -845,7 +845,7 @@ void floodtestServer(const char *exename,const char *daliserver,const char *grpn
             StringAttr msg;
             mb.read(msg);
             StringBuffer url;
-            IERRLOG("%3d (%s): %s\n",r+1,group->queryNode(r).endpoint().getUrlStr(url).str(),msg.get());
+            IERRLOG("%3d (%s): %s\n",r+1,group->queryNode(r).endpoint().getEndpointHostText(url).str(),msg.get());
         }
         else if (fn==FLOODTEST_CONNECTED) {
             if (setState(group,"Connected",r,connected)) {

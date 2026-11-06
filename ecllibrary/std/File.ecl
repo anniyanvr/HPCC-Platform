@@ -101,7 +101,19 @@ EXPORT FsDropZone := lib_fileservices.FsDropZone;
 
 EXPORT FsDropZoneRecord := lib_fileservices.FsDropZoneRecord;
 
+EXPORT FsLandingZoneRecord := lib_fileservices.FsLandingZoneRecord;
+
 /*------------------------------------- Spray functions -----------------------------------------------------------*/
+
+/**
+ * Returns the boolean value of 'noCommon' property from the Software/Globals if it is defined,
+ * otherwise return with 'true' as default.
+ *
+ * @return              Boolean value of 'noCommon' property.
+ */
+
+EXPORT boolean GetNoCommonDefault() :=
+    lib_fileservices.FileServices.GetNoCommonDefault();
 
 /**
  * Returns whether the file exists.
@@ -170,6 +182,19 @@ EXPORT varstring ExternalLogicalFileName(varstring location, varstring path, boo
     lib_fileservices.FileServices.ExternalLogicalFileName(location, path, abspath);
 
 /**
+ * Returns an encoded logical filename that can be used to refer to a file on a named data plane.
+ *
+ * @param planeName     The storage plane name. Only planes of category 'lz' are currently supported.
+ * @param path          The file path. Relative paths are interpreted under the plane prefix. Absolute paths must
+ *                      start with the plane prefix.
+ * @param abspath       Should a tilde (~) be prepended to the resulting logical file name. Defaults to TRUE.
+ * @return              The encoded logical filename.
+ */
+
+EXPORT varstring PlaneLogicalFileName(varstring planeName, varstring path, boolean abspath=TRUE) :=
+    lib_fileservices.FileServices.PlaneLogicalFileName(planeName, path, abspath);
+
+/**
  * Returns a string containing the description information associated with the specified filename. This description
  * is set either through ECL watch or by using the FileServices.SetFileDescription function.
  *
@@ -193,13 +218,14 @@ EXPORT SetFileDescription(varstring lfn, varstring val) :=
  * Returns a dataset containing a list of files from the specified machineIP and directory.
  *
  * @param machineIP     The IP address of the remote machine.
- * @param directory     The path to the directory to read. This must be in the appropriate format for the operating
+ * @param dir           The path to the directory to read. This must be in the appropriate format for the operating
  *                      system running on the remote machine.
  * @param mask          The filemask specifying which files to include in the result. Defaults to '*' (all files).
  * @param recurse       Whether to include files from subdirectories under the directory. Defaults to FALSE.
+ * @param planeName     The name of the data plane containing the file.
  */
-EXPORT dataset(FsFilenameRecord) RemoteDirectory(varstring machineIP, varstring dir, varstring mask='*', boolean recurse=FALSE) :=
-    lib_fileservices.FileServices.RemoteDirectory(machineIP, dir, mask, recurse);
+EXPORT dataset(FsFilenameRecord) RemoteDirectory(varstring machineIP, varstring dir, varstring mask='*', boolean recurse=FALSE, varstring planeName='') :=
+    lib_fileservices.FileServices.RemoteDirectory(machineIP, dir, mask, recurse, planeName);
 
 /**
  * Returns a dataset of information about the logical files known to the system.
@@ -212,7 +238,92 @@ EXPORT dataset(FsFilenameRecord) RemoteDirectory(varstring machineIP, varstring 
  *                      locally.  Defaults to blank.
  */
 EXPORT dataset(FsLogicalFileInfoRecord) LogicalFileList(varstring namepattern='*', boolean includenormal=TRUE, boolean includesuper=FALSE, boolean unknownszero=FALSE, varstring foreigndali='') :=
-    lib_fileservices.FileServices.LogicalFileList(namepattern, includenormal, includesuper, unknownszero, foreigndali);
+    lib_fileservices.FileServices.LogicalFileList(namepattern, includenormal, includesuper, unknownszero, foreigndali)
+    : DEPRECATED('Use Std.File.LogicalFileListFiltered for enhanced filtering and count information');
+
+/**
+ * Returns information about logical files known to the system, including count and limit breach status.
+ * This function supports file limits, filtering, and field projection for efficient data retrieval.
+ *
+ * @param namepattern   The mask of the files to list. Defaults to '*' (all files).
+ * @param filters       Filter string using search-like syntax for complex queries. Defaults to blank.
+ *                      Multiple filters separated by commas. Supports:
+ *
+ *                      Field matching:
+ *                        field:value          - Exact wildcard match (owner:jsmith, name:*test*)
+ *                        !field:value         - Negation (not matching)
+ *
+ *                      Numeric comparisons:
+ *                        field>value          - Greater than (size>1000000, recordcount>0)
+ *                        field<value          - Less than (size<1000)
+ *                        field>=value         - Greater than or equal
+ *                        field<=value         - Less than or equal
+ *                        field=value          - Exact match (recordcount=0)
+ *
+ *                      String comparisons:
+ *                        modified>2024-01-01  - Date/string greater than
+ *                        modified<2024-12-31  - Date/string less than
+ *
+ *                      Property checks:
+ *                        has:propertyname     - Property exists
+ *                        !has:propertyname    - Property does not exist
+ *
+ *                      File type:
+ *                        is:superfile         - Superfiles only
+ *                        is:normal            - Normal files only
+ *                        is:any               - All file types (default)
+ *
+ *                      Common fields: owner, cluster, name, size, recordcount, modified, recordsize, numparts
+ *
+ *                      Examples:
+ *                        'owner:jsmith'                         - Files owned by jsmith
+ *                        'owner:*doe'                           - Owner ends with 'doe'
+ *                        'size>100000000'                       - Files larger than 100MB
+ *                        'recordcount>0'                        - Files with records
+ *                        'is:superfile'                         - Superfiles only
+ *                        'is:normal !has:description'           - Normal files without description
+ *                        'owner:jsmith size>1000000'            - Multiple filters (AND logic)
+ *                        'modified>2024-01-01 is:normal'        - Recent normal files
+ * @param fields        Comma-separated list of field names to include in the result. Defaults to blank (all default fields).
+ *                      When blank or empty, returns default fields: name, modified, size, rowcount, cluster, superfile, owner.
+ *                      Available fields: name, modified, size, rowcount, cluster, superfile, owner, recordsize, numparts.
+ *                      Note: 'name' field is always included regardless of specification.
+ *                      Examples:
+ *                        ''                   - Default fields (backward compatible)
+ *                        'name,size'          - Only name and size
+ *                        'name,superfile,owner' - Name, superfile flag, and owner
+ * @param unknownszero  Whether to set file sizes that are unknown to zero(0) instead of minus-one (-1). Defaults to FALSE.
+ * @param remoteDfs     The name of the remote DFS service to perform the lookup on. If blank then the list is
+ *                      resolved locally. Defaults to blank. (Not yet supported; specifying this will raise an error.)
+ * @param maxFileLimit  Maximum number of files to return. Set to -1 to use server default limit (100,000).
+ *                      Maximum client-side limit is 1,000,000. Defaults to -1.
+ * @return              A record containing:
+ *                      - count: Number of files returned
+ *                      - limitBreached: TRUE if more files match than the limit allows
+ *                      - files: Dataset of file information records
+ *
+ * Example usage:
+ *   IMPORT Std;
+ *
+ *   // List all files
+ *   result1 := Std.File.LogicalFileListFiltered();
+ *   OUTPUT(result1.count);
+ *   OUTPUT(result1.files);
+ *
+ *   // List with limit
+ *   result2 := Std.File.LogicalFileListFiltered(maxFileLimit := 100);
+ *
+ *   // List files > 100MB
+ *   result3 := Std.File.LogicalFileListFiltered(filters := 'size>100000000');
+ *
+ *   // List superfiles owned by jsmith
+ *   result4 := Std.File.LogicalFileListFiltered(filters := 'owner:jsmith,is:superfile');
+ *
+ *   // List normal files without description, modified recently
+ *   result5 := Std.File.LogicalFileListFiltered(filters := 'is:normal,!has:description,modified>2024-01-01');
+ */
+EXPORT lib_fileservices.FsLogicalFileListResult LogicalFileListFiltered(varstring namepattern='*', varstring filters='', varstring fields='', boolean unknownszero=FALSE, varstring remoteDfs='', integer8 maxFileLimit=-1) :=
+    lib_fileservices.FileServices.LogicalFileListFiltered(namepattern, filters, fields, unknownszero, remoteDfs, maxFileLimit);
 
 /**
  * Compares two files, and returns a result indicating how well they match.
@@ -346,9 +457,10 @@ EXPORT RfsAction(varstring server, varstring query) :=
  * @param location      The IP address of the remote machine.
  * @param frompath      The path/name of the file to move.
  * @param topath        The path/name of the target file.
+ * @param planename     The name of the data plane containing the file.
  */
-EXPORT MoveExternalFile(varstring location, varstring frompath, varstring topath) :=
-    lib_fileservices.FileServices.MoveExternalFile(location, frompath, topath);
+EXPORT MoveExternalFile(varstring location, varstring frompath, varstring topath, varstring planename='') :=
+    lib_fileservices.FileServices.MoveExternalFile(location, frompath, topath, planename);
 
 /**
  * Removes a single physical file from a remote machine. The
@@ -356,9 +468,10 @@ EXPORT MoveExternalFile(varstring location, varstring frompath, varstring topath
  *
  * @param location      The IP address of the remote machine.
  * @param path          The path/name of the file to remove.
+ * @param planename     The name of the data plane containing the file.
  */
-EXPORT DeleteExternalFile(varstring location, varstring path) :=
-    lib_fileservices.FileServices.DeleteExternalFile(location, path);
+EXPORT DeleteExternalFile(varstring location, varstring path, varstring planename='') :=
+    lib_fileservices.FileServices.DeleteExternalFile(location, path, planename);
 
 /**
  * Creates the path on the location (if it does not already exist). The
@@ -366,9 +479,10 @@ EXPORT DeleteExternalFile(varstring location, varstring path) :=
  *
  * @param location      The IP address of the remote machine.
  * @param path          The path/name of the file to remove.
+ * @param planename     The name of the data plane containing the directory.
  */
-EXPORT CreateExternalDirectory(varstring location, varstring path) :=
-    lib_fileservices.FileServices.CreateExternalDirectory(location, path);
+EXPORT CreateExternalDirectory(varstring location, varstring path, varstring planename='') :=
+    lib_fileservices.FileServices.CreateExternalDirectory(location, path, planename);
 
 /**
  * Returns the value of the given attribute for the specified logicalfilename.
@@ -419,11 +533,14 @@ EXPORT DfuPlusExec(varstring cmdline) :=
  * @param failIfNoSourceFile If TRUE it causes a missing source file to trigger a failure.  Defaults to FALSE.
  * @param expireDays    Number of days to auto-remove file. Default is -1, not expire.
  * @param dfuServerQueue Name of target DFU Server queue. Default is '' (empty) for the first DFU queue in the environment.
- * @param noSplit      Don't split a file part to multiple target parts. Default is FALSE.
+ * @param noSplit       Don't split a file part to multiple target parts. Default is FALSE.
+ * @param sourcePlane   The name of the landing zone containing the file.
+ * @param destinationNumParts Override the number of parts to be created when spraying.
+ * @param noCommon      Set to FALSE to enable commoning up of puller or pusher processes on same host. Default is TRUE.
  * @return              The DFU workunit id for the job.
  */
-EXPORT varstring fSprayFixed(varstring sourceIP, varstring sourcePath, integer4 recordSize, varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE) :=
-    lib_fileservices.FileServices.fSprayFixed(sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit);
+EXPORT varstring fSprayFixed(varstring sourceIP='', varstring sourcePath, integer4 recordSize, varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, varstring sourcePlane='', unsigned4 destinationNumParts=0) :=
+    lib_fileservices.FileServices.fSprayFixed(sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts);
 
 /**
  * Same as fSprayFixed, but does not return the DFU Workunit ID.
@@ -431,16 +548,16 @@ EXPORT varstring fSprayFixed(varstring sourceIP, varstring sourcePath, integer4 
  * @see fSprayFixed
  */
 
-EXPORT SprayFixed(varstring sourceIP, varstring sourcePath, integer4 recordSize, varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE) :=
-    lib_fileservices.FileServices.SprayFixed(sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit);
+EXPORT SprayFixed(varstring sourceIP='', varstring sourcePath, integer4 recordSize, varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, varstring sourcePlane='', unsigned4 destinationNumParts=0, boolean noCommon=GetNoCommonDefault()) :=
+    lib_fileservices.FileServices.SprayFixed(sourceIP, sourcePath, recordSize, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
 
 // fSprayVariable is now called fSprayDelimited (but the old name is available for backward compatibility)
-EXPORT varstring fSprayVariable(varstring sourceIP, varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceCsvSeparate='\\,', varstring sourceCsvTerminate='\\n,\\r\\n', varstring sourceCsvQuote='\"', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, varstring sourceCsvEscape='', boolean failIfNoSourceFile=FALSE, boolean recordStructurePresent=FALSE, boolean quotedTerminator=TRUE, varstring encoding='ascii', integer4 expireDays=-1, varstring dfuServerQueue='', boolean noSplit=FALSE) :=
-    lib_fileservices.FileServices.fSprayVariable(sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, sourceCsvEscape, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit);
+EXPORT varstring fSprayVariable(varstring sourceIP='', varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceCsvSeparate='\\,', varstring sourceCsvTerminate='\\n,\\r\\n', varstring sourceCsvQuote='\"', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, varstring sourceCsvEscape='', boolean failIfNoSourceFile=FALSE, boolean recordStructurePresent=FALSE, boolean quotedTerminator=TRUE, varstring encoding='ascii', integer4 expireDays=-1, varstring dfuServerQueue='', boolean noSplit=FALSE, varstring sourcePlane='', unsigned4 destinationNumParts=0, boolean noCommon=GetNoCommonDefault()) :=
+    lib_fileservices.FileServices.fSprayVariable(sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, sourceCsvEscape, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
 
 // SprayVariable is now called SprayDelimited (but the old name is available for backward compatibility)
-EXPORT SprayVariable(varstring sourceIP, varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceCsvSeparate='\\,', varstring sourceCsvTerminate='\\n,\\r\\n', varstring sourceCsvQuote='\"', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, varstring sourceCsvEscape='', boolean failIfNoSourceFile=FALSE, boolean recordStructurePresent=FALSE, boolean quotedTerminator=TRUE, varstring encoding='ascii', integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE) :=
-    lib_fileservices.FileServices.SprayVariable(sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, sourceCsvEscape, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit);
+EXPORT SprayVariable(varstring sourceIP='', varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceCsvSeparate='\\,', varstring sourceCsvTerminate='\\n,\\r\\n', varstring sourceCsvQuote='\"', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, varstring sourceCsvEscape='', boolean failIfNoSourceFile=FALSE, boolean recordStructurePresent=FALSE, boolean quotedTerminator=TRUE, varstring encoding='ascii', integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, varstring sourcePlane='', unsigned4 destinationNumParts=0, boolean noCommon=GetNoCommonDefault()) :=
+    lib_fileservices.FileServices.SprayVariable(sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, sourceCsvEscape, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
 
 /**
  * Sprays a file of fixed delimited records from a single machine and distributes it across the nodes of the
@@ -466,16 +583,19 @@ EXPORT SprayVariable(varstring sourceIP, varstring sourcePath, integer4 sourceMa
  * @param recordStructurePresent If TRUE derives the record structure from the header of the file.
  * @param quotedTerminator Can the terminator character be included in a quoted field.  Defaults to TRUE.
  *                      If FALSE it allows quicker partitioning of the file (avoiding a complete file scan).
- * @param encoding      A null-terminated string containing the encoding. 
- *                      Can be set to one of the following: 
+ * @param encoding      A null-terminated string containing the encoding.
+ *                      Can be set to one of the following:
  *                      ascii, utf8, utf8n, utf16, utf16le, utf16be, utf32, utf32le,utf32be. If omitted, the default is ascii.
  * @param expireDays    Number of days to auto-remove file. Default is -1, not expire.
  * @param dfuServerQueue Name of target DFU Server queue. Default is '' (empty) for the first DFU queue in the environment.
  * @param noSplit      Don't split a file part to multiple target parts. Default is FALSE.
+ * @param sourcePlane   The name of the landing zone containing the file.
+ * @param destinationNumParts Override the number of parts to be created when spraying.
+ * @param noCommon      Set to FALSE to enable commoning up of puller or pusher processes on same host. Default is TRUE.
  * @return              The DFU workunit id for the job.
  */
-EXPORT varstring fSprayDelimited(varstring sourceIP, varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceCsvSeparate='\\,', varstring sourceCsvTerminate='\\n,\\r\\n', varstring sourceCsvQuote='\"', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, varstring sourceCsvEscape='', boolean failIfNoSourceFile=FALSE, boolean recordStructurePresent=FALSE, boolean quotedTerminator=TRUE, varstring encoding='ascii', integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE) :=
-    lib_fileservices.FileServices.fSprayVariable(sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, sourceCsvEscape, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit);
+EXPORT varstring fSprayDelimited(varstring sourceIP='', varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceCsvSeparate='\\,', varstring sourceCsvTerminate='\\n,\\r\\n', varstring sourceCsvQuote='\"', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, varstring sourceCsvEscape='', boolean failIfNoSourceFile=FALSE, boolean recordStructurePresent=FALSE, boolean quotedTerminator=TRUE, varstring encoding='ascii', integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, varstring sourcePlane='', unsigned4 destinationNumParts=0, boolean noCommon=GetNoCommonDefault()) :=
+    lib_fileservices.FileServices.fSprayVariable(sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, sourceCsvEscape, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
 
 /**
  * Same as fSprayDelimited, but does not return the DFU Workunit ID.
@@ -483,8 +603,8 @@ EXPORT varstring fSprayDelimited(varstring sourceIP, varstring sourcePath, integ
  * @see fSprayDelimited
  */
 
-EXPORT SprayDelimited(varstring sourceIP, varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceCsvSeparate='\\,', varstring sourceCsvTerminate='\\n,\\r\\n', varstring sourceCsvQuote='\"', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, varstring sourceCsvEscape='', boolean failIfNoSourceFile=FALSE, boolean recordStructurePresent=FALSE, boolean quotedTerminator=TRUE, const varstring encoding='ascii', integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE) :=
-    lib_fileservices.FileServices.SprayVariable(sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, sourceCsvEscape, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit);
+EXPORT SprayDelimited(varstring sourceIP='', varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceCsvSeparate='\\,', varstring sourceCsvTerminate='\\n,\\r\\n', varstring sourceCsvQuote='\"', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, varstring sourceCsvEscape='', boolean failIfNoSourceFile=FALSE, boolean recordStructurePresent=FALSE, boolean quotedTerminator=TRUE, const varstring encoding='ascii', integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, varstring sourcePlane='', unsigned4 destinationNumParts=0, boolean noCommon=GetNoCommonDefault()) :=
+    lib_fileservices.FileServices.SprayVariable(sourceIP, sourcePath, sourceMaxRecordSize, sourceCsvSeparate, sourceCsvTerminate, sourceCsvQuote, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, sourceCsvEscape, failIfNoSourceFile, recordStructurePresent, quotedTerminator, encoding, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
 
 
 
@@ -509,11 +629,14 @@ EXPORT SprayDelimited(varstring sourceIP, varstring sourcePath, integer4 sourceM
  * @param expireDays    Number of days to auto-remove file. Default is -1, not expire.
  * @param dfuServerQueue Name of target DFU Server queue. Default is '' (empty) for the first DFU queue in the environment.
  * @param noSplit      Don't split a file part to multiple target parts. Default is FALSE.
+ * @param sourcePlane   The name of the landing zone containing the file.
+ * @param destinationNumParts Override the number of parts to be created when spraying.
+ * @param noCommon      Set to FALSE to enable commoning up of puller or pusher processes on same host. Default is TRUE.
  * @return              The DFU workunit id for the job.
  */
 
-EXPORT varstring fSprayXml(varstring sourceIP, varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceRowTag, varstring sourceEncoding='utf8', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE) :=
-    lib_fileservices.FileServices.fSprayXml(sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit);
+EXPORT varstring fSprayXml(varstring sourceIP='', varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceRowTag, varstring sourceEncoding='utf8', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, varstring sourcePlane='', unsigned4 destinationNumParts=0, boolean noCommon=GetNoCommonDefault()) :=
+    lib_fileservices.FileServices.fSprayXml(sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
 
 /**
  * Same as fSprayXml, but does not return the DFU Workunit ID.
@@ -521,8 +644,8 @@ EXPORT varstring fSprayXml(varstring sourceIP, varstring sourcePath, integer4 so
  * @see fSprayXml
  */
 
-EXPORT SprayXml(varstring sourceIP, varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceRowTag, varstring sourceEncoding='utf8', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE) :=
-    lib_fileservices.FileServices.SprayXml(sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit);
+EXPORT SprayXml(varstring sourceIP='', varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceRowTag, varstring sourceEncoding='utf8', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, varstring sourcePlane='', unsigned4 destinationNumParts=0, boolean noCommon=GetNoCommonDefault()) :=
+    lib_fileservices.FileServices.SprayXml(sourceIP, sourcePath, sourceMaxRecordSize, sourceRowTag, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, sourcePlane, destinationNumParts, noCommon);
 
 
 
@@ -551,11 +674,14 @@ EXPORT SprayXml(varstring sourceIP, varstring sourcePath, integer4 sourceMaxReco
  *                      indicates that no user authentication is required; OPTIONAL, defaults to an empty string
  * @param userPw        String containing the password to be used with the user cited in the username argument; if username is
  *                      empty then this will be ignored; OPTIONAL, defaults to an empty string
+ * @param sourcePlane   The name of the landing zone containing the file.
+ * @param destinationNumParts Override the number of parts to be created when spraying.
+ * @param noCommon      Set to FALSE to enable commoning up of puller or pusher processes on same host. Default is TRUE.
  * @return              The DFU workunit id for the job.
  */
 
-EXPORT varstring fSprayJson(varstring sourceIP, varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceRowPath='/', varstring sourceEncoding='utf8', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, const varstring username = '', const varstring userPw = '') :=
-    lib_fileservices.FileServices.fSprayJson(sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw);
+EXPORT varstring fSprayJson(varstring sourceIP='', varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceRowPath='/', varstring sourceEncoding='utf8', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, const varstring username = '', const varstring userPw = '', varstring sourcePlane='', unsigned4 destinationNumParts=0, boolean noCommon=GetNoCommonDefault()) :=
+    lib_fileservices.FileServices.fSprayJson(sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, sourcePlane, destinationNumParts, noCommon);
 
 
 /**
@@ -564,8 +690,8 @@ EXPORT varstring fSprayJson(varstring sourceIP, varstring sourcePath, integer4 s
  * @see fSprayJson
  */
 
-EXPORT SprayJson(varstring sourceIP, varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceRowPath='/', varstring sourceEncoding='utf8', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=FALSE, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, const varstring username = '', const varstring userPw = '') :=
-    lib_fileservices.FileServices.SprayJson(sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw);
+EXPORT SprayJson(varstring sourceIP='', varstring sourcePath, integer4 sourceMaxRecordSize=8192, varstring sourceRowPath='/', varstring sourceEncoding='utf8', varstring destinationGroup, varstring destinationLogicalName, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean compress=__CONTAINERIZED__, boolean failIfNoSourceFile=FALSE, integer4 expireDays=-1, const varstring dfuServerQueue='', boolean noSplit=FALSE, const varstring username = '', const varstring userPw = '', varstring sourcePlane='', unsigned4 destinationNumParts=0, boolean noCommon=GetNoCommonDefault()) :=
+    lib_fileservices.FileServices.SprayJson(sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, sourcePlane, destinationNumParts, noCommon);
 
 
 /**
@@ -582,8 +708,8 @@ EXPORT SprayJson(varstring sourceIP, varstring sourcePath, integer4 sourceMaxRec
  * @return              The DFU workunit id for the job.
  */
 
-EXPORT varstring fDespray(varstring logicalName, varstring destinationIP, varstring destinationPath, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE) :=
-    lib_fileservices.FileServices.fDespray(logicalName, destinationIP, destinationPath, timeOut, espServerIpPort, maxConnections, allowOverwrite);
+EXPORT varstring fDespray(varstring logicalName, varstring destinationIP='', varstring destinationPath, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, varstring destinationPlane='') :=
+    lib_fileservices.FileServices.fDespray(logicalName, destinationIP, destinationPath, timeOut, espServerIpPort, maxConnections, allowOverwrite, destinationPlane);
 
 /**
  * Same as fDespray, but does not return the DFU Workunit ID.
@@ -591,13 +717,13 @@ EXPORT varstring fDespray(varstring logicalName, varstring destinationIP, varstr
  * @see fDespray
  */
 
-EXPORT Despray(varstring logicalName, varstring destinationIP, varstring destinationPath, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE) :=
-    lib_fileservices.FileServices.Despray(logicalName, destinationIP, destinationPath, timeOut, espServerIpPort, maxConnections, allowOverwrite);
+EXPORT Despray(varstring logicalName, varstring destinationIP='', varstring destinationPath, integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, varstring destinationPlane='') :=
+    lib_fileservices.FileServices.Despray(logicalName, destinationIP, destinationPath, timeOut, espServerIpPort, maxConnections, allowOverwrite, destinationPlane);
 
 /**
  * Copies a distributed file to another distributed file.
  *
- * @param sourceLogicalName The name of the file to despray.
+ * @param sourceLogicalName The name of the file to copy.
  * @param destinationGroup The name of the group to distribute the file across.
  * @param destinationLogicalName The logical name of the file to create.
  * @param sourceDali    The dali that contains the source file (blank implies same dali).  Defaults to same dali.
@@ -616,11 +742,13 @@ EXPORT Despray(varstring logicalName, varstring destinationIP, varstring destina
  * @param transferBufferSize Overrides the size (in bytes) of the internal buffer used to copy the file.  Default is 64k.
  * @param noSplit       Don't split a file part to multiple target parts. Default is FALSE.
  * @param expireDays    Number of days to auto-remove file. Default is -1, not expire.
+ * @param ensure        Only copy file parts if not copied. Defaults to FALSE.
+ * @param wrap          Should the fileparts be wrapped when copying to a smaller sized cluster?  The default is FALSE.
  * @return              The DFU workunit id for the job.
  */
 
-EXPORT varstring fCopy(varstring sourceLogicalName, varstring destinationGroup, varstring destinationLogicalName, varstring sourceDali='', integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean asSuperfile=FALSE, boolean compress=FALSE, boolean forcePush=FALSE, integer4 transferBufferSize=0, boolean preserveCompression=TRUE, boolean noSplit=FALSE, integer4 expireDays=-1) :=
-    lib_fileservices.FileServices.fCopy(sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays);
+EXPORT varstring fCopy(varstring sourceLogicalName, varstring destinationGroup, varstring destinationLogicalName, varstring sourceDali='', integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean asSuperfile=FALSE, boolean compress=FALSE, boolean forcePush=FALSE, integer4 transferBufferSize=0, boolean preserveCompression=TRUE, boolean noSplit=FALSE, integer4 expireDays=-1, boolean ensure=false, boolean wrap=false, varstring keyCompression='') :=
+    lib_fileservices.FileServices.fCopy(sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, wrap, keyCompression);
 
 /**
  * Same as fCopy, but does not return the DFU Workunit ID.
@@ -628,8 +756,8 @@ EXPORT varstring fCopy(varstring sourceLogicalName, varstring destinationGroup, 
  * @see fCopy
  */
 
-EXPORT Copy(varstring sourceLogicalName, varstring destinationGroup, varstring destinationLogicalName, varstring sourceDali='', integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean asSuperfile=FALSE, boolean compress=FALSE, boolean forcePush=FALSE, integer4 transferBufferSize=0, boolean preserveCompression=TRUE, boolean noSplit=FALSE, integer4 expireDays=-1) :=
-    lib_fileservices.FileServices.Copy(sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays);
+EXPORT Copy(varstring sourceLogicalName, varstring destinationGroup, varstring destinationLogicalName, varstring sourceDali='', integer4 timeOut=-1, varstring espServerIpPort=GETENV('ws_fs_server'), integer4 maxConnections=-1, boolean allowOverwrite=FALSE, boolean replicate=FALSE, boolean asSuperfile=FALSE, boolean compress=FALSE, boolean forcePush=FALSE, integer4 transferBufferSize=0, boolean preserveCompression=TRUE, boolean noSplit=FALSE, integer4 expireDays=-1, boolean ensure=false, boolean wrap=false, varstring keyCompression='') :=
+    lib_fileservices.FileServices.Copy(sourceLogicalName, destinationGroup, destinationLogicalName, sourceDali, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, asSuperfile, compress, forcePush, transferBufferSize, preserveCompression, noSplit, expireDays, ensure, wrap, keyCompression);
 
 /**
  * Ensures the specified file is replicated to its mirror copies.
@@ -805,6 +933,7 @@ EXPORT boolean SuperFileExists(varstring superName) :=
  * Deletes the superfile.
  *
  * @param superName     The logical name of the superfile.
+ * @param deletesub     Whether to delete subfiles. Default is FALSE.
  *
  * @see FileExists
  */
@@ -1028,7 +1157,22 @@ EXPORT varstring GetEspURL(const varstring username = '', const varstring userPW
 EXPORT varstring GetDefaultDropZone() :=
     lib_fileservices.FileServices.GetDefaultDropZone();
 
+
  /**
+ * Returns the name of the default Drop Zone
+ *
+ *
+ * @return              A string containing the name of the default Drop Zone.
+ *                      If more than one Drop Zone
+ *                      process is defined then the first found will
+ *                      be returned; will return an empty string if a Drop Zone
+ *                      cannot be found
+ */
+EXPORT varstring GetDefaultDropZoneName() :=
+    lib_fileservices.FileServices.GetDefaultDropZoneName();
+
+
+    /**
  * Returns a dataset with full paths to all Drop Zones
  *
  *
@@ -1041,6 +1185,19 @@ EXPORT dataset(FsDropZoneRecord) GetDropZones() :=
     lib_fileservices.FileServices.GetDropZones();
 
 /**
+ * Returns a dataset with (name, path and hostname) for all landing zones (or Drop Zones)
+ * A enhanced version of GetDropZones()
+ *
+ *
+ * @return              A dataset containing all defined Drop Zone paths.
+ *                      Will return an empty dataset if a Drop Zone
+ *                      cannot be found
+ */
+
+EXPORT dataset(FsLandingZoneRecord) GetLandingZones() :=
+    lib_fileservices.FileServices.GetLandingZones();
+
+/**
  * Return the expire days property of the specified logical filename.
  *
  * @param lfn           The name of the logical file.
@@ -1049,19 +1206,19 @@ EXPORT dataset(FsDropZoneRecord) GetDropZones() :=
  *
  */
 
-EXPORT integer4 GetExpireDays(varstring lfn) := 
+EXPORT integer4 GetExpireDays(varstring lfn) :=
 	lib_fileservices.Fileservices.GetExpireDays(lfn);
-	
+
 
 /**
  * Set the expire days property of the specified logical filename.
  *
  * @param lfn           The name of the logical file.
  * @param expireDays    Number of days before file expired. 0 means using system expire value.
- *                      
+ *
  */
 
-EXPORT SetExpireDays(varstring lfn, integer4 expireDays) := 
+EXPORT SetExpireDays(varstring lfn, integer4 expireDays) :=
 	lib_fileservices.Fileservices.SetExpireDays(lfn, expireDays);
 
 /**
@@ -1071,7 +1228,7 @@ EXPORT SetExpireDays(varstring lfn, integer4 expireDays) :=
  *
  */
 
-EXPORT ClearExpireDays(varstring lfn) := 
+EXPORT ClearExpireDays(varstring lfn) :=
 	lib_fileservices.Fileservices.ClearExpireDays(lfn);
 
 END;

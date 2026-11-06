@@ -13,6 +13,11 @@
             name="localhost"
             netAddress="."/>
   <Switch name="Switch"/>
+  <cost currencyCode="USD"
+        perCpu="0.113"
+        storageAtRest="0.0135"
+        storageReads="0.0485"
+        storageWrites="0.0038"/>
  </Hardware>
  <Software>
   <DropZone build="_"
@@ -23,6 +28,7 @@
             name="mydropzone"
             umask="022"/>
   <RoxieCluster allFilesDynamic="true"
+                allowedPipePrograms="*"
                 blindLogging="false"
                 blobCacheMem="0"
                 build="_"
@@ -54,13 +60,12 @@
                 defaultStripLeadingWhitespace="1"
                 description="Roxie cluster"
                 directory="${RUNTIME_PATH}/myroxie"
-                diskReadBufferSize="65536"
                 doIbytiDelay="true"
                 enableHeartBeat="true"
                 enableKeyDiff="true"
                 enableSysLog="true"
                 fastLaneQueue="true"
-                fieldTranslationEnabled="payload"
+                fieldTranslationEnabled="payloadRemoveOnly"
                 flushJHtreeCacheOnOOM="true"
                 forceStdLog="false"
                 heapRetainMemory="false"
@@ -76,7 +81,6 @@
                 ldapPassword=""
                 ldapUser="roxie"
                 leafCacheMem="50"
-                linuxYield="false"
                 localFilesExpire="-1"
                 localSlave="true"
                 lockDali="false"
@@ -86,7 +90,7 @@
                 logQueueLen="512"
                 lowTimeout="10000"
                 maxBlockSize="10000000"
-                maxHttpConnectionRequests="10"
+                maxHttpConnectionRequests="0"
                 maxHttpKeepAliveWait="5000"
                 maxLocalFilesOpen="4000"
                 maxLockAttempts="5"
@@ -109,7 +113,6 @@
                 numDataCopies="1"
                 parallelAggregate="0"
                 perChannelFlowLimit="10"
-                pingInterval="60"
                 pluginsPath="${PLUGINS_PATH}"
                 preabortIndexReadsThreshold="100"
                 preabortKeyedJoinsThreshold="100"
@@ -119,7 +122,6 @@
                 reloadRetriesFailed="true"
                 remoteFilesExpire="3600000"
                 roxieMulticastEnabled="true"
-                serverSideCacheSize="0"
                 serverThreads="30"
                 simpleLocalKeyedJoins="true"
                 siteCertificate=""
@@ -142,8 +144,6 @@
                 traceLimit="10"
                 trapTooManyActiveQueries="true"
                 udpFlowSocketsSize="131071"
-                udpInlineCollation="false"
-                udpInlineCollationPacketLimit="50"
                 udpLocalWriteSocketSize="131071"
                 udpMaxRetryTimedoutReqs="0"
                 udpMaxSlotsPerClient="2147483647"
@@ -151,11 +151,8 @@
                 udpOutQsPriority="0"
                 udpQueueSize="100"
                 udpRequestToSendTimeout="5"
-                udpResendEnabled="false"
-                udpRetryBusySenders="0"
-                udpSendCompletedInData="false"
+                udpResendLostPackets="true"
                 udpSendQueueSize="50"
-                udpSnifferEnabled="true"
                 udpTraceLevel="1"
                 useHardLink="false"
                 useLogQueue="true"
@@ -218,8 +215,7 @@
                     monitorinterval="900"
                     monitorqueue="dfuserver_monitor_queue"
                     name="mydfuserver"
-                    queue="dfuserver_queue"
-                    transferBufferSize="65536">
+                    queue="dfuserver_queue">
    <Instance computer="localhost"
              directory="${RUNTIME_PATH}/mydfuserver"
              name="s1"
@@ -405,6 +401,11 @@
                          path="CodeSignAccess"
                          resource="CodeSignAccess"
                          service="ws_codesign"/>
+    <AuthenticateFeature authenticate="Yes"
+                         description="Access to DFS service"
+                         path="DfsAccess"
+                         resource="DfsAccess"
+                         service="ws_dfsservice"/>
     <Authenticate access="Read"
                   description="Root access to SMC service"
                   path="/"
@@ -649,6 +650,10 @@
                          path="CodeSignAccess"
                          resource="CodeSignAccess"
                          service="ws_codesign"/>
+    <AuthenticateFeature description="Access to DFS service"
+                         path="DfsAccess"
+                         resource="DfsAccess"
+                         service="ws_dfsservice"/>
     <ProcessFilters>
      <Platform name="Windows">
       <ProcessFilter name="any">
@@ -722,7 +727,8 @@
              throttleCPULimit="75"
              throttleDelayMs="5000"/>
   </DafilesrvProcess>
-  <ThorCluster autoAffinity="true"
+  <ThorCluster allowedPipePrograms="*"
+               autoAffinity="true"
                autoCopyBackup="false"
                build="_"
                buildSet="thor"
@@ -780,7 +786,7 @@
   <home>${HOME_DIR}</home>
   <blockname>HPCCSystems</blockname>
   <mpEnd>7500</mpEnd>
-  <group>${RUNTIME_USER}</group>
+  <group>${RUNTIME_GROUP}</group>
   <interface>*</interface>
   <mpSoMaxConn>128</mpSoMaxConn>
   <user>${RUNTIME_USER}</user>
@@ -948,6 +954,10 @@
                           path="CodeSignAccess"
                           resource="CodeSignAccess"
                           service="ws_codesign"/>
+    <AuthenticateFeature  description="Access to DFS service"
+                          path="DfsAccess"
+                          resource="DfsAccess"
+                          service="ws_dfsservice"/>
      <ProcessFilters>
       <Platform name="Windows">
        <ProcessFilter name="any">

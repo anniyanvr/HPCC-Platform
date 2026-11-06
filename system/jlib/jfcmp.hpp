@@ -15,8 +15,13 @@
     limitations under the License.
 ############################################################################## */
 
+#ifndef __JFCMP__
+#define __JFCMP__
+
 #include "platform.h"
 #include "jlzw.hpp"
+#include "jexcept.hpp"
+#include "jerror.hpp"
 
 #define COMMITTED ((size32_t)-1)
 
@@ -26,19 +31,19 @@ class jlib_decl CFcmpCompressor : public CSimpleInterfaceOf<ICompressor>
 {
 protected:
     size32_t blksz = 0;
-    size32_t bufalloc = 0;
     MemoryBuffer inma;      // equals blksize len
     MemoryBuffer *outBufMb = nullptr; // used when dynamic output buffer (when open() used)
     size32_t outBufStart = 0;
     byte *inbuf = nullptr;
     size32_t inmax = 0;         // remaining
     size32_t inlen = 0;
-    size32_t inlenblk = 0;      // set to COMMITTED when so
     bool trailing = false;
+    bool allowPartialWrites{true};
     byte *outbuf = nullptr;
     size32_t outlen = 0;
     size32_t wrmax = 0;
     size32_t dynamicOutSz = 0;
+    size32_t originalMax = 0;
 
     virtual void setinmax() = 0;
     virtual void flushcommitted() = 0;
@@ -49,7 +54,6 @@ protected:
         *(size32_t *)outbuf = 0;
         outlen = sizeof(size32_t);
         inlen = 0;
-        inlenblk = COMMITTED;
         setinmax();
     }
 
@@ -60,33 +64,15 @@ public:
         wrmax = 0;          // set at open
     }
 
-    virtual ~CFcmpCompressor()
+    virtual void open(void *buf, size32_t max, size32_t fixedRowSize, bool _allowPartialWrites) override
     {
-        if (bufalloc)
-            free(outbuf);
-    }
+        assertex(buf);
 
-    virtual void open(void *buf,size32_t max)
-    {
-        if (max<1024)
-            throw MakeStringException(-1,"CFcmpCompressor::open - block size (%d) not large enough", max);
         wrmax = max;
-        if (buf)
-        {
-            if (bufalloc)
-                free(outbuf);
-            bufalloc = 0;
-            outbuf = (byte *)buf;
-        }
-        else if (max>bufalloc)
-        {
-            if (bufalloc)
-                free(outbuf);
-            outbuf = (byte *)malloc(max);
-            if (!outbuf)
-                throw MakeStringException(-1,"CFcmpCompressor::open - out of memory, requesting %d bytes", max);
-            bufalloc = max;
-        }
+        originalMax = max;
+        allowPartialWrites = _allowPartialWrites;
+        outbuf = (byte *)buf;
+
         outBufMb = NULL;
         outBufStart = 0;
         dynamicOutSz = 0;
@@ -94,18 +80,12 @@ public:
         initCommon(max);
     }
 
-    virtual void open(MemoryBuffer &mb, size32_t initialSize)
+    virtual void open(MemoryBuffer &mb, size32_t initialSize, size32_t fixedRowSize) override
     {
         if (!initialSize)
             initialSize = FCMP_BUFFER_SIZE; // 1MB
-        if (initialSize<1024)
-            throw MakeStringException(-1,"CFcmpCompressor::open - block size (%d) not large enough", initialSize);
         wrmax = initialSize;
-        if (bufalloc)
-        {
-            free(outbuf);
-            bufalloc = 0;
-        }
+        allowPartialWrites = false; // buffer is always expanded to fit
         inbuf = (byte *)inma.ensureCapacity(initialSize);
         outBufMb = &mb;
         outBufStart = mb.length();
@@ -114,16 +94,18 @@ public:
         initCommon(initialSize);
     }
 
-    virtual void close()
+    virtual void close() override
     {
-        if (inlenblk!=COMMITTED)
+        //Protect against close() being called more than once on a compressor
+        if (!inbuf)
         {
-            inlen = inlenblk; // transaction failed
-            inlenblk = COMMITTED;
+            if (isDebugBuild())
+                throwUnexpectedX("CFCmpCompressor::close() called more than once");
+            return;
         }
         flushcommitted();
         size32_t totlen = outlen+sizeof(size32_t)+inlen;
-        assertex(blksz>=totlen);
+        assertex(totlen <= (dynamicOutSz ? dynamicOutSz : blksz));
         size32_t *tsize = (size32_t *)(outbuf+outlen);
         *tsize = inlen;
         memcpy(tsize+1,inbuf,inlen);
@@ -137,8 +119,9 @@ public:
         }
     }
 
-    size32_t write(const void *buf,size32_t len)
+    size32_t write(const void *buf,size32_t len) override
     {
+        size32_t savedInlen = inlen;
         // no more than wrmax per write (unless dynamically sizing)
         size32_t lenb = wrmax;
         byte *b = (byte *)buf;
@@ -150,14 +133,30 @@ public:
             if (lenb+inlen>inmax)
             {
                 if (trailing)
-                    return written;
-                flushcommitted();
+                {
+                    //There is not enough space to write the remaining data - either return amount writen, or unwind the write.
+                    if (allowPartialWrites)
+                        return written;
+
+                    inlen = savedInlen;
+                    return 0;
+                }
+
+                if (inlen == inmax)
+                    flushcommitted();
+
                 if (lenb+inlen>inmax)
                 {
                     if (outBufMb) // sizing input buffer, but outBufMb!=NULL is condition of whether in use or not
                     {
-                        blksz += len > FCMP_BUFFER_SIZE ? len : FCMP_BUFFER_SIZE;
-                        verifyex(inma.ensureCapacity(blksz));
+                        // How much space is required?
+                        size32_t delta = len + inlen - inmax;
+
+                        // round delta up to nearest FCMP_BUFFER_SIZE
+                        delta = ((delta + FCMP_BUFFER_SIZE - 1) / FCMP_BUFFER_SIZE) * FCMP_BUFFER_SIZE;
+
+                        // (inmax will increase less than blksz, so this may loop, but rounding the size will prevent excessive looping).
+                        verifyex(inma.ensureCapacity(blksz + delta));
                         blksz = inma.capacity();
                         inbuf = (byte *)inma.bufferBase();
                         wrmax = blksz;
@@ -179,38 +178,35 @@ public:
         return written;
     }
 
-    void * bufptr()
+    virtual bool supportsBlockCompression() const override { return false; }
+    virtual bool supportsIncrementalCompression() const override { return true; }
+
+    virtual size32_t compressBlock(size32_t destSize, void * dest, size32_t srcSize, const void * src) override
+    {
+        return 0;
+    }
+
+    virtual size32_t compressDirect(size32_t destSize, void * dest, size32_t srcSize, const void * src, size32_t * numCompressed) override
+    {
+        throwUnimplemented();
+    }
+
+    virtual void * bufptr() override
     {
         assertex(!inbuf);  // i.e. closed
         return outbuf;
     }
-
-    size32_t buflen()
-    {
-        assertex(!inbuf);  // i.e. closed
-        return outlen;
-    }
-
-    void startblock()
-    {
-        inlenblk = inlen;
-    }
-
-    void commitblock()
-    {
-        inlenblk = COMMITTED;
-    }
-
 };
 
 
-class jlib_decl CFcmpExpander : public CSimpleInterfaceOf<IExpander>
+class jlib_decl CFcmpExpander : public CExpanderBase
 {
 protected:
     byte *outbuf;
     size32_t outlen;
     size32_t bufalloc;
     const size32_t *in = nullptr;
+    const void * original = nullptr;
 
 public:
     CFcmpExpander()
@@ -228,54 +224,11 @@ public:
 
     virtual size32_t init(const void *blk)
     {
+        original = blk;
         const size32_t *expsz = (const size32_t *)blk;
         outlen = *expsz;
         in = (expsz+1);
         return outlen;
-    }
-
-    virtual void expand(void *buf)
-    {
-        if (!outlen)
-            return;
-        if (buf)
-        {
-            if (bufalloc)
-                free(outbuf);
-            bufalloc = 0;
-            outbuf = (unsigned char *)buf;
-        }
-        else if (outlen>bufalloc)
-        {
-            if (bufalloc)
-                free(outbuf);
-            bufalloc = outlen;
-            outbuf = (unsigned char *)malloc(bufalloc);
-            if (!outbuf)
-                throw MakeStringException(MSGAUD_operator,0, "Out of memory in FcmpExpander::expand, requesting %d bytes", bufalloc);
-        }
-        size32_t done = 0;
-        for (;;)
-        {
-            const size32_t szchunk = *in;
-            in++;
-            if (szchunk+done<outlen)
-            {
-                memcpy((byte *)buf+done, in, szchunk);
-                size32_t written = szchunk;
-                done += written;
-                if (!written||(done>outlen))
-                    throw MakeStringException(0, "FcmpExpander - corrupt data(1) %d %d",written,szchunk);
-            }
-            else
-            {
-                if (szchunk+done!=outlen)
-                    throw MakeStringException(0, "FcmpExpander - corrupt data(2) %d %d",szchunk,outlen);
-                memcpy((byte *)buf+done,in,szchunk);
-                break;
-            }
-            in = (const size32_t *)(((const byte *)in)+szchunk);
-        }
     }
 
     virtual void *bufptr() { return outbuf;}
@@ -333,11 +286,11 @@ public:
         MemoryAttr cmpma;
         byte *cmpbuf = (byte *)cmpma.allocate(sz[1]);
         if (baseio->read(cmpOffset,sz[1],cmpbuf)!=sz[1])
-            throw MakeStringException(-1,"CFcmpStream: file corrupt.1");
+            throw MakeStringException(JLIBERR_CompressCfcmpstreamFileCorrupt1,"CFcmpStream: file corrupt.1");
         memcpy(ma.bufferBase(), cmpbuf, sz[1]);
         size32_t amnt = sz[1];
         if (amnt!=bufsize)
-            throw MakeStringException(-1,"CFcmpStream: file corrupt.2");
+            throw MakeStringException(JLIBERR_CompressCfcmpstreamFileCorrupt2,"CFcmpStream: file corrupt.2");
         cmpOffset += sz[1];
         return true;
     }
@@ -393,7 +346,7 @@ public:
         if ((origin==IFScurrent)&&(pos==0))
             return;
         if ((origin==IFSbegin)||(pos!=0))
-            throw MakeStringException(-1,"CFcmpStream seek not supported");
+            throw MakeStringException(JLIBERR_CompressCfcmpstreamSeekNotSupported,"CFcmpStream seek not supported");
         expOffset = 0;
         bufpos = 0;
         bufsize = 0;
@@ -412,7 +365,7 @@ public:
     virtual size32_t read(size32_t len, void * data)
     {
         if (!reading)
-            throw MakeStringException(-1,"CFcmpStream read to stream being written");
+            throw MakeStringException(JLIBERR_CompressCfcmpstreamReadToStreamBeingWritten,"CFcmpStream read to stream being written");
         size32_t ret=0;
         while (len)
         {
@@ -437,7 +390,7 @@ public:
     virtual size32_t write(size32_t len, const void * data)
     {
         if (reading)
-            throw MakeStringException(-1,"CFcmpStream write to stream being read");
+            throw MakeStringException(JLIBERR_CompressCfcmpstreamWriteToStreamBeingRead,"CFcmpStream write to stream being read");
         size32_t ret = len;
         while (len+bufsize>FCMP_BUFFER_SIZE)
         {
@@ -468,4 +421,16 @@ public:
         }
     }
 
+    virtual unsigned __int64 getStatistic(StatisticKind kind)
+    {
+        return baseio->getStatistic(kind);
+    }
+
+    virtual void close() override
+    {
+        flush();
+        baseio->close();
+    }
 };
+
+#endif

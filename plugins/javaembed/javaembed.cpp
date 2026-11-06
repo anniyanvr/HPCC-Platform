@@ -28,7 +28,6 @@
 #include "rtlfield.hpp"
 #include "rtlds_imp.hpp"
 #include "jprop.hpp"
-#include "build-config.h"
 #include "roxiemem.hpp"
 #include "nbcd.hpp"
 #include "rtlformat.hpp"
@@ -788,7 +787,6 @@ static void setupGlobals(CheckedJNIEnv *J)
     }
     catch (IException *E)
     {
-        Owned<IException> e = E;
         throw makeWrappedExceptionV(E, E->errorCode(), "javaembed: Unable to load Java system classes - is classpath set properly?");
     }
 
@@ -804,8 +802,53 @@ static void setupGlobals(CheckedJNIEnv *J)
     }
     catch (IException *E)
     {
-        Owned<IException> e = E;
         throw makeWrappedExceptionV(E, E->errorCode(), "javaembed: Unable to find HPCC classes - is classpath set properly?");
+    }
+
+    try
+    {
+        const char *log4jLevel = nullptr;
+        const char *log4jPattern = nullptr;
+
+        if (isContainerized())
+        {
+            log4jLevel = getenv("HPCC_JAVA_EMBED_LOG4J_LEVEL");
+            log4jPattern = getenv("HPCC_JAVA_EMBED_LOG4J_PATTERN");
+        }
+        else
+        {
+            const IProperties &conf = queryEnvironmentConf();
+            log4jLevel = conf.queryProp("log4jLevel");
+            log4jPattern = conf.queryProp("log4jPattern");
+        }
+
+        // Only load log handler if log4jLevel is set
+        if (log4jLevel && *log4jLevel)
+        {
+            jclass logHandlerClass = J->FindClass("com/HPCCSystems/HpccLogHandler");
+            if (logHandlerClass)
+            {
+                jmethodID initialize = J->GetStaticMethodID(logHandlerClass, "initialize", "(Ljava/lang/String;Ljava/lang/String;)V");
+                if (initialize)
+                {
+                    jstring log4jLevelStr = J->NewStringUTF(log4jLevel);
+                    jstring log4jPatternStr = J->NewStringUTF(log4jPattern);
+
+                    J->CallStaticVoidMethod(logHandlerClass, initialize, log4jLevelStr, log4jPatternStr);
+
+                    J->DeleteLocalRef(log4jLevelStr);
+                    J->DeleteLocalRef(log4jPatternStr);
+                }
+            }
+        }
+        else if (log4jPattern && *log4jPattern)
+        {
+            DBGLOG("javaembed: Ignoring log4jPattern setting because log4jLevel was not set");
+        }
+    }
+    catch (IException *E)
+    {
+        throw makeWrappedExceptionV(E, E->errorCode(), "javaembed: Unable to find HpccLogHandler - is classpath set properly?");
     }
 }
 
@@ -839,7 +882,7 @@ public:
             queryJNIEnv()->DeleteGlobalRef(instance);
         }
     }
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     jobject instance = nullptr;
     StringAttr name;
     virtual const void * getKey() const { return name; }
@@ -899,6 +942,7 @@ public:
 
 static StringBuffer &appendClassPath(StringBuffer &classPath)
 {
+#ifndef _CONTAINERIZED
     const IProperties &conf = queryEnvironmentConf();
     if (conf.hasProp("classpath"))
     {
@@ -906,8 +950,9 @@ static StringBuffer &appendClassPath(StringBuffer &classPath)
         classPath.append(ENVSEPCHAR);
     }
     else
+#endif
     {
-        classPath.append(INSTALL_DIR).append(PATHSEPCHAR).append("classes").append(ENVSEPCHAR);
+        classPath.append(hpccBuildInfo.installDir).append(PATHSEPCHAR).append("classes").append(ENVSEPCHAR);
     }
     return classPath;
 }
@@ -931,6 +976,23 @@ public:
         newPath.append(".");
         optionStrings.append(newPath);
 
+        // Options we should set (but allow for override with jvmoptions below)
+        optionStrings.append("-XX:-UseLargePages");
+
+#ifdef _CONTAINERIZED
+        const char *jvmLibPath = getenv("JAVA_LIBRARY_PATH");
+        if (jvmLibPath)
+        {
+            VStringBuffer libPath("-Djava.library.path=%s", jvmLibPath);
+            optionStrings.append(libPath);
+        }
+        const char *jvmOptions = getenv("JVM_OPTIONS");
+        if (jvmOptions)
+        {
+            // Use space as field sep as ':' and ';' are valid
+            optionStrings.appendList(jvmOptions, " ");
+        }
+#else
         const IProperties &conf = queryEnvironmentConf();
         if (conf.hasProp("jvmlibpath"))
         {
@@ -939,20 +1001,19 @@ public:
             conf.getProp("jvmlibpath", libPath);
             optionStrings.append(libPath);
         }
-
-        // Options we should set (but allow for override with jvmoptions below)
-        optionStrings.append("-XX:-UseLargePages");
-
         if (conf.hasProp("jvmoptions"))
         {
             // Use space as field sep as ':' and ';' are valid
             optionStrings.appendList(conf.queryProp("jvmoptions"), " ");
         }
+#endif
 
         // Options we know we always want set
         optionStrings.append("-Xrs");
+
 #ifdef RLIMIT_STACK
         // JVM has a habit of reducing the stack limit on main thread to 1M - probably dates back to when it was actually an increase...
+        // is this different than -XX:ThreadStackSize ?
         StringBuffer stackOption("-Xss");
         struct rlimit limit;
         rlim_t slim = 0;
@@ -962,6 +1023,9 @@ public:
             slim = 8*1024*1024;
         if (slim >= 1*1024*1024)
         {
+            // 500m max resonable ?
+            if (slim >= 0x1f400000)
+                slim = 0x1f400000;
             stackOption.append((__uint64) slim);
             optionStrings.append(stackOption);
         }
@@ -1037,7 +1101,7 @@ public:
     static void unregister(const char *key);
     JavaVM *javaVM;       /* denotes a Java VM */
 private:
-    CriticalSection hashCrit;
+    CriticalSection hashCrit{SYNC_LOCATION};
     StringMapOf<PersistedObject> persistedObjects;
 
 } *globalState;
@@ -2102,7 +2166,7 @@ class JavaObjectXmlWriter : public CInterface
 {
 public:
     JavaObjectXmlWriter(CheckedJNIEnv *_JNIenv, jobject _obj, const char *_reqType, IEsdlDefinition &_esdl, const char *_esdlService, IXmlWriter &_writer)
-    : JNIenv(_JNIenv), obj(_obj), writer(_writer), esdl(_esdl), esdlService(_esdlService), reqType(_reqType)
+    : JNIenv(_JNIenv), javaClasses(), Class(nullptr), obj(_obj), writer(_writer), esdl(_esdl), reqType(_reqType), esdlService(_esdlService)
     {
         Class = (jclass) JNIenv->NewGlobalRef(JNIenv->GetObjectClass(obj), "class");
     }
@@ -2762,7 +2826,7 @@ public:
     class DefStackEntry : public CInterface
     {
     public:
-        DefStackEntry(const char *fieldname, IEsdlDefObject *_defType, IEsdlDefObject *_defObj) : name(fieldname), defType(_defType), defObj(_defObj), Class(0), obj(0), constructor(0), append(0), fieldId(0)
+        DefStackEntry(const char *fieldname, IEsdlDefObject *_defType, IEsdlDefObject *_defObj) : defType(_defType), defObj(_defObj), name(fieldname), Class(0), constructor(0), append(0), fieldId(0), obj(0)
         {
         }
         ~DefStackEntry()
@@ -3222,7 +3286,7 @@ class JavaEmbedImportContext : public CInterfaceOf<IJavaEmbedFunctionContext>
 {
 public:
     JavaEmbedImportContext(ICodeContext *codeCtx, JavaThreadContext *_sharedCtx, jobject _instance, unsigned _flags, const char *options, const IThorActivityContext *_activityContext)
-    : sharedCtx(_sharedCtx), JNIenv(sharedCtx->JNIenv), instance(_instance), flags(_flags), activityContext(_activityContext)
+    : sharedCtx(_sharedCtx), JNIenv(sharedCtx->JNIenv), instance(_instance), activityContext(_activityContext), flags(_flags)
     {
         argcount = 0;
         argsig = NULL;
@@ -3242,12 +3306,31 @@ public:
             }
         }
         StringBuffer lclassPath;
+        bool needSep = false;
         if (engine)
         {
-            const StringArray &manifestJars = engine->queryManifestFiles("jar");
+            StringArray manifestJars;
+            engine->getManifestFiles("jar", manifestJars);
             ForEachItemIn(idx, manifestJars)
             {
-                lclassPath.append(';').append(manifestJars.item(idx));
+                if (doTrace(traceJava))
+                    DBGLOG("Adding manifest file %s to classpath", manifestJars.item(idx));
+                const char *thisJar = manifestJars.item(idx);
+                if (thisJar)
+                {
+                    if (needSep)
+                        lclassPath.append(';');
+                    lclassPath.append(manifestJars.item(idx));
+                    needSep = true;
+                }
+                else
+                {
+                    if (needSep)
+                    {
+                        lclassPath.append('|');
+                        needSep = false;
+                    }
+                }
             }
         }
         ForEachItemIn(idx, opts)
@@ -3259,7 +3342,12 @@ public:
                 StringBuffer optName(val-opt, opt);
                 val++;
                 if (stricmp(optName, "classpath")==0)
-                    lclassPath.append(';').append(val);
+                {
+                    if (needSep)
+                        lclassPath.append('|');   // The | means we use a common classloader for the bit named by classpath
+                    lclassPath.append(val);
+                    needSep = true;
+                }
                 else if (strieq(optName, "globalscope"))
                     globalScopeKey.set(val);
                 else if (strieq(optName, "persist"))
@@ -3281,8 +3369,8 @@ public:
                     throw MakeStringException(0, "javaembed: Unknown option %s", optName.str());
             }
         }
-        if (lclassPath.length()>1)
-            classpath.set(lclassPath.str()+1);
+        if (lclassPath.length())
+            classpath.set(lclassPath);
         if (flags & EFthreadlocal)
             sharedCtx->registerContext(this);  // Do at end - otherwise an exception thrown during construction will leave this reference dangling
     }
@@ -3490,7 +3578,7 @@ public:
         size32_t outBytes = 0;
         if (numResults > 0)
         {
-            if (elemSize != UNKNOWN_LENGTH)
+            if (!isUnknownLength(elemSize))
             {
                 out.ensureAvailable(numResults * elemSize); // MORE - check for overflow?
                 outData = out.getbytes();
@@ -3544,7 +3632,7 @@ public:
                         switch (elemType)
                         {
                         case type_string:
-                            if (elemSize == UNKNOWN_LENGTH)
+                            if (isUnknownLength(elemSize))
                             {
                                 out.ensureAvailable(outBytes + lenBytes + sizeof(size32_t));
                                 outData = out.getbytes() + outBytes;
@@ -3556,7 +3644,7 @@ public:
                                 rtlStrToStr(elemSize, outData, lenBytes, text);
                             break;
                         case type_varstring:
-                            if (elemSize == UNKNOWN_LENGTH)
+                            if (isUnknownLength(elemSize))
                             {
                                 out.ensureAvailable(outBytes + lenBytes + 1);
                                 outData = out.getbytes() + outBytes;
@@ -3572,7 +3660,7 @@ public:
                             size32_t numchars = rtlUtf8Length(lenBytes, text);
                             if (elemType == type_utf8)
                             {
-                                assertex (elemSize == UNKNOWN_LENGTH);
+                                assertex (isUnknownLength(elemSize));
                                 out.ensureAvailable(outBytes + lenBytes + sizeof(size32_t));
                                 outData = out.getbytes() + outBytes;
                                 * (size32_t *) outData = numchars;
@@ -3581,7 +3669,7 @@ public:
                             }
                             else
                             {
-                                if (elemSize == UNKNOWN_LENGTH)
+                                if (isUnknownLength(elemSize))
                                 {
                                     // You can't assume that number of chars in utf8 matches number in unicode16 ...
                                     size32_t numchars16;
@@ -3605,7 +3693,7 @@ public:
                         }
                         JNIenv->ReleaseStringUTFChars(elem, text);
                         JNIenv->DeleteLocalRef(elem);
-                        if (elemSize != UNKNOWN_LENGTH)
+                        if (!isUnknownLength(elemSize))
                             outData += elemSize;
                     }
                 }
@@ -3618,7 +3706,7 @@ public:
             }
         }
         __isAllResult = false;
-        __resultBytes = elemSize == UNKNOWN_LENGTH ? outBytes : elemSize * numResults;
+        __resultBytes = isUnknownLength(elemSize) ? outBytes : elemSize * numResults;
         __result = out.detachdata();
     }
     virtual IRowStream *getDatasetResult(IEngineRowAllocator * _resultAllocator)
@@ -3914,7 +4002,7 @@ public:
                 argsig += 17;  // Yes, 17, because we increment again at the end of the case
                 const byte *inData = (const byte *) setData;
                 const byte *endData = inData + totalBytes;
-                if (elemSize == UNKNOWN_LENGTH)
+                if (isUnknownLength(elemSize))
                 {
                     numElems = 0;
                     // Will need 2 passes to work out how many elements there are in the set :(
@@ -3958,13 +4046,13 @@ public:
                         rtlDataAttr unicode;
                         rtlStrToUnicodeX(unicodeChars, unicode.refustr(), numChars, (const char *) inData);
                         thisElem = JNIenv->NewString(unicode.getustr(), unicodeChars);
-                        if (elemSize == UNKNOWN_LENGTH)
+                        if (isUnknownLength(elemSize))
                             thisSize = numChars + 1;
                         break;
                     }
                     case type_string:
                     {
-                        if (elemSize == UNKNOWN_LENGTH)
+                        if (isUnknownLength(elemSize))
                         {
                             thisSize = * (size32_t *) inData;
                             inData += sizeof(size32_t);
@@ -3977,7 +4065,7 @@ public:
                     }
                     case type_unicode:
                     {
-                        if (elemSize == UNKNOWN_LENGTH)
+                        if (isUnknownLength(elemSize))
                         {
                             thisSize = (* (size32_t *) inData) * sizeof(UChar); // NOTE - it's in chars...
                             inData += sizeof(size32_t);
@@ -3987,7 +4075,7 @@ public:
                     }
                     case type_utf8:
                     {
-                        assertex (elemSize == UNKNOWN_LENGTH);
+                        assertex (isUnknownLength(elemSize));
                         size32_t numChars = * (size32_t *) inData;
                         inData += sizeof(size32_t);
                         unsigned unicodeChars;
@@ -4382,7 +4470,10 @@ protected:
         JNIenv->ExceptionClear();
         jmethodID loadClassMethod = JNIenv->GetMethodID(JNIenv->GetObjectClass(classLoader), "loadClass","(Ljava/lang/String;)Ljava/lang/Class;");
         jstring classNameString = JNIenv->NewStringUTF(className);
+        CCycleTimer timer;
         jclass Class = (jclass) JNIenv->CallObjectMethod(classLoader, loadClassMethod, classNameString);
+        if (doTrace(traceJava, TraceFlags::Max))
+            DBGLOG("javaembed: loadClass(%s) took %u ms", className, timer.elapsedMs());
         return Class;
     }
 
@@ -4483,11 +4574,13 @@ protected:
                     jmethodID loadClassMethod = JNIenv->GetMethodID(JNIenv->GetObjectClass(classLoader), "loadClass","(Ljava/lang/String;)Ljava/lang/Class;");
                     try
                     {
+                        CCycleTimer timer;
                         javaClass = (jclass) JNIenv->CallObjectMethod(classLoader, loadClassMethod, JNIenv->NewStringUTF(classname));
+                        if (doTrace(traceJava))
+                            DBGLOG("javaembed: loading class %s took %u ms", classname.str(), timer.elapsedMs());
                     }
                     catch (IException *E)
                     {
-                        Owned<IException> e = E;
                         throw makeWrappedExceptionV(E, E->errorCode(), "Failed to resolve class name %s", classname.str());
                     }
                     javaClass = (jclass) JNIenv->NewGlobalRef(javaClass, "javaClass");
@@ -4686,7 +4779,7 @@ class JavaEmbedServiceContext : public CInterfaceOf<IEmbedServiceContext>
 {
 public:
     JavaEmbedServiceContext(JavaThreadContext *_sharedCtx, const char *service, const char *_options)
-    : sharedCtx(_sharedCtx), Class(0), options(_options), className(service), object(0)
+    : sharedCtx(_sharedCtx), className(service), Class(0), object(0), options(_options)
     {
         StringArray opts;
         opts.appendList(options, ",");
@@ -4718,8 +4811,16 @@ public:
         jmethodID loadClassMethod = sharedCtx->JNIenv->GetMethodID(sharedCtx->JNIenv->GetObjectClass(classLoader), "loadClass","(Ljava/lang/String;)Ljava/lang/Class;");
         jstring methodString = sharedCtx->JNIenv->NewStringUTF(className);
 
+        CCycleTimer timer;
         Class = (jclass) sharedCtx->JNIenv->NewGlobalRef(sharedCtx->JNIenv->CallObjectMethod(classLoader, loadClassMethod, methodString), "Class");
+        if (doTrace(traceJava))
+        {
+            DBGLOG("javaembed: loading class %s took %u ms", className.str(), timer.elapsedMs());
+            timer.reset();
+        }
         jmethodID constructor = sharedCtx->JNIenv->GetMethodID(Class, "<init>", "()V");
+        if (doTrace(traceJava))
+            DBGLOG("javaembed: constructor for %s took %u ms", className.str(), timer.elapsedMs());
         object = sharedCtx->JNIenv->NewGlobalRef(sharedCtx->JNIenv->NewObject(Class, constructor), "constructed");
     }
     virtual IEmbedFunctionContext *createFunctionContext(const char *function)
@@ -4949,7 +5050,15 @@ void doPrecompile(size32_t & __lenResult, void * & __result, const char *funcNam
     StringBuffer options(compilerOptions);
     if (isEmptyString(compilerOptions))
         options.append("-g:none");
-    appendClassPath(options.append(" -cp "));
+    options.append(" -cp ");
+    const char* origPath = getenv("CLASSPATH");
+    StringBuffer newPath;
+    if (origPath && *origPath)
+    {
+        options.append(origPath).append(ENVSEPCHAR);
+    }
+    appendClassPath(options);
+    options.append(".");
     VStringBuffer javac("javac %s %s", options.str(), javafile.str());
     if (!pipe->run("javac", javac, tmpDirName, false, false, true, 0, false))
     {

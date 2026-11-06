@@ -1,13 +1,14 @@
 import { Gauge } from "@hpcc-js/chart";
 import { Palette } from "@hpcc-js/common";
-import { GetTargetClusterUsageEx, MachineService } from "@hpcc-js/comms";
+import { WsMachineEx, MachineService, DFUXRefService, WsDFUXRefEx } from "@hpcc-js/comms";
 import { ColumnFormat, Table } from "@hpcc-js/dgrid";
 import { FlexGrid } from "@hpcc-js/layout";
+import { on as dojoOn } from "src-dojo/index";
 import nlsHPCC from "./nlsHPCC";
 
 Palette.rainbow("DiskUsage", ["green", "green", "green", "green", "green", "green", "green", "green", "orange", "red", "red"]);
 
-const connection = new MachineService({ baseUrl: "", timeoutSecs: 360 });
+const machineService = new MachineService({ baseUrl: "", timeoutSecs: 360 });
 
 interface CompontentT {
     rowCount: number;
@@ -16,7 +17,7 @@ interface CompontentT {
     max: number;
 }
 
-type DetailsT = GetTargetClusterUsageEx.TargetClusterUsage | CompontentT;
+type DetailsT = WsMachineEx.TargetClusterUsage | CompontentT;
 
 const calcPct = (val, tot) => Math.round((val / tot) * 100);
 
@@ -71,14 +72,10 @@ export class Summary extends FlexGrid {
                 ;
         }
         if (!hasGauge) {
-            this._loadingMsg && this._loadingMsg
-                .text(nlsHPCC.loadingMessage)
-                ;
+            this._loadingMsg?.text(nlsHPCC.loadingMessage);
         }
-        connection.GetTargetClusterUsageEx(this._targetCluster !== undefined ? [this._targetCluster] : undefined, bypassCachedResult).then(response => {
-            this._loadingMsg && this._loadingMsg
-                .html('<i class="fa fa-database"></i>')
-                ;
+        machineService.GetTargetClusterUsageEx(this._targetCluster !== undefined ? [this._targetCluster] : undefined, bypassCachedResult).then(response => {
+            this._loadingMsg?.html('<i class="fa fa-database"></i>');
             if (!this._targetCluster) {
                 response.forEach(details => {
                     if (!this._usage[details.Name]) {
@@ -156,6 +153,86 @@ export class Summary extends FlexGrid {
     }
 }
 
+export class ClusterGauge extends Gauge {
+    constructor(readonly _targetCluster: string) {
+        super();
+        this
+            .title(_targetCluster)
+            .showTick(true);
+    }
+
+    refresh(bypassCachedResult: boolean = false) {
+        machineService.GetTargetClusterUsageEx([this._targetCluster], bypassCachedResult).then(response => {
+            const details = response && response[0];
+            if (details) {
+                this
+                    .value((details.max || 0) / 100)
+                    .valueDescription(nlsHPCC.Max)
+                    .tickValue((details.mean || 0) / 100)
+                    .tickValueDescription(nlsHPCC.Mean)
+                    .tooltip(details.ComponentUsagesDescription)
+                    .render();
+            }
+        });
+        return this;
+    }
+}
+
+const netAddress = mu => mu.NetAddress !== "." ? mu.NetAddress : mu.Name;
+
+interface DirectoryEx {
+    Cluster: string;
+    Num: number;
+    Name: string;
+    MaxSize: number;
+    MaxIP: string;
+    MinSize: number;
+    MinIP: string;
+    Size: number;
+    PositiveSkew: string;
+}
+
+interface XREFDirectories {
+    nodes: WsDFUXRefEx.XRefNode[];
+    directories: DirectoryEx[];
+}
+
+function xrefDirectory(cluster: string): Promise<WsDFUXRefEx.DFUXRefDirectoriesQueryResponseEx> {
+    const service = new DFUXRefService({ baseUrl: "" });
+    return service.DFUXRefDirectoriesEx({ Cluster: cluster }).catch(e => {
+        return {} as WsDFUXRefEx.DFUXRefDirectoriesQueryResponseEx;
+    });
+}
+
+function xrefDirectories(): Promise<XREFDirectories> {
+    const service = new DFUXRefService({ baseUrl: "" });
+    return service.DFUXRefListEx({}).then(response => {
+        return Promise.all(response.DFUXRefListResult.XRefNode.map(xrefNode => xrefDirectory(xrefNode.Name)))
+            .then(responses => {
+                const directories: DirectoryEx[] = [];
+                for (const response of responses) {
+                    response.DFUXRefDirectoriesQueryResult?.Directory?.forEach(dir => {
+                        directories.push({
+                            Cluster: response.DFUXRefDirectoriesQueryResult?.Cluster,
+                            Name: dir.Name,
+                            Num: Number(dir.Num),
+                            PositiveSkew: dir.PositiveSkew,
+                            Size: Number(dir.Size),
+                            MaxIP: dir.MaxIP,
+                            MaxSize: Number(dir.MaxSize),
+                            MinIP: dir.MinIP,
+                            MinSize: Number(dir.MinSize)
+                        });
+                    });
+                }
+                return {
+                    nodes: response.DFUXRefListResult.XRefNode,
+                    directories: directories.filter(dir => Number(dir.Num) > 0)
+                };
+            });
+    });
+}
+
 export class Details extends Table {
 
     constructor(readonly _targetCluster: string) {
@@ -171,8 +248,8 @@ export class Details extends Table {
             ;
     }
 
-    private _details: GetTargetClusterUsageEx.TargetClusterUsage;
-    private details(_: GetTargetClusterUsageEx.TargetClusterUsage) {
+    private _details: WsMachineEx.TargetClusterUsage;
+    private details(_: WsMachineEx.TargetClusterUsage) {
         this._details = _;
         const data = [];
         this
@@ -182,11 +259,81 @@ export class Details extends Table {
             ;
         this._details.ComponentUsages.forEach(cu => {
             cu.MachineUsages.forEach(mu => {
-                mu.DiskUsages.forEach(du => {
-                    data.push([calcPct(du.InUse, du.Total), cu.Name, du.Name, mu.NetAddress !== "." ? mu.NetAddress : mu.Name, du.Path, du.InUse, du.Total]);
+                mu.DiskUsages.forEach((du, i) => {
+                    data.push([calcPct(du.InUse, du.Total), cu.Name, du.Name, "<a id='" + netAddress(mu) + "' href='#' class='ip' onClick='return false;'>" + netAddress(mu) + "</a>", du.Path, du.InUse, du.Total]);
                 });
             });
         });
+        this
+            .sortBy(nlsHPCC.PercentUsed)
+            .sortByDescending(true)
+            .data(data)
+            ;
+        return this;
+    }
+
+    private _signal;
+    enter(domNode, element) {
+        super.enter(domNode, element);
+        this._signal = dojoOn(domNode, ".ip:click", evt => {
+            const component = evt.selectorTarget.id;
+            this.componentClick(component);
+        });
+    }
+
+    exit(domNode, element) {
+        this._signal?.remove();
+        super.exit(domNode, element);
+    }
+
+    refresh() {
+        this
+            .noDataMessage(nlsHPCC.loadingMessage)
+            .data([])
+            .render()
+            ;
+
+        Promise.all([
+            machineService.GetTargetClusterUsageEx([this._targetCluster]),
+            xrefDirectories().then(xref => {
+                return xref;
+            })
+        ]).then(([details, xref]) => {
+            this
+                .noDataMessage(nlsHPCC.noDataMessage)
+                .details(details[0])
+                .render()
+                ;
+        });
+        return this;
+    }
+
+    //  Events  ---
+    componentClick(component: string) {
+    }
+}
+
+export class ComponentDetails extends Table {
+
+    constructor(readonly _ipAddress: string) {
+        super();
+        this
+            .sortable(true)
+            .columns([nlsHPCC.Folder, nlsHPCC.Files, nlsHPCC.FileSize, nlsHPCC.MaxNode, nlsHPCC.MaxSize, nlsHPCC.MinNode, nlsHPCC.MinSize, nlsHPCC.SkewPositive])
+            ;
+    }
+
+    private details(xref: XREFDirectories) {
+        const data = [];
+        this
+            .sortByDescending(false)
+            .data([])
+            .render()
+            ;
+        xref.directories?.filter(dir => dir.MaxIP === this._ipAddress)
+            .forEach(dir => {
+                data.push([dir.Name, dir.Num, dir.Size, dir.MaxIP, dir.MaxSize, dir.MinIP, dir.MinSize, dir.PositiveSkew]);
+            });
         this
             .sortBy(nlsHPCC.PercentUsed)
             .sortByDescending(true)
@@ -201,10 +348,11 @@ export class Details extends Table {
             .data([])
             .render()
             ;
-        connection.GetTargetClusterUsageEx([this._targetCluster]).then(details => {
+
+        xrefDirectories().then(xrefDirs => {
             this
                 .noDataMessage(nlsHPCC.noDataMessage)
-                .details(details[0])
+                .details(xrefDirs)
                 .render()
                 ;
         });

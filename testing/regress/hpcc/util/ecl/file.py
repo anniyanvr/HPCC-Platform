@@ -25,7 +25,7 @@ import re
 import xml.etree.ElementTree as ET
 import unicodedata
 
-from ...util.util import isPositiveIntNum, getConfig, PrintException
+from ...util.util import isPositiveIntNum, getConfig, printException
 from ...common.error import Error
 
 logger = logging.getLogger('RegressionTestEngine')
@@ -60,6 +60,7 @@ class ECLFile:
 
     def __init__(self, ecl, dir_a, dir_ex, dir_r, dir_inc, cluster, args):
         logger.debug("%3d. ECLFile(ecl: '%s', cluster: '%s').", self.taskId, ecl,  cluster)
+        self.config = getConfig()
         self.dir_ec = os.path.dirname(ecl)
         self.dir_ex = dir_ex
         self.dir_r = dir_r
@@ -70,6 +71,7 @@ class ECLFile:
         self.engine = args.engine;
         self.baseEcl = os.path.basename(ecl)
         self.basename = os.path.splitext(self.baseEcl)[0]
+        self.isEclXml = self.baseEcl.endswith('.eclxml')
         self.baseXml = self.basename + '.xml'
         self.baseQueryXml = self.basename+'.queryxml'
         self.ecl = self.baseEcl
@@ -86,7 +88,9 @@ class ECLFile:
         self.isVersions=False
         self.version=''
         self.versionId=0
-        self.timeout = int(args.timeout)
+        self.timeout = self.checkFileTimeout(int(args.timeout))
+        if self.timeout == -1:
+            self.timeout = int(self.config.timeout) # use default from config
         self.args = args
         self.eclccWarning = ''
         self.eclccWarningChanges = ''
@@ -110,16 +114,15 @@ class ECLFile:
         # -X in the CLI is the highest.
         self.optXHash=self.checkQueryxmlFile()
 
-        self.config = getConfig()
         try:
             # Process definitions of stored input value(s) from config
             for param in self.config.Params:
                 [testSpec,  val] = param.split(':')
 
                 if '*' in testSpec:
-                    testSpec = testSpec.replace('*',  '\w+')
+                    testSpec = testSpec.replace('*',  '\\w+')
 
-                testSpec = testSpec.replace('.',  '\.')
+                testSpec = testSpec.replace('.',  '\\.')
                 match = re.match(testSpec,  self.baseEcl)
                 if match:
                     optXs = ("-X"+val.replace(',',  ',-X')).split(',')
@@ -359,7 +362,7 @@ class ECLFile:
         eclText = open(self.getEcl(), 'rb')
         for line in eclText:
             _line = str(line)
-            if re.search(tag+'[^\w]', _line, re.IGNORECASE):
+            if re.search(tag+'[^\\w]', _line, re.IGNORECASE):
                 retVal = True
                 break
         logger.debug("%3d.__checkTag() returns with %s", self.taskId,  retVal)
@@ -463,30 +466,29 @@ class ECLFile:
     def setVersionId(self,  id):
         self.versionId=id
 
-    def getTimeout(self):
-        timeout = 0
-        if  self.timeout == 0:
-            # Standard string has a problem with unicode characters
-            # use byte arrays and binary file open instead
-            tag = '//timeout'
-            logger.debug("%3d. getTimeout (ecl:'%s', tag:'%s')", self.taskId,  self.ecl, tag)
-            eclText = open(self.getEcl(), 'rb')
-            for line in eclText:
-                try:
-                    line = line.decode("utf-8")
-                except UnicodeDecodeError:
-                    line = str(line)
-                if tag in line:
-                    timeoutParts = line.split()
-                    if len(timeoutParts) == 2:
-                        if (timeoutParts[1] == '-1') or isPositiveIntNum(timeoutParts[1]) :
-                            timeout = int(timeoutParts[1])
-                            self.timeout = timeout
-                    break
-        else:
-            timeout = self.timeout
+    def checkFileTimeout(self,  timeout):
+        timeout = timeout
+        # Standard string has a problem with unicode characters
+        # use byte arrays and binary file open instead
+        tag = '//timeout'
+        logger.debug("%3d. checkFileTimeout (ecl:'%s', tag:'%s')", self.taskId,  self.ecl, tag)
+        eclText = open(self.getEcl(), 'rb')
+        for line in eclText:
+            try:
+                line = line.decode("utf-8")
+            except UnicodeDecodeError:
+                line = str(line)
+            if tag in line:
+                timeoutParts = line.split()
+                if len(timeoutParts) == 2:
+                    if (timeoutParts[1] == '-1') or isPositiveIntNum(timeoutParts[1]) :
+                        timeout = int(timeoutParts[1])
+                break
         logger.debug("%3d. Timeout is :%d sec",  self.taskId,  timeout)
         return timeout
+
+    def getTimeout(self):
+        return self.timeout
 
     def setTimeout(self,  timeout):
         self.timeout = timeout
@@ -510,11 +512,18 @@ class ECLFile:
             logger.debug("%3d. recieved: " + repr(recieved),  self.taskId )
             diffLines = ''
             lineIndex = 1
+            missingLines = 0
+            addedLines = 0
             for line in difflib.unified_diff(expected, recieved, fromfile=self.xml_e, tofile=self.xml_r):
+                if line.startswith('-'):
+                    missingLines += 1
+                if line.startswith('-'):
+                    addedLines += 1
                 diffLines += line
                 logger.debug("%3d. Line" + str(lineIndex) +":" + line,  self.taskId )
                 lineIndex += 1
 
+            logger.debug("%3d. missingLines: %d, addedLines: %d" % (self.taskId, missingLines,  addedLines))
             logger.debug("%3d. diffLines: " + diffLines,  self.taskId )
             if len(diffLines) > 0:
                 self.diff += ("%3d. Test: %s\n") % (self.taskId,  self.getBaseEclRealName())
@@ -527,7 +536,7 @@ class ECLFile:
                     else:
                         diffLines = repr(diffLines)
                 except Exception as e:
-                    PrintException(repr(e) + " runQuery() end")
+                    printException(repr(e) + " runQuery() end")
                     
                     
                 self.diff += str(diffLines)
@@ -538,10 +547,8 @@ class ECLFile:
             logger.debug("EXP: %s",  self.getExpected(),  extra={'taskId':self.taskId})
             logger.debug("REC: %s",  self.getResults(),  extra={'taskId':self.taskId})
             return False
-        finally:
-            if not self.diff:
-                return True
-            return False
+
+        return not self.diff
 
     def setElapsTime(self,  time):
         self.elapsTime = time
@@ -558,7 +565,10 @@ class ECLFile:
         #  'multiPart=false,useSequential=true'
         # to this
         #   'multiPart(false)-useSequential(true)'
-        self.jobnameVersion += '-' +version.replace('=', '(').replace(',', ')-')+')'
+        # need to handle this kind of value as well:
+        #  url='http://.:9876'
+        # where the ':', '.' and '/' can cause problem later in version result check 
+        self.jobnameVersion += '-' +version.replace('=', '(').replace(',', ')-').replace('.','-dot-').replace(':','-colon-').replace('/','-slash-').replace('?','-qmark-').replace('*','-star-')+')'
         pass
         
     def setJobname(self,  timestamp):

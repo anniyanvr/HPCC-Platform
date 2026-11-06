@@ -47,15 +47,17 @@ static IAtom * emptyAtom;
 static CriticalSection * typeCS;
 static TypeCache * globalTypeCache;
 
-static CBoolTypeInfo *btt = NULL;
-static CBlobTypeInfo *bltt = NULL;
-static CVoidTypeInfo *vtt = NULL;
-static CNullTypeInfo *ntt = NULL;
-static CRecordTypeInfo *rtt = NULL;
-static CAnyTypeInfo *anytt = NULL;
-static CPatternTypeInfo *patt = NULL;
-static CTokenTypeInfo *tokentt = NULL;
-static CFeatureTypeInfo *featurett = NULL;
+static std::atomic<CBoolTypeInfo*> btt(nullptr);
+static std::atomic<CBlobTypeInfo*> bltt(nullptr);
+static std::atomic<CVoidTypeInfo*> vtt(nullptr);
+static std::atomic<CNullTypeInfo*> ntt(nullptr);
+static std::atomic<CRecordTypeInfo*> rtt(nullptr);
+static std::atomic<CPatternTypeInfo*> patt(nullptr);
+static std::atomic<CTokenTypeInfo*> tokentt(nullptr);
+static std::atomic<CFeatureTypeInfo*> featurett(nullptr);
+static std::atomic<CEventTypeInfo*> ett(nullptr);
+static std::atomic<CAnyTypeInfo*> anytt(nullptr);
+
 static CStringTypeToTypeMap * stt;
 static CStringTypeToTypeMap * datatt;
 static CStringTypeToTypeMap * vstt;
@@ -63,15 +65,16 @@ static CStringTypeToTypeMap * qstt;
 static CUnicodeTypeToTypeMap * utt;
 static CUnicodeTypeToTypeMap * vutt;
 static CUnicodeTypeToTypeMap * u8tt;
-static CIntTypeInfo *itt[2][8];
-static CSwapIntTypeInfo *sitt[2][8];
+
+static std::atomic<CIntTypeInfo*> itt[2][8] = {};
+static std::atomic<CSwapIntTypeInfo*> sitt[2][8] = {};
+static std::atomic<CRealTypeInfo*> realtt[10] = {};
+static std::atomic<CBitfieldTypeInfo*> bftt[64][8] = {};
+static std::atomic<CCharTypeInfo*> ctt[2] = {};
+
 static TypeToTypeMap * pitt;
-static CRealTypeInfo *realtt[10];
-static CBitfieldTypeInfo *bftt[64][8];
-static CCharTypeInfo * ctt[2];
 static TypeToTypeMap * setTT;
 
-static CEventTypeInfo *ett = NULL;
 
 //charssets and collation...
 static ICharsetInfo * dataCharset;
@@ -87,7 +90,7 @@ static ITranslationInfo * ebcdic2ascii;
 
 MODULE_INIT(INIT_PRIORITY_DEFTYPE)
 {
-    typeCS = new CriticalSection;
+    typeCS = new CriticalSection(SYNC_LOCATION);
     asciiAtom = createLowerCaseAtom("ascii");
     dataAtom = createLowerCaseAtom("data");
     ebcdicAtom = createLowerCaseAtom("ebcdic");
@@ -473,7 +476,7 @@ bool CRealTypeInfo::assignableFrom(ITypeInfo *t2)
 
 inline unsigned cvtDigitsToLength(bool isSigned, unsigned digits)
 {
-    if (digits == UNKNOWN_LENGTH)
+    if (isUnknownLength(digits))
         return UNKNOWN_LENGTH;
     return isSigned ? digits/2+1 : (digits+1)/2;
 }
@@ -481,15 +484,15 @@ inline unsigned cvtDigitsToLength(bool isSigned, unsigned digits)
 CDecimalTypeInfo::CDecimalTypeInfo(unsigned _digits, unsigned _prec, bool _isSigned)
 : CHashedTypeInfo(cvtDigitsToLength(_isSigned, _digits))
 {
-    digits = (_digits == UNKNOWN_LENGTH) ? UNKNOWN_DIGITS : (byte)_digits;
-    prec = (_prec == UNKNOWN_LENGTH) ? UNKNOWN_DIGITS : (byte)_prec;
+    digits = (isUnknownLength(_digits)) ? UNKNOWN_DIGITS : (byte)_digits;
+    prec = (isUnknownLength(_prec)) ? UNKNOWN_DIGITS : (byte)_prec;
     typeIsSigned = _isSigned;
 };
 
 IValue * CDecimalTypeInfo::createValueFromStack()
 {
     Linked<ITypeInfo> retType;
-    if ((length == UNKNOWN_LENGTH) || (length == MAX_DECIMAL_LEADING + MAX_DECIMAL_PRECISION))
+    if (isUnknownLength(length) || (length == MAX_DECIMAL_LEADING + MAX_DECIMAL_PRECISION))
     {
         unsigned tosDigits, tosPrecision;
         DecClipInfo(tosDigits, tosPrecision);
@@ -556,7 +559,7 @@ bool CDecimalTypeInfo::equals(const CTypeInfo & _other) const
 
 unsigned CDecimalTypeInfo::getStringLen(void)
 {
-    if (length == UNKNOWN_LENGTH)
+    if (isUnknownLength(length))
         return UNKNOWN_LENGTH;
     return (typeIsSigned ? 1 : 0) + getDigits() + (prec ? 1 : 0); // sign + digits + dot
 }
@@ -739,7 +742,7 @@ IValue * CStringTypeInfo::castFrom(double value)
 {
     char * text = NULL;
     unsigned length = getStringLen();
-    if (length == UNKNOWN_LENGTH)
+    if (isUnknownLength(length))
     {
         rtlRealToStrX(length, text, value);
     }
@@ -766,12 +769,12 @@ unsigned CStringTypeInfo::getCrc()
     {
         const char * name = str(charset->queryName());
         //MORE: This and following should really be case insensitive, but we get away with it at the moment because the atoms are created very early
-        crc = hashc((const byte *)name, (size32_t)strlen(name), crc);
+        crc = hashcz((const byte *)name, crc);
     }
     if (collation)
     {
         const char * name = str(collation->queryName());
-        crc = hashc((const byte *)name, (size32_t)strlen(name), crc);
+        crc = hashcz((const byte *)name, crc);
     }
     return crc;
 }
@@ -781,7 +784,7 @@ StringBuffer &CStringTypeInfo::getECLType(StringBuffer &out)
     if (charset->queryName() == ebcdicAtom)
         out.append("EBCDIC ");
     out.append("string");
-    if (length != UNKNOWN_LENGTH)
+    if (!isUnknownLength(length))
         out.append(length);
     return out;
 }
@@ -789,7 +792,7 @@ StringBuffer &CStringTypeInfo::getECLType(StringBuffer &out)
 StringBuffer &CStringTypeInfo::getDescriptiveType(StringBuffer &out)
 {
     out.append("string");
-    if (length != UNKNOWN_LENGTH)
+    if (!isUnknownLength(length))
         out.append(length);
     if(charset || collation)
     {
@@ -842,7 +845,7 @@ StringBuffer &CUnicodeTypeInfo::getECLType(StringBuffer &out)
     out.append("unicode");
     if(locale && *str(locale))
         out.append('_').append(str(locale));
-    if(length != UNKNOWN_LENGTH)
+    if(!isUnknownLength(length))
         out.append(length/2);
     return out;
 }
@@ -886,7 +889,7 @@ StringBuffer & CVarUnicodeTypeInfo::getECLType(StringBuffer & out)
     out.append("varunicode");
     if(locale && *str(locale))
         out.append('_').append(str(locale));
-    if(length != UNKNOWN_LENGTH)
+    if(!isUnknownLength(length))
         out.append(length/2-1);
     return out;
 }
@@ -896,7 +899,7 @@ StringBuffer & CVarUnicodeTypeInfo::getECLType(StringBuffer & out)
 IValue * CUtf8TypeInfo::castFrom(size32_t len, const UChar * uchars)
 {
     unsigned tlen = getStringLen();
-    if (tlen == UNKNOWN_LENGTH)
+    if (isUnknownLength(tlen))
         tlen = len;
 
     rtlDataAttr buff(tlen * 4);
@@ -909,7 +912,7 @@ StringBuffer &CUtf8TypeInfo::getECLType(StringBuffer &out)
     out.append("utf8");
     if(locale && *str(locale))
         out.append('_').append(str(locale));
-    if(length != UNKNOWN_LENGTH)
+    if(!isUnknownLength(length))
         out.append('_').append(length/4);
     return out;
 }
@@ -922,7 +925,7 @@ CDataTypeInfo::CDataTypeInfo(int _length) : CStringTypeInfo(_length, getCharset(
 
 StringBuffer &CDataTypeInfo::getECLType(StringBuffer &out)
 {
-    if(length != UNKNOWN_LENGTH && length != INFINITE_LENGTH)
+    if(!isUnknownLength(length) && length != INFINITE_LENGTH)
         return out.append("data").append(length);
     else
         return out.append("data");
@@ -944,7 +947,7 @@ bool CDataTypeInfo::assignableFrom(ITypeInfo *t2)
 
 IValue * CDataTypeInfo::castFrom(size32_t len, const char * text)
 {
-    if (length == UNKNOWN_LENGTH)
+    if (isUnknownLength(length))
         return createDataValue(text, len);
     return createDataValue(text, LINK(this), len);
 }
@@ -969,7 +972,7 @@ IValue * CVarStringTypeInfo::castFrom(size32_t len, const char * text)
 StringBuffer &CVarStringTypeInfo::getECLType(StringBuffer &out)
 {
     out.append("varstring");
-    if (length != UNKNOWN_LENGTH)
+    if (!isUnknownLength(length))
         out.append(length-1);
     return out;
 }
@@ -977,7 +980,7 @@ StringBuffer &CVarStringTypeInfo::getECLType(StringBuffer &out)
 StringBuffer &CVarStringTypeInfo::getDescriptiveType(StringBuffer &out)
 {
     out.append("varstring");
-    if (length != UNKNOWN_LENGTH)
+    if (!isUnknownLength(length))
         out.append(length-1);
     if(charset || collation)
     {
@@ -992,7 +995,7 @@ StringBuffer &CVarStringTypeInfo::getDescriptiveType(StringBuffer &out)
 
 //---------------------------------------------------------------------------
 
-CQStringTypeInfo::CQStringTypeInfo(unsigned _strLength) : CStringTypeInfo(_strLength == UNKNOWN_LENGTH ? UNKNOWN_LENGTH : rtlQStrSize(_strLength), NULL, NULL)
+CQStringTypeInfo::CQStringTypeInfo(unsigned _strLength) : CStringTypeInfo(isUnknownLength(_strLength) ? _strLength : rtlQStrSize(_strLength), NULL, NULL)
 {
     strLength = _strLength;
 }
@@ -1012,7 +1015,7 @@ bool CQStringTypeInfo::assignableFrom(ITypeInfo *t2)
 
 IValue * CQStringTypeInfo::castFrom(size32_t len, const char * text)
 {
-    if (length != UNKNOWN_LENGTH)
+    if (!isUnknownLength(length))
     {
         if (len >= strLength)
             len = strLength;
@@ -1023,7 +1026,7 @@ IValue * CQStringTypeInfo::castFrom(size32_t len, const char * text)
 StringBuffer &CQStringTypeInfo::getECLType(StringBuffer &out)
 {
     out.append("qstring");
-    if (length != UNKNOWN_LENGTH)
+    if (!isUnknownLength(length))
         out.append(strLength);
     return out;
 }
@@ -1397,12 +1400,12 @@ void CFunctionTypeInfo::serialize(MemoryBuffer &tgt)
 
 size32_t CArrayTypeInfo::getSize()                  
 { 
-    if (length == UNKNOWN_LENGTH)
+    if (isUnknownLength(length))
         return UNKNOWN_LENGTH;
     if (basetype->isReference())
         return length * sizeof(void *);
     size32_t baseSize = basetype->getSize();
-    if (baseSize == UNKNOWN_LENGTH)
+    if (isUnknownLength(baseSize))
         return UNKNOWN_LENGTH;
     return baseSize * length;
 }
@@ -1426,7 +1429,6 @@ bool CModifierTypeInfo::equals(const CTypeInfo & _other) const
     const CModifierTypeInfo & other = static_cast<const CModifierTypeInfo &>(_other);
     return (baseType == other.baseType) && (kind == other.kind) && (extra == other.extra);
 }
-
 
 //===========================================================================
 
@@ -1466,7 +1468,7 @@ extern DEFTYPE_API ITypeInfo *makeStringType(unsigned len, ICharsetInfo * charse
 extern DEFTYPE_API ITypeInfo *makeVarStringType(unsigned len, ICharsetInfo * charset, ICollationInfo * collation)
 {
     //NB: Length passed is the number of characters....
-    unsigned size = (len != UNKNOWN_LENGTH) ? len + 1 : UNKNOWN_LENGTH;
+    unsigned size = (!isUnknownLength(len)) ? len + 1 : UNKNOWN_LENGTH;
 
     //NB: Length passed is the number of characters....
     if (!charset)
@@ -1537,8 +1539,8 @@ extern DEFTYPE_API ITypeInfo *makeUnicodeType(unsigned len, IAtom * locale)
         ret = (ITypeInfo *)LINK(*match);
     else
     {
-        if(len == UNKNOWN_LENGTH)
-            ret = new CUnicodeTypeInfo(UNKNOWN_LENGTH, locale);
+        if(isUnknownLength(len))
+            ret = new CUnicodeTypeInfo(len, locale);
         else
             ret = new CUnicodeTypeInfo(len*2, locale);
         utt->setValue(key, ret);
@@ -1562,8 +1564,8 @@ extern DEFTYPE_API ITypeInfo *makeVarUnicodeType(unsigned len, IAtom * locale)
         ret = (ITypeInfo *)LINK(*match);
     else
     {
-        if(len == UNKNOWN_LENGTH)
-            ret = new CVarUnicodeTypeInfo(UNKNOWN_LENGTH, locale);
+        if(isUnknownLength(len))
+            ret = new CVarUnicodeTypeInfo(len, locale);
         else
             ret = new CVarUnicodeTypeInfo((len+1)*2, locale);
         vutt->setValue(key, ret);
@@ -1586,8 +1588,8 @@ extern DEFTYPE_API ITypeInfo *makeUtf8Type(unsigned len, IAtom * locale)
         ret = (ITypeInfo *)LINK(*match);
     else
     {
-        if (len == UNKNOWN_LENGTH)
-            ret = new CUtf8TypeInfo(UNKNOWN_LENGTH, locale);
+        if (isUnknownLength(len))
+            ret = new CUtf8TypeInfo(len, locale);
         else
             ret = new CUtf8TypeInfo(len*4, locale);
         u8tt->setValue(key, ret);
@@ -1623,12 +1625,9 @@ extern DEFTYPE_API ITypeInfo *makeIntType(int len, bool isSigned)
     if (len <= 0 || len > 8)
         return NULL;
 
-    CriticalBlock procedure(*typeCS);
-    CIntTypeInfo *ret = itt[isSigned][len-1];
-    if (ret==NULL)
-        ret = itt[isSigned][len-1] = new CIntTypeInfo(len, isSigned);
-    ::Link(ret);
-    return ret;
+    ITypeInfo* type = querySingleton(itt[isSigned][len-1], *typeCS, [=]{ return new CIntTypeInfo(len, isSigned); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeSwapIntType(int len, bool isSigned)
@@ -1637,12 +1636,9 @@ extern DEFTYPE_API ITypeInfo *makeSwapIntType(int len, bool isSigned)
     if (len <= 0 || len > 8)
         return NULL;
 
-    CriticalBlock procedure(*typeCS);
-    CIntTypeInfo *ret = sitt[isSigned][len-1];
-    if (ret==NULL)
-        ret = sitt[isSigned][len-1] = new CSwapIntTypeInfo(len, isSigned);
-    ::Link(ret);
-    return ret;
+    ITypeInfo* type = querySingleton(sitt[isSigned][len-1], *typeCS, [=]{ return new CSwapIntTypeInfo(len, isSigned);} );
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makePackedIntType(ITypeInfo * basetype)
@@ -1672,12 +1668,9 @@ extern DEFTYPE_API ITypeInfo *makeRealType(int len)
     if (len != 4 && len != 8)
         return NULL;
 
-    CriticalBlock procedure(*typeCS);
-    CRealTypeInfo *ret = realtt[len-1];
-    if (ret==NULL)
-        ret = realtt[len-1] = new CRealTypeInfo(len);
-    ::Link(ret);
-    return ret;
+    ITypeInfo* type = querySingleton(realtt[len-1], *typeCS, [=]{ return new CRealTypeInfo(len); });
+    ::LINK(type);
+    return type;
 }
 
 /* Precondition: len>0 && len>64 */
@@ -1687,7 +1680,6 @@ extern DEFTYPE_API ITypeInfo *makeBitfieldType(int len, ITypeInfo * basetype)
     if (len <= 0 || len > 64)
         return NULL;
 
-    CriticalBlock procedure(*typeCS);
     if (basetype)
     {
         assertex(basetype->getTypeCode() == type_int);
@@ -1695,113 +1687,88 @@ extern DEFTYPE_API ITypeInfo *makeBitfieldType(int len, ITypeInfo * basetype)
     else
         basetype = getPromotedBitfieldType(len);
 
-    unsigned baseSize=basetype->getSize();
-    CBitfieldTypeInfo *ret = bftt[len-1][baseSize-1];
-    if (ret==NULL)
-        ret = bftt[len-1][baseSize-1] = new CBitfieldTypeInfo(len, basetype);
-    else
-        ::Release(basetype);
-    ::Link(ret);
-    return ret;
+    unsigned baseSize = basetype->getSize();
+
+    ITypeInfo* type = querySingleton(bftt[len-1][baseSize-1], *typeCS, [=]{ return new CBitfieldTypeInfo(len, basetype); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeBoolType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!btt)
-        btt = new CBoolTypeInfo();
-    ::Link(btt);
-    return btt;
+    ITypeInfo* type = querySingleton(btt, *typeCS, []{ return new CBoolTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeBlobType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!bltt)
-        bltt = new CBlobTypeInfo();
-    ::Link(bltt);
-    return bltt;
+    ITypeInfo* type = querySingleton(bltt, *typeCS, []{ return new CBlobTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeVoidType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!vtt)
-        vtt = new CVoidTypeInfo();
-    ::Link(vtt);
-    return vtt;
+    ITypeInfo* type = querySingleton(vtt, *typeCS, []{ return new CVoidTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeNullType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!ntt)
-        ntt = new CNullTypeInfo();
-    ::Link(ntt);
-    return ntt;
+    ITypeInfo* type = querySingleton(ntt, *typeCS, []{ return new CNullTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeRecordType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!rtt)
-        rtt = new CRecordTypeInfo();
-    ::Link(rtt);
-    return rtt;
+    ITypeInfo* type = querySingleton(rtt, *typeCS, []{ return new CRecordTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makePatternType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!patt)
-        patt = new CPatternTypeInfo();
-    ::Link(patt);
-    return patt;
+    ITypeInfo* type = querySingleton(patt, *typeCS, []{ return new CPatternTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeTokenType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!tokentt)
-        tokentt = new CTokenTypeInfo();
-    ::Link(tokentt);
-    return tokentt;
+    ITypeInfo* type = querySingleton(tokentt, *typeCS, []{ return new CTokenTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeFeatureType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!featurett)
-        featurett = new CFeatureTypeInfo();
-    ::Link(featurett);
-    return featurett;
+    ITypeInfo* type = querySingleton(featurett, *typeCS, []{ return new CFeatureTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeEventType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!ett)
-        ett = new CEventTypeInfo();
-    ::Link(ett);
-    return ett;
+    ITypeInfo* type = querySingleton(ett, *typeCS, []{ return new CEventTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeAnyType()
 {
-    CriticalBlock procedure(*typeCS);
-    if (!anytt)
-        anytt = new CAnyTypeInfo();
-    ::Link(anytt);
-    return anytt;
+    ITypeInfo* type = querySingleton(anytt, *typeCS, []{ return new CAnyTypeInfo(); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeCharType(bool caseSensitive)
 {
-    CriticalBlock procedure(*typeCS);
-    if (!ctt[caseSensitive])
-        ctt[caseSensitive] = new CCharTypeInfo(caseSensitive);
-    ::Link(ctt[caseSensitive]);
-    return ctt[caseSensitive];
+    ITypeInfo* type = querySingleton(ctt[caseSensitive], *typeCS, [=]{ return new CCharTypeInfo(caseSensitive); });
+    ::LINK(type);
+    return type;
 }
 
 extern DEFTYPE_API ITypeInfo *makeSetType(ITypeInfo *basetype)
@@ -1857,9 +1824,9 @@ extern DEFTYPE_API ITypeInfo *makeKeyedIntType(ITypeInfo *basetype)
 
 extern DEFTYPE_API ITypeInfo *makeDecimalType(unsigned digits, unsigned prec, bool isSigned)
 {
-    assertex((digits == UNKNOWN_LENGTH) || (digits - prec <= MAX_DECIMAL_LEADING));
-    assertex((prec == UNKNOWN_LENGTH) || ((prec <= digits) && (prec <= MAX_DECIMAL_PRECISION)));
-    assertex((prec != UNKNOWN_LENGTH) || (digits == UNKNOWN_LENGTH));
+    assertex((isUnknownLength(digits)) || (digits - prec <= MAX_DECIMAL_LEADING));
+    assertex((isUnknownLength(prec)) || ((prec <= digits) && (prec <= MAX_DECIMAL_PRECISION)));
+    assertex((!isUnknownLength(prec)) || (isUnknownLength(digits)));
     return commonUpType(new CDecimalTypeInfo(digits, prec, isSigned));
 }
 
@@ -1995,6 +1962,16 @@ inline void ReleaseAndClear(T * & ptr)
     {
         ptr->Release();
         ptr = NULL;
+    }
+}
+
+template <class T>
+inline void ReleaseAndClear(std::atomic<T*>& atomicPtr)
+{
+    T* ptr = atomicPtr.exchange(nullptr);
+    if (ptr)
+    {
+        ptr->Release();
     }
 }
 
@@ -2158,6 +2135,11 @@ bool isPatternType(ITypeInfo * type)
     }
 }
 
+bool isUTF8Type(ITypeInfo * type)
+{
+    return (type->getTypeCode() == type_utf8);
+}
+
 bool isUnicodeType(ITypeInfo * type)
 {
     switch(type->getTypeCode())
@@ -2259,7 +2241,7 @@ ITypeInfo * getNumericType(ITypeInfo * type)
     case type_varunicode:
     case type_data:
         digits = type->getDigits();
-        if (digits == UNKNOWN_LENGTH)
+        if (isUnknownLength(digits))
             digits = 20;
         break;
     case type_boolean:
@@ -2407,7 +2389,7 @@ static ITypeInfo * getPromotedDecimal(ITypeInfo * left, ITypeInfo * right, bool 
 
     unsigned lDigits = left->getDigits();
     unsigned rDigits  = right->getDigits();
-    if (lDigits == UNKNOWN_LENGTH || rDigits == UNKNOWN_LENGTH)
+    if (isUnknownLength(lDigits) || isUnknownLength(rDigits))
         return makeDecimalType(UNKNOWN_LENGTH, UNKNOWN_LENGTH, left->isSigned() || right->isSigned());
 
     if (isCompare)
@@ -2824,7 +2806,7 @@ extern DEFTYPE_API ITypeInfo * getRoundType(ITypeInfo * type)
     if (type->getTypeCode() == type_decimal)
     {
         unsigned olddigits = type->getDigits();
-        if (olddigits == UNKNOWN_LENGTH)
+        if (isUnknownLength(olddigits))
             return LINK(type);
 
         //rounding could increase the number of digits by 1.
@@ -2842,7 +2824,7 @@ extern DEFTYPE_API ITypeInfo * getRoundToType(ITypeInfo * type)
     {
         unsigned olddigits = type->getDigits();
         unsigned oldPrecision = type->getPrecision();
-        if ((olddigits == UNKNOWN_LENGTH) || (olddigits-oldPrecision == MAX_DECIMAL_LEADING))
+        if ((isUnknownLength(olddigits)) || (olddigits-oldPrecision == MAX_DECIMAL_LEADING))
             return LINK(type);
         //rounding could increase the number of digits by 1.
         return makeDecimalType(olddigits+1, oldPrecision, type->isSigned());
@@ -2855,7 +2837,7 @@ extern DEFTYPE_API ITypeInfo * getTruncType(ITypeInfo * type)
     if (type->getTypeCode() == type_decimal)
     {
         unsigned olddigits = type->getDigits();
-        if (olddigits == UNKNOWN_LENGTH)
+        if (isUnknownLength(olddigits))
             return LINK(type);
 
         unsigned newdigits = (olddigits - type->getPrecision());
@@ -3044,6 +3026,18 @@ ICharsetInfo * getAsciiCharset()
 
 ITypeInfo * getStretchedType(unsigned newLen, ITypeInfo * type)
 {
+#ifdef PRESERVE_STRETCHED_MODIFIERS
+    // This code is not currently used, but preserved as a reminder that it might be needed in future.
+    if (type->queryModifier() != typemod_none)
+    {
+        ITypeInfo * srcType = type->queryTypeBase();
+        ITypeInfo * stretchedType = getStretchedType(newLen, srcType);
+        if (stretchedType == srcType)
+            return LINK(type);
+        return cloneModifier(type, stretchedType);
+    }
+#endif
+
     switch (type->getTypeCode())
     {
     case type_string:
@@ -3083,6 +3077,8 @@ ITypeInfo * getMaxLengthType(ITypeInfo * type)
     case type_utf8:
     case type_qstring:
     case type_data:
+        if (isUnknownLength(type->getStringLen()))
+            return LINK(type);
         return getStretchedType(UNKNOWN_LENGTH, type);
     default:
         return LINK(type);
@@ -3346,20 +3342,23 @@ ITypeInfo * replaceChildType(ITypeInfo * type, ITypeInfo * newChild)
     return cloneModifiers(type, newType);
 }
 
-//---------------------------------------------------------------------------
-
-extern unsigned getClarionResultType(ITypeInfo *type)
+bool canOverrideStringLength(type_t tc)
 {
-    if (type)
+    switch (tc)
     {
-        type_t tc = type->getTypeCode();
-        size32_t size = ((tc == type_row) || (tc == type_record)) ? 0 : type->getSize();
-        return tc | (size << 16) |
-                (type->isInteger() && !type->isSigned() ? type_unsigned : 0) |
-                (type->queryCharset() && type->queryCharset()->queryName()==ebcdicAtom ? type_ebcdic : 0);
+    case type_string:
+    case type_unicode:
+    case type_utf8:
+    case type_qstring:
+    case type_data:
+        return true;
     }
-    else
-        return 0;
+    return false;
+}
+
+bool canOverrideStringLength(ITypeInfo * type)
+{
+    return canOverrideStringLength(type->getTypeCode());
 }
 
 //---------------------------------------------------------------------------
@@ -3456,7 +3455,7 @@ extern DEFTYPE_API ITypeInfo * deserializeType(MemoryBuffer &src)
                 return makeStringType(size, charset, collation);
             else
             {
-                if (size != UNKNOWN_LENGTH) size--;
+                if (!isUnknownLength(size)) size--;
                 return makeVarStringType(size, charset, collation);
             }
         }
@@ -3645,7 +3644,7 @@ void XmlSchemaBuilder::getXmlTypeName(StringBuffer & xmlType, ITypeInfo & type)
             xmlType.append("xs:nonNegativeInteger"); 
         break;
     case type_data:
-        if (len == UNKNOWN_LENGTH)
+        if (isUnknownLength(len))
             xmlType.append("xs:hexBinary");
         else
         {
@@ -3681,7 +3680,7 @@ void XmlSchemaBuilder::getXmlTypeName(StringBuffer & xmlType, ITypeInfo & type)
     case type_varunicode:
     case type_utf8:
         //NB: xs::maxLength is in unicode characters...
-        if (len==UNKNOWN_LENGTH)
+        if (isUnknownLength(len))
             xmlType.append("xs:string");
         else
         {

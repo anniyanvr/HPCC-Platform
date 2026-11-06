@@ -56,7 +56,9 @@ SHARED STRING _indexPrefix := '~regress::' +
 EXPORT filePrefix := #IFDEFINED(root.filePrefix, _filePrefix);
 EXPORT indexPrefix := #IFDEFINED(root.filePrefix, _indexPrefix);
 
-EXPORT QueryFilePrefixId := __TARGET_PLATFORM__ + '::' + Str.ToLowerCase(WORKUNIT) + '::';
+wuid := Str.ToLowerCase(WORKUNIT);
+wuidScope := IF(wuid <> '', wuid, 'WORKUNIT');
+EXPORT QueryFilePrefixId := __TARGET_PLATFORM__ + '::' + wuidScope + '::';
 EXPORT QueryFilePrefix := filePrefix + QueryFilePrefixId;
 
 EXPORT DG_FileOut              := filePrefix + 'DG_';
@@ -79,6 +81,8 @@ EXPORT DG_DsFilename        := filePrefix + 'SerialLibraryDs';
 EXPORT DG_DictFilename      := filePrefix + 'SerialLibraryDict';
 EXPORT DG_DictKeyFilename   := indexPrefix + 'SerialLibraryKeyDict';
 EXPORT DG_BookKeyFilename   := indexPrefix + 'SerialBookKey';
+
+EXPORT SEQ_Filename              := filePrefix + 'Sequence';
 
 //record structures
 EXPORT DG_FetchRecord := RECORD
@@ -201,8 +205,23 @@ EXPORT SET OF STRING3 DG_MONTHS := ['JAN','FEB','MAR','APR','MAY','JUN','JUL','A
 
 EXPORT NameWordIndex() := indexPrefix + 'wordIndex' + IF(useLocal, '_Local', '') + IF(useTranslation, '_Trans', '') ;
 EXPORT NameSearchIndex := indexPrefix + 'searchIndex';
+EXPORT NameSearchSource := indexPrefix + 'searchSource';
 EXPORT getWordIndex() := INDEX(TS.textSearchIndex, NameWordIndex());
 EXPORT getSearchIndex() := INDEX(TS.textSearchIndex, NameSearchIndex);
+EXPORT getSearchIndexVariant(string variant) := INDEX(TS.textSearchIndex, NameSearchIndex + IF(variant != '', '_' + variant, ''));
+EXPORT getOptSearchIndexVariant(string variant) := INDEX(TS.textSearchIndex, NameSearchIndex + IF(variant != '', '_' + variant, ''), OPT);
+
 EXPORT getSearchSuperIndex() := INDEX(TS.textSearchIndex, '{' + NameSearchIndex + ',' + NameWordIndex() + '}');
+EXPORT getSearchSource() := DATASET(NameSearchSource, TS.textSourceRecord, THOR);
+
+EXPORT SeqRecord := { unsigned seq; };
+EXPORT SeqReadRecord :=
+  RECORD(SeqRecord)
+    unsigned8 filepos{virtual(fileposition)};
+    unsigned8 localfilepos{virtual(localfileposition)};
+  END;
+
+EXPORT SeqFile := DATASET(SEQ_Filename, SeqReadRecord, THOR);
+EXPORT SeqDupFile := DATASET('{' + SEQ_Filename + ',' + SEQ_Filename + '}', SeqReadRecord, THOR);
 
 END;

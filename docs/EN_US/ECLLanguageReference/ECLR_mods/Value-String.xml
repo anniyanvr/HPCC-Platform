@@ -22,23 +22,33 @@
   <para>The optional <emphasis>StringType</emphasis> may specify ASCII or
   EBCDIC. If the <emphasis>StringType</emphasis> is missing, the data is in
   ASCII format. Defining an EBCDIC STRING Attribute as a string constant value
-  implies an ASCII to EBCDIC conversion. However, defining an EBCDIC STRING
-  Attribute as a hexadecimal string constant value implies no conversion, as
-  the programmer is assumed to have supplied the correct hexadecimal EBCDIC
-  value.</para>
+  implies an ASCII to EBCDIC conversion. </para>
 
   <para>The upper size limit for any STRING value is 4GB.</para>
 
+  <para>Fields can optionally have a <emphasis role="bold">LENGTHSIZE</emphasis><indexterm>
+      <primary>LENGTHSIZE</primary>
+    </indexterm> attribute to specify the number of bytes (1, 2, or 4) used to store a variable-length field's length prefix. The default is 4 bytes. This is useful for reducing memory usage for small variable-length strings. If a longer string is assigned, it will be truncated.</para>
+
   <para>Example:</para>
 
-  <programlisting>STRING1 MyString := IF(SomeAttribute &gt; 10,'1','0');
+  <programlisting lang="ECL_Runnable">STRING1 MyString := IF(SomeAttribute &gt; 10,'1','0');
         // declares MyString a 1-byte ASCII string
 
 EBCDIC STRING3 MyString1 := 'ABC';
         //implicit ASCII to EBCDIC conversion
- 
-EBCDIC STRING3 MyString2 := x'616263';
-        //NO conversion here</programlisting>
+
+testRecord := RECORD
+    STRING name;
+    STRING name1{LENGTHSIZE(1)};
+    STRING name2{LENGTHSIZE(2)};
+    STRING name4{LENGTHSIZE(4)};
+    UNSIGNED1 sentinel;
+END;
+
+OUTPUT(MyString);
+OUTPUT(MyString1); 
+</programlisting>
 
   <para>See Also: <link linkend="LENGTH">LENGTH</link>, <link
   linkend="TRIM">TRIM</link>, <link linkend="Set_Ordering_and_Indexing">Set

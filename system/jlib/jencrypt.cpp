@@ -17,10 +17,15 @@
 
 
 #include "jencrypt.hpp"
+#include "jerror.hpp"
 
 #ifdef _USE_OPENSSL
 
 #include "ske.hpp"
+#include <openssl/conf.h>
+#include <openssl/evp.h>
+#include <openssl/err.h>
+#include <string.h>
 
 #endif
 
@@ -100,6 +105,7 @@ typedef unsigned short UINT16;
 #define RIJNDAEL_NOT_INITIALIZED -5
 #define RIJNDAEL_BAD_DIRECTION -6
 #define RIJNDAEL_CORRUPTED_DATA -7
+#define RIJNDAEL_INSUFFICIENT_SPACE -8
 
 class Rijndael
 {   
@@ -164,9 +170,9 @@ public:
     int blockDecrypt(const UINT8 *input, int inputLen, UINT8 *outBuffer);
     // Decrypts the input vector
     // Input len is in BYTES!
-    // outBuffer must be at least inputLen bytes long
+    // outBuffer must be at least outputLen bytes long
     // Returns the decrypted buffer length in BYTES and an error code < 0 in case of error
-    int padDecrypt(const UINT8 *input, int inputOctets, UINT8 *outBuffer);
+    int padDecrypt(const UINT8 *input, int inputOctets, UINT8 *outBuffer, int outputLen);
 protected:
     void keySched(UINT8 key[_MAX_KEY_COLUMNS][4]);
     void keyEncToDec();
@@ -1415,7 +1421,7 @@ int Rijndael::blockDecrypt(const UINT8 *input, int inputLen, UINT8 *outBuffer)
     return 128*numBlocks;
 }
 
-int Rijndael::padDecrypt(const UINT8 *input, int inputOctets, UINT8 *outBuffer)
+int Rijndael::padDecrypt(const UINT8 *input, int inputOctets, UINT8 *outBuffer, int outlen)
 {
     int i, numBlocks, padLen;
     UINT8 block[16];
@@ -1427,7 +1433,8 @@ int Rijndael::padDecrypt(const UINT8 *input, int inputOctets, UINT8 *outBuffer)
     if(input == 0 || inputOctets <= 0)return 0;
 
     if((inputOctets % 16) != 0)return RIJNDAEL_CORRUPTED_DATA;
-
+    if (inputOctets-16 > outlen)
+        return RIJNDAEL_INSUFFICIENT_SPACE;
     numBlocks = inputOctets/16;
 
     switch(m_mode){
@@ -1446,6 +1453,8 @@ int Rijndael::padDecrypt(const UINT8 *input, int inputOctets, UINT8 *outBuffer)
             {
                 if(block[i] != padLen)return RIJNDAEL_CORRUPTED_DATA;
             }
+            if (outlen < inputOctets-padLen)
+                return RIJNDAEL_INSUFFICIENT_SPACE;
             memcpy(outBuffer, block, 16 - padLen);
         break;  
         case CBC:
@@ -1475,6 +1484,8 @@ int Rijndael::padDecrypt(const UINT8 *input, int inputOctets, UINT8 *outBuffer)
             {
                 if(block[i] != padLen)return RIJNDAEL_CORRUPTED_DATA;
             }
+            if (outlen < inputOctets-padLen)
+                return RIJNDAEL_INSUFFICIENT_SPACE;
             memcpy(outBuffer, block, 16 - padLen);
             break;
         
@@ -1752,7 +1763,8 @@ static const char *aesErrorText[] =
     "Bad Key",
     "Not Initialized",
     "Bad Direction",
-    "Corrupted Data"
+    "Corrupted Data",
+    "Output buffer too small",
 };
 
 inline const char *getAesErrorText(int err)
@@ -1767,7 +1779,7 @@ inline Rijndael::KeyLength getAesKeyType(size_t keylen)
     if (keylen==24)
         return Rijndael::Key24Bytes;
     if (keylen < 32)
-        throw MakeStringException(-1,"AES Encryption error: %d is not a valid key length", (unsigned)keylen);
+        throw MakeStringException(JLIBERR_UtilAesEncryptionErrorDIsNotA,"AES Encryption error: %d is not a valid key length", (unsigned)keylen);
 
     return Rijndael::Key32Bytes;
 }
@@ -1782,12 +1794,12 @@ MemoryBuffer &aesEncrypt(const void *key, size_t keylen, const void *input, size
     
     rin.init(Rijndael::CBC, Rijndael::Encrypt, (const UINT8 *)key, keyType);
     size32_t truncInLen = (size32_t)inlen; //MORE: Modify the padEncrypt function
-    int len = rin.padEncrypt((const UINT8 *)input, truncInLen, (UINT8 *) output.clear().reserveTruncate(truncInLen + 16));
-
+    size32_t origLen = output.length();
+    int len = rin.padEncrypt((const UINT8 *)input, truncInLen, (UINT8 *) output.reserveTruncate(truncInLen + 16));
     if(len >= 0)
-        output.setLength(len);
+        output.setLength(origLen+len);
     else 
-        throw MakeStringException(-1,"AES Encryption error: %d, %s", len, getAesErrorText(len));
+        throw MakeStringException(JLIBERR_UtilAesEncryptionErrorDS,"AES Encryption error: %d, %s", len, getAesErrorText(len));
     return output;
 }
 
@@ -1798,25 +1810,314 @@ MemoryBuffer &aesDecrypt(const void *key, size_t keylen, const void *input, size
     
     rin.init(Rijndael::CBC, Rijndael::Decrypt, (const UINT8 *)key, keyType);
     size32_t truncInLen = (size32_t)inlen;
-    int len = rin.padDecrypt((const UINT8 *)input, truncInLen, (UINT8 *) output.clear().reserveTruncate(truncInLen));
-
+    size32_t origLen = output.length();
+    int len = rin.padDecrypt((const UINT8 *)input, truncInLen, (UINT8 *) output.reserveTruncate(truncInLen), truncInLen);
     if(len >= 0)
-        output.setLength(len);
+        output.setLength(origLen+len);
     else 
-        throw MakeStringException(-1,"AES Decryption error: %d, %s", len, getAesErrorText(len));
+        throw MakeStringException(JLIBERR_UtilAesDecryptionErrorDS,"AES Decryption error: %d, %s", len, getAesErrorText(len));
     return output;
+}
+
+size_t aesEncryptInPlace(const void *key, size_t keylen, void *buffer, size_t inlen, size_t maxlen)
+{
+    if (!buffer || !inlen)
+        return 0;
+    // Make sure there is space for the padding. This is up to 16 bytes
+    if (maxlen - inlen < 16)
+        throw MakeStringException(JLIBERR_UtilAesEncryptionErrorInsufficientSpaceInInput,"AES Encryption error: Insufficient space in input buffer");
+    Rijndael rin;
+    Rijndael::KeyLength keyType = getAesKeyType(keylen);
+    
+    rin.init(Rijndael::CBC, Rijndael::Encrypt, (const UINT8 *)key, keyType);
+    size32_t truncInLen = (size32_t)inlen; //MORE: Modify the padEncrypt function
+    int len = rin.padEncrypt((const UINT8 *)buffer, truncInLen, (UINT8 *) buffer);
+    if(len >= 0)
+        return len;
+    else 
+        throw MakeStringException(JLIBERR_UtilAesEncryptionErrorDS_1,"AES Encryption error: %d, %s", len, getAesErrorText(len));
+}
+
+size_t aesDecryptInPlace(const void *key, size_t keylen, void *data, size_t inlen)
+{
+    Rijndael rin;
+    Rijndael::KeyLength keyType = getAesKeyType(keylen);
+
+    rin.init(Rijndael::CBC, Rijndael::Decrypt, (const UINT8 *)key, keyType);
+    size32_t truncInLen = (size32_t)inlen;
+    int len = rin.padDecrypt((const UINT8 *)data, truncInLen, (UINT8 *) data, inlen);
+    if(len < 0)
+        throw MakeStringException(JLIBERR_UtilAesDecryptionErrorDS_1,"AES Decryption error: %d, %s", len, getAesErrorText(len));
+    return len;
 }
 
 } // end of namespace jlib
 
+#ifdef _USE_OPENSSL
+namespace openssl {
+
+static void encryptError(const char *what)
+{
+    char errorMessage[256];
+    ERR_error_string_n(ERR_get_error(), errorMessage, sizeof(errorMessage));
+    throw makeStringExceptionV(JLIBERR_UtilOpensslAesencryptUnexpectedFailureInSS, "openssl::aesEncrypt: unexpected failure in %s: %s", what, errorMessage);
+}
+
+MemoryBuffer &aesEncrypt(const void *key, size_t keylen, const void *plaintext, size_t plaintext_len, MemoryBuffer &output)
+{
+    if (!plaintext || !plaintext_len)
+        return output;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+        encryptError("Failed to create context");
+    try
+    {
+        unsigned char iv[16] = { 0 };
+        switch (keylen)
+        {
+            case 32:
+                if(1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, (const unsigned char *) key, iv))
+                    encryptError("Failed to initialize context");
+                break;
+            case 24:
+                if(1 != EVP_EncryptInit_ex(ctx, EVP_aes_192_cbc(), NULL, (const unsigned char *) key, iv))
+                    encryptError("Failed to initialize context");
+                break;
+            case 16:
+                if(1 != EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, (const unsigned char *) key, iv))
+                    encryptError("Failed to initialize context");
+                break;
+            default:
+                encryptError("Unsupported key length");
+                break;
+        }
+        unsigned originalLen = output.length();
+        byte *ciphertext = (byte *) output.reserve(plaintext_len + 16);
+        int ciphertext_len = 0;
+        int thislen = 0;
+        if(1 != EVP_EncryptUpdate(ctx, ciphertext, &thislen, (const unsigned char *) plaintext, plaintext_len))
+            encryptError("Error in EVP_EncryptUpdate");
+        ciphertext_len += thislen;
+        if(1 != EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &thislen))
+            encryptError("Error in EVP_EncryptFinal_ex");
+        ciphertext_len += thislen;
+        EVP_CIPHER_CTX_free(ctx);
+        output.setLength(originalLen + ciphertext_len);
+        return output;
+    }
+    catch (...)
+    {
+        EVP_CIPHER_CTX_free(ctx);
+        throw;
+    }
+}
+
+extern jlib_decl size_t aesEncryptInPlace(const void *key, size_t keylen, void *buffer, size_t inlen, size_t buflen)
+{
+    if (!buffer || !inlen)
+        return 0;
+    byte *data = (byte *) buffer;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+        encryptError("Failed to create context");
+    try
+    {
+        unsigned char iv[16] = { 0 };
+        switch (keylen)
+        {
+            case 32:
+                if(1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, (const unsigned char *) key, iv))
+                    encryptError("Failed to initialize context");
+                break;
+            case 24:
+                if(1 != EVP_EncryptInit_ex(ctx, EVP_aes_192_cbc(), NULL, (const unsigned char *) key, iv))
+                    encryptError("Failed to initialize context");
+                break;
+            case 16:
+                if(1 != EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, (const unsigned char *) key, iv))
+                    encryptError("Failed to initialize context");
+                break;
+            default:
+                encryptError("Unsupported key length");
+                break;
+        }
+        // Make sure there is space for the padding. This is up to 16 bytes
+        if (buflen - inlen < 16)
+            encryptError("Insufficient space in input buffer");
+        int ciphertext_len = 0;
+        int thislen = 0;
+        if(1 != EVP_EncryptUpdate(ctx, data, &thislen, (const unsigned char *) data, inlen))
+            encryptError("Error in EVP_EncryptUpdate");
+        ciphertext_len += thislen;
+        if(1 != EVP_EncryptFinal_ex(ctx, data + ciphertext_len, &thislen))
+            encryptError("Error in EVP_EncryptFinal_ex");
+        ciphertext_len += thislen;
+        EVP_CIPHER_CTX_free(ctx);
+        return ciphertext_len;
+    }
+    catch (...)
+    {
+        EVP_CIPHER_CTX_free(ctx);
+        throw;
+    }
+}
+
+static void decryptError(const char *what)
+{
+    char errorMessage[256];
+    ERR_error_string_n(ERR_get_error(), errorMessage, sizeof(errorMessage));
+    throw makeStringExceptionV(JLIBERR_UtilOpensslAesdecryptUnexpectedFailureInSS, "openssl::aesDecrypt: unexpected failure in %s: %s", what, errorMessage);
+}
+
+MemoryBuffer &aesDecrypt(const void *key, size_t keylen, const void *ciphertext, size_t ciphertext_len, MemoryBuffer &output)
+{
+    if (!ciphertext || !ciphertext_len)
+        return output;
+    EVP_CIPHER_CTX *ctx;
+
+    int thislen = 0;
+    int plaintext_len = 0;
+
+    if(!(ctx = EVP_CIPHER_CTX_new()))
+        decryptError("Failed to create context");
+    try
+    {
+        unsigned char iv[16] = { 0 };
+        switch (keylen)
+        {
+            case 32:
+                if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, (const unsigned char *) key, iv))
+                    decryptError("Failed to initialize context");
+                break;
+            case 24:
+                if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_192_cbc(), NULL, (const unsigned char *) key, iv))
+                    decryptError("Failed to initialize context");
+                break;
+            case 16:
+                if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, (const unsigned char *) key, iv))
+                    decryptError("Failed to initialize context");
+                break;
+            default:
+                decryptError("Unsupported key length");
+                break;
+        }
+        unsigned originalLen = output.length();
+        byte *plaintext = (byte *) output.reserve(ciphertext_len);
+        if(1 != EVP_DecryptUpdate(ctx, plaintext, &thislen, (const unsigned char *) ciphertext, ciphertext_len))
+            decryptError("Error in EVP_DecryptUpdate");
+        plaintext_len += thislen;
+
+        if(1 != EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &thislen))
+            decryptError("Error in EVP_DecryptFinal_ex");
+        plaintext_len += thislen;
+        output.setLength(originalLen + plaintext_len);
+        EVP_CIPHER_CTX_free(ctx);
+        return output;
+    }
+    catch (...)
+    {
+        EVP_CIPHER_CTX_free(ctx);
+        throw;
+    }
+}
+
+size_t aesDecryptInPlace(const void *key, size_t keylen, void *ciphertext, size_t ciphertext_len)
+{
+    if (!ciphertext || !ciphertext_len)
+        return 0;
+    EVP_CIPHER_CTX *ctx;
+
+    int thislen = 0;
+    size_t plaintext_len = 0;
+
+    if(!(ctx = EVP_CIPHER_CTX_new()))
+        decryptError("Failed to create context");
+
+    try
+    {
+        unsigned char iv[16] = { 0 };
+        switch (keylen)
+        {
+            case 32:
+                if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, (const unsigned char *) key, iv))
+                    decryptError("Failed to initialize context");
+                break;
+            case 24:
+                if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_192_cbc(), NULL, (const unsigned char *) key, iv))
+                    decryptError("Failed to initialize context");
+                break;
+            case 16:
+                if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, (const unsigned char *) key, iv))
+                    decryptError("Failed to initialize context");
+                break;
+            default:
+                decryptError("Unsupported key length");
+                break;
+        }
+        byte *plaintext = (byte *) ciphertext;
+        if(1 != EVP_DecryptUpdate(ctx, plaintext, &thislen, (const unsigned char *) ciphertext, ciphertext_len))
+            decryptError("Error in EVP_DecryptUpdate");
+        plaintext_len += thislen;
+
+        if(1 != EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &thislen))
+            decryptError("Error in EVP_DecryptFinal_ex");
+        plaintext_len += thislen;
+        assertex(plaintext_len <= ciphertext_len);
+        EVP_CIPHER_CTX_free(ctx);
+        return plaintext_len;
+    }
+    catch (...)
+    {
+        EVP_CIPHER_CTX_free(ctx);
+        throw;
+    }
+}
+
+}  // namespace
+#endif
+
+static bool useLegacyAES = false;
+
 MemoryBuffer &aesEncrypt(const void *key, size_t keylen, const void *input, size_t inlen, MemoryBuffer &output)
 {
+#ifdef _USE_OPENSSL
+    if (!useLegacyAES)
+        return openssl::aesEncrypt(key, keylen, input, inlen, output);
+#endif
     return jlib::aesEncrypt(key, keylen, input, inlen, output);
 }
 
 MemoryBuffer &aesDecrypt(const void *key, size_t keylen, const void *input, size_t inlen, MemoryBuffer &output)
 {
+#ifdef _USE_OPENSSL
+    if (!useLegacyAES)
+        return openssl::aesDecrypt(key, keylen, input, inlen, output);
+#endif
     return jlib::aesDecrypt(key, keylen, input, inlen, output);
+}
+
+size_t aesEncryptInPlace(const void *key, size_t keylen, void *buffer, size_t inlen, size_t buflen)
+{
+#ifdef _USE_OPENSSL
+    if (!useLegacyAES)
+        return openssl::aesEncryptInPlace(key, keylen, buffer, inlen, buflen);
+#endif
+    return jlib::aesEncryptInPlace(key, keylen, buffer, inlen, buflen);
+}
+
+
+size_t aesDecryptInPlace(const void *key, size_t keylen, void *data, size_t inlen)
+{
+#ifdef _USE_OPENSSL
+    if (!useLegacyAES)
+        return openssl::aesDecryptInPlace(key, keylen, data, inlen);
+#endif
+    return jlib::aesDecryptInPlace(key, keylen, data, inlen);
+}
+
+void setLegacyAES(bool value)
+{
+    useLegacyAES = value;
 }
 
 #define CRYPTSIZE 32
@@ -1848,4 +2149,6 @@ void decrypt(StringBuffer &ret, const char *in)
         ret.append(out1.length(), out1.toByteArray());
     }
 }
+
+
 

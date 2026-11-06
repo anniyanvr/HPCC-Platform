@@ -71,14 +71,14 @@ public:
 
 
     Esdl2TransformerContext(Esdl2Transformer& xformer_, IXmlWriterExt *writer_ , double client_ver_, IProperties *pgs, EsdlProcessMode mode_, unsigned int flags_=0, const char *nsp=NULL, const char *schema_location=NULL)
-        : xformer(xformer_), xppp(NULL), client_ver(client_ver_), mode(mode_), param_groups(pgs), skip_root(false), counter(0), flags(flags_), ns(nsp),schemaLocation(schema_location)
+        : xformer(xformer_), mode(mode_), flags(flags_), xppp(NULL), client_ver(client_ver_), param_groups(pgs), skip_root(false), counter(0), ns(nsp),schemaLocation(schema_location)
     {
         writer = writer_;
         do_output_ns = (nsp && *nsp) ? true : false;
     }
 
     Esdl2TransformerContext(Esdl2Transformer& xformer_, IXmlWriterExt *writer_ , XmlPullParser &xppx_, double client_ver_, IProperties *pgs, EsdlProcessMode mode_, unsigned int flags_=0, const char *nsp=NULL, const char *schema_location=NULL)
-        : xformer(xformer_), xppp(&xppx_), client_ver(client_ver_), mode(mode_), param_groups(pgs), skip_root(false), counter(0), flags(flags_), ns(nsp), schemaLocation(schema_location)
+        : xformer(xformer_), mode(mode_), flags(flags_), xppp(&xppx_), client_ver(client_ver_), param_groups(pgs), skip_root(false), counter(0), ns(nsp), schemaLocation(schema_location)
     {
             writer = writer_;
             do_output_ns = (nsp && *nsp) ? true : false;
@@ -99,7 +99,7 @@ class Esdl2LocalContext
     StringArray *m_dataOrig;
 
 public:
-    Esdl2LocalContext() : dataForProcessed(false), m_dataFor(NULL), m_dataOrig(NULL),m_startTag(NULL)  { }
+    Esdl2LocalContext() : m_dataFor(NULL), m_dataOrig(NULL), dataForProcessed(false), m_startTag(NULL)  { }
     ~Esdl2LocalContext() { delete m_dataFor; delete m_dataOrig; }
 
     bool dataForProcessed;
@@ -387,6 +387,13 @@ public:
     {
         Esdl2Base::serialize(out, "EsdlRequest");
     }
+    bool hasDefaults()
+    {
+        if (!defvals)
+            return false;
+        Owned<IPropertyIterator> it = defvals->getIterator();
+        return (it && it->first());
+    }
 
     virtual void buildDefaults(Esdl2Transformer *xformer);
 
@@ -466,11 +473,11 @@ class Esdl2Transformer : public CInterface, implements IEsdlTransformer
 private:
     Owned<IEsdlDefinition> m_def;
 
-    ReadWriteLock rwTypeLock;
+    ReadWriteLock rwTypeLock{SYNC_LOCATION};
     EsdlBaseArray types;  //elements and arrays
     EsdlBaseMap type_map;
 
-    ReadWriteLock rwMethodLock;
+    ReadWriteLock rwMethodLock{SYNC_LOCATION};
     EsdlMethodArray methods;  //elements and arrays
     EsdlMethodMap meth_map;
 

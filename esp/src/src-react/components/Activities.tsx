@@ -1,0 +1,437 @@
+import * as React from "react";
+import { CommandBar, ContextualMenuItemType, ICommandBarItemProps } from "./CommandBarV9";
+import { useConst } from "@fluentui/react-hooks";
+import * as ESPActivity from "src/ESPActivity";
+import * as Utility from "src/Utility";
+import nlsHPCC from "src/nlsHPCC";
+import { useGrid } from "../hooks/grid";
+import { useBuildInfo } from "../hooks/platform";
+import { ReflexContainer, ReflexElement, ReflexSplitter, useReflexClassNames, styles } from "../layouts/react-reflex";
+import { HolyGrail } from "../layouts/HolyGrail";
+import { selector, tree } from "./DojoGrid";
+import { Summary } from "./DiskUsage";
+
+declare const dojoConfig;
+
+class DelayedRefresh {
+    _promises: Promise<any>[] = [];
+
+    constructor(private _refresh: (clearSelection?) => void) {
+    }
+
+    push(promise: Promise<any>) {
+        this._promises.push(promise);
+    }
+
+    refresh() {
+        if (this._promises.length) {
+            Promise.all(this._promises).then(() => {
+                this._refresh();
+            });
+        }
+    }
+}
+
+const defaultUIState = {
+    clusterSelected: false,
+    thorClusterSelected: false,
+    wuSelected: false,
+    clusterPausedSelected: false,
+    clusterNotPausedSelected: false,
+    clusterHasItems: false,
+    wuCanHigh: false,
+    wuCanNormal: false,
+    wuCanLow: false,
+    wuCanUp: false,
+    wuCanDown: false
+};
+
+const isDFUWorkunit = (wuid: string): boolean => {
+    if (!wuid) return false;
+    const firstChar = wuid.trim().charAt(0).toUpperCase();
+    return firstChar === "D" || firstChar === "P";
+};
+
+interface ActivitiesProps {
+}
+
+export const Activities: React.FunctionComponent<ActivitiesProps> = ({
+}) => {
+
+    const [uiState, setUIState] = React.useState({ ...defaultUIState });
+    const classNames = useReflexClassNames();
+
+    const [, { isContainer }] = useBuildInfo();
+
+    //  Grid ---
+    const activity = useConst(() => ESPActivity.Get());
+    const { Grid, selection, refreshTable, copyButtons } = useGrid({
+        store: activity.getStore({}),
+        sort: { attribute: "idx", descending: false },
+        filename: "activities",
+        columns: {
+            col1: selector({
+                width: 27,
+                selectorType: "checkbox",
+                sortable: false
+            }),
+            Priority: {
+                renderHeaderCell: React.useCallback(function (node) {
+                    node.innerHTML = Utility.getImageHTML("priority.png", nlsHPCC.Priority);
+                }, []),
+                width: 25,
+                sortable: false,
+                formatter: React.useCallback(function (Priority) {
+                    switch (Priority) {
+                        case "high":
+                            return Utility.getImageHTML("priority_high.png");
+                        case "low":
+                            return Utility.getImageHTML("priority_low.png");
+                    }
+                    return "";
+                }, [])
+            },
+            DisplayName: tree({
+                label: nlsHPCC.TargetWuid,
+                width: 300,
+                sortable: true,
+                shouldExpand: function (row, level, previouslyExpanded) {
+                    if (level === 0) {
+                        return previouslyExpanded === undefined ? true : previouslyExpanded;
+                    }
+                    return previouslyExpanded;
+                },
+                formatter: function (_name, row) {
+                    const img = row.getStateImage();
+                    if (activity.isInstanceOfQueue(row)) {
+                        if (row.ClusterType === 3 && !isContainer) {
+                            return `<img src="${img}"/>&nbsp;<a href="#/operations/clusters/${encodeURIComponent(row.ClusterName)}" class="dgrid-row-url">${Utility.encodeHTML(_name)}</a>`;
+                        } else {
+                            return `<img src="${img}"/>&nbsp;<span>${Utility.encodeHTML(_name)}</span>`;
+                        }
+                    }
+                    const route = isDFUWorkunit(row.Wuid) ? "dfuworkunits" : "workunits";
+                    return `<img src="${img}"/>&nbsp;<a href="#/${route}/${encodeURIComponent(row.Wuid)}" class="dgrid-row-url">${Utility.encodeHTML(row.Wuid)}</a>`;
+                }
+            }),
+            GID: {
+                label: nlsHPCC.Graph, width: 90, sortable: true,
+                formatter: React.useCallback(function (_gid, row) {
+                    if (activity.isInstanceOfWorkunit(row)) {
+                        if (row.GraphName) {
+                            return `<a href="#/workunits/${encodeURIComponent(row.Wuid)}/metrics/${encodeURIComponent(row.GraphName)}">${Utility.encodeHTML(row.GraphName + "-" + row.GID)}</a>`;
+                        }
+                    }
+                    return "";
+                }, [activity])
+            },
+            State: {
+                label: nlsHPCC.State,
+                sortable: false,
+                formatter: React.useCallback(function (state, row) {
+                    if (activity.isInstanceOfQueue(row)) {
+                        return row.isNormal() ? "" : row.StatusDetails;
+                    }
+                    if (row.Duration) {
+                        return state + " (" + row.Duration + ")";
+                    } else if (row.Instance && !(state.indexOf && state.indexOf(row.Instance) !== -1)) {
+                        return state + " [" + row.Instance + "]";
+                    }
+                    return state;
+                }, [activity])
+            },
+            Owner: { label: nlsHPCC.Owner, width: 90, sortable: false },
+            Jobname: { label: nlsHPCC.JobName, sortable: false }
+        },
+        getSelected: function () {
+            const retVal = [];
+            for (const id in this.selection) {
+                const item = activity.resolve(id);
+                if (item) {
+                    retVal.push(item);
+                }
+            }
+            return retVal;
+        }
+    });
+
+    React.useEffect(() => {
+        refreshTable();
+        const handle = activity.watch("__hpcc_changedCount", function (item, oldValue, newValue) {
+            refreshTable();
+        });
+        return () => handle.unwatch();
+    }, [activity, refreshTable]);
+
+    //  Command Bar  ---
+    const wuPriority = React.useCallback((priority) => {
+        const promises = new DelayedRefresh(refreshTable);
+        selection.forEach((item, idx) => {
+            const queue = item.get("ESPQueue");
+            if (queue) {
+                promises.push(queue.setPriority(item.Wuid, priority));
+            }
+        });
+        promises.refresh();
+    }, [refreshTable, selection]);
+
+    const buttons = React.useMemo((): ICommandBarItemProps[] => [
+        {
+            key: "refresh", text: nlsHPCC.Refresh, iconProps: { iconName: "Refresh" },
+            onClick: () => activity.refresh()
+        },
+        { key: "divider_1", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "open", text: nlsHPCC.Open, disabled: !uiState.wuSelected && !uiState.thorClusterSelected, iconProps: { iconName: "WindowEdit" },
+            onClick: () => {
+                if (selection.length === 1) {
+                    let url = `#/operations/clusters/${selection[0].ClusterName}`;
+                    if (selection[0].Wuid) {
+                        const route = isDFUWorkunit(selection[0].Wuid) ? "dfuworkunits" : "workunits";
+                        url = `#/${route}/${selection[0].Wuid}`;
+                    }
+                    window.location.href = url;
+                } else {
+                    for (let i = selection.length - 1; i >= 0; --i) {
+                        let url = `#/operations/clusters/${selection[i].ClusterName}`;
+                        if (selection[i].Wuid) {
+                            const route = isDFUWorkunit(selection[i].Wuid) ? "dfuworkunits" : "workunits";
+                            url = `#/${route}/${selection[i].Wuid}`;
+                        }
+                        window.open(url, "_blank");
+                    }
+                }
+            }
+        },
+        { key: "divider_2", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "pause", text: nlsHPCC.Pause, disabled: !uiState.clusterNotPausedSelected,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                selection.forEach((item, idx) => {
+                    if (activity.isInstanceOfQueue(item)) {
+                        promises.push(item.pause());
+                    }
+                });
+                promises.refresh();
+            }
+        },
+        {
+            key: "resume", text: nlsHPCC.Resume, disabled: !uiState.clusterPausedSelected,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                selection.forEach((item, idx) => {
+                    if (activity.isInstanceOfQueue(item)) {
+                        promises.push(item.resume());
+                    }
+                });
+                promises.refresh();
+            }
+        },
+        {
+            key: "clear", text: nlsHPCC.Clear, disabled: !uiState.clusterPausedSelected,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                selection.forEach((item, idx) => {
+                    if (activity.isInstanceOfQueue(item)) {
+                        promises.push(item.clear());
+                    }
+                });
+                promises.refresh();
+            }
+        },
+        { key: "divider_3", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "wu-pause", text: nlsHPCC.Pause, disabled: !uiState.wuSelected,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                selection.forEach((item, idx) => {
+                    if (activity.isInstanceOfWorkunit(item)) {
+                        promises.push(item.pause());
+                    }
+                });
+                promises.refresh();
+            }
+        },
+        {
+            key: "wu-pause-now", text: nlsHPCC.PauseNow, disabled: !uiState.wuSelected,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                selection.forEach((item, idx) => {
+                    if (activity.isInstanceOfWorkunit(item)) {
+                        promises.push(item.pauseNow());
+                    }
+                });
+                promises.refresh();
+            }
+        },
+        {
+            key: "wu-resume", text: nlsHPCC.Resume, disabled: !uiState.wuSelected,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                selection.forEach((item, idx) => {
+                    if (activity.isInstanceOfWorkunit(item)) {
+                        promises.push(item.resume());
+                    }
+                });
+                promises.refresh();
+            }
+        },
+        {
+            key: "wu-abort", text: nlsHPCC.Abort, disabled: !uiState.wuSelected,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                selection.forEach((item, idx) => {
+                    if (activity.isInstanceOfWorkunit(item)) {
+                        promises.push(item.abort());
+                    }
+                });
+                promises.refresh();
+            }
+        },
+        { key: "divider_4", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "wu-high", text: nlsHPCC.High, disabled: !uiState.wuCanHigh,
+            onClick: () => wuPriority("high")
+        },
+        {
+            key: "wu-normal", text: nlsHPCC.Normal, disabled: !uiState.wuCanNormal,
+            onClick: () => wuPriority("normal")
+        },
+        {
+            key: "wu-low", text: nlsHPCC.Low, disabled: !uiState.wuCanLow,
+            onClick: () => wuPriority("low")
+        },
+        { key: "divider_5", itemType: ContextualMenuItemType.Divider },
+        {
+            key: "wu-top", text: nlsHPCC.Top, disabled: !uiState.wuCanUp,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                for (let i = selection.length - 1; i >= 0; --i) {
+                    const item = selection[i];
+                    if (activity.isInstanceOfWorkunit(item)) {
+                        const queue = item.get("ESPQueue");
+                        if (queue) {
+                            promises.push(queue.moveTop(item.Wuid));
+                        }
+                    }
+                }
+                promises.refresh();
+            }
+        },
+        {
+            key: "wu-up", text: nlsHPCC.Up, disabled: !uiState.wuCanUp,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                selection.forEach((item, idx) => {
+                    if (activity.isInstanceOfWorkunit(item)) {
+                        const queue = item.get("ESPQueue");
+                        if (queue) {
+                            promises.push(queue.moveUp(item.Wuid));
+                        }
+                    }
+                });
+                promises.refresh();
+            }
+        },
+        {
+            key: "wu-down", text: nlsHPCC.Down, disabled: !uiState.wuCanDown,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                for (let i = selection.length - 1; i >= 0; --i) {
+                    const item = selection[i];
+                    if (activity.isInstanceOfWorkunit(item)) {
+                        const queue = item.get("ESPQueue");
+                        if (queue) {
+                            promises.push(queue.moveDown(item.Wuid));
+                        }
+                    }
+                }
+                promises.refresh();
+            }
+        },
+        {
+            key: "wu-bottom", text: nlsHPCC.Bottom, disabled: !uiState.wuCanDown,
+            onClick: () => {
+                const promises = new DelayedRefresh(refreshTable);
+                selection.forEach((item, idx) => {
+                    if (activity.isInstanceOfWorkunit(item)) {
+                        const queue = item.get("ESPQueue");
+                        if (queue) {
+                            promises.push(queue.moveBottom(item.Wuid));
+                        }
+                    }
+                });
+                promises.refresh();
+            }
+        },
+    ], [activity, refreshTable, selection, uiState.clusterNotPausedSelected, uiState.clusterPausedSelected, uiState.thorClusterSelected, uiState.wuCanDown, uiState.wuCanHigh, uiState.wuCanLow, uiState.wuCanNormal, uiState.wuCanUp, uiState.wuSelected, wuPriority]);
+
+    //  Selection  ---
+    React.useEffect(() => {
+        const state = { ...defaultUIState };
+
+        selection.forEach(item => {
+            if (activity.isInstanceOfQueue(item)) {
+                state.clusterSelected = true;
+                if (item.isPaused()) {
+                    state.clusterPausedSelected = true;
+                } else {
+                    state.clusterNotPausedSelected = true;
+                }
+                if (item.getChildCount()) {
+                    state.clusterHasItems = true;
+                }
+                if (item.ClusterType === 3) {
+                    state.thorClusterSelected = true;
+                }
+            } else if (activity.isInstanceOfWorkunit(item)) {
+                state.wuSelected = true;
+                const queue = item.get("ESPQueue");
+                if (queue) {
+                    if (queue.canChildMoveUp(item.__hpcc_id)) {
+                        state.wuCanUp = true;
+                    }
+                    if (queue.canChildMoveDown(item.__hpcc_id)) {
+                        state.wuCanDown = true;
+                    }
+                }
+                if (item.get("Priority") !== "high") {
+                    state.wuCanHigh = true;
+                }
+                if (item.get("Priority") !== "normal") {
+                    state.wuCanNormal = true;
+                }
+                if (item.get("Priority") !== "low") {
+                    state.wuCanLow = true;
+                }
+            }
+        });
+        setUIState(state);
+    }, [activity, selection]);
+
+    if (isContainer) {
+        return <HolyGrail key="activities"
+            header={<CommandBar items={buttons} farItems={copyButtons} />}
+            main={
+                <Grid />
+            }
+        />;
+    }
+    return <ReflexContainer orientation="horizontal">
+        <ReflexElement size={100} minSize={100} style={{ overflow: "hidden" }}>
+            <Summary />
+        </ReflexElement>
+        <ReflexSplitter style={styles.reflexSplitter}>
+            <div className={classNames.reflexSplitterDiv}></div>
+        </ReflexSplitter>
+        <ReflexElement>
+            <HolyGrail key="activities"
+                header={<CommandBar items={buttons} farItems={copyButtons} />}
+                main={
+                    <Grid />
+                }
+            />
+        </ReflexElement>
+    </ReflexContainer>;
+};

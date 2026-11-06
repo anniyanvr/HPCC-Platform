@@ -15,7 +15,6 @@
     limitations under the License.
 ############################################################################## */
 
-#define da_decl DECL_EXPORT
 #include "platform.h"
 #include "jlib.hpp"
 #include "jsuperhash.hpp"
@@ -55,8 +54,8 @@ class CLockState: public CInterface
 {
 public:
     Int64Array owners;
-    Semaphore sem;
-    CriticalSection sect;
+    Semaphore sem{SYNC_LOCATION};
+    CriticalSection sect{SYNC_LOCATION};
     unsigned short waiting;
     unsigned exclusivenest;
     DistributedLockId id;
@@ -135,7 +134,7 @@ public:
 
 class CLockStateTable: private SuperHashTableOf<CLockState,DistributedLockId>
 {
-    CriticalSection sect;
+    CriticalSection sect{SYNC_LOCATION};
 
 
     void onAdd(void *)
@@ -239,7 +238,9 @@ public:
     {
         ICoven &coven=queryCoven();
         ICommunicator &comm=coven.queryComm();
-        CMessageHandler<CLockRequestServer> handler("CLockRequestServer",this,&CLockRequestServer::processMessage);
+        unsigned maxThreads = 100; // NB: can exceed with up to 1s delay
+        maxThreads = getComponentConfigSP()->getPropInt("expert/@daliLockPoolLimit", maxThreads);
+        CMessageHandler<CLockRequestServer> handler("CLockRequestServer", this, &CLockRequestServer::processMessage, nullptr, maxThreads);
         stopped = false;
         CMessageBuffer mb;
         while (!stopped) {

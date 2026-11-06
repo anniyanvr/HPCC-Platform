@@ -30,6 +30,7 @@
 #include "rtlcommon.hpp"
 #include "rtldynfield.hpp"
 #include "eclhelper_dyn.hpp"
+#include "jplane.hpp"
 #include "hqlexpr.hpp"
 #include "hqlutil.hpp"
 #include <algorithm>
@@ -39,6 +40,7 @@
 #include "roxiemem.hpp"
 #include "thorstep.hpp"
 #include "roxiemem.hpp"
+#include "dadfs.hpp"
 
 #define ROWAGG_PERROWOVERHEAD (sizeof(AggregateRowBuilder))
 
@@ -65,8 +67,11 @@ static CClassMeta<AggregateRowBuilder> AggregateRowBuilderMeta;
 
 void RowAggregator::start(IEngineRowAllocator *_rowAllocator, ICodeContext *ctx, unsigned activityId)
 {
-    rowAllocator.set(_rowAllocator);
-    rowBuilderAllocator.setown(ctx->getRowAllocatorEx(&AggregateRowBuilderMeta, activityId, roxiemem::RHFunique|roxiemem::RHFscanning|roxiemem::RHFdelayrelease));
+    if (rowAllocator != _rowAllocator)
+    {
+        rowAllocator.set(_rowAllocator);
+        rowBuilderAllocator.setown(ctx->getRowAllocatorEx(&AggregateRowBuilderMeta, activityId, roxiemem::RHFunique|roxiemem::RHFscanning|roxiemem::RHFdelayrelease));
+    }
 }
 
 void RowAggregator::reset()
@@ -80,7 +85,6 @@ void RowAggregator::reset()
     _releaseAll();
     eof = false;
     cursor = NULL;
-    rowAllocator.clear();
     totalSize = overhead = 0;
 }
 
@@ -798,7 +802,7 @@ extern const char * getActivityText(ThorActivityKind kind)
     case TAKstreamediterator:       return "Streamed Dataset";
     case TAKexternalsource:         return "User Source";
     case TAKexternalsink:           return "User Output";
-    case TAKexternalprocess:        return "User Proceess";
+    case TAKexternalprocess:        return "User Process";
     case TAKwhen_action:            return "When";
     case TAKsubsort:                return "Sub Sort";
     case TAKdictionaryworkunitwrite:return "Dictionary Write";
@@ -984,11 +988,9 @@ static NullVirtualFieldCallback nullVirtualFieldCallback;
 class CRowStreamReader : public CSimpleInterfaceOf<IExtRowStream>
 {
 protected:
-    Linked<IFileIO> fileio;
-    Linked<IMemoryMappedFile> mmfile;
+    Linked<IBufferedSerialInputStream> strm;
     Linked<IOutputRowDeserializer> deserializer;
     Linked<IEngineRowAllocator> allocator;
-    Owned<ISerialStream> strm;
     Owned<ISourceRowPrefetcher> prefetcher;
     CThorContiguousRowBuffer prefetchBuffer;
     unsigned __int64 progress = 0;
@@ -1011,16 +1013,6 @@ protected:
     static unsigned rdnum;
 #endif
 
-    class : implements IFileSerialStreamCallback
-    {
-    public:
-        CRC32 crc;
-        void process(offset_t ofs, size32_t sz, const void *buf)
-        {
-            crc.tally(sz,buf);
-        }
-    } crccb;
-    
     inline bool fieldFilterMatch(const void * buffer)
     {
         if (actualFilter.numFilterFields())
@@ -1071,16 +1063,18 @@ protected:
         }
         return false;
     }
-    const byte *getNextPrefetchRow()
+    const byte *getNextPrefetchRow(size32_t & size)
     {
         while (true)
         {
             ++progress;
             if (checkEmptyRow())
-                return nullptr;
+                break;
+
             currentRowOffset = prefetchBuffer.tell();
             prefetcher->readAhead(prefetchBuffer);
             bool matched = fieldFilterMatch(prefetchBuffer.queryRow());
+            size = prefetchBuffer.tell() - currentRowOffset;
             checkEog();
             if (matched) // NB: prefetchDone() call must be paired with a row returned from prefetchRow()
             {
@@ -1092,6 +1086,7 @@ protected:
             if (checkExitConditions())
                 break;
         }
+        size = 0;
         return nullptr;
     }
     const void *getNextRow()
@@ -1125,17 +1120,13 @@ protected:
         return nullptr;
     }
 public:
-    CRowStreamReader(IFileIO *_fileio, IMemoryMappedFile *_mmfile, IRowInterfaces *rowif, offset_t _ofs, offset_t _len, bool _tallycrc, EmptyRowSemantics _emptyRowSemantics, ITranslator *_translatorContainer, IVirtualFieldCallback * _fieldCallback)
-        : fileio(_fileio), mmfile(_mmfile), allocator(rowif->queryRowAllocator()), prefetchBuffer(nullptr), emptyRowSemantics(_emptyRowSemantics), translatorContainer(_translatorContainer), fieldCallback(_fieldCallback)
+    CRowStreamReader(IBufferedSerialInputStream *_strm, IRowInterfaces *rowif, EmptyRowSemantics _emptyRowSemantics, ITranslator *_translatorContainer, IVirtualFieldCallback * _fieldCallback)
+        : strm(_strm), allocator(rowif->queryRowAllocator()), prefetchBuffer(nullptr), translatorContainer(_translatorContainer), fieldCallback(_fieldCallback), emptyRowSemantics(_emptyRowSemantics)
     {
 #ifdef TRACE_CREATE
         PROGLOG("CRowStreamReader %d = %p",++rdnum,this);
 #endif
-        if (fileio)
-            strm.setown(createFileSerialStream(fileio,_ofs,_len,(size32_t)-1, _tallycrc?&crccb:NULL));
-        else
-            strm.setown(createFileSerialStream(mmfile,_ofs,_len,_tallycrc?&crccb:NULL));
-        currentRowOffset = _ofs;
+        currentRowOffset = strm ? strm->tell() : 0;
         if (translatorContainer)
         {
             actualFormat = &translatorContainer->queryActualFormat();
@@ -1163,19 +1154,6 @@ public:
 
     IMPLEMENT_IINTERFACE_USING(CSimpleInterfaceOf<IExtRowStream>)
 
-    virtual void reinit(offset_t _ofs,offset_t _len,unsigned __int64 _maxrows) override
-    {
-        assertex(_maxrows == 0);
-        eoi = false;
-        eos = (_len==0);
-        eog = false;
-        hadMatchInGroup = false;
-        bufofs = 0;
-        progress = 0;
-        strm->reset(_ofs,_len);
-        currentRowOffset = _ofs;
-    }
-
     virtual const void *nextRow() override
     {
         if (eog)
@@ -1191,7 +1169,8 @@ public:
             {
                 if (translator)
                 {
-                    const byte *row = getNextPrefetchRow();
+                    size32_t prefetchSize;
+                    const byte *row = getNextPrefetchRow(prefetchSize);
                     if (row)
                     {
                         RtlDynamicRowBuilder rowBuilder(*allocator);
@@ -1207,7 +1186,7 @@ public:
         return nullptr;
     }
 
-    virtual const byte *prefetchRow() override
+    virtual const void *prefetchRow(size32_t & size) override
     {
         // NB: prefetchDone() call must be paired with a row returned from prefetchRow()
         if (eog)
@@ -1221,20 +1200,21 @@ public:
                 eos = true;
             else
             {
-                const byte *row = getNextPrefetchRow();
+                const byte *row = getNextPrefetchRow(size);
                 if (row)
                 {
                     if (translator)
                     {
                         translateBuf.setLength(0);
                         MemoryBufferBuilder rowBuilder(translateBuf, 0);
-                        translator->translate(rowBuilder, *fieldCallback, row);
+                        size = translator->translate(rowBuilder, *fieldCallback, row);
                         row = rowBuilder.getSelf();
                     }
                     return row;
                 }
             }
         }
+        size = 0;
         return nullptr;
     }
 
@@ -1245,24 +1225,22 @@ public:
 
     virtual void stop() override
     {
-        stop(NULL);
+        if (!eos)
+        {
+            eos = true;
+            clear();
+        }
     }
 
     void clear()
     {
         strm.clear();
-        fileio.clear();
     }
 
-    virtual void stop(CRC32 *crcout) override
+    virtual CRC32 queryCRC() const override
     {
-        if (!eos) {
-            eos = true;
-            clear();
-        }
         // NB CRC will only be right if stopped at eos
-        if (crcout)
-            *crcout = crccb.crc;
+        return 0;
     }
 
     virtual offset_t getOffset() const override
@@ -1277,13 +1255,12 @@ public:
 
     virtual unsigned __int64 getStatistic(StatisticKind kind) override
     {
-        if (fileio)
-            return fileio->getStatistic(kind);
-        return 0;
-    }
-    virtual unsigned __int64 queryProgress() const override
-    {
-        return progress;
+        switch (kind)
+        {
+        case StNumRowsRead:
+            return progress;
+        }
+        return strm ? strm->getStatistic(kind) : 0;
     }
     virtual void setFilters(IConstArrayOf<IFieldFilter> &filters)
     {
@@ -1314,21 +1291,12 @@ class CLimitedRowStreamReader : public CRowStreamReader
     unsigned __int64 rownum;
 
 public:
-    CLimitedRowStreamReader(IFileIO *_fileio, IMemoryMappedFile *_mmfile, IRowInterfaces *rowif, offset_t _ofs, offset_t _len, unsigned __int64 _maxrows, bool _tallycrc, EmptyRowSemantics _emptyRowSemantics, ITranslator *translatorContainer, IVirtualFieldCallback * _fieldCallback)
-        : CRowStreamReader(_fileio, _mmfile, rowif, _ofs, _len, _tallycrc, _emptyRowSemantics, translatorContainer, _fieldCallback)
+    CLimitedRowStreamReader(IBufferedSerialInputStream *_strm, IRowInterfaces *rowif, unsigned __int64 _maxrows, EmptyRowSemantics _emptyRowSemantics, ITranslator *translatorContainer, IVirtualFieldCallback * _fieldCallback)
+        : CRowStreamReader(_strm, rowif, _emptyRowSemantics, translatorContainer, _fieldCallback)
     {
         maxrows = _maxrows;
         rownum = 0;
         eos = maxrows==0;
-    }
-
-    virtual void reinit(offset_t _ofs,offset_t _len,unsigned __int64 _maxrows) override
-    {
-        CRowStreamReader::reinit(_ofs, _len, 0);
-        if (_maxrows==0)
-            eos = true;
-        maxrows = _maxrows;
-        rownum = 0;
     }
 
     virtual const void *nextRow() override
@@ -1344,56 +1312,134 @@ public:
 unsigned CRowStreamReader::rdnum;
 #endif
 
-IExtRowStream *createRowStreamEx(IFileIO *fileIO, IRowInterfaces *rowIf, offset_t offset, offset_t len, unsigned __int64 maxrows, unsigned rwFlags, ITranslator *translatorContainer, IVirtualFieldCallback * fieldCallback)
+static IExtRowStream * makeRowStreamReader(IBufferedSerialInputStream *strm, IRowInterfaces *rowIf, unsigned __int64 maxrows, EmptyRowSemantics emptyRowSemantics, ITranslator *translatorContainer, IVirtualFieldCallback *fieldCallback)
 {
-    EmptyRowSemantics emptyRowSemantics = extractESRFromRWFlags(rwFlags);
     if (maxrows == (unsigned __int64)-1)
-        return new CRowStreamReader(fileIO, NULL, rowIf, offset, len, TestRwFlag(rwFlags, rw_crc), emptyRowSemantics, translatorContainer, fieldCallback);
+        return new CRowStreamReader(strm, rowIf, emptyRowSemantics, translatorContainer, fieldCallback);
     else
-        return new CLimitedRowStreamReader(fileIO, NULL, rowIf, offset, len, maxrows, TestRwFlag(rwFlags, rw_crc), emptyRowSemantics, translatorContainer, fieldCallback);
+        return new CLimitedRowStreamReader(strm, rowIf, maxrows, emptyRowSemantics, translatorContainer, fieldCallback);
 }
 
-bool UseMemoryMappedRead = false;
+static constexpr unsigned defaultRowStreamReadAheadThreads = 32;
+static constexpr size32_t defaultRowStreamChunkSize = 0x100000; // 1MB
 
-IExtRowStream *createRowStreamEx(IFile *file, IRowInterfaces *rowIf, offset_t offset, offset_t len, unsigned __int64 maxrows, unsigned rwFlags, IExpander *eexp, ITranslator *translatorContainer, IVirtualFieldCallback * fieldCallback)
+void getPlaneReadAheadSizing(const IStoragePlane *plane, unsigned &numThreads, size32_t &chunkSize)
 {
-    bool compressed = TestRwFlag(rwFlags, rw_compress);
-    EmptyRowSemantics emptyRowSemantics = extractESRFromRWFlags(rwFlags);
+    if (numThreads && chunkSize) // already set, no need to look up plane
+        return;
+    size32_t planeBlockSize = 0; // retain for kludge check that forces readAheadThreads if looks like a blob plane
+    if (!chunkSize)
+    {
+        chunkSize = defaultRowStreamChunkSize; // default if plane doesn't override
+        if (plane)
+        {
+            planeBlockSize = (size32_t) plane->getAttribute(BlockedSequentialIO, 0);
+            if (planeBlockSize)
+                chunkSize = planeBlockSize;
+        }
+    }
+    if (!numThreads)
+    {
+        numThreads = 1; // default if plane doesn't override
+        if (plane)
+        {
+            unsigned numThreadsPlaneValue = (unsigned) plane->getAttribute(ReadAheadThreads, 0);
+            if (0 != numThreadsPlaneValue)
+                numThreads = numThreadsPlaneValue;
+            else // unset
+            {
+                // 2026-08-28: temp kludge to enabled parallel reading without waiting on TF propagation of plane configuration (removed this code when settled in and configured properly)
+                // we assume this is set because it's an azure blob based plane
+                if (planeBlockSize >= 1024 * 4096)
+                    numThreads = defaultRowStreamReadAheadThreads;
+            }
+        }
+    }
+}
+
+void getPlaneReadAheadSizing(const char *filename, unsigned &numThreads, size32_t &chunkSize)
+{
+    if (isEmptyString(filename))
+        return;
+    if (numThreads && chunkSize) // already set, no need to look up plane
+        return;
+    Owned<const IStoragePlane> plane = getStoragePlaneFromPath(filename, false);
+    return getPlaneReadAheadSizing(plane, numThreads, chunkSize);
+}
+
+IBufferedSerialInputStream * createParallelRowInputStream(IFileIO *fileio, unsigned numThreads, size32_t chunkSize, size32_t overflowMaxSize, offset_t offset, offset_t len)
+{
+    // Caller is responsible for looking up plane-derived sizing (see getPlaneReadAheadSizing());
+    assertex(numThreads);
+    assertex(chunkSize);
+    return createParallelReadAheadInputStream(fileio, numThreads, chunkSize, overflowMaxSize, offset, len);
+}
+
+IBufferedSerialInputStream * createParallelRowInputStream(IFileIO *fileio, unsigned numThreads, size32_t chunkSize, size32_t overflowMaxSize)
+{
+    return createParallelRowInputStream(fileio, numThreads, chunkSize, overflowMaxSize, 0, (offset_t)-1);
+}
+
+
+IExtRowStream *createRowStream(IFileIO *fileIO, IRowInterfaces *rowIf, const RowStreamOptions &options)
+{
+    unsigned numThreads = options.numThreads;
+    size32_t chunkSize = options.chunkSize;
+    IFile *iFile = fileIO->queryFile();
+    const char *filename = iFile ? iFile->queryFilename() : nullptr;
+    getPlaneReadAheadSizing(filename, numThreads, chunkSize); // if numThreads/chunkSize are unset, this will determine appropriate values based on plane configuration
+    Owned<IBufferedSerialInputStream> strm;
+    if (numThreads>1)
+    {
+        ICompressedFileIO *compIO = dynamic_cast<ICompressedFileIO *>(fileIO);
+        if (compIO)
+            strm.setown(compIO->createParallelReadStream(numThreads, chunkSize));
+        else
+        {
+            // NB: createParallelRowInputStream falls back to createBufferedInputStream if parallel read is not supported
+            strm.setown(createParallelRowInputStream(fileIO, numThreads, chunkSize, ParallelReadAheadArbitraryPeek, options.offset, options.len));
+        }
+    }
+    if (!strm)
+        strm.setown(createFileSerialStream(fileIO, options.offset, options.len, (size32_t)-1));
+    if (options.offset != 0 || options.len != (offset_t)-1)
+        strm->reset(options.offset, options.len);
+    EmptyRowSemantics emptyRowSemantics = extractESRFromRWFlags(options.rwFlags);
+    return makeRowStreamReader(strm, rowIf, options.maxRows, emptyRowSemantics, options.translatorContainer, options.fieldCallback);
+}
+
+static bool UseMemoryMappedRead = false;
+
+IExtRowStream *createRowStream(IFile *file, IRowInterfaces *rowIf, const FileRowStreamOptions &options)
+{
+    bool compressed = TestRwFlag(options.rwFlags, rw_compress);
+    EmptyRowSemantics emptyRowSemantics = extractESRFromRWFlags(options.rwFlags);
     if (UseMemoryMappedRead && !compressed)
     {
         PROGLOG("Memory Mapped read of %s",file->queryFilename());
         Owned<IMemoryMappedFile> mmfile = file->openMemoryMapped();
         if (!mmfile)
             return NULL;
-        if (maxrows == (unsigned __int64)-1)
-            return new CRowStreamReader(NULL, mmfile, rowIf, offset, len, TestRwFlag(rwFlags, rw_crc), emptyRowSemantics, translatorContainer, fieldCallback);
-        else
-            return new CLimitedRowStreamReader(NULL, mmfile, rowIf, offset, len, maxrows, TestRwFlag(rwFlags, rw_crc), emptyRowSemantics, translatorContainer, fieldCallback);
+        Owned<IBufferedSerialInputStream> strm = createFileSerialStream(mmfile, options.offset, options.len);
+        return makeRowStreamReader(strm, rowIf, options.maxRows, emptyRowSemantics, options.translatorContainer, options.fieldCallback);
     }
     else
     {
-        Owned<IFileIO> fileio;
+        Owned<IFileIO> iFileIO;
         if (compressed)
         {
             // JCSMORE should pass in a flag for rw_compressblkcrc I think, doesn't look like it (or anywhere else)
             // checks the block crc's at the moment.
-            fileio.setown(createCompressedFileReader(file, eexp, UseMemoryMappedRead));
+            iFileIO.setown(createCompressedFileReader(file, options.eexp, useDefaultIoBufferSize, UseMemoryMappedRead, IFEnone));
         }
         else
-            fileio.setown(file->open(IFOread));
-        if (!fileio)
-            return NULL;
-        if (maxrows == (unsigned __int64)-1)
-            return new CRowStreamReader(fileio, NULL, rowIf, offset, len, TestRwFlag(rwFlags, rw_crc), emptyRowSemantics, translatorContainer, fieldCallback);
-        else
-            return new CLimitedRowStreamReader(fileio, NULL, rowIf, offset, len, maxrows, TestRwFlag(rwFlags, rw_crc), emptyRowSemantics, translatorContainer, fieldCallback);
+            iFileIO.setown(file->open(IFOread));
+        if (!iFileIO)
+            return nullptr;
+        return createRowStream(iFileIO, rowIf, options);
     }
 }
 
-IExtRowStream *createRowStream(IFile *file, IRowInterfaces *rowIf, unsigned rwFlags, IExpander *eexp, ITranslator *translatorContainer, IVirtualFieldCallback * fieldCallback)
-{
-    return createRowStreamEx(file, rowIf, 0, (offset_t)-1, (unsigned __int64)-1, rwFlags, eexp, translatorContainer, fieldCallback);
-}
 
 // Memory map sizes can be big, restrict to 64-bit platforms.
 void useMemoryMappedRead(bool on)
@@ -1404,14 +1450,12 @@ void useMemoryMappedRead(bool on)
 }
 
 #define ROW_WRITER_BUFFERSIZE (0x100000)
-class CRowStreamWriter : private IRowSerializerTarget, implements IExtRowWriter, public CSimpleInterface
+class CRowStreamWriter final : private IRowSerializerTarget, implements ILogicalRowWriter, public CSimpleInterface
 {
     Linked<IFileIOStream> stream;
     Linked<IOutputRowSerializer> serializer;
     Linked<IEngineRowAllocator> allocator;
-    CRC32 crc;
     EmptyRowSemantics emptyRowSemantics;
-    bool tallycrc;
     unsigned nested;
     MemoryAttr ma;
     MemoryBuffer extbuf;  // may need to spill to disk at some point
@@ -1428,8 +1472,6 @@ class CRowStreamWriter : private IRowSerializerTarget, implements IExtRowWriter,
         {
             if (bufpos) {
                 stream->write(bufpos,buf);
-                if (tallycrc)
-                    crc.tally(bufpos,buf);
                 bufpos = 0;
             }
             size32_t extpos = extbuf.length();
@@ -1439,8 +1481,6 @@ class CRowStreamWriter : private IRowSerializerTarget, implements IExtRowWriter,
                 extpos = (extpos/ROW_WRITER_BUFFERSIZE)*ROW_WRITER_BUFFERSIZE;
             if (extpos) {
                 stream->write(extpos,extbuf.toByteArray());
-                if (tallycrc)
-                    crc.tally(extpos,extbuf.toByteArray());
             }
             if (extpos<extbuf.length()) {
                 bufpos = extbuf.length()-extpos;
@@ -1471,13 +1511,12 @@ class CRowStreamWriter : private IRowSerializerTarget, implements IExtRowWriter,
 public:
     IMPLEMENT_IINTERFACE_USING(CSimpleInterface);
 
-    CRowStreamWriter(IFileIOStream *_stream, IOutputRowSerializer *_serializer, IEngineRowAllocator *_allocator, EmptyRowSemantics _emptyRowSemantics, bool _tallycrc, bool _autoflush)
+    CRowStreamWriter(IFileIOStream *_stream, IOutputRowSerializer *_serializer, IEngineRowAllocator *_allocator, EmptyRowSemantics _emptyRowSemantics, bool _autoflush)
         : stream(_stream), serializer(_serializer), allocator(_allocator), emptyRowSemantics(_emptyRowSemantics)
     {
 #ifdef TRACE_CREATE
         PROGLOG("createRowWriter %d = %p",++wrnum,this);
 #endif
-        tallycrc = _tallycrc;
         nested = 0;
         buf = (byte *)ma.allocate(ROW_WRITER_BUFFERSIZE);
         bufpos = 0;
@@ -1499,7 +1538,7 @@ public:
         }
     }
 
-    void putRow(const void *row)
+    virtual void putRow(const void *row) override
     {
         if (row)
         {
@@ -1521,6 +1560,7 @@ public:
                         extbuf.append(b);
                 }
             }
+
             allocator->releaseRow(row);
         }
         else if (ers_eogonly == emptyRowSemantics) // backpatch
@@ -1541,18 +1581,22 @@ public:
         }
     }
 
-    void flush()
+    virtual void writeRow(const void *row) override
+    {
+#ifdef _DEBUG
+        PrintStackReport();
+#endif
+        UNIMPLEMENTED_X("Caller should use putRow() instead");
+    }
+
+    virtual void flush() override
     {
         flushBuffer(true);
         streamFlush();
     }
 
-    void flush(CRC32 *crcout)
+    virtual void noteStopped() override
     {
-        flushBuffer(true);
-        streamFlush();
-        if (crcout)
-            *crcout = crc;
     }
 
     offset_t getPosition()
@@ -1618,24 +1662,24 @@ public:
         --nested;
     }
 
+    virtual unsigned __int64 getStatistic(StatisticKind kind) override
+    {
+        return stream->getStatistic(kind);
+    }
 };
 
 #ifdef TRACE_CREATE
 unsigned CRowStreamWriter::wrnum=0;
 #endif
 
-IExtRowWriter *createRowWriter(IFile *iFile, IRowInterfaces *rowIf, unsigned flags, ICompressor *compressor, size32_t compressorBlkSz)
+ILogicalRowWriter *createRowWriter(IFile *iFile, IRowInterfaces *rowIf, unsigned flags, ICompressor *compressor, size32_t compressorBlkSz)
 {
     OwnedIFileIO iFileIO;
     if (TestRwFlag(flags, rw_compress))
     {
-        size32_t fixedSize = rowIf->queryRowMetaData()->querySerializedDiskMeta()->getFixedSize();
-        if (fixedSize && TestRwFlag(flags, rw_grouped))
-            ++fixedSize; // row writer will include a grouping byte
-        ICompressedFileIO *compressedFileIO = createCompressedFileWriter(iFile, fixedSize, TestRwFlag(flags, rw_extend), TestRwFlag(flags, rw_compressblkcrc), compressor, getCompMethod(flags));
-        if (compressorBlkSz)
-            compressedFileIO->setBlockSize(compressorBlkSz);
-        iFileIO.setown(compressedFileIO);
+        flags &= ~rw_buffered; // if compressed, do not want buffered stream as well
+        size32_t bufferSize = (size32_t)-1; // MORE: Should be cleanly passed through
+        iFileIO.setown(createCompressedFileWriter(iFile, TestRwFlag(flags, rw_extend), TestRwFlag(flags, rw_compressblkcrc), compressor, getCompMethod(flags), compressorBlkSz, bufferSize, IFEnone));
     }
     else
         iFileIO.setown(iFile->open((flags & rw_extend)?IFOwrite:IFOcreate));
@@ -1645,10 +1689,15 @@ IExtRowWriter *createRowWriter(IFile *iFile, IRowInterfaces *rowIf, unsigned fla
     return createRowWriter(iFileIO, rowIf, flags);
 }
 
-IExtRowWriter *createRowWriter(IFileIO *iFileIO, IRowInterfaces *rowIf, unsigned flags, size32_t compressorBlkSz)
+ILogicalRowWriter *createRowWriter(IFileIO *iFileIO, IRowInterfaces *rowIf, unsigned flags, ICompressor *compressor, size32_t compressorBlkSz)
 {
+    Owned<IFileIO> compressedFileIO;
     if (TestRwFlag(flags, rw_compress))
-        throw MakeStringException(0, "Unsupported createRowWriter flags");
+    {
+        size32_t bufferSize = (size32_t)-1; // MORE: Should be cleanly passed through
+        compressedFileIO.setown(createCompressedFileWriter(iFileIO, TestRwFlag(flags, rw_extend), TestRwFlag(flags, rw_compressblkcrc), compressor, getCompMethod(flags), compressorBlkSz, bufferSize));
+        iFileIO = compressedFileIO.get();
+    }
     Owned<IFileIOStream> stream;
     if (TestRwFlag(flags, rw_buffered))
         stream.setown(createBufferedIOStream(iFileIO));
@@ -1656,16 +1705,16 @@ IExtRowWriter *createRowWriter(IFileIO *iFileIO, IRowInterfaces *rowIf, unsigned
         stream.setown(createIOStream(iFileIO));
     if (flags & rw_extend)
         stream->seek(0, IFSend);
-    flags &= ~((unsigned)(rw_extend|rw_buffered));
+    flags &= ~((unsigned)(rw_extend|rw_buffered|COMP_MASK));
     return createRowWriter(stream, rowIf, flags);
 }
 
-IExtRowWriter *createRowWriter(IFileIOStream *strm, IRowInterfaces *rowIf, unsigned flags)
+ILogicalRowWriter *createRowWriter(IFileIOStream *strm, IRowInterfaces *rowIf, unsigned flags)
 {
     if (0 != (flags & (rw_extend|rw_buffered|COMP_MASK)))
         throw MakeStringException(0, "Unsupported createRowWriter flags");
     EmptyRowSemantics emptyRowSemantics = extractESRFromRWFlags(flags);
-    Owned<CRowStreamWriter> writer = new CRowStreamWriter(strm, rowIf->queryRowSerializer(), rowIf->queryRowAllocator(), emptyRowSemantics, TestRwFlag(flags, rw_crc), TestRwFlag(flags, rw_autoflush));
+    Owned<CRowStreamWriter> writer = new CRowStreamWriter(strm, rowIf->queryRowSerializer(), rowIf->queryRowAllocator(), emptyRowSemantics, TestRwFlag(flags, rw_autoflush));
     return writer.getClear();
 }
 
@@ -1682,7 +1731,7 @@ public:
     IMPLEMENT_IINTERFACE;
 
     CDiskMerger(IRowInterfaces *_rowInterfaces, IRowLinkCounter *_linker, const char *_tempnamebase)
-        : rowInterfaces(_rowInterfaces), linker(_linker), tempnamebase(_tempnamebase)
+        : tempnamebase(_tempnamebase), linker(_linker), rowInterfaces(_rowInterfaces)
     {
         strms = NULL;
     }
@@ -2013,6 +2062,22 @@ static IOutputMetaData *_getDaliLayoutInfo(MemoryBuffer &layoutBin, IPropertyTre
         if (props.hasProp("_rtlType"))
         {
             props.getPropBin("_rtlType", layoutBin);
+            if (layoutBin.length())
+            {
+                try
+                {
+                    return createTypeInfoOutputMetaData(layoutBin, isGrouped);
+                }
+                catch (IException *E)
+                {
+                    EXCLOG(E);
+                    error.setown(E); // Save to throw later if we can't recover via ECL
+                }
+            }
+        }
+        if (props.hasProp("meta"))
+        {
+            props.getPropBin("meta", layoutBin);
             try
             {
                 return createTypeInfoOutputMetaData(layoutBin, isGrouped);
@@ -2023,14 +2088,15 @@ static IOutputMetaData *_getDaliLayoutInfo(MemoryBuffer &layoutBin, IPropertyTre
                 error.setown(E); // Save to throw later if we can't recover via ECL
             }
         }
-        if (props.hasProp("ECL"))
+        const char * layoutECL = props.queryProp("ECL");
+        if (!layoutECL)
+            layoutECL = props.queryProp("@ecl");
+        if (layoutECL)
         {
             const char *kind = props.queryProp("@kind");
             bool isIndex = (kind && streq(kind, "key"));
-            StringBuffer layoutECL;
-            props.getProp("ECL", layoutECL);
             MultiErrorReceiver errs;
-            Owned<IHqlExpression> expr = parseQuery(layoutECL.str(), &errs);
+            Owned<IHqlExpression> expr = parseQuery(layoutECL, &errs);
             if (expr && (errs.errCount() == 0))
             {
                 if (props.hasProp("_record_layout"))  // Some old indexes need the payload count patched in from here
@@ -2115,6 +2181,9 @@ static bool getTranslators(Owned<const IDynamicTransform> &translator, Owned<con
 
             if (!translator->canTranslate())
                 throw MakeStringException(0, "Untranslatable record layout mismatch detected for file %s", tracing);
+
+            if (mode == RecordTranslationMode::PayloadRemoveOnly && translator->hasNewFields())
+                throw MakeStringException(0, "Translatable file layout mismatch reading file %s but translation disabled when expected fields are missing from source.", tracing);
 
             if (translator->needsTranslate())
             {
@@ -2231,3 +2300,26 @@ bool CPersistentTask::join(unsigned timeout, bool throwException)
 }
 #endif
 
+unsigned __int64 crcLogicalFileTime(IDistributedFile * file, unsigned __int64 crc, const char * filename)
+{
+    IDistributedSuperFile * super = file->querySuperFile();
+    if (super)
+    {
+        Owned<IDistributedFileIterator> iter = super->getSubFileIterator(true);
+        ForEach(*iter)
+        {
+            IDistributedFile & cur = iter->query();
+            const char * name = cur.queryLogicalName();
+            crc = rtlHash64Data(strlen(name), name, crc);
+            crc = crcLogicalFileTime(&cur, crc, name);
+        }
+    }
+    else
+    {
+        CDateTime dt;
+        file->getModificationTime(dt);
+        unsigned __int64 modifiedTime = dt.getSimple();
+        crc = rtlHash64Data(sizeof(modifiedTime), &modifiedTime, crc);
+    }
+    return crc;
+}

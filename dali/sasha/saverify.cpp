@@ -11,7 +11,6 @@
 #include "rmtfile.hpp"
 #include "dasds.hpp"
 #include "dadfs.hpp"
-#include "saserver.hpp"
 #include "saverify.hpp"
 #include "sautil.hpp"
 #include "dautils.hpp"
@@ -199,18 +198,14 @@ public:
 class CFileCrcList
 {
     CIpTable dafilesrvips;
-    Owned<IUserDescriptor> udesc;
+    Linked<IUserDescriptor> udesc;
 public:
     bool &stopped;
     CIArrayOf<CFileCrcItem> list;
 
-    CFileCrcList(bool &_stopped)
-        : stopped(_stopped)
+    CFileCrcList(bool &_stopped, IUserDescriptor *_udesc)
+        : udesc(_udesc), stopped(_stopped)
     {
-        StringBuffer userName;
-        serverConfig->getProp("@sashaUser", userName);
-        udesc.setown(createUserDescriptor());
-        udesc->set(userName.str(), nullptr);
     }
 
     void add(RemoteFilename &filename,unsigned partno,unsigned copy,unsigned crc)
@@ -226,7 +221,7 @@ public:
 
     void verifyFile(const char *name,CDateTime *cutoff)
     {
-        Owned<IDistributedFile> file=queryDistributedFileDirectory().lookup(name,udesc,false,false,false,nullptr,defaultPrivilegedUser);
+        Owned<IDistributedFile> file=queryDistributedFileDirectory().lookup(name,udesc,AccessMode::readSequential,false,false,nullptr,defaultPrivilegedUser);
         if (!file)
             return;
         IPropertyTree &fileprops = file->queryAttributes();
@@ -252,7 +247,7 @@ public:
             SocketEndpoint ep(testpart->queryNode()->endpoint()); 
             if (!dafilesrvips.verifyDaliFileServer(ep)) {
                 StringBuffer ips;
-                ep.getIpText(ips);
+                ep.getHostText(ips);
                 PROGLOG("VERIFY: file %s, cannot run DAFILESRV on %s",name,ips.str());
                 return;
             }
@@ -276,7 +271,7 @@ public:
                 SocketEndpoint ep(part->queryNode()->endpoint());
                 if (!dafilesrvips.verifyDaliFileServer(ep)) {
                     StringBuffer ips;
-                    ep.getIpText(ips);
+                    ep.getHostText(ips);
                     PROGLOG("VERIFY: file %s, cannot run DAFILESRV on %s",name,ips.str());
                     continue;
                 }
@@ -290,7 +285,7 @@ public:
             return;
         PROGLOG("VERIFY: file %s started",name);
         file.clear();
-        CriticalSection crit;
+        CriticalSection crit{SYNC_LOCATION};
         class casyncfor: public CAsyncFor
         {
             CFileCrcList *parent;
@@ -298,7 +293,7 @@ public:
         public:
             bool ok;
             casyncfor(CFileCrcList *_parent, CriticalSection &_crit)
-                : crit(_crit)
+                : CAsyncFor(SYNC_LOCATION), crit(_crit)
             {
                 parent = _parent;
                 ok = true;
@@ -315,7 +310,7 @@ public:
                 try
                 {
                     partfile.setown(createIFile(rfn));
-                    // PROGLOG("VERIFY: part %s on %s",partfile->queryFilename(),rfn.queryEndpoint().getUrlStr(eps).str());
+                    // PROGLOG("VERIFY: part %s on %s",partfile->queryFilename(),rfn.queryEndpoint().getEndpointHostText(eps).str());
                     if (partfile) {
                         if (parent->stopped)
                             return;
@@ -329,7 +324,7 @@ public:
                 catch (IException *e)
                 {
                     StringBuffer s;
-                    s.appendf("VERIFY: part %s on %s",partfile->queryFilename(),rfn.queryEndpoint().getUrlStr(eps).str());
+                    s.appendf("VERIFY: part %s on %s",partfile->queryFilename(),rfn.queryEndpoint().getEndpointHostText(eps).str());
                     EXCLOG(e, s.str());
                     e->Release();
                     ok = false;
@@ -348,7 +343,9 @@ public:
             }
         }
         if (!stopped) {
-            file.setown(queryDistributedFileDirectory().lookup(name,udesc,false,false,false,nullptr,defaultPrivilegedUser));
+            // On success the @verified attribute is written below (DistributedFilePropertyLock + setProp),
+            // so this lookup mutates metadata - use writeMeta.
+            file.setown(queryDistributedFileDirectory().lookup(name,udesc,AccessMode::writeLogicalMeta,false,false,nullptr,defaultPrivilegedUser));
             if (!file)
                 return;
             if (afor.ok) {
@@ -369,10 +366,10 @@ class CSashaVerifierServer: public ISashaServer, public Thread
 {  
 
     bool stopped;
-    Semaphore stopsem;
+    Semaphore stopsem{SYNC_LOCATION};
     Owned<IUserDescriptor> udesc;
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
 
     CSashaVerifierServer()
         : Thread("CSashaVerifierServer")
@@ -380,7 +377,9 @@ public:
         stopped = false;
 
         StringBuffer userName;
-        serverConfig->getProp("@sashaUser", userName);
+        getComponentConfigSP()->getProp("@user", userName);
+        if (userName.isEmpty()) // for backward compatibility
+            getComponentConfigSP()->getProp("@sashaUser", userName);
         udesc.setown(createUserDescriptor());
         udesc->set(userName.str(), nullptr);
     }
@@ -391,7 +390,7 @@ public:
 
     void start()
     {
-        Thread::start();
+        Thread::start(false);
     }
 
     void ready()
@@ -412,7 +411,12 @@ public:
 
     int run()
     {
-        Owned<IPropertyTree> verifprops = serverConfig->getPropTree("Verifier");
+#ifdef _CONTAINERIZED
+        Owned<IPropertyTree> verifprops = getComponentConfig();
+#else
+        Owned<IPropertyTree> verifprops = getComponentConfigSP()->getPropTree("Verifier");
+#endif
+
         if (!verifprops)
             verifprops.setown(createPTree("Verifier"));
         unsigned interval = verifprops->getPropInt("@interval",DEFAULT_VERIFY_INTERVAL);
@@ -421,8 +425,8 @@ public:
         while (!stopped) {
             try {
                 PROGLOG("VERIFIER: Started");
-                CFileCrcList filelist(stopped);
-                Owned<IDFAttributesIterator> iter = queryDistributedFileDirectory().getDFAttributesIterator("*",udesc,true,false);
+                CFileCrcList filelist(stopped, udesc);
+                Owned<IPropertyTreeIterator> iter = queryDistributedFileDirectory().getDFAttributesIterator("*",udesc,true,false);
                 if (iter) {
                     CDateTime mincutoff;
                     mincutoff.setNow();
@@ -472,9 +476,9 @@ class CSashaDaFSMonitorServer: public ISashaServer, public Thread
 {  
 
     bool stopped;
-    Semaphore stopsem;
+    Semaphore stopsem{SYNC_LOCATION};
 public:
-    IMPLEMENT_IINTERFACE;
+    IMPLEMENT_IINTERFACE_USING(Thread);
 
     CSashaDaFSMonitorServer()
         : Thread("CSashaDaFSMonitorServer")
@@ -488,7 +492,7 @@ public:
 
     void start()
     {
-        Thread::start();
+        Thread::start(false);
     }
 
     void ready()
@@ -511,7 +515,7 @@ public:
             return;
         IPointerArrayOf<ISocket> sockets;
         multiConnect(eps,sockets,60*1000);
-        CriticalSection sect;
+        CriticalSection sect{SYNC_LOCATION};
         unsigned failurelimit = 10;             // only report 10 from each cluster
         class casyncfor: public CAsyncFor
         {
@@ -522,7 +526,7 @@ public:
             const char *clustername;
         public:
             casyncfor(SocketEndpointArray &_eps,IPointerArrayOf<ISocket> &_sockets, CriticalSection &_sect, unsigned &_failurelimit,const char *_clustername) 
-                : eps(_eps), sockets(_sockets), sect(_sect), failurelimit(_failurelimit)
+                : CAsyncFor(SYNC_LOCATION), eps(_eps), sockets(_sockets), sect(_sect), failurelimit(_failurelimit)
             { 
                 clustername = _clustername;
             }
@@ -540,12 +544,12 @@ public:
                     if (rver==0) {
                         StringBuffer epstr;
                         SocketEndpoint ep = eps.item(i);
-                        ep.getUrlStr(epstr);
+                        ep.getEndpointHostText(epstr);
                         CriticalBlock block(sect);
                         if (failurelimit) {
-                            LOG(MCoperatorError, unknownJob,"DAFSMON: dafilesrv on %s cannot be contacted",epstr.str());
+                            LOG(MCoperatorError, "DAFSMON: dafilesrv on %s cannot be contacted",epstr.str());
                             if (--failurelimit==0) 
-                                LOG(MCoperatorError, unknownJob,"DAFSMON: monitoring suspended for cluster %s (too many failures)",clustername);
+                                LOG(MCoperatorError, "DAFSMON: monitoring suspended for cluster %s (too many failures)",clustername);
                         }
                     }
                 }
@@ -554,10 +558,10 @@ public:
                     CriticalBlock block(sect);
                     StringBuffer epstr;
                     SocketEndpoint ep = eps.item(i);
-                    ep.getUrlStr(epstr);
+                    ep.getEndpointHostText(epstr);
                     StringBuffer s;
                     s.appendf("DAFSMON: dafilesrv %s",epstr.str());
-                    LOG(MCoperatorError, unknownJob, e, s.str());
+                    LOG(MCoperatorError, e, s.str());
                     e->Release();
                     return;
                 }
@@ -599,7 +603,7 @@ public:
                 if (!ep.isNull()) {
                     if (trc.length())
                         trc.append(", ");
-                    ep.getUrlStr(trc);
+                    ep.getEndpointHostText(trc);
                     if (ep.port==0)
                         ep.port = getDaliServixPort();
                     eps.append(ep);
@@ -620,9 +624,10 @@ public:
 
     int run()
     {
-        Owned<IPropertyTree> monprops = serverConfig->getPropTree("DaFileSrvMonitor");
+        // NB: this service is BM only
+        Owned<IPropertyTree> monprops = getComponentConfigSP()->getPropTree("DaFileSrvMonitor");
         if (!monprops)
-            monprops.setown(createPTree("DaFSMonitorServer"));
+            monprops.setown(createPTree("DaFileSrvMonitor"));
         unsigned interval = monprops->getPropInt("@interval",DEFAULT_DAFSMONITOR_INTERVAL);
         if (!interval)
             stopped = true;
@@ -659,7 +664,7 @@ ISashaServer *createSashaVerifierServer()
     return sashaVerifierServer;
 }
 
-ISashaServer *createSashaDaFSMonitorServer()
+ISashaServer *createSashaDaFSMonitorServer() // BM only
 {
     assertex(!sashaDaFSMonitorServer); // initialization problem
     sashaDaFSMonitorServer = new CSashaDaFSMonitorServer();

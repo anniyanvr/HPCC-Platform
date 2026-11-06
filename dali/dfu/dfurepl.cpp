@@ -182,8 +182,8 @@ struct ReplicateFileItem: extends CInterface
     ReplicateFileItem(CReplicateServer &_parent);
     StringAttr uuid;
     CIArrayOf<ReplicatePartItem> parts;
-    Semaphore sem;
-    CriticalSection sect;
+    Semaphore sem{SYNC_LOCATION};
+    CriticalSection sect{SYNC_LOCATION};
     bool stopping;
 
     class cThread: public Thread
@@ -215,7 +215,7 @@ struct ReplicateFileItem: extends CInterface
     } thread;
 
     ReplicateFileItem(CReplicateServer &_parent,CDfsLogicalFileName _dlfn,IUserDescriptor *_userdesc,CDateTime _filedt)
-        : thread(*this), parent(_parent), dlfn(_dlfn), userdesc(_userdesc), filedt(_filedt)
+        : dlfn(_dlfn), userdesc(_userdesc), parent(_parent), filedt(_filedt), thread(*this)
     {
         stopping = true; // set false once started
     }
@@ -229,7 +229,9 @@ struct ReplicateFileItem: extends CInterface
     {
         CriticalBlock block(sect);
         stopping = false;
-        thread.start();
+        //MORE: This seems inefficient to create a thread for each item being replicated
+        //rather than using a thread pool.  Should possibly pass true to start() to link to the dfuwu.
+        thread.start(false);
     }
 
     void stop()
@@ -258,7 +260,7 @@ struct ReplicateFileItem: extends CInterface
             OERRLOG(LOGPFX "Cannot replicate foreign file %s",lfn);
             return;
         }
-        Owned<IDistributedFile> dfile = queryDistributedFileDirectory().lookup(dlfn,userdesc,false,false,false,nullptr,defaultPrivilegedUser);
+        Owned<IDistributedFile> dfile = queryDistributedFileDirectory().lookup(dlfn,userdesc,AccessMode::readLogicalMeta|AccessMode::writeSequential,false,false,nullptr,defaultPrivilegedUser);
         if (!dfile) {
             UWARNLOG(LOGPFX "Cannot find file %s, perhaps deleted",lfn);
             return;
@@ -301,7 +303,7 @@ struct ReplicateFileItem: extends CInterface
         IPropertyTree &root = *conn->queryRoot();
         root.setProp("@name",lfn);
         StringBuffer node;
-        queryMyNode()->endpoint().getIpText(node);
+        queryMyNode()->endpoint().getHostText(node);
         root.setProp("@node",node.str());
         root.setPropInt("@mpport",queryMyNode()->endpoint().port);
         dt.setNow();
@@ -332,7 +334,7 @@ struct ReplicateFileItem: extends CInterface
         }
         bool abort = true;
         try {
-            dfile.setown(queryDistributedFileDirectory().lookup(dlfn,userdesc,false,false,false,nullptr,defaultPrivilegedUser));
+            dfile.setown(queryDistributedFileDirectory().lookup(dlfn,userdesc,AccessMode::readLogicalMeta,false,false,nullptr,defaultPrivilegedUser));
             if (dfile) {
                 CDateTime newfiledt;
                 dfile->getModificationTime(newfiledt);
@@ -380,7 +382,7 @@ ReplicatePartItem::ReplicatePartItem(ReplicateFileItem &_parent,IDistributedFile
 }
 
 ReplicatePartCopyItem::ReplicatePartCopyItem(ReplicatePartItem &_parent,IFile *_file,unsigned pn)
-    : parent(_parent),file(_file)
+    : file(_file),parent(_parent)
 {
     from = NULL;
     try {
@@ -415,7 +417,8 @@ bool ReplicatePartCopyItem::doneCopy(unsigned timeout)
                 0,
                 (offset_t)-1, // all file
                 NULL, // no progress needed (yet)
-                timeout))
+                timeout,
+                CFflush_rdwr))
                     state = RPCS_tempcopied;  // done
         }
         catch (IException *e) {
@@ -430,8 +433,8 @@ bool ReplicatePartCopyItem::doneCopy(unsigned timeout)
 
 class CReplicateServer: public CInterface, implements IThreaded, implements IReplicateServer
 {
-    CriticalSection runningsect;
-    Semaphore runningsem;
+    CriticalSection runningsect{SYNC_LOCATION};
+    Semaphore runningsem{SYNC_LOCATION};
     CIArrayOf<ReplicateFileItem> running;
     Owned<IQueueChannel> qchannel;
     bool stopping;
@@ -470,7 +473,7 @@ public:
     {
         stopping = false;
         thread.setown(new CThreaded("ReplicateServerThread"));
-        thread->init(this);
+        thread->init(this, false);
     }
 
     virtual void threadmain() override

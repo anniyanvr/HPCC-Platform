@@ -151,6 +151,7 @@ unsigned getOperatorMetaFlags(node_operator op)
     case no_pure:
     case no_sequence:
     case no_getenv:
+    case no_getsecret:
     
 //Selection operators  - could be arithmetic, string, dataset etc.
     case no_map:
@@ -179,6 +180,7 @@ unsigned getOperatorMetaFlags(node_operator op)
     case no_matchunicode:
     case no_matchutf8:
     case no_regex_find:
+    case no_regex_extract:
     case no_regex_findset:
     case no_regex_replace:
     case no_toxml:
@@ -506,6 +508,7 @@ unsigned getOperatorMetaFlags(node_operator op)
     case no_thor:
     case no_flat:
     case no_pipe:
+    case no_filetype:
     case no_joined:
     case no_any:
     case no_xml:
@@ -621,10 +624,9 @@ unsigned getOperatorMetaFlags(node_operator op)
 
     case no_unused6:
     case no_unused13: case no_unused14: case no_unused15:
-    case no_unused34: case no_unused35: case no_unused36: case no_unused37: case no_unused38:
+    case no_unused35: case no_unused36: case no_unused37: case no_unused38:
     case no_unused40: case no_unused41: case no_unused42: case no_unused43: case no_unused44: case no_unused45: case no_unused46: case no_unused47: case no_unused48: case no_unused49:
     case no_unused50: case no_unused52:
-    case no_unused80: case no_unused81:
     case no_unused102:
     case no_is_null:
     case no_position:
@@ -674,7 +676,7 @@ inline unsigned truncMaxlength(unsigned __int64 value)
 static unsigned getMaxSize(ITypeInfo * type, IHqlExpression * maxLength, IHqlExpression * maxSize, IHqlExpression * maxCount)
 {
     unsigned size = type->getSize();
-    if (size != UNKNOWN_LENGTH)
+    if (!isUnknownLength(size))
         return size;
 
     if (!maxLength) maxLength = queryAttributeChild(type, maxLengthAtom, 0);
@@ -684,6 +686,7 @@ static unsigned getMaxSize(ITypeInfo * type, IHqlExpression * maxLength, IHqlExp
     if (maxSize)
         return (unsigned)getIntValue(maxSize, 0);
 
+    size32_t lengthSize = getLengthSizeBytes(size);
     if (maxLength)
     {
         unsigned __int64 len = (unsigned)getIntValue(maxLength, 0);
@@ -691,17 +694,17 @@ static unsigned getMaxSize(ITypeInfo * type, IHqlExpression * maxLength, IHqlExp
         {
         case type_string:
         case type_data:
-            return truncMaxlength(sizeof(size32_t) + len);
+            return truncMaxlength(lengthSize + len);
         case type_unicode:
-            return truncMaxlength(sizeof(size32_t) + len*sizeof(UChar));
+            return truncMaxlength(lengthSize + len*sizeof(UChar));
         case type_qstring:
-            return truncMaxlength(sizeof(size32_t) + rtlQStrSize((unsigned)len));
+            return truncMaxlength(lengthSize + rtlQStrSize((unsigned)len));
         case type_varstring:
             return truncMaxlength(len + 1);
         case type_varunicode:
             return truncMaxlength((len + 1) * sizeof(UChar));
         case type_utf8:
-            return truncMaxlength(sizeof(size32_t) + (len * 4));
+            return truncMaxlength(lengthSize + (len * 4));
         case type_set:
             return truncMaxlength(len);
         }
@@ -718,12 +721,15 @@ static unsigned getMaxSize(ITypeInfo * type, IHqlExpression * maxLength, IHqlExp
                 if (!childType)
                     break;
                 unsigned elemSize = getMaxSize(childType, NULL, NULL, NULL);
-                if (elemSize != UNKNOWN_LENGTH)
+                if (!isUnknownLength(elemSize))
                     return truncMaxlength(sizeof(bool) + sizeof(size32_t) + count * elemSize);
                 break;
             }
         }
     }
+
+    if (lengthSize < 4)
+        return (1U << (lengthSize*8)) - 1;
 
     return UNKNOWN_LENGTH;
 }
@@ -743,7 +749,7 @@ static unsigned getMaxSize(IHqlExpression * field)
     IHqlExpression * maxSize = queryAttributeChild(field, maxSizeAtom, 0);
     IHqlExpression * maxCount = queryAttributeChild(field, maxCountAtom, 0);
     unsigned max = getMaxSize(type, maxLength, maxSize, maxCount);
-    if (max != UNKNOWN_LENGTH)
+    if (!isUnknownLength(max))
         return max;
     ITypeInfo * indirect = queryModifier(type, typemod_indirect);
     if (indirect)
@@ -758,7 +764,7 @@ static unsigned getMaxSize(IHqlExpression * field)
 static double twoThirds = 2.0/3.0;
 static unsigned guessSize(unsigned minLen, unsigned maxLen)
 {
-    if (maxLen == UNKNOWN_LENGTH)
+    if (isUnknownLength(maxLen))
         maxLen = 4096;
     if (maxLen < minLen)
         return minLen;
@@ -958,7 +964,7 @@ static IHqlExpression * evaluateFieldAttrSize(IHqlExpression * expr)
                         unsigned __int64 num = (unsigned)getIntValue(count);
                         thisSize = truncMaxlength(num * childExpectedSize);
                         minSize = truncMaxlength(num * childMinimumSize);
-                        if (childMaximumSize != UNKNOWN_LENGTH)
+                        if (!isUnknownLength(childMaximumSize))
                             maxSize = truncMaxlength(num * childMaximumSize);
                         else
                             thisMaxSizeExpr.setown(createValue(no_mul, LINK(sizetType), ensureExprType(count, sizetType), LINK(childMaximumSizeExpr)));
@@ -970,7 +976,7 @@ static IHqlExpression * evaluateFieldAttrSize(IHqlExpression * expr)
                             maxSize = (unsigned)getIntValue(maxLength);
                         else if (maxCount)
                         {
-                            if (childMaximumSize != UNKNOWN_LENGTH)
+                            if (!isUnknownLength(childMaximumSize))
                                 maxSize = truncMaxlength((unsigned __int64)getIntValue(maxCount) * childMaximumSize);
                             else
                                 thisMaxSizeExpr.setown(createValue(no_mul, LINK(sizetType), ensureExprType(maxCount, sizetType), LINK(childMaximumSizeExpr)));
@@ -986,7 +992,7 @@ static IHqlExpression * evaluateFieldAttrSize(IHqlExpression * expr)
                         maxSize = (unsigned)getIntValue(maxLength);
                     else if (maxCount)
                     {
-                        if (childMaximumSize != UNKNOWN_LENGTH)
+                        if (!isUnknownLength(childMaximumSize))
                             maxSize = truncMaxlength(sizeof(size32_t) + (unsigned __int64)getIntValue(maxCount) * childMaximumSize);
                         else
                             thisMaxSizeExpr.setown(createValue(no_add, LINK(sizetType), getSizetConstant(sizeof(size32_t)),
@@ -1002,28 +1008,28 @@ static IHqlExpression * evaluateFieldAttrSize(IHqlExpression * expr)
         case type_unicode:
         case type_qstring:
         case type_utf8:
-            if (thisSize == UNKNOWN_LENGTH)
+            if (isUnknownLength(thisSize))
             {
-                minSize = sizeof(size32_t);
+                minSize = getLengthSizeBytes(thisSize);
                 maxSize = getMaxSize(expr);
             }
             break;
         case type_varstring:
-            if (thisSize == UNKNOWN_LENGTH)
+            if (isUnknownLength(thisSize))
             {
                 minSize = 1;
                 maxSize = getMaxSize(expr);
             }
             break;
         case type_varunicode:
-            if (thisSize == UNKNOWN_LENGTH)
+            if (isUnknownLength(thisSize))
             {
                 minSize = sizeof(UChar);
                 maxSize = getMaxSize(expr);
             }
             break;
         case type_set:
-            if (thisSize == UNKNOWN_LENGTH)
+            if (isUnknownLength(thisSize))
             {
                 minSize = sizeof(size32_t)+sizeof(bool);
                 maxSize = getMaxSize(expr);
@@ -1034,7 +1040,7 @@ static IHqlExpression * evaluateFieldAttrSize(IHqlExpression * expr)
                 IHqlAlienTypeInfo * alien = queryAlienType(type);
                 thisSize = alien->getPhysicalTypeSize();
                 
-                if (thisSize == UNKNOWN_LENGTH)
+                if (isUnknownLength(thisSize))
                 {
                     IHqlExpression * lengthAttr = queryUncastExpr(alien->queryLengthFunction());
                     if (lengthAttr->isConstant() && !lengthAttr->isFunction())
@@ -1044,7 +1050,7 @@ static IHqlExpression * evaluateFieldAttrSize(IHqlExpression * expr)
                             thisSize = (unsigned)getIntValue(folded);
                     }
                 }
-                if (thisSize == UNKNOWN_LENGTH)
+                if (isUnknownLength(thisSize))
                 {
                     minSize = 0;
                     IHqlExpression * maxSizeExpr = expr->queryAttribute(maxSizeAtom);
@@ -1068,17 +1074,17 @@ static IHqlExpression * evaluateFieldAttrSize(IHqlExpression * expr)
             maxSize = getMaxSize(expr);
             break;
         default:
-            assertex(thisSize != UNKNOWN_LENGTH);
+            assertex(!isUnknownLength(thisSize));
             break;
         }
     }
     if (thisMaxSizeExpr)
         maxSize = UNKNOWN_LENGTH;
-    if (thisSize == UNKNOWN_LENGTH)
+    if (isUnknownLength(thisSize))
         thisSize = guessSize(minSize, maxSize);
     else
     {
-        if (minSize == UNKNOWN_LENGTH)
+        if (isUnknownLength(minSize))
             minSize = thisSize;
         if (maxSize == 0)
             maxSize = thisSize;
@@ -1091,7 +1097,7 @@ static IHqlExpression * evaluateFieldAttrSize(IHqlExpression * expr)
     }
 
     if (!thisMaxSizeExpr)
-        thisMaxSizeExpr.setown((maxSize == UNKNOWN_LENGTH) ? createAttribute(unknownSizeFieldAtom) : getSizetConstant(maxSize));
+        thisMaxSizeExpr.setown((isUnknownLength(maxSize)) ? createAttribute(unknownSizeFieldAtom) : getSizetConstant(maxSize));
     OwnedHqlExpr attr = createExprAttribute(_propSize_Atom, getSizetConstant(thisSize), getSizetConstant(minSize), thisMaxSizeExpr.getClear());
     meta.addProperty(expr, EPsize, attr);
     return attr;
@@ -2056,7 +2062,7 @@ static bool increasesRowSize(IHqlExpression * newRecord, IHqlExpression * oldRec
     unsigned newRowSize = estimateRowSize(newRecord);
     unsigned oldRowSize = estimateRowSize(oldRecord);
     //Fixed size records
-    if ((newRowSize != UNKNOWN_LENGTH) && (oldRowSize != UNKNOWN_LENGTH))
+    if ((!isUnknownLength(newRowSize)) && (!isUnknownLength(oldRowSize)))
         return newRowSize > oldRowSize;
 
     //Fixed size record compared with the minimum size of a variable size record.
@@ -2596,10 +2602,20 @@ IHqlExpression * calcRowInformation(IHqlExpression * expr)
             return getRecordCountInfo(ds);
         }
     case no_allnodes:
-    case no_nwaydistribute:
         {
             retrieveRowInformation(info, ds);
             info.scaleRange(RCclusterSizeEstimate);
+            break;
+        }
+    case no_nwaydistribute:
+        {
+            retrieveRowInformation(info, ds);
+            if (expr->hasAttribute(widthAtom))
+            {
+                //width does not affect the row counts
+            }
+            else
+                info.scaleRange(RCclusterSizeEstimate);
             break;
         }
     case no_limit:
@@ -3315,7 +3331,7 @@ unsigned getMaxRecordSize(IHqlExpression * record, unsigned defaultMaxRecordSize
     IHqlExpression * maxSizeExpr = size->queryChild(2);
     unsigned maxSize = (unsigned)getIntValue(maxSizeExpr, UNKNOWN_LENGTH);
     hasKnownSize = (minSizeExpr == maxSizeExpr);
-    if (maxSize == UNKNOWN_LENGTH)
+    if (isUnknownLength(maxSize))
     {
         OwnedHqlExpr defaultExpr = getSizetConstant(defaultMaxRecordSize);
         OwnedHqlExpr value = replaceExpression(maxSizeExpr, queryDefaultMaxRecordLengthExpr(), defaultExpr);
@@ -4073,9 +4089,13 @@ inline bool isSelfSelect(IHqlExpression * expr)
     return true;
 }
 
-//This should possibly cache the results for a record using an attribute....
-bool canDefinitelyProcessWithTranslator(IHqlExpression * record)
+//This should possibly cache the results for a record using an attribute....  it does protect against excessive recursion by caching
+//results for a record for each call.
+static bool checkCanDefinitelyProcessWithTranslator(IHqlExpression * record)
 {
+    if (record->queryTransformExtra())
+        return true;
+
     dbgassertex(record->getOperator() == no_record);
     ForEachChild(i, record)
     {
@@ -4094,7 +4114,7 @@ bool canDefinitelyProcessWithTranslator(IHqlExpression * record)
             case type_row:
                 if (hasReferenceModifier(type))  // Never currently generated
                     return false;
-                if (!canDefinitelyProcessWithTranslator(cur->queryRecord()))
+                if (!checkCanDefinitelyProcessWithTranslator(cur->queryRecord()))
                     return false;
                 break;
             case type_dictionary:
@@ -4112,6 +4132,8 @@ bool canDefinitelyProcessWithTranslator(IHqlExpression * record)
                                 return false;
                         }
                     }
+                    if (!checkCanDefinitelyProcessWithTranslator(cur->queryRecord()))
+                        return false;
                     break;
                 }
             }
@@ -4119,24 +4141,37 @@ bool canDefinitelyProcessWithTranslator(IHqlExpression * record)
         }
         case no_ifblock:
             {
+                if (!checkCanDefinitelyProcessWithTranslator(cur->queryChild(1)))
+                    return false;
                 IHqlExpression * cond = cur->queryChild(0);
                 node_operator condOp = cond->getOperator();
                 //Match the subset of the expressions that are supported by the record translation
                 //false positives are acceptable, false negatives are not
-                if ((condOp == no_eq) || (condOp == no_ne))
+                if ((condOp == no_eq) || (condOp == no_ne) || (condOp == no_in) || (condOp == no_notin))
                 {
                     //SELF.x [=|!=] constant
                     IHqlExpression * lhs = cond->queryChild(0);
                     IHqlExpression * rhs = cond->queryChild(1);
-                    if (isSelfSelect(lhs) && rhs->getOperator() == no_constant)
-                        return true;
+                    if (isSelfSelect(lhs) && rhs->isConstant())
+                        break;
                 }
                 else if (isSelfSelect(cond)) // SELF.someboolean
-                    return true;
+                    break;
                 return false;
             }
+        case no_record:
+            if (!checkCanDefinitelyProcessWithTranslator(cur))
+                return false;
+            break;
         }
     }
 
+    record->setTransformExtra(record);
     return true;
+}
+
+bool canDefinitelyProcessWithTranslator(IHqlExpression * record)
+{
+    TransformMutexBlock block;
+    return checkCanDefinitelyProcessWithTranslator(record);
 }

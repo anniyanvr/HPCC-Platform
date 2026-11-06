@@ -21,12 +21,34 @@
 #include "permissions.hpp"
 #include "ldaputils.hpp"
 
+interface IAci : extends IInterface
+{
+    virtual StringBuffer& target() = 0;
+    virtual StringArray& userdns() = 0;
+    virtual StringArray& groupdns() = 0;
+    virtual bool isDeny() = 0;
+    virtual int permission() = 0;
+
+    virtual StringBuffer& serialize(StringBuffer& acibuf) = 0;
+    virtual void debugPrintout() = 0;
+};
+
+#ifdef _USE_CPPUNIT
+// Test-only factory functions exposing the otherwise internal CAci class
+// (defined entirely within aci.cpp, with no header declaration of its own)
+// so that white-box unit tests can exercise its ACI-string parser and
+// permission-flag constructor without changing the production visibility
+// of CAci itself. Implemented in aci.cpp, guarded by the same macro.
+IAci* createAciForTest(const char* acistr);
+IAci* createAciForTest(bool isDeny, int perm, ACT_TYPE actType, const char* dn);
+#endif
+
 class AciProcessor : implements IPermissionProcessor, public CInterface
 {
 protected:
     Owned<IPropertyTree> m_cfg;
     Owned<IPropertyTree> m_sidcache;
-    Mutex                m_mutex;
+    Mutex m_mutex{SYNC_LOCATION};
     StringBuffer         m_server;
     ILdapClient*         m_ldap_client;
     LdapServerType       m_servertype;
@@ -44,12 +66,14 @@ public:
     virtual bool getPermissions(ISecUser& user, IArrayOf<CSecurityDescriptor>& sdlist, IArrayOf<ISecResource>& resources);
     virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, ISecResource* resource, SecPermissionType ptype);
     virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype);
+    virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype, LDAP* ld);
     virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, ISecResource* resource, MemoryBuffer& initial_sd);
     virtual bool retrieveUserInfo(ISecUser& user);
 
     virtual void getCachedSid(const char* name, MemoryBuffer& sid);
     virtual void cacheSid(const char* name, int len, const void* sidbuf);
     virtual void lookupSid(const char* act_name, MemoryBuffer& act_sid, ACT_TYPE acttype=USER_ACT);
+    virtual void lookupSid(const char* act_name, MemoryBuffer& act_sid, ACT_TYPE acttype, LDAP* ld);
     virtual int sdSegments(CSecurityDescriptor* sd);
 
     virtual StringBuffer& sec2aci(SecAccessFlags secperm, StringBuffer& aciperm);
@@ -67,6 +91,7 @@ public:
 
     virtual StringBuffer& sec2aci(SecAccessFlags secperm, StringBuffer& aciperm);
     virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype);
+    virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype, LDAP* ld);
     virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, ISecResource* resource, MemoryBuffer& initial_sd);
 };
 
@@ -80,6 +105,7 @@ public:
     
     virtual StringBuffer& sec2aci(SecAccessFlags secperm, StringBuffer& aciperm);
     virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype);
+    virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, const char* name, SecPermissionType ptype, LDAP* ld);
     virtual CSecurityDescriptor* createDefaultSD(ISecUser * const user, ISecResource* resource, MemoryBuffer& initial_sd);
 };
 

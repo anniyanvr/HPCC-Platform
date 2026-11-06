@@ -15,24 +15,31 @@
     limitations under the License.
 ############################################################################## */
 
+#include <algorithm>
+#include <functional>
+#include <unordered_map>
 
 #include "platform.h"
-#include <algorithm>
 
 #include "jexcept.hpp"
 #include <assert.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <errno.h>
+#include "jfile.hpp"
+#include "jplane.hpp"
 #include "jptree.hpp"
+#include "jerror.hpp"
 
 #ifdef _WIN32
 #include "psapi.h"
 #include <eh.h>
-#elif defined (__linux__) || defined(__FreeBSD__)  || defined(__APPLE__)
+#elif defined (__linux__) || defined(__FreeBSD__)  || defined(__APPLE__) || defined(__EMSCRIPTEN__)
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <stddef.h>
+#include <time.h>
+#include <signal.h>
 #include <errno.h>
 #ifdef __linux__
 #include <execinfo.h> // comment out if not present
@@ -66,11 +73,159 @@ const char * querySeverityString(ErrorSeverity errorSeverity)
         return errorSeverityString[SeverityUnknown];
 }
 
+
+static std::unordered_map<std::string, ExceptionInterceptClass> eClassTypes = {
+    { "string", ExceptionInterceptClass::eString },
+    { "errno", ExceptionInterceptClass::eErrno},
+    { "os", ExceptionInterceptClass::eOs},
+    { "socket", ExceptionInterceptClass::eSocket}
+};
+class CExceptionInterceptor : implements IExceptionIntercept
+{
+    std::unordered_map<unsigned __int64, InterceptHandler> interceptHandlers;
+    mutable CriticalSection crit{SYNC_LOCATION};
+    StringBuffer debugDir;
+    unsigned handledExceptionClassMask = 0;
+    void ensureDebugDir()
+    {
+        if (debugDir.length())
+            return;
+#ifdef _CONTAINERIZED
+        StringBuffer planeName;
+        if (!getDefaultPlane(planeName, "@debugPlane", "debug"))
+        {
+            WARNLOG("Exception handlers configured, but debug plane is missing");
+            return;
+        }
+        Owned<const IStoragePlane> plane = getStoragePlaneByName(planeName, true);
+        verifyex(debugDir.append(plane->queryPrefix()));
+#else
+        verifyex(getConfigurationDirectory(nullptr, "temp", nullptr, "debug", debugDir));
+#endif
+        recursiveCreateDirectory(debugDir);
+    }
+    void unsafeSetIntercept(ExceptionInterceptClass eClass, int code, InterceptHandler handler)
+    {
+        unsigned __int64 key = (unsigned __int64)eClass << 56 | (unsigned)code;
+        handledExceptionClassMask |= (byte)eClass;
+        interceptHandlers[key] = handler;
+    }
+public:
+    virtual void handle(ExceptionInterceptClass eClass, IException *e) const override
+    {
+        if (handledExceptionClassMask & ((byte)eClass))
+        {
+            unsigned __int64 key = (unsigned __int64)eClass << 56 | (unsigned)e->errorCode();
+            CriticalBlock b(crit);
+            auto it = interceptHandlers.find(key);
+            if (it != interceptHandlers.end())
+                it->second(e);
+        }
+    }
+    virtual void clear() override
+    {
+        CriticalBlock b(crit);
+        handledExceptionClassMask = 0;
+        interceptHandlers.clear();
+    }
+    virtual void setIntercept(ExceptionInterceptClass eClass, int code, InterceptHandler handler) override
+    {
+        CriticalBlock b(crit);
+        unsafeSetIntercept(eClass, code, handler);
+    }
+    virtual void addFromConfig(const IPropertyTree *exceptionHandlerTree) override
+    {
+        Owned<IPropertyTreeIterator> iter = exceptionHandlerTree->getElements("exceptionHandler");
+        if (iter->first())
+        {
+            ensureDebugDir();
+            do
+            {
+                IPropertyTree &handler = iter->query();
+                StringBuffer eClassStr;
+                handler.getProp("@class", eClassStr);
+                eClassStr.toLowerCase();
+                int code = handler.getPropInt("@code");
+                StringBuffer cmd;
+                handler.getProp("@cmd", cmd);
+
+                auto it = eClassTypes.find(eClassStr.str());
+                if ((0 == code) || (0 == cmd.length()) || (it == eClassTypes.end()))
+                    WARNLOG("Invalid exception handler configuration ['%s', %d, '%s']", eClassStr.str(), code, cmd.str());
+                else
+                {
+                    ExceptionInterceptClass eClass = it->second;
+                    InterceptHandler f = [capturedDebugDir = std::string(debugDir), capturedCmds = std::string(cmd)](IException *e)
+                    {
+                        try
+                        {
+                            StringBuffer debugFilePath(capturedDebugDir.c_str());
+                            addPathSepChar(debugFilePath);
+                            debugFilePath.append("exception-").append(e->errorCode()).append("-");
+                            CDateTime dt;
+                            dt.setNow();
+                            dt.getString(debugFilePath).append(".log");
+                            DWORD runcode;
+                            if (!invoke_program(capturedCmds.c_str(), runcode, true, debugFilePath))
+                                WARNLOG("Intercept handler for exception code '%d', failed to excute cmd '%s'", e->errorCode(), capturedCmds.c_str());
+                        }
+                        catch (IException *e)
+                        {
+                            EXCLOG(e);
+                            e->Release();
+                        }
+                    };
+                    unsafeSetIntercept(eClass, code, f);
+                }
+            }
+            while (iter->next());
+        }
+    }
+};
+
+static CExceptionInterceptor exceptionInterceptor;
+
+IExceptionIntercept &queryExceptionIntercept()
+{
+    return exceptionInterceptor;
+}
+
+
+// Install exception intercept handlers from configuration
+static unsigned exceptionHandlerCBId = 0;
+MODULE_INIT(INIT_PRIORITY_STANDARD)
+{
+    auto updateFunc = [&](const IPropertyTree *oldComponentConfiguration, const IPropertyTree *oldGlobalConfiguration)
+    {
+        exceptionInterceptor.clear();
+        StringBuffer xpath;
+        getExpertOptPath(nullptr, xpath);
+        Owned<IPropertyTree> expertSettings = getGlobalConfigSP()->getPropTree(xpath);
+        if (expertSettings)
+            exceptionInterceptor.addFromConfig(expertSettings);
+        expertSettings.setown(getComponentConfigSP()->getPropTree(xpath));
+        if (expertSettings)
+            exceptionInterceptor.addFromConfig(expertSettings);
+    };
+    exceptionHandlerCBId = installConfigUpdateHook(updateFunc, true);
+    return true;
+}
+
+MODULE_EXIT()
+{
+    removeConfigUpdateHook(exceptionHandlerCBId);
+}
+
+
+
 class jlib_thrown_decl StringException: public IException, public CInterface
 {
 public:
     IMPLEMENT_IINTERFACE;
-    StringException(int code, const char *str, MessageAudience aud = MSGAUD_user) : errcode(code), msg(str), audience(aud) {};
+    StringException(int code, const char *str, MessageAudience aud = MSGAUD_user) : errcode(code), msg(str), audience(aud)
+    {
+        queryExceptionIntercept().handle(ExceptionInterceptClass::eString, this);
+    }
     
     int             errorCode() const { return errcode; }
     StringBuffer &  errorMessage(StringBuffer &str) const { str.append(msg); return str;}   
@@ -119,10 +274,18 @@ IException *makeStringExceptionV(MessageAudience aud, int code, const char *form
     return ret;
 }
 
-IException jlib_decl *makeStringException(MessageAudience aud,int code,const char *why)
+IException *makeStringException(MessageAudience aud,int code,const char *why)
 {
     return new StringException(code,why,aud);
 }
+
+IException *makePrefixedException(const char * prefix, const IException * e)
+{
+    StringBuffer msg;
+    e->errorMessage(msg.append(prefix));
+    return makeStringException(e->errorAudience(), e->errorCode(), msg);
+}
+
 
 class jlib_thrown_decl WrappedException: public StringException
 {
@@ -141,8 +304,13 @@ public:
         return str;
     }
 protected:
-    Linked<IException> exception;
+    Owned<IException> exception;
 };
+
+IException *makeWrappedException(IException *e, int code, const char *why)
+{
+    return new WrappedException(e, code, why);
+}
 
 IException *makeWrappedExceptionVA(IException *e, int code, const char *format, va_list args)
 {
@@ -173,8 +341,14 @@ class jlib_thrown_decl OsException: public IOSException, public CInterface
 {
 public:
     IMPLEMENT_IINTERFACE;
-    OsException(int code) : errcode(code) {};
-    OsException(int code, const char *_msg) : msg(_msg), errcode(code) {};
+    OsException(int code) : errcode(code)
+    {
+        exceptionInterceptor.handle(ExceptionInterceptClass::eOs, this);
+    };
+    OsException(int code, const char *_msg) : msg(_msg), errcode(code)
+    {
+        exceptionInterceptor.handle(ExceptionInterceptClass::eOs, this);
+    };
     ~OsException() {}
     
     int             errorCode() const { return errcode; }
@@ -216,8 +390,16 @@ class jlib_thrown_decl ErrnoException: public IErrnoException, public CInterface
 {
 public:
     IMPLEMENT_IINTERFACE;
-    ErrnoException(int errn) : audience(MSGAUD_user) { errcode = errn==-1?errno:errn; }
-    ErrnoException(int errn, const char *_msg, MessageAudience aud = MSGAUD_user) : msg(_msg), audience(aud) { errcode = errn==-1?errno:errn; }
+    ErrnoException(int errn) : audience(MSGAUD_user)
+    {
+        errcode = errn==-1?errno:errn;
+        exceptionInterceptor.handle(ExceptionInterceptClass::eErrno, this);
+    }
+    ErrnoException(int errn, const char *_msg, MessageAudience aud = MSGAUD_user) : msg(_msg), audience(aud)
+    {
+        errcode = errn==-1?errno:errn;
+        exceptionInterceptor.handle(ExceptionInterceptClass::eErrno, this);
+    }
     ~ErrnoException() { }
     
     int             errorCode() const { return errcode; }
@@ -225,10 +407,7 @@ public:
     {
         if (msg)
             str.append(msg).append(", ");
-        if (errcode==DISK_FULL_EXCEPTION_CODE)
-            str.append("Disk full");
-        else
-            str.append(strerror(errcode));
+        str.append(strerror(errcode));
         return str;
     }
     MessageAudience errorAudience() const { return audience; }
@@ -302,6 +481,7 @@ const char* serializeMessageAudience(MessageAudience ma)
     case MSGAUD_operator:    ret = "operator";      break;
     case MSGAUD_user:        ret = "user";          break;
     case MSGAUD_programmer:  ret = "programmer";    break;
+    case MSGAUD_monitor:     ret = "monitor";       break;
     case MSGAUD_all:         ret = "all";           break;
     default:                 ret = "unknown";       break;
     }
@@ -319,6 +499,8 @@ MessageAudience deserializeMessageAudience(const char* text)
             ma = MSGAUD_user;
         else if (!strcmp(text, "programmer"))
             ma = MSGAUD_programmer;
+        else if (!strcmp(text, "monitor"))
+            ma = MSGAUD_monitor;
         else if (!strcmp(text, "all"))
             ma = MSGAUD_all;
     }
@@ -512,7 +694,7 @@ public:
             xml = wrapper.appendf("<Exceptions>%s</Exceptions>", xml).str();
         Owned<IPropertyTree> pTree = createPTreeFromXMLString(xml);
         if (!pTree)
-            throw makeStringException(-1, "Failed to deserialize IMultiException!");
+            throw makeStringException(JLIBERR_UtilFailedToDeserializeImultiexception, "Failed to deserialize IMultiException!");
         Owned<IPropertyTreeIterator> i = pTree->getElements("Exception");
         
         if (pTree->hasProp("Source"))
@@ -568,7 +750,7 @@ private:
     CMultiException( const CMultiException& );
     IArrayOf<IException> array_;
     StringBuffer         source_;
-    mutable Mutex        m_mutex;
+    mutable Mutex        m_mutex{SYNC_LOCATION};
 };
 
 IMultiException *makeMultiException(const char* source/*=NULL*/)
@@ -613,16 +795,40 @@ const char *sanitizeSourceFile(const char *file)
     return file;
 }
 
-void throwUnexpectedException(const char * file, unsigned line)
+void throwUnexpectedException(const char * function, const char * file, unsigned line)
 {
     printStackReport();
-    throw makeStringExceptionV(9999, "Internal Error at %s(%d)", sanitizeSourceFile(file), line);
+    throw makeStringExceptionV(JLIBERR_UtilInternalErrorInSAtSD, "Internal Error in %s() at %s(%d)", function, sanitizeSourceFile(file), line);
 }
 
-void throwUnexpectedException(const char * where, const char * file, unsigned line)
+void throwUnexpectedException(const char * what, const char * function, const char * file, unsigned line)
 {
     printStackReport();
-    throw makeStringExceptionV(9999, "Internal Error '%s' at %s(%d)", where, sanitizeSourceFile(file), line);
+    throw makeStringExceptionV(JLIBERR_UtilInternalErrorSInSAtSD, "Internal Error '%s' in %s() at %s(%d)", what, function, sanitizeSourceFile(file), line);
+}
+
+void jlib_decl throwUnimplementedException(const char * function, const char * file, unsigned line)
+{
+    printStackReport();
+    throw makeStringExceptionV(JLIBERR_UtilUnimplementedFeatureInFunctionSAtSD, "UNIMPLEMENTED feature in function %s() at %s(%d)", function, sanitizeSourceFile(file), line);
+}
+
+void jlib_decl throwUnimplementedException(const char * what, const char * function, const char * file, unsigned line)
+{
+    printStackReport();
+    throw makeStringExceptionV(JLIBERR_UtilUnimplementedFeatureSInFunctionSAt, "UNIMPLEMENTED feature [%s] in function %s() at %s(%d)", what, function, sanitizeSourceFile(file), line);
+}
+
+void jlib_decl throwUnimplementedException(const char * what, const char *what2, const char * function, const char * file, unsigned line)
+{
+    printStackReport();
+    throw makeStringExceptionV(JLIBERR_UtilUnimplementedFeatureSSInFunctionS, "UNIMPLEMENTED feature [%s %s] in function %s() at %s(%d)", what, what2, function, sanitizeSourceFile(file), line);
+}
+
+static bool backtraceOnAssert = true;
+void setBacktraceOnAssert(bool value)
+{
+    backtraceOnAssert = value;
 }
 
 void raiseAssertException(const char *assertion, const char *file, unsigned line)
@@ -637,7 +843,8 @@ void raiseAssertException(const char *assertion, const char *file, unsigned line
 
     if (queryLogMsgManager())
     {
-        printStackReport();
+        if (backtraceOnAssert)
+            printStackReport();
         IERRLOG("%s",s.str());       // make sure doesn't get lost!
         queryLogMsgManager()->flushQueue(10*1000);
 #ifdef _DEBUG
@@ -657,7 +864,7 @@ void raiseAssertException(const char *assertion, const char *file, unsigned line
 #endif
 #endif
 
-    throw makeStringException(3000, s.str()); // 3000: internal error
+    throw makeStringException(JLIBERR_InternalError, s.str());
 }
 
 void raiseAssertCore(const char *assertion, const char *file, unsigned line)
@@ -915,10 +1122,7 @@ static void doPrintStackReport( size_t ip, size_t _bp, size_t sp )
     
     
     StackWalk( ip , _bp);
-    ModuleWalk();
-    StringBuffer threadlist;
-    IERRLOG( "ThreadList:\n%s",getThreadList(threadlist).str());
-    
+    ModuleWalk();    
 }
 
 
@@ -1048,7 +1252,7 @@ public:
     { 
 #ifdef _DEBUG
         if (u == 0x80000003) return; // int 3 breakpoints
-        static CriticalSection crit;
+        static CriticalSection crit(SYNC_LOCATION);
         {
             CriticalBlock b(crit);
             PrintExceptionReport(pExp);
@@ -1111,11 +1315,40 @@ void jlib_decl setProcessAborted(bool _abortVal)
     processAborted = _abortVal;
 }
 
+static constexpr unsigned SIGNAL_RAISE_DELAY_SECONDS = 20;
+
+#if defined(__linux__)
+  static timer_t killTimerId;
+  static std::atomic<bool> killTimerCreated { false };
+    static CriticalSection killTimerCS(SYNC_LOCATION);
+#endif
+
+static void raiseKillSigInFuture(unsigned timeoutSec)
+{
+#if defined(__linux__)
+    if (killTimerCreated.load())
+    {
+        struct itimerspec itSpec;
+
+        itSpec.it_value.tv_sec = timeoutSec;
+        itSpec.it_value.tv_nsec = 0;
+        itSpec.it_interval.tv_sec = 0;
+        itSpec.it_interval.tv_nsec = 0;
+
+        timer_settime(killTimerId, 0, &itSpec, 0);
+    }
+#endif
+}
+
 NO_SANITIZE("alignment") void excsighandler(int signum, siginfo_t *info, void *extra)
 {
     static byte nested=0;
     if (nested++)
         return;
+
+    // If the program is aborting because of a corruption in the memory manager,
+    // ensure that it really exits, rather than deadlocking on a memory manager mutex
+    raiseKillSigInFuture(SIGNAL_RAISE_DELAY_SECONDS);
 
     //If the program is terminating then do not try and trace
     if (!queryLogMsgManager())
@@ -1153,7 +1386,8 @@ NO_SANITIZE("alignment") void excsighandler(int signum, siginfo_t *info, void *e
     
     StringBuffer networkIp;
     PROGLOG("================================================");
-    PROGLOG("Program:   %s:%s", queryHostIP().getIpText(networkIp).str(),queryCurrentProcessPath());
+    PROGLOG("Program:   %s:%s", queryHostIP().getHostText(networkIp).str(),queryCurrentProcessPath());
+    PROGLOG("Version:   %s %s %s", hpccBuildInfo.buildVersion, hpccBuildInfo.buildTag, hpccBuildInfo.buildTagTimestamp);
     PROGLOG("Signal:    %d %s",signum,strsignal(signum));
     PROGLOG("Fault IP:  " I64X "", ip);
     PROGLOG("Accessing: " I64X "", (unsigned __int64) info->si_addr);
@@ -1211,7 +1445,8 @@ NO_SANITIZE("alignment") void excsighandler(int signum, siginfo_t *info, void *e
     
     StringBuffer networkIp;
     PROGLOG("================================================");
-    PROGLOG("Program:   %s:%s", queryHostIP().getIpText(networkIp).str(),queryCurrentProcessPath());
+    PROGLOG("Program:   %s:%s", queryHostIP().getHostText(networkIp).str(),queryCurrentProcessPath());
+    PROGLOG("Version:   %s %s %s", hpccBuildInfo.buildVersion, hpccBuildInfo.buildTag, hpccBuildInfo.buildTagTimestamp);
     PROGLOG("Signal:    %d %s",signum,strsignal(signum));
     PROGLOG("Fault IP:  %08X", ip);
     PROGLOG("Accessing: %08X", (unsigned) info->si_addr);
@@ -1349,8 +1584,6 @@ NO_SANITIZE("alignment") void excsighandler(int signum, siginfo_t *info, void *e
 
 #endif
 
-    StringBuffer threadlist;
-    PROGLOG( "ThreadList:\n%s",getThreadList(threadlist).str());
     queryLogMsgManager()->flushQueue(10*1000);
 
     // MCK - really should not return after recv'ing any of these signals
@@ -1420,6 +1653,25 @@ void jlib_decl enableSEHtoExceptionMapping()
 #endif
     if (SEHnested++)
         return; // already done
+
+#if defined(__linux__)
+    {
+        CriticalBlock block(killTimerCS);
+        if (!killTimerCreated.load())
+        {
+            struct sigevent sigev;
+            sigev.sigev_notify = SIGEV_SIGNAL;
+            sigev.sigev_signo = SIGKILL;
+            sigev.sigev_value.sival_ptr = &killTimerId;
+            sigev.sigev_notify_function = nullptr;
+            sigev.sigev_notify_attributes = NULL;
+            int srtn = timer_create(CLOCK_MONOTONIC, &sigev, &killTimerId);
+            if (srtn == 0)
+                killTimerCreated = true;
+        }
+    }
+#endif
+
 #ifdef _WIN32
     enableThreadSEH();
     SEHrestore = EnableSEHtranslation();
@@ -1476,6 +1728,30 @@ void  jlib_decl disableSEHtoExceptionMapping()
 #endif
 }
 
+void jlib_decl raiseSignalInFuture(int signo, unsigned timeoutSec)
+{
+#if defined(__linux__)
+    int ret;
+    timer_t timerId;
+    struct sigevent sigev;
+    struct itimerspec itSpec;
+
+    sigev.sigev_notify = SIGEV_SIGNAL;
+    sigev.sigev_signo = signo;
+    sigev.sigev_value.sival_ptr = &timerId;
+    sigev.sigev_notify_function = nullptr;
+    sigev.sigev_notify_attributes = NULL;
+
+    itSpec.it_value.tv_sec = timeoutSec;
+    itSpec.it_value.tv_nsec = 0;
+    itSpec.it_interval.tv_sec = 0;
+    itSpec.it_interval.tv_nsec = 0;
+
+    ret = timer_create(CLOCK_MONOTONIC, &sigev, &timerId);
+    if (!ret)
+        timer_settime(timerId, 0, &itSpec, 0);
+#endif
+}
 
 StringBuffer & formatSystemError(StringBuffer & out, unsigned errcode)
 {
@@ -1597,7 +1873,9 @@ bool getDebuggerGetStacksCmd(StringBuffer &output)
         output.append("Unable to capture stacks");
         return false;
     }
-    return output.appendf("gdb --batch -n -ex 'thread apply all bt' %s %u", exePath, GetCurrentProcessId());
+
+    output.appendf("gdb --batch -ix %s/.gdbinit -x %s/post-mortem-gdb %s %u", hpccBuildInfo.execDir, hpccBuildInfo.execDir, exePath, GetCurrentProcessId());
+    return true;
 }
 
 bool getAllStacks(StringBuffer &output)
@@ -1743,14 +2021,16 @@ void IErrorReceiver::throwStringExceptionV(int code,const char *format, ...) con
 void IErrorReceiver::reportError(int errNo, const char *msg, const char *filename, int lineno, int column, int position)
 {
     Owned<IError> err = createError(errNo,msg,filename,lineno,column,position);
-    report(err);
+    Owned<IError> mapped = mapError(err);
+    report(mapped);
 }
 
 void IErrorReceiver::reportWarning(WarnErrorCategory category, int warnNo, const char *msg, const char *filename, int lineno, int column, int position)
 {
     ErrorSeverity severity = queryDefaultSeverity(category);
     Owned<IError> warn = createError(category, severity,warnNo,msg,filename,lineno,column,position);
-    report(warn);
+    Owned<IError> mapped = mapError(warn);
+    report(mapped);
 }
 
 const LogMsgCategory & mapToLogMsgCategory(ErrorSeverity severity, MessageAudience aud)
@@ -1784,7 +2064,7 @@ const LogMsgCategory & mapToLogMsgCategory(ErrorSeverity severity, MessageAudien
                 case MSGAUD_audit:
                     return MCauditWarning;
                 default:
-                    return MCinternalWarning;
+                    return MCdebugWarning;
             }
         }
         case SeverityFatal:
@@ -1799,7 +2079,7 @@ const LogMsgCategory & mapToLogMsgCategory(ErrorSeverity severity, MessageAudien
                 case MSGAUD_audit:
                     return MCauditError;
                 default:
-                    return MCinternalError;
+                    return MCdebugError;
             }
         }
     }

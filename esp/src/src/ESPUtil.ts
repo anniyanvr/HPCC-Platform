@@ -1,35 +1,7 @@
 ﻿import { select as d3Select } from "@hpcc-js/common";
-import * as registry from "dijit/registry";
-import * as Tooltip from "dijit/Tooltip";
-import * as arrayUtil from "dojo/_base/array";
-import * as declare from "dojo/_base/declare";
-import * as lang from "dojo/_base/lang";
-import * as aspect from "dojo/aspect";
-import * as domClass from "dojo/dom-class";
-import * as domStyle from "dojo/dom-style";
-import * as Evented from "dojo/Evented";
-import * as json from "dojo/json";
-import * as on from "dojo/on";
-import * as query from "dojo/query";
-import * as Stateful from "dojo/Stateful";
-import * as Memory from "dojo/store/Memory";
+import { registry, arrayUtil, declare, lang, aspect, domClass, domStyle, Evented, json, on, query, Stateful, Tooltip, ColumnResizer, CompoundColumns, DijitRegistry, Grid as DGridGrid, Keyboard, OnDemandGrid, Selection } from "src-dojo/index";
+import { Memory } from "./store/Memory";
 
-// @ts-ignore
-import * as ColumnResizer from "dgrid/extensions/ColumnResizer";
-// @ts-ignore
-import * as CompoundColumns from "dgrid/extensions/CompoundColumns";
-// @ts-ignore
-import * as DijitRegistry from "dgrid/extensions/DijitRegistry";
-// @ts-ignore
-import * as DGrid from "dgrid/Grid";
-// @ts-ignore
-import * as Keyboard from "dgrid/Keyboard";
-// @ts-ignore
-import * as OnDemandGrid from "dgrid/OnDemandGrid";
-// @ts-ignore
-import * as Selection from "dgrid/Selection";
-
-import { declareDecorator } from "./DeclareDecorator";
 import nlsHPCC from "./nlsHPCC";
 import { userKeyValStore } from "./KeyValStore";
 import { Pagination } from "./Pagination";
@@ -268,13 +240,9 @@ const GridHelper = declare(null, {
 export const LocalStorage = dojo.declare([Evented], {
     constructor() {
         const context = this;
-        if (typeof Storage !== void (0)) {
-            window.addEventListener("storage", function (event) {
-                context.emit("storageUpdate", { event });
-            });
-        } else {
-            console.log("Browser doesn't support multi-tab communication");
-        }
+        window.addEventListener("storage", function (event) {
+            context.emit("storageUpdate", { event });
+        });
     },
 
     setItem(key, value) {
@@ -334,20 +302,22 @@ export const IdleWatcher = dojo.declare([Evented], {
 
     start() {
         this.stop();
-        const context = this;
-        this._keydownHandle = on(document, "keydown", function (item, index, array) {
-            context.emit("active", {});
-            context.stop();
-            context.start();
-        });
-        this._mousedownHandle = on(document, "mousedown", function (item, index, array) {
-            context.emit("active", {});
-            context.stop();
-            context.start();
-        });
-        this._intervalHandle = setInterval(function () {
-            context.emit("idle", {});
-        }, this._idleDuration);
+        if (document.cookie.indexOf("ESPAuthenticated=true") > -1) {
+            const context = this;
+            this._keydownHandle = on(document, "keydown", function (item, index, array) {
+                context.emit("active", {});
+                context.stop();
+                context.start();
+            });
+            this._mousedownHandle = on(document, "mousedown", function (item, index, array) {
+                context.emit("active", {});
+                context.stop();
+                context.start();
+            });
+            this._intervalHandle = setInterval(function () {
+                context.emit("idle", {});
+            }, this._idleDuration);
+        }
     },
 
     stop() {
@@ -398,23 +368,10 @@ export const FormHelper = declare(null, {
     }
 });
 
-type Memory = {
-    data: any[];
-    queryEngine: any;
-    setData(data: any);
-    query(query: any, options: any): any;
-};
+export class UndefinedMemory extends Memory {
 
-export interface UndefinedMemoryBase extends Memory {
-}
-
-@declareDecorator("UndefinedMemoryBase", Memory)
-export class UndefinedMemoryBase { }
-
-export class UndefinedMemory extends UndefinedMemoryBase {
-
-    constructor() {
-        super();
+    constructor(idProperty: string = "id") {
+        super(idProperty);
     }
 
     query(query: any, options: any) {
@@ -446,12 +403,12 @@ export class UndefinedMemory extends UndefinedMemoryBase {
 }
 
 export function Grid(pagination?, selection?, overrides?: object, compoundColumns?, gridName?) {
-    let baseClass = [];
+    let baseClass;
     const params = overrides || {};
-    const rows = Number(localStorage.getItem(gridName));
+    const rows = Number(localStorage.getItem(gridName + "_GridRowsPerPage"));
 
     if (pagination) {
-        baseClass = [DGrid, Pagination, ColumnResizer, Keyboard, DijitRegistry, CompoundColumns];
+        baseClass = [DGridGrid, Pagination, ColumnResizer, Keyboard, DijitRegistry, CompoundColumns];
         lang.mixin(params, {
             rowsPerPage: rows || 50,
             pagingLinks: 1,
@@ -525,7 +482,6 @@ export function MonitorVisibility(widget, callback) {
 
 const slice = Array.prototype.slice;
 export function override(method) {
-    /** @this target object */
     const proxy = function () {
         const context = this;
         const inherited = (this.getInherited && this.getInherited({

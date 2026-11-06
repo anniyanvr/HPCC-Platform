@@ -15,7 +15,9 @@
     limitations under the License.
 ############################################################################## */
 
+#ifdef _MSC_VER
 #pragma warning( disable : 4786)
+#endif
 
 #include "platform.h"
 #define BINDUTIL_EXPORT DECL_EXPORT
@@ -494,7 +496,7 @@ IPropertyTree *getProtocolConfig(IPropertyTree *tree, const char *prot, const ch
 }
 
 
-static unsigned char isValidUrlChar[96] =
+static constexpr unsigned char isValidUrlChar[96] =
 {
     0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1,0x0,0x0,0x1,0x1,0x0, /*  !"#$%&'()*+,-./   */
     0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x1,0x0,0x0,0x0,0x0,0x0,0x0, /* 0123456789:;<=>?   */
@@ -527,6 +529,11 @@ int Utils::url_decode(const char* url, StringBuffer& result)
 {
     appendDecodedURL(result, url);
     return 0;
+}
+
+void Utils::url_decode(size_t len, const char* url, StringBuffer& result)
+{
+    appendDecodedURL(result, len, url);
 }
 
 void Utils::SplitURL(const char* url, StringBuffer& protocol,StringBuffer& UserName,StringBuffer& Password,StringBuffer& host, StringBuffer& port, StringBuffer& path)
@@ -599,8 +606,7 @@ void Utils::SplitURL(const char* url, StringBuffer& protocol,StringBuffer& UserN
         UserName.append(username);
     }
 
-    if(hostptr)
-        host.append(hostptr);
+    host.append(hostptr);
 
     if(portptr)
         port.append(portptr);

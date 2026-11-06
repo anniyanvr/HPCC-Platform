@@ -98,7 +98,7 @@ IFvDataSource * createFileDataSource(const char * logicalName, const char * clus
         udesc->set(username, password);
     }
 
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(logicalName, udesc.get(),false,false,false,nullptr,defaultPrivilegedUser);
+    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(logicalName, udesc.get(),AccessMode::readRandom,false,false,nullptr,defaultPrivilegedUser);
     if (!df)
         throwError1(FVERR_CouldNotResolveX, logicalName);
     return createFileDataSource(df, logicalName, cluster, username, password);
@@ -282,7 +282,7 @@ CResultSetMetaData::CResultSetMetaData(IFvDataSourceMetaData * _meta, bool _useX
         CResultSetColumnInfo * column = new CResultSetColumnInfo;
         column->type = type;
         column->flag = meta->queryFieldFlags(idx);
-        if (type->getSize() == UNKNOWN_LENGTH)
+        if (isUnknownLength(type->getSize()))
             fixedSize = false;
         switch (type->getTypeCode())
         {
@@ -332,28 +332,29 @@ void CResultSetMetaData::calcFieldOffsets(const byte * data, unsigned * offsets)
     {
         ITypeInfo & type = *columns.item(idx).type;
         unsigned size = type.getSize();
-        if (size == UNKNOWN_LENGTH)
+        if (isUnknownLength(size))
         {
             const byte * cur = data + curOffset;
+            unsigned lengthSize = getLengthSizeBytes(size);
             switch (type.getTypeCode())
             {
             case type_data:
             case type_string:
             case type_table:
             case type_groupedtable:
-                size = *((unsigned *)cur) + sizeof(unsigned);
+                size = rtlReadInt(cur, lengthSize) + lengthSize;
                 break;
             case type_set:
-                size = *((unsigned *)(cur + sizeof(bool))) + sizeof(unsigned) + sizeof(bool);
+                size = rtlReadInt(cur + sizeof(bool), lengthSize) + lengthSize + sizeof(bool);
                 break;
             case type_qstring:
-                size = rtlQStrSize(*((unsigned *)cur)) + sizeof(unsigned);
+                size = rtlQStrSize(rtlReadInt(cur, lengthSize)) + lengthSize;
                 break;
             case type_unicode:
-                size = *((unsigned *)cur)*sizeof(UChar) + sizeof(unsigned);
+                size = rtlReadInt(cur, lengthSize) * sizeof(UChar) + lengthSize;
                 break;
             case type_utf8:
-                size = sizeof(unsigned) + rtlUtf8Size(*(unsigned *)cur, cur+sizeof(unsigned));
+                size = lengthSize + rtlUtf8Size(rtlReadInt(cur, lengthSize), cur+lengthSize);
                 break;
             case type_varstring:
                 size = strlen((char *)cur)+1;
@@ -489,18 +490,11 @@ bool CResultSetMetaData::isBigEndian(int column) const
 }
 
 
-unsigned CResultSetMetaData::getColumnRawType(int column) const
-{
-    assertex(columns.isItem(column));
-    return getClarionResultType(columns.item(column).type);
-}
-
-
 unsigned CResultSetMetaData::getColumnRawSize(int column) const
 {
     assertex(columns.isItem(column));
     unsigned size = columns.item(column).type->getSize();
-    return (size == UNKNOWN_LENGTH) ? 0 : size;
+    return (isUnknownLength(size)) ? 0 : size;
 }
 
 
@@ -902,10 +896,11 @@ bool CResultSetCursor::first()
 static unsigned getLength(ITypeInfo & type, const byte * & cursor)
 {
     unsigned len = type.getStringLen();
-    if (len != UNKNOWN_LENGTH)
+    if (!isUnknownLength(len))
         return len;
-    len = *(unsigned *)cursor;
-    cursor += sizeof(unsigned);
+    unsigned lengthSize = getLengthSizeBytes(len);
+    len = rtlReadInt(cursor, lengthSize);
+    cursor += lengthSize;
     return len;
 }
 
@@ -996,8 +991,10 @@ IResultSetCursor * CResultSetCursor::getChildren(int columnIndex) const
         return NULL;
     }
 
-    unsigned len = *(unsigned *)cur;
-    const byte * data = cur + sizeof(unsigned);
+    unsigned size = type.getSize();
+    unsigned lengthSize = getLengthSizeBytes(size);
+    unsigned len = rtlReadInt(cur, lengthSize);
+    const byte * data = cur + lengthSize;
     Owned<IFvDataSource> childData = meta.meta->createChildDataSource(columnIndex, len, data);
     Owned<CResultSet> nestedResult = new CResultSet(childData, meta.alwaysUseXPath);
     return nestedResult->createCursor();
@@ -1140,8 +1137,8 @@ IStringVal & CResultSetCursor::getDisplayText(IStringVal &ret, int columnIndex)
         {
             len = getLength(type, cur);
             StringBuffer temp;
-            while (len--)
-                temp.appendhex(*cur++, true);
+            temp.appendhex(len, cur, true);
+            cur += len;
             ret.setLen(temp.str(), temp.length());
             break;
         }
@@ -1586,21 +1583,6 @@ IExtendedResultSetCursor * DelayedFilteredResultSetCursor::queryBase()
 }
 
 //---------------------------------------------------------------------------
-
-inline byte hex2digit(char c)
-{
-    if (c >= 'a')
-        return (c - 'a' + 10);
-    else if (c >= 'A')
-        return (c - 'A' + 10);
-    return (c - '0');
-}
-
-inline byte getHexPair(const char * s)
-{
-    return hex2digit(s[0]) << 4 | hex2digit(s[1]);
-}
-
 
 static unsigned getSubstringMatchLength(size32_t len, const void * data)
 {
@@ -2136,7 +2118,7 @@ IDistributedFile * CResultSetFactory::lookupLogicalName(const char * logicalName
         udesc->set(username, password);
     }
 
-    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(logicalName, udesc.get(),false,false,false,nullptr,defaultPrivilegedUser);
+    Owned<IDistributedFile> df = queryDistributedFileDirectory().lookup(logicalName, udesc.get(),AccessMode::readRandom,false,false,nullptr,defaultPrivilegedUser);
     if (!df)
         throwError1(FVERR_CouldNotResolveX, logicalName);
     return df.getClear();
@@ -2292,34 +2274,37 @@ int findResultSetColumn(const INewResultSet * results, const char * columnName)
 }
 
 
-extern FILEVIEW_API unsigned getResultCursorXml(IStringVal & ret, IResultSetCursor * cursor, const char * name, unsigned start, unsigned count, const char * schemaName, const IProperties *xmlns)
+extern FILEVIEW_API unsigned getResultCursorXml(IStringVal & ret, IResultSetCursor * cursor, const char * name,
+    unsigned start, unsigned count, const char * schemaName, const IProperties * xmlns, IAbortRequestCallback * abortCheck, __uint64 maxSize)
 {
     Owned<CommonXmlWriter> writer = CreateCommonXmlWriter(XWFexpandempty);
-    unsigned rc = writeResultCursorXml(*writer, cursor, name, start, count, schemaName, xmlns);
+    unsigned rc = writeResultCursorXml(*writer, cursor, name, start, count, schemaName, xmlns, false, abortCheck, maxSize);
     ret.set(writer->str());
     return rc;
 
 }
 
-extern FILEVIEW_API unsigned getResultXml(IStringVal & ret, INewResultSet * result, const char* name,unsigned start, unsigned count, const char * schemaName, const IProperties *xmlns)
+extern FILEVIEW_API unsigned getResultXml(IStringVal & ret, INewResultSet * result, const char * name,
+    unsigned start, unsigned count, const char * schemaName, const IProperties * xmlns, IAbortRequestCallback * abortCheck, __uint64 maxSize)
 {
     Owned<IResultSetCursor> cursor = result->createCursor();
-    return getResultCursorXml(ret, cursor, name, start, count, schemaName, xmlns);
+    return getResultCursorXml(ret, cursor, name, start, count, schemaName, xmlns, abortCheck, maxSize);
 }
 
-extern FILEVIEW_API unsigned getResultJSON(IStringVal & ret, INewResultSet * result, const char* name,unsigned start, unsigned count, const char * schemaName)
+extern FILEVIEW_API unsigned getResultJSON(IStringVal & ret, INewResultSet * result, const char * name,
+    unsigned start, unsigned count, const char * schemaName, IAbortRequestCallback * abortCheck, __uint64 maxSize)
 {
     Owned<IResultSetCursor> cursor = result->createCursor();
     Owned<CommonJsonWriter> writer = new CommonJsonWriter(0);
     writer->outputBeginRoot();
-    unsigned rc = writeResultCursorXml(*writer, cursor, name, start, count, schemaName);
+    unsigned rc = writeResultCursorXml(*writer, cursor, name, start, count, schemaName, nullptr, false, abortCheck, maxSize);
     writer->outputEndRoot();
     ret.set(writer->str());
     return rc;
 }
 
-extern FILEVIEW_API unsigned writeResultCursorXml(IXmlWriter & writer, IResultSetCursor * cursor, const char * name,
-    unsigned start, unsigned count, const char * schemaName, const IProperties *xmlns, bool flushContent)
+extern FILEVIEW_API unsigned writeResultCursorXml(IXmlWriterExt & writer, IResultSetCursor * cursor, const char * name,
+    unsigned start, unsigned count, const char * schemaName, const IProperties * xmlns, bool flushContent, IAbortRequestCallback * abortCheck, __uint64 maxSize)
 {
     if (schemaName)
     {
@@ -2339,20 +2324,26 @@ extern FILEVIEW_API unsigned writeResultCursorXml(IXmlWriter & writer, IResultSe
         writer.outputCString(schemaName, "@xmlSchema");
     if (xmlns)
     {
-        Owned<IPropertyIterator> it = const_cast<IProperties*>(xmlns)->getIterator();
+        Owned<IPropertyIterator> it = xmlns->getIterator();
         ForEach(*it)
         {
             const char *name = it->getPropKey();
-            writer.outputXmlns(name,const_cast<IProperties*>(xmlns)->queryProp(name));
+            const char *value = it->queryPropValue();
+            writer.outputXmlns(name,value);
         }
     }
     cursor->beginWriteXmlRows(writer);
     unsigned c=0;
     for(bool ok=cursor->absolute(start);ok;ok=cursor->next())
     {
+        if (abortCheck && abortCheck->abortRequested())
+            break;
         cursor->writeXmlRow(writer);
         if (flushContent)
             writer.flushContent(false);
+
+        if (maxSize && (writer.length() > maxSize))
+            throw makeStringExceptionV(-1, "writeResultCursorXml exceeded max size (%u MB)", (unsigned)(maxSize / 0x100000));
 
         c++;
         if(count && c>=count)
@@ -2365,34 +2356,38 @@ extern FILEVIEW_API unsigned writeResultCursorXml(IXmlWriter & writer, IResultSe
     return c;
 }
 
-extern FILEVIEW_API unsigned writeResultXml(IXmlWriter & writer, INewResultSet * result, const char* name,unsigned start, unsigned count, const char * schemaName, const IProperties *xmlns)
+extern FILEVIEW_API unsigned writeResultXml(IXmlWriterExt & writer, INewResultSet * result, const char* name,unsigned start, unsigned count, const char * schemaName, const IProperties *xmlns)
 {
     Owned<IResultSetCursor> cursor = result->createCursor();
     return writeResultCursorXml(writer, cursor, name, start, count, schemaName, xmlns);
 }
 
-extern FILEVIEW_API unsigned getResultCursorBin(MemoryBuffer & ret, IResultSetCursor * cursor, unsigned start, unsigned count)
+extern FILEVIEW_API unsigned getResultCursorBin(MemoryBuffer & ret, IResultSetCursor * cursor, unsigned start, unsigned count, __uint64 maxSize)
 {
     const IResultSetMetaData & meta = cursor->queryResultSet()->getMetaData();
     unsigned numCols = meta.getColumnCount();
 
+    __uint64 startSize = ret.length();
     unsigned c=0;
     for(bool ok=cursor->absolute(start);ok;ok=cursor->next())
     {
         for (unsigned col=0; col < numCols; col++)
             cursor->getRaw(MemoryBuffer2IDataVal(ret), col);
-
         c++;
+
+        if (maxSize && (ret.length()-startSize > maxSize))
+            throw makeStringExceptionV(-1, "getResultCursorBin exceeded max size (%u MB)", (unsigned)(maxSize / 0x100000));
+
         if(count && c>=count)
             break;
     }
     return c;
 }
 
-extern FILEVIEW_API unsigned getResultBin(MemoryBuffer & ret, INewResultSet * result, unsigned start, unsigned count)
+extern FILEVIEW_API unsigned getResultBin(MemoryBuffer & ret, INewResultSet * result, unsigned start, unsigned count, __uint64 maxSize)
 {
     Owned<IResultSetCursor> cursor = result->createCursor();
-    return getResultCursorBin(ret, cursor, start, count);
+    return getResultCursorBin(ret, cursor, start, count, maxSize);
 }
 
 inline const char *getSeverityTagname(ErrorSeverity severity, unsigned flags)
@@ -2415,7 +2410,7 @@ inline const char *getSeverityTagname(ErrorSeverity severity, unsigned flags)
     return "Exception";
 }
 
-extern FILEVIEW_API void writeFullWorkUnitResults(const char *username, const char *password, const IConstWorkUnit *cw, IXmlWriter &writer, unsigned flags, ErrorSeverity minSeverity, const char *rootTag)
+extern FILEVIEW_API void writeFullWorkUnitResults(const char *username, const char *password, const IConstWorkUnit *cw, IXmlWriterExt &writer, unsigned flags, ErrorSeverity minSeverity, const char *rootTag)
 {
     if (rootTag && *rootTag && !(flags & WorkUnitXML_NoRoot))
         writer.outputBeginNested(rootTag, true);

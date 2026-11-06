@@ -23,6 +23,7 @@
 #####################################################
 
 project( remote ) 
+SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STRICT_CXX_FLAGS}")
 
 HPCC_ADD_SUBDIRECTORY(hooks)
 
@@ -64,18 +65,17 @@ ADD_DEFINITIONS( -D_USRDLL -DREMOTE_EXPORTS )
 HPCC_ADD_LIBRARY( remote SHARED ${SRCS}  )
 install ( TARGETS remote RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
 
-target_link_libraries ( remote 
+target_link_libraries ( remote PRIVATE
     eclrtl
     jlib
     jhtree 
     hql   
     mp
     ${URIPARSER_LIBRARIES}
-    ${CPPUNIT_LIBRARIES}
     )
 
 IF (USE_OPENSSL)
-    target_link_libraries ( remote 
+    target_link_libraries ( remote PRIVATE
     	securesocket
     )
 ENDIF()

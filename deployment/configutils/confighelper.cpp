@@ -6,7 +6,6 @@
 #include "jptree.hpp"
 #include "XMLTags.h"
 #include "deploy.hpp"
-#include "build-config.h"
 #include "confighelper.hpp"
 
 #define STANDARD_CONFIG_BUILDSETFILE "buildset.xml"
@@ -16,7 +15,7 @@
 #define PLUGIN_CGEN_COMP_LIST  "cgencomplist.xml"
 #define ENV_GEN_RULES_DO_NOT_GENERATE_PROP "do_not_generate"
 
-CriticalSection CConfigHelper::m_critSect;
+CriticalSection CConfigHelper::m_critSect(SYNC_LOCATION);
 
 CConfigHelper::CConfigHelper(IDeploymentCallback *pCallBack): m_pDefBldSet(NULL)
 {
@@ -62,7 +61,7 @@ CConfigHelper* CConfigHelper::getInstance(const IPropertyTree *cfg, const char* 
 
             if (p_sConfigHelper->m_strConfigXMLDir.length() == 0)
             {
-              p_sConfigHelper->m_strConfigXMLDir = INSTALL_DIR;
+                p_sConfigHelper->m_strConfigXMLDir = hpccBuildInfo.installDir;
             }
 
             p_sConfigHelper->m_strBuildSetFileName = pParams->queryProp(TAG_BUILDSET);

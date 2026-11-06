@@ -24,6 +24,23 @@
     look at loopback
 */
 
+
+/* ISocket implementation/semantic details:
+ *
+ * 1. All sockets are created in non-blocking state. All implementations should cope with non-blocking, i.e. wait/retry.
+ * 2. read/readtms will block until min_size bytes are read or timeout expires (see readtms for more detail).
+ * read/readtms can be called with min_size=0, in which case it will return as soon as no more data is available.
+ * 3. Historically, SSL calls + non-SSL write/writetms, used to flip blocking state during the call, this was prone to error,
+ * because socket could [legitimately] be written to whilst being read from, e.g. a server could be writing to a client, and
+ * at the same time, be notified of traffic and start reading it. Flipping the blocking state of a socket is inherently unsafe
+ * in many usage patterns.
+ *
+ * The non-blocking semantics are designed so that the select handlers can read as much data as possible without blocking.
+ * e.g. dafilesrv and MP avoid blocking in their select handlers, thus avoiding up other client traffic.
+ */
+
+
+
 #include <string>
 #include <unordered_set>
 #include <functional>
@@ -36,6 +53,7 @@
 #include <stdio.h>
 #endif
 #include <algorithm>
+#include <thread>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -67,7 +85,7 @@
 #include "jprop.hpp"
 #include "jregexp.hpp"
 #include "jdebug.hpp"
-#include "build-config.h"
+#include "jerror.hpp"
 
 // epoll only with linux
 
@@ -87,6 +105,11 @@
 # endif
 #endif
 
+// OSX seems to use TCP_KEEPALIVE instead of TCP_KEEPIDLE
+#if defined(__APPLE__) && !defined(TCP_KEEPIDLE)
+# define TCP_KEEPIDLE TCP_KEEPALIVE
+#endif
+
 // various options 
 
 #define CONNECT_TIMEOUT_REFUSED_WAIT    1000        // maximum to sleep on connect_timeout
@@ -104,41 +127,18 @@
   static int dropCounter = 0;
 #endif
 
-#ifndef _WIN32 
-#define BLOCK_POLLED_SINGLE_CONNECTS  // NB this is much slower in windows
-#define CENTRAL_NODE_RANDOM_DELAY
-#else
-#define USERECVSEM      // to singlethread BF_SYNC_TRANSFER_PUSH 
-#endif
-
 #ifdef _DEBUG
 //#define SOCKTRACE
 //#define EPOLLTRACE
 #endif
 
-#ifdef _TESTING
+// comment out this definition to suppress all low-level jsocket error logging
 #define _TRACE
-#endif
 
 #ifdef _TRACE
-#define THROWJSOCKEXCEPTION(exc) \
-  { StringBuffer msg; \
-    msg.appendf("Target: %s, Raised in: %s, line %d",tracename ,sanitizeSourceFile(__FILE__), __LINE__); \
-    IJSOCK_Exception *e = new SocketException(exc,msg.str());\
-    throw e; }
-#define THROWJSOCKEXCEPTION2(exc) \
-  { StringBuffer msg; \
-    msg.appendf("Raised in: %s, line %d",sanitizeSourceFile(__FILE__), __LINE__); \
-    IJSOCK_Exception *e = new SocketException(exc,msg.str());\
-    throw e; }
 #define LOGERR(err,ref,info) LogErr(err,ref,info,__LINE__,NULL)
 #define LOGERR2(err,ref,info) LogErr(err,ref,info,__LINE__,tracename)
-    
 #else
-#define THROWJSOCKEXCEPTION(exc) \
-  { IJSOCK_Exception *e = new SocketException(exc);\
-    throw e; }
-#define THROWJSOCKEXCEPTION2(exc) THROWJSOCKEXCEPTION(exc)
 #define LOGERR(err,ref,info)
 #define LOGERR2(err,ref,info)
 #endif
@@ -154,7 +154,6 @@ static RelaxedAtomic<unsigned> pre_conn_unreach_cnt{0};    // global count of pr
 
 #define IPV6_SERIALIZE_PREFIX (0x00ff00ff)
 
-
 class jlib_thrown_decl SocketException: public IJSOCK_Exception, public CInterface
 {
 public:
@@ -166,6 +165,7 @@ public:
             msg = strdup(_msg);
         else
             msg = NULL;
+        queryExceptionIntercept().handle(ExceptionInterceptClass::eSocket, this);
     };
     ~SocketException() { free(msg); }
     
@@ -187,6 +187,7 @@ public:
         case JSOCKERR_handle_too_large:          return str.append("handle too large");
         case JSOCKERR_bad_netaddr:               return str.append("bad net addr");
         case JSOCKERR_ipv6_not_implemented:      return str.append("IPv6 not implemented");
+        case JSOCKERR_small_udp_packet:          return str.append("small UDP packet");
         // OS errors
 #ifdef _WIN32
         case WSAEINTR:              return str.append("WSAEINTR(10004) - Interrupted system call.");
@@ -289,6 +290,36 @@ private:
     char *msg;
 };
 
+void getSocketErrorMessage(StringBuffer & str, int err)
+{
+    SocketException::geterrormessage(err, str);
+}
+
+IJSOCK_Exception* createJSocketException(int jsockErr, const char *_msg, const char *file, unsigned line)
+{
+    StringBuffer msg;
+    if (_msg)
+        msg.append(_msg).append(", ");
+    msg.appendf("Raised in: %s, line %d", sanitizeSourceFile(file), line);
+    return new SocketException(jsockErr, _msg);
+
+}
+
+void throwJSockException(int jsockErr, const char *_msg, const char *file, unsigned line)
+{
+    throw createJSocketException(jsockErr, _msg, file, line);
+}
+
+inline void throwJSockTargetException(int jsockErr, const char *target, const char *file, unsigned line)
+{
+    VStringBuffer msg("Target: %s", target);
+    throw createJSocketException(jsockErr, msg, file, line);
+}
+
+#define THROWJSOCKTARGETEXCEPTION(exc) throwJSockTargetException(exc, tracename, __FILE__, __LINE__)
+
+
+
 IJSOCK_Exception *IPv6NotImplementedException(const char *filename,unsigned lineno)
 {
     StringBuffer msg;
@@ -325,7 +356,7 @@ struct MCASTREQ
 #define CHECKSOCKRANGE(s)
 #define _USE_SELECT // Windows bug 309411 - WSAPoll does not report failed connections - wont fix
 // #define poll(a, b, c) WSAPoll((a), (b), (c))
-#elif defined(__FreeBSD__) || defined(__APPLE__)
+#elif defined(__FreeBSD__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
 #define XFD_SETSIZE FD_SETSIZE
 #define T_FD_SET fd_set
 #define XFD_ZERO(s) FD_ZERO(s)
@@ -347,16 +378,13 @@ struct xfd_set { __fd_mask fds_bits[XFD_SETSIZE / __NFDBITS]; }; // define our o
 #undef __FD_ISSET
 #define __FD_ISSET(d, s)   ((__FDS_BITS (s)[__FDELT(d)] & __FDMASK(d)) != 0)
 #endif
-#define CHECKSOCKRANGE(s) { if (s>=XFD_SETSIZE) THROWJSOCKEXCEPTION2(JSOCKERR_handle_too_large); }
+#define CHECKSOCKRANGE(s) { if (s>=XFD_SETSIZE) THROWJSOCKEXCEPTION(JSOCKERR_handle_too_large); }
 #endif
 // end 64 bit
 #define T_FD_SET xfd_set
 #define XFD_ZERO(s) memset(s,0,sizeof(xfd_set))
 #define T_SOCKET int
 #define SEND_FLAGS (MSG_NOSIGNAL)
-#endif
-#ifdef CENTRAL_NODE_RANDOM_DELAY
-static SocketEndpointArray CentralNodeArray;
 #endif
 enum SOCKETMODE { sm_tcp_server, sm_tcp, sm_udp_server, sm_udp, sm_multicast_server, sm_multicast};
 
@@ -376,6 +404,207 @@ enum SOCKETMODE { sm_tcp_server, sm_tcp, sm_udp_server, sm_udp, sm_multicast_ser
 # endif
 #endif
 
+enum UseUDE { UNINIT, INITED };
+static std::atomic<UseUDE> expertTCPSettings { UNINIT };
+static CriticalSection queryTCPCS(SYNC_LOCATION);
+
+static bool hasKeepAlive = false;
+static int keepAliveTime = -1;
+static int keepAliveInterval = -1;
+static int keepAliveProbes = -1;
+static bool disableDNSTimeout = false;
+static int maxDNSThreads = 50;
+
+/*
+<Software>
+  <Globals disableDNSTimeout="false" maxDNSThreads="100">
+    <keepalive time="200" interval="75" probes="9"/>
+  </Globals>
+
+global:
+  expert:
+    disableDNSTimeout: false
+    maxDNSThreads: 100
+    keepalive:
+      time: 200
+      interval: 75
+      probes: 9
+*/
+
+static void queryTCPSettings()
+{
+    UseUDE state = expertTCPSettings.load();
+    if (state == UNINIT)
+    {
+        CriticalBlock block(queryTCPCS);
+        state = expertTCPSettings.load();
+        if (state == UNINIT)
+        {
+#ifdef _CONTAINERIZED
+            Owned<IPropertyTree> expert;
+#else
+            Owned<IPropertyTree> envtree;
+            IPropertyTree *expert = nullptr;
+#endif
+            try
+            {
+#ifdef _CONTAINERIZED
+                expert.setown(getGlobalConfigSP()->getPropTree("expert"));
+#else
+                // MCK - without this many components will not have a global prop
+                envtree.setown(getHPCCEnvironment());
+                if (envtree)
+                    expert = envtree->queryPropTree("Software/Globals");
+#endif
+            }
+            catch (IException *e)
+            {
+                e->Release();
+            }
+            catch (...)
+            {
+            }
+            if (expert)
+            {
+                IPropertyTree *keepalive = expert->queryPropTree("keepalive");
+                if (keepalive)
+                {
+                    keepAliveTime = keepalive->getPropInt("@time", keepAliveTime);
+                    keepAliveInterval = keepalive->getPropInt("@interval", keepAliveInterval);
+                    keepAliveProbes = keepalive->getPropInt("@probes", keepAliveProbes);
+                    hasKeepAlive = true;
+                }
+                disableDNSTimeout = expert->getPropBool("@disableDNSTimeout", false);
+                maxDNSThreads = expert->getPropInt("@maxDNSThreads", maxDNSThreads);
+                // could also consider maxDNSThreads==0 as a way to disable DNS timeout ...
+                if (maxDNSThreads < 1)
+                    maxDNSThreads = 1;
+            }
+            expertTCPSettings = INITED;
+        }
+    }
+}
+
+bool queryKeepAlive(int &time, int &intvl, int &probes)
+{
+    queryTCPSettings();
+    if (hasKeepAlive)
+    {
+        time = keepAliveTime;
+        intvl = keepAliveInterval;
+        probes = keepAliveProbes;
+    }
+    return hasKeepAlive;
+}
+
+void setKeepAlive(bool enabled, int time, int intvl, int probes)
+{
+    CriticalBlock block(queryTCPCS);
+    keepAliveTime = time ? time : 200;
+    keepAliveInterval = intvl ? intvl : 75;
+    keepAliveProbes = probes ? probes : 9;
+    hasKeepAlive = enabled;
+    expertTCPSettings = INITED;
+}
+
+static int getAddressInfo(const char *name, unsigned *netaddr, bool okToLogErr);
+
+static CriticalSection queryDNSCS(SYNC_LOCATION);
+
+#ifndef EAI_SYSTEM
+#   define EAI_SYSTEM -11
+#endif
+class CAddrInfoThreadArgs : public CInterface
+{
+public:
+    StringAttr name;
+    unsigned netaddr[4] = { 0, 0, 0, 0 };
+    std::atomic<int> retCode { EAI_SYSTEM };
+
+    CAddrInfoThreadArgs(const char *_name) : name(_name) { }
+};
+
+class CAddrPoolThread : public CInterface, implements IPooledThread
+{
+public:
+    IMPLEMENT_IINTERFACE;
+
+    Linked<CAddrInfoThreadArgs> localAddrThreadInfo;
+
+    virtual void init(void *param) override
+    {
+        localAddrThreadInfo.setown((CAddrInfoThreadArgs *)param);
+    }
+
+    virtual void threadmain() override
+    {
+        localAddrThreadInfo->retCode = getAddressInfo(localAddrThreadInfo->name.get(), localAddrThreadInfo->netaddr, false);
+    }
+
+    virtual bool stop() override
+    {
+        return true;
+    }
+
+    virtual bool canReuse() const override
+    {
+        return true;
+    }
+};
+
+class CAddrInfoFactory : public CInterface, public IThreadFactory
+{
+public:
+    IMPLEMENT_IINTERFACE;
+    IPooledThread *createNew()
+    {
+        return new CAddrPoolThread();
+    }
+};
+
+static Owned<CAddrInfoFactory> addrInfoFactory;
+static Owned<IThreadPool> addrInfoPool;
+static std::atomic<bool> addrInfoPoolCreated { false };
+
+#if !defined(__EMSCRIPTEN__)
+static bool useDNSTimeout()
+{
+    queryTCPSettings();
+    if (!disableDNSTimeout)
+    {
+        if (!addrInfoPoolCreated.load())
+        {
+            CriticalBlock block(queryDNSCS);
+            if (!addrInfoPoolCreated.load())
+            {
+                addrInfoFactory.setown(new CAddrInfoFactory);
+                addrInfoPool.setown(createThreadPool("AddrInfoPool", addrInfoFactory, true, nullptr, maxDNSThreads, 100000000));
+                addrInfoPoolCreated = true;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+#endif
+
+MODULE_INIT(INIT_PRIORITY_STANDARD)
+{
+    return true;
+}
+
+MODULE_EXIT()
+{
+    // NB: this (and other MODULE_EXITs) are not called for Thor and Roxie because they are
+    //     stopped via SIGTERM signal and thus exit() and the atexit handlers are not called
+    if (addrInfoPoolCreated.load())
+    {
+        addrInfoPool->joinAll(true);
+        addrInfoPool.clear();
+        addrInfoPoolCreated = false;
+    }
+}
+
 class CSocket: public ISocket, public CInterface
 {
 public:
@@ -386,22 +615,24 @@ protected:
     friend class CSocketConnectWait;
     enum { ss_open, ss_shutdown, ss_close, ss_pre_open } state;
     T_SOCKET        sock;
-    char*           hostname;   // host address
-    unsigned short  hostport;   // host port
+//    char*           hostname;   // host address
+    unsigned short  hostport;   // host port (NB: this is the peer port if an attached socket)
     unsigned short  localPort;
     SOCKETMODE      sockmode;
-    IpAddress       targetip;
+    IpAddress       targetip;   // NB: this is peer if an attached socket
     SocketEndpoint  returnep;   // set by set_return_addr
 
     MCASTREQ    *   mcastreq;
     size32_t        nextblocksize;
-    unsigned        blockflags;
-    unsigned        blocktimeoutms;
+    unsigned        blockflags = BF_ASYNC_TRANSFER;
+    unsigned        blocktimeoutms = WAIT_FOREVER;
     bool            owned;
     enum            {accept_not_cancelled, accept_cancel_pending, accept_cancelled} accept_cancel_state;
     bool            in_accept;
     bool            nonblocking;
     bool            nagling;
+    SocketStats     stats;
+
     static unsigned connectingcount;
 #ifdef USERECVSEM
     static Semaphore receiveblocksem;
@@ -417,19 +648,20 @@ public:
     void        connect_wait( unsigned timems);
     void        udpconnect();
 
-    void        read(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read,unsigned timeoutsecs);
-    void        readtms(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timedelaysecs);
+    void        read(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timeoutsecs, bool suppresGCIfMinSize=true);
+    void        readtms(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timedelaysecs, bool suppresGCIfMinSize=true);
     void        read(void* buf, size32_t size);
     size32_t    write(void const* buf, size32_t size);
-    size32_t    writetms(void const* buf, size32_t size, unsigned timeoutms=WAIT_FOREVER);
+    size32_t    writetms(void const* buf, size32_t minSize, size32_t size, unsigned timeoutms=WAIT_FOREVER);
     size32_t    write_multiple(unsigned num,void const**buf, size32_t *size);
     size32_t    udp_write_to(const SocketEndpoint &ep,void const* buf, size32_t size);
     void        close();
     void        errclose();
     bool        connectionless() { return (sockmode!=sm_tcp)&&(sockmode!=sm_tcp_server); }
     void        shutdown(unsigned mode=SHUTDOWN_READWRITE);
+    void        shutdownNoThrow(unsigned mode);
 
-    ISocket*    accept(bool allowcancel, SocketEndpoint *peerEp=nullptr);
+    ISocket*    accept(bool allowcancel);
     int         wait_read(unsigned timeout);
     int         logPollError(unsigned revents, const char *rwstr);
     int         wait_write(unsigned timeout);
@@ -444,11 +676,13 @@ public:
     bool        set_nonblock(bool on=true);
     bool        set_nagle(bool on);
     void        set_linger(int lingersecs); 
+    virtual void set_quick_ack(bool on) override;
     void        set_keep_alive(bool set);
     void        logConnectionInfo(unsigned timeoutms, unsigned conn_mstime);
     virtual void set_inherit(bool inherit=false);
     virtual bool check_connection();
     virtual bool isSecure() const override;
+    virtual unsigned __int64 getStatistic(StatisticKind kind) const override;
 
     
     // Block functions
@@ -472,12 +706,14 @@ public:
 
     int         pre_connect(bool block);
     int         post_connect();
+    void        prepareForAsyncConnect(struct sockaddr *& addr, size32_t &addrlen);
+    void        finishAsyncConnect(int connectResult);
 
     void        setTraceName(const char * prefix, const char * name);
     void        setTraceName();
 
     CSocket(const SocketEndpoint &_ep,SOCKETMODE smode,const char *name);
-    CSocket(T_SOCKET new_sock,SOCKETMODE smode,bool _owned);
+    CSocket(T_SOCKET new_sock,SOCKETMODE smode,bool _owned,SocketEndpoint *_peerEp);
 
     virtual ~CSocket();
 
@@ -498,6 +734,7 @@ private:
         if (sock!=INVALID_SOCKET) {
             T_SOCKET s = sock;
             sock = INVALID_SOCKET;
+            nonblocking = false;
             STATS.activesockets--;
     #ifdef SOCKTRACE
             PROGLOG("SOCKTRACE: Closing socket %x %d (%p)", s, s, this);
@@ -512,12 +749,16 @@ private:
         else
             return 0;
     }
+
+    void checkCfgKeepAlive();
+    void setKeepAlive(bool set, int time, int intval, int probes);
+
 };
 
-CriticalSection CSocket::crit;
+CriticalSection CSocket::crit(SYNC_LOCATION);
 unsigned CSocket::connectingcount=0;
 #ifdef USERECVSEM
-Semaphore CSocket::receiveblocksem(2);
+Semaphore CSocket::receiveblocksem({SYNC_LOCATION}, 2);
 #endif
 
 
@@ -550,8 +791,6 @@ public:
 bool win_socket_library::initdone = false;
 static win_socket_library ws32_lib;
 
-#define ERRNO() WSAGetLastError()
-
 #define JSE_ADDRINUSE WSAEADDRINUSE
 #define JSE_CONNRESET WSAECONNRESET
 #define JSE_CONNABORTED WSAECONNABORTED
@@ -562,6 +801,7 @@ static win_socket_library ws32_lib;
 #define JSE_NOTSOCK WSAENOTSOCK
 #define JSE_TIMEDOUT WSAETIMEDOUT
 #define JSE_CONNREFUSED WSAECONNREFUSED
+#define JSE_EAGAIN WSAEWOULDBLOCK
 #define JSE_BADF WSAEBADF
 
 #define JSE_INTR WSAEINTR
@@ -681,6 +921,7 @@ int inet_aton (const char *name, struct in_addr *addr)
 #define JSE_NOTSOCK ENOTSOCK
 #define JSE_TIMEDOUT ETIMEDOUT
 #define JSE_CONNREFUSED ECONNREFUSED
+#define JSE_EAGAIN EAGAIN
 #define JSE_BADF EBADF
 
 
@@ -699,7 +940,6 @@ typedef union {
 
 
 #define JSE_INTR EINTR
-#define ERRNO() (errno)
 #ifndef INADDR_NONE
 #define INADDR_NONE (-1)
 #endif
@@ -708,16 +948,6 @@ typedef union {
 #ifndef INET6_ADDRSTRLEN
 #define INET6_ADDRSTRLEN 65
 #endif
-
-extern jlib_decl void throwJSocketException(int jsockErr)
-{
-    THROWJSOCKEXCEPTION2(jsockErr);
-}
-
-extern jlib_decl IJSOCK_Exception* createJSocketException(int jsockErr, const char *_msg)
-{
-    return new SocketException(jsockErr, _msg);
-}
 
 inline void LogErr(unsigned err,unsigned ref,const char *info,unsigned lineno,const char *tracename)
 {
@@ -794,6 +1024,9 @@ inline void getSockAddrEndpoint(const J_SOCKADDR &u, socklen_t ul, SocketEndpoin
 
 bool CSocket::set_nonblock(bool on)
 {
+    if (nonblocking==on)
+        return nonblocking;
+
     int flags = fcntl(sock, F_GETFL, 0);
     if (flags == -1)
         return nonblocking;
@@ -842,6 +1075,14 @@ bool CSocket::set_nagle(bool on)
     return ret;
 }
 
+void CSocket::set_quick_ack(bool on)
+{
+#ifdef TCP_QUICKACK
+    int flag = (int)on;
+    setsockopt(sock, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag));
+#endif
+}
+
 void CSocket::set_inherit(bool inherit)
 {
 #ifndef _WIN32
@@ -864,83 +1105,224 @@ size32_t CSocket::avail_read()
     if (ioctl(sock, FIONREAD, &avail)==0) 
 #endif
         return (size32_t)avail;
-    int err = ERRNO();
+    int err = SOCKETERRNO();
     LOGERR2(err,1,"avail_read");
     return 0;
 }
 
 #define PRE_CONN_UNREACH_ELIM  100
 
-int CSocket::pre_connect (bool block)
+// Static helper: Set socket blocking/non-blocking mode
+static bool set_socket_nonblock(T_SOCKET sock, bool nonblocking)
 {
-    if (NULL == hostname || '\0' == (*hostname))
+#if defined(O_NONBLOCK)
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1)
+        return false;
+    if (nonblocking)
+        flags |= O_NONBLOCK;
+    else
+        flags &= ~O_NONBLOCK;
+    return (fcntl(sock, F_SETFL, flags) == 0);
+#else
+#ifdef _WIN32
+    u_long yes = nonblocking ? 1 : 0;
+    return (ioctlsocket(sock, FIONBIO, &yes) == 0);
+#else
+    int yes = nonblocking ? 1 : 0;
+    return (ioctl(sock, FIONBIO, &yes) == 0);
+#endif
+#endif
+}
+
+// Static helper: Prepare a socket for connection (shared by sync and async paths)
+// Returns the socket descriptor and sockaddr structure
+// Throws exception on error
+static T_SOCKET prepare_socket_for_connect(const IpAddress & targetip, unsigned short hostport, J_SOCKADDR & sockaddr, socklen_t & sockaddrlen, const char * tracename)
+{
+    if (targetip.isNull())
     {
         StringBuffer err;
-        err.appendf("CSocket::pre_connect - Invalid/missing host IP address raised in : %s, line %d",sanitizeSourceFile(__FILE__), __LINE__);
+        err.appendf("prepare_socket_for_connect - Invalid/missing host IP address raised in : %s, line %d",sanitizeSourceFile(__FILE__), __LINE__);
         IJSOCK_Exception *e = new SocketException(JSOCKERR_bad_netaddr,err.str());
         throw e;
     }
 
-    DEFINE_SOCKADDR(u);
-    if (targetip.isNull()) {
-        set_return_addr(hostport,hostname);
-        targetip.ipset(returnep);
+    memset(&sockaddr, 0, sizeof(J_SOCKADDR));
+    sockaddrlen = setSockAddr(sockaddr, targetip, hostport);
+    T_SOCKET sock = ::socket(sockaddr.sa.sa_family, SOCK_STREAM, targetip.isIp4() ? 0 : PF_INET6);
+    if (sock == INVALID_SOCKET)
+    {
+        int err = SOCKETERRNO();
+        LOGERR(err, 1, "prepare_socket_for_connect");
+        throwJSockTargetException(err, tracename, __FILE__, __LINE__);
     }
-    socklen_t ul = setSockAddr(u,targetip,hostport);
-    sock = ::socket(u.sa.sa_family, SOCK_STREAM, targetip.isIp4()?0:PF_INET6);
-    owned = true;
-    state = ss_pre_open;            // will be set to open by post_connect
-    if (sock == INVALID_SOCKET) {
-        int err = ERRNO();
-        THROWJSOCKEXCEPTION(err);
-    }
+
     STATS.activesockets++;
+    return sock;
+}
+
+// Static helper: Perform synchronous connect on prepared socket
+// Returns error code (0 = success, or error that needs handling by caller)
+static int perform_socket_connect(T_SOCKET sock, const J_SOCKADDR & sockaddr, socklen_t sockaddrlen, bool nonblocking, const char * tracename)
+{
+    // Set socket to blocking or non-blocking mode
+    if (!set_socket_nonblock(sock, nonblocking))
+    {
+        int err = SOCKETERRNO();
+        LOGERR2(err, 1, "perform_socket_connect: Failed to set socket blocking mode");
+        return err;
+    }
+
+    int rc = ::connect(sock, &sockaddr.sa, sockaddrlen);
     int err = 0;
-    set_nonblock(!block);
-    int rc = ::connect(sock, &u.sa, ul);
-    if (rc==SOCKET_ERROR) {
-        err = ERRNO();
-        if ((err != JSE_INPROGRESS)&&(err != JSE_WOULDBLOCK)&&(err != JSE_TIMEDOUT)&&(err!=JSE_CONNREFUSED)) {   // handled by caller
-            if (err != JSE_NETUNREACH) {
+    if (rc == SOCKET_ERROR)
+    {
+        err = SOCKETERRNO();
+        if ((err != JSE_INPROGRESS) && (err != JSE_WOULDBLOCK) && (err != JSE_TIMEDOUT) && (err != JSE_CONNREFUSED))    // handled by caller
+        {
+            if (err != JSE_NETUNREACH)
+            {
                 pre_conn_unreach_cnt.store(0);
-                LOGERR2(err,1,"pre_connect");
-            } else {
+                LOGERR(err, 1, "perform_socket_connect");
+            }
+            else
+            {
                 int ecnt = pre_conn_unreach_cnt.load();
-                if (ecnt <= PRE_CONN_UNREACH_ELIM) {
+                if (ecnt <= PRE_CONN_UNREACH_ELIM)
+                {
                     pre_conn_unreach_cnt.fetch_add(1);
-                    LOGERR2(err,1,"pre_connect network unreachable");
+                    LOGERR(err, 1, "perform_socket_connect network unreachable");
                 }
             }
-        } else
+        }
+        else
             pre_conn_unreach_cnt.store(0);
-    } else
+    }
+    else
         pre_conn_unreach_cnt.store(0);
+
+#ifdef SOCKTRACE
+    PROGLOG("SOCKTRACE: perform_socket_connect socket%s %x %d err=%d", nonblocking?"":"(block)", sock, sock, err);
+#endif
+    return err;
+}
+
+// Static helper: Complete post-connect operations (shared by sync and async paths)
+// Returns: 0 on success, or system error code (e.g. JSE_TIMEDOUT, JSE_CONNREFUSED, etc.) on failure.
+//   Callers should treat any non-zero return value as a connection error.
+//   Common error codes include:
+//     - JSE_TIMEDOUT: Connection attempt timed out
+//     - JSE_CONNREFUSED: Connection was refused by the remote host
+//     - Other system error codes as returned by getsockopt(SO_ERROR)
+static int finalize_socket_connect(T_SOCKET sock, const char * tracename)
+{
+    // Ensure socket is in non-blocking mode
+    if (!set_socket_nonblock(sock, true))
+    {
+        LOGERR2(SOCKETERRNO(), 1, "finalize_socket_connect: Failed to set socket non-blocking");
+        return SOCKETERRNO();
+    }
+
+    int err = 0;
+    socklen_t errlen = sizeof(err);
+    int rc = getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen); // check for error
+    if ((rc != 0) && !err)
+        err = SOCKETERRNO();  // some implementations of getsockopt duff
+    if ((err != 0) && (err != JSE_TIMEDOUT) && (err != JSE_CONNREFUSED)) // handled by caller
+        LOGERR(err, 1, "finalize_socket_connect");
+    return err;
+}
+
+int CSocket::pre_connect(bool block)
+{
+    DEFINE_SOCKADDR(u);
+    socklen_t ul;
+    sock = prepare_socket_for_connect(targetip, hostport, u, ul, tracename);
+    owned = true;
+    state = ss_pre_open;            // will be set to open by post_connect
+
+    checkCfgKeepAlive();
+
+    nonblocking = !block;  // Track the blocking state
+    int err = perform_socket_connect(sock, u, ul, !block, tracename);
 #ifdef SOCKTRACE
     PROGLOG("SOCKTRACE: pre-connected socket%s %x %d (%p) err=%d", block?"(block)":"", sock, sock, this, err);
 #endif
     return err;
 }
 
-int CSocket::post_connect ()
+int CSocket::post_connect()
 {
-    set_nonblock(false);
-    int err = 0;
-    socklen_t  errlen = sizeof(err);
-    int rc = getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen); // check for error
-    if ((rc!=0)&&!err)
-        err = ERRNO();  // some implementations of getsockopt duff
-    if (err==0) {
+    int err = finalize_socket_connect(sock, tracename);
+    if (err==0)
+    {
         nagling = true;
         set_nagle(false);
         state = ss_open;
         SocketEndpoint ep;
         localPort = getEndpoint(ep).port;
     }
-    else if ((err!=JSE_TIMEDOUT)&&(err!=JSE_CONNREFUSED)) // handled by caller
-        LOGERR2(err,1,"post_connect");
     return err;
 }
 
+// Memory for addr is allocated by this function and must be freed -- via free() -- by the caller
+void CSocket::prepareForAsyncConnect(struct sockaddr *& addr, size32_t & addrlen)
+{
+    // Prepare the socket for async connection
+    DEFINE_SOCKADDR(u);
+    socklen_t ul;
+    sock = prepare_socket_for_connect(targetip, hostport, u, ul, tracename);
+    owned = true;
+    state = ss_pre_open;  // will be set to open by finishAsyncConnect
+
+    checkCfgKeepAlive();
+    set_nonblock(true);  // Async connections must be non-blocking
+
+    // Allocate and copy the sockaddr for the caller
+    addr = (struct sockaddr *)malloc(ul);
+    if (!addr)
+    {
+        errclose();
+        throw MakeStringException(JSOCKERR_graceful_close, "Failed to allocate memory for sockaddr");
+    }
+    memcpy(addr, &u, ul);
+    addrlen = ul;
+
+#ifdef _TRACE
+    setTraceName();
+#endif
+}
+
+void CSocket::finishAsyncConnect(int connectResult)
+{
+    if (connectResult < 0)
+    {
+        // Connection failed
+        errclose();
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_connection_failed);
+    }
+
+    // Finalize the connection
+    int err = finalize_socket_connect(sock, tracename);
+    if (err != 0)
+    {
+        errclose();
+        THROWJSOCKTARGETEXCEPTION(err);
+    }
+
+    // Complete socket setup
+    nagling = true;
+    set_nagle(false);
+    state = ss_open;
+    SocketEndpoint ep;
+    localPort = getEndpoint(ep).port;
+
+    STATS.connects++;
+#ifdef SOCKTRACE
+    PROGLOG("SOCKTRACE: async connect completed for socket %x %d (%p)", sock, sock, this);
+#endif
+}
 
 void CSocket::open(int listen_queue_size,bool reuseports)
 {
@@ -954,8 +1336,12 @@ void CSocket::open(int listen_queue_size,bool reuseports)
     else
         sock = ::socket(AF_INET, connectionless()?SOCK_DGRAM:SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
-        THROWJSOCKEXCEPTION(ERRNO());
+        THROWJSOCKTARGETEXCEPTION(SOCKETERRNO());
     }
+
+    checkCfgKeepAlive();
+    set_nonblock(true);
+
     STATS.activesockets++;
 
 #ifdef SOCKTRACE
@@ -981,18 +1367,14 @@ void CSocket::open(int listen_queue_size,bool reuseports)
 
     DEFINE_SOCKADDR(u);
     socklen_t  ul;
-    if (hostname) {
-        if (targetip.isNull()) {
-            set_return_addr(hostport,hostname);
-            targetip.ipset(returnep);
-        }
+    if (!targetip.isNull()) {
         ul = setSockAddr(u,targetip,hostport);
     }
     else 
         ul = setSockAddrAny(u,hostport);
     int saverr;
     if (::bind(sock, &u.sa, ul) != 0) {
-        saverr = ERRNO();
+        saverr = SOCKETERRNO();
         if (saverr==JSE_ADDRINUSE) {   // don't log as error (some usages probe ports)
 ErrPortInUse:
             closesock();
@@ -1003,23 +1385,23 @@ ErrPortInUse:
         }
         else {
             closesock();
-            THROWJSOCKEXCEPTION(saverr);
+            THROWJSOCKTARGETEXCEPTION(saverr);
         }
     }
     if (!connectionless() && listen_queue_size) {
         if (::listen(sock, listen_queue_size) != 0) {
-            saverr = ERRNO();
+            saverr = SOCKETERRNO();
             if (saverr==JSE_ADDRINUSE)
                 goto ErrPortInUse;
             closesock();
-            THROWJSOCKEXCEPTION(saverr);
+            THROWJSOCKTARGETEXCEPTION(saverr);
         }
     }
     if (mcastreq) {
         if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,(char*)mcastreq, sizeof(*mcastreq))!=0) {
-            saverr = ERRNO();
+            saverr = SOCKETERRNO();
             closesock();
-            THROWJSOCKEXCEPTION(saverr);
+            THROWJSOCKTARGETEXCEPTION(saverr);
         }
     }
 
@@ -1032,7 +1414,7 @@ ErrPortInUse:
 
 
 
-ISocket* CSocket::accept(bool allowcancel, SocketEndpoint *peerEp)
+ISocket* CSocket::accept(bool allowcancel)
 {
     if ((accept_cancel_state!=accept_not_cancelled) && allowcancel) {
         accept_cancel_state=accept_cancelled;
@@ -1040,61 +1422,85 @@ ISocket* CSocket::accept(bool allowcancel, SocketEndpoint *peerEp)
     }
     if (state != ss_open) {
         IERRLOG("invalid accept, state = %d",(int)state);
-        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_not_opened);
     }
     if (connectionless()) {
-        THROWJSOCKEXCEPTION(JSOCKERR_connectionless_socket);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_connectionless_socket);
     }
 
     DEFINE_SOCKADDR(peerSockAddr);      // used if peerIp
     socklen_t peerSockAddrLen = sizeof(peerSockAddr);
 
     T_SOCKET newsock;
-    for (;;) {
+    for (;;)
+    {
         in_accept = true;
         newsock = (sock!=INVALID_SOCKET)?::accept(sock, &peerSockAddr.sa, &peerSockAddrLen):INVALID_SOCKET;
         in_accept = false;
-    #ifdef SOCKTRACE
+#ifdef SOCKTRACE
         PROGLOG("SOCKTRACE: accept created socket %x %d (%p)", newsock,newsock,this);
-    #endif
+#endif
 
-        if (newsock!=INVALID_SOCKET) {
+        if (newsock!=INVALID_SOCKET)
+        {
             if ((sock==INVALID_SOCKET)||(accept_cancel_state==accept_cancel_pending)) {
                 ::close(newsock);
                 newsock=INVALID_SOCKET;
             }
-            else {
+            else
+            {
                 accept_cancel_state = accept_not_cancelled;
                 break;
             }
         }
         int saverr;
-        saverr = ERRNO();
-        if ((sock==INVALID_SOCKET)||(accept_cancel_state==accept_cancel_pending)) {
+        saverr = SOCKETERRNO();
+
+        if ((sock==INVALID_SOCKET)||(accept_cancel_state==accept_cancel_pending))
+        {
             accept_cancel_state = accept_cancelled;
             if (allowcancel)
                 return NULL;
-            THROWJSOCKEXCEPTION(JSOCKERR_cancel_accept);
+            THROWJSOCKTARGETEXCEPTION(JSOCKERR_cancel_accept);
         }
-        if (saverr != JSE_INTR) {
+        else if (saverr == EAGAIN || saverr == EWOULDBLOCK)
+        {
+            int rc = wait_read(WAIT_FOREVER); // JCSMORE accept should support a timeout really
+            if ((sock==INVALID_SOCKET)||(accept_cancel_state==accept_cancel_pending))
+            {
+                accept_cancel_state = accept_cancelled;
+                if (allowcancel)
+                    return NULL;
+                THROWJSOCKTARGETEXCEPTION(JSOCKERR_cancel_accept);
+            }
+            if (rc < 0)
+                THROWJSOCKTARGETEXCEPTION(SOCKETERRNO());
+            else if (rc == 0)
+                THROWJSOCKTARGETEXCEPTION(JSOCKERR_timeout_expired);
+            continue;
+        }
+
+        if (saverr != JSE_INTR)
+        {
             accept_cancel_state = accept_not_cancelled;
-            THROWJSOCKEXCEPTION(saverr);
+            THROWJSOCKTARGETEXCEPTION(saverr);
         }
     }
-    if (state != ss_open) {
+    if (state != ss_open)
+    {
         accept_cancel_state = accept_cancelled;
         if (allowcancel)
             return NULL;
-        THROWJSOCKEXCEPTION(JSOCKERR_cancel_accept);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_cancel_accept);
     }
 
-    if (peerEp)
-        getSockAddrEndpoint(peerSockAddr, peerSockAddrLen, *peerEp);
-
-    CSocket *ret = new CSocket(newsock,sm_tcp,true);
+    SocketEndpoint peerEp;
+    getSockAddrEndpoint(peerSockAddr, peerSockAddrLen, peerEp);
+    CSocket *ret = new CSocket(newsock,sm_tcp,true,&peerEp);
+    ret->checkCfgKeepAlive();
     ret->set_inherit(false);
+    ret->set_nonblock(true);
     return ret;
-
 }
 
 
@@ -1108,12 +1514,62 @@ void CSocket::set_linger(int lingertime)
     }
 }
 
+void CSocket::setKeepAlive(bool set, int time, int intvl, int probes)
+{
+    if (connectionless())
+        return;
+
+    int on=set?1:0;
+    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (char*)&on, sizeof(on)) != 0)
+    {
+        OWARNLOG("KeepAlive not set");
+        return;
+    }
+
+    if (!on)
+        return;
+
+    int srtn, optval;
+    socklen_t optlen = sizeof(optval);
+
+    if (time >= 0)
+    {
+        optval = time;
+        srtn = setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (char *)&optval, optlen);
+        if (srtn != 0)
+            OWARNLOG("KeepAlive time not set");
+    }
+
+    if (intvl >= 0)
+    {
+        optval = intvl;
+        srtn = setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (char *)&optval, optlen);
+        if (srtn != 0)
+            OWARNLOG("KeepAlive interval not set");
+    }
+
+    if (probes >= 0)
+    {
+        optval = probes;
+        srtn = setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, (char *)&optval, optlen);
+        if (srtn != 0)
+            OWARNLOG("KeepAlive probes not set");
+    }
+}
+
+void CSocket::checkCfgKeepAlive()
+{
+    if (connectionless())
+        return;
+
+    int time, intvl, probes;
+    if (queryKeepAlive(time, intvl, probes))
+        setKeepAlive(true, time, intvl, probes);
+}
+
 void CSocket::set_keep_alive(bool set)
 {
-    int on=set?1:0;
-    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (char*)&on, sizeof(on)) != 0) {
-        IWARNLOG("KeepAlive not set");
-    }
+    setKeepAlive(set, -1, -1, -1);
 }
 
 
@@ -1124,7 +1580,7 @@ int CSocket::name(char *retname,size32_t namemax)
     if (retname && namemax)
     {
         StringBuffer s;
-        ep.getIpText(s);
+        ep.getHostText(s);
         if (namemax-1<s.length())
             s.setLength(namemax-1);
         memcpy(retname,s.str(),s.length()+1);
@@ -1145,7 +1601,7 @@ int CSocket::peer_name(char *retname,size32_t namemax)
     }
     StringBuffer s;
     if (sockmode==sm_udp_server) { // udp server
-        returnep.getIpText(s);
+        returnep.getHostText(s);
         ret =  returnep.port;
     }   
     else {
@@ -1155,7 +1611,7 @@ int CSocket::peer_name(char *retname,size32_t namemax)
             return -1;      // don't log as used to test socket
         SocketEndpoint ep;
         getSockAddrEndpoint(u,ul,ep);
-        ep.getIpText(s);
+        ep.getHostText(s);
         ret = ep.port;
     }
     if (namemax>1) {
@@ -1169,22 +1625,14 @@ int CSocket::peer_name(char *retname,size32_t namemax)
 SocketEndpoint &CSocket::getPeerEndpoint(SocketEndpoint &ep)
 {
     if (state != ss_open) {
-        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_not_opened);
     }
     StringBuffer s;
     if (sockmode==sm_udp_server) { // udp server
         ep.set(returnep);
     }   
-    else {
-        DEFINE_SOCKADDR(u);
-        socklen_t ul = sizeof(u);       
-        if (::getpeername(sock,&u.sa, &ul)<0) {         
-            DBGLOG("getpeername failed %d",ERRNO());
-            ep.set(NULL, 0);
-        }
-        else
-            getSockAddrEndpoint(u,ul,ep);
-    }
+    else
+        ep.set(hostport, targetip); // NB: if this is an attached socket, targetip/hostpost are the peer
     return ep;
 }
 
@@ -1199,7 +1647,7 @@ IpAddress & CSocket::getPeerAddress(IpAddress &addr)
 void CSocket::set_return_addr(int port,const char *retname)
 {
     if (!returnep.ipset(retname)) {
-        IJSOCK_Exception *e = new SocketException(JSOCKERR_bad_address); // don't use THROWJSOCKEXCEPTION here
+        IJSOCK_Exception *e = new SocketException(JSOCKERR_bad_address); // don't use THROWJSOCKTARGETEXCEPTION here
         throw e;
     }
     returnep.port = port;
@@ -1209,12 +1657,12 @@ void CSocket::set_return_addr(int port,const char *retname)
 SocketEndpoint &CSocket::getEndpoint(SocketEndpoint &ep) const
 {
     if (state != ss_open) {
-        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_not_opened);
     }
     DEFINE_SOCKADDR(u);
     socklen_t ul = sizeof(u);
     if (::getsockname(sock,&u.sa, &ul)<0) {
-        THROWJSOCKEXCEPTION(ERRNO());
+        THROWJSOCKTARGETEXCEPTION(SOCKETERRNO());
     }
     getSockAddrEndpoint(u,ul,ep);
     return ep;
@@ -1223,7 +1671,7 @@ SocketEndpoint &CSocket::getEndpoint(SocketEndpoint &ep) const
 void CSocket::cancel_accept()
 {
     if (connectionless()) {
-        THROWJSOCKEXCEPTION(JSOCKERR_connectionless_socket);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_connectionless_socket);
     }
 #ifdef SOCKTRACE
     PROGLOG("SOCKTRACE: Cancel accept socket %x %d (%p)", sock, sock, this);
@@ -1281,11 +1729,27 @@ inline void refused_sleep(CTimeMon &tm, unsigned &refuseddelay)
                 refuseddelay = CONNECT_TIMEOUT_REFUSED_WAIT;
         }
         else 
-            Sleep(remaining/4); // towards end of timeout approach gradually
+        {
+            unsigned delay = remaining/4;
+            if (delay == 0)
+                delay = 1;
+            Sleep(delay); // towards end of timeout approach gradually
+        }
     }
 }
 
-bool CSocket::connect_timeout( unsigned timeout, bool noexception)
+// JCSMORE - there's a lot of duplicated nuanced code here and in connect_wait
+// that could do with clearing up. Some of it is very similar to wait_write
+
+// As they current stand:
+// connect_timeout if successful, will always leave the socket in a non-blocking state
+//
+// connect_wait has weird semantic of trying one final attempt if it has timedout, where it will switch to blocking mode
+// NB: that will happen on 1st attempt if connect_wait is passed 0 as a timeout.
+//
+// pre_connect() is what actually customizes the socket [conditionally] sets it to non-blocking mode
+// post_connect() errors checks and ensures it is in non-blocking mode (only relevant if connect_wait left it in blocking mode)
+bool CSocket::connect_timeout(unsigned timeout, bool noexception)
 {
     // simple connect with timeout (no fancy stuff!)
     unsigned startt = usTick();
@@ -1295,7 +1759,7 @@ bool CSocket::connect_timeout( unsigned timeout, bool noexception)
     int err;
     while (!tm.timedout(&remaining))
     {
-        err = pre_connect(false);
+        err = pre_connect(false); // NB: sets and leaves socket into non-blocking mode
         if ((err == JSE_INPROGRESS)||(err == JSE_WOULDBLOCK))
         {
 #ifdef _USE_SELECT
@@ -1323,13 +1787,13 @@ bool CSocket::connect_timeout( unsigned timeout, bool noexception)
                 socklen_t errlen = sizeof(err);
                 rc = getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen); // check for error
                 if ((rc!=0)&&!err) 
-                    err = ERRNO();  // some implementations of getsockopt duff
+                    err = SOCKETERRNO();  // some implementations of getsockopt duff
                 if (err) //  probably ECONNREFUSED but treat all errors same
                     refused_sleep(tm,refuseddelay);
             }
             else if (rc<0)
             {
-                err = ERRNO();
+                err = SOCKETERRNO();
                 if (err != JSE_INTR)
                 {
                     LOGERR2(err,2,"::select/poll");
@@ -1365,7 +1829,7 @@ bool CSocket::connect_timeout( unsigned timeout, bool noexception)
     STATS.failedconnects++;
     STATS.failedconnecttime+=usTick()-startt;
     if (!noexception)
-        THROWJSOCKEXCEPTION(JSOCKERR_connection_failed);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_connection_failed);
     return false;
 }
 
@@ -1373,15 +1837,13 @@ bool CSocket::connect_timeout( unsigned timeout, bool noexception)
 ISocket*  ISocket::connect_timeout(const SocketEndpoint &ep,unsigned timeout)
 {
     if (ep.isNull()||(ep.port==0))
-        THROWJSOCKEXCEPTION2(JSOCKERR_bad_address);
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
     Owned<CSocket> sock = new CSocket(ep,sm_tcp,NULL);
     sock->connect_timeout(timeout,false);
     return sock.getClear();
 }
 
-#define POLLTIME 50
-
-
+#define SOCKET_POLLTIME 50
 
 void CSocket::connect_wait(unsigned timems)
 {
@@ -1391,20 +1853,8 @@ void CSocket::connect_wait(unsigned timems)
     bool exit = false;
     int err;
     unsigned refuseddelay = 1;
-    while (!exit) {
-#ifdef CENTRAL_NODE_RANDOM_DELAY
-        ForEachItemIn(cn,CentralNodeArray) {
-            const SocketEndpoint &ep=CentralNodeArray.item(cn);
-            if (ep.ipequals(targetip)) {
-                unsigned sleeptime = getRandom() % 1000;
-                StringBuffer s;
-                ep.getIpText(s);
-                DBGLOG("Connection to central node %s - sleeping %d milliseconds", s.str(), sleeptime);
-                Sleep(sleeptime);           
-                break;
-            }
-        }
-#endif
+    while (!exit)
+    {
         unsigned remaining;
         exit = tm.timedout(&remaining);
         bool blockselect = exit;                            // if last time round block
@@ -1413,7 +1863,7 @@ void CSocket::connect_wait(unsigned timems)
             if (++connectingcount>4)
                 blockselect = true;
         }
-        err = pre_connect(blockselect);             
+        err = pre_connect(blockselect);
         if (blockselect)
         {
             if (err&&!exit)
@@ -1463,14 +1913,14 @@ void CSocket::connect_wait(unsigned timems)
                     socklen_t errlen = sizeof(err);
                     rc = getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen); // check for error
                     if ((rc!=0)&&!err)
-                        err = ERRNO();  // some implementations of getsockopt duff
+                        err = SOCKETERRNO();  // some implementations of getsockopt duff
                     if (err)
                         refused_sleep(tm,refuseddelay); //  probably ECONNREFUSED but treat all errors same
                     break;
                 }
                 if (rc<0)
                 {
-                    err = ERRNO();
+                    err = SOCKETERRNO();
                     if (err != JSE_INTR)
                     {
                         LOGERR2(err,2,"::select/poll");
@@ -1492,8 +1942,8 @@ void CSocket::connect_wait(unsigned timems)
                     polltime = timeoutms;
                 Sleep(polltime);                    // sleeps 1-50ms (to let other threads run)
                 timeoutms -= polltime;
-                if (polltime>POLLTIME/2)
-                    polltime = POLLTIME;
+                if (polltime>SOCKET_POLLTIME/2)
+                    polltime = SOCKET_POLLTIME;
                 else
                     polltime *= 2;
     #endif
@@ -1527,7 +1977,7 @@ void CSocket::connect_wait(unsigned timems)
 #endif
     STATS.failedconnects++;
     STATS.failedconnecttime+=usTick()-startt;
-    THROWJSOCKEXCEPTION(JSOCKERR_connection_failed);
+    THROWJSOCKTARGETEXCEPTION(JSOCKERR_connection_failed);
 }
 
 void CSocket::setTraceName(const char * prefix, const char * name)
@@ -1550,29 +2000,48 @@ void CSocket::setTraceName(const char * prefix, const char * name)
 void CSocket::setTraceName()
 {
 #ifdef _TRACE
+    StringBuffer hostname;
+    targetip.getHostText(hostname);
     setTraceName("C!", hostname);
 #endif
 }
 
 
-ISocket*  ISocket::connect_wait( const SocketEndpoint &ep, unsigned timems)
+ISocket *  ISocket::connect_wait( const SocketEndpoint & ep, unsigned timems)
 {
-    if (ep.isNull()||(ep.port==0))
-        THROWJSOCKEXCEPTION2(JSOCKERR_bad_address);
+    if (ep.isNull() || (ep.port==0))
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
     Owned<CSocket> sock = new CSocket(ep,sm_tcp,NULL);
     sock->connect_wait(timems);
     return sock.getClear();
 }
 
+// Create a socket prepared for async connection - returns socket descriptor and sockaddr for use with io_uring
+// memory for addr is allocated by this function and must be freed -- via free() -- by the caller
+ISocket * ISocket::createForAsyncConnect(const SocketEndpoint & ep, struct sockaddr *& addr, size32_t & addrlen)
+{
+    if (ep.isNull() || (ep.port==0))
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
+
+    Owned<CSocket> csock = new CSocket(ep, sm_tcp, NULL);
+    csock->prepareForAsyncConnect(addr, addrlen);
+    return csock.getClear();
+}
+
+// Complete an async connection after io_uring connect completes
+void ISocket::completeAsyncConnect(ISocket * socket, int connectResult)
+{
+    CSocket * csock = dynamic_cast<CSocket *>(socket);
+    if (!csock)
+        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
+
+    csock->finishAsyncConnect(connectResult);
+}
 
 
 void CSocket::udpconnect()
 {
     DEFINE_SOCKADDR(u);
-    if (targetip.isNull()) {
-        set_return_addr(hostport,hostname);
-        targetip.ipset(returnep);
-    }
     socklen_t  ul = setSockAddr(u,targetip,hostport);
     sock = ::socket(u.sa.sa_family, SOCK_DGRAM, targetip.isIp4()?0:PF_INET6);
 #ifdef SOCKTRACE
@@ -1580,13 +2049,14 @@ void CSocket::udpconnect()
 #endif
     STATS.activesockets++;
     if (sock == INVALID_SOCKET) {
-        THROWJSOCKEXCEPTION(ERRNO());
+        THROWJSOCKTARGETEXCEPTION(SOCKETERRNO());
     }
     int res = ::connect(sock, &u.sa, ul);
     if (res != 0) { // works for UDP
         closesock();
-        THROWJSOCKEXCEPTION(JSOCKERR_connection_failed);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_connection_failed);
     }
+    set_nonblock(true);
     nagling = false; // means nothing for UDP
     state = ss_open;
 #ifdef _TRACE
@@ -1604,12 +2074,14 @@ int CSocket::logPollError(unsigned revents, const char *rwstr)
     if (revents & POLLERR)
     {
         StringBuffer errStr;
-        errStr.appendf("%s POLLERR %u l:%d r:%s:%d", rwstr, sock, localPort, (hostname?hostname:"NULL"), hostport);
+        StringBuffer hostname;
+        targetip.getHostText(hostname);
+        errStr.appendf("%s POLLERR %u l:%d r:%s:%d", rwstr, sock, localPort, hostname.str(), hostport);
         int serror = 0;
         socklen_t serrlen = sizeof(serror);
         int srtn = getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&serror, &serrlen);
         if (srtn != 0)
-            serror = ERRNO();
+            serror = SOCKETERRNO();
         LOGERR2(serror,2,errStr.str());
         retcode = serror;
     }
@@ -1629,6 +2101,7 @@ int CSocket::logPollError(unsigned revents, const char *rwstr)
 int CSocket::wait_read(unsigned timeout)
 {
     int ret = 0;
+    int retrycount = 100;
     while (sock!=INVALID_SOCKET)
     {
 #ifdef _USE_SELECT
@@ -1656,15 +2129,20 @@ int CSocket::wait_read(unsigned timeout)
 #endif
         if (ret == SOCKET_ERROR)
         {   // error
-            int err = ERRNO();
+            int err = SOCKETERRNO();
             if (err!=JSE_INTR)
             {   // else retry (should adjust time but for our usage don't think it matters that much)
                 LOGERR2(err,1,"wait_read");
                 break;
             }
+            else
+            {
+                if (retrycount-- <= 0)
+                    break;
+            }
         }
         else if (ret == 0)
-        {   // timeout
+        {   // timeout, no error (timeout can be 0 for a fast check)
             break;
         }
         else
@@ -1723,7 +2201,7 @@ int CSocket::wait_write(unsigned timeout)
 #endif
         if (ret==SOCKET_ERROR)
         {
-            int err = ERRNO();
+            int err = SOCKETERRNO();
             if (err!=JSE_INTR)
             {   // else retry (should adjust time but for our usage don't think it matters that much)
                 LOGERR2(err,1,"wait_write");
@@ -1768,239 +2246,189 @@ int CSocket::wait_write(unsigned timeout)
     return ret;
 }
 
-void CSocket::readtms(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read,
-                     unsigned timeoutms)
+void CSocket::readtms(void* buf, size32_t min_size, size32_t max_size, size32_t &sizeRead, unsigned timeoutMs, bool suppresGCIfMinSize)
 {
-    if (timeoutms == WAIT_FOREVER) {
-        read(buf,min_size, max_size, size_read,WAIT_FOREVER);
+    /*
+     * Read at least min_size bytes, up to max_size bytes.
+     * Reads as much as possible off socket until block detected.
+     * NB: If min_size==0 then will return asap if no data is avail.
+     * NB: If min_size==0, but notified of graceful close, throw graceful close exception.
+     * NB: timeout is meaningless if min_size is 0
+     *
+     * NB: for UDP, it will never try to read more. It will call recvfrom once, if it gets less than min_size, it will throw an exception.
+     * if blocks and received nothing (and min_size>0), poll and retry.
+     *
+     * NB: the underlying socket should be in non-blocking mode, if it is not it will not honour the timeout correctly.
+     */
+
+    sizeRead = 0;
+    if (0 == max_size)
         return;
-    }
-        
-
-    unsigned startt=usTick();
-    size_read = 0;
-    if (state != ss_open) {
+    if (state != ss_open)
         THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
-    }
-    unsigned start;
-    unsigned timeleft;
-    start = msTick();
-    timeleft = timeoutms;
 
-    do {
-        int rc = wait_read(timeleft);
-        if (rc < 0) {
-            THROWJSOCKEXCEPTION(ERRNO());
-        }
-        if (rc == 0) {
-            THROWJSOCKEXCEPTION(JSOCKERR_timeout_expired);
-        }
-        unsigned elapsed = (msTick()-start);
-        if (elapsed<timeoutms)
-            timeleft = timeoutms-elapsed;
-        else
-            timeleft = 0;
+    CCycleTimer timer;
+    while (true)
+    {
         unsigned retrycount=100;
+        int rc;
 EintrRetry:
-        if (sockmode==sm_udp_server) { // udp server        
+        if (sockmode==sm_udp_server) // udp server
+        {
             DEFINE_SOCKADDR(u);
             socklen_t ul=sizeof(u);
-            rc = recvfrom(sock, (char*)buf + size_read, max_size - size_read, 0, &u.sa,&ul);
+            rc = recvfrom(sock, (char*)buf + sizeRead, max_size - sizeRead, 0, &u.sa,&ul);
             getSockAddrEndpoint(u,ul,returnep);
         }
-        else {
-            rc = recv(sock, (char*)buf + size_read, max_size - size_read, 0);
+        else
+            rc = recv(sock, (char*)buf + sizeRead, max_size - sizeRead, 0);
+        if (rc > 0)
+        {
+            sizeRead += rc;
+            if (sockmode==sm_udp_server)
+            {
+                if (sizeRead >= min_size)
+                    break;
+                throwJSockException(JSOCKERR_small_udp_packet, "readtms: UDP packet smaller than min_size", __FILE__, __LINE__); // else, it is an error in UDP if receive anything less than min_size
+            }
+            else if (sizeRead == max_size)
+                break;
+            // NB: will exit when blocked if sizeRead >= min_size
         }
-        if (rc < 0) {
-            int err = ERRNO();
-            if (BADSOCKERR(err)) {
-                // don't think this should happen but convert to same as shutdown while investigation
-                LOGERR2(err,1,"Socket closed during read");
-                rc = 0;
-            }
-            else if ((err==JSE_INTR)&&(retrycount--!=0)) {
-                LOGERR2(err,1,"EINTR retrying");
-                goto EintrRetry;
-            }
-            else {
-                VStringBuffer errMsg("readtms(timeoutms=%d)", timeoutms);
-                LOGERR2(err,1,errMsg.str());
-                if ((err==JSE_CONNRESET)||(err==JSE_INTR)||(err==JSE_CONNABORTED)) {
-                    errclose();
-                    err = JSOCKERR_broken_pipe;
+        else
+        {
+            if (rc < 0)
+            {
+                int err = SOCKETERRNO();
+                if (BADSOCKERR(err))
+                {
+                    // don't think this should happen but convert to same as shutdown while investigation
+                    LOGERR2(err,1,"Socket closed during read");
+                    rc = 0;
                 }
-                THROWJSOCKEXCEPTION(err);
+                else if ((err==JSE_INTR)&&(retrycount--!=0))
+                {
+                    if (sock==INVALID_SOCKET)
+                        rc = 0;         // convert an EINTR after closed to a graceful close
+                    else
+                    {
+                        LOGERR2(err,1,"EINTR retrying");
+                        goto EintrRetry;
+                    }
+                }
+                else
+                {
+                    if (err == JSE_WOULDBLOCK || err == JSE_EAGAIN) // if EAGAIN or EWOULDBLOCK - no more data to read
+                    {
+                        //NB: in UDP can only reach here if have not read anything so far.
+
+                        if (sizeRead >= min_size)
+                            break;
+                        // otherwise, continue waiting for min_size
+                    }
+                    else
+                    {
+                        VStringBuffer errMsg("readtms(timeoutMs=%d)", timeoutMs);
+                        LOGERR2(err,1,errMsg.str());
+                        if ((err==JSE_CONNRESET)||(err==JSE_INTR)||(err==JSE_CONNABORTED))
+                        {
+                            errclose();
+                            err = JSOCKERR_broken_pipe;
+                        }
+                        THROWJSOCKTARGETEXCEPTION(err);
+                    }
+                    // fall through to timeout/wait_read handling below.
+                }
+            }
+            if (rc == 0)
+            {
+                state = ss_shutdown;
+                if (suppresGCIfMinSize && (sizeRead >= min_size))
+                    break;
+                THROWJSOCKTARGETEXCEPTION(JSOCKERR_graceful_close);
             }
         }
-        if (rc == 0) {
-            state = ss_shutdown;
-            if (min_size==0) 
-                break;                      // if min_read is 0 return 0 if socket closed
-            THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
-        }
-        size_read += rc;
-    } while (size_read < min_size);
-    STATS.reads++;
-    STATS.readsize += size_read;
-    STATS.readtime+=usTick()-startt;
 
+        unsigned remainingMs = timer.remainingMs(timeoutMs);
+        if (rc > 0)
+        {
+            if (0 == remainingMs)
+            {
+                if (sizeRead >= min_size)
+                    break;
+                THROWJSOCKTARGETEXCEPTION(JSOCKERR_timeout_expired);
+            }
+
+            // loop around to read more, or detect blocked.
+        }
+        else // NB rc < 0, (if rc == 0 handled already above)
+        {
+            // here because blocked (and sizeRead < min_size)
+            rc = wait_read(remainingMs);
+            if (rc < 0)
+                THROWJSOCKTARGETEXCEPTION(SOCKETERRNO());
+            else if (rc == 0)
+                THROWJSOCKTARGETEXCEPTION(JSOCKERR_timeout_expired);
+        }
+        //else // read something, loop around to see if can read more, or detect blocked.
+    }
+
+    cycle_t elapsedCycles = timer.elapsedCycles();
+    STATS.reads++;
+    STATS.readsize += sizeRead;
+    STATS.readtimecycles += elapsedCycles;
+    stats.ioReads++;
+    stats.ioReadBytes += sizeRead;
+    stats.ioReadCycles += elapsedCycles;
 }
 
-void CSocket::read(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read,
-                     unsigned timeoutsecs)
+void CSocket::read(void* buf, size32_t min_size, size32_t max_size, size32_t &size_read, unsigned timeoutsecs, bool suppresGCIfMinSize)
 {
-    unsigned startt=usTick();
-    size_read = 0;
-    unsigned start = 0;
-    unsigned timeleft = 0;
-    if (state != ss_open) {
-        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
-    }
-    if (timeoutsecs != WAIT_FOREVER) {
-        start = (unsigned)time(NULL);
-        timeleft = timeoutsecs;
-    }
+    unsigned timeoutMs = (timeoutsecs==WAIT_FOREVER) ? WAIT_FOREVER : (timeoutsecs * 1000);
+    readtms(buf, min_size, max_size, size_read, timeoutMs, suppresGCIfMinSize);
+}
 
-    do {
-        int rc;
-        if (timeoutsecs != WAIT_FOREVER) {
-            rc = wait_read(timeleft*1000);
-            if (rc < 0) {
-                THROWJSOCKEXCEPTION(ERRNO());
-            }
-            if (rc == 0) {
-                THROWJSOCKEXCEPTION(JSOCKERR_timeout_expired);
-            }
-            unsigned elapsed = ((unsigned)time(NULL))-start;
-            if (elapsed<timeoutsecs)
-                timeleft = timeoutsecs-elapsed;
-            else
-                timeleft = 0;
-        }
-        unsigned retrycount=100;
-EintrRetry:
-        if (sockmode==sm_udp_server) { // udp server
-            DEFINE_SOCKADDR(u);
-            socklen_t ul=sizeof(u.sin);     
-            rc = recvfrom(sock, (char*)buf + size_read, max_size - size_read, 0, &u.sa,&ul);
-            getSockAddrEndpoint(u,ul,returnep);
-        }
-        else {
-            rc = recv(sock, (char*)buf + size_read, max_size - size_read, 0);
-        }
-        if (rc < 0) {
-            int err = ERRNO();
-            if (BADSOCKERR(err)) {
-                // don't think this should happen but convert to same as shutdown while investigation
-                LOGERR2(err,3,"Socket closed during read");
-                rc = 0;
-            }
-            else if ((err==JSE_INTR)&&(retrycount--!=0)) {
-                if (sock==INVALID_SOCKET)
-                    rc = 0;         // convert an EINTR after closed to a graceful close
-                else {
-                    LOGERR2(err,3,"EINTR retrying");
-                    goto EintrRetry;
-                }
-            }
-            else {
-                LOGERR2(err,3,"read");
-                if ((err==JSE_CONNRESET)||(err==JSE_INTR)||(err==JSE_CONNABORTED)) {
-                    errclose();
-                    err = JSOCKERR_broken_pipe;
-                }
-                THROWJSOCKEXCEPTION(err);
-            }
-        }
-        if (rc == 0) {
-            state = ss_shutdown;
-            if (min_size==0) 
-                break;                      // if min_read is 0 return 0 if socket closed
-            THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
-        }
-        size_read += rc;
-    } while (size_read < min_size);
-    STATS.reads++;
-    STATS.readsize += size_read;
-    STATS.readtime+=usTick()-startt;
+bool readtmsAllowClose(ISocket *sock, void* buf, size32_t min_size, size32_t max_size, size32_t &sizeRead, unsigned timeoutMs)
+{
+    try
+    {
+        sock->readtms(buf, min_size, max_size, sizeRead, timeoutMs, false);
+    }
+    catch(IJSOCK_Exception *e)
+    {
+        if (JSOCKERR_graceful_close != e->errorCode())
+            throw;
+        e->Release();
+        return true;
+    }
+    return false;
 }
 
 void CSocket::read(void* buf, size32_t size)
 {
-    if (!size)
-        return;
-    unsigned startt=usTick();
-    size32_t size_read=size;
-    if (state != ss_open) {
-        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
-    }
-
-    do {
-        unsigned retrycount=100;
-EintrRetry:
-        int rc;
-        if (sockmode==sm_udp_server) { // udp server
-            DEFINE_SOCKADDR(u);
-            socklen_t ul=sizeof(u.sin);
-            rc = recvfrom(sock, (char*)buf, size, 0, &u.sa,&ul);
-            getSockAddrEndpoint(u,ul,returnep);
-        }
-        else {
-            rc = recv(sock, (char*)buf, size, 0);
-        }
-        if (rc < 0) {
-            int err = ERRNO();
-            if (BADSOCKERR(err)) {
-                // don't think this should happen but convert to same as shutdown while investigation
-                LOGERR2(err,5,"Socket closed during read");
-                rc = 0;
-            }
-            else if ((err==JSE_INTR)&&(retrycount--!=0)) {
-                LOGERR2(err,5,"EINTR retrying");
-                goto EintrRetry;
-            }
-            else {
-                LOGERR2(err,5,"read");
-                if ((err==JSE_CONNRESET)||(err==JSE_INTR)||(err==JSE_CONNABORTED)) {
-                    errclose();
-                    err = JSOCKERR_broken_pipe;
-                }
-                THROWJSOCKEXCEPTION(err);
-            }
-        }
-        if (rc == 0) {
-            state = ss_shutdown;
-            THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
-        }
-        buf = (char*)buf + rc;
-        size -= rc;
-    } while (size != 0);
-    STATS.reads++;
-    STATS.readsize += size_read;
-    STATS.readtime+=usTick()-startt;
-
+    size32_t size_read;
+    readtms(buf, size, size, size_read, WAIT_FOREVER);
 }
 
-
-
-size32_t CSocket::write(void const* buf, size32_t size)
+size32_t CSocket::writetms(void const* buf, size32_t minSize, size32_t size, unsigned timeoutMs)
 {
     if (size==0)
         return 0;
-    unsigned startt=usTick();
-    size32_t size_writ = size;
-    if (state != ss_open) {
-        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
-    }
-    size32_t res=0;
-    do {
+    size32_t sizeWritten = 0;
+    CCycleTimer timer;
+    if (state != ss_open)
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_not_opened);
+
+    while (true)
+    {
         unsigned retrycount=100;
 EintrRetry:
         int rc;
-        if (sockmode==sm_udp_server) { // udp server
+        if (sockmode==sm_udp_server) // udp server
+        {
             DEFINE_SOCKADDR(u);
-            socklen_t  ul = setSockAddr(u,returnep,returnep.port);
-            rc = sendto(sock, (char*)buf, size, 0, &u.sa, ul);
+            socklen_t ul = setSockAddr(u,returnep,returnep.port);
+            rc = sendto(sock, (char*)buf + sizeWritten, size - sizeWritten, 0, &u.sa, ul);
         }
 #ifdef SIMULATE_LOST_UDP_PACKETS
         else if (sockmode==sm_udp && size <= 24 && dropCounter++ >= dropThreshold)
@@ -2010,106 +2438,83 @@ EintrRetry:
             rc = size;
         }
 #endif
-        else {
-            rc = send(sock, (char*)buf, size, SEND_FLAGS);
+        else
+            rc = send(sock, (char*)buf + sizeWritten, size - sizeWritten, SEND_FLAGS);
+
+        if (rc > 0)
+        {
+            sizeWritten += rc;
+            if (sizeWritten == size)
+                break;
+            // NB: will exit when blocked if sizeWritten >= minSize
         }
-        if (rc < 0) {
-            int err=ERRNO();
-            if (BADSOCKERR(err)) {
+        else if (rc < 0)
+        {
+            int err=SOCKETERRNO();
+            if (BADSOCKERR(err))
+            {
                 LOGERR2(err,7,"Socket closed during write");
                 rc = 0;
             }
-            else if ((err==JSE_INTR)&&(retrycount--!=0)) {
+            else if ((err==JSE_INTR)&&(retrycount--!=0)&&(timer.elapsedMs() < timeoutMs))
+            {
                 LOGERR2(err,7,"EINTR retrying");
                 goto EintrRetry;
             }
-            else {
+            else
+            {
                 if (((sockmode==sm_multicast)||(sockmode==sm_udp))&&(err==JSE_CONNREFUSED))
                     break; // ignore
-                LOGERR2(err,7,"write");
                 if ((err==JSE_CONNRESET)||(err==JSE_INTR)||(err==JSE_CONNABORTED)
 #ifndef _WIN32
                     ||(err==EPIPE)||(err==JSE_TIMEDOUT)  // linux can raise these on broken pipe
 #endif
-                    ) {
+                    )
+                {
                     errclose();
                     err = JSOCKERR_broken_pipe;
                 }
-                if ((err == JSE_WOULDBLOCK) && nonblocking)
-                    break;
-                THROWJSOCKEXCEPTION(err);
+                if (err == JSE_WOULDBLOCK || err == JSE_EAGAIN)
+                {
+                    if (sizeWritten >= minSize)
+                        break;
+                    unsigned remainingMs = timer.remainingMs(timeoutMs);
+                    rc = wait_write(remainingMs);
+                    if (rc < 0)
+                        THROWJSOCKTARGETEXCEPTION(SOCKETERRNO());
+                    else if (rc == 0)
+                        THROWJSOCKTARGETEXCEPTION(JSOCKERR_timeout_expired);
+
+                    goto EintrRetry;
+                }
+                THROWJSOCKTARGETEXCEPTION(err);
             }
-        }   
-        res += rc;
-        if (rc == 0) {
-            state = ss_shutdown;
-            THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
         }
-        if (nonblocking)
-            break;
-        buf = (char*)buf + rc;
-        size -= rc;
-    } while (size != 0);
+        if (rc == 0)
+        {
+            state = ss_shutdown;
+            THROWJSOCKTARGETEXCEPTION(JSOCKERR_graceful_close);
+        }
+        if (timer.elapsedMs() >= timeoutMs)
+        {
+            IERRLOG("writetms timed out; timeout: %u, nwritten: %u, size: %u", timeoutMs, sizeWritten, size);
+            THROWJSOCKTARGETEXCEPTION(JSOCKERR_timeout_expired);
+        }
+    }
+
+    cycle_t elapsedCycles = timer.elapsedCycles();
     STATS.writes++;
-    STATS.writesize += size_writ;
-    STATS.writetime+=usTick()-startt;
-    return res;
+    STATS.writesize += size;
+    STATS.writetimecycles += elapsedCycles;
+    stats.ioWrites++;
+    stats.ioWriteBytes += size;
+    stats.ioWriteCycles += elapsedCycles;
+    return sizeWritten;
 }
 
-size32_t CSocket::writetms(void const* buf, size32_t size, unsigned timeoutms)
+size32_t CSocket::write(void const* buf, size32_t size)
 {
-    if (size==0)
-        return 0;
-
-    if (state != ss_open)
-    {
-        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
-    }
-
-    if (timeoutms == WAIT_FOREVER)
-        return write(buf, size);
-
-    const char *p = (const char *)buf;
-    unsigned start, elapsed;
-    start = msTick();
-    elapsed = 0;
-    size32_t nwritten = 0;
-    size32_t nleft = size;
-    unsigned rollover = 0;
-
-    bool prevblock = set_nonblock(true);
-
-    while ( (nwritten < size) && (elapsed <= timeoutms) )
-    {
-        size32_t amnt = write(p,nleft);
-
-        // can nonblock mode write() return -1 ?
-        if ( (amnt == 0) || (amnt == (size32_t)-1) )
-        {
-            if (++rollover >= 20)
-            {
-                rollover = 0;
-                Sleep(20);
-            }
-        }
-        else
-        {
-            nwritten += amnt;
-            nleft -= amnt;
-            p += amnt;
-        }
-        elapsed = msTick() - start;
-    }
-
-    set_nonblock(prevblock);
-
-    if (nwritten < size)
-    {
-        IERRLOG("writetms timed out; timeout: %u, nwritten: %u, size: %u", timeoutms, nwritten, size);
-        THROWJSOCKEXCEPTION(JSOCKERR_timeout_expired);
-    }
-
-    return nwritten;
+    return writetms(buf, size, size, WAIT_FOREVER);
 }
 
 bool CSocket::check_connection()
@@ -2117,26 +2522,51 @@ bool CSocket::check_connection()
     if (state != ss_open) 
         return false;
 
-    unsigned retrycount=100;
-EintrRetry:
-    int rc;
-    if (sockmode==sm_udp_server) { // udp server
-        DEFINE_SOCKADDR(u);
-        socklen_t  ul = setSockAddr(u,returnep,returnep.port);
-        rc = sendto(sock, NULL, 0, 0, &u.sa, ul);
-    }
-    else {
-        rc = send(sock, NULL, 0, SEND_FLAGS);
-    }
-    if (rc < 0) {
-        int err=ERRNO();
-        if ((err==JSE_INTR)&&(retrycount--!=0)) {
-            LOGERR2(err,7,"EINTR retrying");
-            goto EintrRetry;
+    // This routine is for TCP stream sockets.
+    // if another thread called sock->read() between the
+    // wait_read() and recv() calls below then the
+    // wait_read() might return EWOULDBLOCK and we would
+    // assume then the socket is still connected and ok.
+
+    // wait_read() returns = 0 - socket ok atm
+    //             returns < 0 - error, assume closed
+    //             returns > 0 - recv() to check for eof
+    int rc = wait_read(0);
+    if (rc == 0)
+        return true;
+    else if (rc < 0)
+        return false;
+
+    int retrycount = 100;
+    char buffer;
+
+    int recvFlags = MSG_PEEK;
+#ifndef _WIN32
+    recvFlags |= MSG_DONTWAIT;
+#endif
+
+EintrRecv:
+    rc = recv(sock, &buffer, sizeof(buffer), recvFlags);
+
+    // recv() returns = 0 - socket eof (closed)
+    //        returns < 0 - and errno not EWOULDBLOCK/EAGAIN, assume closed
+    //        returns > 0 - socket ok atm
+    if (rc == 0)
+        return false;
+    else if (rc < 0)
+    {
+        int err=SOCKETERRNO();
+        if ((err==JSE_INTR)&&(retrycount--!=0))
+        {
+            LOGERR2(err,7,"recv EINTR retrying");
+            goto EintrRecv;
         }
+        else if ((err==EWOULDBLOCK) || (err==EAGAIN))
+            return true;
         else
             return false;
-    }   
+    }
+
     return true;
 }
 
@@ -2144,38 +2574,54 @@ size32_t CSocket::udp_write_to(const SocketEndpoint &ep, void const* buf, size32
 {
     if (size==0)
         return 0;
-    unsigned startt=usTick();
+    cycle_t startcycles=get_cycles_now();
     if (state != ss_open) {
-        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_not_opened);
     }
     size32_t res=0;
     DEFINE_SOCKADDR(u); 
-    for (;;) {
+    for (;;)
+    {
         socklen_t  ul = setSockAddr(u,ep,ep.port);      
         int rc = sendto(sock, (char*)buf, size, 0, &u.sa, ul);
-        if (rc < 0) {
-            int err=ERRNO();
+        if (rc < 0)
+        {
+            int err=SOCKETERRNO();
             if (((sockmode==sm_multicast)||(sockmode==sm_udp))&&(err==JSE_CONNREFUSED))
                 break; // ignore
-            if (err!=JSE_INTR) {
-                THROWJSOCKEXCEPTION(err);
+            if (err == JSE_WOULDBLOCK || err == JSE_EAGAIN)
+            {
+                int retCode = wait_write(WAIT_FOREVER);
+                if (retCode < 0)
+                    THROWJSOCKTARGETEXCEPTION(SOCKETERRNO());
+                else if (retCode == 0)
+                    THROWJSOCKTARGETEXCEPTION(JSOCKERR_timeout_expired);
+            }
+            else if (err!=JSE_INTR)
+            {
+                THROWJSOCKTARGETEXCEPTION(err);
             }
         }
-        else {
+        else
+        {
             res = (size32_t)rc;
             break;
         }
     }
+
+    cycle_t elapsedCycles = get_cycles_now()-startcycles;
     STATS.writes++;
     STATS.writesize += res;
-    STATS.writetime+=usTick()-startt;
+    STATS.writetimecycles += elapsedCycles;
+    stats.ioWrites++;
+    stats.ioWriteBytes += res;
+    stats.ioWriteCycles += elapsedCycles;
     return res;
 }
 
 size32_t CSocket::write_multiple(unsigned num,const void **buf, size32_t *size)
 {
     assertex(sockmode!=sm_udp_server);
-    assertex(!nonblocking);
     if (num==1)
         return write(buf[0],size[0]);
     size32_t total = 0;
@@ -2185,9 +2631,9 @@ size32_t CSocket::write_multiple(unsigned num,const void **buf, size32_t *size)
     if (total==0)
         return 0;
     
-    unsigned startt=usTick();
+    cycle_t startcycles=get_cycles_now();
     if (state != ss_open) {
-        THROWJSOCKEXCEPTION(JSOCKERR_not_opened);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_not_opened);
     }
     size32_t res=0;
 #ifdef _WIN32
@@ -2200,7 +2646,7 @@ size32_t CSocket::write_multiple(unsigned num,const void **buf, size32_t *size)
 EintrRetry:
     DWORD sent;
     if (WSASendTo(sock,bufs,num,&sent,0,NULL,0,NULL,NULL)==SOCKET_ERROR) {
-        int err=ERRNO();
+        int err=SOCKETERRNO();
         if (BADSOCKERR(err)) {
             LOGERR2(err,8,"Socket closed during write");
             sent = 0;
@@ -2215,12 +2661,12 @@ EintrRetry:
                 errclose();
                 err = JSOCKERR_broken_pipe;
             }
-            THROWJSOCKEXCEPTION(err);
+            THROWJSOCKTARGETEXCEPTION(err);
         }
     }   
     if (sent == 0) {
         state = ss_shutdown;
-        THROWJSOCKEXCEPTION(JSOCKERR_graceful_close);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_graceful_close);
     }
     res = sent;
 #else
@@ -2303,9 +2749,14 @@ EintrRetry:
     }
 #endif
 #endif
+
+    cycle_t elapsedCycles = get_cycles_now()-startcycles;
     STATS.writes++;
     STATS.writesize += res;
-    STATS.writetime+=usTick()-startt;
+    STATS.writetimecycles += elapsedCycles;
+    stats.ioWrites++;
+    stats.ioWriteBytes += res;
+    stats.ioWriteCycles += elapsedCycles;
     return res;
 }
 
@@ -2382,37 +2833,6 @@ bool CSocket::send_block(const void *blk,size32_t sz)
 #endif
     return true;
 }
-
-#ifdef USERECVSEM
-
-class CSemProtect
-{
-    Semaphore *sem;
-    bool *owned;
-public:
-    CSemProtect() { clear(); }
-    ~CSemProtect() 
-    { 
-        if (sem&&*owned) {
-            *owned = false;
-            sem->signal(); 
-        }
-    }
-    void set(Semaphore *_sem,bool *_owned)
-    {
-        sem = _sem;
-        owned = _owned;
-    }
-    bool wait(Semaphore *_sem,bool *_owned,unsigned timeout) {
-        if (!*_owned&&!_sem->wait(timeout))
-            return false;
-        *_owned = true;
-        set(_sem,_owned);
-        return true;
-    }
-    void clear() { sem = NULL; owned = NULL; }
-};
-#endif
 
 size32_t CSocket::receive_block_size()
 {
@@ -2491,9 +2911,8 @@ size32_t CSocket::receive_block(void *blk,size32_t maxsize)
         else { // truncate
             readtms(blk,maxsize,maxsize,rd,blocktimeoutms);
             sz -= maxsize;
-            void *tmp=malloc(sz);
+            OwnedMalloc<void> tmp = malloc(sz);
             readtms(tmp,sz,sz,rd,blocktimeoutms);
-            free(tmp);
             sz = maxsize;
         }
         if (blockflags&BF_RELIABLE_TRANSFER) {
@@ -2526,7 +2945,7 @@ void CSocket::shutdown(unsigned mode)
 #endif
         int rc = ::shutdown(sock, mode);
         if (rc != 0) {
-            int err=ERRNO();
+            int err=SOCKETERRNO();
             if (err==JSE_NOTCONN) {
 #ifdef _TRACELINKCLOSED
                 DBGLOG("CSocket::shutdown(%d) failed, socket: %d", mode, sock);
@@ -2534,8 +2953,20 @@ void CSocket::shutdown(unsigned mode)
                 LOGERR2(err,9,"shutdown");
                 err = JSOCKERR_broken_pipe;
             }
-            THROWJSOCKEXCEPTION(err);
+            THROWJSOCKTARGETEXCEPTION(err);
         }
+    }
+}
+
+void CSocket::shutdownNoThrow(unsigned mode)
+{
+    if (state == ss_open)
+    {
+        state = ss_shutdown;
+#ifdef SOCKTRACE
+        PROGLOG("SOCKTRACE: shutdown(%d) socket %x %d (%p)", mode, sock, sock, this);
+#endif
+        ::shutdown(sock, mode);
     }
 }
 
@@ -2575,7 +3006,7 @@ void CSocket::close()
         if (mcastreq)
             setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,(char*)mcastreq,sizeof(*mcastreq));
         if (closesock() != 0) {
-            THROWJSOCKEXCEPTION(ERRNO());
+            THROWJSOCKTARGETEXCEPTION(SOCKETERRNO());
         }
     }
 }
@@ -2605,12 +3036,12 @@ size32_t CSocket::get_send_buffer_size()
 void CSocket::set_send_buffer_size(size32_t maxsend)
 {
     if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *)&maxsend, sizeof(maxsend))!=0) {
-        LOGERR2(ERRNO(),1,"setsockopt(SO_SNDBUF)");
+        LOGERR2(SOCKETERRNO(),1,"setsockopt(SO_SNDBUF)");
     }
 #ifdef CHECKBUFSIZE
     size32_t v;
     if (getsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *)&v, sizeof(v))!=0) {
-        LOGERR2(ERRNO(),1,"getsockopt(SO_SNDBUF)");
+        LOGERR2(SOCKETERRNO(),1,"getsockopt(SO_SNDBUF)");
     }
     if (v!=maxsend) 
         IWARNLOG("set_send_buffer_size requested %d, got %d",maxsend,v);
@@ -2630,12 +3061,12 @@ size32_t CSocket::get_receive_buffer_size()
 void CSocket::set_receive_buffer_size(size32_t max)
 {
     if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&max, sizeof(max))!=0) {
-        LOGERR2(ERRNO(),1,"setsockopt(SO_RCVBUF)");
+        LOGERR2(SOCKETERRNO(),1,"setsockopt(SO_RCVBUF)");
     }
 #ifdef CHECKBUFSIZE
     size32_t v;
     if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&v, sizeof(v))!=0) {
-        LOGERR2(ERRNO(),1,"getsockopt(SO_RCVBUF)");
+        LOGERR2(SOCKETERRNO(),1,"getsockopt(SO_RCVBUF)");
     }
     if (v<max) 
         IWARNLOG("set_receive_buffer_size requested %d, got %d",max,v);
@@ -2646,7 +3077,7 @@ void CSocket::set_receive_buffer_size(size32_t max)
 bool CSocket::join_multicast_group(SocketEndpoint &ep) 
 {
     StringBuffer s;
-    ep.getIpText(s);    // will improve later
+    ep.getHostText(s);    // will improve later
     MCASTREQ req(s.str());
     if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,(char*)&req, sizeof(req))!=0) {
         return false;
@@ -2658,7 +3089,7 @@ bool CSocket::join_multicast_group(SocketEndpoint &ep)
 bool CSocket::leave_multicast_group(SocketEndpoint &ep) 
 {
     StringBuffer s;
-    ep.getIpText(s);    // will improve later
+    ep.getHostText(s);    // will improve later
     MCASTREQ req(s.str());
     if (setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,(char*)&req, sizeof(req))!=0) {
         return false;
@@ -2685,13 +3116,20 @@ void CSocket::set_ttl(unsigned _ttl)
 
 void CSocket::logConnectionInfo(unsigned timeoutms, unsigned conn_mstime)
 {
-    PROGLOG("SOCKTRACE: connect(%u) - time:%u ms fd:%d l:%d r:%s:%d", timeoutms, conn_mstime, sock, localPort, (hostname?hostname:"NULL"), hostport);
+    StringBuffer hostname;
+    targetip.getHostText(hostname);
+    PROGLOG("SOCKTRACE: connect(%u) - time:%u ms fd:%d l:%d r:%s:%d", timeoutms, conn_mstime, sock, localPort, hostname.str(), hostport);
     // PrintStackReport();
 }
 
 bool CSocket::isSecure() const
 {
     return false;
+}
+
+unsigned __int64 CSocket::getStatistic(StatisticKind kind) const
+{
+    return stats.getStatistic(kind);
 }
 
 CSocket::~CSocket()
@@ -2708,8 +3146,6 @@ CSocket::~CSocket()
             e->Release();
         }
     }
-    free(hostname);
-    hostname = NULL;
 #ifdef _TRACE
     free(tracename);
     tracename = NULL;
@@ -2726,8 +3162,8 @@ CSocket::CSocket(const SocketEndpoint &ep,SOCKETMODE smode,const char *name)
 #endif
     nagling = true; // until turned off
     hostport = ep.port;
+    targetip.ipset(ep);
     localPort = 0;
-    hostname = NULL;
     mcastreq = NULL;
 #ifdef _TRACE
     tracename = NULL;
@@ -2737,9 +3173,9 @@ CSocket::CSocket(const SocketEndpoint &ep,SOCKETMODE smode,const char *name)
         mcastreq = new MCASTREQ(name);
     }
     else {
-        if (!name&&!ep.isNull())
-            name = ep.getIpText(tmp).str();
-        hostname = name?strdup(name):NULL;
+        //MORE: I don't think the name parameter is needed anymore
+        if (name && ep.isNull())
+            targetip.ipset(name);
     }
     sock = INVALID_SOCKET;
     sockmode = smode;
@@ -2753,15 +3189,13 @@ CSocket::CSocket(const SocketEndpoint &ep,SOCKETMODE smode,const char *name)
     else
     {
         StringBuffer hostname;
-        SocketEndpoint self;
-        self.setLocalHost(0);
-        self.getUrlStr(hostname);
+        targetip.getHostText(hostname);
         setTraceName("S>", hostname.str());
     }
 #endif
 }
 
-CSocket::CSocket(T_SOCKET new_sock,SOCKETMODE smode,bool _owned)
+CSocket::CSocket(T_SOCKET new_sock,SOCKETMODE smode,bool _owned,SocketEndpoint *_peerEp)
 {
     nonblocking = false;
 #ifdef USERECVSEM
@@ -2783,20 +3217,31 @@ CSocket::CSocket(T_SOCKET new_sock,SOCKETMODE smode,bool _owned)
     accept_cancel_state = accept_not_cancelled;
     set_nagle(false);
     //set_linger(DEFAULT_LINGER_TIME); -- experiment with removing this as closesocket should still endevour to send outstanding data
-    char peer[256];
-    hostport = peer_name(peer,sizeof(peer));
-    hostname = strdup(peer);
+    if (_peerEp)
+    {
+        targetip = *_peerEp;
+        hostport = _peerEp->port;
+    }
+    else
+    {
+        char peer[256];
+        hostport = peer_name(peer,sizeof(peer));
+        targetip.ipset(peer);
+    }
     SocketEndpoint ep;
     localPort = getEndpoint(ep).port;
 #ifdef _TRACE
-    setTraceName("A!", peer);
+    StringBuffer tmp;
+    targetip.getIpText(tmp);
+    tmp.append(":").append(hostport);
+    setTraceName("A!", tmp);
 #endif
 }
 
 ISocket* ISocket::create(unsigned short p,int listen_queue_size)
 {
     if (p==0)
-        THROWJSOCKEXCEPTION2(JSOCKERR_bad_address);
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
     SocketEndpoint ep;
     ep.port = p;
     Owned<CSocket> sock = new CSocket(ep,sm_tcp_server,NULL);
@@ -2808,7 +3253,7 @@ ISocket* ISocket::create(unsigned short p,int listen_queue_size)
 ISocket* ISocket::create_ip(unsigned short p,const char *host,int listen_queue_size)
 {
     if (p==0)
-        THROWJSOCKEXCEPTION2(JSOCKERR_bad_address);
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
     SocketEndpoint ep(host,p);
     Owned<CSocket> sock = new CSocket(ep,sm_tcp_server,host);
     sock->open(listen_queue_size);
@@ -2828,7 +3273,7 @@ ISocket* ISocket::udp_create(unsigned short p)
 ISocket* ISocket::multicast_create(unsigned short p, const char *mcip, unsigned _ttl)
 {
     if (p==0)
-        THROWJSOCKEXCEPTION2(JSOCKERR_bad_address);
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
     SocketEndpoint ep(mcip,p);
     Owned<CSocket> sock = new CSocket(ep,sm_multicast_server,mcip);
     sock->open(0,true);
@@ -2840,10 +3285,10 @@ ISocket* ISocket::multicast_create(unsigned short p, const char *mcip, unsigned 
 ISocket* ISocket::multicast_create(unsigned short p, const IpAddress &ip, unsigned _ttl)
 {
     if (p==0)
-        THROWJSOCKEXCEPTION2(JSOCKERR_bad_address);
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
     SocketEndpoint ep(p, ip);
     StringBuffer tmp;
-    Owned<CSocket> sock = new CSocket(ep,sm_multicast_server,ip.getIpText(tmp).str());
+    Owned<CSocket> sock = new CSocket(ep,sm_multicast_server,ip.getHostText(tmp).str());
     sock->open(0,true);
     if (_ttl)
         sock->set_ttl(_ttl);
@@ -2853,7 +3298,7 @@ ISocket* ISocket::multicast_create(unsigned short p, const IpAddress &ip, unsign
 ISocket* ISocket::udp_connect(unsigned short p, char const* name)
 {
     if (!name||!*name||(p==0))
-        THROWJSOCKEXCEPTION2(JSOCKERR_bad_address);
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
     SocketEndpoint ep(name, p);
     Owned<CSocket> sock = new CSocket(ep,sm_udp,name);
     sock->udpconnect();
@@ -2870,7 +3315,7 @@ ISocket* ISocket::udp_connect(const SocketEndpoint &ep)
 ISocket* ISocket::multicast_connect(unsigned short p, char const* mcip, unsigned _ttl)
 {
     if (p==0)
-        THROWJSOCKEXCEPTION2(JSOCKERR_bad_address);
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
     SocketEndpoint ep(mcip,p);
     return multicast_connect(ep, _ttl);
 }
@@ -2886,7 +3331,8 @@ ISocket* ISocket::multicast_connect(const SocketEndpoint &ep, unsigned _ttl)
 
 ISocket* ISocket::attach(int s, bool tcpip)
 {
-    CSocket* sock = new CSocket((SOCKET)s, tcpip?sm_tcp:sm_udp, false);
+    CSocket* sock = new CSocket((SOCKET)s, tcpip?sm_tcp:sm_udp, false, nullptr);
+    sock->set_nonblock(true);
     return sock;
 }
 
@@ -3019,7 +3465,7 @@ NO_SANITIZE("alignment") bool getInterfaceIp(IpAddress &ip,const char *ifname)
 static StringAttr cachehostname;
 static IpAddress cachehostip;
 static IpAddress localhostip;
-static CriticalSection hostnamesect;
+static CriticalSection hostnamesect(SYNC_LOCATION);
 
 const char * GetCachedHostName()
 {
@@ -3027,12 +3473,15 @@ const char * GetCachedHostName()
     if (!cachehostname.get())
     {
 #ifndef _WIN32
+#ifdef _CONTAINERIZED
+        //MORE: Does this need to be implemented a different way?
+#else
         IpAddress ip;
         const char *ifs = queryEnvironmentConf().queryProp("interface");
         if (getInterfaceIp(ip, ifs))
         {
             StringBuffer ips;
-            ip.getIpText(ips);
+            ip.getHostText(ips);
             if (ips.length())
             {
                 cachehostname.set(ips.str());
@@ -3040,6 +3489,7 @@ const char * GetCachedHostName()
                 return cachehostname.get();
             }
         }
+#endif
 #endif
         char temp[1024];
         if (gethostname(temp, sizeof(temp))==0)
@@ -3156,6 +3606,7 @@ inline bool isIp4(const unsigned *netaddr)
 
 void IpAddress::setIP4(unsigned ip)
 {
+    hostname.clear();
     netaddr[0] = 0;
     netaddr[1] = 0;
     if (ip)
@@ -3250,7 +3701,7 @@ static bool decodeNumericIP(const char *text,unsigned *netaddr)
         int ret = _inet_pton(AF_INET6, text, netaddr);
         if (ret>=0)
             return (ret>0);
-        int err = ERRNO();
+        int err = SOCKETERRNO();
         StringBuffer tmp("_inet_pton: ");
         tmp.append(text);
         LOGERR(err,1,tmp.str());
@@ -3258,11 +3709,113 @@ static bool decodeNumericIP(const char *text,unsigned *netaddr)
     return false;
 }
 
-static bool lookupHostAddress(const char *name,unsigned *netaddr)
+static void RecursionSafeLogErr(int ret, int ref, const char *msg, unsigned lineno, const char *name)
+{
+    static __thread bool recursioncheck = false; // needed to stop error message recursing
+    if (!recursioncheck)
+    {
+        recursioncheck = true;
+        LogErr(ret, ref, msg, lineno, name);
+#ifdef _DEBUG
+        PrintStackReport();
+#endif
+        recursioncheck = false;
+    }
+}
+
+int getAddressInfo(const char *name, unsigned *netaddr, bool okToLogErr)
+{
+    struct addrinfo hints;
+    struct addrinfo *addrInfo = NULL;
+    int retry=10;
+    int retCode;
+
+    // each retry could take up to several seconds, depending on how DNS resolver is configured
+    // should a few specific non-zero return codes break out early from retry loop (EAI_NONAME) ?
+    while (true)
+    {
+        memset(&hints, 0, sizeof(hints));
+        // dont wait for both A and AAAA records ...
+        if (IP4only || (!IP6preferred))
+            hints.ai_family = AF_INET;
+        // hints.ai_flags = AI_CANONNAME | AI_ADDRCONFIG | AI_V4MAPPED
+        retCode = getaddrinfo(name, NULL, &hints, &addrInfo);
+        if (0 == retCode)
+            break;
+        if (--retry > 0)
+            Sleep((10-retry)*100);
+        else
+        {
+            // use gai_strerror(ret) to get meaningful error text ?
+            if (okToLogErr)
+                RecursionSafeLogErr(retCode, 1, "getaddrinfo failed", __LINE__, name);
+            return retCode;
+        }
+        if (EAI_NONAME == retCode)
+        {
+            // try one more time, but why ?
+            // MCK TODO: probably should only retry on EAI_AGAIN and possibly EAI_SYSTEM ...
+            retry = 1;
+        }
+    }
+
+    struct addrinfo *best = NULL;
+    bool snm = !PreferredSubnet.isNull();
+    for (;;) {
+        struct addrinfo  *ai;
+        for (ai = addrInfo; ai; ai = ai->ai_next) {
+//          printf("flags=%d, family=%d, socktype=%d, protocol=%d, addrlen=%d, canonname=%s\n",ai->ai_flags,ai->ai_family,ai->ai_socktype,ai->ai_protocol,ai->ai_addrlen,ai->ai_canonname?ai->ai_canonname:"NULL");
+            switch (ai->ai_family) {
+            case AF_INET: {
+                    if (snm) {
+                        IpAddress ip;
+                        ip.setNetAddress(sizeof(in_addr),&(((sockaddr_in *)ai->ai_addr)->sin_addr));
+                        if (!PreferredSubnet.test(ip))
+                            continue;
+                    }
+                    if ((best==NULL)||((best->ai_family==AF_INET6)&&!IP6preferred))
+                        best = ai;
+                    break;
+                }
+            case AF_INET6: {
+                    if (snm) {
+                        IpAddress ip;
+                        ip.setNetAddress(sizeof(in_addr6),&(((sockaddr_in6 *)ai->ai_addr)->sin6_addr));
+                        if (!PreferredSubnet.test(ip))
+                            continue;
+                    }
+                    if ((best==NULL)||((best->ai_family==AF_INET)&&IP6preferred))
+                        best = ai;
+                    break;
+                }
+            }
+        }
+        if (best||!snm)
+            break;
+        snm = false;
+    }
+    if (best) {
+        if (best->ai_family==AF_INET6)
+            memcpy(netaddr,&(((sockaddr_in6 *)best->ai_addr)->sin6_addr),sizeof(in6_addr));
+        else {
+            memcpy(netaddr+3,&(((sockaddr_in *)best->ai_addr)->sin_addr),sizeof(in_addr));
+            netaddr[2] = 0xffff0000;
+            netaddr[1] = 0;
+            netaddr[0] = 0;
+        }
+    }
+    freeaddrinfo(addrInfo);
+    if (best!=NULL)
+        return 0;
+    else
+        return EAI_NONAME; // or EAI_NODATA ?
+}
+
+static bool lookupHostAddress(const char *name, unsigned *netaddr, unsigned timeoutms=INFINITE)
 {
     // if IP4only or using MS V6 can only resolve IPv4 using 
-    static bool recursioncheck = false; // needed to stop error message recursing
-    unsigned retry=10;
+    int retry=10;
+
 #if defined(__linux__) || defined (__APPLE__) || defined(getaddrinfo)
     if (IP4only) {
 #else
@@ -3272,11 +3825,7 @@ static bool lookupHostAddress(const char *name,unsigned *netaddr)
         hostent * entry = gethostbyname(name);
         while (entry==NULL) {
             if (retry--==0) {
-                if (!recursioncheck) {
-                    recursioncheck = true;
-                    LogErr(h_errno,1,"gethostbyname failed",__LINE__,name);
-                    recursioncheck = false;
-                }
+                RecursionSafeLogErr(h_errno, 1, "gethostbyname failed", __LINE__, name);
                 return false;
             }
             {
@@ -3308,100 +3857,105 @@ static bool lookupHostAddress(const char *name,unsigned *netaddr)
         }
         return false;
     }
+
 #if defined(__linux__) || defined (__APPLE__) || defined(getaddrinfo)
-    struct addrinfo hints;
-    memset(&hints,0,sizeof(hints));
-    struct addrinfo  *addrInfo = NULL;
-    for (;;) {
-        memset(&hints,0,sizeof(hints));
-        int ret = getaddrinfo(name, NULL , &hints, &addrInfo);
-        if (!ret) 
-            break;
-        if (retry--==0) {
-            if (!recursioncheck) {
-                recursioncheck = true;
-                LogErr(ret,1,"getaddrinfo failed",__LINE__,name);
-#ifdef _DEBUG
-                PrintStackReport();
-#endif
-                recursioncheck = false;
-            }
+    int retCode = 0;
+    if ( (timeoutms != INFINITE) && (useDNSTimeout()) ) // could addrInfoPool be NULL ?
+    {
+        // getaddrinfo_a() offers an async getaddrinfo method, but has some limitations and a possible mem leak
+        // could implement timeout getaddrinfo functionality without threads by connecting with DNS servers and parsing response ...
+        // lookup performance may be significantly improved if system uses a DNS resolver cache
+
+        PooledThreadHandle thrdHandle;
+        Owned<CAddrInfoThreadArgs> addrThreadInfo = new CAddrInfoThreadArgs(name);
+        CTimeMon dnstimeout(timeoutms);
+
+        try
+        {
+            // wait up to timeoutms for an available thread from pool ...
+            thrdHandle = addrInfoPool->start((void *)addrThreadInfo.getLink(), "getaddrinfo-thread", timeoutms);
+            // MCK TODO: if have to create a new thread and at os/system/shell thread limit, create/start can take up to several seconds, can we control this ?
+        }
+        catch (IException *e)
+        {
+            addrThreadInfo->Release();
+            StringBuffer excMsg;
+            StringBuffer emsg;
+            emsg.appendf("getaddrinfo failed (thread) (%d) (exc:%d) %s", timeoutms, e->errorCode(), e->errorMessage(excMsg).str());
+            RecursionSafeLogErr(100, 1, emsg.str(), __LINE__, name);
+            e->Release();
             return false;
         }
-        Sleep((10-retry)*100);
-    }
-    struct addrinfo  *best = NULL;
-    bool snm = !PreferredSubnet.isNull();
-    for (;;) {
-        struct addrinfo  *ai;
-        for (ai = addrInfo; ai; ai = ai->ai_next) {
-//          printf("flags=%d, family=%d, socktype=%d, protocol=%d, addrlen=%d, canonname=%s\n",ai->ai_flags,ai->ai_family,ai->ai_socktype,ai->ai_protocol,ai->ai_addrlen,ai->ai_canonname?ai->ai_canonname:"NULL");
-            switch (ai->ai_family) {
-            case AF_INET: {
-                    if (snm) {
-                        IpAddress ip;
-                        ip.setNetAddress(sizeof(in_addr),&(((sockaddr_in *)ai->ai_addr)->sin_addr));
-                        if (!PreferredSubnet.test(ip))
-                            continue;
-                    }
-                    if ((best==NULL)||((best->ai_family==AF_INET6)&&!IP6preferred))
-                        best = ai;
-                    break;
-                }
-            case AF_INET6: {
-                    if (snm) {
-                        IpAddress ip;
-                        ip.setNetAddress(sizeof(in_addr6),&(((sockaddr_in6 *)ai->ai_addr)->sin6_addr));
-                        if (!PreferredSubnet.test(ip))
-                            continue;
-                    }
-                    if ((best==NULL)||((best->ai_family==AF_INET)&&IP6preferred))
-                        best = ai;
-                    break;
-                }                   
+        catch (...)
+        {
+            addrThreadInfo->Release();
+            RecursionSafeLogErr(101, 1, "getaddrinfo failed (thread) (other exc)", __LINE__, name);
+            return false;
+        }
+
+        // take into account time already passed creating/starting thread above ...
+        unsigned remaining;
+        dnstimeout.timedout(&remaining);
+        if (addrInfoPool->join(thrdHandle, remaining))
+        {
+            if (0 == addrThreadInfo->retCode)
+            {
+                memcpy(netaddr, addrThreadInfo->netaddr, sizeof(addrThreadInfo->netaddr));
+                return true;
+            }
+            else
+            {
+                // use gai_strerror(ret) to get meaningful error text ?
+                StringBuffer emsg;
+                emsg.appendf("getaddrinfo failed (thread)");
+                RecursionSafeLogErr(addrThreadInfo->retCode.load(), 1, emsg.str(), __LINE__, name);
+                return false;
             }
         }
-        if (best||!snm)
-            break;
-        snm = false;
+        // if join() returns false thread still running, but its detached,
+        // will terminate, release thread args and return to pool on its own ...
+
+        StringBuffer emsg;
+        emsg.appendf("getaddrinfo timed out (thread) (%d)", timeoutms);
+        RecursionSafeLogErr(EAI_AGAIN, 1, emsg.str(), __LINE__, name);
+        return false;
     }
-    if (best) {
-        if (best->ai_family==AF_INET6)
-            memcpy(netaddr,&(((sockaddr_in6 *)best->ai_addr)->sin6_addr),sizeof(in6_addr));
-        else {
-            memcpy(netaddr+3,&(((sockaddr_in *)best->ai_addr)->sin_addr),sizeof(in_addr));
-            netaddr[2] = 0xffff0000;
-            netaddr[1] = 0;
-            netaddr[0] = 0;
-        }
-    }
-    freeaddrinfo(addrInfo);
-    return best!=NULL;
+
+    retCode = getAddressInfo(name, netaddr, true);
+    if (0 == retCode)
+        return true;
+    else
+        return false;
 #endif
-    return false;
-            
 }
 
-
-
-bool IpAddress::ipset(const char *text)
+bool IpAddress::ipset(const char *text, unsigned timeoutms)
 {
-    if (text&&*text) {
-        if ((text[0]=='.')&&(text[1]==0)) {
+    if (text&&*text)
+    {
+        if ((text[0]=='.')&&(text[1]==0))
+        {
             ipset(queryHostIP());
             return true;
         }
         if (decodeNumericIP(text,netaddr))
+        {
+            hostname.clear();
             return true;
+        }
         const char *s;
         for (s=text;*s;s++)
             if (!isdigit(*s)&&(*s!=':')&&(*s!='.')) 
                 break;
         if (!*s)
             return ipset(NULL);
-        if (lookupHostAddress(text,netaddr))
+        if (lookupHostAddress(text, netaddr, timeoutms))
+        {
+            hostname.set(text);
             return true;
+        }
     }
+    hostname.clear();
     memset(&netaddr,0,sizeof(netaddr));
     return false;
 }
@@ -3421,21 +3975,19 @@ inline char * addbyte(char *s,byte b)
     *(s++) = b+'0';
     return s;
 }
-        
-
 
 StringBuffer & IpAddress::getIpText(StringBuffer & out) const
 {
     if (::isIp4(netaddr)) {
         const byte *ip = (const byte *)&netaddr[3];
-        char ips[16]; 
+        char ips[16];
         char *s = ips;
         for (unsigned i=0;i<4;i++) {
             if (i)
                 *(s++) = '.';
             s = addbyte(s,ip[i]);
         }
-        return out.append(s-ips,ips); 
+        return out.append(s-ips,ips);
     }
     char tmp[INET6_ADDRSTRLEN];
     const char *res = _inet_ntop(AF_INET6, &netaddr, tmp, sizeof(tmp));
@@ -3444,11 +3996,18 @@ StringBuffer & IpAddress::getIpText(StringBuffer & out) const
     return out.append(res);
 }
 
+StringBuffer & IpAddress::getHostText(StringBuffer & out) const
+{
+    if (hostname)
+        return out.append(hostname);
+    return getIpText(out);
+}
+
 void IpAddress::ipserialize(MemoryBuffer & out) const
 {
     if (((netaddr[2]==0xffff0000)||(netaddr[2]==0))&&(netaddr[1]==0)&&(netaddr[0]==0)) {
         if (netaddr[3]==IPV6_SERIALIZE_PREFIX)
-            throw MakeStringException(-1,"Invalid network address"); // hack prevention
+            throw MakeStringException(JLIBERR_SocketInvalidNetworkAddress,"Invalid network address"); // hack prevention
         out.append(sizeof(netaddr[3]), &netaddr[3]); 
     }
     else {
@@ -3459,6 +4018,7 @@ void IpAddress::ipserialize(MemoryBuffer & out) const
 
 void IpAddress::ipdeserialize(MemoryBuffer & in)
 {
+    hostname.clear();
     unsigned pfx;
     in.read(sizeof(pfx),&pfx);
     if (pfx!=IPV6_SERIALIZE_PREFIX) {
@@ -3476,14 +4036,11 @@ unsigned IpAddress::ipdistance(const IpAddress &other,unsigned offset) const
 {   
     if (offset>3)
         offset = 3;
-    int i1;
+    unsigned i1;
     _cpyrev4(&i1,&netaddr[3-offset]);
-    int i2;
+    unsigned i2;
     _cpyrev4(&i2,&other.netaddr[3-offset]);
-    i1-=i2;
-    if (i1>0)
-        return i1;
-    return -i1;
+    return (i1 > i2) ? (i1 - i2) : (i2 - i1);
 }
 
 bool IpAddress::ipincrement(unsigned count,byte minoctet,byte maxoctet,unsigned short minipv6piece,unsigned maxipv6piece)
@@ -3519,6 +4076,7 @@ bool IpAddress::ipincrement(unsigned count,byte minoctet,byte maxoctet,unsigned 
             count = v/base;
         }
     }
+    hostname.clear(); // Probably should never be set for an IpAddress where ipincrement is used
     return true;
 }
 
@@ -3565,6 +4123,7 @@ NO_SANITIZE("alignment") size32_t IpAddress::getNetAddress(size32_t maxsz,void *
 
 NO_SANITIZE("alignment") void IpAddress::setNetAddress(size32_t sz,const void *src)
 {
+    hostname.clear();
     if (sz==sizeof(unsigned)) { // IPv4
         netaddr[0] = 0;
         netaddr[1] = 0;
@@ -3594,7 +4153,7 @@ void SocketEndpoint::serialize(MemoryBuffer & out) const
 }
 
 
-bool SocketEndpoint::set(const char *name,unsigned short _port)
+bool SocketEndpoint::set(const char *name,unsigned short _port, unsigned timeoutms)
 { 
     if (name) {
         if (*name=='[') { 
@@ -3624,7 +4183,7 @@ bool SocketEndpoint::set(const char *name,unsigned short _port)
             name = ips;
             _port = atoi(colon+1);
         }
-        if (ipset(name)) {
+        if (ipset(name, timeoutms)) {
             port = _port; 
             return true;
         }
@@ -3634,12 +4193,28 @@ bool SocketEndpoint::set(const char *name,unsigned short _port)
     return false;
 }
 
-void SocketEndpoint::getUrlStr(char * str, size32_t len) const
+StringBuffer &SocketEndpoint::getEndpointIpText(StringBuffer &str) const
+{
+    getIpText(str);
+    if (port)
+        str.append(':').append((unsigned)port);         // TBD IPv6 put [] on
+    return str;
+}
+
+StringBuffer &SocketEndpoint::getEndpointHostText(StringBuffer &str) const
+{
+    getHostText(str);
+    if (port)
+        str.append(':').append((unsigned)port);         // TBD IPv6 put [] on
+    return str;
+}
+
+void SocketEndpoint::getEndpointHostText(char * str, size32_t len) const
 {
     if (len==0)
         return;
     StringBuffer _str;
-    getUrlStr(_str);
+    getEndpointHostText(_str);
     size32_t l = _str.length()+1;
     if (l>len)
     { 
@@ -3649,20 +4224,19 @@ void SocketEndpoint::getUrlStr(char * str, size32_t len) const
     memcpy(str,_str.str(),l);
 }
 
-StringBuffer &SocketEndpoint::getUrlStr(StringBuffer &str) const
-{
-    getIpText(str);
-    if (port) 
-        str.append(':').append((unsigned)port);         // TBD IPv6 put [] on
-    return str;
-}
-
-
 unsigned SocketEndpoint::hash(unsigned prev) const
 {
     return hashc((const byte *)&port,sizeof(port),iphash(prev));
 }
 
+
+StringBuffer &getRemoteAccessibleHostText(StringBuffer &str, const SocketEndpoint &ep)
+{
+    if (isContainerized())
+        return ep.getEndpointIpText(str);
+    else
+        return ep.getEndpointHostText(str);
+}
 
 
 
@@ -3676,7 +4250,7 @@ SocketListCreator::SocketListCreator()
 void SocketListCreator::addSocket(const SocketEndpoint &ep)
 {
     StringBuffer ipstr;
-    ep.getIpText(ipstr);
+    ep.getHostText(ipstr);
     addSocket(ipstr.str(), ep.port);
 }
 
@@ -3732,7 +4306,7 @@ void SocketListCreator::addSockets(SocketEndpointArray &array)
     ForEachItemIn(i,array) {
         const SocketEndpoint &sockep=array.item(i);
         StringBuffer ipstr;
-        sockep.getIpText(ipstr);
+        sockep.getHostText(ipstr);
         addSocket(ipstr.str(),sockep.port);
     }
 }
@@ -3870,6 +4444,11 @@ unsigned SocketListParser::getSockets(SocketEndpointArray &array,unsigned defpor
     return array.ordinality();
 }
 
+jlib_decl JSocketStatistics *getSocketStatPtr()
+{
+    return &STATS;
+}
+
 void getSocketStatistics(JSocketStatistics &stats)
 {
     // should put in simple lock
@@ -3902,10 +4481,10 @@ StringBuffer &getSocketStatisticsString(JSocketStatistics &stats,StringBuffer &s
     str.append("failedconnects=").append(stats.failedconnects).append('\n');
     appendtime(str.append("failedconnecttime="),stats.failedconnecttime).append('\n');
     str.append("reads=").append(stats.reads).append('\n');
-    appendtime(str.append("readtime="),stats.readtime).append('\n');
+    appendtime(str.append("readtime="),cycle_to_microsec(stats.readtimecycles)).append('\n');
     str.append("readsize=").append(stats.readsize).append(" bytes\n");
     str.append("writes=").append(stats.writes).append('\n');
-    appendtime(str.append("writetime="),stats.writetime).append('\n');
+    appendtime(str.append("writetime="),cycle_to_microsec(stats.writetimecycles)).append('\n');
     str.append("writesize=").append(stats.writesize).append(" bytes").append('\n');
     str.append("activesockets=").append(stats.activesockets).append('\n');
     str.append("numblockrecvs=").append(stats.numblockrecvs).append('\n');
@@ -3928,7 +4507,7 @@ struct SelectItem
     T_SOCKET handle;
     ISocketSelectNotify *nfy;
     byte mode;
-    bool del; // only used in select handler method
+    bool del;
     bool operator == (const SelectItem & other) const { return sock == other.sock; }
 };
 
@@ -4003,17 +4582,16 @@ class CSocketBaseThread: public Thread
 {
 protected:
     bool terminating;
-    CriticalSection sect;
-    Semaphore ticksem;
+    CriticalSection sect{SYNC_LOCATION};
+    Semaphore ticksem{SYNC_LOCATION};
     std::atomic_uint tickwait;
     unsigned offset;
-    bool selectvarschange;
+    std::atomic<bool> selectvarschange;
     unsigned waitingchange;
-    Semaphore waitingchangesem;
+    Semaphore waitingchangesem{SYNC_LOCATION};
     int validateselecterror;
     unsigned validateerrcount;
     const char *selecttrace;
-    unsigned basesize;
 #ifdef _USE_PIPE_FOR_SELECT_TRIGGER
     T_SOCKET dummysock[2];
 #else
@@ -4038,7 +4616,7 @@ public:
         CriticalBlock block(sect);
         char c = 0;
         if(write(dummysock[1], &c, 1) != 1) {
-            int err = ERRNO();
+            int err = SOCKETERRNO();
             LOGERR(err,1,"Socket closed during trigger select");
         }
 #else
@@ -4074,7 +4652,7 @@ public:
         if (getsockopt(sock, SOL_SOCKET, SO_TYPE, (char *)&t, &tl)!=0) {
             StringBuffer sockstr;
             const char *tracename = sockstr.append((unsigned)sock).str();
-            LOGERR2(ERRNO(),1,"CSocketBaseThread select handle");
+            LOGERR2(SOCKETERRNO(),1,"CSocketBaseThread select handle");
             return false;
         }
 #ifdef _USE_SELECT
@@ -4090,7 +4668,7 @@ public:
         if (rc<0) {
             StringBuffer sockstr;
             const char *tracename = sockstr.append((unsigned)sock).str();
-            LOGERR2(ERRNO(),2,"CSocketBaseThread select handle");
+            LOGERR2(SOCKETERRNO(),2,"CSocketBaseThread select handle");
             return false;
         }
 # ifdef _DEBUG
@@ -4105,7 +4683,7 @@ public:
         if (rc<0) {
             StringBuffer sockstr;
             const char *tracename = sockstr.append((unsigned)sock).str();
-            LOGERR2(ERRNO(),3,"CSocketBaseThread select handle");
+            LOGERR2(SOCKETERRNO(),3,"CSocketBaseThread select handle");
             return false;
         }
 # ifdef _DEBUG
@@ -4131,13 +4709,13 @@ public:
         }
         else
         {
-            int err = ERRNO();
+            int err = SOCKETERRNO();
             if (err == JSE_INTR)
                 return true; // assume ok until next time called
         }
         StringBuffer sockstr;
         const char *tracename = sockstr.append((unsigned)sock).str();
-        LOGERR2(ERRNO(),3,"CSocketBaseThread poll handle");
+        LOGERR2(SOCKETERRNO(),3,"CSocketBaseThread poll handle");
         return false;
 #endif
     }
@@ -4148,6 +4726,7 @@ public:
 class CSocketSelectThread: public CSocketBaseThread
 {
     SelectItemArray items;
+    unsigned basesize;
 
     void opendummy()
     {
@@ -4155,7 +4734,7 @@ class CSocketSelectThread: public CSocketBaseThread
         if (!dummysockopen) { 
 #ifdef _USE_PIPE_FOR_SELECT_TRIGGER
             if(pipe(dummysock)) {
-                IWARNLOG("CSocketSelectThread: create pipe failed %d",ERRNO());
+                IWARNLOG("CSocketSelectThread: create pipe failed %d",SOCKETERRNO());
                 return;
             }
             for (unsigned i=0;i<2;i++) {
@@ -4273,7 +4852,6 @@ class CSocketSelectThread: public CSocketBaseThread
 
 #endif 
 public:
-    IMPLEMENT_IINTERFACE;
     CSocketSelectThread(const char *trc)
         : CSocketBaseThread("CSocketSelectThread")
     {
@@ -4311,9 +4889,10 @@ public:
 
     Owned<IException> termexcept;
 
+    // JCSMORE: this is very similar to the version in CSocketEpollThread. Could be commoned if items used common structure.
     void updateItems()
     {
-        // must be in CriticalBlock block(sect); 
+        // must be in CriticalBlock block(sect);
         unsigned n = items.ordinality();
 #ifdef _WIN32
         bool hashupdateneeded = (n!=basesize); // additions all come at end
@@ -4353,6 +4932,7 @@ public:
         basesize = n;
     }
 
+    // JCSMORE: this is very similar to the version in CSocketEpollThread. Could be commoned if items used common structure.
     bool checkSocks()
     {
         bool ret = false;
@@ -4400,9 +4980,12 @@ public:
         unsigned n=0;
         ForEachItemIn(i,items) {
             SelectItem &si = items.element(i);
-            if (!si.del) {
-                if (si.sock==sock) {
+            if (!si.del)
+            {
+                if (si.sock==sock)
+                {
                     si.del = true;
+                    break;
                 }
                 else 
                     n++;
@@ -4437,7 +5020,7 @@ public:
                 // bad socket not found
                 PROGLOG("CSocketSelectThread::updateSelectVars cannot find socket error");
                 if (validateerrcount>10)
-                    throw MakeStringException(-1,"CSocketSelectThread:Socket select error %d",validateselecterror);
+                    throw MakeStringException(JLIBERR_SocketSelectError,"CSocketSelectThread:Socket select error %d",validateselecterror);
             }
         }
         else
@@ -4545,7 +5128,7 @@ public:
                 if (n < 0)
                 {
                     CriticalBlock block(sect);
-                    int err = ERRNO();
+                    int err = SOCKETERRNO();
                     if (err != JSE_INTR)
                     {
                         if (dummysockopen)
@@ -4700,8 +5283,8 @@ public:
 
 class CSocketSelectHandler: implements ISocketSelectHandler, public CInterface
 {
-    CIArrayOf<CSocketSelectThread> threads;
-    CriticalSection sect;
+    IArrayOf<CSocketSelectThread> threads;
+    CriticalSection sect{SYNC_LOCATION};
     bool started;
     std::atomic<bool> stopped;
     StringAttr selecttrace;
@@ -4722,7 +5305,7 @@ public:
         if (!started) {
             started = true;
             ForEachItemIn(i,threads) {
-                threads.item(i).start();
+                threads.item(i).start(false);
             }
         }
             
@@ -4745,7 +5328,7 @@ public:
             CSocketSelectThread *thread = new CSocketSelectThread(selecttrace);
             threads.append(*thread);
             if (started)
-                thread->start();
+                thread->start(false);
         }
     }
     void remove(ISocket *sock)
@@ -4784,6 +5367,7 @@ public:
 #ifdef _HAS_EPOLL_SUPPORT
 # define SOCK_ADDED   0x1
 # define SOCK_REMOVED 0x2
+# define SOCK_FAILED  0x4
 class CSocketEpollThread: public CSocketBaseThread
 {
     int epfd;
@@ -4810,8 +5394,43 @@ class CSocketEpollThread: public CSocketBaseThread
         srtn = ::epoll_ctl(efd, op, fd, &event);
         // if another thread closed fd before here don't fail
         if ( (srtn < 0) && (op != EPOLL_CTL_DEL) ){
-            int err = ERRNO();
+            int err = SOCKETERRNO();
             IWARNLOG("epoll_ctl failed op:%d, fd:%d, err=%d", op, fd, err);
+        }
+    }
+
+    // JCSMORE: this is very similar to the version in CSocketSelectThread. Could be commoned if items used common structure.
+    void updateItems()
+    {
+        // must be in CriticalBlock block(sect);
+        unsigned n = items.ordinality();
+        for (unsigned i=0;i<n;)
+        {
+            SelectItem *si = items.element(i);
+            if (si->del)
+            {
+                // Release/dtors should not throw but leaving try/catch here until all paths checked
+                try
+                {
+#ifdef SOCKTRACE
+                    PROGLOG("CSocketSelectThread::updateItems release %d",si.handle);
+#endif
+                    si->nfy->Release();
+                    si->sock->Release();
+                    delete si;
+                }
+                catch (IException *e)
+                {
+                    EXCLOG(e,"CSocketSelectThread::updateItems");
+                    e->Release();
+                }
+                n--;
+                if (i < n)
+                    items.swap(i, n);
+                items.remove(n);
+            }
+            else
+                i++;
         }
     }
 
@@ -4820,15 +5439,16 @@ class CSocketEpollThread: public CSocketBaseThread
         CriticalBlock block(sect);
         if (!dummysockopen)
         {
+            // NB: not notified when triggered, because explicitly spotted and handled before tonotify loop
             sidummy = new SelectItem;
             sidummy->sock = nullptr;
             sidummy->nfy = nullptr;
-            sidummy->del = true;  // so its not added to tonotify ...
+            sidummy->del = false;
             sidummy->mode = 0;
 #ifdef _USE_PIPE_FOR_SELECT_TRIGGER
             if(pipe(dummysock))
             {
-                IWARNLOG("CSocketEpollThread: create pipe failed %d",ERRNO());
+                IWARNLOG("CSocketEpollThread: create pipe failed %d",SOCKETERRNO());
                 return;
             }
             for (unsigned i=0;i<2;i++)
@@ -4883,35 +5503,34 @@ class CSocketEpollThread: public CSocketBaseThread
         }
     }
 
-    void delSelItem(SelectItem *si)
-    {
-        epoll_op(epfd, EPOLL_CTL_DEL, si, 0);
-        // Release/dtors should not throw but leaving try/catch here until all paths checked
-        try
-        {
-            si->nfy->Release();
-            si->sock->Release();
-            delete si;
-        }
-        catch (IException *e)
-        {
-            EXCLOG(e,"CSocketEpollThread::delSelItem()");
-            e->Release();
-        }
-    }
+    // void delSelItem(SelectItem *si)
+    // {
+    //     epoll_op(epfd, EPOLL_CTL_DEL, si, 0);
+    //     // Release/dtors should not throw but leaving try/catch here until all paths checked
+    //     try
+    //     {
+    //         si->nfy->Release();
+    //         si->sock->Release();
+    //         delete si;
+    //     }
+    //     catch (IException *e)
+    //     {
+    //         EXCLOG(e,"CSocketEpollThread::delSelItem()");
+    //         e->Release();
+    //     }
+    // }
 
-    void delSelItemPos(SelectItem *si, unsigned pos)
-    {
-        unsigned last = items.ordinality();
-        delSelItem(si);
-        last--;
-        if (pos < last)
-            items.swap(pos, last);
-        items.remove(last);
-    }
+    // void delSelItemPos(SelectItem *si, unsigned pos)
+    // {
+    //     unsigned last = items.ordinality();
+    //     delSelItem(si);
+    //     last--;
+    //     if (pos < last)
+    //         items.swap(pos, last);
+    //     items.remove(last);
+    // }
 
 public:
-    IMPLEMENT_IINTERFACE;
     CSocketEpollThread(const char *trc, unsigned _hdlPerThrd)
         : CSocketBaseThread("CSocketEpollThread")
     {
@@ -4927,9 +5546,9 @@ public:
         epfd = ::epoll_create(1); // NB: arg is not used in newer kernels
         if (epfd < 0)
         {
-            int err = ERRNO();
+            int err = SOCKETERRNO();
             LOGERR(err,1,"epoll_create()");
-            THROWJSOCKEXCEPTION2(err);
+            THROWJSOCKEXCEPTION(err);
         }
 # ifdef FD_CLOEXEC
         int epflags = fcntl(epfd, F_GETFD, 0);
@@ -4948,9 +5567,9 @@ public:
         }
         catch (const std::bad_alloc &e)
         {
-            int err = ERRNO();
+            int err = SOCKETERRNO();
             LOGERR(err,1,"epevents alloc()");
-            THROWJSOCKEXCEPTION2(err);
+            THROWJSOCKEXCEPTION(err);
         }
         opendummy();
     }
@@ -4960,9 +5579,21 @@ public:
         closedummy();
         ForEachItemIn(i, items)
         {
-            SelectItem *si = items.element(i);
-            delSelItem(si);
+            // Release/dtors should not throw but leaving try/catch here until all paths checked
+            try
+            {
+                SelectItem *si = items.element(i);
+                si->nfy->Release();
+                si->sock->Release();
+                delete si;
+            }
+            catch (IException *e)
+            {
+                EXCLOG(e,"~CSocketSelectThread");
+                e->Release();
+            }
         }
+
         if (epfd >= 0)
         {
 # ifdef EPOLLTRACE
@@ -4976,52 +5607,52 @@ public:
 
     Owned<IException> termexcept;
 
+    // JCSMORE: this is very similar to the version in CSocketSelectThread. Could be commoned if items used common structure.
     bool checkSocks()
     {
         bool ret = false;
-        // must be holding CriticalBlock (sect)
-        unsigned n = items.ordinality();
-        for (unsigned i=0;i<n;)
+        ForEachItemIn(i, items)
         {
-            SelectItem *si = items.element(i);
-            if (!sockOk(si->handle))
+            SelectItem &si = *items.element(i);
+            if (si.del)
+                ret = true; // maybe that bad one
+            else if (!sockOk(si.handle))
             {
-                delSelItemPos(si, i);
-                n--;
+                si.del = true;
                 ret = true;
             }
-            else
-                i++;
         }
         return ret;
     }
 
-    bool removeSock(ISocket *sock)
-    {
-        // must be holding CriticalBlock (sect)
-        unsigned n = items.ordinality();
-        for (unsigned i=0;i<n;)
-        {
-            SelectItem *si = items.element(i);
-            if (si->sock==sock)
-            {
-                delSelItemPos(si, i);
-                n--;
-                return true;
-            }
-            else
-                i++;
-        }
-        return false;
-    }
+    // bool removeSock(ISocket *sock)
+    // {
+    //     // must be holding CriticalBlock (sect)
+    //     unsigned n = items.ordinality();
+    //     for (unsigned i=0;i<n;)
+    //     {
+    //         SelectItem *si = items.element(i);
+    //         if (si->sock==sock)
+    //         {
+    //             delSelItemPos(si, i);
+    //             n--;
+    //             return true;
+    //         }
+    //         else
+    //             i++;
+    //     }
+    //     return false;
+    // }
 
     bool remove(ISocket *sock)
     {
-        CriticalBlock block(sect);
         if (terminating)
-            return false;
-        if (sock==NULL)
-        { // wait until no changes outstanding
+            return true; // pretend is, to short-circuit caller
+        CriticalBlock block(sect);
+
+        // JCS - I can't see when sock can be null
+        if (sock==NULL) // wait until no changes outstanding
+        {
             while (selectvarschange)
             {
                 waitingchange++;
@@ -5030,33 +5661,59 @@ public:
             }
             return true;
         }
-        if (removeSock(sock))
+
+        ForEachItemIn(i, items)
         {
-            selectvarschange = true;
-            // NB: could set terminating here if no more hdls on
-            // this thread and at least one other thread is present
-            triggerselect();
-            return true;
+            SelectItem *si = items.element(i);
+            if (!si->del && (si->sock==sock))
+            {
+                // epoll_wait (in the CSocketEpollThread thread) may have pending events on socket this is about to remove
+                // so we must not remove the SelectItem here, just mark it as deleted (deletion performed in updateEpollVars)
+                epoll_op(epfd, EPOLL_CTL_DEL, si, 0);
+                si->del = true;
+                selectvarschange = true;
+                triggerselect();
+                // JCSMORE see comment in CSocketEpollThread::run re. need for CS.
+                // I think the array could be manipulated here, as long as the SelectItem isn't deleted.
+                // It may also be more efficient if it used a double linked list to remove items.
+                return true;
+            }
         }
         return false;
     }
 
-    unsigned add(ISocket *sock,unsigned mode,ISocketSelectNotify *nfy)
+    unsigned add(ISocket *sock, unsigned mode, ISocketSelectNotify *nfy)
     {
         if ( !sock || !nfy ||
              !(mode & (SELECTMODE_READ|SELECTMODE_WRITE|SELECTMODE_EXCEPT)) )
         {
             IWARNLOG("EPOLL: adding fd but sock or nfy is NULL or mode is empty");
             dbgassertex(false);
-            return 0;
+            return SOCK_FAILED;
         }
         CriticalBlock block(sect);
         if (terminating)
-            return 0;
+            return SOCK_FAILED;
+
+        // JCSMORE may be more efficient to use a double linked list to avoid this scan (and array/expansion)
         unsigned rm = 0;
-        if (removeSock(sock))
-            rm = SOCK_REMOVED;
-        unsigned n = items.ordinality();
+        unsigned n=0;
+        ForEachItemIn(i, items)
+        {
+            SelectItem &si = *items.element(i);
+            if (!si.del)
+            {
+                if (si.sock==sock)
+                {
+                    si.del = true;
+                    rm = SOCK_REMOVED;
+                    break;
+                }
+                else
+                    n++;
+            }
+        }
+
         // new handler thread
         if (n >= hdlPerThrd)
             return (0|rm);
@@ -5074,6 +5731,7 @@ public:
             ep_mode |= EPOLLOUT;
         if (mode & SELECTMODE_EXCEPT)
             ep_mode |= EPOLLPRI;
+        // JCSMORE - we are in a CS, but it is thread-safe to epoll_wait concurrently with epoll_op
         epoll_op(epfd, EPOLL_CTL_ADD, sn, ep_mode);
         selectvarschange = true;
         triggerselect();
@@ -5097,7 +5755,7 @@ public:
                 // bad socket not found
                 IWARNLOG("CSocketEpollThread::updateEpollVars cannot find socket error");
                 if (validateerrcount>10)
-                    throw MakeStringException(-1,"CSocketEpollThread:Socket epoll error %d",validateselecterror);
+                    throw MakeStringException(JLIBERR_SocketEpollError,"CSocketEpollThread:Socket epoll error %d",validateselecterror);
             }
         }
         else
@@ -5105,6 +5763,7 @@ public:
 #ifndef _USE_PIPE_FOR_SELECT_TRIGGER
         opendummy();
 #endif
+        updateItems();
         ni = items.ordinality();
         validateselecterror = 0;
     }
@@ -5139,7 +5798,7 @@ public:
                 int err = 0;
                 int n = ::epoll_wait(epfd, epevents, 1, 1000);
                 if (n < 0)
-                    err = ERRNO();
+                    err = SOCKETERRNO();
 
 # ifdef EPOLLTRACE
                 if(n > 0)
@@ -5150,9 +5809,9 @@ public:
                     break;
                 if (n < 0)
                 {
-                    CriticalBlock block(sect);
                     if (err != JSE_INTR)
                     {
+                        CriticalBlock block(sect);
                         if (dummysockopen)
                         {
                             LOGERR(err,12,"CSocketEpollThread epoll error"); // should cache error ?
@@ -5174,6 +5833,11 @@ public:
                     totnum++;
                     SelectItemArray tonotify;
                     {
+                        // JCSMORE - I don't think this CS is needed.
+                        // It is in the CSocketSelectThread version because the items array needs protecting)
+                        // But in the epoll version, we reference the SelectItem pointers only, the items array isn't referenced,
+                        // and epoll_op's are thread-safe. But we must ensure the SelectItem's are only deleted by this thread,
+                        // since even if in a mutex, pending events may referene them.
                         CriticalBlock block(sect);
 
                         // retrieve events, without waiting, while holding CS ...
@@ -5183,20 +5847,26 @@ public:
                         {
                             int tfd = -1;
                             SelectItem *epsi = (SelectItem *)epevents[j].data.ptr;
-                            if (epsi)
+                            if (epsi && !epsi->del) // NB: could receive an event for a pending deleted item
                                 tfd = epsi->handle;
 # ifdef EPOLLTRACE
                             DBGLOG("EPOLL: j = %d, fd = %d, emask = %u", j, tfd, epevents[j].events);
 # endif
                             if (tfd >= 0)
                             {
-# ifdef _USE_PIPE_FOR_SELECT_TRIGGER
-                                if ( (dummysockopen) && (tfd == dummysock[0]) )
+                                if (dummysockopen)
                                 {
-                                    resettrigger();
-                                    continue;
-                                }
+# ifdef _USE_PIPE_FOR_SELECT_TRIGGER
+                                    if (tfd == dummysock[0])
+                                    {
+                                        resettrigger();
+                                        continue;
+                                    }
+#else
+                                    // would still need to resettrigger and ignore dummysock (but subtly different code)
+                                    throwUnimplemented();
 # endif
+                                }
                                 unsigned int ep_mode = 0;
                                 if (epevents[j].events & (EPOLLINX | EPOLLHUP | EPOLLERR))
                                     ep_mode |= SELECTMODE_READ;
@@ -5229,6 +5899,7 @@ public:
                         const SelectItem &si = tonotify.item(j);
                         try
                         {
+                            // is it worth checking si.del again? we can't guarantee that this is a socket that has been marked deleted.
                             si.nfy->notifySelected(si.sock,si.mode); // ignore return
                         }
                         catch (IException *e)
@@ -5286,8 +5957,8 @@ public:
 
 class CSocketEpollHandler: implements ISocketSelectHandler, public CInterface
 {
-    CIArrayOf<CSocketEpollThread> threads;
-    CriticalSection sect;
+    IArrayOf<CSocketEpollThread> threads;
+    CriticalSection sect{SYNC_LOCATION};
     bool started;
     std::atomic<bool> stopped;
     StringAttr epolltrace;
@@ -5313,7 +5984,7 @@ public:
             started = true;
             ForEachItemIn(i,threads)
             {
-                threads.item(i).start();
+                threads.item(i).start(false);
             }
         }
     }
@@ -5322,7 +5993,7 @@ public:
     {
         if ( !sock || !nfy ||
              !(mode & (SELECTMODE_READ|SELECTMODE_WRITE|SELECTMODE_EXCEPT)) )
-            throw MakeStringException(-1,"CSocketEpollHandler::add() invalid sock or nfy or mode");
+            throw MakeStringException(JLIBERR_SocketEpollInvalidState,"CSocketEpollHandler::add() invalid sock or nfy or mode");
 
         CriticalBlock block(sect);
         if (stopped)
@@ -5339,7 +6010,9 @@ public:
             if (!(addrm & SOCK_ADDED))
             {
                 addrm |= threads.item(i).add(sock,mode,nfy);
-                if (addrm & (SOCK_ADDED | SOCK_REMOVED))
+                // if both added and removed, we're done
+                if (((addrm & (SOCK_ADDED | SOCK_REMOVED)) == (SOCK_ADDED | SOCK_REMOVED)) ||
+                    (addrm & SOCK_FAILED))
                     return;
             }
             else if (!(addrm & SOCK_REMOVED))
@@ -5354,7 +6027,7 @@ public:
         CSocketEpollThread *thread = new CSocketEpollThread(epolltrace, hdlPerThrd);
         threads.append(*thread);
         if (started)
-            thread->start();
+            thread->start(false);
         thread->add(sock,mode,nfy);
     }
 
@@ -5385,7 +6058,7 @@ public:
 
 enum EpollMethod { EPOLL_INIT = 0, EPOLL_DISABLED, EPOLL_ENABLED };
 static EpollMethod epoll_method = EPOLL_INIT;
-static CriticalSection epollsect;
+static CriticalSection epollsect(SYNC_LOCATION);
 
 void check_epoll_cfg()
 {
@@ -5393,6 +6066,11 @@ void check_epoll_cfg()
     // DBGLOG("check_epoll_cfg(): epoll_method = %d",epoll_method);
     if (epoll_method == EPOLL_INIT)
     {
+#ifdef _CONTAINERIZED
+//Does this need to be implemented a different way?
+        epoll_method = EPOLL_ENABLED;
+        epoll_hdlPerThrd = UINT_MAX;
+#else
         if (queryEnvironmentConf().getPropBool("use_epoll", true))
             epoll_method = EPOLL_ENABLED;
         else
@@ -5402,6 +6080,7 @@ void check_epoll_cfg()
         if (epoll_hdlPerThrd == 0)
             epoll_hdlPerThrd = UINT_MAX;
         // DBGLOG("check_epoll_cfg(): after reading conf file, epoll_hdlPerThrd = %u",epoll_hdlPerThrd);
+#endif
     }
 }
 #endif // _HAS_EPOLL_SUPPORT
@@ -5527,82 +6206,160 @@ bool catchWriteBuffer(ISocket * socket, MemoryBuffer & buffer)
     return false;
 }
 
-// utility interface for simple conversations 
-// conversation is always between two ends, 
-// at any given time one end must be receiving and other sending (though these may swap during the conversation)
-class CSingletonSocketConnection: implements IConversation, public CInterface
+CSingletonSocketConnection::CSingletonSocketConnection(SocketEndpoint &_ep)
 {
-    Owned<ISocket> sock;
-    Owned<ISocket> listensock;
-    enum { Snone, Saccept, Sconnect, Srecv, Ssend, Scancelled } state;
-    bool cancelling;
-    SocketEndpoint ep;
-    CriticalSection crit;
-public:
-    IMPLEMENT_IINTERFACE;
+    ep = _ep;
+    state = Snone;
+    cancelling = false;
+}
 
-    CSingletonSocketConnection(SocketEndpoint &_ep)
-    {
-        ep = _ep;
-        state = Snone;
-        cancelling = false;
-    }
+CSingletonSocketConnection::~CSingletonSocketConnection()
+{
+    shutdownAndCloseNoThrow(sock);
+}
 
-    ~CSingletonSocketConnection()
-    {
+void CSingletonSocketConnection::set_keep_alive(bool keepalive)
+{
+    if (sock)
+        sock->set_keep_alive(keepalive);
+}
+
+bool CSingletonSocketConnection::connect(unsigned timeoutms)
+{
+    CriticalBlock block(crit);
+    if (cancelling)
+        state = Scancelled;
+    if (state==Scancelled)
+        return false;
+    assertex(!sock);
+    ISocket *newsock=NULL;
+    state = Sconnect;
+    unsigned start = 0;
+    if (timeoutms!=(unsigned)INFINITE)
+        start = msTick();
+    while (state==Sconnect) {
         try {
-            if (sock)
-                sock->close();
+            CriticalUnblock unblock(crit);
+            newsock = ISocket::connect_wait(ep,1000*60*4);
+            break;
+        }
+        catch (IException * e) {
+            if ((e->errorCode()==JSOCKERR_timeout_expired)||(e->errorCode()==JSOCKERR_connection_failed)) {
+                e->Release();
+                if ((state==Sconnect)&&(timeoutms!=(unsigned)INFINITE)&&(msTick()-start>timeoutms)) {
+                    state = Snone;
+                    return false;
+                }
+            }
+            else {
+                state = Scancelled;
+                EXCLOG(e,"CSingletonSocketConnection::connect");
+                e->Release();
+                return false;
+            }
+        }
+    }
+    if (state!=Sconnect) {
+        ::Release(newsock);
+        newsock = NULL;
+    }
+    if (!newsock) {
+        state = Scancelled;
+        return false;
+    }
+    sock.setown(newsock);
+    return true;
+}
+
+bool CSingletonSocketConnection::send(MemoryBuffer &mb)
+{
+    CriticalBlock block(crit);
+    if (cancelling)
+        state = Scancelled;
+    if (state==Scancelled)
+        return false;
+    assertex(sock);
+    state = Srecv;
+    try {
+        CriticalUnblock unblock(crit);
+        writeBuffer(sock,mb);
+    }
+    catch (IException * e) {
+        state = Scancelled;
+        EXCLOG(e,"CSingletonSocketConnection::send");
+        e->Release();
+        return false;
+    }
+    state = Snone;
+    return true;
+}
+
+unsigned short CSingletonSocketConnection::setRandomPort(unsigned short base, unsigned num)
+{
+    for (;;) {
+        try {
+            ep.port = base+(unsigned short)(getRandom()%num);
+            listensock.setown(ISocket::create(ep.port));
+            return ep.port;
         }
         catch (IException *e) {
-            if (e->errorCode()!=JSOCKERR_graceful_close)
-                EXCLOG(e,"CSingletonSocketConnection close");
+            if (e->errorCode()!=JSOCKERR_port_in_use) {
+                state = Scancelled;
+                EXCLOG(e,"CSingletonSocketConnection::setRandomPort");
+                e->Release();
+                break;
+            }
             e->Release();
         }
     }
+    return 0;
+}
 
-    void set_keep_alive(bool keepalive)
-    {
-        if (sock)
-            sock->set_keep_alive(keepalive);
-    }
 
-    bool connect(unsigned timeoutms)
-    {
-        CriticalBlock block(crit);
-        if (cancelling) 
-            state = Scancelled;
-        if (state==Scancelled)
-            return false;
-        assertex(!sock);
+bool CSingletonSocketConnection::accept(unsigned timeoutms)
+{
+    CriticalBlock block(crit);
+    if (cancelling)
+        state = Scancelled;
+    if (state==Scancelled)
+        return false;
+    if (!sock) {
         ISocket *newsock=NULL;
-        state = Sconnect;
-        unsigned start = 0;
-        if (timeoutms!=(unsigned)INFINITE)
-            start = msTick();
-        while (state==Sconnect) {
+        state = Saccept;
+        for (;;) {
             try {
-                CriticalUnblock unblock(crit);
-                newsock = ISocket::connect_wait(ep,1000*60*4);
-                break;
-            }
-            catch (IException * e) {
-                if ((e->errorCode()==JSOCKERR_timeout_expired)||(e->errorCode()==JSOCKERR_connection_failed)) {
-                    e->Release();
-                    if ((state==Sconnect)&&(timeoutms!=(unsigned)INFINITE)&&(msTick()-start>timeoutms)) {
+                {
+                    CriticalUnblock unblock(crit);
+                    if (!listensock)
+                        listensock.setown(ISocket::create(ep.port));
+                    if ((timeoutms!=(unsigned)INFINITE)&&(!listensock->wait_read(timeoutms))) {
                         state = Snone;
                         return false;
                     }
                 }
-                else {
+                if (cancelling)
                     state = Scancelled;
-                    EXCLOG(e,"CSingletonSocketConnection::connect");
-                    e->Release();
+                if (state==Scancelled)
                     return false;
+                {
+                    CriticalUnblock unblock(crit);
+                    newsock=listensock->accept(true);
+                    break;
                 }
             }
-        }   
-        if (state!=Sconnect) {
+            catch (IException *e) {
+                if (e->errorCode()==JSOCKERR_graceful_close)
+                    PROGLOG("CSingletonSocketConnection: Closed socket on accept - retrying...");
+                else {
+                    state = Scancelled;
+                    EXCLOG(e,"CSingletonSocketConnection::accept");
+                    e->Release();
+                    break;
+                }
+                e->Release();
+            }
+        }
+        if (state!=Saccept) {
             ::Release(newsock);
             newsock = NULL;
         }
@@ -5611,179 +6368,78 @@ public:
             return false;
         }
         sock.setown(newsock);
-        return true;
     }
+    return true;
+}
 
-    bool send(MemoryBuffer &mb)
-    {
-        CriticalBlock block(crit);
-        if (cancelling) 
+bool CSingletonSocketConnection::recv(MemoryBuffer &mb, unsigned timeoutms)
+{
+    CriticalBlock block(crit);
+    if (cancelling)
+        state = Scancelled;
+    if (state==Scancelled)
+        return false;
+    assertex(sock);
+    state = Srecv;
+    try {
+        CriticalUnblock unblock(crit);
+        readBuffer(sock,mb,timeoutms);
+    }
+    catch (IException *e) {
+        if (e->errorCode()==JSOCKERR_timeout_expired)
+            state = Snone;
+        else {
             state = Scancelled;
-        if (state==Scancelled)
-            return false;
-        assertex(sock);
-        state = Srecv;
+            if (e->errorCode()!=JSOCKERR_graceful_close)
+                EXCLOG(e,"CSingletonSocketConnection::recv");
+        }
+        e->Release();
+        return false;
+    }
+    state = Snone;
+    return true;
+}
+
+void CSingletonSocketConnection::cancel()
+{
+    CriticalBlock block(crit);
+    while (state!=Scancelled) {
+        cancelling = true;
         try {
-            CriticalUnblock unblock(crit);
-            writeBuffer(sock,mb);
-        }
-        catch (IException * e) {
-            state = Scancelled;
-            EXCLOG(e,"CSingletonSocketConnection::send");
-            e->Release();
-            return false;
-        }
-        state = Snone;
-        return true;
-    }
-
-    unsigned short setRandomPort(unsigned short base, unsigned num)
-    {
-        for (;;) {
-            try {
-                ep.port = base+(unsigned short)(getRandom()%num);
-                listensock.setown(ISocket::create(ep.port));
-                return ep.port;
-            }
-            catch (IException *e) {
-                if (e->errorCode()!=JSOCKERR_port_in_use) {
-                    state = Scancelled;
-                    EXCLOG(e,"CSingletonSocketConnection::setRandomPort");
-                    e->Release();
-                    break;
+            switch (state) {
+            case Saccept:
+                {
+                    if (listensock)
+                        listensock->cancel_accept();
                 }
-                e->Release();
-            }
-        }
-        return 0;
-    }
-
-
-    bool accept(unsigned timeoutms)
-    {
-        CriticalBlock block(crit);
-        if (cancelling) 
-            state = Scancelled;
-        if (state==Scancelled)
-            return false;
-        if (!sock) {
-            ISocket *newsock=NULL;
-            state = Saccept;
-            for (;;) {
-                try {
-                    { 
-                        CriticalUnblock unblock(crit);
-                        if (!listensock)
-                            listensock.setown(ISocket::create(ep.port));
-                        if ((timeoutms!=(unsigned)INFINITE)&&(!listensock->wait_read(timeoutms))) {
-                            state = Snone;
-                            return false;
-                        }
-                    }
-                    if (cancelling) 
-                        state = Scancelled;
-                    if (state==Scancelled)
-                        return false;
-                    {
-                        CriticalUnblock unblock(crit);
-                        newsock=listensock->accept(true);
-                        break;
-                    }
+                break;
+            case Sconnect:
+                // wait for timeout
+                break;
+            case Srecv:
+                {
+                    if (sock)
+                        sock->close();
                 }
-                catch (IException *e) {
-                    if (e->errorCode()==JSOCKERR_graceful_close) 
-                        PROGLOG("CSingletonSocketConnection: Closed socket on accept - retrying...");
-                    else {
-                        state = Scancelled;
-                        EXCLOG(e,"CSingletonSocketConnection::accept");
-                        e->Release();
-                        break;
-                    }
-                    e->Release();
-                }
-            }
-            if (state!=Saccept) {
-                ::Release(newsock);
-                newsock = NULL;
-            }
-            if (!newsock) {
+                break;
+            case Ssend:
+                // wait for finished
+                break;
+            default:
                 state = Scancelled;
-                return false;
+                break;
             }
-            sock.setown(newsock);
-        }
-        return true;
-    }
-
-    bool recv(MemoryBuffer &mb, unsigned timeoutms)
-    {
-        CriticalBlock block(crit);
-        if (cancelling) 
-            state = Scancelled;
-        if (state==Scancelled)
-            return false;
-        assertex(sock);
-        state = Srecv;
-        try {
-            CriticalUnblock unblock(crit);
-            readBuffer(sock,mb,timeoutms);
         }
         catch (IException *e) {
-            if (e->errorCode()==JSOCKERR_timeout_expired)
-                state = Snone;
-            else {
-                state = Scancelled;
-                if (e->errorCode()!=JSOCKERR_graceful_close)
-                    EXCLOG(e,"CSingletonSocketConnection::recv");
-            }
+            EXCLOG(e,"CSingletonSocketConnection::cancel");
             e->Release();
-            return false;
         }
-        state = Snone;
-        return true;
-    }
-
-    virtual void cancel()
-    {
-        CriticalBlock block(crit);
-        while (state!=Scancelled) {
-            cancelling = true;
-            try {
-                switch (state) {
-                case Saccept:
-                    {
-                        if (listensock)
-                            listensock->cancel_accept();
-                    }
-                    break;
-                case Sconnect:
-                    // wait for timeout
-                    break;
-                case Srecv:
-                    {
-                        if (sock)
-                            sock->close();
-                    }
-                    break;
-                case Ssend:
-                    // wait for finished
-                    break;
-                default:
-                    state = Scancelled;
-                    break;
-                }
-            }
-            catch (IException *e) {
-                EXCLOG(e,"CSingletonSocketConnection::cancel");
-                e->Release();
-            }
-            {
-                CriticalUnblock unblock(crit);
-                Sleep(1000);
-            }
+        {
+            CriticalUnblock unblock(crit);
+            Sleep(1000);
         }
     }
-};
+}
 
     
 IConversation *createSingletonSocketConnection(unsigned short port,SocketEndpoint *_ep)
@@ -5805,7 +6461,7 @@ class CSocketBufferReader: implements ISocketBufferReader, public CInterface
         CSocketBufferReader *parent;
         unsigned num;           // top bit used for ready
         MemoryAttr blk;
-        CriticalSection sect;
+        CriticalSection sect{SYNC_LOCATION};
         Linked<ISocket> sock;
         bool active;
         bool pending;
@@ -5871,8 +6527,8 @@ class CSocketBufferReader: implements ISocketBufferReader, public CInterface
     size32_t buffersize;
     size32_t buffermax;
     unsigned bufferwaiting;
-    CriticalSection buffersect;
-    Semaphore buffersem;
+    CriticalSection buffersect{SYNC_LOCATION};
+    Semaphore buffersem{SYNC_LOCATION};
     bool isdone;
 
 public:
@@ -5960,15 +6616,6 @@ ISocketBufferReader *createSocketBufferReader(const char *trc)
 }
 
 
-extern jlib_decl void markNodeCentral(SocketEndpoint &ep)
-{
-#ifdef CENTRAL_NODE_RANDOM_DELAY
-    CriticalBlock block(CSocket::crit);
-    CentralNodeArray.append(ep);
-#endif
-}
-
-
 static CSocket *prepareSocket(unsigned idx,const SocketEndpoint &ep, ISocketConnectNotify &inotify)
 {
     Owned<CSocket> sock = new CSocket(ep,sm_tcp,NULL);
@@ -6051,8 +6698,8 @@ void multiConnect(const SocketEndpointArray &eps,ISocketConnectNotify &inotify,u
         return;
     elems = new SocketElem[n];
     unsigned i;
-    CriticalSection sect;
-    Semaphore notifysem;
+    CriticalSection sect(SYNC_LOCATION);
+    Semaphore notifysem(SYNC_LOCATION);
     Owned<ISocketSelectHandler> selecthandler = createSocketSelectHandler(
 #ifdef _DEBUG
         "multiConnect"
@@ -6122,7 +6769,7 @@ void multiConnect(const SocketEndpointArray &eps, IPointerArrayOf<ISocket> &rets
     }   
     while (retsockets.ordinality()<n)
         retsockets.append(NULL);
-    CriticalSection sect;
+    CriticalSection sect(SYNC_LOCATION);
     class cNotify: implements ISocketConnectNotify
     {
         CriticalSection &sect;
@@ -6143,7 +6790,7 @@ void multiConnect(const SocketEndpointArray &eps, IPointerArrayOf<ISocket> &rets
         void failed(unsigned idx,const SocketEndpoint &ep,int err)
         {
             StringBuffer s;
-            PROGLOG("multiConnect failed to %s with %d",ep.getUrlStr(s).str(),err);
+            PROGLOG("multiConnect failed to %s with %d",ep.getEndpointHostText(s).str(),err);
         }
     } notify(retsockets,sect);
     multiConnect(eps,notify,timeout);
@@ -6166,28 +6813,32 @@ inline void flushText(StringBuffer &text,unsigned short port,unsigned &rep,unsig
 
 
 
-StringBuffer &SocketEndpointArray::getText(StringBuffer &text)
+StringBuffer &SocketEndpointArray::getText(StringBuffer &text) const
 {
     unsigned count = ordinality();
     if (!count)
         return text;
     if (count==1)
-        return item(0).getUrlStr(text);
+        return item(0).getEndpointHostText(text);
     byte lastip[4];
     const SocketEndpoint &first = item(0);
-    bool lastis4 = first.getNetAddress(sizeof(lastip),&lastip)==sizeof(lastip);
+    first.getHostText(text);
+    bool lastis4 = false;
+    if (!first.queryHostname())
+        lastis4 = first.getNetAddress(sizeof(lastip),&lastip)==sizeof(lastip);
     unsigned short lastport = first.port;
-    first.getIpText(text);
     unsigned rep=0;
     unsigned range=0;
     for (unsigned i=1;i<count;i++) {
         byte ip[4];
         const SocketEndpoint &ep = item(i);
-        bool is4 = ep.getNetAddress(sizeof(ip),&ip)==sizeof(ip);
+        bool is4 = false;
+        if (!ep.queryHostname())
+            is4 = ep.getNetAddress(sizeof(ip),&ip)==sizeof(ip);
         if (!lastis4||!is4) {
             flushText(text,lastport,rep,range);
             text.append(',');
-            ep.getIpText(text);
+            ep.getHostText(text);
         }
         else { // try and shorten
             unsigned j;
@@ -6285,7 +6936,7 @@ inline bool appendv4range(SocketEndpointArray *array,char *str,SocketEndpoint &e
                 return false;
             }
             StringBuffer tmp;
-            ep.getIpText(tmp);
+            ep.getHostText(tmp);
             dc++;
             for (;;) {
                 if (tmp.length()==0)
@@ -6340,7 +6991,7 @@ bool SocketEndpointArray::fromName(const char *name, unsigned defport)
     case 1:
         break;
     default:
-        throw MakeStringException(-1, "Invalid name %s SocketEndpointArray::fromName", name);
+        throw MakeStringException(JLIBERR_SocketInvalidEndpointName, "Invalid name %s SocketEndpointArray::fromName", name);
     }
 #if defined(__linux__) || defined (__APPLE__) || defined(getaddrinfo)
     if (IP4only)
@@ -6365,44 +7016,15 @@ bool SocketEndpointArray::fromName(const char *name, unsigned defport)
         return ordinality()>0;
     }
 #if defined(__linux__) || defined (__APPLE__) || defined(getaddrinfo)
-    struct addrinfo hints;
-    memset(&hints,0,sizeof(hints));
-    struct addrinfo  *addrInfo = NULL;
-    memset(&hints,0,sizeof(hints));
-    int ret = getaddrinfo(name, NULL , &hints, &addrInfo);
-    if (ret == 0)
+    unsigned netaddr[4];
+    int retCode = getAddressInfo(name, netaddr, true);
+    if (0 == retCode)
     {
-        struct addrinfo  *ai;
-        for (ai = addrInfo; ai; ai = ai->ai_next)
-        {
-            // DBGLOG("flags=%d, family=%d, socktype=%d, protocol=%d, addrlen=%d, canonname=%s",ai->ai_flags,ai->ai_family,ai->ai_socktype,ai->ai_protocol,ai->ai_addrlen,ai->ai_canonname?ai->ai_canonname:"NULL");
-            if (ai->ai_protocol == IPPROTO_IP)
-            {
-                switch (ai->ai_family)
-                {
-                    case AF_INET:
-                    {
-                        SocketEndpoint ep;
-                        ep.setNetAddress(sizeof(in_addr),&(((sockaddr_in *)ai->ai_addr)->sin_addr));
-                        ep.port = defport;
-                        append(ep);
-                        // StringBuffer s;
-                        // DBGLOG("Lookup %s found %s", name, ep.getUrlStr(s).str());
-                        break;
-                    }
-                case AF_INET6:
-                    {
-                        SocketEndpoint ep;
-                        ep.setNetAddress(sizeof(in_addr6),&(((sockaddr_in6 *)ai->ai_addr)->sin6_addr));
-                        ep.port = defport;
-                        append(ep);
-                        break;
-                    }
-                }
-            }
-        }
+        SocketEndpoint ep;
+        ep.setNetAddress(sizeof(netaddr),netaddr);
+        ep.port = defport;
+        append(ep);
     }
-    freeaddrinfo(addrInfo);
 #endif
     return ordinality()>0;
 }
@@ -6572,10 +7194,10 @@ StringBuffer &lookupHostName(const IpAddress &ip,StringBuffer &ret)
         if (phostent)
             ret.append(phostent->h_name);
         else
-            ip.getIpText(ret);
+            ip.getHostText(ret);
     }
     else
-        ip.getIpText(ret);
+        ip.getHostText(ret);
     return ret;
 }
 
@@ -6682,7 +7304,7 @@ class CSocketConnectWait: implements ISocketConnectWait, public CInterface
         STATS.failedconnects++;
         STATS.failedconnecttime+=usTick()-startt;
         const char* tracename = sock->tracename;
-        THROWJSOCKEXCEPTION(JSOCKERR_connection_failed);
+        THROWJSOCKTARGETEXCEPTION(JSOCKERR_connection_failed);
     }
 
 public:
@@ -6762,13 +7384,13 @@ public:
                     socklen_t errlen = sizeof(err);
                     rc = getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen); // check for error
                     if ((rc!=0)&&!err) 
-                        err = ERRNO();  // some implementations of getsockopt duff
+                        err = SOCKETERRNO();  // some implementations of getsockopt duff
                     if (err&&!oneshot) //  probably ECONNREFUSED but treat all errors same
                         refused_sleep((waitremaining==remaining)?waittm:connecttm,refuseddelay); // this stops becoming cpu bound
                 }
                 else
                 {   // select/poll failed
-                    err = ERRNO();
+                    err = SOCKETERRNO();
                     if (err != JSE_INTR)
                     {
                         LOGERR(err,2,"CSocketConnectWait ::select/poll");
@@ -6791,13 +7413,13 @@ public:
             }
             sock->errclose();
             isopen = false;
-        } while (!waittimedout&&!oneshot);
+        } while (!waittimedout&&!connectimedout&&!oneshot);
         if (connectimedout)
         {
             STATS.failedconnects++;
             STATS.failedconnecttime+=usTick()-startt;
             const char* tracename = sock->tracename;
-            THROWJSOCKEXCEPTION(JSOCKERR_connection_failed);
+            THROWJSOCKTARGETEXCEPTION(JSOCKERR_connection_failed);
         }
         return NULL;
     }
@@ -6818,7 +7440,7 @@ int wait_multiple(bool isRead,               //IN   true if wait read, false it 
 {
     aindex_t numSocks = socks.length();
     if (numSocks == 0)
-        THROWJSOCKEXCEPTION2(JSOCKERR_bad_address);
+        THROWJSOCKEXCEPTION(JSOCKERR_bad_address);
 
 #ifdef _DEBUG
     StringBuffer dbgSB("wait_multiple() on sockets :");
@@ -6846,8 +7468,8 @@ int wait_multiple(bool isRead,               //IN   true if wait read, false it 
     }
     catch (const std::bad_alloc &e)
     {
-        int err = ERRNO();
-        throw MakeStringException(-1,"wait_multiple::fds malloc failure %d", err);
+        int err = SOCKETERRNO();
+        throw MakeStringException(JLIBERR_SocketWaitMultipleMalloc,"wait_multiple::fds malloc failure %d", err);
     }
     for (aindex_t idx = 0; idx < numSocks; idx++)
     {
@@ -6909,13 +7531,13 @@ int wait_multiple(bool isRead,               //IN   true if wait read, false it 
     else if (res == SOCKET_ERROR)
     {
         res = 0; // dont return negative on failure
-        int err = ERRNO();
+        int err = SOCKETERRNO();
         if (err != JSE_INTR)
         {
 #ifndef _USE_SELECT
             delete [] fds;
 #endif
-            throw MakeStringException(-1,"wait_multiple::select/poll error %d", err);
+            throw MakeStringException(JLIBERR_SocketWaitMultipleError,"wait_multiple::select/poll error %d", err);
         }
     }
 #ifndef _USE_SELECT
@@ -6995,7 +7617,7 @@ class CAllowListHandler : public CSimpleInterfaceOf<IAllowListHandler>, implemen
     std::unordered_set<std::pair<std::string, unsigned __int64>, PairHasher> allowList;
     std::unordered_set<std::string> IPOnlyAllowList;
     bool allowAnonRoles = false;
-    mutable CriticalSection populatedCrit;
+    mutable CriticalSection populatedCrit{SYNC_LOCATION};
     mutable bool populated = false;
     mutable bool enabled = true;
 
@@ -7043,7 +7665,7 @@ public:
         if (responseText)
         {
             responseText->append("Access denied! [server ip=");
-            queryHostIP().getIpText(*responseText);
+            queryHostIP().getHostText(*responseText);
             responseText->append(", client ip=");
             responseText->append(ip);
             if (role)
@@ -7112,5 +7734,18 @@ IAllowListHandler *createAllowListHandler(AllowListPopulateFunction populateFunc
     return new CAllowListHandler(populateFunc, roleFormatFunc);
 }
 
-static_assert(sizeof(IpAddress) == 16, "check size of IpAddress");
-static_assert(sizeof(SocketEndpoint) == 20, "check size of SocketEndpoint");
+extern jlib_decl void shutdownAndCloseNoThrow(ISocket * optSocket)
+{
+    if (!optSocket)
+        return;
+
+    optSocket->shutdownNoThrow();
+    try
+    {
+        optSocket->close();
+    }
+    catch (IException * e)
+    {
+        e->Release();
+    }
+}

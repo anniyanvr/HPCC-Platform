@@ -15,6 +15,7 @@
     limitations under the License.
 ############################################################################## */
 
+#include "jstring.hpp"
 #include "platform.h"
 #include "jlog.hpp"
 #include "jutil.hpp"
@@ -24,8 +25,7 @@
 #include "jptree.hpp"
 #include "jerror.hpp"
 #include "jsecrets.hpp"
-
-#include "build-config.h"
+#include "jthread.hpp"
 
 //including cpp-httplib single header file REST client
 //  doesn't work with format-nonliteral as an error
@@ -33,9 +33,12 @@
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
+
+//httplib also generates warning about access outside of array bounds in gcc
+#pragma GCC diagnostic ignored "-Warray-bounds"
 #endif
 
-#ifdef _USE_OPENSSL
+#if defined(_USE_OPENSSL) || defined(__EMSCRIPTEN__)
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #endif
 
@@ -46,43 +49,139 @@
 #pragma GCC diagnostic pop
 #endif
 
+#ifdef verify
+    #define JWT_HAS_VERIFY_MACRO
+    #define OLD_VERIFY verify
+    #undef verify
+#endif
+
+#include "jwt-cpp/jwt.h"
+#include "nlohmann/json.hpp"
+
+#ifdef JWT_HAS_VERIFY_MACRO
+    //Force an error if verify macro is used in any of the following code
+    #undef verify
+#endif
+
+#ifdef _USE_OPENSSL
+#include <opensslcommon.hpp>
+#include <openssl/x509v3.h>
+#endif
+
+//#define TRACE_SECRETS
 #include <vector>
 
-enum class CVaultKind { kv_v1, kv_v2 };
+// Vault specific support
+enum class CVaultKind { 
+    kv_v1,        // Hashicorp vault API version 1
+    kv_v2,        // Hashicorp vault API version 2
+    akeyless_v2   // Akeyless vault API version 2
+};
+enum class VaultType { hashicorp, akeyless };   // Vault provider type.
 
 CVaultKind getSecretType(const char *s)
 {
     if (isEmptyString(s))
         return CVaultKind::kv_v2;
-    if (streq(s, "kv_v1"))
+    if (strieq(s, "kv-v1"))
         return CVaultKind::kv_v1;
+    if (strieq(s, "kv-v2"))
+        return CVaultKind::kv_v2;
+    if (strieq(s, "akeyless"))
+        return CVaultKind::akeyless_v2;
     return CVaultKind::kv_v2;
 }
+
+static VaultType getVaultType(const char *s)
+{
+    if (strisame(s, "akeyless"))
+        return VaultType::akeyless;
+    return VaultType::hashicorp;
+}
+
 interface IVaultManager : extends IInterface
 {
-    virtual bool getCachedSecretFromVault(const char *category, const char *vaultId, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version) = 0;
-    virtual bool requestSecretFromVault(const char *category, const char *vaultId, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version) = 0;
-    virtual bool getCachedSecretByCategory(const char *category, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version) = 0;
-    virtual bool requestSecretByCategory(const char *category, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version) = 0;
+    virtual IPropertyTree *requestSecretFromVault(const char *category, const char *vaultId, const char *secret, const char *version) = 0;
+    virtual IPropertyTree *requestSecretByCategory(const char *category, const char *secret, const char *version) = 0;
 };
 
-static CriticalSection secretCacheCS;
-static Owned<IPropertyTree> secretCache;
 static Owned<IVaultManager> vaultManager;
+static MemoryAttr udpKey;
+static bool udpKeyInitialized = false;
 
-MODULE_INIT(INIT_PRIORITY_SYSTEM)
+static const IPropertyTree *getLocalSecret(const char *category, const char * name)
 {
-    secretCache.setown(createPTree());
+    return getSecret(category, name, "k8s", nullptr);
+}
+
+// based on kubernetes secret / key names. Even if some vault backends support additional characters we'll restrict to this subset for now
+// isKeyName is not currently used, but may be in the future
+inline static bool isValidSecretOrKeyNameChr(char c, bool firstOrLastChar, bool isKeyName)
+{
+    if (c == '\0')
+        return false;
+    if (isalnum(c))
+        return true;
+    if (firstOrLastChar)
+        return false;
+
+    switch (c)
+    {
+    case '.':
+    case '-':
+    case '_':   //keyname supports '_', relax restrictions for all - since supported by vaults
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool isValidSecretOrKeyName(const char *name, bool isKeyName)
+{
+    if (!isValidSecretOrKeyNameChr(*name, true, isKeyName))
+        return false;
+    ++name;
+    while ('\0' != *name)
+    {
+        bool lastChar = ('\0' == *(name+1));
+        if (!isValidSecretOrKeyNameChr(*name, lastChar, isKeyName))
+            return false;
+        ++name;
+    }
     return true;
 }
 
-MODULE_EXIT()
+static void validateCategoryName(const char *category)
 {
-    vaultManager.clear();
-    secretCache.clear();
+    if (!isValidSecretOrKeyName(category, true))
+      throw makeStringExceptionV(JLIBERR_SystemInvalidSecretCategoryS, "Invalid secret category %s", category);
 }
 
-static void splitUrlAddress(const char *address, size_t len, StringBuffer &host, StringBuffer *port)
+static void validateSecretNameNotEmpty(const char *name)
+{
+    if (isEmptyString(name))
+        throw makeStringExceptionV(JLIBERR_SystemInvalidSecretNameS, "Invalid secret name %s", name);
+}
+
+static void validateKeyName(const char *key)
+{
+    if (!isValidSecretOrKeyName(key, true))
+      throw makeStringExceptionV(JLIBERR_SystemInvalidSecretKeyNameS, "Invalid secret key name %s", key);
+}
+
+static bool isUnsignedInteger(const char *value)
+{
+    if (isEmptyString(value))
+        return false;
+    for (const char *cur = value; *cur; ++cur)
+    {
+        if (!isdigit(*cur))
+            return false;
+    }
+    return true;
+}
+
+static void splitUrlAddress(const char *address, size_t len, StringBuffer &host, StringBuffer &port)
 {
     if (!address || len==0)
         return;
@@ -93,14 +192,11 @@ static void splitUrlAddress(const char *address, size_t len, StringBuffer &host,
     {
         host.append(sep - address, address);
         len = len - (sep - address) - 1;
-        if (port)
-            port->append(len, sep+1);
-        else
-            host.append(':').append(len, sep+1);
+        port.append(len, sep+1);
     }
 }
 
-static void splitUrlAuthority(const char *authority, size_t authorityLen, StringBuffer &user, StringBuffer &password, StringBuffer &host, StringBuffer *port)
+static void splitUrlAuthority(const char *authority, size_t authorityLen, StringBuffer &user, StringBuffer &password, StringBuffer &host, StringBuffer &port)
 {
     if (!authority || authorityLen==0)
         return;
@@ -123,10 +219,18 @@ static void splitUrlAuthority(const char *authority, size_t authorityLen, String
     }
 }
 
+static void splitUrlAuthorityHostPort(const char *authority, size_t authorityLen, StringBuffer &user, StringBuffer &password, StringBuffer &hostPort)
+{
+    StringBuffer port;
+    splitUrlAuthority(authority, authorityLen, user, password, hostPort, port);
+    if (port.length())
+        hostPort.append(':').append(port);
+}
+
 static inline void extractUrlProtocol(const char *&url, StringBuffer *scheme)
 {
     if (!url)
-        throw makeStringException(-1, "Invalid empty URL");
+        throw makeStringException(JLIBERR_SystemInvalidEmptyUrl, "Invalid empty URL");
     if (0 == strnicmp(url, "HTTPS://", 8))
     {
         url+=8;
@@ -140,7 +244,7 @@ static inline void extractUrlProtocol(const char *&url, StringBuffer *scheme)
             scheme->append("http://");
     }
     else
-        throw MakeStringException(-1, "Invalid URL, protocol not recognized %s", url);
+        throw MakeStringException(JLIBERR_SystemInvalidUrlProtocolNotRecognizedS, "Invalid URL, protocol not recognized %s", url);
 }
 
 static void splitUrlSections(const char *url, const char * &authority, size_t &authorityLen, StringBuffer &fullpath, StringBuffer *scheme)
@@ -153,7 +257,8 @@ static void splitUrlSections(const char *url, const char * &authority, size_t &a
     else
     {
         authorityLen = path-url;
-        fullpath.append(path);
+        if (!streq(path, "/")) // treat empty trailing path as equal to no path
+            fullpath.append(path);
     }
 }
 
@@ -162,7 +267,7 @@ extern jlib_decl void splitFullUrl(const char *url, StringBuffer &user, StringBu
     const char *authority = nullptr;
     size_t authorityLen = 0;
     splitUrlSections(url, authority, authorityLen, path, nullptr);
-    splitUrlAuthority(authority, authorityLen, user, password, host, &port);
+    splitUrlAuthority(authority, authorityLen, user, password, host, port);
 }
 
 extern jlib_decl void splitUrlSchemeHostPort(const char *url, StringBuffer &user, StringBuffer &password, StringBuffer &schemeHostPort, StringBuffer &path)
@@ -170,28 +275,107 @@ extern jlib_decl void splitUrlSchemeHostPort(const char *url, StringBuffer &user
     const char *authority = nullptr;
     size_t authorityLen = 0;
     splitUrlSections(url, authority, authorityLen, path, &schemeHostPort);
-    splitUrlAuthority(authority, authorityLen, user, password, schemeHostPort, nullptr);
+    splitUrlAuthorityHostPort(authority, authorityLen, user, password, schemeHostPort);
+}
+
+extern jlib_decl void splitUrlIsolateScheme(const char *url, StringBuffer &user, StringBuffer &password, StringBuffer &scheme, StringBuffer &host, StringBuffer &port, StringBuffer &path)
+{
+    const char *authority = nullptr;
+    size_t authorityLen = 0;
+    splitUrlSections(url, authority, authorityLen, path, &scheme);
+    splitUrlAuthority(authority, authorityLen, user, password, host, port);
+}
+
+
+static StringBuffer &replaceExtraHostAndPortChars(StringBuffer &s)
+{
+    size_t l = s.length();
+    for (size_t i = 0; i < l; i++)
+    {
+        if (s.charAt(i) == '.' || s.charAt(i) == ':')
+            s.setCharAt(i, '-');
+    }
+    return s;
+}
+
+
+extern jlib_decl StringBuffer &generateDynamicUrlSecretName(StringBuffer &secretName, const char *scheme, const char *userPasswordPair, const char *host, unsigned port, const char *path)
+{
+    secretName.set("http-connect-");
+    //Having the host and port visible will help with manageability wherever the secret is stored
+    if (scheme)
+    {
+        if (!strnicmp("http", scheme, 4))
+        {
+            if ('s' == scheme[4])
+            {
+                if (443 == port)
+                    port = 0; // suppress default port, such that with or without, the generated secret name will be the same
+                secretName.append("ssl-");
+            }
+            else if (':' == scheme[4])
+            {
+                if (80 == port)
+                    port = 0; // suppress default port, such that with or without, the generated secret name will be the same
+            }
+        }
+    }
+    secretName.append(host);
+    //port is optionally already part of host
+    replaceExtraHostAndPortChars(secretName);
+    if (port)
+        secretName.append('-').append(port);
+    //Path and username are both sensitive and shouldn't be accessible in the name, include both in the hash to give us the uniqueness we need
+    unsigned hashvalue = 0;
+    if (!isEmptyString(path))
+        hashvalue = hashcz((const unsigned char *)path, hashvalue);
+    if (!isEmptyString(userPasswordPair))
+    {
+        const char *delim = strchr(userPasswordPair, ':');
+        //Make unique for a given username, but not the current password.  The pw provided could change but what's in the secret (if there is one) wins
+        if (delim)
+            hashvalue = hashc((const unsigned char *)userPasswordPair, delim-userPasswordPair, hashvalue);
+        else
+            hashvalue = hashcz((const unsigned char *)userPasswordPair, hashvalue);
+    }
+    if (hashvalue)
+        secretName.appendf("-%x", hashvalue);
+    return secretName;
+}
+
+extern jlib_decl StringBuffer &generateDynamicUrlSecretName(StringBuffer &secretName, const char *url, const char *inputUsername)
+{
+    StringBuffer username;
+    StringBuffer urlPassword;
+    StringBuffer scheme;
+    StringBuffer host;
+    StringBuffer port;
+    StringBuffer path;
+    splitUrlIsolateScheme(url, username, urlPassword, scheme, host, port, path);
+    if (!isEmptyString(inputUsername))
+        username.set(inputUsername);
+    unsigned portNum = port.length() ? atoi(port) : 0;
+    return generateDynamicUrlSecretName(secretName, scheme, username, host, portNum, path);
 }
 
 //---------------------------------------------------------------------------------------------------------------------
 
-
 static StringBuffer secretDirectory;
-static CriticalSection secretCS;
+static CriticalSection secretCS(SYNC_LOCATION);
 
 //there are various schemes for renewing kubernetes secrets and they are likely to vary greatly in how often
 //  a secret gets updated this timeout determines the maximum amount of time before we'll pick up a change
 //  10 minutes for now we can change this as we gather more experience and user feedback
-static unsigned secretTimeoutMs = 10 * 60 * 1000;
+static unsigned __int64 secretTimeoutNs = 10 * 60 * 1000000000LL;
 
 extern jlib_decl unsigned getSecretTimeout()
 {
-    return secretTimeoutMs;
+    return secretTimeoutNs / 1000000;
 }
 
 extern jlib_decl void setSecretTimeout(unsigned timeoutMs)
 {
-    secretTimeoutMs = timeoutMs;
+    secretTimeoutNs = (unsigned __int64)timeoutMs * 1000000;
 }
 
 extern jlib_decl void setSecretMount(const char * path)
@@ -205,168 +389,1191 @@ extern jlib_decl void setSecretMount(const char * path)
         secretDirectory.set(path);
 }
 
-static inline bool checkSecretExpired(unsigned created)
+static const char *ensureSecretDirectory()
 {
-    if (!created)
-        return false;
-    unsigned age = msTick() - created;
-    return age > getSecretTimeout();
+    CriticalBlock block(secretCS);
+    if (secretDirectory.isEmpty())
+        setSecretMount(nullptr);
+    return secretDirectory;
 }
+
+static StringBuffer &buildSecretPath(StringBuffer &path, const char *category, const char * name)
+{
+    return addPathSepChar(path.append(ensureSecretDirectory())).append(category).append(PATHSEPCHAR).append(name).append(PATHSEPCHAR);
+}
+
+
+enum class VaultAuthType {unknown, k8s, appRole, token, clientcert};
+
+static void setTimevalMS(timeval &tv, time_t ms)
+{
+    if (!ms)
+        tv = {0, 0};
+    else
+    {
+        tv.tv_sec = ms / 1000;
+        tv.tv_usec = (ms % 1000)*1000;
+    }
+}
+
+static bool isEmptyTimeval(const timeval &tv)
+{
+    return (tv.tv_sec==0 && tv.tv_usec==0);
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+//The secret key has the form category/name[@vaultId][#version]
+
+static std::string buildSecretKey(const char * category, const char * name, const char * optVaultId, const char * optVersion)
+{
+    std::string key;
+    key.append(category).append("/").append(name);
+    if (optVaultId)
+        key.append("@").append(optVaultId);
+    if (optVersion)
+        key.append("#").append(optVersion);
+    return key;
+}
+
+static void expandSecretKey(std::string & category, std::string & name, std::string & optVaultId, std::string & optVersion, const char * key)
+{
+    const char * slash = strchr(key, '/');
+    assertex(slash);
+    const char * at = strchr(slash, '@');
+    const char * hash = strchr(slash, '#');
+
+    const char * end = nullptr;
+    if (hash)
+    {
+        optVersion.assign(hash+1);
+        end = hash;
+    }
+    if (at)
+    {
+        if (end)
+            optVaultId.assign(at+1, end-at-1);
+        else
+            optVaultId.assign(at+1);
+        end = at;
+    }
+    if (end)
+        name.assign(slash+1, end-slash-1);
+    else
+        name.assign(slash+1);
+    category.assign(key, slash-key);
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+//Represents an entry in the secret cache.  Once created it is always used for the secret.
+using cache_timestamp = unsigned __int64;
+using cache_timestamp_diff = __int64;
+inline cache_timestamp getCacheTimestamp() { return nsTick(); }
+
+class SecretCacheEntry : public CInterface
+{
+    friend class SecretCache;
+
+public:
+    //A cache entry is initally created that has a create and access,and check time of now
+    SecretCacheEntry(cache_timestamp _now, const char * _secretKey)
+    : secretKey(_secretKey), contentTimestamp(_now), accessedTimestamp(_now), checkedTimestamp(_now)
+    {
+    }
+
+    unsigned getHash() const
+    {
+        return contentHash;
+    }
+
+    void getSecretOptions(std::string & category, std::string & name, std::string & optVaultId, std::string & optVersion)
+    {
+        expandSecretKey(category, name, optVaultId, optVersion, secretKey.c_str());
+    }
+
+    // We should never replace known contents for unknown contents
+    // so once this returns true it should always return true
+    bool hasContents() const
+    {
+        return contents != nullptr;
+    }
+
+    //Has the secret value been used since it was last checked for an update?
+    bool isActive() const
+    {
+        return (cache_timestamp_diff)(accessedTimestamp - checkedTimestamp) >= 0;
+    }
+
+    //Is the secret potentially out of date?
+    bool isStale() const
+    {
+        cache_timestamp now = getCacheTimestamp();
+        cache_timestamp elapsed = (now - contentTimestamp);
+        return (elapsed > secretTimeoutNs);
+    }
+
+    // Is it time to check if there is a new value for this secret?
+    bool needsRefresh(cache_timestamp now) const
+    {
+        if (!initialized)
+            return true;
+        cache_timestamp elapsed = (now - checkedTimestamp);
+        return (elapsed > secretTimeoutNs);
+    }
+
+    void noteAccessed(cache_timestamp now)
+    {
+        accessedTimestamp = now;
+    }
+
+    void noteFailedUpdate(cache_timestamp now, bool accessed)
+    {
+        //Update the checked timestamp - so that we do not continually check for updates to secrets which
+        //are stale because the vault or other source of values in inaccessible.
+        //Keep using the last good value
+        initialized = true;
+        checkedTimestamp = now;
+        if (accessed)
+            accessedTimestamp = now;
+    }
+
+    const char * queryTraceName() const { return secretKey.c_str(); }
+
+    //The following functions can only be called from member functions of SecretCache
+private:
+    void updateContents(IPropertyTree * _contents, cache_timestamp now, bool accessed)
+    {
+        initialized = true;
+        contents.set(_contents);
+        updateHash();
+        contentTimestamp = now;
+        checkedTimestamp = now;
+        if (accessed)
+            accessedTimestamp = now;
+    }
+
+    void updateHash()
+    {
+        if (contents)
+            contentHash = getPropertyTreeHash(*contents, 0x811C9DC5);
+        else
+            contentHash = 0;
+    }
+private:
+    const std::string secretKey; // Duplicate of the key used to find this entry in the cache
+    Linked<IPropertyTree> contents;// Can only be accessed when SecretCache::cs is held
+    cache_timestamp contentTimestamp = 0;  // When was this secret read from disk/vault
+    cache_timestamp accessedTimestamp = 0; // When was this secret last accessed?
+    cache_timestamp checkedTimestamp = 0;  // When was this last checked for updates?
+    unsigned contentHash = 0;
+    bool initialized = false;
+};
+
+
+// A cache of (secret[:version] to a secret cache entry)
+// Once a hash table entry has been created for a secret it is never removed and the associated
+// value is never replaced.  This means it is safe to keep a pointer to the entry in another class.
+class SecretCache
+{
+public:
+    const IPropertyTree * getContents(SecretCacheEntry * match)
+    {
+        //Return contents within the critical section so no other thread can modify it
+        CriticalBlock block(cs);
+        return LINK(match->contents);
+    }
+
+    //Check to see if a secret exists, and if not add a null entry that has expired.
+    SecretCacheEntry * getSecret(const std::string & secretKey, cache_timestamp now, bool & isNewEntry)
+    {
+        SecretCacheEntry * result;
+        isNewEntry = false;
+        CriticalBlock block(cs);
+        auto match = secrets.find(secretKey);
+        if (match != secrets.cend())
+        {
+            result = match->second.get();
+            result->accessedTimestamp = now;
+        }
+        else
+        {
+            //Insert an entry with a null value
+            result = new SecretCacheEntry(now, secretKey.c_str());
+            secrets.emplace(secretKey, result);
+            isNewEntry = true;
+        }
+        return result;
+    }
+
+
+    void gatherPendingRefresh(std::vector<SecretCacheEntry *> & pending, cache_timestamp when)
+    {
+        CriticalBlock block(cs);
+        for (auto & entry : secrets)
+        {
+            SecretCacheEntry * secret = entry.second.get();
+            //Only refresh secrets that have been used since the last time they were refreshed, otherwise the vault
+            //may be overloaed with unnecessary requests - since secrets are never removed from the hash table.
+            if (secret->isActive() && secret->needsRefresh(when))
+                pending.push_back(secret);
+        }
+    }
+
+    void updateSecret(SecretCacheEntry * match, IPropertyTree * value, cache_timestamp now, bool accessed)
+    {
+        CriticalBlock block(cs);
+        match->updateContents(value, now, accessed);
+    }
+
+private:
+    CriticalSection cs{SYNC_LOCATION};
+    std::unordered_map<std::string, std::unique_ptr<SecretCacheEntry>> secrets;
+};
+
+//---------------------------------------------------------------------------------------------------------------------
 
 class CVault
 {
-private:
-    bool useKubernetesAuth = true;
-    CVaultKind kind;
-    CriticalSection vaultCS;
-    Owned<IPropertyTree> cache;
+public:
+    virtual ~CVault() = default;
+    virtual IPropertyTree *requestSecret(const char *secret, const char *version) = 0;
 
+    CVaultKind getVaultKind() const { return kind; }
+    VaultType getVaultType() const { return vaultType; }
+
+    // Static helper to extract and prepare namespace from config
+    static StringAttr prepareNamespace(const IPropertyTree *vault, bool stripLeadingSlash=false)
+    {
+        StringBuffer ns;
+        ns.set(vault->queryProp("@namespace"));
+        if (stripLeadingSlash)
+        {
+            while (ns.length() && ns.charAt(0) == '/')
+                ns.remove(0, 1);
+        }
+        if (ns.length())
+            addPathSepChar(ns, '/');
+
+        return StringAttr(ns.str());
+    }
+
+protected:
+    enum class SecretFetchStatus
+    {
+        success,
+        authFailure,
+        notFound,
+        failure
+    };
+
+    CVault(const IPropertyTree *vault, VaultType _vaultType, CVaultKind vaultKind, const char *namespace_prepared = nullptr)
+    {
+        category.appendLower(vault->queryName());
+
+        StringBuffer url;
+        replaceEnvVariables(url, vault->queryProp("@url"), false);
+        PROGLOG("vault url %s", url.str());
+        if (url.length())
+            splitUrlSchemeHostPort(url.str(), username, password, schemeHostPort, path);
+
+        if (username.length() || password.length())
+            WARNLOG("vault: unexpected use of basic auth in url, user=%s", username.str());
+
+        name.set(vault->queryProp("@name"));
+
+        // Vault type and kind are fixed by derived class.
+        vaultType = _vaultType;
+        kind = vaultKind;
+
+        // namespace is prepared and passed in by derived class
+        if (!isEmptyString(namespace_prepared))
+            vaultNamespace.set(namespace_prepared);
+        verify_server = vault->getPropBool("@verify_server", true);
+        retries = (unsigned) vault->getPropInt("@retries", retries);
+        retryWait = (unsigned) vault->getPropInt("@retryWait", retryWait);
+
+        if (vault->hasProp("@backoffTimeout"))
+            backoffTimeoutUs = vault->getPropInt64("@backoffTimeout") * 1000ULL;
+
+        setTimevalMS(connectTimeout, (time_t) vault->getPropInt("@connectTimeout"));
+        setTimevalMS(readTimeout, (time_t) vault->getPropInt("@readTimeout"));
+        setTimevalMS(writeTimeout, (time_t) vault->getPropInt("@writeTimeout"));
+
+        PROGLOG("Vault: httplib verify_server=%s", boolToStr(verify_server));
+    }
+
+    void initHttpClient(httplib::Client &cli, httplib::Headers &headers, unsigned &numRetries)
+    {
+        numRetries = retries;
+        cli.enable_server_certificate_verification(verify_server);
+        if (!isEmptyTimeval(connectTimeout))
+            cli.set_connection_timeout(connectTimeout.tv_sec, connectTimeout.tv_usec);
+        if (!isEmptyTimeval(readTimeout))
+            cli.set_read_timeout(readTimeout.tv_sec, readTimeout.tv_usec);
+        if (!isEmptyTimeval(writeTimeout))
+            cli.set_write_timeout(writeTimeout.tv_sec, writeTimeout.tv_usec);
+        if (username.length() && password.length())
+            cli.set_basic_auth(username, password);
+    }
+
+    void throwAuthError(const char *authType, const char *msg)
+    {
+        Owned<IException> e = makeStringExceptionV(JLIBERR_SystemVaultSSAuthErrorS, "Vault [%s] %s auth error %s", name.str(), authType, msg);
+        OERRLOG(e);
+        throw e.getClear();
+    }
+
+    void throwAuthErrorV(const char *authType, const char* format, ...) __attribute__((format(printf, 3, 4)))
+    {
+        va_list args;
+        va_start(args, format);
+        StringBuffer msg;
+        msg.valist_appendf(format, args);
+        va_end(args);
+        throwAuthError(authType, msg);
+    }
+
+protected:
+    CVaultKind kind;
+    VaultType vaultType = VaultType::hashicorp;
+    CriticalSection vaultCS{SYNC_LOCATION};
+    StringBuffer category;
     StringBuffer schemeHostPort;
     StringBuffer path;
+    StringBuffer vaultNamespace;
     StringBuffer username;
     StringBuffer password;
     StringAttr name;
-    StringAttr role;
-    StringAttr token;
+    bool verify_server = true;
+    unsigned retries = 3;
+    unsigned retryWait = 1000;
+    timestamp_type backoffTimeoutUs = 0; // Default to no backoff
+    std::atomic<timestamp_type> backoffFailureTs{0};
+    timeval connectTimeout = {0, 0};
+    timeval readTimeout = {0, 0};
+    timeval writeTimeout = {0, 0};
+};
+
+class CHashicorpVault final : public CVault
+{
+private:
+    VaultAuthType authType = VaultAuthType::unknown;
+    std::string clientCertPath;
+    std::string clientKeyPath;
+
+    StringAttr authRole; //authRole is used by kubernetes and client cert auth, it's not part of appRole auth
+    StringAttr appRoleId;
+    StringBuffer appRoleSecretName;
+
+    StringBuffer clientToken;
+    time_t clientTokenExpiration = 0;
+    bool clientTokenRenewable = false;
 
 public:
-    CVault(IPropertyTree *vault)
+    CHashicorpVault(const IPropertyTree *vault, CVaultKind vaultKind)
+        : CVault(vault, VaultType::hashicorp, vaultKind, CVault::prepareNamespace(vault))
     {
-        cache.setown(createPTree());
-        StringBuffer url;
-        replaceEnvVariables(url, vault->queryProp("@url"), false);
-        if (url.length())
-            splitUrlSchemeHostPort(url.str(), username, password, schemeHostPort, path);
-        name.set(vault->queryProp("@name"));
-        kind = getSecretType(vault->queryProp("@kind"));
-        if (vault->hasProp("@role"))
-            role.set(vault->queryProp("@role"));
-        else
-            role.set("hpcc-vault-access");
-        if (vault->hasProp("@client-secret"))
+        StringBuffer clientTlsPath;
+        buildSecretPath(clientTlsPath, "certificates", "vaultclient");
+
+        clientCertPath.append(clientTlsPath.str()).append(category.str()).append("/tls.crt");
+        clientKeyPath.append(clientTlsPath.str()).append(category.str()).append("/tls.key");
+
+        if (!checkFileExists(clientCertPath.c_str()))
+            WARNLOG("vault: client cert not found, %s", clientCertPath.c_str());
+        if (!checkFileExists(clientKeyPath.c_str()))
+            WARNLOG("vault: client key not found, %s", clientKeyPath.c_str());
+
+        //set up vault client auth [appRole, clientToken (aka "token from the sky"), or kubernetes auth]
+        appRoleId.set(vault->queryProp("@appRoleId"));
+        if (appRoleId.length())
         {
-            useKubernetesAuth = false;
-            //for now only support direct access token.  we can support other combinations for example login token, ldap login, etc later.
-            Owned<IPropertyTree> clientSecret = getLocalSecret("system", vault->queryProp("@client-secret"));
+            authType = VaultAuthType::appRole;
+            if (vault->hasProp("@appRoleSecret"))
+                appRoleSecretName.set(vault->queryProp("@appRoleSecret"));
+            if (appRoleSecretName.isEmpty())
+                appRoleSecretName.set("appRoleSecret");
+        }
+        else if (vault->hasProp("@client-secret"))
+        {
+            Owned<const IPropertyTree> clientSecret = getLocalSecret("system", vault->queryProp("@client-secret"));
             if (clientSecret)
-                token.set(clientSecret->queryProp("token"));
-        }
-    }
-    CVaultKind getVaultKind() const { return kind; }
-    void kubernetesLogin()
-    {
-        CriticalBlock block(vaultCS);
-        if (token.length())
-            return;
-        StringBuffer login_token;
-        login_token.loadFile("/var/run/secrets/kubernetes.io/serviceaccount/token");
-        if (login_token.length())
-        {
-            std::string json;
-            json.append("{\"jwt\": \"").append(login_token.str()).append("\", \"role\": \"").append(role.str()).append("\"}");
-            httplib::Client cli(schemeHostPort.str());
-            if (username.length() && password.length())
-                cli.set_basic_auth(username, password);
-            httplib::Result res = cli.Post("/v1/auth/kubernetes/login", json, "application/json");
-            if (res)
             {
-                if (res->status == 200)
+                StringBuffer tokenText;
+                // NOTE: Token is loaded once at construction from filesystem (via getLocalSecret() which reads Kubernetes-mounted secrets).
+                // The secret is NOT re-read on every request; instead it is cached in clientToken.
+                // If using Kubernetes secrets: kubelet automatically updates the mounted filesystem when the secret is rotated,
+                // but this code must detect the update via error responses. If using an externalized vault backend for client-secret,
+                // that backend would need to ensure the filesystem is updated when tokens rotate.
+                // Token rotation is detected via: (1) isClientTokenExpired() checking lease_duration (if available), or
+                // (2) a 403 permission denied error triggering relogin via checkAuthentication().
+                // Both mechanisms re-read the filesystem, picking up the new token.
+                if (getSecretKeyValue(clientToken, clientSecret, "token"))
                 {
-                    const char *response = res->body.c_str();
-                    if (!isEmptyString(response))
-                    {
-                        Owned<IPropertyTree> respTree = createPTreeFromJSONString(response);
-                        if (respTree)
-                            token.set(respTree->queryProp("auth/client_token"));
-                    }
-                }
-                else
-                {
-                    Owned<IException> e = MakeStringException(0, "Vault kube auth error [%d](%d) - vault: %s - response: %s", res->status, res.error(), name.str(), res->body.c_str());
-                    OWARNLOG(e);
-                    throw e.getClear();
+                    authType = VaultAuthType::token;
+                    PROGLOG("using a client token for vault auth");
                 }
             }
         }
-    }
-    bool getCachedSecret(CVaultKind &rkind, StringBuffer &content, const char *secret, const char *version)
-    {
-        CriticalBlock block(vaultCS);
-        IPropertyTree *tree = cache->queryPropTree(secret);
-        if (tree)
+        else if (vault->getPropBool("@useTLSCertificateAuth", false))
         {
-            VStringBuffer vername("v.%s", isEmptyString(version) ? "latest" : version);
-            IPropertyTree *envelope = tree->queryPropTree(vername);
-            if (!envelope)
-                return false;
-            if (checkSecretExpired((unsigned) envelope->getPropInt("@created")))
-            {
-                tree->removeTree(envelope);
-                return false;
-            }
-            const char *s = envelope->queryProp("");
-            if (!isEmptyString(s))
-            {
-                rkind = kind;
-                content.append(s);
-                return true;
-            }
+            authType = VaultAuthType::clientcert;
+            if (vault->hasProp("@role"))
+                authRole.set(vault->queryProp("@role"));
         }
-        return false;
-    }
-    void addCachedSecret(const char *content, const char *secret, const char *version)
-    {
-        VStringBuffer vername("v.%s", isEmptyString(version) ? "latest" : version);
-        Owned<IPropertyTree> envelope = createPTree(vername);
-        envelope->setPropInt("@created", (int) msTick());
-        envelope->setProp("", content);
+        else if (isContainerized())
         {
-            CriticalBlock block(vaultCS);
-            IPropertyTree *parent = ensurePTree(cache, secret);
-            parent->setPropTree(vername, envelope.getClear());
+            authType = VaultAuthType::k8s;
+            if (vault->hasProp("@role"))
+                authRole.set(vault->queryProp("@role"));
+            else
+                authRole.set("hpcc-vault-access");
+            PROGLOG("using kubernetes vault auth");
         }
     }
-    bool requestSecret(CVaultKind &rkind, StringBuffer &content, const char *secret, const char *version)
+
+    virtual IPropertyTree *requestSecret(const char *secret, const char *version) override
     {
         if (isEmptyString(secret))
-            return false;
-        if (useKubernetesAuth && token.isEmpty())
-            kubernetesLogin();
-        if (token.isEmpty())
-        {
-            Owned<IException> e = MakeStringException(0, "Vault auth error - vault: %s - vault access token not provided", name.str());
-            OERRLOG(e);
-            throw e.getClear();
-        }
+            return nullptr;
+
         StringBuffer location(path);
         location.replaceString("${secret}", secret);
         location.replaceString("${version}", version ? version : "1");
 
-        httplib::Client cli(schemeHostPort.str());
-        if (username.length() && password.length())
-            cli.set_basic_auth(username.str(), password.str());
+        StringBuffer content;
+        if (requestSecretAtLocation(content, location, secret, version, false) != SecretFetchStatus::success)
+            return nullptr;
 
-        httplib::Headers headers = {
-            { "X-Vault-Token", token.str() }
-        };
+        return parseHashicorpSecretResponse(content.str());
+    }
 
-        if (httplib::Result res = cli.Get(location, headers))
+private:
+    IPropertyTree *parseHashicorpSecretResponse(const char *content)
+    {
+        if (isEmptyString(content))
+            return nullptr;
+
+        Owned<IPropertyTree> tree;
+        try
         {
-            if (res->status == 200)
+            tree.setown(createPTreeFromJSONString(content));
+        }
+        catch (IException * e)
+        {
+            OERRLOG(e, "Failed to parse vault secret JSON response");
+            e->Release();
+            return nullptr;
+        }
+
+        // Extract data based on Hashicorp KV version
+        if (kind == CVaultKind::kv_v1)
+        {
+            return tree->getPropTree("data");
+        }
+        else if (kind == CVaultKind::kv_v2)
+        {
+            return tree->getPropTree("data/data");
+        }
+        else
+        {
+            return nullptr;
+        }
+    }
+    inline const char *queryAuthType()
+    {
+        switch (authType)
+        {
+            case VaultAuthType::appRole:
+                return "approle";
+            case VaultAuthType::k8s:
+                return "kubernetes";
+            case VaultAuthType::token:
+                return "token";
+            case VaultAuthType::clientcert:
+                return "clientcert";
+        }
+        return "unknown";
+    }
+    void buildClientHeaders(httplib::Headers &headers) const
+    {
+        if (vaultNamespace.length())
+            headers.emplace("X-Vault-Namespace", vaultNamespace.str());
+    }
+
+    void processClientTokenResponse(httplib::Result &res)
+    {
+        if (!res)
+            throwAuthErrorV(queryAuthType(), "login communication error %d", res.error());
+        if (res.error()!=0)
+            throwAuthErrorV(queryAuthType(), "JSECRETS login calling HTTPLIB POST returned error %d", res.error());
+        if (res->status != 200)
+            throwAuthErrorV(queryAuthType(), "[%d](%d) - response: %s", res->status, res.error(), res->body.c_str());
+        const char *json = res->body.c_str();
+        if (isEmptyString(json))
+            throwAuthError(queryAuthType(), "empty login response");
+
+        Owned<IPropertyTree> respTree;
+        try
+        {
+            respTree.setown(createPTreeFromJSONString(json));
+        }
+        catch (IException *e)
+        {
+            StringBuffer msg("parsing JSON response: ");
+            e->errorMessage(msg);
+            e->Release();
+            throwAuthError(queryAuthType(), msg.str());
+        }
+        const char *token = respTree->queryProp("auth/client_token");
+        if (isEmptyString(token))
+            throwAuthError(queryAuthType(), "response missing client_token");
+
+        clientToken.set(token);
+        clientTokenRenewable = respTree->getPropBool("auth/renewable");
+        unsigned lease_duration = respTree->getPropInt("auth/lease_duration");
+        if (lease_duration==0)
+            clientTokenExpiration = 0;
+        else
+            clientTokenExpiration = time(nullptr) + lease_duration;
+        PROGLOG("VAULT TOKEN duration=%d", lease_duration);
+    }
+    bool isClientTokenExpired()
+    {
+        if (clientTokenExpiration==0)
+            return false;
+
+        double remaining = difftime(clientTokenExpiration, time(nullptr));
+        if (remaining <= 0)
+        {
+            PROGLOG("vault auth client token expired");
+            return true;
+        }
+        //TBD check renewal
+        return false;
+    }
+
+    //if we tried to use our token and it returned access denied it could be that we need to login again, or
+    //  perhaps it could be specific permissions about the secret that was being accessed, I don't think we can tell the difference
+    void kubernetesLogin(bool permissionDenied)
+    {
+        CriticalBlock block(vaultCS);
+        if (!permissionDenied && (clientToken.length() && !isClientTokenExpired()))
+            return;
+        DBGLOG("kubernetesLogin%s", permissionDenied ? " because existing token permission denied" : "");
+        StringBuffer login_token;
+        login_token.loadFile("/var/run/secrets/kubernetes.io/serviceaccount/token");
+        if (login_token.isEmpty())
+            throwAuthError(queryAuthType(), "missing k8s auth token");
+
+        std::string json;
+        json.append("{\"jwt\": \"").append(login_token.str()).append("\", \"role\": \"").append(authRole.str()).append("\"}");
+        httplib::Client cli(schemeHostPort.str());
+        httplib::Headers headers;
+        buildClientHeaders(headers);
+
+        unsigned numRetries = 0;
+        initHttpClient(cli, headers, numRetries);
+        httplib::Result res = cli.Post("/v1/auth/kubernetes/login", headers, json, "application/json");
+        while (!res && numRetries > 0)
+        {
+            OERRLOG("Retrying vault %s kubernetes auth, communication error %d", name.str(), res.error());
+            if (retryWait)
+                Sleep(retryWait);
+            numRetries--;
+            res = cli.Post("/v1/auth/kubernetes/login", headers, json, "application/json");
+        }
+
+        processClientTokenResponse(res);
+    }
+
+    void clientCertLogin(bool permissionDenied)
+    {
+        CriticalBlock block(vaultCS);
+        if (!permissionDenied && (clientToken.length() && !isClientTokenExpired()))
+            return;
+        DBGLOG("clientCertLogin%s", permissionDenied ? " because existing token permission denied" : "");
+
+        std::string json;
+        json.append("{\"name\": \"").append(authRole.str()).append("\"}"); //name can be empty but that is inefficient because vault would have to search for the cert being used
+
+        httplib::Client cli(schemeHostPort.str(), clientCertPath, clientKeyPath);
+        httplib::Headers headers;
+        buildClientHeaders(headers);
+
+        unsigned numRetries = 0;
+        initHttpClient(cli, headers, numRetries);
+        httplib::Result res = cli.Post("/v1/auth/cert/login", headers, json, "application/json");
+        while (!res && numRetries > 0)
+        {
+            OERRLOG("Retrying vault %s client cert auth, communication error %d", name.str(), res.error());
+            if (retryWait)
+                Sleep(retryWait);
+            numRetries--;
+            res = cli.Post("/v1/auth/cert/login", headers, json, "application/json");
+        }
+
+        processClientTokenResponse(res);
+    }
+
+    //if we tried to use our token and it returned access denied it could be that we need to login again, or
+    //  perhaps it could be specific permissions about the secret that was being accessed, I don't think we can tell the difference
+    void appRoleLogin(bool permissionDenied)
+    {
+        CriticalBlock block(vaultCS);
+        if (!permissionDenied && (clientToken.length() && !isClientTokenExpired()))
+            return;
+        DBGLOG("appRoleLogin%s", permissionDenied ? " because existing token permission denied" : "");
+        StringBuffer appRoleSecretId;
+        Owned<const IPropertyTree> appRoleSecret = getLocalSecret("system", appRoleSecretName);
+        if (!appRoleSecret)
+            throwAuthErrorV(queryAuthType(), "appRole secret %s not found", appRoleSecretName.str());
+        else if (!getSecretKeyValue(appRoleSecretId, appRoleSecret, "secret-id"))
+            throwAuthErrorV(queryAuthType(), "appRole secret id not found at '%s/secret-id'", appRoleSecretName.str());
+        if (appRoleSecretId.isEmpty())
+            throwAuthError(queryAuthType(), "missing app-role-secret-id");
+
+        std::string json;
+        json.append("{\"role_id\": \"").append(appRoleId).append("\", \"secret_id\": \"").append(appRoleSecretId).append("\"}");
+
+        httplib::Client cli(schemeHostPort.str());
+        httplib::Headers headers;
+        buildClientHeaders(headers);
+
+        unsigned numRetries = 0;
+        initHttpClient(cli, headers, numRetries);
+        httplib::Result res = cli.Post("/v1/auth/approle/login", headers, json, "application/json");
+        while (!res && numRetries > 0)
+        {
+            OERRLOG("Retrying vault %s appRole auth, communication error %d", name.str(), res.error());
+            if (retryWait)
+                Sleep(retryWait);
+            numRetries--;
+            res = cli.Post("/v1/auth/approle/login", headers, json, "application/json");
+        }
+
+        processClientTokenResponse(res);
+    }
+    void checkAuthentication(bool permissionDenied)
+    {
+        if (authType == VaultAuthType::appRole)
+            appRoleLogin(permissionDenied);
+        else if (authType == VaultAuthType::k8s)
+            kubernetesLogin(permissionDenied);
+        else if (authType == VaultAuthType::clientcert)
+            clientCertLogin(permissionDenied);
+        else if (permissionDenied && authType == VaultAuthType::token)
+            throwAuthError(queryAuthType(), "token permission denied"); //don't permanently invalidate token. Try again next time because it could be permissions for a particular secret rather than invalid token
+        if (clientToken.isEmpty())
+            throwAuthError(queryAuthType(), "no vault access token");
+    }
+    SecretFetchStatus requestSecretAtLocation(StringBuffer &content, const char *location, const char *secretCacheKey, const char *version, bool permissionDenied)
+    {
+        //If a previous request failed, then do not retry until backoffTimeoutUs has passed.
+        if (backoffFailureTs)
+        {
+            if (getTimeStampNowValue() - backoffFailureTs < backoffTimeoutUs)
+                return SecretFetchStatus::failure;
+
+            //Clear the last failure - to avoid the check on the timestamp.
+            backoffFailureTs = 0;
+        }
+
+        bool backoff = false;
+        try
+        {
+            checkAuthentication(permissionDenied);
+            if (isEmptyString(location))
             {
-                rkind = kind;
-                content.append(res->body.c_str());
-                addCachedSecret(content.str(), secret, version);
-                return true;
+                OERRLOG("Vault %s cannot get secret at location without a location", name.str());
+                return SecretFetchStatus::failure;
+            }
+
+            httplib::Client cli(schemeHostPort.str());
+            httplib::Headers headers = {
+                { "X-Vault-Token", clientToken.str() }
+            };
+            buildClientHeaders(headers);
+
+            unsigned numRetries = 0;
+            initHttpClient(cli, headers, numRetries);
+            httplib::Result res = cli.Get(location, headers);
+            while (!res && numRetries > 0)
+            {
+                OERRLOG("Retrying vault %s get secret, communication error %d location %s", name.str(), res.error(), location);
+                if (retryWait)
+                    Sleep(retryWait);
+                numRetries--;
+                res = cli.Get(location, headers);
+            }
+
+            if (res)
+            {
+                if (res->status == 200)
+                {
+                    content.append(res->body.c_str());
+                    return SecretFetchStatus::success;
+                }
+                else if (res->status == 403)
+                {
+                    //try again forcing relogin, but only once.  Just in case the token was invalidated but hasn't passed expiration time (for example max usage count exceeded).
+                    if (permissionDenied==false)
+                        return requestSecretAtLocation(content, location, secretCacheKey, version, true);
+                    OERRLOG("Vault %s permission denied accessing secret (check namespace=%s?) %s.%s location %s [%d](%d) - response: %s", name.str(), vaultNamespace.str(), secretCacheKey, version ? version : "", location, res->status, res.error(), res->body.c_str());
+                    return SecretFetchStatus::authFailure;
+                }
+                else if (res->status == 404)
+                {
+                    OERRLOG("Vault %s secret not found %s.%s location %s", name.str(), secretCacheKey, version ? version : "", location);
+                    return SecretFetchStatus::notFound;
+                }
+                else
+                {
+                    OERRLOG("Vault %s error accessing secret %s.%s location %s [%d](%d) - response: %s", name.str(), secretCacheKey, version ? version : "", location, res->status, res.error(), res->body.c_str());
+                    return SecretFetchStatus::failure;
+                }
             }
             else
             {
-                DBGLOG("Vault %s error accessing secret %s.%s [%d](%d) - response: %s", name.str(), secret, version ? version : "", res->status, res.error(), res->body.c_str());
+                OERRLOG("Error: Vault %s http error (%d) accessing secret %s.%s location %s", name.str(), res.error(), secretCacheKey, version ? version : "", location);
+                return SecretFetchStatus::failure;
             }
         }
-        return false;
+        catch (IException * e)
+        {
+            backoff = true;
+            OERRLOG(e);
+            e->Release();
+        }
+
+        //If authentication failed (or another serious error), then record when that failure occurred
+        if (backoff && backoffTimeoutUs)
+            backoffFailureTs = getTimeStampNowValue();
+
+        return SecretFetchStatus::failure;
     }
 };
+
+class CAkeylessVault final : public CVault
+{
+private:
+    StringBuffer accessId;
+    StringBuffer accessKey;
+    StringBuffer accessType;
+    StringBuffer clientToken;
+    unsigned clientTokenIssuedTick = 0;
+    unsigned clientTokenTtlMs = 0; // 0 = no expiry known or indefinite TTL
+    StringAttr accessKeySecretName;  // Name of K8s secret containing access-key (for rotation support)
+
+    // Build the full secret name by prefixing with namespace if present
+    void buildFullSecretName(StringBuffer &fullName, const char *secretName)
+    {
+        // Remove leading '/' from secret name to match local secret naming conventions
+        const char *normalizedSecretName = secretName;
+        while (*normalizedSecretName == '/')
+            normalizedSecretName++;
+
+        if (vaultNamespace.length())
+        {
+            fullName.append(vaultNamespace.str());
+            fullName.append(normalizedSecretName);
+        }
+        else
+        {
+            fullName.append(normalizedSecretName);
+        }
+    }
+
+public:
+    CAkeylessVault(const IPropertyTree *vault, CVaultKind vaultKind)
+        : CVault(vault, VaultType::akeyless, vaultKind, CVault::prepareNamespace(vault, true))
+    {
+        const char *accessIdProp = vault->queryProp("@accessId");
+        if (!isEmptyString(accessIdProp))
+            replaceEnvVariables(accessId, accessIdProp, false);
+
+        const char *accessKeyProp = vault->queryProp("@accessKey");
+        if (!isEmptyString(accessKeyProp))
+            replaceEnvVariables(accessKey, accessKeyProp, false);
+
+        const char *accessTypeProp = vault->queryProp("@accessType");
+        if (!isEmptyString(accessTypeProp))
+            replaceEnvVariables(accessType, accessTypeProp, false);
+        if (accessType.isEmpty())
+            accessType.set("access_key");
+
+        if (vault->hasProp("@client-secret"))
+        {
+            // Store the secret name so we can re-read it when authentication is needed (to pick up rotations)
+            accessKeySecretName.set(vault->queryProp("@client-secret"));
+            PROGLOG("will read access key from client-secret '%s' for akeyless auth", accessKeySecretName.str());
+        }
+
+        if (accessId.isEmpty())
+            throwAuthError("akeyless", "missing accessId for akeyless auth");
+        if (accessKey.isEmpty() && accessKeySecretName.isEmpty())
+            throwAuthError("akeyless", "missing accessKey or client-secret for akeyless auth");
+    }
+
+    IPropertyTree *requestSecret(const char *secretName, const char *version) override
+    {
+        if (isEmptyString(secretName))
+            return nullptr;
+
+        //If a previous request failed, then do not retry until backoffTimeoutUs has passed.
+        if (backoffFailureTs)
+        {
+            if (getTimeStampNowValue() - backoffFailureTs < backoffTimeoutUs)
+                return nullptr;
+
+            //Clear the last failure - to avoid the check on the timestamp.
+            backoffFailureTs = 0;
+        }
+
+        // Construct the full secret name, prefixing with namespace if present
+        StringBuffer fullSecretName;
+        buildFullSecretName(fullSecretName, secretName);
+        PROGLOG("requesting akeyless secret %s", fullSecretName.str());
+
+        try
+        {
+            // Ensure we have a valid access token
+            StringBuffer accessToken;
+            getAccessToken(accessToken);
+            if (accessToken.isEmpty())
+                return nullptr;
+
+            // Make the initial request
+            StringBuffer response;
+            SecretFetchStatus fetchStatus = getSecretFromVault(response, fullSecretName.str(), version, accessToken.str());
+            if (fetchStatus == SecretFetchStatus::success)
+                return parseSecretResponse(response.str(), fullSecretName);
+
+            // Only retry with a fresh token on auth failures.
+            if (fetchStatus != SecretFetchStatus::authFailure)
+                return nullptr;
+
+            // On authentication failure, try once more with a fresh token
+            {
+                CriticalBlock block(vaultCS);
+                if (clientToken.length())
+                    clientToken.clear();
+            }
+            accessToken.clear();
+            getAccessToken(accessToken);
+            if (accessToken.isEmpty())
+                return nullptr;
+
+            response.clear();
+            if (getSecretFromVault(response, fullSecretName.str(), version, accessToken.str()) == SecretFetchStatus::success)
+                return parseSecretResponse(response.str(), fullSecretName);
+            return nullptr;
+        }
+        catch (IException * e)
+        {
+            // Authentication failed (or another serious error), then record when that failure occurred
+            if (backoffTimeoutUs)
+                backoffFailureTs = getTimeStampNowValue();
+
+            OERRLOG(e);
+            e->Release();
+        }
+
+        return nullptr;
+    }
+
+private:
+    IPropertyTree *parseSecretResponse(const char *content, const char *secretName)
+    {
+        if (isEmptyString(secretName) || isEmptyString(content))
+            return nullptr;
+
+        Owned<IPropertyTree> tree;
+        try
+        {
+            tree.setown(createPTreeFromJSONString(content));
+        }
+        catch (IException * e)
+        {
+            EXCLOG(e, "Failed to parse secret JSON response");
+            e->Release();
+            return nullptr;
+        }
+
+        // Skip leading '/' to match local secret naming conventions
+        const char *nameToEncode = secretName;
+        if (*nameToEncode == '/')
+            nameToEncode++;
+
+        // Akeyless secret names commonly contain '/', which the property tree encodes as '_f'.
+        StringBuffer normalizedName;
+        encodePTreeName(normalizedName, nameToEncode);
+
+        // Check if the value is a JSON string; if so, parse it into a property tree
+        const char *secretValue = tree->queryProp(normalizedName.str());
+        if (secretValue)
+        {
+            Owned<IPropertyTree> parsed;
+            try
+            {
+                parsed.setown(createPTreeFromJSONString(secretValue));
+            }
+            catch (IException *e)
+            {
+                EXCLOG(e, "Failed to parse akeyless secret JSON string value");
+                e->Release();
+                return nullptr;
+            }
+            return parsed.getClear();
+        }
+
+        // If the value is an object, try to retrieve as a subtree.
+        IPropertyTree *childTree = tree->queryPropTree(normalizedName.str());
+        if (childTree)
+            return LINK(childTree);
+
+        return nullptr;
+    }
+
+    StringBuffer &buildEndpoint(StringBuffer &endpoint, const char *suffix) const
+    {
+        endpoint.set(path);
+        while (endpoint.length() && endpoint.charAt(endpoint.length() - 1) == '/')
+            endpoint.setLength(endpoint.length() - 1);
+        endpoint.append('/').append(suffix);
+        return endpoint;
+    }
+
+    void buildClientHeaders(httplib::Headers &headers) const
+    {
+        // Reserved for Akeyless-specific headers.
+    }
+
+    void processTokenResponse(httplib::Result &res)
+    {
+        // Note, called inside a critical section, so updates are protected
+        if (!res)
+            throwAuthErrorV("akeyless", "login communication error %d", res.error());
+        if (res.error()!=0)
+            throwAuthErrorV("akeyless", "login calling HTTPLIB POST returned error %d", res.error());
+        if (res->status != 200)
+            throwAuthErrorV("akeyless", "[%d](%d) - response: %s", res->status, res.error(), res->body.c_str());
+        const char *json = res->body.c_str();
+        if (isEmptyString(json))
+            throwAuthError("akeyless", "empty login response");
+
+        Owned<IPropertyTree> respTree;
+        try
+        {
+            respTree.setown(createPTreeFromJSONString(json));
+        }
+        catch (IException *e)
+        {
+            StringBuffer msg("parsing JSON response: ");
+            e->errorMessage(msg);
+            e->Release();
+            throwAuthError("akeyless", msg.str());
+        }
+        
+        const char *token = respTree->queryProp("token");
+        if (isEmptyString(token))
+            token = respTree->queryProp("data/token");
+        if (isEmptyString(token))
+            token = respTree->queryProp("auth/token");
+        if (isEmptyString(token))
+            token = respTree->queryProp("access_token");
+        if (isEmptyString(token))
+            token = respTree->queryProp("data/access_token");
+        if (isEmptyString(token))
+            throwAuthError("akeyless", "response missing token");
+
+        clientToken.set(token);  // Already in critical section, so no need for additional locking
+        unsigned ttl = respTree->getPropInt("ttl");
+        
+        // Clamp TTL to 1 day max to avoid very large intervals that can become ambiguous across msTick() wrap
+        constexpr unsigned dayInSeconds = 24U * 60U * 60U;
+        if ((ttl != 0) && (ttl > dayInSeconds))
+            ttl = dayInSeconds;
+        
+        if (ttl == 0)
+        {
+            clientTokenIssuedTick = 0;
+            clientTokenTtlMs = 0; // no expiry info; keep indefinitely
+        }
+        else
+        {
+            clientTokenIssuedTick = msTick();
+            clientTokenTtlMs = ttl * 1000U;
+        }
+    }
+
+    void getAccessToken(StringBuffer &token)
+    {
+        CriticalBlock block(vaultCS);
+        if (clientToken.length())
+        {
+            // Use unsigned tick subtraction so timeout checks remain valid across tick wrap.
+            if ((clientTokenTtlMs == 0) || ((msTick() - clientTokenIssuedTick) < clientTokenTtlMs))
+            {
+                token.set(clientToken);
+                return;
+            }
+            clientToken.clear();
+            clientTokenIssuedTick = 0;
+            clientTokenTtlMs = 0;
+        }
+
+        // Re-read access key from client-secret to pick up rotated credentials
+        if (accessKeySecretName.length())
+        {
+            Owned<const IPropertyTree> clientSecret = getLocalSecret("system", accessKeySecretName.str());
+            if (clientSecret)
+            {
+                StringBuffer accessKeyValue;
+                if (getSecretKeyValue(accessKeyValue, clientSecret, "access-key"))
+                    accessKey.set(accessKeyValue);
+            }
+        }
+
+        if (accessKey.isEmpty())
+            throwAuthError("akeyless", "missing accessKey for akeyless auth");
+
+        StringBuffer json;
+        json.append('{');
+        appendJSONValue(json, "access-id", accessId.str());
+        appendJSONValue(json, "access-key", accessKey.str());
+        appendJSONValue(json, "access-type", accessType.str());
+        appendJSONValue(json, "json", true);
+        json.append('}');
+
+        httplib::Client cli(schemeHostPort.str());
+        httplib::Headers headers;
+        buildClientHeaders(headers);
+
+        unsigned numRetries = 0;
+        initHttpClient(cli, headers, numRetries);
+        StringBuffer endpoint;
+        buildEndpoint(endpoint, "auth");
+        httplib::Result res = cli.Post(endpoint.str(), headers, json.str(), "application/json");
+        while (!res && numRetries > 0)
+        {
+            OERRLOG("Retrying vault %s akeyless auth, communication error %d", name.str(), res.error());
+            if (retryWait)
+                Sleep(retryWait);
+            numRetries--;
+            res = cli.Post(endpoint.str(), headers, json.str(), "application/json");
+        }
+
+        processTokenResponse(res);
+        token.set(clientToken);
+    }
+
+    SecretFetchStatus getSecretFromVault(StringBuffer &content, const char *secretName, const char *version, const char *accessToken)
+    {
+        httplib::Client cli(schemeHostPort.str());
+        httplib::Headers headers;
+        buildClientHeaders(headers);
+
+        unsigned numRetries = 0;
+        initHttpClient(cli, headers, numRetries);
+
+        StringBuffer json;
+        json.append('{');
+        appendJSONName(json, "names");
+        json.append('[').append('"');
+        encodeJSON(json, secretName);
+        json.append('"').append(']');
+
+        if (!isEmptyString(version))
+        {
+            if (isUnsignedInteger(version))
+                appendJSONValue(json, "version", (int)atoi(version));
+            else
+                OERRLOG("Vault %s invalid akeyless version %s for secret %s", name.str(), version, secretName);
+        }
+
+        appendJSONValue(json, "token", accessToken);
+        appendJSONValue(json, "json", true);
+        json.append('}');
+
+        StringBuffer endpoint;
+        buildEndpoint(endpoint, "get-secret-value");
+        httplib::Result res = cli.Post(endpoint.str(), headers, json.str(), "application/json");
+        while (!res && numRetries > 0)
+        {
+            OERRLOG("Retrying vault %s get secret, communication error %d", name.str(), res.error());
+            if (retryWait)
+                Sleep(retryWait);
+            numRetries--;
+            res = cli.Post(endpoint.str(), headers, json.str(), "application/json");
+        }
+
+        if (res)
+        {
+            if (res->status == 200)
+            {
+                content.append(res->body.c_str());
+                return SecretFetchStatus::success;
+            }
+            else if (res->status == 401 || res->status == 403)
+            {
+                OERRLOG("Vault %s permission denied accessing secret %s.%s [%d](%d) - response: %s", name.str(), secretName, version ? version : "", res->status, res.error(), res->body.c_str());
+                return SecretFetchStatus::authFailure;
+            }
+            else if (res->status == 404)
+            {
+                OERRLOG("Vault %s secret not found %s.%s", name.str(), secretName, version ? version : "");
+                return SecretFetchStatus::notFound;
+            }
+            else
+            {
+                OERRLOG("Vault %s error accessing secret %s.%s [%d](%d) - response: %s", name.str(), secretName, version ? version : "", res->status, res.error(), res->body.c_str());
+                return SecretFetchStatus::failure;
+            }
+        }
+        else
+        {
+            OERRLOG("Error: Vault %s http error (%d) accessing secret %s.%s", name.str(), res.error(), secretName, version ? version : "");
+            return SecretFetchStatus::failure;
+        }
+    }
+};
+
+static std::unique_ptr<CVault> createVault(const IPropertyTree *vault)
+{
+    const char *typeProp = vault->queryProp("@type");
+    const char *kindProp = vault->queryProp("@kind");
+
+    VaultType vaultType;
+    CVaultKind vaultKind;
+
+    if (!isEmptyString(typeProp))
+    {
+        vaultType = getVaultType(typeProp);
+
+        // Prefer explicit @kind if provided, otherwise derive from @type
+        if (!isEmptyString(kindProp))
+            vaultKind = getSecretType(kindProp);
+        else 
+            vaultKind = (vaultType == VaultType::akeyless) ? CVaultKind::akeyless_v2 : getSecretType(typeProp);
+    }
+    else
+    {
+        // No @type specified, determine type and kind from @kind as before
+        vaultKind = getSecretType(kindProp);
+        vaultType = (vaultKind == CVaultKind::akeyless_v2) ? VaultType::akeyless : VaultType::hashicorp;
+    }
+
+    switch (vaultType)
+    {
+        case VaultType::akeyless:
+            return std::unique_ptr<CVault>(new CAkeylessVault(vault, vaultKind));
+        case VaultType::hashicorp:
+        default:
+            return std::unique_ptr<CVault>(new CHashicorpVault(vault, vaultKind));
+    }
+}
 
 class CVaultSet
 {
@@ -376,49 +1583,31 @@ public:
     CVaultSet()
     {
     }
-    void addVault(IPropertyTree *vault)
+    void addVault(const IPropertyTree *vault)
     {
         const char *name = vault->queryProp("@name");
         if (!isEmptyString(name))
-            vaults.emplace(name, std::unique_ptr<CVault>(new CVault(vault)));
+            vaults.emplace(name, createVault(vault));
     }
-    bool getCachedSecret(CVaultKind &kind, StringBuffer &content, const char *secret, const char *version)
+    IPropertyTree *requestSecret(const char *secret, const char *version)
     {
         auto it = vaults.begin();
         for (; it != vaults.end(); it++)
         {
-            if (it->second->getCachedSecret(kind, content, secret, version))
-                return true;
+            IPropertyTree *secretTree = it->second->requestSecret(secret, version);
+            if (secretTree)
+                return secretTree;
         }
-        return false;
+        return nullptr;
     }
-    bool requestSecret(CVaultKind &kind, StringBuffer &content, const char *secret, const char *version)
-    {
-        auto it = vaults.begin();
-        for (; it != vaults.end(); it++)
-        {
-            if (it->second->requestSecret(kind, content, secret, version))
-                return true;
-        }
-        return false;
-    }
-    bool getCachedSecretFromVault(const char *vaultId, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version)
+    IPropertyTree *requestSecretFromVault(const char *vaultId, const char *secret, const char *version)
     {
         if (isEmptyString(vaultId))
-            return false;
+            return nullptr;
         auto it = vaults.find(vaultId);
         if (it == vaults.end())
-            return false;
-        return it->second->getCachedSecret(kind, content, secret, version);
-    }
-    bool requestSecretFromVault(const char *vaultId, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version)
-    {
-        if (isEmptyString(vaultId))
-            return false;
-        auto it = vaults.find(vaultId);
-        if (it == vaults.end())
-            return false;
-        return it->second->requestSecret(kind, content, secret, version);
+            return nullptr;
+        return it->second->requestSecret(secret, version);
     }
 };
 
@@ -429,10 +1618,10 @@ private:
 public:
     CVaultManager()
     {
-        IPropertyTree *config = nullptr;
+        Owned<const IPropertyTree> config;
         try
         {
-            config = queryComponentConfig().queryPropTree("vaults");
+            config.setown(getComponentConfigSP()->getPropTree("vaults"));
         }
         catch (IException * e)
         {
@@ -457,259 +1646,894 @@ public:
                 it->second->addVault(&vault);
         }
     }
-    bool getCachedSecretFromVault(const char *category, const char *vaultId, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version) override
+    IPropertyTree *requestSecretFromVault(const char *category, const char *vaultId, const char *secret, const char *version) override
     {
         if (isEmptyString(category))
-            return false;
+            return nullptr;
         auto it = categories.find(category);
         if (it == categories.end())
-            return false;
-        return it->second->getCachedSecretFromVault(vaultId, kind, content, secret, version);
+            return nullptr;
+        return it->second->requestSecretFromVault(vaultId, secret, version);
     }
-    bool requestSecretFromVault(const char *category, const char *vaultId, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version) override
+    IPropertyTree *requestSecretByCategory(const char *category, const char *secret, const char *version) override
     {
         if (isEmptyString(category))
-            return false;
+            return nullptr;
         auto it = categories.find(category);
         if (it == categories.end())
-            return false;
-        return it->second->requestSecretFromVault(vaultId, kind, content, secret, version);
-    }
-
-    bool getCachedSecretByCategory(const char *category, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version) override
-    {
-        if (isEmptyString(category))
-            return false;
-        auto it = categories.find(category);
-        if (it == categories.end())
-            return false;
-        return it->second->getCachedSecret(kind, content, secret, version);
-    }
-    bool requestSecretByCategory(const char *category, CVaultKind &kind, StringBuffer &content, const char *secret, const char *version) override
-    {
-        if (isEmptyString(category))
-            return false;
-        auto it = categories.find(category);
-        if (it == categories.end())
-            return false;
-        return it->second->requestSecret(kind, content, secret, version);
+            return nullptr;
+        return it->second->requestSecret(secret, version);
     }
 };
 
-IVaultManager *ensureVaultManager()
+static CConfigUpdateHook vaultManagerUpdateHook;
+static void vaultManagerConfigUpdate(const IPropertyTree *oldComponentConfiguration, const IPropertyTree *oldGlobalConfiguration)
+{
+    Owned<IVaultManager> newVaultManager = new CVaultManager();
+    {
+        CriticalBlock block(secretCS);
+        vaultManager.swap(newVaultManager);
+    }
+}
+IVaultManager *getVaultManager()
 {
     CriticalBlock block(secretCS);
     if (!vaultManager)
+    {
         vaultManager.setown(new CVaultManager());
-    return vaultManager;
-}
-
-static IPropertyTree *getCachedLocalSecret(const char *category, const char *name)
-{
-    if (isEmptyString(name))
-        return nullptr;
-    Owned<IPropertyTree> secret;
-    {
-        CriticalBlock block(secretCacheCS);
-        IPropertyTree *tree = secretCache->queryPropTree(category);
-        if (!tree)
-            return nullptr;
-        secret.setown(tree->getPropTree(name));
-        if (secret)
-        {
-            if (checkSecretExpired((unsigned) secret->getPropInt("@created")))
-            {
-                secretCache->removeProp(name);
-                return nullptr;
-            }
-            return secret.getClear();
-        }
+        vaultManagerUpdateHook.installOnce(vaultManagerConfigUpdate, false);
     }
-    return nullptr;
+    return LINK(vaultManager);
 }
 
-static void addCachedLocalSecret(const char *category, const char *name, IPropertyTree *secret)
+//---------------------------------------------------------------------------------------------------------------------
+
+static SecretCache globalSecretCache;
+static CriticalSection mtlsInfoCacheCS(SYNC_LOCATION);
+static std::unordered_map<std::string, Linked<ISyncedPropertyTree>> mtlsInfoCache;
+
+MODULE_INIT(INIT_PRIORITY_SYSTEM)
 {
-    if (!secret || isEmptyString(name) || isEmptyString(category))
-        return;
-    secret->setPropInt("@created", (int)msTick());
-    {
-        CriticalBlock block(secretCacheCS);
-        IPropertyTree *tree = ensurePTree(secretCache, category);
-        tree->setPropTree(name, LINK(secret));
-    }
+    return true;
 }
 
-static const char *ensureSecretDirectory()
+MODULE_EXIT()
 {
-    CriticalBlock block(secretCS);
-    if (secretDirectory.isEmpty())
-        setSecretMount(nullptr);
-    return secretDirectory;
+    vaultManager.clear();
+    udpKey.clear();
 }
 
-static IPropertyTree *loadLocalSecret(const char *category, const char * name)
+
+static IPropertyTree * resolveLocalSecret(const char *category, const char * name)
 {
+    if (!isValidSecretOrKeyName(name, false))
+        throw makeStringExceptionV(JLIBERR_SystemInvalidSecretNameS_1, "Invalid secret name %s", name);
+
     StringBuffer path;
-    addPathSepChar(path.append(ensureSecretDirectory())).append(category).append(PATHSEPCHAR).append(name).append(PATHSEPCHAR);
+    buildSecretPath(path, category, name);
+
     Owned<IDirectoryIterator> entries = createDirectoryIterator(path);
     if (!entries || !entries->first())
         return nullptr;
-    Owned<IPropertyTree> tree = createPTree(name);
-    tree->setPropInt("@created", (int) msTick());
+
+    Owned<IPropertyTree> tree(createPTree(name));
     ForEach(*entries)
     {
         if (entries->isDir())
             continue;
-        StringBuffer name;
-        entries->getName(name);
-        if (!validateXMLTag(name))
+        StringBuffer secretKeyName;   // filename is used as the secret key name
+        entries->getName(secretKeyName);
+        if (!validateXMLTag(secretKeyName))
             continue;
-        MemoryBuffer content;
-        Owned<IFileIO> io = entries->get().open(IFOread);
-        read(io, 0, (size32_t)-1, content);
-        if (!content.length())
+
+        Owned<IFileIO> io = entries->query().open(IFOread);
+        if (!io)
             continue;
-        tree->setPropBin(name, content.length(), content.bufferBase());
+
+        offset_t sz = io->size();
+        if (sz == 0)
+            continue;
+
+        StringBuffer value;
+        char *valuePtr = value.reserveTruncate(sz);
+        if (sz != io->read(0, sz, valuePtr))
+            continue;
+
+        // Remove trailing whitespace
+        value.clip();
+
+        tree->setProp(secretKeyName, value);
     }
-    addCachedLocalSecret(category, name, tree);
+
     return tree.getClear();
 }
 
-extern jlib_decl IPropertyTree *getLocalSecret(const char *category, const char * name)
+static IPropertyTree *resolveVaultSecret(const char *category, const char * name, const char *vaultId, const char *version)
 {
-    Owned<IPropertyTree> tree = getCachedLocalSecret(category, name);
-    if (tree)
-        return tree.getClear();
-    return loadLocalSecret(category, name);
-}
-
-static IPropertyTree *createPTreeFromVaultSecret(const char *content, CVaultKind kind)
-{
-    if (isEmptyString(content))
-        return nullptr;
-
-    Owned<IPropertyTree> tree = createPTreeFromJSONString(content);
-    if (!tree)
-        return nullptr;
-    switch (kind)
-    {
-        case CVaultKind::kv_v1:
-            tree.setown(tree->getPropTree("data"));
-            break;
-        default:
-        case CVaultKind::kv_v2:
-            tree.setown(tree->getPropTree("data/data"));
-            break;
-    }
-    return tree.getClear();
-}
-static IPropertyTree *getCachedVaultSecret(const char *category, const char *vaultId, const char * name, const char *version)
-{
-    CVaultKind kind;
-    StringBuffer json;
-    IVaultManager *vaultmgr = ensureVaultManager();
+    Owned<IVaultManager> vaultmgr = getVaultManager();
     if (isEmptyString(vaultId))
     {
-        if (!vaultmgr->getCachedSecretByCategory(category, kind, json, name, version))
-            return nullptr;
+        return vaultmgr->requestSecretByCategory(category, name, version);
     }
     else
     {
-        if (!vaultmgr->getCachedSecretFromVault(category, vaultId, kind, json, name, version))
-            return nullptr;
+        return vaultmgr->requestSecretFromVault(category, vaultId, name, version);
     }
-    return createPTreeFromVaultSecret(json.str(), kind);
 }
 
-static IPropertyTree *requestVaultSecret(const char *category, const char *vaultId, const char * name, const char *version)
+static IPropertyTree * resolveSecret(const char *category, const char * name, const char * optVaultId, const char * optVersion)
 {
-    CVaultKind kind;
-    StringBuffer json;
-    IVaultManager *vaultmgr = ensureVaultManager();
-    if (isEmptyString(vaultId))
+    if (!isEmptyString(optVaultId))
     {
-        if (!vaultmgr->requestSecretByCategory(category, kind, json, name, version))
-            return nullptr;
+        if (strieq(optVaultId, "k8s"))
+            return resolveLocalSecret(category, name);
+        else
+            return resolveVaultSecret(category, name, optVaultId, optVersion);
     }
     else
     {
-        if (!vaultmgr->requestSecretFromVault(category, vaultId, kind, json, name, version))
-            return nullptr;
+        Owned<IPropertyTree> resolved;
+        if (isValidSecretOrKeyName(name, false))
+            resolved.setown(resolveLocalSecret(category, name));
+        if (!resolved)
+            resolved.setown(resolveVaultSecret(category, name, nullptr, optVersion));
+        return resolved.getClear();
     }
-    return createPTreeFromVaultSecret(json.str(), kind);
 }
 
-extern jlib_decl IPropertyTree *getVaultSecret(const char *category, const char *vaultId, const char * name, const char *version)
+static SecretCacheEntry * getSecretEntry(const char * category, const char * name, const char * optVaultId, const char * optVersion)
 {
-    CVaultKind kind;
-    StringBuffer json;
-    IVaultManager *vaultmgr = ensureVaultManager();
-    if (isEmptyString(vaultId))
-    {
-        if (!vaultmgr->getCachedSecretByCategory(category, kind, json, name, version))
-            vaultmgr->requestSecretByCategory(category, kind, json, name, version);
-    }
+    cache_timestamp now = getCacheTimestamp();
+
+    std::string key(buildSecretKey(category, name, optVaultId, optVersion));
+
+    bool isNewEntry;
+    SecretCacheEntry * match = globalSecretCache.getSecret(key, now, isNewEntry);
+    if (!isNewEntry && !match->needsRefresh(now))
+        return match;
+
+    Owned<IPropertyTree> resolved(resolveSecret(category, name, optVaultId, optVersion));
+
+    //If the secret could no longer be resolved (e.g. a vault has gone down) then keep the old one
+    if (resolved)
+        globalSecretCache.updateSecret(match, resolved, now, true);
     else
-    {
-        if (!vaultmgr->getCachedSecretFromVault(category, vaultId, kind, json, name, version))
-            vaultmgr->requestSecretFromVault(category, vaultId, kind, json, name, version);
-    }
-    return createPTreeFromVaultSecret(json.str(), kind);
+        match->noteFailedUpdate(now, true);
+
+    return match;
 }
 
-extern jlib_decl IPropertyTree *getSecret(const char *category, const char * name)
+static void refreshSecret(SecretCacheEntry * secret, bool accessed)
 {
-    //check for any chached first
-    Owned<IPropertyTree> secret = getCachedLocalSecret(category, name);
-    if (!secret)
-        secret.setown(getCachedVaultSecret(category, nullptr, name, nullptr));
-    //now check local, then vaults
-    if (!secret)
-        secret.setown(loadLocalSecret(category, name));
-    if (!secret)
-        secret.setown(requestVaultSecret(category, nullptr, name, nullptr));
-    return secret.getClear();
+    cache_timestamp now = getCacheTimestamp();
+
+    std::string category;
+    std::string name;
+    std::string optVaultId;
+    std::string optVersion;
+    secret->getSecretOptions(category, name, optVaultId, optVersion);
+
+    Owned<IPropertyTree> resolved(resolveSecret(category.c_str(), name.c_str(), optVaultId.c_str(), optVersion.c_str()));
+
+    //If the secret could no longer be resolved (e.g. a vault has gone down) then keep the old one
+    if (resolved)
+        globalSecretCache.updateSecret(secret, resolved, now, accessed);
+    else
+        secret->noteFailedUpdate(now, accessed);
 }
 
-extern jlib_decl bool getSecretKeyValue(MemoryBuffer & result, IPropertyTree *secret, const char * key)
+static const IPropertyTree *getSecretTree(const char *category, const char * name, const char * optVaultId, const char * optVersion)
 {
-    IPropertyTree *tree = secret->queryPropTree(key);
-    if (tree)
-        return tree->getPropBin(nullptr, result);
-    return false;
+    SecretCacheEntry * secret = getSecretEntry(category, name, optVaultId, optVersion);
+    if (secret)
+        return globalSecretCache.getContents(secret);
+    return nullptr;
 }
 
-extern jlib_decl bool getSecretKeyValue(StringBuffer & result, IPropertyTree *secret, const char * key)
+
+//Public interface to the secrets
+
+const IPropertyTree *getSecret(const char *category, const char * name, const char * optVaultId, const char * optVersion)
 {
-    IPropertyTree *tree = secret->queryPropTree(key);
-    if (!tree)
+    validateCategoryName(category);
+    validateSecretNameNotEmpty(name);
+
+    return getSecretTree(category,  name, optVaultId, optVersion);
+}
+
+
+bool getSecretKeyValue(MemoryBuffer & result, const IPropertyTree *secret, const char * key)
+{
+    validateKeyName(key);
+    if (!secret)
         return false;
-    if (tree->isBinary(nullptr))
-    {
-        MemoryBuffer mb;
-        tree->getPropBin(nullptr, mb);
-        //caller implies it's a string
-        result.append(mb.length(), mb.toByteArray());
-        return true;
-    }
-    const char *value = tree->queryProp(nullptr);
-    if (value)
-    {
-        result.append(value);
-        return true;
-    }
-    return false;
+    return secret->getPropBin(key, result);
+}
+
+bool getSecretKeyValue(StringBuffer & result, const IPropertyTree *secret, const char * key)
+{
+    validateKeyName(key);
+    if (!secret)
+        return false;
+    return secret->getProp(key, result);
 }
 
 extern jlib_decl bool getSecretValue(StringBuffer & result, const char *category, const char * name, const char * key, bool required)
 {
-    Owned<IPropertyTree> secret = getSecret(category, name);
+    Owned<const IPropertyTree> secret = getSecret(category, name);
     if (required && !secret)
-        throw MakeStringException(-1, "secret %s.%s not found", category, name);
+        throw MakeStringException(JLIBERR_SystemSecretSSNotFound, "secret %s.%s not found", category, name);
     bool found = getSecretKeyValue(result, secret, key);
     if (required && !found)
-        throw MakeStringException(-1, "secret %s.%s missing key %s", category, name, key);
+        throw MakeStringException(JLIBERR_SystemSecretSSMissingKeyS, "secret %s.%s missing key %s", category, name, key);
     return true;
 }
 
+//---------------------------------------------------------------------------------------------------------------------
+
+class CSecret final : public CInterfaceOf<ISyncedPropertyTree>
+{
+public:
+    CSecret(SecretCacheEntry * _secret)
+    : secret(_secret)
+    {
+    }
+
+    virtual const IPropertyTree * getTree() const override;
+
+    virtual bool getProp(MemoryBuffer & result, const char * key) const override
+    {
+        CriticalBlock block(secretCs);
+        checkUptoDate();
+        Owned<const IPropertyTree> contents = globalSecretCache.getContents(secret);
+        return getSecretKeyValue(result, contents, key);
+    }
+    virtual bool getProp(StringBuffer & result, const char * key) const override
+    {
+        CriticalBlock block(secretCs);
+        checkUptoDate();
+        Owned<const IPropertyTree> contents = globalSecretCache.getContents(secret);
+        return getSecretKeyValue(result, contents, key);
+    }
+    virtual bool isStale() const override
+    {
+        return secret->isStale();
+    }
+    virtual unsigned getVersion() const override
+    {
+        CriticalBlock block(secretCs);
+        checkUptoDate();
+        return secret->getHash();
+    }
+    virtual bool isValid() const override
+    {
+        return secret->hasContents();
+    }
+
+protected:
+    void checkUptoDate() const;
+
+protected:
+    mutable CriticalSection secretCs{SYNC_LOCATION};
+    mutable SecretCacheEntry * secret;
+};
+
+
+const IPropertyTree * CSecret::getTree() const
+{
+    CriticalBlock block(secretCs);
+    checkUptoDate();
+    return globalSecretCache.getContents(secret);
+}
+
+void CSecret::checkUptoDate() const
+{
+    cache_timestamp now = getCacheTimestamp();
+    if (secret->needsRefresh(now))
+    {
+#ifdef TRACE_SECRETS
+        DBGLOG("Secret %s is stale updating...", secret->queryTraceName());
+#endif
+        //MORE: This could block or fail - in roxie especially it would be better to return the old value
+        try
+        {
+            refreshSecret(secret, true);
+        }
+        catch (IException * e)
+        {
+            VStringBuffer msg("Failed to update secret %s", secret->queryTraceName());
+            EXCLOG(e, msg.str());
+            e->Release();
+        }
+    }
+    else
+        secret->noteAccessed(now);
+}
+
+ISyncedPropertyTree * getSyncedSecret(const char *category, const char * name, const char * optVaultId, const char * optVersion)
+{
+    validateCategoryName(category);
+    validateSecretNameNotEmpty(name);
+
+    SecretCacheEntry * resolved = getSecretEntry(category, name, optVaultId, optVersion);
+    return new CSecret(resolved);
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+//Manage a background thread, that checks which of the secrets have been accessed recently and refreshes them if they
+//are going to go out of date soon.
+
+static cache_timestamp refreshLookaheadNs = 0;
+class SecretRefreshThread : public Thread
+{
+public:
+    SecretRefreshThread() : Thread("SecretRefreshThread")
+    {
+    }
+    virtual int run() override
+    {
+        std::vector<SecretCacheEntry *> pending;
+        while (!abort)
+        {
+#ifdef TRACE_SECRETS
+            DBGLOG("Check for expired secrets...");
+#endif
+            cache_timestamp now = getCacheTimestamp();
+            globalSecretCache.gatherPendingRefresh(pending, now + refreshLookaheadNs);
+            for (auto secret : pending)
+            {
+#ifdef TRACE_SECRETS
+                DBGLOG("Refreshing secret %s", secret->queryTraceName());
+#endif
+                refreshSecret(secret, false);
+            }
+            pending.clear();
+
+            unsigned intervalMs = refreshLookaheadNs/4/1000000;
+            if (sem.wait(intervalMs))
+                break;
+        }
+        return 0;
+    }
+
+    void stop()
+    {
+        abort = true;
+        sem.signal();
+        join();
+    }
+
+public:
+    std::atomic<bool> abort{false};
+    Semaphore sem{SYNC_LOCATION};
+};
+static Owned<SecretRefreshThread> refreshThread;
+
+void startSecretUpdateThread(const unsigned lookaheadMs)
+{
+    cache_timestamp lookaheadNs = (cache_timestamp)lookaheadMs * 1000000;
+    if (lookaheadNs == 0)
+        lookaheadNs = secretTimeoutNs / 5;
+    if (lookaheadNs > secretTimeoutNs / 2)
+        lookaheadNs = secretTimeoutNs / 2;
+    refreshLookaheadNs = lookaheadNs;
+    if (!refreshThread)
+    {
+        refreshThread.setown(new SecretRefreshThread());
+        refreshThread->start(false);
+    }
+}
+
+void stopSecretUpdateThread()
+{
+    if (refreshThread)
+    {
+        refreshThread->stop();
+        refreshThread->join();
+        refreshThread.clear();
+    }
+}
+
+MODULE_INIT(INIT_PRIORITY_SYSTEM)
+{
+    return true;
+}
+MODULE_EXIT()
+{
+    //This should have been called already, but for safety ensure the thread is terminated.
+    stopSecretUpdateThread();
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+
+void initSecretUdpKey()
+{
+    if (udpKeyInitialized)
+        return;
+
+//can find alternatives for old openssl in the future if necessary
+#if defined(_USE_OPENSSL) && (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+    StringBuffer path;
+    BIO *in = BIO_new_file(buildSecretPath(path, "certificates", "udp").append("tls.key"), "r");
+    if (in == nullptr)
+        return;
+    EC_KEY *eckey = PEM_read_bio_ECPrivateKey(in, nullptr, nullptr, nullptr);
+    if (eckey)
+    {
+        unsigned char *priv = NULL;
+        size_t privlen = EC_KEY_priv2buf(eckey, &priv);
+        if (privlen != 0)
+        {
+            udpKey.set(privlen, priv);
+            OPENSSL_clear_free(priv, privlen);
+        }
+        EC_KEY_free(eckey);
+    }
+    BIO_free(in);
+#endif
+    udpKeyInitialized = true;
+}
+
+void setTestUdpKey()
+{
+    // Used in unit tests etc
+    constexpr unsigned char key[] = { 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+                                      0x38, 0x39, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+                                      0x36, 0x37, 0x38, 0x39, 0x30, 0x31, 0x32, 0x33,
+                                      0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30, 0x31
+                                    };
+    udpKey.set(32, key);
+    udpKeyInitialized = true;
+}
+
+const MemoryAttr &getSecretUdpKey(bool required)
+{
+    if (!udpKeyInitialized)
+        throw makeStringException(JLIBERR_SystemUdpKeyNotInitialized, "UDP Key not initialized.");
+    if (required && !udpKey.length())
+        throw makeStringException(JLIBERR_SystemUdpKeyNotFoundCertManagerIntegrationConfigurationRequired, "UDP Key not found, cert-manager integration/configuration required.");
+    return udpKey;
+}
+
+jlib_decl bool containsEmbeddedKey(const char *certificate)
+{
+    // look for any of:
+    // -----BEGIN PRIVATE KEY-----
+    // -----BEGIN RSA PRIVATE KEY-----
+    // -----BEGIN CERTIFICATE-----
+    // -----BEGIN PUBLIC KEY-----
+    // or maybe just:
+    // -----BEGIN
+
+    if ( (strstr(certificate, "-----BEGIN PRIVATE KEY-----")) ||
+         (strstr(certificate, "-----BEGIN RSA PRIVATE KEY-----")) ||
+         (strstr(certificate, "-----BEGIN PUBLIC KEY-----")) ||
+         (strstr(certificate, "-----BEGIN CERTIFICATE-----")) )
+        return true;
+
+    return false;
+}
+
+
+//---------------------------------------------------------------------------------------------------------------------
+
+class CSyncedCertificateBase : public CInterfaceOf<ISyncedPropertyTree>
+{
+public:
+    CSyncedCertificateBase(const char *_issuer)
+    : issuer(_issuer)
+    {
+    }
+
+    virtual const IPropertyTree * getTree() const override final;
+
+    virtual bool getProp(MemoryBuffer & result, const char * key) const override final
+    {
+        CriticalBlock block(secretCs);
+        checkUptoDate();
+        return getSecretKeyValue(result, config, key);
+    }
+    virtual bool getProp(StringBuffer & result, const char * key) const override final
+    {
+        CriticalBlock block(secretCs);
+        checkUptoDate();
+        return getSecretKeyValue(result, config, key);
+    }
+    virtual bool isStale() const override final
+    {
+        return secret->isStale();
+    }
+    virtual bool isValid() const override
+    {
+        return secret->isValid();
+
+    }
+    virtual unsigned getVersion() const override final
+    {
+        CriticalBlock block(secretCs);
+        checkUptoDate();
+        //If information that is combined with the secret (e.g. trusted peers) can also change dynamically this would
+        //need to be a separate hash calculated from the config tree
+        return secretHash;
+    }
+
+protected:
+    virtual void updateConfigFromSecret(const IPropertyTree * secretInfo) const = 0;
+
+protected:
+    void checkUptoDate() const;
+    void createConfig() const;
+    void createDefaultConfigFromSecret(const IPropertyTree * secretInfo, bool addCertificates, bool addCertificateAuthority) const;
+    void updateCertificateFromSecret(const IPropertyTree * secretInfo) const;
+    void updateCertificateAuthorityFromSecret(const IPropertyTree * secretInfo) const;
+
+protected:
+    StringAttr issuer;
+    Owned<ISyncedPropertyTree> secret;
+    mutable CriticalSection secretCs{SYNC_LOCATION};
+    mutable Linked<IPropertyTree> config;
+    mutable std::atomic<unsigned> secretHash{0};
+};
+
+
+const IPropertyTree * CSyncedCertificateBase::getTree() const
+{
+    CriticalBlock block(secretCs);
+    checkUptoDate();
+    return LINK(config);
+}
+
+void CSyncedCertificateBase::checkUptoDate() const
+{
+    if (secretHash != secret->getVersion())
+        createConfig();
+}
+
+void CSyncedCertificateBase::createConfig() const
+{
+    //Update before getting the tree to avoid potential race condition updating the tree at the same time.
+    //Could alternatively return the version number from the getTree() call.
+    secretHash = secret->getVersion();
+
+    Owned<const IPropertyTree> secretInfo = secret->getTree();
+    if (secretInfo)
+    {
+        config.setown(createPTree(issuer));
+        ensurePTree(config, "verify");
+        updateConfigFromSecret(secretInfo);
+    }
+    else
+        config.clear();
+}
+
+
+void CSyncedCertificateBase::updateCertificateFromSecret(const IPropertyTree * secretInfo) const
+{
+    StringBuffer value;
+    config->setProp("@issuer", issuer); // server only?
+    if (secretInfo->getProp("tls.crt", value.clear()))
+        config->setProp("certificate", value.str());
+    if (secretInfo->getProp("tls.key", value.clear()))
+        config->setProp("privatekey", value.str());
+}
+
+void CSyncedCertificateBase::updateCertificateAuthorityFromSecret(const IPropertyTree * secretInfo) const
+{
+    StringBuffer value;
+    if (secretInfo->getProp("ca.crt", value.clear()))
+    {
+        IPropertyTree *verify = config->queryPropTree("verify");
+        IPropertyTree *ca = ensurePTree(verify, "ca_certificates");
+        ca->setProp("pem", value.str());
+    }
+}
+
+
+//---------------------------------------------------------------------------------------------------------------------
+
+class CIssuerConfig final : public CSyncedCertificateBase
+{
+public:
+    CIssuerConfig(const char *_issuer, const char * _trustedPeers, bool _isClientConnection, bool _acceptSelfSigned, bool _addCACert, bool _disableMTLS)
+    : CSyncedCertificateBase(_issuer), trustedPeers(_trustedPeers), isClientConnection(_isClientConnection), acceptSelfSigned(_acceptSelfSigned), addCACert(_addCACert), disableMTLS(_disableMTLS)
+    {
+        secret.setown(getSyncedSecret("certificates", issuer, nullptr, nullptr));
+        createConfig();
+    }
+
+    virtual void updateConfigFromSecret(const IPropertyTree * secretInfo) const override;
+
+protected:
+    StringAttr trustedPeers;
+    bool isClientConnection; // required in constructor
+    bool acceptSelfSigned; // required in constructor
+    bool addCACert; // required in constructor
+    bool disableMTLS;
+};
+
+
+void CIssuerConfig::updateConfigFromSecret(const IPropertyTree * secretInfo) const
+{
+    if (!isClientConnection || !strieq(issuer, "public"))
+        updateCertificateFromSecret(secretInfo);
+
+
+    // addCACert is usually true. A client hitting a public issuer is the case where we don't want the ca cert
+    // defined. Otherwise, for MTLS we want control over our CACert using addCACert. When hitting public services
+    // using public certificate authorities we want the well known (browser compatible) CA list installed on the
+    // system instead.
+    if (!isClientConnection || addCACert)
+        updateCertificateAuthorityFromSecret(secretInfo);
+
+    IPropertyTree *verify = config->queryPropTree("verify");
+    assertex(verify); // Should always be defined by this point.
+
+    //For now only the "public" issuer implies client certificates are not required
+    verify->setPropBool("@enable", !disableMTLS && (isClientConnection || !strieq(issuer, "public")));
+    verify->setPropBool("@address_match", false);
+    verify->setPropBool("@accept_selfsigned", isClientConnection && acceptSelfSigned);
+    if (trustedPeers) // Allow blank string to mean none, null means anyone
+        verify->setProp("trusted_peers", trustedPeers);
+    else
+        verify->setProp("trusted_peers", "anyone");
+}
+
+
+ISyncedPropertyTree * createIssuerTlsConfig(const char * issuer, const char * optTrustedPeers, bool isClientConnection, bool acceptSelfSigned, bool addCACert, bool disableMTLS)
+{
+    return new CIssuerConfig(issuer, optTrustedPeers, isClientConnection, acceptSelfSigned, addCACert, disableMTLS);
+
+}
+//---------------------------------------------------------------------------------------------------------------------
+
+class CCertificateConfig final : public CSyncedCertificateBase
+{
+public:
+    CCertificateConfig(const char * _category, const char * _secretName, bool _addCACert)
+    : CSyncedCertificateBase(nullptr), addCACert(_addCACert)
+    {
+        secret.setown(getSyncedSecret(_category, _secretName, nullptr, nullptr));
+        if (!secret->isValid())
+            throw makeStringExceptionV(JLIBERR_SystemSecretSSNotFound_1, "secret %s.%s not found", _category, _secretName);
+        createConfig();
+    }
+
+    virtual void updateConfigFromSecret(const IPropertyTree * secretInfo) const override;
+
+protected:
+    bool addCACert; // required in constructor
+};
+
+void CCertificateConfig::updateConfigFromSecret(const IPropertyTree * secretInfo) const
+{
+    updateCertificateFromSecret(secretInfo);
+
+    if (addCACert)
+        updateCertificateAuthorityFromSecret(secretInfo);
+}
+
+
+ISyncedPropertyTree * createStorageTlsConfig(const char * secretName, bool addCACert)
+{
+    return new CCertificateConfig("storage", secretName, addCACert);
+
+}
+
+
+const ISyncedPropertyTree * getIssuerTlsSyncedConfig(const char * issuer, const char * optTrustedPeers, bool disableMTLS)
+{
+    if (isEmptyString(issuer))
+        return nullptr;
+
+    const char * key;
+    StringBuffer temp;
+    if (!isEmptyString(optTrustedPeers) || disableMTLS)
+    {
+        temp.append(issuer).append("/").append(optTrustedPeers).append('/').append(disableMTLS);
+        key = temp.str();
+    }
+    else
+        key = issuer;
+
+    CriticalBlock block(mtlsInfoCacheCS);
+    auto match = mtlsInfoCache.find(key);
+    if (match != mtlsInfoCache.cend())
+        return LINK(match->second);
+
+    Owned<ISyncedPropertyTree> config = createIssuerTlsConfig(issuer, optTrustedPeers, false, false, true, disableMTLS);
+    mtlsInfoCache.emplace(key, config);
+    return config.getClear();
+}
+
+bool hasIssuerTlsConfig(const char *issuer)
+{
+    Owned<const ISyncedPropertyTree> match = getIssuerTlsSyncedConfig(issuer, nullptr, false);
+    return match && match->isValid();
+}
+
+enum UseMTLS { UNINIT, DISABLED, ENABLED };
+static UseMTLS useMtls = UNINIT;
+
+static CriticalSection queryMtlsCS(SYNC_LOCATION);
+
+jlib_decl bool queryMtls()
+{
+    CriticalBlock block(queryMtlsCS);
+    if (useMtls == UNINIT)
+    {
+        useMtls = DISABLED;
+#if defined(_USE_OPENSSL)
+# ifdef _CONTAINERIZED
+        // check component setting first, but default to global
+        if (getConfigBool("@mtls"))
+            useMtls = ENABLED;
+# else
+        if (queryMtlsBareMetalConfig())
+        {
+            useMtls = ENABLED;
+            const char *cert = nullptr;
+            const char *pubKey = nullptr;
+            const char *privKey = nullptr;
+            const char *passPhrase = nullptr;
+            if (queryHPCCPKIKeyFiles(&cert, &pubKey, &privKey, &passPhrase))
+            {
+                if ( (!isEmptyString(cert)) && (!isEmptyString(privKey)) )
+                {
+                    if (checkFileExists(cert) && checkFileExists(privKey))
+                    {
+                        CriticalBlock block(mtlsInfoCacheCS);
+                        assertex(mtlsInfoCache.find("local") == mtlsInfoCache.cend());
+
+                        Owned<IPropertyTree> info = createPTree("local");
+                        info->setProp("certificate", cert);
+                        info->setProp("privatekey", privKey);
+                        if ( (!isEmptyString(pubKey)) && (checkFileExists(pubKey)) )
+                            info->setProp("publickey", pubKey);
+                        if (!isEmptyString(passPhrase))
+                            info->setProp("passphrase", passPhrase); // encrypted
+
+                        Owned<ISyncedPropertyTree> entry = createSyncedPropertyTree(info);
+                        mtlsInfoCache.emplace("local", entry);
+                    }
+                }
+            }
+        }
+# endif
+#endif
+    }
+    if (useMtls == ENABLED)
+        return true;
+    else
+        return false;
+}
+
+
+#ifdef _USE_CPPUNIT
+std::string testBuildSecretKey(const char * category, const char * name, const char * optVaultId, const char * optVersion)
+{
+    return buildSecretKey(category, name, optVaultId, optVersion);
+}
+
+void testExpandSecretKey(std::string & category, std::string & name, std::string & optVaultId, std::string & optVersion, const char * key)
+{
+    expandSecretKey(category, name, optVaultId, optVersion, key);
+}
+#endif
+
+/**
+ * Masks a secret string by replacing a percentage of its characters with a mask character.
+ *
+ * @param maskedSecret      [out] StringBuffer to receive the masked secret.
+ * @param originalSecret    [in]  The original secret string to be masked.
+ * @param maskPercentage    [in]  Percentage of the string to mask (70-100). If below minimum, defaults to 70%.
+ * @param maskRightSide     [in]  If true, mask the right side of the string; if false, mask the left side.
+ * @param maskChar          [in]  Character to use for masking.
+ *
+ * If originalSecret is empty or nullptr, maskedSecret will be unchanged.
+ * If originalSecret is length 1, the result will be a single maskChar.
+ * If maskPercentage is out of bounds, it will be clamped to [MIN_MASK_PERCENTAGE, 100].
+ */
+void maskSecret(StringBuffer & maskedSecret, const char * originalSecret, unsigned maskPercentage, bool maskRightSide, char maskChar)
+{
+    if (isEmptyString(originalSecret))
+        return;
+
+    auto secretLen = strlen(originalSecret);
+    if (secretLen == 1)
+    {
+        maskedSecret.append(maskChar);
+        return;
+    }
+
+    if (maskPercentage < MIN_MASK_PERCENTAGE)
+        maskPercentage = MIN_MASK_PERCENTAGE;
+
+    if (maskPercentage > 100)
+        maskPercentage = 100;
+
+    size_t unmaskedCharsCount = static_cast<size_t>(((100 - maskPercentage) / 100.0) * secretLen);
+    if (maskRightSide)
+    {
+        for (size_t i = 0; i < unmaskedCharsCount; ++i)
+            maskedSecret.append(originalSecret[i]);
+
+        for (size_t i = 0; i < secretLen - unmaskedCharsCount; ++i)
+            maskedSecret.append(maskChar);
+    }
+    else
+    {
+        for (size_t i = 0; i < secretLen - unmaskedCharsCount; ++i)
+            maskedSecret.append(maskChar);
+
+        for (size_t i = secretLen - unmaskedCharsCount; i < secretLen; ++i)
+            maskedSecret.append(originalSecret[i]);
+    }
+}
+
+std::string generateGithubIAT(const char * appId, const char * appKey, const char * installationId)
+{
+    try
+    {
+        auto now = std::chrono::system_clock::now();
+        auto token = jwt::create()
+            .set_issuer(appId)
+            .set_issued_at(now)
+            .set_expires_at(now + std::chrono::minutes(10))
+            .sign(jwt::algorithm::rs256("", appKey));
+
+        httplib::SSLClient cli("api.github.com");
+        cli.set_bearer_token_auth(token.c_str());
+        cli.set_default_headers({
+            {"User-Agent", "ECL-Compiler/1.0"},
+            {"Accept", "application/vnd.github.v3+json"}
+        });
+
+        // Generate Access Token
+        std::string tokenPath = "/app/installations/";
+        tokenPath += installationId;
+        tokenPath += "/access_tokens";
+        auto postRes = cli.Post(tokenPath.c_str());
+        if (!postRes || postRes->status != 201)
+        {
+            DBGLOG("Failed to generate GitHub IAT. HTTP status: %d", postRes ? postRes->status : -1);
+            return "";
+        }
+
+        auto tokenJson = nlohmann::json::parse(postRes->body);
+        return tokenJson["token"].get<std::string>();
+    }
+    catch (const std::exception& e)
+    {
+        DBGLOG("Exception generating GitHub IAT: %s", e.what());
+    }
+
+    return "";
+}
+
+IFile * getFileWithGitAccessToken(const char * gitUser)
+{
+    Owned<const IPropertyTree> secret = getSecret("git", gitUser);
+    if (!secret)
+    {
+        DBGLOG("No secret found for git user %s", gitUser);
+        return nullptr;
+    }
+
+    MemoryBuffer gitKey;
+    if (getSecretKeyValue(gitKey, secret, "password"))
+        return writeToProtectedTempFile("eclcc", "git", gitKey.length(), gitKey.toByteArray());
+
+    StringBuffer appId, appKey, installationId;
+    if (getSecretKeyValue(appId, secret, "appid") && getSecretKeyValue(appKey, secret, "appkey") && getSecretKeyValue(installationId, secret, "installationid"))
+    {
+        // Generate an Installation Access Token (IAT) from the App ID, Private Key, and Installation ID
+        std::string iat = generateGithubIAT(appId.str(), appKey.str(), installationId.str());
+        if (!iat.empty())
+            return writeToProtectedTempFile("eclcc", "git", iat.length(), iat.c_str());
+        return nullptr;
+    }
+
+    DBGLOG("Secret doesn't contain password or github app credentials for git user %s", gitUser);
+    return nullptr;
+}

@@ -4,9 +4,10 @@
 <sect1 id="User_Security_Maint">
   <title>Manutenção de Segurança do Usuário</title>
 
-  <para>Configurar o HPCC System para usar o Active Directory ou segurança
-  baseada em LDAP permite definir permissões para o controle de acesso aos
-  Recursos, Escopo de arquivos e Escopos da Workunit.</para>
+  <para>Configurar uma plataforma HPCC Systems<superscript>®</superscript> para
+  usar segurança baseada em Active Directory ou LDAP permite definir
+  permissões para controlar o acesso a Features, File Scopes e Workunit
+  Scopes.</para>
 
   <sect2 id="User_Security_Intro">
     <title>Introdução</title>
@@ -163,34 +164,23 @@
       topo da página do ECL Watch .</para>
 
       <para><graphic fileref="../../images/ECLWMyAccount.jpg"
-      vendor="eclwatchSS"/> <orderedlist>
+      vendor="eclwatchSS"/> <itemizedlist>
           <listitem>
-            <para>Clique no link <emphasis role="bold">LOGGED IN
-            AS:</emphasis></para>
-
-            <para>A aba User Details será exibida com as informações de sua
-            conta.<graphic fileref="../../images/ECLWUserDetails.jpg"
+            <para>Uma aba <emphasis role="bold">User Details</emphasis> com
+            as informações da sua conta é exibida.<graphic
+            fileref="../../images/ECLWUserDetails.jpg"
             vendor="eclwatchSS"/></para>
           </listitem>
 
           <listitem>
-            <para>Confirme o User Name que você usou para entrar no
-            sistema.</para>
-
-            <para>Observe que são necessários direitos de administrador para
-            gerenciar usuários e permissões.</para>
-
-            <para>Verifique se você está usando uma conta com direitos de
-            administrador se precisar gerenciar usuários ou permissões.</para>
+            <para>Você pode alterar sua senha aqui, se desejar.</para>
           </listitem>
 
           <listitem>
-            <para>Verifique a data de validade da senha ou se a senha está
-            prestes a expirar.</para>
-
-            <para>Se desejar, você também pode mudar sua senha aqui.</para>
+            <para>Você também pode verificar a data de expiração da senha,
+            caso sua senha expire.</para>
           </listitem>
-        </orderedlist></para>
+        </itemizedlist></para>
     </sect3>
 
     <sect3 id="UsingSecurity_SettingAndModifyingUserPermissions" role="brk">
@@ -1542,20 +1532,20 @@
               </row>
 
               <row>
-                <entry/>
+                <entry></entry>
 
-                <entry>Acesso à Modificar ou reenviar workunit do
+                <entry>Acesso para modificar ou reenviar workunits do
                 usuário</entry>
 
-                <entry>Gravação</entry>
+                <entry>Write</entry>
               </row>
 
               <row>
-                <entry/>
+                <entry></entry>
 
-                <entry>Acesso à Remover workunit de outros usuários</entry>
+                <entry>Acesso para excluir workunits de outro usuário</entry>
 
-                <entry>Completo</entry>
+                <entry>Full</entry>
               </row>
 
               <row>
@@ -1567,19 +1557,19 @@
               </row>
 
               <row>
-                <entry/>
+                <entry></entry>
 
-                <entry>Acesso à Criar ou modificar a própria workunit</entry>
+                <entry>Acesso para criar ou modificar a própria workunit</entry>
 
-                <entry>Gravação</entry>
+                <entry>Write</entry>
               </row>
 
               <row>
-                <entry/>
+                <entry></entry>
 
-                <entry>Acesso a remoção da própria workunit</entry>
+                <entry>Acesso à exclusão da própria workunit</entry>
 
-                <entry>Completo</entry>
+                <entry>Full</entry>
               </row>
 
               <row>
@@ -1607,11 +1597,112 @@
               </row>
 
               <row>
+                <entry>CodeSignAccess</entry>
+
+                <entry>Acesso ao serviço de assinatura de código
+                ListUserIDs</entry>
+
+                <entry>Read</entry>
+              </row>
+
+              <row>
+                <entry></entry>
+
+                <entry>Assinar código</entry>
+
+                <entry>Full</entry>
+              </row>
+
+              <row>
+                <entry>WsELKAccess</entry>
+
+                <entry>Acesso ao serviço de integração ELK</entry>
+
+                <entry>Access</entry>
+              </row>
+
+              <row>
+                <entry></entry>
+
+                <entry>Ler a configuração ELK</entry>
+
+                <entry>Read</entry>
+              </row>
+
+              <row>
+                <entry>WsStoreAccess</entry>
+
+                <entry>Acesso ao serviço WsStore</entry>
+
+                <entry>Access</entry>
+              </row>
+
+              <row>
+                <entry></entry>
+
+                <entry>Listar stores, buscar pares key-value, listkeys,
+                listnamespaces</entry>
+
+                <entry>Read</entry>
+              </row>
+
+              <row>
+                <entry></entry>
+
+                <entry>Definir pares key-value</entry>
+
+                <entry>Write</entry>
+              </row>
+
+              <row>
+                <entry></entry>
+
+                <entry>Excluir keys, excluir namespaces, buscar
+                keymetadata</entry>
+
+                <entry>Full</entry>
+              </row>
+
+              <row>
                 <entry>WsEclAccess</entry>
 
                 <entry>Acesso ao serviço WS ECL</entry>
 
                 <entry>Completo</entry>
+              </row>
+
+              <row>
+                <entry>WsLogAccess</entry>
+
+                <entry>Habilita a função de leitura de logs dos
+                componentes</entry>
+
+                <entry>Leitura</entry>
+              </row>
+
+              <row>
+                <entry>SashaAccess</entry>
+
+                <entry>Acesso para o serviço WsSasha</entry>
+
+                <entry>Access</entry>
+              </row>
+
+              <row>
+                <entry/>
+
+                <entry>Listar Workunits</entry>
+
+                <entry>Read</entry>
+              </row>
+
+              <row>
+                <entry/>
+
+                <entry>Archivar Workunits, restaurar Workunits
+                arquivadas</entry>
+
+                <entry>Full</entry>
               </row>
             </tbody>
           </tgroup>
@@ -1656,6 +1747,15 @@
             entrada de arquivos para o cluster, assim como para fazer o
             despray (consolidar dados dos nós) dos arquivos do cluster para a
             zona de entrada de arquivos.</para>
+          </listitem>
+
+          <listitem>
+            <para>O serviço WsStore usa <emphasis
+            role="bold">namespaces</emphasis> (semelhantes a um banco de
+            dados em um sistema DBMS), <emphasis role="bold">stores</emphasis>
+            (semelhantes a tabelas em um banco de dados) e <emphasis
+            role="bold">pares key-value</emphasis> (semelhantes a
+            campos).</para>
           </listitem>
         </itemizedlist>
       </sect4>
@@ -1921,10 +2021,8 @@
           entrada de arquivos</para>
 
           <para>Isso oferece uma maneira de permitir ou negar acesso ao escopo
-          de arquivo principal.</para>
-
-          <para>Por padrão, apenas os administradores têm acesso a esse
-          escopo.</para>
+          de arquivo principal. Por padrão, apenas os administradores têm
+          acesso a esse escopo.</para>
         </listitem>
 
         <listitem>
@@ -1966,6 +2064,129 @@
 
       <para><graphic fileref="../../images/Perm031.jpg"
       vendor="eclwatchSS"/></para>
+    </sect3>
+  </sect2>
+
+  <sect2 id="GS-LZ-Scopes">
+    <title>Segurança da Landing Zone</title>
+
+    <para>Você pode definir opções de segurança adicionais na(s) Landing
+    Zone(s). A segurança no nível do recurso permite que você defina
+    permissões de acesso e o que os usuários ou grupos podem fazer lá. Landing
+    Zone Scope Security permite que você defina permissões em subpastas em uma
+    Landing Zone. Isso fornece um meio de conceder e negar permissão aos
+    usuários para áreas dentro de uma Landing Zone.</para>
+
+    <sect3 id="GS_LandingZoneFeatureAuth">
+      <title>Autorização de Recurso da Landing Zone</title>
+
+      <para>Lista a Landing Zone do HPCC System usando autorização de nível de
+      recurso:</para>
+
+      <para><informaltable>
+          <tgroup cols="2">
+            <tbody>
+              <row>
+                <entry>Lista/pesquisa arquivos de Dropzone</entry>
+
+                <entry>FileSprayAccess - SecAccess_Read</entry>
+              </row>
+
+              <row>
+                <entry>Spray de um arquivo de uma Dropzone</entry>
+
+                <entry>FileSprayAccess - SecAccess_Write</entry>
+              </row>
+
+              <row>
+                <entry>Despray de um arquivo para uma Dropzone</entry>
+
+                <entry>FileDesprayAccess - SecAccess_Write</entry>
+              </row>
+
+              <row>
+                <entry>Lê o conteúdo do arquivo de uma Dropzone</entry>
+
+                <entry>FileIOAccess - SecAccess_Read</entry>
+              </row>
+
+              <row>
+                <entry>Grava o conteúdo de um arquivo de uma Dropzone</entry>
+
+                <entry>FileIOAccess - SecAccess_Write</entry>
+              </row>
+
+              <row>
+                <entry>Upload de um arquivo para uma Dropzone utilizando o
+                ECLWatch:</entry>
+
+                <entry>FileUploadAccess - SecAccess_Full</entry>
+              </row>
+
+              <row>
+                <entry>Download de um arquivo de uma Dropzone utilizando o
+                ECLWatch</entry>
+
+                <entry>FileSprayAccess - SecAccess_Full</entry>
+              </row>
+            </tbody>
+          </tgroup>
+        </informaltable>Para habilitar o acesso a um recurso, defina a
+      permissão de acordo.</para>
+
+      <para>Isso pode ser um nível de segurança suficiente em alguns casos; no
+      entanto, restrições adicionais podem ser necessárias para proteger
+      determinados arquivos de determinados usuários ou grupos. Você pode usar
+      a segurança Landing Zone File Scope para fazer isso.</para>
+    </sect3>
+
+    <sect3 id="LZ_FileScopes">
+      <title>Arquivo de Escopos da Landing Zone</title>
+
+      <para>A autorização de nível de escopo de arquivo fornece um meio de
+      proteger o acesso a pastas dentro de uma Landing Zone.</para>
+
+      <para>Um administrador de HPCC pode definir os escopos da landing zone
+      para cada pasta.</para>
+
+      <para>Cada escopo é uma pasta de arquivo de uma Landing Zone
+      HPCC.</para>
+
+      <para>Os escopos do arquivo Landing Zone podem ser definidos usando
+      ECLWatch para sistemas habilitados para segurança.</para>
+
+      <para><graphic fileref="../../images/LDAP_0058-1.jpg"
+      vendor="ECLWatchSecurity"/>Para criar uma novo escopo de Landing Zone,
+      vá para a página Security do ECL Watch, e clique em Permissões.</para>
+
+      <para><graphic fileref="../../images/LDAP_0058-2.jpg"
+      vendor="ECLWatchSecurity"/>Na aba Permissões, pressione o botão
+      Add.</para>
+
+      <para><graphic fileref="../../images/LDAP_0058-3.jpg"
+      vendor="ECLWatchSecurity"/></para>
+
+      <para>Escolha Escopos de arquivo na caixa de opção suspensa e, em
+      seguida, forneça um nome e, opcionalmente, uma descrição.</para>
+
+      <para><graphic fileref="../../images/LDAP_0058-4.jpg"
+      vendor="ECLWatchSecurity"/></para>
+    </sect3>
+
+    <sect3 id="SEC_LZFilePermissions">
+      <title>Arquivo de Permissões da Landing Zone</title>
+
+      <para>You can set the Landing Zone file permissions according to your
+      requirements. Access your new Landing Zone using the following
+      annotation:</para>
+
+      <programlisting> plane::{dropzone_name}::{folder_name}::{subfolder_name}::{subfolder_name}...</programlisting>
+
+      <para>Seu Administrador HPCC pode definir os direitos de acesso para
+      cada escopo para cada usuário HPCC ou grupo de usuários.</para>
+
+      <para><graphic fileref="../../images/LDAP_0059-1.jpg"
+      vendor="ECLWatchSecurity"/></para>
     </sect3>
   </sect2>
 
@@ -2014,7 +2235,7 @@
 
     <para>Você pode substituir o escopo padrão usando o código ECL:</para>
 
-    <para><programlisting>#workunit(‘scope’,’MyScopeValue’);</programlisting></para>
+    <para><programlisting>#workunit('scope','MyScopeValue');</programlisting></para>
 
     <sect3 id="Securing_Workunit_Scopes">
       <title>Protegendo os escopos dos workunits</title>

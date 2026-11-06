@@ -15,71 +15,72 @@
 ################################################################################
 
 
-# Component: ws_machine 
+# Component: ws_machine
 #####################################################
 # Description:
 # ------------
 #    Cmake Input File for ws_machine
 #####################################################
 
-project( ws_machine ) 
+project( ws_machine )
 
 include(${HPCC_SOURCE_DIR}/esp/scm/espscm.cmake)
 
-set (    SRCS 
-         ${ESPSCM_GENERATED_DIR}/ws_machine_esp.cpp 
-         ws_machineBinding.cpp 
-         ws_machinePlugin.cpp 
-         ws_machineService.cpp 
-         ws_machineServiceMetrics.cpp 
-         ws_machineServiceRexec.cpp 
+set (    SRCS
+         ${ESPSCM_GENERATED_DIR}/ws_machine_esp.cpp
+         ws_machineBinding.cpp
+         ws_machinePlugin.cpp
+         ws_machineService.cpp
+         ws_machineServiceMetrics.cpp
+         ws_machineServiceRexec.cpp
          componentstatus.cpp
     )
 
-include_directories ( 
-         ./../.. 
-         ./../../../system/mp 
-         ./../../../system/jlib 
-         ./../../services 
-         ./../../../system/xmllib 
-         ./../../../system/security/securesocket 
-         ./../../../system/security/shared   
-         ./../../../system/include 
-         ./../../../common/remote 
+include_directories (
+         ./../..
+         ./../../../system/mp
+         ./../../../system/jlib
+         ./../../services
+         ./../../../system/xmllib
+         ./../../../system/security/securesocket
+         ./../../../system/security/shared
+         ./../../../system/include
+         ./../../../common/remote
          ./../../../common/environment
          ./../../../common/roxiecommlib
          ./../../../common/workunit
-         ./../../clients 
+         ./../../clients
          ./../../../dali/base
          ./../../../dali/sasha
-         ./../../bindings 
-         ./../../bindings/SOAP/xpp 
-         ./../../../esp/platform 
-         ./../../smc/SMCLib 
+         ./../../bindings
+         ./../../bindings/SOAP/xpp
+         ./../../../esp/platform
+         ./../../smc/SMCLib
          ${HPCC_SOURCE_DIR}/common/thorhelper
     )
 
-ADD_DEFINITIONS( -D_USRDLL )
+ADD_DEFINITIONS( -D_USRDLL -Dws_machine_API_LOCAL -DESP_SERVICE_ws_machine)
 
 HPCC_ADD_LIBRARY( ws_machine SHARED ${SRCS} )
 add_dependencies( ws_machine espscm )
 install ( TARGETS ws_machine RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( ws_machine
+target_link_libraries ( ws_machine PRIVATE
          jlib
          roxiecommlib
-         xmllib 
-         esphttp 
-         mp 
-         hrpc 
-         remote 
-         dalibase 
-         environment 
+         xmllib
+         esphttp
+         mp
+         remote
+         dalibase
+         environment
          workunit
          SMCLib
+         ${COMMON_ESP_SERVICE_LIBS}
     )
 
 IF (USE_OPENSSL)
     target_link_libraries ( ws_machine
+    	PRIVATE
     	securesocket
     )
 ENDIF()
@@ -96,4 +97,3 @@ FOREACH ( iFILES
 )
     Install ( FILES ${iFILES} DESTINATION componentfiles/smc_xslt/ws_machine COMPONENT Runtime )
 ENDFOREACH ( iFILES )
-

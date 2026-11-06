@@ -127,6 +127,8 @@ include_directories (
          ${HPCC_SOURCE_DIR}/system/codesigner
     )
 
+set_source_files_properties(hqlgram.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+
 if (WIN32)
     add_custom_command ( OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/hqlgram.cpp ${CMAKE_CURRENT_BINARY_DIR}/hqlgram.h
         #${bisonopt} is used to force s/r and r/r errors to abort compiling
@@ -148,9 +150,9 @@ add_custom_command ( OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/hqllex.cpp
     DEPENDS hqllex.l
 )
 
-if (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG)
-  SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-switch -Wno-unused-parameter -Werror -Wno-error=delete-non-virtual-dtor")
+SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STRICT_CXX_FLAGS}")
 
+if (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG)
   if (CMAKE_COMPILER_IS_GNUCC AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS "7.0.0")
     SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wimplicit-fallthrough=3")
     #gcc incorrectly thinks that a function that never returns can fall through
@@ -163,8 +165,14 @@ if (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG)
     set_source_files_properties (hqllex.cpp PROPERTIES COMPILE_FLAGS " -Wno-class-memaccess -Wno-sign-compare")
   endif()
 
-  #Compiler complains about an unused function yyunput, and make sure that any warnings are not reported as errors
-  set_source_files_properties (hqllex.cpp PROPERTIES COMPILE_FLAGS " -Wno-unused-function -Wno-error")
+    #Compiler complains about an unused function yyunput, and make sure that any warnings are not reported as errors
+    set_property (SOURCE hqllex.cpp APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-unused-function -Wno-error")
+
+    #Compiler complains about a variable is set but not used
+    set_property (SOURCE hqlgram.cpp APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-unused-but-set-variable -Wno-error=class-memaccess")
+    if (CMAKE_COMPILER_IS_CLANG)
+        set_property (SOURCE hqlgram.cpp APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-nontrivial-memcall")
+    endif()
 endif()
 
 if (WIN32)
@@ -174,18 +182,24 @@ endif()
 ADD_DEFINITIONS( -D_USRDLL -DHQL_EXPORTS -DHQLFOLD_EXPORTS -DHQLTRANS_EXPORTS )
 
 HPCC_ADD_LIBRARY( hql SHARED ${SRCS} ${CMAKE_CURRENT_BINARY_DIR}/hqlgram.cpp ${CMAKE_CURRENT_BINARY_DIR}/hqllex.cpp  )
+if (EMSCRIPTEN)
+    set_target_properties(hql PROPERTIES COMPILE_FLAGS "${COMPILE_FLAGS} -Wno-error=nontrivial-memcall -Wno-error=unused-variable")
+endif ()
 install ( TARGETS hql RUNTIME DESTINATION ${EXEC_DIR} LIBRARY DESTINATION ${LIB_DIR} )
-target_link_libraries ( hql
+target_link_libraries ( hql PRIVATE
          jlib
          nbcd
          eclrtl
          deftype
-         ${CPPUNIT_LIBRARIES}
+         ${CppUnit_LIBRARIES}
     )
 
+if (CMAKE_DL_LIBS)
+    target_link_libraries ( hql PRIVATE ${CMAKE_DL_LIBS} )
+endif()
+
 IF (USE_ZLIB)
-    target_link_libraries ( hql
-        ${ZLIB_LIBRARIES}
+    target_link_libraries ( hql PRIVATE
         zcrypt
     )
 ENDIF()

@@ -36,6 +36,8 @@
  #define jlib_thrown_decl DECL_IMPORT
 #endif
 
+#include <atomic>
+
 interface IInterface
 {
     virtual void Link() const = 0;
@@ -53,17 +55,18 @@ template <class X> inline void Release(X * ptr) { if (ptr) ptr->Release(); }
 template <class CLASS> class Shared
 {
 public:
-    inline Shared()                              { ptr = NULL; }
+    constexpr inline Shared() = default;
     inline Shared(CLASS * _ptr, bool owned)      { ptr = _ptr; if (!owned && _ptr) _ptr->Link(); }
     inline Shared(const Shared & other)          { ptr = other.getLink(); }
 #if defined(__cplusplus) && __cplusplus >= 201100
     inline Shared(Shared && other)               { ptr = other.getClear(); }
+    explicit operator bool() const               { return ptr != nullptr; }
 #endif
     inline ~Shared()                             { ::Release(ptr); }
     inline Shared<CLASS> & operator = (const Shared<CLASS> & other) { this->set(other.get()); return *this;  }
 
-    inline CLASS * operator -> () const         { return ptr; } 
-    inline operator CLASS *() const             { return ptr; } 
+    inline CLASS * operator -> () const         { return ptr; }
+    inline operator CLASS *() const             { return ptr; }
 
     inline void clear()                         { CLASS *temp=ptr; ptr=NULL; ::Release(temp); }
     inline CLASS * get() const                  { return ptr; }
@@ -81,8 +84,21 @@ public:
     }
     inline void set(const Shared<CLASS> &other) { this->set(other.get()); }
     inline void setown(CLASS * _ptr)            { CLASS * temp = ptr; ptr = _ptr; ::Release(temp); }
+    inline bool setownIfNull(CLASS * _ptr)
+    {
+        if (!ptr)
+        {
+            ptr = _ptr;
+            return true;
+        }
+        else
+        {
+            ::Release(_ptr);
+            return false;
+        }
+    }
     inline void swap(Shared<CLASS> & other)     { CLASS * temp = ptr; ptr = other.ptr; other.ptr = temp; }
-    
+
 protected:
     inline Shared(CLASS * _ptr)                  { ptr = _ptr; } // deliberately protected
 
@@ -91,7 +107,7 @@ private:
     inline Shared<CLASS> & operator = (const CLASS * other);
 
 private:
-    CLASS * ptr;
+    CLASS * ptr = nullptr;
 };
 
 
@@ -99,7 +115,7 @@ private:
 template <class CLASS> class Owned : public Shared<CLASS>
 {
 public:
-    inline Owned()                              { }
+    constexpr inline Owned() = default;
     inline Owned(CLASS * _ptr) : Shared<CLASS>(_ptr)   { }
 
     inline Shared<CLASS> & operator = (const Shared<CLASS> & other) { this->set(other.get()); return *this;  }
@@ -114,7 +130,7 @@ private:
 template <class CLASS> class Linked : public Shared<CLASS>
 {
 public:
-    inline Linked()                         { }
+    constexpr inline Linked() = default;
     inline Linked(CLASS * _ptr) : Shared<CLASS>(LINK(_ptr)) { }
     inline Linked(const Shared<CLASS> & other) : Shared<CLASS>(other) { }
 
@@ -146,7 +162,7 @@ interface IDataVal
 };
 
 
-// IIterator 
+// IIterator
 interface IIterator : extends IInterface
 {
     virtual bool first() = 0;
@@ -156,7 +172,7 @@ interface IIterator : extends IInterface
     virtual IInterface & get() = 0;
 };
 
-template <class C> 
+template <class C>
 interface IIteratorOf : public IInterface
 {
 public:
@@ -183,6 +199,8 @@ class StringBuffer;
 
 typedef enum
 {
+    // Unknown target audience
+    MSGAUD_unknown    = 0x00,
     // Target audience: system admins
     // Purpose: Information useful for administering the platform, diagnosing errors and
     //          resolving system issues
@@ -196,7 +214,8 @@ typedef enum
     //          would not be resolvable by sysadmin or ECL developers. Additional information that may
     //          be useful for improving the platform.
     MSGAUD_programmer  = 0x20,
-    // MSGAUD_legacy      = 0x40, REMOVED - may be reused later
+    // Target audience: Automatic monitoring tools
+    MSGAUD_monitor     = 0x40,
     // Target audience: persons involved in accounting and security audits
     MSGAUD_audit       = 0x80,
     // MSGAUD_all is to be used for filtering or specifying which messages are to be logged

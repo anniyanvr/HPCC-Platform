@@ -1,0 +1,107 @@
+import { Workunit, WorkunitsService, type WsWorkunits } from "@hpcc-js/comms";
+import { scopedLogger } from "@hpcc-js/util";
+import nlsHPCC from "src/nlsHPCC";
+import { Thenable } from "src/store/Deferred";
+import { Paged } from "src/store/Paged";
+import { BaseStore } from "src/store/Store";
+import { wuidToDateTime } from "src/Utility";
+
+const logger = scopedLogger("src-react/comms/workunit.ts");
+
+const service = new WorkunitsService({ baseUrl: "" });
+
+type WUQueryWithTime = WsWorkunits.WUQuery & {
+    StartTime?: string;
+    EndTime?: string;
+};
+
+export type WUQueryStore = BaseStore<WUQueryWithTime, Workunit>;
+
+export function CreateWUQueryStore(): BaseStore<WUQueryWithTime, Workunit> {
+    const store = new Paged<WUQueryWithTime, Workunit>({
+        start: "PageStartFrom",
+        count: "PageSize",
+        sortBy: "Sortby",
+        descending: "Descending"
+    }, "Wuid", (request, abortSignal): Thenable<{ data: Workunit[], total: number }> => {
+        if (request.Sortby && request.Sortby === "TotalClusterTime") {
+            request.Sortby = "ClusterTime";
+        }
+        if (request.StartDate && request.StartDate.indexOf("T") < 0) {
+            const time = request.StartTime || "00:00";
+            request.StartDate = `${request.StartDate}T${time}:00.000Z`;
+        }
+        delete request.StartTime;
+        if (request.EndDate && request.EndDate.indexOf("T") < 0) {
+            const time = request.EndTime || "00:00";
+            request.EndDate = `${request.EndDate}T${time}:00.000Z`;
+        }
+        delete request.EndTime;
+        if (request.EndDate) {
+            request.EndDate = new Date(request.EndDate).toISOString();
+        }
+        if (request.StartDate) {
+            request.StartDate = new Date(request.StartDate).toISOString();
+        }
+        return service.WUQuery(request, abortSignal).then(response => {
+            const page = {
+                start: undefined,
+                end: undefined
+            };
+            const data = response.Workunits.ECLWorkunit.map((wu): Workunit => {
+                const start = wuidToDateTime(wu.Wuid);
+                if (!page.start || page.start > start) {
+                    page.start = start;
+                }
+                let timePartsSection = 0;
+                const end = new Date(start);
+                const timeParts = wu.TotalClusterTime?.split(":") ?? [];
+                while (timeParts.length) {
+                    const timePart = timeParts.pop();
+                    switch (timePartsSection) {
+                        case 0:
+                            end.setSeconds(end.getSeconds() + +timePart);
+                            break;
+                        case 1:
+                            end.setMinutes(end.getMinutes() + +timePart);
+                            break;
+                        case 2:
+                            end.setHours(end.getHours() + +timePart);
+                            break;
+                        case 3:
+                            end.setDate(end.getDate() + +timePart);
+                            break;
+                    }
+                    ++timePartsSection;
+                }
+                if (!page.end || page.end < end) {
+                    page.end = end;
+                }
+                const retVal = Workunit.attach(service, wu.Wuid, wu);
+                //  HPCC-33121 - Move to @hpcc-js/comms  ---
+                retVal["__timeline_timings"] = {
+                    start,
+                    end,
+                    page
+                };
+                return retVal;
+            });
+            return {
+                data,
+                total: response.NumWUs
+            };
+        }).catch(e => {
+            const message = e?.Message ?? e?.message ?? e?.Exception?.[0]?.Message;
+            if (message === nlsHPCC.GridAbortMessage) {
+                logger.debug(message);
+            } else {
+                logger.error(e);
+            }
+            return {
+                data: [],
+                total: 0
+            };
+        });
+    });
+    return store;
+}

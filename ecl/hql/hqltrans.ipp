@@ -206,7 +206,6 @@ protected:
     IHqlExpression * transformAlienType(IHqlExpression * expr);
     IHqlExpression * transformField(IHqlExpression * expr);
     bool transformChildren(IHqlExpression * expr, HqlExprArray & children);
-    bool transformScope(IHqlScope * newScope, IHqlScope * oldScope);
     bool transformScope(HqlExprArray & newSymbols, IHqlScope * scope);
     IHqlExpression * transformScope(IHqlExpression * expr);
 
@@ -281,6 +280,24 @@ protected:
     IHqlExpression * prev;
     IIdAtom * search;
 };
+
+class HQL_API MatchExprTracer : public QuickHqlTransformer
+{
+    using callback = std::function<bool(IHqlExpression *)>;
+public:
+    MatchExprTracer(callback _matches);
+
+    virtual void doAnalyse(IHqlExpression * expr);
+    void reportMatches(const char * title);
+
+protected:
+    callback matches;
+    HqlExprArray matchedExprs;
+};
+
+
+//E.g. traceMatchExpr("afterX", curWorkflow.queryExprs(), [](IHqlExpression * expr) -> bool { return expr->queryName() == createAtom("SearchSymbol"); });
+void traceMatchExpr(const char * title, const HqlExprArray & exprs, std::function<bool(IHqlExpression *)> matches);
 
 //---------------------------------------------------------------------------
 
@@ -671,7 +688,8 @@ private:
 class HQL_API ConditionalHqlTransformer : public NewHqlTransformer
 {
 public:
-    enum { CTFnoteifactions     = 0x0001,
+    enum { CTFnone              = 0x0000,
+           CTFnoteifactions     = 0x0001,
            CTFnoteifdatasets    = 0x0002,
            CTFnoteifdatarows    = 0x0004,
            CTFnoteifall         = 0x0008,
@@ -1262,6 +1280,8 @@ extern HQL_API void gatherTransformStats(IStatisticTarget & target);
 extern HQL_API void clearTransformStats();
 extern HQL_API unsigned getExpressionCount(IHqlExpression * expr, bool onlyActivities, bool processColon, bool processSequential);
 extern HQL_API unsigned getExpressionCount(const HqlExprArray & exprs, bool onlyActivities, bool processColon, bool processSequential);
+
+extern HQL_API IHqlExpression * createPackedStringRecord(IHqlExpression * record, unsigned firstPayloadIndex, unsigned minFieldLength);
 
 #ifdef OPTIMIZE_TRANSFORM_ALLOCATOR
 size32_t beginTransformerAllocator();

@@ -75,7 +75,7 @@ CLogMsgLinkToChild::CLogMsgLinkToChild(MPLogId _cid, MPLogId _pid, INode * _chil
     : childNode(_childNode), cid(_cid), pid(_pid), connected(_connected)
 {
     receiverThread.setown(new LogMsgLogReceiverThread(cid, childNode));
-    receiverThread->start();
+    receiverThread->start(false);
 }
 
 CLogMsgLinkToChild::~CLogMsgLinkToChild()
@@ -280,7 +280,7 @@ bool disconnectLogMsgManagerFromChildOwn(INode * childNode)
 void startLogMsgChildReceiver()
 {
     childReceiver = new LogMsgChildReceiverThread();
-    childReceiver->startRelease();
+    childReceiver->start(false);
 }
 
 // CHILD-SIDE CLASSES
@@ -368,7 +368,7 @@ void LinkToParentLogMsgHandler::addToPTree(IPropertyTree * tree) const
     IPropertyTree * handlerTree = createPTree(ipt_caseInsensitive);
     handlerTree->setProp("@type", "linktoparent");
     StringBuffer buff;
-    parentNode->endpoint().getUrlStr(buff);
+    parentNode->endpoint().getEndpointHostText(buff);
     handlerTree->setProp("@url", buff.str());
     tree->addPropTree("handler", handlerTree);
 }
@@ -532,6 +532,8 @@ aindex_t LogMsgParentReceiverThread::findParent(const INode * node) const
 
 bool connectLogMsgManagerToParent(INode * parentNode)
 {
+    if (isContainerized())
+        return false;
     assertex(parentReceiver);
     MPLogId pid = parentReceiver->getNextId();
     return parentReceiver->addParentToManager(0, pid, parentNode, false);
@@ -539,6 +541,8 @@ bool connectLogMsgManagerToParent(INode * parentNode)
 
 bool connectLogMsgManagerToParentOwn(INode * parentNode)
 {
+    if (isContainerized())
+        return false;
     bool ret = connectLogMsgManagerToParent(parentNode);
     parentNode->Release();
     return ret;
@@ -546,11 +550,15 @@ bool connectLogMsgManagerToParentOwn(INode * parentNode)
 
 bool disconnectLogMsgManagerFromParent(INode * parentNode)
 {
+    if (isContainerized())
+        return false;
     return parentReceiver->removeParentFromManager(parentNode, false);
 }
 
 bool disconnectLogMsgManagerFromParentOwn(INode * parentNode)
 {
+    if (isContainerized())
+        return false;
     bool ret = disconnectLogMsgManagerFromParent(parentNode);
     parentNode->Release();
     return ret;
@@ -558,8 +566,10 @@ bool disconnectLogMsgManagerFromParentOwn(INode * parentNode)
 
 void startLogMsgParentReceiver()
 {
+    if (isContainerized())
+        return; // we do not redirect logging between components in containerized environments (this is used for audit->dali in BM)
     parentReceiver = new LogMsgParentReceiverThread();
-    parentReceiver->startRelease();
+    parentReceiver->start(false);
 }
 
 // MISC. HELPER FUNCTION
@@ -573,18 +583,16 @@ void stopLogMsgReceivers()
 {
     if(parentReceiver)
     {
-        parentReceiver->Link();
         parentReceiver->stop();
         parentReceiver->Release();
+        parentReceiver = nullptr;
     }
-    parentReceiver = 0;
     if(childReceiver)
     {
-        childReceiver->Link();
         childReceiver->stop();
         childReceiver->Release();
+        childReceiver = nullptr;
     }
-    childReceiver = 0;
     queryLogMsgManager()->removeMonitorsMatching(isMPLogMsgMonitor);
     queryLogMsgManager()->removeAllChildren();
 }

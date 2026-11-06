@@ -20,8 +20,6 @@
 #include "jfile.hpp"
 #include "jargv.hpp"
 
-#include "build-config.h"
-
 #include "ws_packageprocess_esp.ipp"
 
 #include "eclcmd.hpp"
@@ -30,21 +28,6 @@
 
 
 //=========================================================================================
-
-IClientWsPackageProcess *getWsPackageSoapService(const char *server, const char *port, const char *username, const char *password)
-{
-    if(server == NULL)
-        throw MakeStringException(-1, "Server url not specified");
-
-    VStringBuffer url("http://%s:%s/WsPackageProcess", server, port);
-
-    IClientWsPackageProcess *packageProcessClient = createWsPackageProcessClient();
-    packageProcessClient->addServiceUrl(url.str());
-    packageProcessClient->setUsernameToken(username, password, NULL);
-
-    return packageProcessClient;
-}
-
 
 class EclCmdPackageActivate : public EclCmdCommon
 {
@@ -104,7 +87,7 @@ public:
     {
         Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
         Owned<IClientActivatePackageRequest> request = packageProcessClient->createActivatePackageRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setTarget(optTarget);
         request->setPackageMap(optPackageMap);
@@ -195,7 +178,7 @@ public:
     {
         Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
         Owned<IClientDeActivatePackageRequest> request = packageProcessClient->createDeActivatePackageRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setTarget(optTarget);
         request->setPackageMap(optPackageMap);
@@ -265,7 +248,7 @@ public:
     {
         Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
         Owned<IClientListPackageRequest> request = packageProcessClient->createListPackageRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setTarget(optTarget);
         request->setProcess("*");
@@ -356,7 +339,7 @@ public:
     {
         Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
         Owned<IClientGetPackageRequest> request = packageProcessClient->createGetPackageRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setTarget(optTarget);
         request->setProcess("*");
@@ -387,7 +370,7 @@ private:
 class EclCmdPackageDelete : public EclCmdCommon
 {
 public:
-    EclCmdPackageDelete()
+    EclCmdPackageDelete() : optGlobalScope(false)
     {
     }
     virtual eclCmdOptionMatchIndicator parseCommandLineOptions(ArgvIterator &iter)
@@ -448,7 +431,7 @@ public:
 
         Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
         Owned<IClientDeletePackageRequest> request = packageProcessClient->createDeletePackageRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setTarget(optTarget);
         request->setPackageMap(optPackageMap);
@@ -486,8 +469,8 @@ private:
 class EclCmdPackageAdd : public EclCmdCommon
 {
 public:
-    EclCmdPackageAdd() : optActivate(false), optOverWrite(false), optGlobalScope(false), optAllowForeign(false), optPreloadAll(false),
-        optUpdateSuperfiles(false), optUpdateCloneFrom(false), optDontAppendCluster(false), optReplacePackagemap(false)
+    EclCmdPackageAdd() : 
+        optActivate(false), optOverWrite(false), optReplacePackagemap(false), optUpdateSuperfiles(false), optUpdateCloneFrom(false), optDontAppendCluster(false), optGlobalScope(false), optAllowForeign(false), optPreloadAll(false)
     {
     }
     virtual eclCmdOptionMatchIndicator parseCommandLineOptions(ArgvIterator &iter)
@@ -535,6 +518,10 @@ public:
                 continue;
             if (iter.matchFlag(optPreloadAll, ECLOPT_PRELOAD_ALL_PACKAGES))
                 continue;
+            if (iter.matchFlag(optIgnorePackageMapSources, ECLOPT_IGNORE_PACKAGEMAP_SOURCES))
+                continue;
+            if (dfuOptions.match(iter))
+                continue;
             eclCmdOptionMatchIndicator ind = EclCmdCommon::matchCommandLineOption(iter, true);
             if (ind != EclCmdOptionMatch)
                 return ind;
@@ -548,6 +535,8 @@ public:
             usage();
             return false;
         }
+        if (!dfuOptions.finalizeOptions(*this, globals))
+            return false;
         StringBuffer err;
         if (optFileName.isEmpty())
             err.append("\n ... Missing package file name\n");
@@ -578,10 +567,15 @@ public:
         StringBuffer pkgInfo;
         pkgInfo.loadFile(optFileName);
 
-        fprintf(stdout, "\n ... adding package map %s now\n\n", optFileName.str());
+        if (dfuOptions.optOnlyCopyFiles)
+            fprintf(stdout, "\n ... copying files for package map %s\n\n", optFileName.str());
+        else if (dfuOptions.optStopIfFilesCopied)
+            fprintf(stdout, "\n ... copying files for, OR adding package map %s\n\n", optFileName.str());
+        else
+            fprintf(stdout, "\n ... adding package map %s\n\n", optFileName.str());
 
         Owned<IClientAddPackageRequest> request = packageProcessClient->createAddPackageRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setActivate(optActivate);
         request->setInfo(pkgInfo);
@@ -599,8 +593,14 @@ public:
         request->setUpdateCloneFrom(optUpdateCloneFrom);
         request->setAppendCluster(!optDontAppendCluster);
 
+        dfuOptions.updateRequest(request.get());
+        request->setIgnorePackageMapSources(optIgnorePackageMapSources);
+
         Owned<IClientAddPackageResponse> resp = packageProcessClient->AddPackage(request);
         int ret = outputMultiExceptionsEx(resp->getExceptions());
+
+        if (ret==0 && dfuOptions.report(resp.get()))
+            puts("\n package added.\n");
 
         StringArray &notFound = resp->getFilesNotFound();
         if (notFound.length())
@@ -632,12 +632,13 @@ public:
                     "   --source-process         Process cluster to copy files from\n"
                     "   --allow-foreign          Do not fail if foreign files are used in packagemap\n"
                     "   --preload-all            Set preload files option for all packages\n"
-                    "   --replace                Replace existing packagmap"
+                    "   --replace                Replace existing packagemap\n"
                     "   --update-super-files     Update local DFS super-files if remote DALI has changed\n"
                     "   --update-clone-from      Update local clone from location if remote DALI has changed\n"
-                    "   --dont-append-cluster    Only use to avoid locking issues due to adding cluster to file\n",
+                    "   --dont-append-cluster    Only use to avoid locking issues due to adding cluster to file\n"
+                    "   --ignore-packagemap-sources Ignore source locations and LFN qualifiers declared in the package map\n",
                     stdout);
-
+        dfuOptions.usage();
         EclCmdCommon::usage();
     }
 private:
@@ -648,6 +649,9 @@ private:
     StringAttr optDaliIP;
     StringAttr optPackageMapId;
     StringAttr optSourceProcess;
+
+    EclCmdOptionsDFU dfuOptions;
+
     bool optActivate;
     bool optOverWrite;
     bool optReplacePackagemap;
@@ -657,6 +661,7 @@ private:
     bool optGlobalScope;
     bool optAllowForeign;
     bool optPreloadAll;
+    bool optIgnorePackageMapSources = false;
 };
 
 class EclCmdPackageMapCopy : public EclCmdCommon
@@ -704,6 +709,10 @@ public:
                 continue;
             if (iter.matchFlag(optPreloadAll, ECLOPT_PRELOAD_ALL_PACKAGES))
                 continue;
+            if (iter.matchFlag(optIgnorePackageMapSources, ECLOPT_IGNORE_PACKAGEMAP_SOURCES))
+                continue;
+            if (dfuOptions.match(iter))
+                continue;
             eclCmdOptionMatchIndicator ind = EclCmdCommon::matchCommandLineOption(iter, true);
             if (ind != EclCmdOptionMatch)
                 return ind;
@@ -717,6 +726,8 @@ public:
             usage();
             return false;
         }
+        if (!dfuOptions.finalizeOptions(*this, globals))
+            return false;
         StringBuffer err;
         if (optSrcPath.isEmpty())
             err.append("\n ... Missing path to source packagemap\n");
@@ -735,10 +746,15 @@ public:
     {
         Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
 
-        fprintf(stdout, "\n ... copy package map %s to %s\n\n", optSrcPath.str(), optTarget.str());
+        if (dfuOptions.optOnlyCopyFiles)
+            fprintf(stdout, "\n ... copying files, in preparation for copying package map %s to %s\n\n", optSrcPath.str(), optTarget.str());
+        else if (dfuOptions.optStopIfFilesCopied)
+            fprintf(stdout, "\n ... copying files for, OR copying package map %s to %s\n\n", optSrcPath.str(), optTarget.str());
+        else
+            fprintf(stdout, "\n ... copying package map %s to %s\n\n", optSrcPath.str(), optTarget.str());
 
         Owned<IClientCopyPackageMapRequest> request = packageProcessClient->createCopyPackageMapRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setSourcePath(optSrcPath);
         request->setTarget(optTarget);
@@ -753,8 +769,14 @@ public:
         request->setUpdateCloneFrom(optUpdateCloneFrom);
         request->setAppendCluster(!optDontAppendCluster);
 
+        dfuOptions.updateRequest(request.get());
+        request->setIgnorePackageMapSources(optIgnorePackageMapSources);
+
         Owned<IClientCopyPackageMapResponse> resp = packageProcessClient->CopyPackageMap(request);
         int ret = outputMultiExceptionsEx(resp->getExceptions());
+
+        if (ret==0 && dfuOptions.report(resp.get()))
+            puts("\n package copied.\n");
 
         StringArray &notFound = resp->getFilesNotFound();
         if (notFound.length())
@@ -786,12 +808,13 @@ public:
                     "   --pmid                 Identifier of package map - defaults to source PMID\n"
                     "   --source-process       Process cluster to copy files from\n"
                     "   --preload-all          Set preload files option for all packages\n"
-                    "   --replace              Replace existing packagmap\n"
+                    "   --replace              Replace existing packagemap\n"
                     "   --update-super-files   Update local DFS super-files if remote DALI has changed\n"
                     "   --update-clone-from    Update local clone from location if remote DALI has changed\n"
-                    "   --dont-append-cluster  Only use to avoid locking issues due to adding cluster to file\n",
+                    "   --dont-append-cluster  Only use to avoid locking issues due to adding cluster to file\n"
+                    "   --ignore-packagemap-sources Ignore source locations and LFN qualifiers declared in the package map\n",
                     stdout);
-
+        dfuOptions.usage();
         EclCmdCommon::usage();
     }
 private:
@@ -800,12 +823,16 @@ private:
     StringAttr optPMID;
     StringAttr optDaliIP;
     StringAttr optSourceProcess;
+
+    EclCmdOptionsDFU dfuOptions;
+
     bool optActivate = false;
     bool optReplacePackagemap = false;
     bool optUpdateSuperfiles = false;
     bool optUpdateCloneFrom = false;
     bool optDontAppendCluster = false; //Undesirable but here temporarily because DALI may have locking issues
     bool optPreloadAll = false;
+    bool optIgnorePackageMapSources = false;
 };
 
 class EclCmdPackageValidate : public EclCmdCommon
@@ -920,9 +947,9 @@ public:
     }
     virtual int processCMD()
     {
-        Owned<IClientWsPackageProcess> packageProcessClient = getWsPackageSoapService(optServer, optPort, optUsername, optPassword);
+        Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
         Owned<IClientValidatePackageRequest> request = packageProcessClient->createValidatePackageRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         if (optFileName.length())
         {
@@ -1143,9 +1170,9 @@ public:
     }
     virtual int processCMD()
     {
-        Owned<IClientWsPackageProcess> packageProcessClient = getWsPackageSoapService(optServer, optPort, optUsername, optPassword);
+        Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
         Owned<IClientGetQueryFileMappingRequest> request = packageProcessClient->createGetQueryFileMappingRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setTarget(optTarget);
         request->setQueryName(optQueryId);
@@ -1261,6 +1288,10 @@ public:
                 continue;
             if (iter.matchFlag(optDontAppendCluster, ECLOPT_DONT_APPEND_CLUSTER))
                 continue;
+            if (iter.matchFlag(optIgnorePackageMapSources, ECLOPT_IGNORE_PACKAGEMAP_SOURCES))
+                continue;
+            if (dfuOptions.match(iter))
+                continue;
             eclCmdOptionMatchIndicator ind = EclCmdCommon::matchCommandLineOption(iter, true);
             if (ind != EclCmdOptionMatch)
                 return ind;
@@ -1274,6 +1305,8 @@ public:
             usage();
             return false;
         }
+        if (!dfuOptions.finalizeOptions(*this, globals))
+            return false;
         StringBuffer err;
         if (optFileName.isEmpty())
             err.append("\n ... Missing package file name\n");
@@ -1303,10 +1336,15 @@ public:
         StringBuffer content;
         content.loadFile(optFileName);
 
-        fprintf(stdout, "\n ... adding packagemap %s part %s from file %s\n\n", optPMID.get(), optPartName.get(), optFileName.get());
+        if (dfuOptions.optOnlyCopyFiles)
+            fprintf(stdout, "\n ... copying files for packagemap %s part %s from file %s\n\n", optPMID.get(), optPartName.get(), optFileName.get());
+        else if (dfuOptions.optStopIfFilesCopied)
+            fprintf(stdout, "\n ... copying files for, OR adding packagemap %s part %s from file %s\n\n", optPMID.get(), optPartName.get(), optFileName.get());
+        else
+            fprintf(stdout, "\n ... adding packagemap %s part %s from file %s\n\n", optPMID.get(), optPartName.get(), optFileName.get());
 
         Owned<IClientAddPartToPackageMapRequest> request = packageProcessClient->createAddPartToPackageMapRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setTarget(optTarget);
         request->setPackageMap(optPMID);
@@ -1322,8 +1360,14 @@ public:
         request->setUpdateCloneFrom(optUpdateCloneFrom);
         request->setAppendCluster(!optDontAppendCluster);
 
+        dfuOptions.updateRequest(request.get());
+        request->setIgnorePackageMapSources(optIgnorePackageMapSources);
+
         Owned<IClientAddPartToPackageMapResponse> resp = packageProcessClient->AddPartToPackageMap(request);
         int ret = outputMultiExceptionsEx(resp->getExceptions());
+
+        if (ret==0 && dfuOptions.report(resp.get()))
+            puts("\n package added.\n");
 
         StringArray &notFound = resp->getFilesNotFound();
         if (notFound.length())
@@ -1357,9 +1401,10 @@ public:
                     "   --preload-all               Set preload files option for all packages\n"
                     "   --update-super-files        Update local DFS super-files if remote DALI has changed\n"
                     "   --update-clone-from         Update local clone from location if remote DALI has changed\n"
-                    "   --dont-append-cluster       Only use to avoid locking issues due to adding cluster to file\n",
+                    "   --dont-append-cluster       Only use to avoid locking issues due to adding cluster to file\n"
+                    "   --ignore-packagemap-sources Ignore source locations and LFN qualifiers declared in the package map\n",
                     stdout);
-
+        dfuOptions.usage();
         EclCmdCommon::usage();
     }
 private:
@@ -1369,6 +1414,9 @@ private:
     StringAttr optSourceProcess;
     StringAttr optPartName;
     StringAttr optFileName;
+
+    EclCmdOptionsDFU dfuOptions;
+
     bool optDeletePrevious;
     bool optGlobalScope;
     bool optAllowForeign;
@@ -1376,12 +1424,13 @@ private:
     bool optUpdateSuperfiles;
     bool optUpdateCloneFrom;
     bool optDontAppendCluster;
+    bool optIgnorePackageMapSources = false;
 };
 
 class EclCmdPackageRemovePart : public EclCmdCommon
 {
 public:
-    EclCmdPackageRemovePart()
+    EclCmdPackageRemovePart() : optGlobalScope(false)
     {
     }
     virtual eclCmdOptionMatchIndicator parseCommandLineOptions(ArgvIterator &iter)
@@ -1444,7 +1493,7 @@ public:
 
         Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
         Owned<IClientRemovePartFromPackageMapRequest> request = packageProcessClient->createRemovePartFromPackageMapRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setTarget(optTarget);
         request->setPackageMap(optPMID);
@@ -1483,7 +1532,7 @@ private:
 class EclCmdPackageGetPart: public EclCmdCommon
 {
 public:
-    EclCmdPackageGetPart()
+    EclCmdPackageGetPart() : optGlobalScope(false)
     {
     }
     virtual eclCmdOptionMatchIndicator parseCommandLineOptions(ArgvIterator &iter)
@@ -1544,7 +1593,7 @@ public:
     {
         Owned<IClientWsPackageProcess> packageProcessClient = createCmdClient(WsPackageProcess, *this);
         Owned<IClientGetPartFromPackageMapRequest> request = packageProcessClient->createGetPartFromPackageMapRequest();
-        setCmdRequestTimeouts(request->rpc(), 0, optWaitConnectMs, optWaitReadSec);
+        setRpcOptions(request->rpc());
 
         request->setTarget(optTarget);
         request->setPackageMap(optPMID);
@@ -1644,7 +1693,7 @@ public:
 
 static int doMain(int argc, const char *argv[])
 {
-    PackageCMDShell processor(argc, argv, createPackageSubCommand, BUILD_TAG);
+    PackageCMDShell processor(argc, argv, createPackageSubCommand, hpccBuildInfo.buildTag);
     return processor.run();
 }
 

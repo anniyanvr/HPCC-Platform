@@ -1,11 +1,7 @@
-import { Workunit, WUStateID } from "@hpcc-js/comms";
-import Step from "@material-ui/core/Step";
-import StepLabel from "@material-ui/core/StepLabel";
-import Stepper from "@material-ui/core/Stepper";
-import { MuiThemeProvider } from "@material-ui/core/styles";
-import nlsHPCC from "../nlsHPCC";
-import { theme } from "./theme";
 import * as React from "react";
+import { Workunit, WUStateID } from "@hpcc-js/comms";
+import { StepProps, Stepper } from "../../src-react/components/controls/Stepper";
+import nlsHPCC from "../nlsHPCC";
 
 const Steps = [
     {
@@ -64,42 +60,70 @@ const wuStep = (wu?: Workunit): number => {
 };
 
 interface WUStatus {
-    wuid: string;
+    wuid?: string;
+    workunit?: Workunit;
 }
 
+const stepTimings = (wu: Workunit, isCompile: boolean): string[] => {
+    const timers = wu.CTimers ?? [];
+    const compileTimer = timers.find(t => t.Name === "compile" || t.Name === ">compile");
+    const executeTimer = timers.find(t => t.Name === "Total cluster time" || t.Name === "Total thor time");
+    if (isCompile) {
+        // Steps: Created(0), Compiled(1), Completed(2)
+        return ["", compileTimer?.Value ?? "", ""];
+    }
+    // Steps: Created(0), Compiled(1), Executed(2), Completed(3)
+    return ["", compileTimer?.Value ?? "", executeTimer?.Value ?? "", ""];
+};
+
 export const WUStatus: React.FunctionComponent<WUStatus> = ({
-    wuid
+    wuid,
+    workunit
 }) => {
     const [activeStep, setActiveStep] = React.useState(-1);
     const [failed, setFailed] = React.useState(false);
+    const [stepProps, setStepProps] = React.useState<StepProps[]>();
     const [steps, setSteps] = React.useState([]);
+    const [timing, setTiming] = React.useState<string[]>([]);
 
     React.useEffect(() => {
-        const wu = Workunit.attach({ baseUrl: "" }, wuid);
-        const wuWatchHandle = wu.watch(() => {
+        if (!wuid && !workunit) {
+            return;
+        }
+        const updateWUStatus = (wu: Workunit) => {
             setActiveStep(wuStep(wu));
             setFailed(wu.isFailed());
             setSteps(wuSteps(wu.ActionEx === "compile"));
-        });
-        wu.refresh(true);
+            setTiming(stepTimings(wu, wu.ActionEx === "compile"));
+        };
+        const wu = workunit ?? Workunit.attach({ baseUrl: "" }, wuid);
+        updateWUStatus(wu);
+
+        const wuWatchHandle = wu.watch(() => updateWUStatus(wu));
+
+        if (!workunit) {
+            wu.refresh(true, { IncludeTimers: true });
+        }
+
         return () => {
             wuWatchHandle.release();
         };
-    }, [wuid]);
+    }, [workunit, wuid]);
 
-    return (
-        <MuiThemeProvider theme={theme}>
-            <Stepper activeStep={activeStep} alternativeLabel>
-                {steps.map((step, i) => {
-                    const labelProps = {
-                        error: i <= activeStep ? failed : false
-                    };
-                    const label = activeStep === i ? step.activeText : step.text;
-                    return <Step key={i}>
-                        <StepLabel {...labelProps}>{label}</StepLabel>
-                    </Step>;
-                })}
-            </Stepper>;
-        </MuiThemeProvider>
-    );
+    React.useEffect(() => {
+        setStepProps(steps.map((step, i) => {
+            const label = activeStep === i ? step.activeText : step.text;
+            return {
+                key: `${label}_${i}`,
+                label: label,
+                step: i + 1,
+                failed: failed,
+                completed: activeStep > i,
+                showConnector: i > 0 && i < steps.length + 1,
+                timing: timing[i]
+            };
+        }));
+    }, [activeStep, failed, steps, timing]);
+
+    return <Stepper activeStep={activeStep} steps={stepProps}></Stepper>;
 };

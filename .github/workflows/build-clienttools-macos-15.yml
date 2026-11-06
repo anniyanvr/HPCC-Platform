@@ -1,0 +1,108 @@
+name: Build Clienttools macos-15
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,read"
+  VCPKG_NUGET_REPOSITORY: "https://nuget.pkg.github.com/hpcc-systems/index.json"
+
+on:
+  workflow_call:
+    inputs:
+      community-ref:
+        type: string
+        description: 'community_[semver]'
+        required: true
+      cmake-config-options:
+        type: string
+        description: 'CMake config options'
+        required: false
+        default: ""
+      cmake-build-options:
+        type: string
+        description: 'CMake build options'
+        required: false
+        default: "--parallel $(nproc)"
+      make-latest:
+        type: boolean
+        description: 'Make Latest'
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  generate_macos_15_clienttools:
+    name: Generate MacOS 15 Clienttools
+    runs-on: "macos-15"
+
+    steps:
+      - name: Dependencies
+        shell: "bash"
+        run: |
+          brew install bison flex autoconf-archive libtool automake openjdk@11
+          if [ "$(uname -m)" = "x86_64" ]; then
+            brew install --cask mono-mdk
+            echo "/Library/Frameworks/Mono.framework/Versions/Current/Commands" >> "$GITHUB_PATH"
+          else
+            brew install mono
+          fi
+
+      - name: Remove builtin vcpkg
+        shell: "bash"
+        run: |
+          sudo rm -rf "$VCPKG_INSTALLATION_ROOT"
+
+      - name: Checkout HPCC-Platform
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.community-ref }}
+          submodules: recursive
+          path: ./HPCC-Platform
+
+      - name: vcpkg bootstrap
+        shell: "bash"
+        run: |
+          ./HPCC-Platform/vcpkg/bootstrap-vcpkg.sh
+
+      - name: "Setup NuGet credentials"
+        shell: "bash"
+        run: |
+          mono `./HPCC-Platform/vcpkg/vcpkg fetch nuget | tail -n 1` \
+          sources add \
+          -name "GitHub" \
+          -source "https://nuget.pkg.github.com/hpcc-systems/index.json" \
+          -storepasswordincleartext \
+          -username "${{ github.repository_owner }}" \
+          -password "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Setup Source Directory
+        id: setup_source
+        shell: "bash"
+        run: |
+          echo "Building community clienttools"
+          echo "source_dir=./HPCC-Platform" >> $GITHUB_OUTPUT
+
+      - name: Build Clienttools
+        shell: "bash"
+        run: |
+          mkdir -p ./build
+          cmake -S ${{ steps.setup_source.outputs.source_dir }} -B ./build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DUSE_NATIVE_LIBRARIES=ON -DUSE_OPTIONAL=OFF -DCLIENTTOOLS_ONLY=ON -DUSE_AZURE=OFF -DUSE_CASSANDRA=OFF -DUSE_PARQUET=OFF -DUSE_JAVA=OFF -DUSE_OPENLDAP=OFF ${{ inputs.cmake-config-options }}
+          cmake --build ./build ${{ inputs.cmake-build-options }} --target package
+
+      - name: Release Community Clienttools
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          generateReleaseNotes: false
+          prerelease: ${{ contains(github.ref, '-rc') }}
+          makeLatest: ${{ inputs.make-latest }}
+          artifacts: "./build/hpccsystems-clienttools-community*.pkg"
+
+      - name: Upload Error Logs
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-15-clienttools-logs-${{ github.job }}-${{ github.run_number }}
+          path: ./build/**/*.log
+          retention-days: 1

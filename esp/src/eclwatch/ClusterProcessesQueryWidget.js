@@ -2,6 +2,7 @@ define([
     "dojo/_base/declare",
     "src/nlsHPCC",
     "dojo/topic",
+    "dojo/dom-construct",
 
     "dijit/registry",
 
@@ -17,14 +18,16 @@ define([
     "hpcc/DelayLoadWidget",
     "hpcc/PreflightDetailsWidget",
     "hpcc/MachineInformationWidget",
-    "hpcc/IFrameWidget"
-], function (declare, nlsHPCCMod, topic,
+    "hpcc/IFrameWidget",
+
+    "dijit/Dialog",
+], function (declare, nlsHPCCMod, topic, domConstruct,
     registry,
     tree, selector,
     GridDetailsWidget, ESPPreflight, ESPRequest, WsTopology, Utility, ESPUtil, DelayLoadWidget, PreflightDetailsWidget, MachineInformationWidget, IFrameWidget) {
 
     var nlsHPCC = nlsHPCCMod.default;
-    return declare("CluserProcessesQueryWidget", [GridDetailsWidget, ESPUtil.FormHelper], {
+    return declare("ClusterProcessesQueryWidget", [GridDetailsWidget, ESPUtil.FormHelper], {
         i18n: nlsHPCC,
 
         gridTitle: nlsHPCC.title_Clusters,
@@ -44,10 +47,14 @@ define([
 
             this.legacyClustersProcessesIframeWidget = new IFrameWidget({
                 id: this.id + "_LegacyClustersProcessesIframeWidget",
-                title: "Clusters Processes (legacy)",
+                title: "Clusters Processes (L)",
                 style: "border: 0; width: 100%; height: 100%"
             });
             this.legacyClustersProcessesIframeWidget.placeAt(this._tabContainer, "last");
+            if (dojoConfig.isContainer) {
+                const legacyTab = registry.byId(this.id + "_LegacyClustersProcessesIframeWidget");
+                legacyTab.set("disabled", true);
+            }
         },
 
         init: function (params) {
@@ -56,7 +63,6 @@ define([
                 return;
 
             this.refreshActionState();
-            this.refreshGrid();
 
             this.machineFilter.on("apply", function (evt) {
                 var selection = context.grid.getSelected();
@@ -84,9 +90,15 @@ define([
                 if (currSel.id === this.id + "_Grid") {
                     this.refreshGrid();
                 } else if (currSel.id === this.legacyClustersProcessesIframeWidget.id && !this.legacyClustersProcessesIframeWidget.initalized) {
-                    this.legacyClustersProcessesIframeWidget.init({
-                        src: ESPRequest.getBaseURL("WsTopology") + "/TpClusterQuery?Type=ROOT"
-                    });
+                    if (!dojoConfig.isContainer) {
+                        this.legacyClustersProcessesIframeWidget.init({
+                            src: ESPRequest.getBaseURL("WsTopology") + "/TpClusterQuery?Type=ROOT"
+                        });
+                    } else {
+                        const unavailMsg = domConstruct.create("div", { style: { margin: "5px" } });
+                        unavailMsg.innerText = this.i18n.UnavailableInContainerized;
+                        this.legacyClustersProcessesIframeWidget.contentPane.set("content", unavailMsg);
+                    }
                 } else {
                     currSel.init(currSel.params);
                 }
@@ -107,7 +119,7 @@ define([
 
         createGrid: function (domID) {
             var context = this;
-            var retVal = new declare([ESPUtil.Grid(true, true, false, true)])({
+            var retVal = new declare([ESPUtil.Grid(true, true, undefined, true)])({
                 store: ESPPreflight.CreateClusterProcessStore(),
                 columns: {
                     col1: selector({
@@ -140,7 +152,11 @@ define([
                                 name = row.Type + " - " + _name;
                             } if (row.type === "machine") {
                                 img = Utility.getImageHTML("machine.png");
-                                name = "<a href='#' onClick='return false;' class='dgrid-row-url'>" + row.Netaddress + " - " + _name + "</a>";
+                                var label = row.Netaddress + " - " + _name;
+                                if (row.Spare) {
+                                    label += " (" + context.i18n.Spare + ")";
+                                }
+                                name = "<a href='#' onClick='return false;' class='dgrid-row-url'>" + label + "</a>";
                             }
                             return img + "&nbsp;" + name;
                         },

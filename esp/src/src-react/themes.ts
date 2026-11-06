@@ -1,55 +1,89 @@
-//  https://fabricweb.z5.web.core.windows.net/pr-deploy-site/refs/heads/7.0/theming-designer/index.html
+/*
+ *  https://fabricweb.z5.web.core.windows.net/pr-deploy-site/refs/heads/7.0/theming-designer/index.html
+ *
+ *  Keep in sync with themes.css
+ */
 
-export const lightTheme = {
-    palette: {
-        themePrimary: "#259ad6",
-        themeLighterAlt: "#f5fbfd",
-        themeLighter: "#d7edf8",
-        themeLight: "#b6dff3",
-        themeTertiary: "#74c0e7",
-        themeSecondary: "#3ba6db",
-        themeDarkAlt: "#218bc1",
-        themeDark: "#1c76a3",
-        themeDarker: "#145778",
-        neutralLighterAlt: "#faf9f8",
-        neutralLighter: "#f3f2f1",
-        neutralLight: "#edebe9",
-        neutralQuaternaryAlt: "#e1dfdd",
-        neutralQuaternary: "#d0d0d0",
-        neutralTertiaryAlt: "#c8c6c4",
-        neutralTertiary: "#d1d1d1",
-        neutralSecondary: "#a3a3a3",
-        neutralPrimaryAlt: "#787878",
-        neutralPrimary: "#666666",
-        neutralDark: "#4e4e4e",
-        black: "#393939",
-        white: "#ffffff",
-    }
+import { CSSProperties } from "react";
+import { BrandVariants, createDarkTheme, createLightTheme, tokens } from "@fluentui/react-components";
+
+const brandWeb: BrandVariants = {
+    10: "#061724",
+    20: "#082338",
+    30: "#0a2e4a",
+    40: "#0c3b5e",
+    50: "#0e4775",
+    60: "#0f548c",
+    70: "#115ea3",
+    80: "#0f6cbd",
+    90: "#2886de",
+    100: "#479ef5",
+    110: "#62abf5",
+    120: "#77b7f7",
+    130: "#96c6fa",
+    140: "#b4d6fa",
+    150: "#cfe4fa",
+    160: "#ebf3fc",
 };
 
-export const darkTheme = {
-    palette: {
-        themePrimary: "#ff8600",
-        themeLighterAlt: "#0a0500",
-        themeLighter: "#291600",
-        themeLight: "#4d2900",
-        themeTertiary: "#995200",
-        themeSecondary: "#e07800",
-        themeDarkAlt: "#ff9419",
-        themeDark: "#ffa53d",
-        themeDarker: "#ffbc70",
-        neutralLighterAlt: "#323232",
-        neutralLighter: "#313131",
-        neutralLight: "#2f2f2f",
-        neutralQuaternaryAlt: "#2c2c2c",
-        neutralQuaternary: "#2a2a2a",
-        neutralTertiaryAlt: "#282828",
-        neutralTertiary: "#c8c8c8",
-        neutralSecondary: "#d0d0d0",
-        neutralPrimaryAlt: "#dadada",
-        neutralPrimary: "#ffffff",
-        neutralDark: "#f4f4f4",
-        black: "#f8f8f8",
-        white: "#333333",
-    }
+const brandTeams: BrandVariants = {
+    10: "#2b2b40",
+    20: "#2f2f4a",
+    30: "#333357",
+    40: "#383966",
+    50: "#3d3e78",
+    60: "#444791",
+    70: "#4f52b2",
+    80: "#5b5fc7",
+    90: "#7579eb",
+    100: "#7f85f5",
+    110: "#9299f7",
+    120: "#aab1fa",
+    130: "#b6bcfa",
+    140: "#c5cbfa",
+    150: "#dce0fa",
+    160: "#e8ebfa",
+};
+
+const brandOffice: BrandVariants = {
+    10: "#29130b",
+    20: "#4d2415",
+    30: "#792000",
+    40: "#99482b",
+    50: "#a52c00",
+    60: "#c33400",
+    70: "#e06a3f",
+    80: "#d83b01",
+    90: "#dd4f1b",
+    100: "#fe7948",
+    110: "#ff865a",
+    120: "#ff9973",
+    130: "#e8825d",
+    140: "#ffb498",
+    150: "#f4beaa",
+    160: "#f9dcd1",
+};
+
+const brands = {
+    "web": brandWeb,
+    "office": brandOffice,
+    "teams": brandTeams
+};
+const brand = brands["web"];
+export { brand as brandVariants };
+
+export const lightThemeV9 = createLightTheme(brand);
+export const darkThemeV9 = createDarkTheme(brand);
+
+//  Fluent's "warning" and "danger" badge palettes are yellow / palette red, which clash with the status colors used elsewhere.
+export const warningBadgeStyle: CSSProperties = {
+    backgroundColor: tokens.colorStatusWarningBackground1,
+    color: tokens.colorStatusWarningForeground1,
+    borderColor: tokens.colorStatusWarningBorder1
+};
+
+export const dangerBadgeStyle: CSSProperties = {
+    backgroundColor: tokens.colorStatusDangerBackground1,
+    color: tokens.colorStatusDangerForeground1,
+    borderColor: tokens.colorStatusDangerBorder1
 };

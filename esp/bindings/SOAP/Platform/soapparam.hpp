@@ -598,7 +598,7 @@ public:
     void copy(SoapArrayParam<arraytype,itemtype> &from)
     {
         arr.kill();
-        arraytype fromArray = from.getValue();
+        const arraytype & fromArray = from.getValue();
         ForEachItemIn(idx, fromArray)
           arr.append(fromArray.item(idx));
     }
@@ -919,7 +919,7 @@ public:
     {
         if (s)
         {
-            int tempval = enumstrings.find(s);
+            aindex_t tempval = enumstrings.find(s);
 
             if (tempval == NotFound)
                 throw MakeStringException(-1, "Invalid value for type %s: %s", typeName_.get(), s);
@@ -956,7 +956,7 @@ public:
     {
         if (s)
         {
-            int tempval = enumstrings.find(s);
+            aindex_t tempval = enumstrings.find(s);
             if (tempval != NotFound)
                 return (enumtype)tempval;
         }
@@ -987,7 +987,7 @@ public:
     {
         if (s)
         {
-            int tempval = enumstrings.find(s);
+            aindex_t tempval = enumstrings.find(s);
             if (tempval == NotFound)
                 throw MakeStringException(-1, "Invalid value for type %s: %s", typeName_.get(), s);
             else
@@ -1022,7 +1022,7 @@ public:
 
     void marshall(IRpcMessage &rpc_call, const char *tagname, const char* itemname, const char* elementtype="",const char *basepath="", const char *prefix="")
     {
-        if ((value >= 0) && (value < enumstrings.length()))
+        if (enumstrings.isItem(value))
             rpc_call.add_value(basepath, prefix, tagname, "string", enumstrings.item(value));
     }
 
@@ -1079,32 +1079,6 @@ public:
         UNIMPLEMENTED;
     }
 
-    void getXsdDefinition_(IEspContext &context, IHttpMessage *request, StringBuffer &schema, BoolHash &added, const char* descriptions[])
-    {
-        if (added.getValue(typeName_))
-            return;
-
-        added.setValue(typeName_, 1);
-
-        schema.appendf("<xsd:simpleType name=\"%s\">", typeName_.get());
-
-        if ( descriptions && ((context.queryOptions()&ESPCTX_NO_ANNOTATION) == 0) )
-        {
-            schema.append("<xsd:annotation><xsd:appinfo>");
-            for (unsigned i=0; i<enumstrings.length(); i++)
-            {
-                const char* desc = descriptions[i];
-                if (desc && *desc)
-                    schema.appendf("<item name=\"%s\" description=\"%s\"/>", enumstrings.item(i), desc);
-            }
-            schema.append("</xsd:appinfo></xsd:annotation>");
-        }
-
-        schema.appendf("<xsd:restriction base=\"xsd:%s\">", baseType_.get());
-        for (unsigned i=0; i<enumstrings.length(); i++)
-            schema.appendf("<xsd:enumeration value=\"%s\"/>", enumstrings.item(i));
-        schema.append("</xsd:restriction></xsd:simpleType>");
-    }
 };
 
 template <class enumtype, class cxtype, class arraytype>

@@ -37,50 +37,45 @@ public:
 class jlib_decl InterruptableSemaphore : public Semaphore
 {
 private:
-    Owned<IException> error;
-    CriticalSection crit;
+    AtomicShared<IException> error;
 
 public:
-    InterruptableSemaphore(unsigned _initialCount = 0U) : Semaphore(_initialCount) {}
+    InterruptableSemaphore(const char * name, unsigned _initialCount = 0U) : Semaphore(name, _initialCount) {}
 
     void interrupt(IException *_error = NULL, unsigned count=1)
     {
-        CriticalBlock b(crit);
-        if (error)
-            ::Release(_error);
-        else
-        {
-            if (!_error)
-                _error = new InterruptedSemaphoreException;
-            error.setown(_error);
+        if (!_error)
+            _error = new InterruptedSemaphoreException;
+
+        if (error.setownIfNull(_error))
             signal(count);
-        }
     }
 
     void wait()
     {
         Semaphore::wait();
-        CriticalBlock b(crit);
-        if (error)
+        if (error.isSet())
         {
-            throw error.getClear();
+            IException * e = error.getClear();
+            if (e)
+                throw e;
         }
     }
 
     bool wait(unsigned timeout)
     {
         bool ret = Semaphore::wait(timeout);
-        CriticalBlock b(crit);
-        if (error)
+        if (error.isSet())
         {
-            throw error.getClear();
+            IException * e = error.getClear();
+            if (e)
+                throw e;
         }
         return ret;
     }
 
     void reinit(unsigned _initialCount = 0U)
     {
-        CriticalBlock b(crit);
         error.clear();
         Semaphore::reinit(_initialCount);
     }
@@ -89,8 +84,8 @@ public:
 
 class jlib_decl TokenBucket : public CInterface
 {
-    SpinLock crit; // MORE: I suspect this should be a critical section
-    Semaphore tokens;
+    SpinLock crit{SYNC_LOCATION}; // MORE: I suspect this should be a critical section
+    Semaphore tokens{SYNC_LOCATION};
     unsigned tokensAvailable;
     unsigned maxBucketSize;
     unsigned tokensPerPeriod;
@@ -123,7 +118,7 @@ class jlib_decl TokenBucket : public CInterface
 
 public:
     TokenBucket(unsigned _tokensPerPeriod, unsigned _period, unsigned _maxBucketSize)
-        : tokens(_maxBucketSize), maxBucketSize(_maxBucketSize), tokensPerPeriod(_tokensPerPeriod), period(_period)
+        : tokens(SYNC_LOCATION, _maxBucketSize), maxBucketSize(_maxBucketSize), tokensPerPeriod(_tokensPerPeriod), period(_period)
     {
         tokensAvailable = _maxBucketSize;
         then = msTick();

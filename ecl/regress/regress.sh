@@ -122,7 +122,7 @@ fi
 if [[ $eclcc != '' ]]; then
     ## Set flags
     default_flags="-P$target_dir -legacy -platform=thorlcr -fforceGenerate -fregressionTest -b -S -shared -meta+"
-    flags="$default_flags $include_dir -fshowMetaInGraph -fspanMultipleCpp- $userflags"
+    flags="$default_flags $include_dir -fshowMetaInGraph -fspanMultipleCpp- -ftraceOptimizations $userflags -ftraceResources"
 
     ## Prepare target directory
     if [[ $query == '' ]]; then
@@ -167,7 +167,10 @@ if [[ $eclcc != '' ]]; then
         ## Compile all regressions
         echo "* Compiling all regression tests"
         echo
-        time make -k -j $np > /dev/null
+        /usr/bin/time -o thisTimings.log make -k -j $np > /dev/null
+        date >> regressionTimings.log
+        cat thisTimings.log >> regressionTimings.log
+        cat thisTimings.log
     fi
 fi
 

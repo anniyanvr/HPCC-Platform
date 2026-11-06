@@ -22,6 +22,11 @@
 #####################################################
 
 project( roxiemem ) 
+SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STRICT_CXX_FLAGS}")
+
+if(USE_TBB)
+    find_package(TBB CONFIG REQUIRED)
+endif()
 
 set (    SRCS 
          roxiemem.cpp 
@@ -38,7 +43,6 @@ include_directories (
          ./../../system/jlib
          ./../../rtl/include
          ./../../testing/unittests
-         ./../../system/tbb_sm/tbb/include
     )
 
 ADD_DEFINITIONS( -D_USRDLL -DROXIEMEM_EXPORTS)
@@ -49,13 +53,12 @@ if (NOT PLUGIN)
 endif()
 
 if(USE_TBB)
-    add_dependencies(roxiemem tbb)
-    target_link_libraries(roxiemem libtbb)
+    target_link_libraries(roxiemem PRIVATE TBB::tbb)
 endif()
 
-target_link_libraries ( roxiemem
+target_link_libraries ( roxiemem PRIVATE
          jlib
-         ${CPPUNIT_LIBRARIES}
+         ${CppUnit_LIBRARIES}
     )
 
 

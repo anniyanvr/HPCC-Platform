@@ -1,0 +1,477 @@
+/*##############################################################################
+
+    Copyright (C) 2025 HPCC Systems®.
+
+    Licensed under the Apache License, Version 2.0 (the "License", 'W'));
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+############################################################################## */
+
+#ifdef _USE_CPPUNIT
+#include <limits>
+
+#include "unittests.hpp"
+#include "workunit.hpp"
+#include "jcomp.hpp"
+#include "querycopysetoptions.hpp"
+
+enum class TestQueryCopyFailurePolicy
+{
+    FailFast,
+    Continue
+};
+
+class CTestQueryCopySetRequest
+{
+public:
+    void setParallel(bool value)
+    {
+        parallel = value;
+    }
+    void setParallelFailurePolicy(TestQueryCopyFailurePolicy value)
+    {
+        failurePolicy = value;
+    }
+    void setParallelQueueTimeout(unsigned value)
+    {
+        queueTimeout = value;
+    }
+    void setParallelCompileTimeout(unsigned value)
+    {
+        compileTimeout = value;
+    }
+    void setParallelWindowSize(unsigned value)
+    {
+        windowSize = value;
+    }
+
+    bool parallel = false;
+    TestQueryCopyFailurePolicy failurePolicy = TestQueryCopyFailurePolicy::FailFast;
+    unsigned queueTimeout = 0;
+    unsigned compileTimeout = 0;
+    unsigned windowSize = 0;
+};
+
+class wuTests : public CppUnit::TestFixture
+{
+    CPPUNIT_TEST_SUITE( wuTests );
+        CPPUNIT_TEST(testLooksLikeAWuid);
+        CPPUNIT_TEST(testLooksLikeAPublishWuid);
+        CPPUNIT_TEST(testWuidPattern);
+        CPPUNIT_TEST(testTargetArchitectureNormalization);
+        CPPUNIT_TEST(testTargetArchitectureMatch);
+        CPPUNIT_TEST(testTargetArchitectureDefaults);
+        CPPUNIT_TEST(testWorkUnitTargetArchitecturePersistence);
+        CPPUNIT_TEST(testAbortDetailsFirstReasonWins);
+        CPPUNIT_TEST(testAbortDetailsEmptyReasonDoesNotOverwrite);
+        CPPUNIT_TEST(testAbortDetailsWithoutReasonAreRecorded);
+        CPPUNIT_TEST(testAbortDetailsClearedByNonAbortStateTransition);
+        CPPUNIT_TEST(testAbortDetailsResetAfterNonAbortState);
+        CPPUNIT_TEST(testCopyWorkUnitForRecompileCompileContext);
+        CPPUNIT_TEST(testCopyWorkUnitPreservesScheduledWorkflowCount);
+        CPPUNIT_TEST(testCopyWorkUnitForRecompileDoesNotCopyScheduledWorkflowCount);
+        CPPUNIT_TEST(testParallelCopySetAllowedOptions);
+        CPPUNIT_TEST(testParallelCopySetOnlyCopyFilesRejected);
+        CPPUNIT_TEST(testParallelCopySetStopIfFilesCopiedRejected);
+        CPPUNIT_TEST(testParallelCopySetControlsRequireParallel);
+        CPPUNIT_TEST(testParallelCopySetUnsignedParsing);
+        CPPUNIT_TEST(testParallelCopySetCommandOptions);
+        CPPUNIT_TEST(testParallelCopySetTimeoutBounds);
+        CPPUNIT_TEST(testParallelCopySetWindowSizeBounds);
+        CPPUNIT_TEST(testMaxCompileThreadsSelection);
+    CPPUNIT_TEST_SUITE_END();
+
+public:
+    wuTests(){}
+
+    void testLooksLikeAWuid()
+    {
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass", looksLikeAWuid("w12345678-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass", looksLikeAWuid("W12345678-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass", looksLikeAWuid("w12345678-123456-1", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass", looksLikeAWuid("w12345678-123456-12", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid(nullptr, 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("x12345678-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("wx2345678-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w1x345678-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12x45678-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w123x5678-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w1234x678-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345x78-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w123456x8-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w1234567x-123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678x123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-x23456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-1x3456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-12x456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-123x56", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-1234x6", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-12345x", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-123456x", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-123456-x", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-123456-1x", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("w12345678-123456-1wx", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W1", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W123", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W1234", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12345", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W123456", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W1234567", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12345678", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12345678-", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12345678-1", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12345678-12", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12345678-123", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12345678-1234", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12345678-12345", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("W12345678-123456-", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail", !looksLikeAWuid("*", 'W'));
+        // Multiple allowable first character interface tests
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass", looksLikeAWuid("W12345678-123456", "W"));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass", looksLikeAWuid("W12345678-123456", "PW"));
+        // Default 'W' first character interface test - no first character passed
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass", looksLikeAWuid("W12345678-123456"));
+    }
+
+    void testLooksLikeAPublishWuid()
+    {
+        // Basic publish WUID format: PYYYYMMDD-HHMMSS
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass for P20250101-120000", looksLikeAWuid("P20250101-120000", 'P'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass for p20231231-235959", looksLikeAWuid("p20231231-235959", 'P'));
+
+        // Publish WUID with uniqueness suffix: PYYYYMMDD-HHMMSS-<n>
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass for P20250101-120000-1", looksLikeAWuid("P20250101-120000-1", 'P'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass for P20250101-120000-123", looksLikeAWuid("P20250101-120000-123", 'P'));
+
+        // Publish subtask WUID format: PYYYYMMDD-HHMMSST<taskId>
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass for P20250101-120000T1", looksLikeAWuid("P20250101-120000T1", 'P'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass for P20250101-120000T123", looksLikeAWuid("P20250101-120000T123", 'P'));
+
+        // Publish subtask WUID with uniqueness suffix: PYYYYMMDD-HHMMSS-<n>T<taskId>
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass for P20250101-120000-1T1", looksLikeAWuid("P20250101-120000-1T1", 'P'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should pass for P20250101-120000-5T999", looksLikeAWuid("P20250101-120000-5T999", 'P'));
+
+        // Invalid formats
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail for W20250101-120000T1", !looksLikeAWuid("W20250101-120000T1", 'W'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail for P20250101-120000T", !looksLikeAWuid("P20250101-120000T", 'P'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail for P20250101-120000Tx", !looksLikeAWuid("P20250101-120000Tx", 'P'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail for P20250101-120000-T1", !looksLikeAWuid("P20250101-120000-T1", 'P'));
+        CPPUNIT_ASSERT_MESSAGE("looksLikeAWuid should fail for P20250101-120000T1x", !looksLikeAWuid("P20250101-120000T1x", 'P'));
+    }
+
+    void testWuidPattern()
+    {
+        CPPUNIT_ASSERT_MESSAGE("wuidPattern should pass", looksLikeAWuid(WuidPattern(" \t\rw12345678-123456 \t\r"), 'W'));
+    }
+
+    void testTargetArchitectureNormalization()
+    {
+        StringBuffer normalized;
+        CPPUNIT_ASSERT_EQUAL_STR(defaultTargetArchitecture, normalizeTargetArchitecture(normalized, nullptr).str());
+        CPPUNIT_ASSERT_EQUAL_STR(defaultTargetArchitecture, normalizeTargetArchitecture(normalized, "").str());
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureX86_64Linux, normalizeTargetArchitecture(normalized, " AMD64 ").str());
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureX86_64Linux, normalizeTargetArchitecture(normalized, "x86-64").str());
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureArm64Linux, normalizeTargetArchitecture(normalized, "aarch64").str());
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureArm64Linux, normalizeTargetArchitecture(normalized, " AARCH64-LINUX ").str());
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureArm64MacOS, normalizeTargetArchitecture(normalized, "arm64-darwin").str());
+        CPPUNIT_ASSERT_EQUAL_STR("riscv64-linux", normalizeTargetArchitecture(normalized, " RiscV64-Linux ").str());
+    }
+
+    void testTargetArchitectureMatch()
+    {
+        CPPUNIT_ASSERT(targetArchitecturesMatch(" AMD64 ", "x86_64-linux"));
+        CPPUNIT_ASSERT(targetArchitecturesMatch("aarch64", "arm64-linux"));
+        CPPUNIT_ASSERT(targetArchitecturesMatch(nullptr, ""));
+        CPPUNIT_ASSERT(!targetArchitecturesMatch("arm64-linux", "x86_64-linux"));
+        CPPUNIT_ASSERT(!targetArchitecturesMatch("arm64-macos", "arm64-linux"));
+    }
+
+    void testTargetArchitectureDefaults()
+    {
+        StringBuffer targetArchitecture;
+        CPPUNIT_ASSERT_EQUAL_STR(defaultTargetArchitecture, getWorkUnitTargetArchitecture(targetArchitecture, nullptr).str());
+        CPPUNIT_ASSERT_EQUAL_STR(defaultTargetArchitecture, getProcessTargetArchitecture(targetArchitecture, nullptr).str());
+
+        Owned<IPropertyTree> process = createPTree("Process");
+        CPPUNIT_ASSERT_EQUAL_STR(defaultTargetArchitecture, getProcessTargetArchitecture(targetArchitecture, process).str());
+        process->setProp("@architecture", "arm64");
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureArm64Linux, getProcessTargetArchitecture(targetArchitecture, process).str());
+    }
+
+    void testWorkUnitTargetArchitecturePersistence()
+    {
+        Owned<ILocalWorkUnit> wu = createLocalWorkUnit();
+        StringBuffer targetArchitecture;
+        CPPUNIT_ASSERT_EQUAL_STR(defaultTargetArchitecture, getWorkUnitTargetArchitecture(targetArchitecture, wu).str());
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureX86_64Linux, getWorkUnitTargetArchitecture(targetArchitecture, wu, targetArchitectureX86_64Linux).str());
+
+        setWorkUnitTargetArchitecture(wu, "aarch64");
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureArm64Linux, getWorkUnitTargetArchitecture(targetArchitecture, wu).str());
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureArm64Linux, getWorkUnitTargetArchitecture(targetArchitecture, wu, targetArchitectureX86_64Linux).str());
+
+        SCMStringBuffer rawValue;
+        wu->getDebugValue(targetArchitectureDebugValue, rawValue);
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureArm64Linux, rawValue.str());
+    }
+
+    void testAbortDetailsFirstReasonWins()
+    {
+        Owned<ILocalWorkUnit> wu = createLocalWorkUnit();
+        wu->recordAbortDetails("cost limit exceeded", "first-user");
+        wu->recordAbortDetails("time limit exceeded", "second-user");
+
+        SCMStringBuffer reason;
+        wu->getAbortReason(reason);
+        CPPUNIT_ASSERT_EQUAL_STR("cost limit exceeded", reason.str());
+
+        SCMStringBuffer abortBy;
+        wu->getAbortBy(abortBy);
+        CPPUNIT_ASSERT_EQUAL_STR("first-user", abortBy.str());
+        CPPUNIT_ASSERT(wu->getAbortTimeStamp() != 0);
+    }
+
+    void testAbortDetailsEmptyReasonDoesNotOverwrite()
+    {
+        Owned<ILocalWorkUnit> wu = createLocalWorkUnit();
+        wu->recordAbortDetails("cost limit exceeded", "first-user");
+        wu->recordAbortDetails(nullptr, "second-user");
+
+        SCMStringBuffer reason;
+        wu->getAbortReason(reason);
+        CPPUNIT_ASSERT_EQUAL_STR("cost limit exceeded", reason.str());
+
+        SCMStringBuffer abortBy;
+        wu->getAbortBy(abortBy);
+        CPPUNIT_ASSERT_EQUAL_STR("first-user", abortBy.str());
+    }
+
+    void testAbortDetailsWithoutReasonAreRecorded()
+    {
+        Owned<ILocalWorkUnit> wu = createLocalWorkUnit();
+        wu->recordAbortDetails(nullptr, "first-user");
+        const unsigned __int64 timestamp = wu->getAbortTimeStamp();
+        wu->recordAbortDetails("time limit exceeded", "second-user");
+
+        SCMStringBuffer reason;
+        wu->getAbortReason(reason);
+        CPPUNIT_ASSERT_EQUAL_STR("", reason.str());
+
+        SCMStringBuffer abortBy;
+        wu->getAbortBy(abortBy);
+        CPPUNIT_ASSERT_EQUAL_STR("first-user", abortBy.str());
+        CPPUNIT_ASSERT(timestamp != 0);
+        CPPUNIT_ASSERT_EQUAL(timestamp, wu->getAbortTimeStamp());
+    }
+
+    // Uses WUStateRunning because local WU terminal transitions require a live Dali connection.
+    void testAbortDetailsClearedByNonAbortStateTransition()
+    {
+        Owned<ILocalWorkUnit> wu = createLocalWorkUnit();
+        wu->recordAbortDetails("cost limit exceeded", "first-user");
+        wu->setState(WUStateRunning);
+
+        SCMStringBuffer reason;
+        wu->getAbortReason(reason);
+        CPPUNIT_ASSERT_EQUAL_STR("", reason.str());
+
+        SCMStringBuffer abortBy;
+        wu->getAbortBy(abortBy);
+        CPPUNIT_ASSERT_EQUAL_STR("", abortBy.str());
+        CPPUNIT_ASSERT_EQUAL((unsigned __int64) 0, wu->getAbortTimeStamp());
+    }
+
+    // A new execution clears prior abort details before a later abort can record new details.
+    // Uses WUStateRunning because local WU terminal transitions require a live Dali connection.
+    void testAbortDetailsResetAfterNonAbortState()
+    {
+        Owned<ILocalWorkUnit> wu = createLocalWorkUnit();
+        wu->recordAbortDetails("cost limit exceeded", "first-user");
+        wu->setState(WUStateRunning);
+
+        wu->recordAbortDetails("time limit exceeded", "second-user");
+        SCMStringBuffer reason;
+        reason.clear();
+        wu->getAbortReason(reason);
+        CPPUNIT_ASSERT_EQUAL_STR("time limit exceeded", reason.str());
+
+        SCMStringBuffer abortBy;
+        wu->getAbortBy(abortBy);
+        CPPUNIT_ASSERT_EQUAL_STR("second-user", abortBy.str());
+    }
+
+    void testCopyWorkUnitForRecompileCompileContext()
+    {
+        Owned<ILocalWorkUnit> source = createLocalWorkUnit();
+        source->setApplicationValue("app", "name", "value", true);
+        source->setClusterName("thor");
+        source->setDebugValue("allowedclusters", "thor,roxie", true);
+        source->setUser("submitter");
+        source->setSnapshot("snapshot1");
+        source->setWarningSeverity(1234, SeverityIgnore);
+        source->setDebugValue("eclcc-option", "1", true);
+        setWorkUnitTargetArchitecture(source, "aarch64");
+
+        Owned<ILocalWorkUnit> target = createLocalWorkUnit();
+        copyWorkUnitForRecompile(target, source);
+
+        SCMStringBuffer value;
+        target->getApplicationValue("app", "name", value);
+        CPPUNIT_ASSERT_EQUAL_STR("value", value.str());
+        CPPUNIT_ASSERT_EQUAL_STR("thor", target->queryClusterName());
+        CPPUNIT_ASSERT_EQUAL_STR("thor,roxie", target->getDebugValue("allowedclusters", value).str());
+        CPPUNIT_ASSERT_EQUAL_STR("submitter", target->queryUser());
+        CPPUNIT_ASSERT_EQUAL_STR("snapshot1", target->getSnapshot(value).str());
+        CPPUNIT_ASSERT_EQUAL(SeverityIgnore, target->getWarningSeverity(1234, SeverityError));
+        CPPUNIT_ASSERT_EQUAL_STR("1", target->getDebugValue("eclcc-option", value).str());
+        CPPUNIT_ASSERT_EQUAL_STR(targetArchitectureArm64Linux, target->getDebugValue(targetArchitectureDebugValue, value).str());
+    }
+
+    void addScheduledWorkflow(IWorkUnit &wu)
+    {
+        Owned<IWorkflowItem> wf = wu.addWorkflowItem(1, WFTypeNormal, WFModeNormal, 0, 0, 0, 0, 0);
+        wu.incEventScheduledCount();
+        wf->setScheduledOn("cron", "* * * * *");
+        wf->setScheduleCount(1);
+    }
+
+    void testCopyWorkUnitPreservesScheduledWorkflowCount()
+    {
+        Owned<ILocalWorkUnit> source = createLocalWorkUnit();
+        source->setCloneable(true);
+        addScheduledWorkflow(*source);
+
+        Owned<ILocalWorkUnit> target = createLocalWorkUnit();
+        queryExtendedWU(target)->copyWorkUnit(source, false, false);
+
+        CPPUNIT_ASSERT_EQUAL(1U, target->queryEventScheduledCount());
+        Owned<IConstWorkflowItemIterator> workflow = target->getWorkflowItems();
+        CPPUNIT_ASSERT(workflow->first());
+        CPPUNIT_ASSERT(workflow->query()->isScheduled());
+    }
+
+    void testCopyWorkUnitForRecompileDoesNotCopyScheduledWorkflowCount()
+    {
+        Owned<ILocalWorkUnit> source = createLocalWorkUnit();
+        addScheduledWorkflow(*source);
+
+        Owned<ILocalWorkUnit> target = createLocalWorkUnit();
+        copyWorkUnitForRecompile(target, source);
+
+        CPPUNIT_ASSERT_EQUAL(0U, target->queryEventScheduledCount());
+    }
+
+    void testParallelCopySetAllowedOptions()
+    {
+        CPPUNIT_ASSERT(QueryCopySetParallelOptionError::None == validateQueryCopySetParallelOptions(true, false, false));
+        CPPUNIT_ASSERT(QueryCopySetParallelOptionError::None == validateQueryCopySetParallelOptions(false, true, false));
+        CPPUNIT_ASSERT(QueryCopySetParallelOptionError::None == validateQueryCopySetParallelOptions(false, false, true));
+    }
+
+    void testParallelCopySetOnlyCopyFilesRejected()
+    {
+        CPPUNIT_ASSERT(QueryCopySetParallelOptionError::OnlyCopyFiles == validateQueryCopySetParallelOptions(true, true, false));
+        CPPUNIT_ASSERT(QueryCopySetParallelOptionError::OnlyCopyFiles == validateQueryCopySetParallelOptions(true, true, true));
+    }
+
+    void testParallelCopySetStopIfFilesCopiedRejected()
+    {
+        CPPUNIT_ASSERT(QueryCopySetParallelOptionError::StopIfFilesCopied == validateQueryCopySetParallelOptions(true, false, true));
+    }
+
+    void testParallelCopySetControlsRequireParallel()
+    {
+        CPPUNIT_ASSERT(queryCopySetParallelControlsAllowed(true, true, true, true, true));
+        CPPUNIT_ASSERT(queryCopySetParallelControlsAllowed(false, false, false, false, false));
+        CPPUNIT_ASSERT(!queryCopySetParallelControlsAllowed(false, true, false, false, false));
+        CPPUNIT_ASSERT(!queryCopySetParallelControlsAllowed(false, false, true, false, false));
+        CPPUNIT_ASSERT(!queryCopySetParallelControlsAllowed(false, false, false, true, false));
+        CPPUNIT_ASSERT(!queryCopySetParallelControlsAllowed(false, false, false, false, true));
+    }
+
+    void testParallelCopySetUnsignedParsing()
+    {
+        unsigned value = 0;
+        CPPUNIT_ASSERT(queryCopySetParseUnsigned("0", value));
+        CPPUNIT_ASSERT_EQUAL(0U, value);
+        StringBuffer maxUnsignedText;
+        maxUnsignedText.append(~0U);
+        CPPUNIT_ASSERT(queryCopySetParseUnsigned(maxUnsignedText, value));
+        CPPUNIT_ASSERT_EQUAL(~0U, value);
+        CPPUNIT_ASSERT(!queryCopySetParseUnsigned(nullptr, value));
+        CPPUNIT_ASSERT(!queryCopySetParseUnsigned("", value));
+        CPPUNIT_ASSERT(!queryCopySetParseUnsigned("-1", value));
+        CPPUNIT_ASSERT(!queryCopySetParseUnsigned("+1", value));
+        CPPUNIT_ASSERT(!queryCopySetParseUnsigned("1x", value));
+        CPPUNIT_ASSERT(!queryCopySetParseUnsigned(" 1", value));
+        CPPUNIT_ASSERT(!queryCopySetParseUnsigned("4294967296", value));
+    }
+
+    void testParallelCopySetCommandOptions()
+    {
+        const char *argv[] =
+        {
+            "copy-set",
+            "--parallel",
+            "--continue-on-error",
+            "--parallel-queue-timeout=3",
+            "--parallel-compile-timeout", "7",
+            "--parallel-window-size=11"
+        };
+        ArgvIterator iter(_elements_in(argv), argv);
+        CQueryCopySetParallelOptions options;
+        for (; !iter.done(); iter.next())
+            CPPUNIT_ASSERT(QueryCopySetParallelOptionMatch::Match == options.match(iter));
+        CPPUNIT_ASSERT(options.controlsAllowed());
+
+        CTestQueryCopySetRequest request;
+        options.updateRequest(&request, TestQueryCopyFailurePolicy::Continue, TestQueryCopyFailurePolicy::FailFast);
+        CPPUNIT_ASSERT(request.parallel);
+        CPPUNIT_ASSERT(TestQueryCopyFailurePolicy::Continue == request.failurePolicy);
+        CPPUNIT_ASSERT_EQUAL(3000U, request.queueTimeout);
+        CPPUNIT_ASSERT_EQUAL(7000U, request.compileTimeout);
+        CPPUNIT_ASSERT_EQUAL(11U, request.windowSize);
+    }
+
+    void testParallelCopySetTimeoutBounds()
+    {
+        CPPUNIT_ASSERT(queryCopySetTimeoutSecondsValid(0));
+        CPPUNIT_ASSERT(queryCopySetTimeoutSecondsValid(~0U / 1000));
+        CPPUNIT_ASSERT(!queryCopySetTimeoutSecondsValid(~0U / 1000 + 1));
+    }
+
+    void testParallelCopySetWindowSizeBounds()
+    {
+        CPPUNIT_ASSERT(!queryCopySetParallelWindowSizeValid(0));
+        CPPUNIT_ASSERT(queryCopySetParallelWindowSizeValid(queryCopySetMinParallelWindowSize));
+        CPPUNIT_ASSERT(queryCopySetParallelWindowSizeValid(queryCopySetMaxParallelWindowSize));
+        CPPUNIT_ASSERT(!queryCopySetParallelWindowSizeValid(queryCopySetMaxParallelWindowSize + 1));
+    }
+
+    void testMaxCompileThreadsSelection()
+    {
+        CPPUNIT_ASSERT_EQUAL(1U, queryMaxCompileThreads(0, 0, 8));
+        CPPUNIT_ASSERT_EQUAL(3U, queryMaxCompileThreads(0, 3, 8));
+        CPPUNIT_ASSERT_EQUAL(4U, queryMaxCompileThreads(0, 4, 8));
+        CPPUNIT_ASSERT_EQUAL(9U, queryMaxCompileThreads(0, 100, 8));
+        CPPUNIT_ASSERT_EQUAL(2U, queryMaxCompileThreads(8, 2, 8));
+        CPPUNIT_ASSERT_EQUAL(2U, queryMaxCompileThreads(0, 100, 0));
+        CPPUNIT_ASSERT_EQUAL(100U, queryMaxCompileThreads(0, 100, std::numeric_limits<unsigned>::max()));
+        CPPUNIT_ASSERT_EQUAL(4U, queryMaxCompileThreads(1000, 4, 8));
+    }
+};
+
+CPPUNIT_TEST_SUITE_REGISTRATION( wuTests );
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION( wuTests, "wu" );
+
+#endif // _USE_CPPUNIT

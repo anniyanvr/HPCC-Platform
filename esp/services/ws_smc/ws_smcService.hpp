@@ -160,7 +160,7 @@ class CActivityInfoCacheReader : public CInfoCacheReader
 {
 public:
     CActivityInfoCacheReader(const char* _name, unsigned _autoRebuildSeconds, unsigned _forceRebuildSeconds)
-        : CInfoCacheReader(_name, _autoRebuildSeconds, _forceRebuildSeconds) {}
+        : CInfoCacheReader(_name, _autoRebuildSeconds, _forceRebuildSeconds, true) {}
 
     virtual CInfoCache* read() override
     {
@@ -182,10 +182,12 @@ class CWsSMCEx : public CWsSMC
     StringBuffer m_BannerColor;
     StringBuffer m_BannerScroll;
     StringBuffer m_PortalURL;
+    StringAttr espInstance;
     int m_BannerAction;
     bool m_EnableChatURL;
-    CriticalSection crit;
+    CriticalSection crit{SYNC_LOCATION};
     Owned<CInfoCacheReader> activityInfoCacheReader;
+    MapStringToMyClass<ISmartSocketFactory> roxieConnMap;
 
 public:
     IMPLEMENT_IINTERFACE;
@@ -207,6 +209,7 @@ public:
     bool onSetJobPriority(IEspContext &context, IEspSMCPriorityRequest &req, IEspSMCPriorityResponse &resp);
     bool onGetThorQueueAvailability(IEspContext &context, IEspGetThorQueueAvailabilityRequest &req, IEspGetThorQueueAvailabilityResponse& resp);
     bool onSetBanner(IEspContext &context, IEspSetBannerRequest &req, IEspSetBannerResponse& resp);
+    bool onGetBanner(IEspContext &context, IEspGetBannerRequest &req, IEspGetBannerResponse& resp);
     bool onNotInCommunityEdition(IEspContext &context, IEspNotInCommunityEditionRequest &req, IEspNotInCommunityEditionResponse &resp);
 
     virtual bool attachServiceToDali() override
@@ -224,8 +227,12 @@ public:
     virtual bool onGetBuildInfo(IEspContext &context, IEspGetBuildInfoRequest &req, IEspGetBuildInfoResponse &resp);
     virtual bool onBrowseResources(IEspContext &context, IEspBrowseResourcesRequest & req, IEspBrowseResourcesResponse & resp);
     virtual bool onRoxieControlCmd(IEspContext &context, IEspRoxieControlCmdRequest &req, IEspRoxieControlCmdResponse &resp);
+    virtual bool onRoxieXrefCmd(IEspContext &context, IEspRoxieXrefCmdRequest &req, IEspRoxieXrefCmdResponse &resp);
+
     virtual bool onGetStatusServerInfo(IEspContext &context, IEspGetStatusServerInfoRequest &req, IEspGetStatusServerInfoResponse &resp);
     virtual bool onLockQuery(IEspContext &context, IEspLockQueryRequest &req, IEspLockQueryResponse &resp);
+    virtual bool onGetGlobalMetrics(IEspContext &context, IEspGetGlobalMetricsRequest &req, IEspGetGlobalMetricsResponse &resp);
+    virtual bool onRecordGlobalMetrics(IEspContext &context, IEspRecordGlobalMetricsRequest &req, IEspRecordGlobalMetricsResponse &resp);
 private:
     void addCapabilities( IPropertyTree* pFeatureNode, const char* access, IArrayOf<IEspCapability>& capabilities);
     void addServerJobQueue(IArrayOf<IEspServerJobQueue>& jobQueues, const char* queueName, const char* serverName,
@@ -285,11 +292,11 @@ public:
     virtual ~CWsSMCSoapBindingEx(){}
     virtual const char* getRootPage(IEspContext* ctx)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
             return nullptr;
         if (ctx->queryRequestParameters()->hasProp("legacy"))
             return NULL;
-        return "stub.htm";
+        return "stub.html";
     }
     virtual int onGet(CHttpRequest* request,  CHttpResponse* response);
     void handleHttpPost(CHttpRequest *request, CHttpResponse *response);
@@ -298,21 +305,21 @@ public:
 
     virtual int onGetRoot(IEspContext &context, CHttpRequest* request,  CHttpResponse* response)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
             return CWsSMCSoapBinding::onGetRoot(context, request,  response);
         return  onGetInstantQuery(context, request, response, "WsSMC", "Activity");
     }
 
     virtual int onGetIndex(IEspContext &context, CHttpRequest* request,  CHttpResponse* response, const char *service)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
             return CWsSMCSoapBinding::onGetIndex(context, request, response, service);
         return  onGetInstantQuery(context, request, response, "WsSMC", "Activity");
     }
 
     virtual void getNavigationData(IEspContext &context, IPropertyTree & data)
     {
-        if (queryComponentConfig().getPropBool("@api_only"))
+        if (getComponentConfigSP()->getPropBool("@api_only"))
         {
             CHttpSoapBinding::getNavigationData(context, data);
             return;

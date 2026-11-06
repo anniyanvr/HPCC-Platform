@@ -3,7 +3,7 @@ define([
     "dojo/_base/lang",
     "src/nlsHPCC",
     "dojo/_base/array",
-    "dojo/store/Memory",
+    "src/store/Memory",
     "dojo/store/Observable",
     "dojo/on",
     "dojo/promise/all",
@@ -23,12 +23,13 @@ define([
     "src/WsDfu",
     "hpcc/DelayLoadWidget",
     "src/ESPUtil",
+    "src/ESPSearch",
     "src/Utility"
 
-], function (declare, lang, nlsHPCCMod, arrayUtil, Memory, Observable, on, all,
+], function (declare, lang, nlsHPCCMod, arrayUtil, MemoryMod, Observable, on, all,
     Standby, validate,
     selector,
-    GridDetailsWidget, WsWorkunits, ESPWorkunit, ESPDFUWorkunit, ESPLogicalFile, ESPQuery, FileSpray, WsDfu, DelayLoadWidget, ESPUtil, Utility) {
+    GridDetailsWidget, WsWorkunits, ESPWorkunit, ESPDFUWorkunit, ESPLogicalFile, ESPQuery, FileSpray, WsDfu, DelayLoadWidget, ESPUtil, ESPSearch, Utility) {
 
     var nlsHPCC = nlsHPCCMod.default;
     return declare("SearchResultsWidget", [GridDetailsWidget], {
@@ -42,7 +43,7 @@ define([
             lang.mixin(this.params, {
                 searchText: searchText
             });
-            this.searchText = searchText;
+            this.searchText = searchText.toUpperCase();
             this.refreshGrid();
         },
 
@@ -92,10 +93,10 @@ define([
         },
 
         createGrid: function (domID) {
-            this.eclStore = new Observable(new Memory({ idProperty: "Wuid", data: [] }));
-            this.dfuStore = new Observable(new Memory({ idProperty: "ID", data: [] }));
-            this.fileStore = new Observable(new Memory({ idProperty: "__hpcc_id", data: [] }));
-            this.queryStore = new Observable(new Memory({ idProperty: "__hpcc_id", data: [] }));
+            this.eclStore = new Observable(new MemoryMod.Memory("Wuid"));
+            this.dfuStore = new Observable(new MemoryMod.Memory("ID"));
+            this.fileStore = new Observable(new MemoryMod.Memory("__hpcc_id"));
+            this.queryStore = new Observable(new MemoryMod.Memory("__hpcc_id"));
             this.eclTab = this.ensurePane({ id: this.i18n.ECLWorkunit }, { type: this.i18n.ECLWorkunit });
             this.dfuTab = this.ensurePane({ id: this.i18n.DFUWorkunit }, { type: this.i18n.DFUWorkunit });
             this.fileTab = this.ensurePane({ id: this.i18n.LogicalFile }, { type: this.i18n.LogicalFile });
@@ -270,102 +271,138 @@ define([
             return null;
         },
 
-        loadWUQueryResponse: function (prefix, response) {
-            var workunits = lang.getObject("WUQueryResponse.Workunits.ECLWorkunit", false, response);
-            if (workunits) {
-                var idPrefix = prefix.split(" ").join("_");
-                var context = this;
-                arrayUtil.forEach(workunits, function (item, idx) {
-                    context.store.add({
-                        storeID: ++context._rowID,
-                        id: context.id + item.Wuid,
-                        Type: context.i18n.ECLWorkunit,
-                        Reason: prefix,
-                        Summary: item.Wuid,
-                        _type: "Wuid",
-                        _wuid: item.Wuid
-                    });
-                    context.eclStore.add(ESPWorkunit.Get(item.Wuid, item), { overwrite: true });
-                });
-                this.refreshTab(this.eclTab);
-                return workunits.length;
-            }
-            return 0;
+        parseWuQueryResponse: function (prefix, response) {
+            return response?.WUQueryResponse?.Workunits?.ECLWorkunit.map(item => {
+                return {
+                    storeID: ++this._rowID,
+                    id: item.Wuid,
+                    Type: nlsHPCC.ECLWorkunit,
+                    Reason: prefix,
+                    Summary: item.Wuid,
+                    _type: "Wuid",
+                    _wuid: item.Wuid,
+                    ...item
+                };
+            });
         },
 
-        loadGetDFUWorkunitsResponse: function (prefix, response) {
-            var workunits = lang.getObject("GetDFUWorkunitsResponse.results.DFUWorkunit", false, response);
-            if (workunits) {
-                var idPrefix = prefix.split(" ").join("_");
-                var context = this;
-                arrayUtil.forEach(workunits, function (item, idx) {
-                    context.store.add({
-                        storeID: ++context._rowID,
-                        id: context.id + item.ID,
-                        Type: context.i18n.DFUWorkunit,
+        parseGetDFUWorkunitResponse: function (prefix, response) {
+            const item = response?.GetDFUWorkunitResponse?.result;
+            return (item && item.State !== 999) ? {
+                storeID: ++this._rowID,
+                id: item.ID,
+                Type: nlsHPCC.DFUWorkunit,
+                Reason: prefix,
+                Summary: item.ID,
+                _type: "DFUWuid",
+                _wuid: item.ID,
+                ...item
+            } : undefined;
+        },
+
+        parseGetDFUWorkunitsResponse: function (prefix, response) {
+            return response?.GetDFUWorkunitsResponse?.results?.DFUWorkunit.map(item => {
+                return {
+                    storeID: ++this._rowID,
+                    id: item.ID,
+                    Type: nlsHPCC.DFUWorkunit,
+                    Reason: prefix,
+                    Summary: item.ID,
+                    _type: "DFUWuid",
+                    _wuid: item.ID,
+                    ...item
+                };
+            });
+        },
+
+        parseDFUQueryResponse: function (prefix, response) {
+            return response?.DFUQueryResponse?.DFULogicalFiles?.DFULogicalFile.map(item => {
+                if (item.isSuperfile) {
+                    return {
+                        storeID: ++this._rowID,
+                        id: item.Name,
+                        Type: nlsHPCC.SuperFile,
                         Reason: prefix,
-                        Summary: item.ID,
-                        _type: "DFUWuid",
-                        _wuid: item.ID
-                    });
-                    context.dfuStore.add(ESPDFUWorkunit.Get(item.ID, item), { overwrite: true });
+                        Summary: item.Name,
+                        _type: "SuperFile",
+                        _nodeGroup: item.NodeGroup,
+                        _name: item.Name,
+                        ...item
+                    };
+                }
+                return {
+                    storeID: ++this._rowID,
+                    id: item.NodeGroup + "::" + item.Name,
+                    Type: nlsHPCC.LogicalFile,
+                    Reason: prefix,
+                    Summary: item.Name + " (" + item.NodeGroup + ")",
+                    _type: "LogicalFile",
+                    _nodeGroup: item.NodeGroup,
+                    _name: item.Name,
+                    ...item
+                };
+            });
+        },
+
+        parseWUListQueriesResponse: function (prefix, response) {
+            return response?.WUListQueriesResponse?.QuerysetQueries?.QuerySetQuery.map(item => {
+                return {
+                    storeID: ++this._rowID,
+                    id: item.QuerySetId + "::" + item.Id,
+                    Type: nlsHPCC.Query,
+                    Reason: prefix,
+                    Summary: item.Name + " (" + item.QuerySetId + " - " + item.Id + ")",
+                    _type: "Query",
+                    _querySetId: item.QuerySetId,
+                    _id: item.Id,
+                    ...item
+                };
+            });
+        },
+
+        loadWUQueryResponse: function (prefix, response) {
+            const results = this.parseWuQueryResponse(prefix, response);
+            if (results) {
+                results.forEach((item, idx) => {
+                    this.store.put(item, { overwrite: true });
+                    this.eclStore.put(ESPWorkunit.Get(item._wuid, item), { overwrite: true });
                 });
-                this.refreshTab(this.dfuTab);
-                return workunits.length;
+                this.refreshTab(this.eclTab);
+                return results.length;
             }
             return 0;
         },
 
         loadGetDFUWorkunitResponse: function (prefix, response) {
-            var context = this;
-            var workunit = lang.getObject("GetDFUWorkunitResponse.result", false, response);
-            if (workunit && workunit.State !== 999) {
-                var idPrefix = prefix.split(" ").join("_");
-                this.store.add({
-                    storeID: ++context._rowID,
-                    id: context.id + workunit.ID,
-                    Type: context.i18n.DFUWorkunit,
-                    Reason: prefix,
-                    Summary: workunit.ID,
-                    _type: "DFUWuid",
-                    _wuid: workunit.ID
-                });
-                this.dfuStore.add(ESPDFUWorkunit.Get(workunit.ID, workunit), { overwrite: true });
+            const workunit = this.parseGetDFUWorkunitResponse(prefix, response);
+            if (workunit) {
+                this.store.put(workunit, { overwrite: true });
+                this.dfuStore.put(ESPDFUWorkunit.Get(workunit._wuid, workunit), { overwrite: true });
                 this.refreshTab(this.dfuTab);
                 return 1;
             }
             return 0;
         },
 
+        loadGetDFUWorkunitsResponse: function (prefix, response) {
+            const results = this.parseGetDFUWorkunitsResponse(prefix, response);
+            if (results) {
+                results.forEach((item, idx) => {
+                    this.store.put(item, { overwrite: true });
+                    this.dfuStore.put(ESPDFUWorkunit.Get(item._wuid, item), { overwrite: true });
+                });
+                this.refreshTab(this.dfuTab);
+                return results.length;
+            }
+            return 0;
+        },
+
         loadDFUQueryResponse: function (prefix, response) {
-            var items = lang.getObject("DFUQueryResponse.DFULogicalFiles.DFULogicalFile", false, response);
+            const items = this.parseDFUQueryResponse(prefix, response);
             if (items) {
-                var idPrefix = prefix.split(" ").join("_");
-                var context = this;
-                arrayUtil.forEach(items, function (item, idx) {
-                    if (item.isSuperfile) {
-                        context.store.add({
-                            storeID: ++context._rowID,
-                            id: context.id + item.Name,
-                            Type: context.i18n.SuperFile,
-                            Reason: prefix,
-                            Summary: item.Name,
-                            _type: "SuperFile",
-                            _name: item.Name
-                        });
-                    } else {
-                        context.store.add({
-                            storeID: ++context._rowID,
-                            id: context.id + item.Name,
-                            Type: context.i18n.LogicalFile,
-                            Reason: prefix,
-                            Summary: item.Name + " (" + item.NodeGroup + ")",
-                            _type: "LogicalFile",
-                            _nodeGroup: item.NodeGroup,
-                            _name: item.Name
-                        });
-                    }
-                    context.fileStore.add(ESPLogicalFile.Get(item.NodeGroup, item.Name, item), { overwrite: true });
+                items.forEach((item, idx) => {
+                    this.store.put(item, { overwrite: true });
+                    this.fileStore.put(ESPLogicalFile.Get(item._nodeGroup, item._name, item), { overwrite: true });
                 });
                 this.refreshTab(this.fileTab);
                 return items.length;
@@ -374,22 +411,11 @@ define([
         },
 
         loadWUListQueriesResponse: function (prefix, response) {
-            var items = lang.getObject("WUListQueriesResponse.QuerysetQueries.QuerySetQuery", false, response);
+            const items = this.parseWUListQueriesResponse(prefix, response);
             if (items) {
-                var idPrefix = prefix.split(" ").join("_");
-                var context = this;
-                arrayUtil.forEach(items, function (item, idx) {
-                    context.store.add({
-                        storeID: ++context._rowID,
-                        id: context.id + item.QuerySetId + "::" + item.Id,
-                        Type: context.i18n.Query,
-                        Reason: prefix,
-                        Summary: item.Name + " (" + item.QuerySetId + " - " + item.Id + ")",
-                        _type: "Query",
-                        _querySetId: item.QuerySetId,
-                        _id: item.Id
-                    });
-                    context.queryStore.add(ESPQuery.Get(item.QuerySetId, item.Id, item), { overwrite: true });
+                items.forEach((item, idx) => {
+                    this.store.put(item, { overwrite: true });
+                    this.queryStore.put(ESPQuery.Get(item._querySetId, item._id, item), { overwrite: true });
                 });
                 this.refreshTab(this.queryTab);
                 return items.length;
@@ -398,8 +424,8 @@ define([
         },
 
         searchAll: function () {
-            var context = this;
             this.standby.show();
+
             if (validate.isNumberFormat(this.searchText, { format: ["W########-######", "W########-######-#???"] })) {
                 var tab = this.ensurePane({
                     id: this.searchText,
@@ -409,6 +435,7 @@ define([
                     _wuid: this.searchText
                 }, {});
                 this.selectChild(tab);
+
             } else if (validate.isNumberFormat(this.searchText, { format: ["D########-######", "D########-######-#???"] })) {
                 var tab = this.ensurePane({
                     id: this.searchText,
@@ -420,89 +447,33 @@ define([
                 this.selectChild(tab);
             }
 
-            var searchECL = false;
-            var searchECLText = false;
-            var searchDFU = false;
-            var searchFile = false;
-            var searchQuery = false;
-            var searchText = "";
-            if (this.searchText.indexOf("ecl:") === 0) {
-                this.selectChild(this.eclTab);
-                searchECL = true;
-                searchECLText = true;
-                searchText = this.searchText.substring(4);
-            } else if (this.searchText.indexOf("dfu:") === 0) {
-                this.selectChild(this.dfuTab);
-                searchDFU = true;
-                searchText = this.searchText.substring(4);
-            } else if (this.searchText.indexOf("file:") === 0) {
-                this.selectChild(this.fileTab);
-                searchFile = true;
-                searchText = this.searchText.substring(5);
-            } else if (this.searchText.indexOf("query:") === 0) {
-                this.selectChild(this.queryTab);
-                searchQuery = true;
-                searchText = this.searchText.substring(6);
-            } else {
-                this.selectChild(this.gridTab);
-                searchECL = true;
-                searchDFU = true;
-                searchFile = true;
-                searchQuery = true;
-                searchText = this.searchText;
-            }
-            searchText = searchText.trim();
+            const specificSearch = ESPSearch.searchAll(
+                this.searchText,
+                (prefix, response) => { this.loadWUQueryResponse(prefix, response); },
+                (prefix, response) => { this.loadGetDFUWorkunitResponse(prefix, response); },
+                (prefix, response) => { this.loadGetDFUWorkunitsResponse(prefix, response); },
+                (prefix, response) => { this.loadDFUQueryResponse(prefix, response); },
+                (prefix, response) => { this.loadWUListQueriesResponse(prefix, response); },
+                (searchCount) => { },
+                (success) => { this.standby.hide(); }
+            );
 
-            var searchArray = [];
-            if (searchECL) {
-                searchArray.push(WsWorkunits.WUQuery({ request: { Wuid: "*" + searchText + "*" }, suppressExceptionToaster: true }).then(function (response) {
-                    context.loadWUQueryResponse(context.i18n.WUID, response);
-                }));
-                searchArray.push(WsWorkunits.WUQuery({ request: { Jobname: "*" + searchText + "*" } }).then(function (response) {
-                    context.loadWUQueryResponse(context.i18n.JobName, response);
-                }));
-                searchArray.push(WsWorkunits.WUQuery({ request: { Owner: searchText } }).then(function (response) {
-                    context.loadWUQueryResponse(context.i18n.Owner, response);
-                }));
+            switch (specificSearch) {
+                case "ecl":
+                    this.selectChild(this.eclTab);
+                    break;
+                case "dfu":
+                    this.selectChild(this.dfuTab);
+                    break;
+                case "file":
+                    this.selectChild(this.fileTab);
+                    break;
+                case "query":
+                    this.selectChild(this.queryTab);
+                    break;
+                default:
+                    this.selectChild(this.gridTab);
             }
-            if (searchECLText) {
-                searchArray.push(WsWorkunits.WUQuery({ request: { ECL: searchText } }).then(function (response) {
-                    context.loadWUQueryResponse(context.i18n.ECL, response);
-                }));
-            }
-            if (searchDFU) {
-                searchArray.push(FileSpray.GetDFUWorkunit({ request: { wuid: "*" + searchText + "*" }, suppressExceptionToaster: true }).then(function (response) {
-                    context.loadGetDFUWorkunitResponse(context.i18n.WUID, response);
-                }));
-                searchArray.push(FileSpray.GetDFUWorkunits({ request: { Jobname: "*" + searchText + "*" } }).then(function (response) {
-                    context.loadGetDFUWorkunitsResponse(context.i18n.JobName, response);
-                }));
-                searchArray.push(FileSpray.GetDFUWorkunits({ request: { Owner: searchText } }).then(function (response) {
-                    context.loadGetDFUWorkunitsResponse(context.i18n.Owner, response);
-                }));
-            }
-            if (searchFile) {
-                searchArray.push(WsDfu.DFUQuery({ request: { LogicalName: "*" + searchText + "*" } }).then(function (response) {
-                    context.loadDFUQueryResponse(context.i18n.LogicalName, response);
-                }));
-                searchArray.push(WsDfu.DFUQuery({ request: { Owner: searchText } }).then(function (response) {
-                    context.loadDFUQueryResponse(context.i18n.Owner, response);
-                }));
-            }
-            if (searchQuery) {
-                searchArray.push(WsWorkunits.WUListQueries({ request: { QueryID: "*" + searchText + "*" } }).then(function (response) {
-                    context.loadWUListQueriesResponse(context.i18n.ID, response);
-                }));
-                searchArray.push(WsWorkunits.WUListQueries({ request: { QueryName: "*" + searchText + "*" } }).then(function (response) {
-                    context.loadWUListQueriesResponse(context.i18n.Name, response);
-                }));
-            }
-
-            all(searchArray).then(function (results) {
-                context.standby.hide();
-            }, function (error) {
-                context.standby.hide();
-            });
         },
 
         refreshGrid: function (args) {

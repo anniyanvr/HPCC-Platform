@@ -24,6 +24,26 @@ ESPenum RoxieQueueFilter : string
     WorkunitsOnly("WorkunitsOnly")
 };
 
+ESPenum TpMachineType : string
+{
+    All("ALLNODES"),
+    Thor("THORMACHINES"),
+    Hole("HOLEMACHINES"),
+    Roxie("ROXIEMACHINES"),
+    Machines("MACHINES"),
+    Available("AVAILABLEMACHINES"),
+    DropZone("DROPZONE"),
+    StandBy("STANDBYNNODE"),
+    ThorSpare("THORSPARENODES"),
+    HoleStandby("HOLESTANDBYNODES")
+};
+
+ESPenum TpConfigResponseFormat : string
+{
+    XML("XML"),
+    YAML("YAML")
+};
+
 //  ===========================================================================
 
 ESPStruct TpMachine
@@ -83,7 +103,7 @@ ESPStruct [nil_remove] TpGroup
 };
 
 //  ===========================================================================
-ESPStruct TpDali        
+ESPStruct TpDali
 {
     string Name;
     string Description;
@@ -98,7 +118,7 @@ ESPStruct TpDali
 
 };
 //  ===========================================================================
-ESPStruct TpEclServer   
+ESPStruct TpEclServer
 {
     string Name;
     string Description;
@@ -110,7 +130,7 @@ ESPStruct TpEclServer
 
 };
 //  ===========================================================================
-ESPStruct TpEclAgent    
+ESPStruct TpEclAgent
 {
     string Name;
     string Description;
@@ -130,7 +150,7 @@ ESPStruct TpAgentExec
 
 };
 //  ===========================================================================
-ESPStruct TpEclScheduler    
+ESPStruct TpEclScheduler
 {
     string Name;
     string Description;
@@ -330,7 +350,7 @@ ESPStruct TpTargetCluster
 {
     string Name;
     string Prefix;
-    TpQueryType Type;
+    string Type;
 
     ESParray<ESPstruct TpCluster>   TpClusters;
     ESParray<ESPstruct TpEclServer> TpEclCCServers;
@@ -339,14 +359,9 @@ ESPStruct TpTargetCluster
     [min_ver("1.16")] ESParray<ESPstruct TpEclScheduler>  TpEclSchedulers;
 };
 
-ESPStruct TpQueryType
-{
-    TPCLUSTER;
-    TPNODE;
-};
 ESPrequest TpTargetClusterQueryRequest
 {
-    TpQueryType Type;
+    string Type;
     string Name;
     bool ShowDetails(false);
 };
@@ -369,7 +384,7 @@ ESPresponse [exceptions_inline]TpTargetClusterQueryResponse
 
 ESPrequest TpClusterQueryRequest
 {
-    TpQueryType Type;
+    string Type;
 };
 
 ESPresponse [exceptions_inline]TpClusterQueryResponse
@@ -420,21 +435,17 @@ ESPresponse [exceptions_inline,encode(0)] TpClusterInfoResponse
 };
 
 
-SCMenum TpMachineType
-{
-    TPMACHINECLUSTER
-};
 ESPrequest [] TpMachineQueryRequest
 {
     //Type of Node the parent is....
-    TpMachineType Type;
+    ESPenum TpMachineType Type;
     string        Cluster;
     string        OldIP;
     //Path to Parent within Dali(Encoded to prevent back-engineering)
     string Path;
     //installation path for corresponding component for monitoring processes
     string Directory;
-    string LogDirectory; 
+    string LogDirectory;
 };
 
 
@@ -442,7 +453,7 @@ ESPresponse [exceptions_inline] TpMachineQueryResponse
 {
     bool   EnablePreflightInfo;
     [min_ver("1.15")] bool   HasThorSpareProcess;
-    TpMachineType Type;
+    ESPenum TpMachineType Type;
     string        Cluster;
     string        OldIP;
     string       LogDirectory;
@@ -582,13 +593,6 @@ ESPresponse [exceptions_inline] SystemLogResponse
     [http_content("application/octet-stream")] binary thefile;
 };
 
-SCMenum OS_TYPE
-{
-    OS_WINDOWS, 
-    OS_SOLARIS, 
-    OS_LINUX
-};
-
 ESPrequest TpGetComponentFileRequest
 {
     string  CompType;
@@ -646,7 +650,54 @@ ESPresponse [nil_remove, exceptions_inline] TpDropZoneQueryResponse
     ESParray<ESPstruct TpDropZone>    TpDropZones;
 };
 
-ESPservice [auth_feature("DEFERRED"), noforms, version("1.31"), cache_group("ESPWsTP"), exceptions_inline("./smc_xslt/exceptions.xslt")] WsTopology
+ESPrequest TpListLogFilesRequest
+{
+    string NetworkAddress;
+    string Path;
+};
+
+ESPStruct LogFileStruct
+{
+    string Name;
+    string Path;
+    string Host;
+    bool IsDir;
+    int64 FileSize;
+    string Modifiedtime;
+};
+
+ESPresponse [exceptions_inline] TpListLogFilesResponse
+{
+    ESParray<ESPStruct LogFileStruct> Files;
+};
+
+ESPrequest TpConfiguredComponentsRequest
+{
+};
+
+ESPresponse [exceptions_inline] TpConfiguredComponentsResponse
+{
+    ESParray<string> ConfiguredComponents;
+};
+
+ESPrequest TpComponentConfigurationRequest
+{
+    ESParray<string> ComponentNames;
+};
+
+ESPstruct TpConfigResult
+{
+    string ComponentName;
+    string Configuration;
+};
+
+ESPresponse [exceptions_inline] TpComponentConfigurationResponse
+{
+    ESPenum TpConfigResponseFormat ConfigFormat;
+    ESParray<ESPstruct TpConfigResult, Result> Results;
+};
+
+ESPservice [auth_feature("DEFERRED"), noforms, version("1.33"), generated_client_version("0.0"), cache_group("ESPWsTP"), exceptions_inline("./smc_xslt/exceptions.xslt")] WsTopology
 {
     ESPmethod [cache_seconds(180), cache_global(1), resp_xsl_default("/esp/xslt/targetclusters.xslt")] TpTargetClusterQuery(TpTargetClusterQueryRequest, TpTargetClusterQueryResponse);
     ESPmethod [cache_seconds(180), cache_global(1), resp_xsl_default("/esp/xslt/topology.xslt")] TpClusterQuery(TpClusterQueryRequest, TpClusterQueryResponse);
@@ -667,8 +718,11 @@ ESPservice [auth_feature("DEFERRED"), noforms, version("1.31"), cache_group("ESP
     ESPmethod [cache_seconds(180), cache_global(1)] TpGetServicePlugins(TpGetServicePluginsRequest, TpGetServicePluginsResponse);
     ESPmethod [cache_seconds(180), cache_global(1)] TpListTargetClusters(TpListTargetClustersRequest, TpListTargetClustersResponse);
     ESPmethod [cache_seconds(180), cache_global(1), min_ver(1.25)] TpMachineInfo(TpMachineInfoRequest, TpMachineInfoResponse);
+    ESPmethod [cache_seconds(180), cache_global(1), min_ver(1.32)] TpListLogFiles(TpListLogFilesRequest, TpListLogFilesResponse);
 
     ESPmethod SystemLog(SystemLogRequest, SystemLogResponse);
+    ESPmethod [cache_seconds(180), cache_global(1), min_ver(1.33)] TpConfiguredComponents(TpConfiguredComponentsRequest, TpConfiguredComponentsResponse);
+    ESPmethod [cache_seconds(180), cache_global(1), min_ver(1.33)] TpComponentConfiguration(TpComponentConfigurationRequest, TpComponentConfigurationResponse);
 };
 
 SCMexportdef(WSWU);

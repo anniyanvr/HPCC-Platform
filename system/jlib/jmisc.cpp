@@ -21,12 +21,14 @@
 
 #include "platform.h"
 #include "stdio.h"
+#include <atomic>
 #include <time.h>
 #include "jmisc.hpp"
 #include "jmutex.hpp"
 #include "jexcept.hpp"
 #include "jstring.hpp"
 #include "jdebug.hpp"
+#include "jerror.hpp"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -65,10 +67,9 @@ void _rev(size32_t len, void * _ptr)
     }
 }
 
-Mutex printMutex;
+Mutex printMutex(SYNC_LOCATION);
 FILE *logFile;
 FILE *stdlog = stderr;
-HiresTimer logTimer;
 class CStdLogIntercept: public ILogIntercept
 {
     bool nl;
@@ -252,7 +253,7 @@ jlib_decl void PrintMemoryStatusLog()
 #ifdef _WIN32
     MEMORYSTATUS mS;
     GlobalMemoryStatus(&mS);
-    LOG(MCdebugInfo, unknownJob, "Available Physical Memory = %dK", (unsigned)(mS.dwAvailPhys/1024));
+    LOG(MCdebugInfo, "Available Physical Memory = %dK", (unsigned)(mS.dwAvailPhys/1024));
 #ifdef FRAGMENTATION_CHECK
     // see if fragmented
     size32_t sz = MAX_TRY_SIZE;
@@ -268,7 +269,7 @@ jlib_decl void PrintMemoryStatusLog()
     }
     sz *= 2;
     if ((sz<MAX_TRY_SIZE)&&(sz<mS.dwAvailPhys/4)) {
-        LOG(MCdebugInfo, unknownJob, "WARNING: Could not allocate block size %d", sz);
+        LOG(MCdebugInfo, "WARNING: Could not allocate block size %d", sz);
        _HEAPINFO hinfo;
        int heapstatus;
        hinfo._pentry = NULL;
@@ -281,8 +282,8 @@ jlib_decl void PrintMemoryStatusLog()
                 fragments++;
            }
        }
-       LOG(MCdebugInfo, unknownJob, "Largest unused fragment = %d", max);
-       LOG(MCdebugInfo, unknownJob, "Number of fragments = %d", fragments);
+       LOG(MCdebugInfo, "Largest unused fragment = %d", max);
+       LOG(MCdebugInfo, "Number of fragments = %d", fragments);
     }
 #endif
 #endif
@@ -568,7 +569,7 @@ bool invoke_program(const char *command_line, DWORD &runcode, bool wait, const c
 
         OERRLOG("%s",s.str());
         if(throwException)
-            throw MakeStringExceptionDirect(-1, s.str());
+            throw MakeStringExceptionDirect(JLIBERR_UtilProcessForkFailed, s.str());
         return false;
     }
 
@@ -646,45 +647,27 @@ void close_program(HANDLE handle)
 
 #endif
 
-#ifndef _WIN32
-bool CopyFile(const char *file, const char *newfile, bool fail)
+bool wait_program_timeout(HANDLE handle,DWORD &runcode,unsigned timeoutMs)
 {
-    struct stat s;
-    if ((fail) && (0 == stat((char *)newfile, &s))) return false;
-    FILE *in=fopen(file,"rb"), *out=fopen(newfile,"wb");
-    try
+    CTimeMon timer(timeoutMs);
+    while (true)
     {
-        if (!in)
-            throw MakeStringException(-1, "failed to open %s for copy",file);
-        if (!out)
-            throw MakeStringException(-1, "failed to create %s",newfile);
-        char b[1024];
-        while (true)
-        {
-            int c=fread(b,1,sizeof(b),in);
-            if (!c) break;
-            if (!fwrite(b,c,1,out)) throw MakeStringException(-1, "failed to copy file %s to %s",file,newfile);
-        }
-        fclose(in);
-        fclose(out);
-        stat((char *)file, &s);
-        chmod(newfile, s.st_mode);
-    } catch (...)
-    {
-        if (in)  fclose(in);
-        if (out) fclose(out);
-        return false;
+        if (wait_program(handle,runcode,false))
+            break;
+        unsigned remaining;
+        if (timer.timedout(&remaining))
+            return false;
+        MilliSleep(remaining > 1000 ? 1000 : remaining);
     }
-
     return true;
 }
-#endif
 
 //========================================================================================================================
 
 static bool hadAbortSignal = false;
 static bool handlerInstalled = false;
-CriticalSection abortCrit;
+static std::atomic<PostAbortSignalHandler> postAbortSignalHandler{nullptr};
+CriticalSection abortCrit(SYNC_LOCATION);
 
 class AbortHandlerInfo : public CInterface
 {
@@ -764,12 +747,18 @@ BOOL WINAPI WindowsAbortHandler ( DWORD dwCtrlType )
         {
             hadAbortSignal = true;
             bool doExit = notifyOnAbort(ahInterrupt);
+            PostAbortSignalHandler postHandler = postAbortSignalHandler.load();
+            if (postHandler)
+                postHandler(ahInterrupt);
             return !doExit; 
         }
         case CTRL_LOGOFF_EVENT:
         case CTRL_SHUTDOWN_EVENT:
             hadAbortSignal = true;
             notifyOnAbort(ahTerminate);
+            PostAbortSignalHandler postHandler = postAbortSignalHandler.load();
+            if (postHandler)
+                postHandler(ahTerminate);
             return FALSE;
     }
     return FALSE; 
@@ -788,7 +777,7 @@ BOOL WINAPI ModuleExitHandler ( DWORD dwCtrlType )
     }
     return FALSE; 
 } 
-#elif defined(__linux__) || defined(__APPLE__)
+#elif defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
 static void UnixAbortHandler(int signo)
 {
     ahType type = ahInterrupt;
@@ -796,9 +785,18 @@ static void UnixAbortHandler(int signo)
             type = ahTerminate;
 
     hadAbortSignal = true;
-    if (handlers.length()==0 || notifyOnAbort(type))
+    bool doExit = handlers.length()==0 || notifyOnAbort(type);
+    PostAbortSignalHandler postHandler = postAbortSignalHandler.load();
+    if (postHandler)
+        postHandler(type);
+    if (doExit)
     {
+#ifdef _COVERAGE
+        ClearModuleObjects();
+        exit(0);
+#else
         _exit(0);
+#endif
     }
 }
 #endif
@@ -810,7 +808,7 @@ void queryInstallAbortHandler()
 
 #if defined(_WIN32)
     SetConsoleCtrlHandler( WindowsAbortHandler, TRUE ); 
-#elif defined(__linux__) || defined(__APPLE__)
+#elif defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
     struct sigaction action;
     sigemptyset(&action.sa_mask);
     action.sa_flags = SA_RESTART;
@@ -875,6 +873,13 @@ void addAbortHandler(IAbortHandler & handler)
     handlers.append(*new AbortHandlerInfo(&handler));
 }
 
+void setPostAbortSignalHandler(PostAbortSignalHandler handler)
+{
+    CriticalBlock c(abortCrit);
+    queryInstallAbortHandler();
+    postAbortSignalHandler.store(handler);
+}
+
 void removeAbortHandler(AbortHandler handler)
 {
     CriticalBlock c(abortCrit);
@@ -917,20 +922,25 @@ void removeAbortHandler(IAbortHandler & handler)
     queryUninstallAbortHandler();
 }
 
-bool isAborting()
+bool hasReceivedAbortSignal()
 {
     return hadAbortSignal;
 }
 
-void throwAbortException()
+void throwAbortSignalException()
 {
-    throw MakeStringException(JLIBERR_UserAbort, "Operation aborted by user");
+    throw makeStringException(JLIBERR_ReceivedAbortSignal, "Abort signal received");
+}
+
+void throwProcessAbortRequestedException()
+{
+    throw makeStringException(JLIBERR_ProcessAbortRequest, "Operation termination requested");
 }
 
 void throwExceptionIfAborting() 
 { 
-    if (isAborting())
-        throwAbortException(); 
+    if (hasReceivedAbortSignal())
+        throwAbortSignalException();
 }
 
 //========================================================================================================================
@@ -940,7 +950,7 @@ void throwExceptionIfAborting()
 
 StringBuffer & hexdump2string(byte const * in, size32_t inSize, StringBuffer & out)
 {
-    out.append("[");
+    out.appendf("%u bytes [", inSize);
     byte last = 0;
     unsigned seq = 1;
     for(unsigned i=0; i<inSize; ++i)
@@ -1020,4 +1030,51 @@ jlib_decl char **getSystemEnv()
 #else
     return environ;
 #endif
+}
+
+
+// 1st checks if 'name' is a standard environment variable.
+// then checks if 'name' is an internal environment variable (prefixed with 'HPCC_')
+// returns a copy of the configured value or the defaultValue if not set.
+// NB: Only HPCC_DEPLOYMENTNAME currently supported, but could be extended.
+char *getHPCCEnvVal(const char *name, const char *defaultValue)
+{
+    StringBuffer val;
+    bool valSet = false;
+
+    if (!isEmptyString(name))
+    {
+        // 1st check environment variable
+        const char *envRes = getenv(name);
+        if (envRes)
+        {
+            val.append(envRes);
+            valSet = true;
+        }
+        else
+        {
+            constexpr const char *builtinPrefix = "HPCC_";
+            if (startsWith(name, builtinPrefix))
+            {
+                const char *hpccEnvVar = name+strlen(builtinPrefix);
+
+                // Match HPCC_DEPLOYMENTNAME (or HPCC_DEPLOYMENT for backward compatibility)
+                if (streq(hpccEnvVar, "DEPLOYMENTNAME") || streq(hpccEnvVar, "DEPLOYMENT"))
+                {
+                    if (isContainerized())
+                        valSet = getGlobalConfigSP()->getProp("@deploymentName", val);
+                    else
+                        valSet = queryEnvironmentConf().getProp("deploymentName", val);
+                }
+                // else other HPCC_ variables could be added here as needed
+            }
+        }
+    }
+
+    if (valSet)
+        return val.detach();
+    else if (defaultValue)
+        return strdup(defaultValue);
+    else
+        return strdup("");
 }

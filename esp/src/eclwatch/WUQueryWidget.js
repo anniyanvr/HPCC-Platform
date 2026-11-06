@@ -105,7 +105,7 @@ define([
             var fileName = this.fileName.get("value") + ".csv";
 
             arrayUtil.forEach(selections, function (cell, idx) {
-                var rowData = [cell.Protected, cell.Wuid, cell.Owner, cell.Jobname, cell.Cluster, cell.RoxieCluster, cell.State, cell.TotalClusterTime];
+                var rowData = [cell.Protected, cell.Wuid, cell.Owner, cell.Jobname, cell.Cluster, cell.State, cell.TotalClusterTime];
                 row.push(rowData);
             });
 
@@ -158,19 +158,19 @@ define([
         },
 
         _onSetToFailed: function (event) {
-            WsWorkunits.WUAction(this.workunitsGrid.getSelected(), "SetToFailed");
+            WsWorkunits.WUAction(this.workunitsGrid.getSelected(), "SetToFailed").then(() => this.refreshGrid());
         },
 
         _onAbort: function (event) {
-            WsWorkunits.WUAction(this.workunitsGrid.getSelected(), "Abort");
+            WsWorkunits.WUAction(this.workunitsGrid.getSelected(), "Abort").then(() => this.refreshGrid());
         },
 
         _onProtect: function (event) {
-            WsWorkunits.WUAction(this.workunitsGrid.getSelected(), "Protect");
+            WsWorkunits.WUAction(this.workunitsGrid.getSelected(), "Protect").then(() => this.refreshGrid());
         },
 
         _onUnprotect: function (event) {
-            WsWorkunits.WUAction(this.workunitsGrid.getSelected(), "Unprotect");
+            WsWorkunits.WUAction(this.workunitsGrid.getSelected(), "Unprotect").then(() => this.refreshGrid());
         },
 
         _onReschedule: function (event) {
@@ -463,7 +463,7 @@ define([
                             node.innerHTML = Utility.getImageHTML("locked.png", context.i18n.Protected);
                         },
                         width: 25,
-                        sortable: false,
+                        sortable: true,
                         formatter: function (_protected) {
                             if (_protected === true) {
                                 return Utility.getImageHTML("locked.png");
@@ -475,16 +475,15 @@ define([
                         label: this.i18n.WUID, width: 180,
                         formatter: function (Wuid, idx) {
                             var wu = ESPWorkunit.Get(Wuid);
-                            return wu.getStateImageHTML() + "&nbsp;<a href='#/workunits/" + Wuid + "' class='dgrid-row-url' onClick='return false;'>" + Wuid + "</a>";
+                            return wu.getStateImageHTML() + `&nbsp;<a href="#/workunits/${encodeURIComponent(Wuid)}" class="dgrid-row-url" onClick="return false;">${Utility.encodeHTML(Wuid)}</a>`;
                         }
                     },
-                    Owner: { label: this.i18n.Owner, width: 90 },
-                    Jobname: { label: this.i18n.JobName, width: 500 },
+                    Owner: { label: this.i18n.Owner, width: 120 },
+                    Jobname: { label: this.i18n.JobName },
                     Cluster: { label: this.i18n.Cluster, width: 90 },
-                    RoxieCluster: { label: this.i18n.RoxieCluster, width: 99 },
                     State: { label: this.i18n.State, width: 90 },
                     TotalClusterTime: {
-                        label: this.i18n.TotalClusterTime, width: 117,
+                        label: this.i18n.TotalClusterTime, width: 150,
                         renderCell: function (object, value, node, options) {
                             domClass.add(node, "justify-right");
                             node.innerText = value;
@@ -492,6 +491,11 @@ define([
                     },
                 }
             }, this.id + "WorkunitsGrid");
+
+            ESPUtil.goToPageUserPreference(this.workunitsGrid, "WUQueryWidget_GridRowsPerPage").then(function () {
+                context.refreshGrid();
+            });
+
             this.workunitsGrid.on(".dgrid-row-url:click", function (evt) {
                 if (context._onRowDblClick) {
                     var item = context.workunitsGrid.row(evt).data;
@@ -527,10 +531,6 @@ define([
                 return deferred.then(function () {
                     args[0] > 1 ? context._idleWatcher.stop() : context._idleWatcher.start();
                 });
-            });
-
-            ESPUtil.goToPageUserPreference(this.workunitsGrid, "WUQueryWidget_GridRowsPerPage").then(function () {
-                context.workunitsGrid.startup();
             });
         },
 

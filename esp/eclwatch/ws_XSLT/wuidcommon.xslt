@@ -25,7 +25,7 @@
     <form name="protect" id="protect" action="/WsWorkunits/WUUpdate?Wuid={$wuid}" method="post">
       <div id="wudetails" xmlns="http://www.w3.org/1999/xhtml">
         <table id="wudetailsContent" class="workunit">
-          <xsl:text disable-output-escaping="yes"><![CDATA[        
+          <xsl:text disable-output-escaping="yes"><![CDATA[
         <colgroup>
           <col width="30%"/>
           <col width="70%"/>
@@ -48,7 +48,7 @@
                   &nbsp;
                   <a href="/esp/iframe?esp_iframe_title=Download ECL Workunit XML - {$wuid}&amp;inner=/WsWorkunits/WUFile%3fWuid%3d{$wuid}%26Type%3dXML%26Option%3d2" >Download XML</a>
                   &nbsp;
-                  <a href="/esp/iframe?esp_iframe_title=ECL Playground - {$wuid}&amp;inner=/esp/files/stub.htm%3fWidget%3dECLPlaygroundWidget%26Wuid%3d{$wuid}%26Target%3d{Cluster}" >ECL Playground</a>
+                  <a href="/esp/iframe?esp_iframe_title=ECL Playground - {$wuid}&amp;inner=/esp/files/stub.html%3fWidget%3dECLPlaygroundWidget%26Wuid%3d{$wuid}%26Target%3d{Cluster}" >ECL Playground</a>
                 </xsl:otherwise>
               </xsl:choose>
             </td>
@@ -290,7 +290,7 @@
           </tr>
         </table>
       </div>
-      
+
       <xsl:if test="HasDebugValue &gt; 0 or DebugValuesDesc != ''">
         <p>
           <div>
@@ -345,7 +345,7 @@
           </div>
         </p>
       </xsl:if>
-      
+
       <xsl:if test="WarningCount &gt; 0">
         <p>
           <div>
@@ -369,7 +369,7 @@
           </div>
         </p>
       </xsl:if>
-      
+
       <xsl:if test="InfoCount &gt; 0">
         <p>
           <div>
@@ -393,7 +393,7 @@
           </div>
         </p>
       </xsl:if>
-      
+
       <xsl:if test="AlertCount &gt; 0">
         <p>
           <div>
@@ -417,7 +417,7 @@
           </div>
         </p>
       </xsl:if>
-      
+
       <xsl:if test="ResultCount &gt; 0 or ResultsDesc != ''">
         <p>
           <div>
@@ -427,7 +427,7 @@
                   Results: (<xsl:value-of select="ResultCount"/>)
                 </A>
                 &nbsp;-&nbsp;
-                <a href="/esp/iframe?esp_iframe_title=Results - {$wuid}&amp;inner=/esp/files/stub.htm%3fWidget%3dResultsWidget%26Wuid%3d{$wuid}%26TabPosition%3dtop" >Show</a>
+                <a href="/esp/iframe?esp_iframe_title=Results - {$wuid}&amp;inner=/esp/files/stub.html%3fWidget%3dResultsWidget%26Wuid%3d{$wuid}%26TabPosition%3dtop" >Show</a>
               </div>
             </div>
             <div id="Results" class="wusectioncontent">
@@ -464,7 +464,7 @@
           </div>
         </p>
       </xsl:if>
-      
+
       <xsl:if test="SourceFileCount &gt; 0 or SourceFilesDesc != ''">
         <p>
           <div>
@@ -543,7 +543,7 @@
           </div>
         </p>
       </xsl:if>
-      
+
       <xsl:if test="GraphCount &gt; 0 or GraphsDesc != ''">
         <p>
           <div>
@@ -587,7 +587,7 @@
           </div>
         </p>
       </xsl:if>
-      
+
       <xsl:if test="TimerCount &gt; 0 or TimersDesc != ''">
         <p>
           <div>
@@ -848,7 +848,7 @@
             </td></tr>
         </table>
       </xsl:if>
-    </form>       
+    </form>
    <div id="wufooterContent">
    <div id="wufooter">
     <xsl:choose>
@@ -1104,15 +1104,20 @@
       <td>
         <xsl:choose>
           <xsl:when test="string-length(Name)">
-            <xsl:if test="(Value = '[undefined]' or Value = '') and contains(Name, 'Result')">
-            <xsl:text disable-output-escaping="yes"><![CDATA[<span style="color:silver">]]></xsl:text>
-            </xsl:if>
-            <xsl:call-template name="id2string">
-              <xsl:with-param name="toconvert" select="Name"/>
-            </xsl:call-template>
-            <xsl:if test="(Value = '[undefined]' or Value = '') and contains(Name, 'Result')">
-            <xsl:text disable-output-escaping="yes"><![CDATA[</span>]]></xsl:text>
-            </xsl:if>
+            <xsl:choose>
+              <xsl:when test="(Value = '[undefined]' or Value = '') and contains(Name, 'Result')">
+                <span style="color:silver">
+                  <xsl:call-template name="id2string">
+                    <xsl:with-param name="toconvert" select="Name"/>
+                  </xsl:call-template>
+                </span>
+              </xsl:when>
+              <xsl:otherwise>
+                <xsl:call-template name="id2string">
+                  <xsl:with-param name="toconvert" select="Name"/>
+                </xsl:call-template>
+              </xsl:otherwise>
+            </xsl:choose>
           </xsl:when>
           <xsl:otherwise>
             <xsl:if test="Value = '[undefined]'">
@@ -1174,9 +1179,7 @@
        </xsl:when>
        <xsl:when test="Value = '[undefined]'">
          <td>
-            <xsl:text disable-output-escaping="yes"><![CDATA[ <span style="color:silver">]]></xsl:text>
-            <xsl:value-of select="Value"/>
-            <xsl:text disable-output-escaping="yes"><![CDATA[ </span>]]></xsl:text>
+          <span style="color:silver"><xsl:value-of select="Value"/></span>
          </td>
          <td/>
          <td/>
@@ -1223,17 +1226,13 @@
         </xsl:otherwise>
       </xsl:choose>
       <td>
-        <a href="javascript:void(0)" onclick="return loadUrl('/WsWorkunits/GVCAjaxGraph?Name={$wuid}&amp;GraphName={Name}');" >
-          <xsl:value-of select="Name"/>
-          <xsl:if test="number(RunningId)">
-            (<xsl:value-of select="RunningId"/>)
-          </xsl:if>
-        </a>
+        <xsl:value-of select="Name"/>
+        <xsl:if test="number(RunningId)">
+          (<xsl:value-of select="RunningId"/>)
+        </xsl:if>
       </td>
       <td>
-        <a href="javascript:void(0)" onclick="return loadUrl('/WsWorkunits/GVCAjaxGraph?Name={$wuid}&amp;GraphName={Name}');" >
-          <xsl:value-of select="Label"/>
-        </a>
+        <xsl:value-of select="Label"/>
       </td>
     </tr>
   </xsl:template>
@@ -1242,14 +1241,10 @@
     <tr class="{$rowclass}">
       <td>
         <xsl:if test="GraphName and SubGraphId">
-          <a href="javascript:void(0)" onclick="return loadUrl('/WsWorkunits/GVCAjaxGraph?Name={$wuid}&amp;GraphName={GraphName}&amp;SubGraphId={SubGraphId}');" >
-            <xsl:value-of select="Name"/>
-          </a>
+          <xsl:value-of select="Name"/>
         </xsl:if>
         <xsl:if test="GraphName and not(SubGraphId)">
-          <a href="javascript:void(0)" onclick="return loadUrl('/WsWorkunits/GVCAjaxGraph?Name={$wuid}&amp;GraphName={GraphName}');" >
-            <xsl:value-of select="Name"/>
-          </a>
+          <xsl:value-of select="Name"/>
         </xsl:if>
         <xsl:if test="not(GraphName)">
           <xsl:value-of select="Name"/>
@@ -1257,14 +1252,10 @@
       </td>
       <td style="text-align:right;">
         <xsl:if test="GraphName and SubGraphId">
-          <a href="javascript:void(0)" onclick="return loadUrl('/WsWorkunits/GVCAjaxGraph?Name={$wuid}&amp;GraphName={GraphName}&amp;SubGraphId={SubGraphId}');" >
-            <xsl:value-of select="Value"/>
-          </a>
+          <xsl:value-of select="Value"/>
         </xsl:if>
         <xsl:if test="GraphName and not(SubGraphId)">
-          <a href="javascript:void(0)" onclick="return loadUrl('/WsWorkunits/GVCAjaxGraph?Name={$wuid}&amp;GraphName={GraphName}');" >
-            <xsl:value-of select="Value"/>
-          </a>
+          <xsl:value-of select="Value"/>
         </xsl:if>
         <xsl:if test="not(GraphName)">
           <xsl:value-of select="Value"/>
@@ -1404,15 +1395,15 @@
                             document.getElementById("deleteBtn").disabled = false;
                             document.getElementById("protectBtn").disabled = false;
                         }
-                     }                     
+                     }
                  function launch(link)
                  {
                     document.location.href=link.href;
-                 }                     
+                 }
                      function onLoad()
                      {
                         initSelection('resultsTable');
-                     }       
+                     }
                ]]></xsl:text>
         </script>
       </head>
@@ -1510,12 +1501,12 @@
         <script type="text/javascript">
           var wuid = '<xsl:value-of select="$wuid0"/>';
           <xsl:text disable-output-escaping="yes"><![CDATA[
-                  
+
                      function onLoad()
                      {
                         initSelection('resultsTable');
-                     }               
-                       
+                     }
+
                      function ChangeHeader(o1, headerid)
                      {
                         if (headerid%2)
@@ -1531,22 +1522,8 @@
                      function launch(link)
                      {
                         document.location.href=link.href;
-                     }     
+                     }
 
-                     function selectSubGraph(GraphName, SubGraphId)
-                     {
-                        if (window.opener)
-              {
-                              window.opener.selectGraphSubGraph(GraphName.substring(5), SubGraphId);
-              }
-              else
-              {
-                // Load the Graph page directly.
-                var urlBase = '/WsWorkunits/GVCAjaxGraph?Name=' + wuid + '&GraphName=' + GraphName + '&SubGraphId=' + SubGraphId;
-                document.location.href = urlBase;
-              }
-                     } 
-   
                ]]></xsl:text>
         </script>
       </head>
@@ -1585,13 +1562,7 @@
   <xsl:template match="Workunit/TimingData/ECLTimingData">
     <tr>
       <td align="left">
-        <xsl:text disable-output-escaping="yes"><![CDATA[<a href="javascript:void(0)" onclick="selectSubGraph('graph]]></xsl:text>
-        <xsl:value-of select="GraphNum"/>
-        <xsl:text disable-output-escaping="yes"><![CDATA[', ]]></xsl:text>
         <xsl:value-of select="GID"/>
-        <xsl:text disable-output-escaping="yes"><![CDATA[);return false;">]]></xsl:text>
-        <xsl:value-of select="GID"/>
-        <xsl:text disable-output-escaping="yes"><![CDATA[ </a> ]]></xsl:text>
       </td>
       <td align="left">
         <xsl:value-of select="GraphNum"/>

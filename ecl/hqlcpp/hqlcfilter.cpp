@@ -75,8 +75,8 @@ void BuildFilterState::popSetName()
 
 //---------------------------------------------------------------------------------------------------------------------
 
-CppFilterExtractor::CppFilterExtractor(IHqlExpression * _tableExpr, HqlCppTranslator & _translator, int _numKeyableFields, bool _isDiskRead, bool forceValueSets)
-    : FilterExtractor(_translator, _tableExpr, _numKeyableFields, _isDiskRead, _isDiskRead || _translator.queryOptions().createValueSets || forceValueSets), translator(_translator)
+CppFilterExtractor::CppFilterExtractor(IHqlExpression * _tableExpr, HqlCppTranslator & _translator, int _numKeyableFields, bool _isDiskRead, bool _createValueSets)
+    : FilterExtractor(_translator, _tableExpr, _numKeyableFields, _isDiskRead, _createValueSets, _translator.queryOptions().allKeyedFiltersOptional), translator(_translator)
 {
     if (createValueSets)
     {
@@ -120,7 +120,7 @@ bool CppFilterExtractor::createGroupingMonitor(BuildCtx ctx, const char * listNa
             {
                 IHqlExpression & cur = keyableSelects.item(i);
                 size32_t curSize = cur.queryType()->getSize();
-                if (!createValueSets && curSize == UNKNOWN_LENGTH)
+                if (!createValueSets && isUnknownLength(curSize))
                     break;
                 if (expr == &cur)
                 {
@@ -221,7 +221,7 @@ void CppFilterExtractor::buildKeySegmentInExpr(BuildFilterState & buildState, Ke
             HqlExprArray args;
             args.append(*LINK(targetVar));
             unsigned srcSize = normalized->queryType()->getSize();
-            if (srcSize < curSize && curSize != UNKNOWN_LENGTH)
+            if (srcSize < curSize && !isUnknownLength(curSize))
             {
                 OwnedHqlExpr lengthExpr = getSizetConstant(srcSize);
                 OwnedHqlExpr rangeLower = getRangeLimit(fieldType, lengthExpr, normalized, -1);
@@ -269,6 +269,24 @@ void CppFilterExtractor::buildKeySegmentInExpr(BuildFilterState & buildState, Ke
             if (boundSubLength.expr)
                 args.append(*LINK(boundSubLength.expr));
             translator.callProcedure(subctx, func, args);
+        }
+    }
+}
+
+void CppFilterExtractor::noteKeyedFieldUsage(SourceFieldUsage * fieldUsage)
+{
+    IHqlExpression * tableSelector = tableExpr->queryNormalizedSelector();
+    ForEachItemIn(idx, keyableSelects)
+    {
+        IHqlExpression * selector = &keyableSelects.item(idx);
+        ForEachItemIn(cond, keyed.conditions)
+        {
+            KeyCondition & cur = keyed.conditions.item(cond);
+            if ((cur.selector == selector) && !cur.isWild)
+            {
+                fieldUsage->noteKeyedSelect(selector, tableSelector);
+                break;
+            }
         }
     }
 }
@@ -707,7 +725,7 @@ IHqlExpression * CppFilterExtractor::getMonitorValueAddress(BuildCtx & ctx, IHql
             {
             case type_varstring: case type_varunicode:
                 {
-                    assertex(type->getSize() != UNKNOWN_LENGTH);
+                    assertex(!isUnknownLength(type->getSize()));
                     CHqlBoundTarget tempTarget;
                     translator.createTempFor(ctx, type, tempTarget, typemod_none, FormatNatural);
                     //clear the variable.
@@ -947,9 +965,9 @@ void CppFilterExtractor::spotSegmentCSE(BuildCtx & ctx)
 
     HqlExprArray associated;
     IHqlExpression * selector = tableExpr->queryNormalizedSelector();
-    translator.traceExpressions("before seg spot", conditions);
+    translator.traceExpressions("beforeSegmentCse", conditions);
     spotScalarCSE(conditions, associated, NULL, selector, translator.queryOptions().spotCseInIfDatasetConditions);
-    translator.traceExpressions("after seg spot", conditions);
+    translator.traceExpressions("afterSegmentCse", conditions);
 
     unsigned curCond = 0;
     ForEachItemIn(i, conditions)
@@ -1004,7 +1022,7 @@ void CppFilterExtractor::buildSegments(BuildCtx & ctx, const char * listName, bo
         IHqlExpression * expandedSelector = &expandedSelects.item(idx);
         IHqlExpression * field = selector->queryChild(1);
         unsigned curSize = expandedSelector->queryType()->getSize();
-        assertex(createValueSets || curSize != UNKNOWN_LENGTH);
+        assertex(createValueSets || !isUnknownLength(curSize));
 
         //MORE: Should also allow nested record structures, and allow keying on first elements.
         //      and field->queryType()->getSize() doesn't work for alien datatypes etc.

@@ -358,7 +358,7 @@ enum node_operator : unsigned short {
         no_unlikely,
         no_inline,
         no_nwaydistribute,
-    no_unused34,
+        no_filetype,                    // File format/type information (input or output)
     no_unused35,
     no_unused36,
     no_unused37,
@@ -573,7 +573,7 @@ enum node_operator : unsigned short {
         no_temprow,
         no_activerow,                   // no_activerow(dataset) - used to disambiguate rows that are in scope.
         no_catch,
-    no_unused80,
+        no_regex_extract,
         no_reference,
         no_callback,                    // only used by code generator to backpatch the source
         no_keyedlimit,
@@ -711,7 +711,7 @@ enum node_operator : unsigned short {
         no_sectioninput,
         no_forcegraph,
         no_eventextra,
-    no_unused81,
+        no_getsecret,
         no_related,
         no_executewhen,
         no_definesideeffect,
@@ -869,11 +869,10 @@ public:
         bool includeImports = false;            // gather imports
         bool includeLocations = false;          // include information about source locations
         bool includeJavadoc = false;
-        StringAttr cacheLocation;
     };
 
-    HqlParseContext(IEclRepository * _eclRepository, ICodegenContextCallback *_codegenCtx, IPropertyTree * _archive, IStatisticTarget & _statsTarget)
-    : archive(_archive), eclRepository(_eclRepository), codegenCtx(_codegenCtx), statsTarget(_statsTarget)
+    HqlParseContext(ICodegenContextCallback *_codegenCtx, IPropertyTree * _archive, IStatisticTarget & _statsTarget)
+    : archive(_archive), codegenCtx(_codegenCtx), statsTarget(_statsTarget)
     {
         expandCallsWhenBound = true;
         ignoreUnknownImport = false;
@@ -883,8 +882,8 @@ public:
     }
 
     void addForwardReference(IHqlScope * owner, IHasUnlinkedOwnerReference * child);
-    void noteBeginAttribute(IHqlScope * scope, IFileContents * contents, IIdAtom * name);
-    void noteBeginModule(IHqlScope * scope, IFileContents * contents);
+    void noteBeginAttribute(const char * package, IHqlScope * scope, IFileContents * contents, IIdAtom * name);
+    void noteBeginModule(const char * package, IHqlScope * scope, IFileContents * contents);
     void noteBeginQuery(IHqlScope * scope, IFileContents * contents);
     void noteBeginMacro(IHqlScope * scope, IIdAtom * name);
     void noteEndAttribute(bool success);
@@ -893,38 +892,29 @@ public:
     void noteFinishedParse(IHqlScope * scope);
     void noteEndMacro();
     void notePrivateSymbols(IHqlScope * scope);
-    IPropertyTree * queryEnsureArchiveModule(const char * name, IHqlScope * scope);
+    IPropertyTree * queryEnsureArchiveModule(const char * package, const char * name, IHqlScope * scope);
 
-    void noteExternalLookup(IHqlScope * parentScope, IHqlExpression * expr);
+    void noteExternalLookup(const char * package, IHqlScope * parentScope, IIdAtom * name, IHqlExpression * expr);
+    IHqlExpression *lookupDFSlayout(const char *filename, IErrorReceiver &errs, const ECLlocation &location, bool isOpt);
 
     void setGatherMeta(const MetaOptions & options);
-    void setCacheLocation(const char * path);
 
     inline IPropertyTree * getClearMetaTree() { return metaTree.getClear(); }
     inline IPropertyTree * queryArchive() const { return archive; }
-    inline IEclRepository * queryRepository() const { return eclRepository; }
     inline bool isAborting() const { return aborting; }
     inline void setAborting() { aborting = true; }
     inline void setFastSyntax() { expandCallsWhenBound = false; }
     inline bool isSyntaxChecking() const { return syntaxChecking; }
     inline void setSyntaxChecking() { syntaxChecking = true; }
-    inline void setCheckSimpleDef() { checkSimpleDef = true; }
-    inline void setRegenerateCache() { regenerateCache = true; }
-    inline void setIgnoreCache() { ignoreCache = true; }
-    inline void setIgnoreSimplified() { ignoreSimplified = true; }
-    void setNeverSimplify(const char *regex) { neverSimplifyRegEx.assign(regex, std::regex_constants::icase); neverSimplifyEnabled = true; };
-    bool neverSimplify(const char *fullname) { return neverSimplifyEnabled? std::regex_match(fullname, neverSimplifyRegEx):false; };
+    bool includeInArchive(IHqlScope * scope) const;
     inline IPropertyTree * queryNestedDependTree() const { return nestedDependTree; }
 
     void beginMetaScope() { metaStack.append(*new FileParseMeta); }
     void beginMetaScope(FileParseMeta & active) { metaStack.append(OLINK(active)); }
     void endMetaScope() { metaStack.pop(); }
-    bool createCache(bool isMacro);
     inline FileParseMeta & curMeta() { return metaStack.tos(); }
-    inline bool hasCacheLocation( ) const { return !metaOptions.cacheLocation.isEmpty();}
 public:
     Linked<IPropertyTree> archive;
-    Linked<IEclRepository> eclRepository;
     Owned<IPropertyTree> nestedDependTree;
     Owned<IPropertyTree> globalDependTree; // A list of all dependencies for the query.  Used to locate manifests.
     Owned<IPropertyTree> metaTree;
@@ -940,14 +930,9 @@ public:
     bool checkDirty = false;
     bool timeParser = false;
     bool syntaxChecking = false;
-    bool checkSimpleDef = false;
-    bool regenerateCache = false;
-    bool ignoreCache = false;
-    bool ignoreSimplified = false;
     Linked<ICodegenContextCallback> codegenCtx;
     IStatisticTarget & statsTarget;
     CIArrayOf<FileParseMeta> metaStack;
-    IEclCachedDefinitionCollection * cache = nullptr;
     hash64_t optionHash = 0;
     unsigned numAttribsProcessed = 0;
 
@@ -957,11 +942,8 @@ private:
     bool checkEndMeta();
     void finishMeta(bool isSeparateFile, bool success, bool generateMeta);
     IPropertyTree * beginMetaSource(IFileContents * contents);
-    void getCacheBaseFilename(StringBuffer & fullName, StringBuffer & baseFilename);
 
     MetaOptions metaOptions;
-    bool neverSimplifyEnabled = false;
-    std::regex neverSimplifyRegEx;
 
     struct {
         bool gatherNow;
@@ -971,7 +953,7 @@ private:
 class HqlDummyParseContext : public HqlParseContext
 {
 public:
-    HqlDummyParseContext() : HqlParseContext(NULL, NULL, NULL, nullStats) {}
+    HqlDummyParseContext() : HqlParseContext(nullptr, nullptr, nullStats) {}
 
     NullStatisticTarget nullStats;
 };
@@ -987,9 +969,10 @@ public:
         container = &other;
         if (parseCtx.timeParser)
             startCycles = get_cycles_now();
+        rootPackage = other.rootPackage;
     }
-    HqlLookupContext(HqlParseContext & _parseCtx, IErrorReceiver * _errs)
-    : parseCtx(_parseCtx), errs(_errs)
+    HqlLookupContext(HqlParseContext & _parseCtx, IErrorReceiver * _errs, IEclPackage * _rootRepository)
+    : parseCtx(_parseCtx), errs(_errs), rootPackage(_rootRepository)
     {
         functionCache = &parseCtx.defaultFunctionCache;
         if (parseCtx.timeParser)
@@ -1002,16 +985,20 @@ public:
     void noteBeginModule(IHqlScope * scope, IFileContents * contents);
     void noteBeginQuery(IHqlScope * scope, IFileContents * contents);
     void noteBeginMacro(IHqlScope * scope, IIdAtom * name) { parseCtx.noteBeginMacro(scope, name); }
+
     inline void noteEndAttribute(bool success) { parseCtx.noteEndAttribute(success); }
     inline void noteEndModule(bool success) { parseCtx.noteEndModule(success); }
     inline void noteEndQuery(bool success) { parseCtx.noteEndQuery(success); }
     inline void noteEndMacro() { parseCtx.noteEndMacro(); }
 
     inline void noteFinishedParse(IHqlScope * scope) { parseCtx.noteFinishedParse(scope); }
-    inline void noteExternalLookup(IHqlScope * parentScope, IHqlExpression * expr) { parseCtx.noteExternalLookup(parentScope, expr); }
+    inline void noteExternalLookup(IHqlScope * parentScope, IIdAtom * id, IHqlExpression * expr)
+    {
+        parseCtx.noteExternalLookup(rootPackage->queryPackageName(), parentScope, id, expr);
+    }
     inline void notePrivateSymbols(IHqlScope * scope) { parseCtx.notePrivateSymbols(scope); }
 
-    inline IEclRepository * queryRepository() const { return parseCtx.eclRepository; }
+    inline IEclPackage * queryPackage() const { return rootPackage; }
     inline bool queryExpandCallsWhenBound() const { return parseCtx.expandCallsWhenBound; }
     inline HqlParseContext & queryParseContext() const { return parseCtx; }
     inline unsigned numErrors() const { return errs ? errs->errCount() : 0; }
@@ -1019,15 +1006,8 @@ public:
     inline void setAborting() { parseCtx.setAborting(); }
     inline bool checkDirty() const { return parseCtx.checkDirty; }
     inline bool syntaxChecking() const { return parseCtx.isSyntaxChecking(); }
-    inline bool regenerateCache() const { return parseCtx.regenerateCache; }
-    inline bool hasCacheLocation() const { return parseCtx.hasCacheLocation();}
-    inline bool checkSimpleDef() const { return parseCtx.checkSimpleDef; }
-    inline bool ignoreCache() const { return parseCtx.ignoreCache; }
-    inline bool ignoreSimplified() const { return parseCtx.ignoreSimplified; }
-    inline bool createCache(bool isMacro) { return parseCtx.createCache(isMacro); }
     void reportTiming(const char * name);
     inline void incrementAttribsProcessed() { ++parseCtx.numAttribsProcessed; }
-    inline bool neverSimplify(const char *fullname) { return parseCtx.neverSimplify(fullname); }
 protected:
 
     inline IPropertyTree * queryArchive() const { return parseCtx.archive; }
@@ -1039,6 +1019,7 @@ private:
 public:
     Linked<IErrorReceiver> errs;
     HqlExprArray * functionCache;
+    IEclPackage * rootPackage;
     cycle_t startCycles = 0;
     cycle_t childCycles = 0;
     HqlLookupContext * container = nullptr;
@@ -1049,7 +1030,7 @@ public:
 class HqlDummyLookupContext
 {
 public:
-    HqlDummyLookupContext(IErrorReceiver * _errs) : lookupCtx(dummyCtx, _errs) {}
+    HqlDummyLookupContext(IErrorReceiver * _errs) : lookupCtx(dummyCtx, _errs, nullptr) {}
 
     HqlLookupContext & ctx() { return lookupCtx; }
     operator HqlLookupContext & () { return lookupCtx; } // implicit cast to a HqlLookupContext
@@ -1093,6 +1074,7 @@ interface IHqlScope : public IInterface
     virtual bool hasBaseClass(IHqlExpression * searchBase) = 0;
     virtual bool allBasesFullyBound() const = 0;
     virtual bool isEquivalentScope(const IHqlScope & other) const = 0;
+    virtual bool isContainerScope() const = 0;
 
     virtual IHqlScope * clone(HqlExprArray & children, HqlExprArray & symbols) = 0;
     virtual IHqlScope * queryConcreteScope() = 0;
@@ -1103,6 +1085,10 @@ interface IHqlScope : public IInterface
     virtual bool isPlugin() const = 0;
     virtual int getPropInt(IAtom *, int) const = 0;
     virtual bool getProp(IAtom *, StringBuffer &) const = 0;
+    virtual bool includeInArchive() const = 0;
+    virtual bool isRemoteScope() const = 0;
+    virtual const char * queryPackageName() const = 0;
+    virtual IEclPackage * queryPackage() const  = 0;
 
     //IHqlCreateScope
     virtual void defineSymbol(IIdAtom * name, IIdAtom * moduleName, IHqlExpression *value, bool isExported, bool isShared, unsigned flags, IFileContents *fc, int lineno, int column, int _startpos, int _bodypos, int _endpos) = 0;
@@ -1180,7 +1166,7 @@ interface IHqlExpression : public IInterface
     virtual bool isIndependentOfScopeIgnoringInputs() = 0;
     virtual void gatherTablesUsed(HqlExprCopyArray & inScope) = 0;
     virtual IValue *queryValue() const = 0;
-    virtual IInterface *queryUnknownExtra() = 0;
+    virtual IInterface *queryUnknownExtra(unsigned idx) = 0;
     virtual unsigned __int64 querySequenceExtra() = 0;              // sequence, but also overloaded with parameter number
 
     virtual IHqlDataset *queryDataset() = 0;
@@ -1367,6 +1353,7 @@ extern HQL_API IHqlExpression *createAttribute(IAtom * name, HqlExprArray & args
 extern HQL_API IHqlExpression *createExprAttribute(IAtom * name, IHqlExpression * value = NULL, IHqlExpression * value2 = NULL, IHqlExpression * value3 = NULL);
 extern HQL_API IHqlExpression *createExprAttribute(IAtom * name, HqlExprArray & args);
 extern HQL_API IHqlExpression *createLinkAttribute(IAtom * name, IHqlExpression * value = NULL, IHqlExpression * value2 = NULL, IHqlExpression * value3 = NULL);
+extern HQL_API IHqlExpression *createMacro(bool complex, IHqlScope * container, IFileContents * value);
 extern HQL_API IHqlExpression *createUnknown(node_operator op, ITypeInfo * type, IAtom * name, IInterface * value);
 extern HQL_API IHqlExpression *createSequence(node_operator op, ITypeInfo * type, IAtom * name, unsigned __int64 value);
 extern HQL_API IHqlExpression *createCompareExpr(node_operator op, IHqlExpression * l, IHqlExpression * r);
@@ -1413,6 +1400,8 @@ extern HQL_API IHqlExpression * createPureVirtual(ITypeInfo * type);
 extern HQL_API IHqlExpression * cloneOrLink(IHqlExpression * expr, HqlExprArray & children);
 extern HQL_API IHqlExpression * createConstantOne();
 extern HQL_API IHqlExpression * createLocalAttribute();
+extern HQL_API IHqlExpression * createNullUidAttribute();
+
 extern HQL_API bool isNullExpr(IHqlExpression * expr, IHqlExpression * field);
 inline bool isNull(IHqlExpression * expr)       { return expr->getOperator() == no_null; }
 inline bool isNullAction(IHqlExpression * expr) { return isNull(expr) && expr->isAction(); }
@@ -1470,7 +1459,7 @@ extern HQL_API IHqlExpression *parseQuery(IHqlScope *scope, IFileContents * cont
                                           HqlLookupContext & ctx, IXmlScope *xmlScope, IProperties * macroParams, bool loadImplicit, bool isRoot);
 extern HQL_API IHqlExpression *parseQuery(const char *in, IErrorReceiver * errs);
 
-extern HQL_API IPropertyTree * gatherAttributeDependencies(IEclRepository * dataServer, const char * items = NULL);
+extern HQL_API IPropertyTree * gatherAttributeDependencies(IEclPackage * dataServer, const char * items = NULL);
 
 extern HQL_API IHqlScope *createService();
 extern HQL_API IHqlScope *createDatabase(IHqlExpression * name);
@@ -1621,6 +1610,7 @@ extern HQL_API void removeAttributes(HqlExprArray & args);
 extern HQL_API bool isChildRelationOf(IHqlExpression * child, IHqlExpression * other);
 extern HQL_API IHqlExpression * queryRecord(ITypeInfo * type);
 extern HQL_API unsigned numPayloadFields(IHqlExpression * index);
+extern HQL_API unsigned numPayloadFieldsFromAttrList(IHqlExpression * indexAttrs);
 extern HQL_API unsigned firstPayloadField(IHqlExpression * index);
 extern HQL_API unsigned firstPayloadField(IHqlExpression * record, unsigned numPayloadFields);
 extern HQL_API unsigned numKeyedFields(IHqlExpression * index);
@@ -1647,7 +1637,6 @@ extern HQL_API IHqlExpression * queryExpression(ITypeInfo * t);
 extern HQL_API IHqlExpression * queryExpression(IHqlDataset * ds);
 inline IHqlExpression * queryExpression(IHqlScope * scope) { return scope ? scope->queryExpression() : NULL; }
 extern HQL_API IHqlScope * queryScope(ITypeInfo * t);
-extern HQL_API IHqlRemoteScope * queryRemoteScope(IHqlScope * scope);
 extern HQL_API IHqlAlienTypeInfo * queryAlienType(ITypeInfo * t);
 extern HQL_API bool includeChildInDependents(IHqlExpression * expr, unsigned which);
 extern HQL_API IHqlExpression * extractFieldAttrs(IHqlExpression * field);
@@ -1697,6 +1686,7 @@ extern HQL_API IHqlExpression * closeAndLink(IHqlExpression * expr);
 extern HQL_API IHqlExpression * createAbstractRecord(IHqlExpression * record);
 extern HQL_API IHqlExpression * createSortList(HqlExprArray & elements);
 extern HQL_API IHqlExpression * queryFunctionAttribute(IHqlExpression * funcdef, IAtom * name);
+extern HQL_API IHqlExpression * findCommonBaseModule(IHqlExpression * left, IHqlExpression * right);
 
 // Same as expr->queryChild() except it doesn't return attributes.
 inline IHqlExpression * queryRealChild(IHqlExpression * expr, unsigned i)
@@ -1981,5 +1971,11 @@ extern HQL_API void setActiveSource(const char * filename);
 extern HQL_API IHqlExpression * annotateIndexBlobs(IHqlExpression * expr);
 extern HQL_API unsigned __int64 querySeqId(IHqlExpression * seq);   // Only for debugging when DEBUG_TRACK_INSTANCEID is defined
 extern HQL_API void enableLocationAnnotations(bool value);
+
+extern HQL_API void sanityCheckTransformation(const char * title, const HqlExprArray & before, const HqlExprArray & after);
+extern HQL_API void sanityCheckTransformation(const char * title, IHqlExpression * before, IHqlExpression * after);
+extern HQL_API void sanityCheckTransformation(const char * title, IHqlExpression * before, const HqlExprArray & after);
+
+extern HQL_API bool isValidIdentifier(const char * text);
 
 #endif

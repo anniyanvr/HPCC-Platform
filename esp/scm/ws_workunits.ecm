@@ -25,7 +25,7 @@ EspInclude(ws_workunits_queryset_req_resp);
 
 ESPservice [
     auth_feature("DEFERRED"), //This declares that the method logic handles feature level authorization
-    version("1.80"), default_client_version("1.80"), cache_group("ESPWsWUs"),
+    version("2.12"), default_client_version("2.12"), cache_group("ESPWsWUs"),
     noforms,exceptions_inline("./smc_xslt/exceptions.xslt"),use_method_name] WsWorkunits
 {
     ESPmethod [cache_seconds(60), resp_xsl_default("/esp/xslt/workunits.xslt")]     WUQuery(WUQueryRequest, WUQueryResponse);
@@ -34,8 +34,8 @@ ESPservice [
     ESPmethod [cache_seconds(30), resp_xsl_default("/esp/xslt/wuiddetails.xslt")]     WUInfoDetails(WUInfoRequest, WUInfoResponse);
     ESPmethod [cache_seconds(30), resp_xsl_default("/esp/xslt/wuid.xslt")]     WUGraphTiming(WUGraphTimingRequest, WUGraphTimingResponse);
     ESPmethod [cache_seconds(30), resp_xsl_default("/esp/xslt/graph.xslt")]         WUGraphInfo(WUGraphInfoRequest, WUGraphInfoResponse);
-    ESPmethod [cache_seconds(30), resp_xsl_default("/esp/xslt/graph_gvc.xslt")]     WUGVCGraphInfo(WUGVCGraphInfoRequest, WUGVCGraphInfoResponse);
-    ESPmethod [description("Stub for Ajax GVC Graph."), help(""), resp_xsl_default("/esp/xslt/GvcGraph.xslt")] GVCAjaxGraph(GVCAjaxGraphRequest, GVCAjaxGraphResponse);
+    ESPmethod [cache_seconds(30)]  WUGVCGraphInfo(WUGVCGraphInfoRequest, WUGVCGraphInfoResponse);
+    ESPmethod [cache_seconds(30), description("Stub for Ajax GVC Graph."), help("")] GVCAjaxGraph(GVCAjaxGraphRequest, GVCAjaxGraphResponse);
     ESPmethod [cache_seconds(30), resp_xsl_default("/esp/xslt/result.xslt")]        WUResult(WUResultRequest, WUResultResponse);
     ESPmethod WUFullResult(WUFullResultRequest, WUFullResultResponse);
     ESPmethod [cache_seconds(30)] WUResultView(WUResultViewRequest, WUResultViewResponse);
@@ -109,12 +109,14 @@ ESPservice [
     ESPmethod [cache_seconds(60), min_ver("1.57")] WUListArchiveFiles(WUListArchiveFilesRequest, WUListArchiveFilesResponse);
     ESPmethod [cache_seconds(60), min_ver("1.57")] WUGetArchiveFile(WUGetArchiveFileRequest, WUGetArchiveFileResponse);
     ESPmethod [cache_seconds(60), min_ver("1.61")] WUGetNumFileToCopy(WUGetNumFileToCopyRequest, WUGetNumFileToCopyResponse);
-    ESPmethod [min_ver("1.71")] WUDetails(WUDetailsRequest, WUDetailsResponse);
+    ESPmethod [min_ver("2.01")] WUDetails(WUDetailsRequest, WUDetailsResponse);
     ESPmethod [cache_seconds(600), min_ver("1.71")] WUDetailsMeta(WUDetailsMetaRequest, WUDetailsMetaResponse);
     ESPmethod [clear_cache_group, min_ver("1.72")] WUEclDefinitionAction(WUEclDefinitionActionRequest, WUEclDefinitionActionResponse);
     ESPmethod [cache_seconds(60), min_ver("1.74")] WUGetThorJobQueue(WUGetThorJobQueueRequest, WUGetThorJobQueueResponse);
     ESPmethod [cache_seconds(60), min_ver("1.74")] WUGetThorJobList(WUGetThorJobListRequest, WUGetThorJobListResponse);
     ESPmethod [cache_seconds(60), min_ver("1.79")] WUGetPlugins(WUGetPluginsRequest, WUGetPluginsResponse);
+    ESPmethod [min_ver("1.94")] WUAnalyseHotspot(WUAnalyseHotspotRequest, WUAnalyseHotspotResponse);
+    ESPmethod [min_ver("2.06")] WUHelperFileArchive(WUHelperFileArchiveRequest, WUHelperFileArchiveResponse);
 };
 
 

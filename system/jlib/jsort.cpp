@@ -266,9 +266,9 @@ class cParQSortBase
         unsigned num;
     };
 
-    NonReentrantSpinLock joblock;
+    NonReentrantSpinLock joblock{SYNC_LOCATION};
     QueueOf<sJobItem,false> jobq;
-    Semaphore jobqsem;
+    Semaphore jobqsem{SYNC_LOCATION};
     unsigned waiting;
     unsigned numsubthreads;
     bool done;
@@ -338,7 +338,7 @@ public:
     void start()
     {
         for (unsigned i=0;i<numsubthreads;i++) 
-            threads[i]->start();
+            threads[i]->start(true);
     }
 
     void subsort(unsigned s, unsigned n)
@@ -696,12 +696,6 @@ bool heap_push_up(unsigned c, unsigned * heap, const void ** rows, ICompare * co
 
 typedef void ** VECTOR;
 
-interface IMergeSorter
-{
-public:
-    virtual IWriteSeq *getOutputStream(bool isEOF) = 0;
-};
-
 #define INSERTMAX 10000
 #define BUFFSIZE 0x100000   // used for output buffer
 
@@ -717,7 +711,7 @@ class CRowStreamMerger
     const ICompare *icmp;
     bool partdedup;
 
-    IRowProvider &provider;
+    IMergeRowProvider &provider;
     MemoryAttr workingbuf;
 #ifdef _DEBUG
     bool *stopped;
@@ -886,7 +880,7 @@ class CRowStreamMerger
     }
 
 public:
-    CRowStreamMerger(IRowProvider &_provider,unsigned numstreams, const ICompare *_icmp,bool _partdedup=false)
+    CRowStreamMerger(IMergeRowProvider &_provider,unsigned numstreams, const ICompare *_icmp,bool _partdedup=false)
         : provider(_provider)
     {
         partdedup = _partdedup;
@@ -957,7 +951,7 @@ protected:
     CRowStreamMerger *merger;
     bool eos;
 
-    class cProvider: implements IRowProvider, public CInterface
+    class cProvider: implements IMergeRowProvider, public CInterface
     {
         IArrayOf<IRowStream> ostreams;
         IRowStream **streams;
@@ -983,7 +977,7 @@ protected:
         cProvider(IRowStream **_streams, unsigned numstreams, IRowLinkCounter *_linkcounter)
             : linkcounter(_linkcounter)
         {
-            ostreams.ensure(numstreams);
+            ostreams.ensureCapacity(numstreams);
             unsigned n = 0;
             while (n<numstreams) 
                 ostreams.append(*LINK(_streams[n++]));
@@ -1001,7 +995,7 @@ public:
         
     }
 
-    CMergeRowStreams(unsigned _numstreams,IRowProvider &_provider,ICompare *_icmp, bool partdedup)
+    CMergeRowStreams(unsigned _numstreams,IMergeRowProvider &_provider,ICompare *_icmp, bool partdedup)
     {
       streamprovider = NULL;
         merger = new CRowStreamMerger(_provider,_numstreams,_icmp,partdedup);
@@ -1047,7 +1041,7 @@ IRowStream *createRowStreamMerger(unsigned numstreams,IRowStream **instreams,ICo
 }
 
 
-IRowStream *createRowStreamMerger(unsigned numstreams,IRowProvider &provider,ICompare *icmp,bool partdedup)
+IRowStream *createRowStreamMerger(unsigned numstreams,IMergeRowProvider &provider,ICompare *icmp,bool partdedup)
 {
     return new CMergeRowStreams(numstreams,provider,icmp,partdedup);
 }

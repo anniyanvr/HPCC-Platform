@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <archive.h>
 #include <archive_entry.h>
+#include <regex>
 
 /*
  * Direct access to files in zip archives (and other libarchive-supported formats), without needing to extract them first
@@ -41,35 +42,38 @@
 
 //Require a trailing / on zip files - use /. for the root - otherwise zip files always get expanded when they are read.
 #ifdef _WIN32
-#define ARCHIVE_SIGNATURE "[.]{zip|tar|tar[.]gz|tgz}{/|\\\\}"
+#define ARCHIVE_SIGNATURE "[.](zip|tar|tar[.]gz|tgz)(/|\\\\)"
 #else
-#define ARCHIVE_SIGNATURE "[.]{zip|tar|tar[.]gz|tgz}/"
+#define ARCHIVE_SIGNATURE "[.](zip|tar|tar[.]gz|tgz)/"
 #endif
 
-static RegExpr *signature;
-static CriticalSection *lock;
+static const std::regex archiveSignatureRegex(ARCHIVE_SIGNATURE);
 
 static const char *splitName(const char *fileName)
 {
     if (!fileName)
-        return NULL;
-    CriticalBlock b(*lock);
-    const char *sig = signature->find(fileName);
-    if (sig)
-        return sig+signature->findlen();
+        return nullptr;
+
+    std::cmatch match;
+    if (std::regex_search(fileName, match, archiveSignatureRegex))
+        return match[0].second;
     else
-        return NULL;
+        return nullptr;
 }
 
 static void splitArchivedFileName(const char *fullName, StringAttr &container, StringAttr &option, StringAttr &relPath)
 {
     const char *tail = splitName(fullName);
-    assertex(tail);
-    size_t containerLen = tail-fullName;
-    if (fullName[containerLen-1]==PATHSEPCHAR)
-        containerLen--;
-    container.set(fullName, containerLen);
-    if (*tail=='{')
+    if (tail)
+    {
+        size_t containerLen = tail-fullName;
+        if (fullName[containerLen-1]==PATHSEPCHAR)
+            containerLen--;
+        container.set(fullName, containerLen);
+    }
+    else
+        container.set(fullName);
+    if (tail && *tail=='{')
     {
         tail++;
         const char *end = strchr(tail, '}');
@@ -168,7 +172,7 @@ class ArchiveFileIO : implements IFileIO, public CInterface
 {
 public:
     IMPLEMENT_IINTERFACE;
-    ArchiveFileIO(const char *_fullName) : fullName(_fullName)
+    ArchiveFileIO(IFile * _file, const char *_fullName) : file(_file), fullName(_fullName)
     {
         // Sadly it seems we can't use a saved entry to read data from an archive. We have to open a new archive
         // object and scan through until we find the matching file, in order to extract it.
@@ -268,10 +272,6 @@ public:
     {
         throwUnexpected();
     }
-    virtual offset_t appendFile(IFile *file,offset_t pos=0,offset_t len=(offset_t)-1)
-    {
-        throwUnexpected();
-    }
     virtual void setSize(offset_t size)
     {
         throwUnexpected();
@@ -284,7 +284,12 @@ public:
     {
         return 0;
     }
+    virtual IFile * queryFile() const override
+    {
+        return file;
+    }
 protected:
+    Linked<IFile> file;
     struct archive *archive = nullptr;
     offset_t fileSize = 0;
 #if ARCHIVE_VERSION_NUMBER < 3000000
@@ -354,7 +359,7 @@ public:
     virtual IFileIO * open(IFOmode mode, IFEflags extraFlags=IFEnone)
     {
         assertex(mode==IFOread && entry != NULL);
-        return new ArchiveFileIO(fullName.str());
+        return new ArchiveFileIO(this, fullName.str());
     }
     virtual IFileAsyncIO * openAsync(IFOmode mode)
     {
@@ -363,7 +368,7 @@ public:
     virtual IFileIO * openShared(IFOmode mode, IFSHmode shmode, IFEflags extraFlags=IFEnone)
     {
         assertex(mode==IFOread && entry != NULL);
-        return new ArchiveFileIO(fullName.str());
+        return new ArchiveFileIO(this, fullName.str());
     }
     virtual const char * queryFilename()
     {
@@ -406,8 +411,8 @@ public:
     virtual bool setCompression(bool set) { UNIMPLEMENTED; }
     virtual offset_t compressedSize() { UNIMPLEMENTED; }
     virtual unsigned getCRC() { UNIMPLEMENTED; }
-    virtual void setCreateFlags(unsigned short cflags) { UNIMPLEMENTED; }
-    virtual void setShareMode(IFSHmode shmode) { UNIMPLEMENTED; }
+    virtual void setCreateFlags(unsigned short cflags) { } // MORE: Should save and apply to any file that was created
+    virtual void setShareMode(IFSHmode shmode) { }         // MORE: Should save and use when the archive io is opened
     virtual bool createDirectory() { UNIMPLEMENTED; }
     virtual IDirectoryDifferenceIterator *monitorDirectory(
                                   IDirectoryIterator *prev=NULL,    // in (NULL means use current as baseline)
@@ -464,7 +469,7 @@ class ArchiveDirectoryIterator : implements IDirectoryIterator, public CInterfac
 public:
     IMPLEMENT_IINTERFACE;
     ArchiveDirectoryIterator(const char *_containedFileName, const char *_mask, bool _sub, bool _includeDirs)
-    : mask(_mask), sub(_sub), includeDirs(_includeDirs)
+    : mask(_mask), includeDirs(_includeDirs), sub(_sub)
     {
         splitArchivedFileName(_containedFileName, container, option, relDir);
         curIndex = 0;
@@ -517,7 +522,7 @@ public:
                 if (includeDirs || !isDir)
                 {
                     const char *filename = archive_entry_pathname(entry);
-                    if (memcmp(filename, relDir.get(), relDir.length())==0)
+                    if (memcmp_iflen(filename, relDir.get(), relDir.length())==0)
                     {
                         StringBuffer tail(filename + relDir.length());
                         if (tail.length())
@@ -599,6 +604,10 @@ public:
         else
             return NULL;
     }
+    virtual IAPICopyClient * getCopyApiClient(IStorageApiInfo * source, IStorageApiInfo * target) override
+    {
+        return nullptr;
+    }
 
 protected:
     static bool isArchiveFileName(const char *fileName)
@@ -611,7 +620,6 @@ protected:
 
 extern ARCHIVEFILE_API void installFileHook()
 {
-    CriticalBlock b(*lock); // Probably overkill!
     if (!archiveFileHook)
     {
         archiveFileHook = new CArchiveFileHook;
@@ -621,22 +629,16 @@ extern ARCHIVEFILE_API void installFileHook()
 
 extern ARCHIVEFILE_API void removeFileHook()
 {
-    if (lock)
+    if (archiveFileHook)
     {
-        CriticalBlock b(*lock); // Probably overkill!
-        if (archiveFileHook)
-        {
-            removeContainedFileHook(archiveFileHook);
-            delete archiveFileHook;
-            archiveFileHook = NULL;
-        }
+        removeContainedFileHook(archiveFileHook);
+        delete archiveFileHook;
+        archiveFileHook = NULL;
     }
 }
 
 MODULE_INIT(INIT_PRIORITY_STANDARD)
 {
-    lock = new CriticalSection;
-    signature = new RegExpr(ARCHIVE_SIGNATURE);
     archiveFileHook = NULL;
     return true;
 }
@@ -649,8 +651,4 @@ MODULE_EXIT()
         ::Release(archiveFileHook);
         archiveFileHook = NULL;
     }
-    delete signature;
-    delete lock;
-    lock = NULL;
-    signature = NULL;
 }

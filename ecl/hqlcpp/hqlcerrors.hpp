@@ -225,6 +225,12 @@
 #define HQLERR_CannotInterpretRecord            4213
 #define HQLERR_NoVirtualAndAlien                4214
 #define HQLERR_CannotFilterLimitInsideActivity  4215
+#define HQLERR_OutputLimitMaxExceeded           4216
+#define HQLERR_OutputLimitFutureMaxExceeded     4217
+#define HQLERR_UnsupportedReturnType            4218
+#define HQLERR_UnsupportedFormEncNotation       4219
+#define HQLERR_SteppedExactField                4220
+#define HQLERR_KeyedJoinDisabled                4221
 
 //Warnings....
 #define HQLWRN_PersistDataNotLikely             4500
@@ -276,6 +282,7 @@
 #define HQLWRN_GlobalDatasetFromChildQuery      4548
 #define HQLWRN_NestedSequentialUseOrdered       4214
 #define HQLWRN_ExpressionsDuplicated            4549
+#define HQLWRN_DistributionNotMatchLocalJoin    4550
 
 //Temporary errors
 #define HQLERR_OrderOnVarlengthStrings          4601
@@ -331,6 +338,7 @@
 #define HQLERR_NoMappingForField                4840
 #define HQLERR_InvalidMatchedPatternInJoin      4841
 #define HQLERR_CodeContextNotAvailable          4842
+#define HQLERR_UseOfSpillOutsideGraph           4843
 
 //#define HQLERR_Max                            4999
 
@@ -533,6 +541,12 @@
 #define HQLERR_CannotInterpretRecord_Text       "This dataset contains deprecated record formats and virtual fields.  Remove the alien data types, or temporarily add __OPTION__(LEGACY) to the table definition"
 #define HQLERR_NoVirtualAndAlien_Text           "GenericDiskReads: VIRTUAL fields are not currently supported with ALIEN types"
 #define HQLERR_CannotFilterLimitInsideActivity_Text "Cannot filter a non keyed limit within a compound activity"
+#define HQLERR_OutputLimitMaxExceeded_Text      "Dali result outputs are restricted to an absolute maximum of %u MB (%u MB specified by option). A huge dali result usually indicates the ECL needs altering."
+#define HQLERR_OutputLimitFutureMaxExceeded_Text "In the next platform version dali result outputs will be restricted to an absolute maximum of %u MB (%u MB specified by option). A huge dali result usually indicates the ECL needs altering."
+#define HQLERR_UnsupportedReturnType_Text       "Function returning type %s is not currently supported"
+#define HQLERR_UnsupportedFormEncNotation_Text  "x-www-form-urlencoded parameter notation format %s is not currently supported"
+#define HQLERR_SteppedExactField_Text           "Stepped field must be an exact field (no expressions allowed) '%s'"
+#define HQLERR_KeyedJoinDisabled_Text           "Keyed JOIN or DENORMALIZE is disallowed in this environment. Add a bare KEYED flag to the JOIN or DENORMALIZE options to explicitly allow keyed access but be aware that performance will suffer"
 
 //Warnings.
 #define HQLWRN_CannotRecreateDistribution_Text  "Cannot recreate the distribution for a persistent dataset"
@@ -573,6 +587,7 @@
 #define HQLWRN_OutputScalarInsideChildQuery_Text "Output(%s) of single value inside a child query has undefined behaviour"
 #define HQLWRN_GlobalDatasetFromChildQuery_Text "Global dataset expression (%s) is used in a child query"
 #define HQLWRN_NestedSequentialUseOrdered_Text  "Using ORDERED instead of SEQUENTIAL for child actions"
+#define HQLWRN_DistributionNotMatchLocalJoin_Text "Input distributions do not appear to match the local join condition in activity %u"
 
 #define HQLERR_DistributionVariableLengthX_Text "DISTRIBUTION does not support variable length field '%s'"
 #define HQLERR_DistributionUnsupportedTypeXX_Text "DISTRIBUTION does not support field '%s' with type %s"
@@ -630,6 +645,7 @@
 #define HQLERR_AccessUnavailableGraph_Text      "INTERNAL: Attempt to access result from unavailable graph (%s)"
 #define HQLERR_NoMappingForField_Text           "INTERNAL: Mapping for field %s is missing from transform"
 #define HQLERR_CodeContextNotAvailable_Text     "INTERNAL: ICodeContext is not available"
+#define HQLERR_UseOfSpillOutsideGraph_Text      "INTERNAL: Use of spill file %s outside of a graph"
 
 #define WARNINGAT(cat, e, x)                 reportWarning(cat, SeverityUnknown, e, x, x##_Text)
 #define WARNINGAT1(cat, e, x, a)             reportWarning(cat, SeverityUnknown, e, x, x##_Text, a)

@@ -38,6 +38,7 @@ public:
     virtual bool getInputCRC(crc32_t & value) { return false; }
     virtual bool setPartition(RemoteFilename & remoteInputName, offset_t _startOffset, offset_t _length, bool compressedInput, const char *decryptKey) = 0;
     virtual void setInputCRC(crc32_t value);
+    virtual stat_type getStatistic(StatisticKind kind) = 0;
 
 protected:
     bool setPartition(RemoteFilename & remoteInputName, offset_t _startOffset, offset_t _length);
@@ -60,6 +61,7 @@ public:
     virtual bool setPartition(RemoteFilename & remoteInputName, offset_t _startOffset, offset_t _length, bool compressedInput, const char *decryptKey);
     virtual size32_t getBlock(IFileIOStream * out);
     virtual offset_t tell();
+    virtual stat_type getStatistic(StatisticKind kind) override { return input->getStatistic(kind); }
 
 protected:
     size32_t read(size32_t maxLength, void * buffer);
@@ -192,6 +194,7 @@ public:
     virtual bool setPartition(RemoteFilename & remoteInputName, offset_t _startOffset, offset_t _length, bool compressedInput, const char *decryptKey);
     virtual void setInputCRC(crc32_t value);
     virtual offset_t tell();
+    virtual stat_type getStatistic(StatisticKind kind) override { return 0;}
 
 protected:
     Owned<IFormatProcessor> processor;
@@ -212,10 +215,12 @@ public:
 
 protected:
     void appendTransformed(unsigned whichChunk, ITransformer * input);
+    void createOutputStream(IFileIO * outio);
     unsigned queryLastOutput(unsigned outputIndex);
     void sendProgress(OutputProgress & curProgress);
     void transferChunk(unsigned chunkIndex);
     void wrapOutInCRC(unsigned startCRC);
+    bool compressOutput() const { return compressOutputFormat != COMPRESS_METHOD_NONE; }
 
 protected:
     PartitionPointArray     partition;
@@ -237,11 +242,12 @@ protected:
     unsigned                throttleNicSpeed;
     unsigned                numParallelSlaves;
     bool                    compressedInput;
-    bool                    compressOutput;
+    CompressionMethod       compressOutputFormat = COMPRESS_METHOD_NONE;
     bool                    copyCompressed;
     size32_t                transferBufferSize;
     StringAttr              encryptKey;
     StringAttr              decryptKey;
+    StringAttr              keyCompression;
     int                     fileUmask;
 };
 

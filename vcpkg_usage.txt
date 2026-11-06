@@ -1,0 +1,353 @@
+apr provides pkg-config modules:
+
+  # The Apache Portable Runtime library
+  apr-1
+
+apr-util provides pkg-config modules:
+
+  # Companion library for APR
+  apr-util-1
+
+rapidjson provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(RapidJSON CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE RapidJSON rapidjson)
+
+rapidjson provides pkg-config modules:
+
+  # A fast JSON parser/generator for C++ with both SAX/DOM style API
+  RapidJSON
+
+zstd provides CMake targets:
+
+  find_package(zstd CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE zstd::libzstd)
+
+The package zlib is compatible with built-in CMake targets:
+
+    find_package(ZLIB REQUIRED)
+    target_link_libraries(main PRIVATE ZLIB::ZLIB)
+
+openssl is compatible with built-in CMake targets:
+
+  find_package(OpenSSL REQUIRED)
+  target_link_libraries(main PRIVATE OpenSSL::SSL)
+  target_link_libraries(main PRIVATE OpenSSL::Crypto)
+
+lz4 provides CMake targets:
+
+  find_package(lz4 CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE lz4::lz4)
+
+lz4 provides pkg-config modules:
+
+  liblz4
+
+The package arrow provides CMake targets:
+
+    find_package(Arrow CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,Arrow::arrow_static,Arrow::arrow_shared>")
+
+    find_package(Parquet CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,Parquet::parquet_static,Parquet::parquet_shared>")
+
+    find_package(ArrowDataset CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,ArrowDataset::arrow_dataset_static,ArrowDataset::arrow_dataset_shared>")
+
+    find_package(ArrowAcero CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,ArrowAcero::arrow_acero_static,ArrowAcero::arrow_acero_shared>")
+
+    find_package(ArrowCompute CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,ArrowCompute::arrow_compute_static,ArrowCompute::arrow_compute_shared>")
+
+curl is compatible with built-in CMake targets:
+
+    find_package(CURL REQUIRED)
+    target_link_libraries(main PRIVATE CURL::libcurl)
+
+The package aws-sdk-cpp:x64-linux-dynamic provides CMake targets:
+
+    When using AWSSDK, AWSSDK_ROOT_DIR must be defined by the user.
+    find_package(AWSSDK CONFIG COMPONENTS core dynamodb kinesis s3 REQUIRED)
+    target_include_directories(main PRIVATE ${AWSSDK_INCLUDE_DIRS})
+    target_link_libraries(main PRIVATE ${AWSSDK_LIBRARIES})
+    
+    OR
+    
+    find_package(aws-cpp-sdk-core REQUIRED)
+    target_include_directories(main PRIVATE aws-cpp-sdk-core)
+    target_link_libraries(main PRIVATE aws-cpp-sdk-core)
+
+azure-storage-blobs-cpp provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(azure-storage-blobs-cpp CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE Azure::azure-storage-blobs)
+
+azure-storage-files-shares-cpp provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(azure-storage-files-shares-cpp CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE Azure::azure-storage-files-shares)
+
+The package boost-property-tree is compatible with built-in CMake targets of FindBoost.cmake:
+
+    find_package(Boost REQUIRED COMPONENTS property_tree)
+    target_link_libraries(main PRIVATE Boost::property_tree)
+
+or the generated cmake configs via:
+
+    find_package( REQUIRED CONFIG)
+    target_link_libraries(main PRIVATE Boost::property_tree)
+
+libuv provides CMake targets:
+
+    find_package(libuv CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE $<IF:$<TARGET_EXISTS:libuv::uv_a>,libuv::uv_a,libuv::uv>)
+
+cpp-driver provides pkg-config modules:
+
+  # A C/C++ client driver for Apache Cassandra and DataStax Products
+  cassandra
+
+cppunit provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(CppUnit CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE CppUnit)
+
+cppunit provides pkg-config modules:
+
+  # The C++ Unit Test Library
+  cppunit
+
+cpr provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(cpr CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE cpr::cpr)
+
+jsoncpp provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(jsoncpp CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE JsonCpp::JsonCpp)
+
+jsoncpp provides pkg-config modules:
+
+  # A C++ library for interacting with JSON
+  jsoncpp
+
+h3 provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(h3 CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE h3::h3)
+
+hiredis provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(hiredis CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE hiredis::hiredis)
+
+hiredis provides pkg-config modules:
+
+  # Minimalistic C client library for Redis.
+  hiredis
+
+icu provides pkg-config modules:
+
+  # International Components for Unicode: Internationalization library
+  icu-i18n
+
+  # International Components for Unicode: Stream and I/O Library
+  icu-io
+
+  # International Components for Unicode: Common and Data libraries
+  icu-uc
+
+jwt-cpp provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(jwt-cpp CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE jwt-cpp::jwt-cpp)
+
+libarchive is compatible with the CMake Find Module:
+
+  find_package(LibArchive REQUIRED)
+  target_link_libraries(main PRIVATE LibArchive::LibArchive) # since CMake 3.17
+
+libarchive provides pkg-config modules:
+
+  # library that can create and read several streaming archive formats
+  libarchive
+
+libcouchbase-cxx is header-only and can be used from CMake via:
+
+  find_path(LIBCOUCHBASE_CXX_INCLUDE_DIRS "libcouchbase/couchbase++.h")
+  target_include_directories(main PRIVATE ${LIBCOUCHBASE_CXX_INCLUDE_DIRS})
+
+libgit2 provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(libgit2 CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE libgit2::libgit2package)
+
+libgit2 provides pkg-config modules:
+
+  # The git library, take 2
+  libgit2
+
+libmemcached provides pkg-config modules:
+
+  # libmemcached C/C++ library.
+  libmemcached
+
+libmysql provides CMake targets:
+
+    find_package(unofficial-libmysql REQUIRED)
+    target_link_libraries(main PRIVATE unofficial::libmysql::libmysql)
+
+libphonenumber provides CMake targets:
+
+    find_package(libphonenumber CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE libphonenumber::phonenumber)
+
+The package librdkafka:x64-linux-dynamic provides CMake targets:
+
+    find_package(RdKafka CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE RdKafka::rdkafka RdKafka::rdkafka++)
+
+The package libxslt is compatible with built-in CMake targets:
+
+    # xslt library
+    find_package(LibXslt REQUIRED)
+    target_link_libraries(main PRIVATE LibXslt::LibXslt)
+
+    # exslt library
+    find_package(LibXslt REQUIRED)
+    target_link_libraries(main PRIVATE LibXslt::LibExslt)
+
+In order to use modules, you must set environment variable LIBXSLT_PLUGINS_PATH
+at runtime.
+
+libyaml provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(yaml CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE yaml)
+
+libyaml provides pkg-config modules:
+
+  # Library to parse and emit YAML
+  yaml-0.1
+
+minizip provides CMake targets:
+
+    find_package(unofficial-minizip CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE unofficial::minizip::minizip)
+
+mongo-cxx-driver provides CMake targets:
+
+    find_package(bsoncxx CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE $<IF:$<TARGET_EXISTS:mongo::bsoncxx_static>,mongo::bsoncxx_static,mongo::bsoncxx_shared>)
+
+    find_package(mongocxx CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE $<IF:$<TARGET_EXISTS:mongo::mongocxx_static>,mongo::mongocxx_static,mongo::mongocxx_shared>)
+
+The package nlohmann-json provides CMake targets:
+
+    find_package(nlohmann_json CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE nlohmann_json::nlohmann_json)
+
+The package nlohmann-json can be configured to not provide implicit conversions via a custom triplet file:
+
+    set(nlohmann-json_IMPLICIT_CONVERSIONS OFF)
+
+For more information, see the docs here:
+    
+    https://json.nlohmann.me/api/macros/json_use_implicit_conversions/
+
+nlp-engine provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(nlp-engine CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE nlp-engine)
+
+numactl provides pkg-config modules:
+
+  # NUMA policy library
+  numa
+
+openblas provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(OpenBLAS CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE OpenBLAS::OpenBLAS)
+
+openblas provides pkg-config modules:
+
+  # OpenBLAS is an optimized BLAS library based on GotoBLAS2 1.13 BSD version
+  openblas
+
+openldap provides pkg-config modules:
+
+  # OpenLDAP Lightweight ASN.1 Basic Encoding Rules library
+  lber
+
+  # OpenLDAP Lightweight Directory Access Protocol library
+  ldap
+
+opentelemetry-cpp provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(opentelemetry-cpp CONFIG REQUIRED)
+  # note: 22 additional targets are not displayed.
+  target_link_libraries(main PRIVATE opentelemetry-cpp::api opentelemetry-cpp::ext opentelemetry-cpp::sdk opentelemetry-cpp::logs)
+
+opentelemetry-cpp provides pkg-config modules:
+
+  # A header-only library to support instrumentation with OpenTelemetry.
+  opentelemetry_api
+
+  # Common components for the OpenTelemetry SDK, a library for exporting telemetry.
+  opentelemetry_common
+
+  # Components for exporting logs in the OpenTelemetry SDK.
+  opentelemetry_logs
+
+  # Components for exporting metrics in the OpenTelemetry SDK.
+  opentelemetry_metrics
+
+  # Components for resource detection in the OpenTelemetry SDK.
+  opentelemetry_resources
+
+  # Components for exporting traces in the OpenTelemetry SDK.
+  opentelemetry_trace
+
+  # A library exporting version information for OpenTelemetry.
+  opentelemetry_version
+
+The package pcre2 is compatible with built-in CMake targets:
+
+    # Each component imports a target:
+    # TARGETS: PCRE2::8BIT PCRE2::16BIT PCRE2::32BIT PCRE2::POSIX
+    find_package(pcre2 CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE PCRE2::8BIT PCRE2::16BIT PCRE2::32BIT PCRE2::POSIX)
+
+picojson is header-only and can be used from CMake via:
+
+  find_path(PICOJSON_INCLUDE_DIRS "picojson/picojson.h")
+  target_include_directories(main PRIVATE ${PICOJSON_INCLUDE_DIRS})
+
+sqlite3 provides pkgconfig bindings.
+sqlite3 provides CMake targets:
+
+    find_package(unofficial-sqlite3 CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE unofficial::sqlite3::sqlite3)
+
+wasmtime-cpp-api is header-only and can be used from CMake via:
+
+  find_path(WASMTIME_CPP_API_INCLUDE_DIRS "wasmtime-cpp-api/wasmtime.hh")
+  target_include_directories(main PRIVATE ${WASMTIME_CPP_API_INCLUDE_DIRS})

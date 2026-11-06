@@ -26,8 +26,12 @@
 #include "sechandler.hpp"
 #include "espprotocol.hpp"
 #include "espsecurecontext.hpp"
-#include "ldapsecurity.ipp"
 #include "dasds.hpp"
+#include "datamasking.h"
+
+#ifdef _USE_OPENLDAP
+#include "ldapsecurity.ipp"
+#endif
 
 class CEspContext : public CInterface, implements IEspContext
 {
@@ -71,6 +75,7 @@ private:
     BoolHash  m_optGroups;
 
     Owned<CTxSummary> m_txSummary;
+
     unsigned    m_active;
     unsigned    m_creationTime;
     unsigned    m_processingTime;
@@ -85,15 +90,16 @@ private:
 
     ESPSerializationFormat respSerializationFormat;
 
-    Owned<IEspSecureContext> m_secureContext;
+    Owned<IEspSecureContextEx> m_secureContext;
 
     StringAttr   m_transactionID;
+    OwnedSpanLifetime m_requestSpan;    // When the context is destroy the span will end.
     IHttpMessage* m_request;
 
 public:
     IMPLEMENT_IINTERFACE;
 
-    CEspContext(IEspSecureContext* secureContext)
+    CEspContext(IEspSecureContextEx* secureContext)
     : m_servPort(0)
     , m_bindingValue(0)
     , m_serviceValue(0)
@@ -112,13 +118,17 @@ public:
         updateTraceSummaryHeader();
         m_secureContext.setown(secureContext);
         m_SecurityHandler.setSecureContext(secureContext);
+        m_requestSpan.setown(getNullSpan());
     }
 
     ~CEspContext()
     {
         flushTraceSummary();
         if (m_txSummary)
-            m_txSummary->log(getTxSummaryLevel());
+        {
+            m_txSummary->tailor(this);
+            m_txSummary->log(getTxSummaryLevel(), getTxSummaryGroup(), getTxSummaryStyle());
+        }
     }
     virtual void addOptions(unsigned opts){options|=opts;}
     virtual void removeOptions(unsigned opts){opts&=~opts;}
@@ -238,7 +248,7 @@ public:
         return m_servName.str();
     }
 
-    virtual const unsigned queryCreationTime()
+    virtual unsigned queryCreationTime()
     {
         return m_creationTime;
     }
@@ -246,7 +256,7 @@ public:
     {
         m_processingTime = msTick() - m_creationTime;
     }
-    virtual const unsigned queryProcessingTime()
+    virtual unsigned queryProcessingTime()
     {
         return m_processingTime;
     }
@@ -256,7 +266,7 @@ public:
         m_exceptionCode = exceptionCode;
         m_exceptionTime = msTick() - m_creationTime;
     }
-    virtual const bool queryException(int& exceptionCode, unsigned& exceptionTime)
+    virtual bool queryException(int& exceptionCode, unsigned& exceptionTime)
     {
         if (m_hasException)
         {
@@ -265,7 +275,7 @@ public:
         }
         return m_hasException;
     }
-    virtual const bool queryHasException()
+    virtual bool queryHasException()
     {
         return m_hasException;
     }
@@ -443,18 +453,20 @@ public:
         if (!validateFeatureAccess(pszFeatureUrl, required, false))
         {
             setAuthStatus(AUTH_STATUS_NOACCESS);
-            throw MakeStringException(excCode, "%s", excMsg);
+            throw MakeStringException(excCode, "Resource %s : %s", pszFeatureUrl, excMsg);
         }
     }
 
     virtual void ensureSuperUser(unsigned excCode, const char* excMsg)
     {
-        CLdapSecManager* secmgr = dynamic_cast<CLdapSecManager*>(m_secmgr.get());
+#ifdef _USE_OPENLDAP
+        ILdapSecManager* secmgr = dynamic_cast<ILdapSecManager*>(m_secmgr.get());
         if (secmgr && !secmgr->isSuperUser(m_user.get()))
         {
             setAuthStatus(AUTH_STATUS_NOACCESS);
             throw makeStringException(excCode, excMsg);
         }
+#endif
     }
 
     void AuditMessage(AuditType type, const char *filterType, const char *title, const char *parms, ...) __attribute__((format(printf, 5, 6)));
@@ -503,40 +515,48 @@ public:
         return m_txSummary.get();
     }
 
-    virtual void addTraceSummaryValue(LogLevel logLevel, const char *name, const char *value)
+    virtual void addTraceSummaryValue(LogLevel logLevel, const char *name, const char *value, const unsigned int group = TXSUMMARY_GRP_CORE)
     {
         if (m_txSummary && !isEmptyString(name))
-            m_txSummary->append(name, value, logLevel);
+            m_txSummary->append(name, value, logLevel, group);
     }
 
-    virtual void addTraceSummaryValue(LogLevel logLevel, const char *name, __int64 value)
+    virtual void addTraceSummaryValue(LogLevel logLevel, const char *name, __int64 value, const unsigned int group = TXSUMMARY_GRP_CORE)
     {
         if (m_txSummary && !isEmptyString(name))
-            m_txSummary->append(name, value, logLevel);
+            m_txSummary->append(name, value, logLevel, group);
     }
 
-    virtual void addTraceSummaryTimeStamp(LogLevel logLevel, const char *name)
+    virtual void addTraceSummaryDoubleValue(LogLevel logLevel, const char *name, double value, const unsigned int group = TXSUMMARY_GRP_CORE)
     {
         if (m_txSummary && !isEmptyString(name))
-            m_txSummary->append(name, m_txSummary->getElapsedTime(), logLevel, "ms");
+            m_txSummary->append(name, value, logLevel, group);
+    }
+
+    virtual void addTraceSummaryTimeStamp(LogLevel logLevel, const char *name, const unsigned int group = TXSUMMARY_GRP_CORE)
+    {
+        if (m_txSummary && !isEmptyString(name))
+            m_txSummary->append(name, m_txSummary->getElapsedTime(), logLevel, group, "ms");
     }
     virtual void flushTraceSummary()
     {
         updateTraceSummaryHeader();
         if (m_txSummary)
         {
-            m_txSummary->set("auth", authStatus.get(), LogMin);
-            m_txSummary->append("total", m_processingTime, LogMin, "ms");
+            m_txSummary->set("auth", authStatus.get(), LogMin, TXSUMMARY_GRP_CORE|TXSUMMARY_GRP_ENTERPRISE);
+            m_txSummary->append("total", m_processingTime, LogMin, TXSUMMARY_GRP_CORE|TXSUMMARY_GRP_ENTERPRISE, "ms");
         }
     }
-    virtual void addTraceSummaryCumulativeTime(LogLevel logLevel, const char* name, unsigned __int64 time)
+
+    virtual void addTraceSummaryCumulativeTime(LogLevel logLevel, const char* name, unsigned __int64 time, const unsigned int group = TXSUMMARY_GRP_CORE)
     {
         if (m_txSummary && !isEmptyString(name))
-            m_txSummary->updateTimer(name, time, logLevel);
+            m_txSummary->updateTimer(name, time, logLevel, group);
     }
-    virtual CumulativeTimer* queryTraceSummaryCumulativeTimer(const char* name)
+
+    virtual CumulativeTimer* queryTraceSummaryCumulativeTimer(LogLevel logLevel, const char *name, const unsigned int group = TXSUMMARY_GRP_CORE)
     {
-        return (m_txSummary ? m_txSummary->queryTimer(name) : NULL);
+        return (m_txSummary ? m_txSummary->queryTimer(name, logLevel, group) : NULL);
     }
     virtual void cancelTxSummary()
     {
@@ -550,6 +570,11 @@ public:
     virtual void setAuthStatus(const char* status)
     {
         authStatus.set(status);
+    }
+
+    virtual const char* queryAuthStatus()
+    {
+        return authStatus.str();
     }
 
     virtual void setAuthenticationMethod(const char* method)
@@ -584,6 +609,10 @@ public:
     {
         return m_secureContext.get();
     }
+    IEspSecureContextEx* querySecureContextEx() override
+    {
+        return m_secureContext.get();
+    }
 
     virtual void setTransactionID(const char * trxid)
     {
@@ -600,6 +629,33 @@ public:
     virtual IHttpMessage* queryRequest()
     {
         return m_request;
+    }
+    virtual void setRequestSpan(ISpan * span) override
+    {
+        // The server span for a request can be set only once.
+        if (span && span != m_requestSpan && m_requestSpan == queryNullSpan())
+            m_requestSpan.set(span);
+    }
+    virtual ISpan * queryRequestSpan() const override
+    {
+        return m_requestSpan;
+    }
+
+    virtual const char* getGlobalId() const override
+    {
+        return m_requestSpan->queryGlobalId();
+    }
+    virtual const char* getCallerId() const override
+    {
+        return m_requestSpan->queryCallerId();
+    }
+    virtual const char* getLocalId() const override
+    {
+        return m_requestSpan->queryLocalId();
+    }
+    virtual IProperties * getClientSpanHeaders() const override
+    {
+        return ::getClientHeaders(m_requestSpan);
     }
 };
 
@@ -686,7 +742,7 @@ void CEspContext::updateTraceSummaryHeader()
 {
     if (m_txSummary)
     {
-        m_txSummary->set("activeReqs", m_active, LogMin);
+        m_txSummary->set("activeReqs", m_active, LogMin, TXSUMMARY_GRP_CORE|TXSUMMARY_GRP_ENTERPRISE);
         VStringBuffer user("%s%s%s", (queryUserId() ? queryUserId() : ""), (m_peer.length() ? "@" : ""), m_peer.str());
         if (!user.isEmpty())
             m_txSummary->set("user", user.str(), LogMin);
@@ -708,16 +764,16 @@ void CEspContext::updateTraceSummaryHeader()
             reqSummary.append("v").append(m_clientVer);
         }
         if (!reqSummary.isEmpty())
-            m_txSummary->set("req", reqSummary.str(), LogMin);
+            m_txSummary->set("req", reqSummary.str(), LogMin, TXSUMMARY_GRP_CORE);
         if (m_hasException)
         {
-            m_txSummary->set("excepttime", m_exceptionTime, LogMin);
-            m_txSummary->set("exceptcode", m_exceptionCode, LogMin);
+            m_txSummary->set("excepttime", m_exceptionTime, LogMin, TXSUMMARY_GRP_CORE);
+            m_txSummary->set("exceptcode", m_exceptionCode, LogMin, TXSUMMARY_GRP_CORE);
         }
     }
 }
 
-IEspContext* createEspContext(IEspSecureContext* secureContext)
+IEspContext* createEspContext(IEspSecureContextEx* secureContext)
 {
     return new CEspContext(secureContext);
 }
@@ -738,7 +794,7 @@ bool getUrlParams(IProperties *props, StringBuffer& params)
             params.append(key);
             if (stricmp(key,"ver_")==0)
                 hasVersion = true;
-            const char* v = props->queryProp(key);
+            const char* v = it->queryPropValue();
             if (v && *v)
                 params.appendf("=%s",v);
         }
@@ -901,6 +957,50 @@ LogLevel getTxSummaryLevel()
     return LogMin;
 }
 
+unsigned int readTxSummaryStyle(char const* style)
+{
+    if (isEmptyString(style))
+        return TXSUMMARY_OUT_TEXT;
+
+    if (strieq(style, "text"))
+        return TXSUMMARY_OUT_TEXT;
+    if (strieq(style, "json"))
+        return TXSUMMARY_OUT_JSON;
+    if (strieq(style, "all"))
+        return TXSUMMARY_OUT_TEXT | TXSUMMARY_OUT_JSON;
+
+    return TXSUMMARY_OUT_TEXT;
+}
+
+unsigned int readTxSummaryGroup(char const* group)
+{
+    if (isEmptyString(group))
+        return TXSUMMARY_GRP_CORE;
+
+    if (strieq(group, "core"))
+        return TXSUMMARY_GRP_CORE;
+    if (strieq(group, "enterprise"))
+        return TXSUMMARY_GRP_ENTERPRISE;
+    if (strieq(group, "all"))
+        return TXSUMMARY_GRP_CORE | TXSUMMARY_GRP_ENTERPRISE;
+
+    return TXSUMMARY_GRP_CORE;
+}
+
+unsigned int getTxSummaryStyle()
+{
+    if (getContainer())
+        return getContainer()->getTxSummaryStyle();
+    return TXSUMMARY_OUT_TEXT;
+}
+
+unsigned int getTxSummaryGroup()
+{
+    if (getContainer())
+        return getContainer()->getTxSummaryGroup();
+    return TXSUMMARY_GRP_CORE;
+}
+
 bool getTxSummaryResourceReq()
 {
     if (getContainer())
@@ -935,7 +1035,7 @@ void ESPLOG(LogLevel level, const char* fmt, ...)
     {
         va_list args;
         va_start(args,fmt);
-        VALOG(MCdebugInfo, unknownJob, fmt, args);
+        VALOG(MCdebugInfo, fmt, args);
         va_end(args);
     }
 }
@@ -946,7 +1046,7 @@ void ESPLOG(IEspContext* ctx, LogLevel level, const char* fmt, ...)
     {
         va_list args;
         va_start(args,fmt);
-        VALOG(MCdebugInfo, unknownJob, fmt, args);
+        VALOG(MCdebugInfo, fmt, args);
         va_end(args);
     }
 }
@@ -999,25 +1099,20 @@ const char* getBuildVersion()
 {
     return g_buildVersion.str();
 }
-static StringBuffer g_buildLevel;
-
-void setBuildLevel(const char* buildLevel)
-{
-    g_buildLevel.clear();
-    if(buildLevel&&*buildLevel)
-        g_buildLevel.append(buildLevel);
-
-    g_buildLevel.trim();
-}
-
-const char* getBuildLevel()
-{
-    return g_buildLevel.str();
-}
-
 IEspServer* queryEspServer()
 {
     return dynamic_cast<IEspServer*>(getESPContainer());
+}
+
+IDataMaskingProfile* queryDataMaskingProfile(const char* profileName, int version)
+{
+    if (getContainer())
+    {
+        IDataMaskingEngine* engine = getContainer()->queryDataMaskingEngine();
+        if (engine)
+            return engine->queryProfile(profileName, version);
+    }
+    return nullptr;
 }
 
 IRemoteConnection* getSDSConnectionWithRetry(const char* xpath, unsigned mode, unsigned timeoutMs)

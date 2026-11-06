@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "ws_sqlService.hpp"
 #include "exception_util.hpp"
+#include "jconfig.hpp"
 
 void CwssqlEx::init(IPropertyTree *_cfg, const char *_process, const char *_service)
 {
@@ -30,9 +31,7 @@ void CwssqlEx::init(IPropertyTree *_cfg, const char *_process, const char *_serv
         throw MakeStringException(-1, "ws_sqlEx: Problem initiating ECLFunctions structure");
     }
 
-    refreshValidClusters();
-
-    setWsSqlBuildVersion(BUILD_TAG);
+    setWsSqlBuildVersion(hpccBuildInfo.buildTag);
 }
 
 bool CwssqlEx::onEcho(IEspContext &context, IEspEchoRequest &req, IEspEchoResponse &resp)
@@ -55,7 +54,7 @@ bool CwssqlEx::onGetDBMetaData(IEspContext &context, IEspGetDBMetaDataRequest &r
     if (includetables)
     {
         Owned<HPCCFileCache> tmpHPCCFileCache = HPCCFileCache::createFileCache(username.str(), passwd);
-        tmpHPCCFileCache->populateTablesResponse(resp, req.getTableFilter());
+        tmpHPCCFileCache->populateTablesResponse(resp, req.getTableFilter(), context.getClientVersion() >= 3.06);
         resp.setTableCount(resp.getTables().length());
     }
 
@@ -65,7 +64,7 @@ bool CwssqlEx::onGetDBMetaData(IEspContext &context, IEspGetDBMetaDataRequest &r
         const char * querysetfilter = req.getQuerySet();
 #ifdef _CONTAINERIZED
         ESPLOG(LogNormal, "WsSQL: getting containerTargetClusters...");
-        Owned<IStringIterator> targets = getContainerTargetClusters(nullptr, nullptr);
+        Owned<IStringIterator> targets = config::getContainerTargets(nullptr, nullptr);
 #else
         ESPLOG(LogNormal, "WsSQL-legacy: getting targetClusters...");
         Owned<IStringIterator> targets = getTargetClusters(nullptr, nullptr);
@@ -99,80 +98,94 @@ bool CwssqlEx::onGetDBMetaData(IEspContext &context, IEspGetDBMetaDataRequest &r
 
                 if (qname && *qname && wuid && *wuid)
                 {
-                    StringBuffer resp;
-
-                    Owned<IEspPublishedQuery> pubQuery = createPublishedQuery();
-                    pubQuery->setName(qname);
-                    pubQuery->setId(id);
-                    pubQuery->setWuid(wuid);
-                    pubQuery->setSuspended(iter->query().getPropBool("@suspended"));
-
-                    Owned<IEspQuerySignature> querysignature = createQuerySignature();
-                    IArrayOf<IEspHPCCColumn> inparams;
-                    IArrayOf<IEspOutputDataset> resultsets;
-
-                    WsEclWuInfo wsinfo(wuid, setname, qname, username, passwd);
-                    Owned<IResultSetFactory> resultSetFactory(getResultSetFactory(username, passwd));
-
-                    //Each published query can have multiple results (datasets)
-                    IConstWUResultIterator &results = wsinfo.ensureWorkUnit()->getResults();
-                    ForEach(results)
+                    try
                     {
-                        Owned<IEspOutputDataset> outputdataset = createOutputDataset();
-                        IArrayOf<IEspHPCCColumn> outparams;
+                        StringBuffer resp;
 
-                        IConstWUResult &result = results.query();
+                        Owned<IEspPublishedQuery> pubQuery = createPublishedQuery();
+                        pubQuery->setName(qname);
+                        pubQuery->setId(id);
+                        pubQuery->setWuid(wuid);
+                        pubQuery->setSuspended(iter->query().getPropBool("@suspended"));
 
-                        SCMStringBuffer resultName;
-                        result.getResultName(resultName);
-                        outputdataset->setName(resultName.s.str());
+                        Owned<IEspQuerySignature> querysignature = createQuerySignature();
+                        IArrayOf<IEspHPCCColumn> inparams;
+                        IArrayOf<IEspOutputDataset> resultsets;
 
-                        Owned<IResultSetMetaData> meta = resultSetFactory->createResultSetMeta(&result);
+                        WsEclWuInfo wsinfo(wuid, setname, qname, username, passwd);
+                        Owned<IResultSetFactory> resultSetFactory(getResultSetFactory(username, passwd));
 
-                        //Each result dataset can have multiple result columns
-                        int columncount = meta->getColumnCount();
-                        for (int i = 0; i < columncount; i++)
+                        //Each published query can have multiple results (datasets)
+                        IConstWUResultIterator &results = wsinfo.ensureWorkUnit()->getResults();
+                        ForEach(results)
+                        {
+                            Owned<IEspOutputDataset> outputdataset = createOutputDataset();
+                            IArrayOf<IEspHPCCColumn> outparams;
+
+                            IConstWUResult &result = results.query();
+
+                            SCMStringBuffer resultName;
+                            result.getResultName(resultName);
+                            outputdataset->setName(resultName.s.str());
+
+                            Owned<IResultSetMetaData> meta = resultSetFactory->createResultSetMeta(&result);
+
+                            //Each result dataset can have multiple result columns
+                            int columncount = meta->getColumnCount();
+                            for (int i = 0; i < columncount; i++)
+                            {
+                                Owned<IEspHPCCColumn> col = createHPCCColumn();
+
+                                SCMStringBuffer columnLabel;
+                                meta->getColumnLabel(columnLabel,i);
+                                col->setName(columnLabel.str());
+
+                                SCMStringBuffer eclType;
+                                meta->getColumnEclType(eclType, i);
+                                col->setType(eclType.str());
+
+                                outparams.append(*col.getLink());
+                            }
+                            outputdataset->setOutParams(outparams);
+                            resultsets.append(*outputdataset.getLink());
+                        }
+
+                        //Each query can have multiple input parameters
+                        IConstWUResultIterator &vars = wsinfo.ensureWorkUnit()->getVariables();
+                        ForEach(vars)
                         {
                             Owned<IEspHPCCColumn> col = createHPCCColumn();
 
-                            SCMStringBuffer columnLabel;
-                            meta->getColumnLabel(columnLabel,i);
-                            col->setName(columnLabel.str());
+                            IConstWUResult &var = vars.query();
 
+                            SCMStringBuffer varname;
+                            var.getResultName(varname);
+                            col->setName(varname.str());
+
+                            Owned<IResultSetMetaData> meta = resultSetFactory->createResultSetMeta(&var);
                             SCMStringBuffer eclType;
-                            meta->getColumnEclType(eclType, i);
+                            meta->getColumnEclType(eclType, 0);
                             col->setType(eclType.str());
 
-                            outparams.append(*col.getLink());
+                            inparams.append(*col.getLink());
                         }
-                        outputdataset->setOutParams(outparams);
-                        resultsets.append(*outputdataset.getLink());
-                    }
 
-                    //Each query can have multiple input parameters
-                    IConstWUResultIterator &vars = wsinfo.ensureWorkUnit()->getVariables();
-                    ForEach(vars)
+                        querysignature->setInParams(inparams);
+                        querysignature->setResultSets(resultsets);
+                        pubQuery->setSignature(*querysignature.getLink());
+                        queries.append(*pubQuery.getLink());
+                    }
+                    catch(IException *e)
                     {
-                        Owned<IEspHPCCColumn> col = createHPCCColumn();
-
-                        IConstWUResult &var = vars.query();
-
-                        SCMStringBuffer varname;
-                        var.getResultName(varname);
-                        col->setName(varname.str());
-
-                        Owned<IResultSetMetaData> meta = resultSetFactory->createResultSetMeta(&var);
-                        SCMStringBuffer eclType;
-                        meta->getColumnEclType(eclType, 0);
-                        col->setType(eclType.str());
-
-                        inparams.append(*col.getLink());
+                        StringBuffer text;
+                        e->errorMessage(text);
+                        ESPLOG(LogNormal, "WsSQL: Could not gather published query '%s' schema: '%s'", qname, text.str());
+                        e->Release();
                     }
-
-                    querysignature->setInParams(inparams);
-                    querysignature->setResultSets(resultsets);
-                    pubQuery->setSignature(*querysignature.getLink());
-                    queries.append(*pubQuery.getLink());
+                    catch(...)
+                    {
+                        ESPLOG(LogNormal, "WsSQL: Could not gather published query '%s' schema", qname);
+                    }
                 }
             }
             pqset->setQuerySetQueries(queries);
@@ -207,7 +220,7 @@ bool CwssqlEx::onGetDBMetaData(IEspContext &context, IEspGetDBMetaDataRequest &r
             StringArray dfuclusters;
 #ifdef _CONTAINERIZED
             ESPLOG(LogNormal, "WsSQL: getting containerTargetClusters...");
-            Owned<IStringIterator> targets = getContainerTargetClusters(nullptr, nullptr);
+            Owned<IStringIterator> targets = config::getContainerTargets(nullptr, nullptr);
             SCMStringBuffer target;
             ForEach(*targets)
             {
@@ -686,44 +699,58 @@ printTree(sqlAST, 0);
 
 bool CwssqlEx::getWUResult(IEspContext &context, const char * wuid, StringBuffer &result, unsigned start, unsigned count, int sequence, const char * dsname, const char * schemaname)
 {
-    context.addTraceSummaryTimeStamp(LogMin, "StrtgetReslts");
-    if (wuid && *wuid)
+    OwnedActiveSpanScope resultSpanScope(queryThreadedActiveSpan()->createInternalSpan("get_wu_result"));
+    try
     {
-        Owned<IWorkUnitFactory> factory = getWorkUnitFactory(context.querySecManager(), context.queryUser());
-        Owned<IConstWorkUnit> cw = factory->openWorkUnit(wuid, false);
-
-        if (!cw)
-           throw MakeStringException(ECLWATCH_CANNOT_UPDATE_WORKUNIT,"Cannot open workunit %s.", wuid);
-
-        SCMStringBuffer stateDesc;
-
-        switch (cw->getState())
+        if (wuid && *wuid)
         {
-           case WUStateCompleted:
-           case WUStateFailed:
-           case WUStateUnknown:
-           case WUStateCompiled:
-           {
-               StringBufferAdaptor resultXML(result);
-               Owned<IResultSetFactory> factory = getResultSetFactory(context.queryUserId(), context.queryPassword());
-               Owned<INewResultSet> nr = factory->createNewResultSet(wuid, sequence, NULL);
-               if (nr.get())
-               {
-                   context.addTraceSummaryTimeStamp(LogMax, "strtgetXMLRslts");
-                   getResultXml(resultXML, nr.get(), dsname, start, count, schemaname);
-                   context.addTraceSummaryTimeStamp(LogMax, "endgetXMLRslts");
-               }
-               else
-                   return false;
-               break;
-           }
-           default:
-               break;
+            Owned<IWorkUnitFactory> factory = getWorkUnitFactory(context.querySecManager(), context.queryUser());
+            Owned<IConstWorkUnit> cw = factory->openWorkUnit(wuid, false);
+
+            if (!cw)
+            throw MakeStringException(ECLWATCH_CANNOT_UPDATE_WORKUNIT,"Cannot open workunit %s.", wuid);
+
+            SCMStringBuffer stateDesc;
+
+            switch (cw->getState())
+            {
+            case WUStateCompleted:
+            case WUStateFailed:
+            case WUStateUnknown:
+            case WUStateCompiled:
+            {
+                StringBufferAdaptor resultXML(result);
+                Owned<IResultSetFactory> factory = getResultSetFactory(context.queryUserId(), context.queryPassword());
+                Owned<INewResultSet> nr = factory->createNewResultSet(wuid, sequence, NULL);
+                if (nr.get())
+                {
+                    OwnedActiveSpanScope xmlSpanScope(queryThreadedActiveSpan()->createInternalSpan("get_result_xml"));
+                    try
+                    {
+                        getResultXml(resultXML, nr.get(), dsname, start, count, schemaname);
+                    }
+                    catch(IException* e)
+                    {
+                        xmlSpanScope->recordException(e);
+                        throw;
+                    }
+                }
+                else
+                    return false;
+                break;
+            }
+            default:
+                break;
+            }
+            return true;
         }
-        context.addTraceSummaryTimeStamp(LogMin, "ExitgetRslts");
-        return true;
     }
-    context.addTraceSummaryTimeStamp(LogMin, "ExitgetRslts");
+    catch(IException* e)
+    {
+        resultSpanScope->recordException(e);
+        throw;
+    }
+    
     return false;
 }
 
@@ -831,8 +858,7 @@ void CwssqlEx::processMultipleClusterOption(StringArray & clusters, const char  
         hashoptions.appendf("\n#OPTION('AllowedClusters', '%s", targetcluster);
         ForEachItemIn(i,clusters)
         {
-            if (!isValidCluster(clusters.item(i)))
-                throw MakeStringException(-1, "Invalid alternate cluster name: %s", clusters.item(i));
+            validateTargetName(clusters.item(i));
 
             hashoptions.appendf(",%s", clusters.item(i));
         }
@@ -842,9 +868,9 @@ void CwssqlEx::processMultipleClusterOption(StringArray & clusters, const char  
 
 bool CwssqlEx::onExecuteSQL(IEspContext &context, IEspExecuteSQLRequest &req, IEspExecuteSQLResponse &resp)
 {
+    OwnedActiveSpanScope exSpanScope(queryThreadedActiveSpan()->createInternalSpan("on_execute_sql"));
     try
     {
-        context.addTraceSummaryTimeStamp(LogMin, "StrtOnExecuteSQL");
         context.ensureFeatureAccess(WSSQLACCESS, SecAccess_Write, -1, "WsSQL::ExecuteSQL: Permission denied.");
 
         double version = context.getClientVersion();
@@ -931,37 +957,41 @@ bool CwssqlEx::onExecuteSQL(IEspContext &context, IEspExecuteSQLRequest &req, IE
         ESPLOG(LogMax, "WsSQL: checking query cache...");
         if(cacheeligible && getCachedQuery(normalizedSQL.str(), compiledwuid.s))
         {
-           ESPLOG(LogMax, "WsSQL: cache hit opening wuid %s...", compiledwuid.str());
-           Owned<IConstWorkUnit> cw = factory->openWorkUnit(compiledwuid.str(), false);
-           if (!cw)//cache hit but unavailable WU
-           {
-               ESPLOG(LogMax, "WsSQL: cache hit but unavailable WU...");
-               removeQueryFromCache(normalizedSQL.str());
-               compiledwuid.clear();
-           }
-           else
-               clonable = true;
+            ESPLOG(LogMax, "WsSQL: cache hit opening wuid %s...", compiledwuid.str());
+            Owned<IConstWorkUnit> cw = factory->openWorkUnit(compiledwuid.str(), false);
+            if (!cw)//cache hit but unavailable WU
+            {
+                ESPLOG(LogMax, "WsSQL: cache hit but unavailable WU...");
+                removeQueryFromCache(normalizedSQL.str());
+                compiledwuid.clear();
+            }
+            else
+                clonable = true;
         }
 
         if (compiledwuid.length()==0)
         {
             {
-                if (isEmpty(cluster))
-                    throw MakeStringException(-1,"Target cluster not set.");
-
-                if (!isValidCluster(cluster))
-                    throw MakeStringException(-1, "Invalid cluster name: %s", cluster);
+                validateTargetName(cluster);
 
                 if (querytype == SQLTypeCreateAndLoad)
                     clonable = false;
 
-                context.addTraceSummaryTimeStamp(LogNormal, "StartECLGenerate");
-                ECLEngine::generateECL(parsedSQL, ecltext);
+                {
+                    OwnedActiveSpanScope eclGenSpanScope(queryThreadedActiveSpan()->createInternalSpan("generate_ecl"));
+                    try
+                    {
+                        ECLEngine::generateECL(parsedSQL, ecltext);
 
-                if (hashoptions.length() > 0)
-                    ecltext.insert(0, hashoptions.str());
-
-                context.addTraceSummaryTimeStamp(LogNormal, "EndECLGenerate");
+                        if (hashoptions.length() > 0)
+                            ecltext.insert(0, hashoptions.str());
+                    }
+                    catch(IException* e)
+                    {
+                        eclGenSpanScope->recordException(e);
+                        throw;
+                    }
+                }
 
                 if (isEmpty(ecltext))
                    throw MakeStringException(1,"Could not generate ECL from SQL.");
@@ -992,10 +1022,18 @@ bool CwssqlEx::onExecuteSQL(IEspContext &context, IEspExecuteSQLRequest &req, IE
                 wu->commit();
                 wu.clear();
 
-                context.addTraceSummaryTimeStamp(LogNormal, "strtWUCompile");
-                WsWuHelpers::submitWsWorkunit(context, compiledwuid.str(), cluster, nullptr, 0, 0, true, false, false, nullptr, nullptr, nullptr, nullptr);
-                waitForWorkUnitToCompile(compiledwuid.str(), req.getWait());
-                context.addTraceSummaryTimeStamp(LogNormal, "endWUCompile");
+                OwnedActiveSpanScope wuCompileSpanScope(queryThreadedActiveSpan()->createInternalSpan("submit_ws_workunits"));
+                try
+                {
+                    WsWuHelpers::submitWsWorkunit(context, compiledwuid.str(), cluster, nullptr, 0, 0, true, false, false, nullptr, nullptr, nullptr, nullptr);
+                    wuCompileSpanScope->setSpanAttribute("compiled_wuid", compiledwuid.str());
+                    waitForWorkUnitToCompile(compiledwuid.str(), req.getWait());
+                }
+                catch(IException* e)
+                {
+                    wuCompileSpanScope->recordException(e);
+                    throw;
+                }
             }
         }
 
@@ -1018,8 +1056,8 @@ bool CwssqlEx::onExecuteSQL(IEspContext &context, IEspExecuteSQLRequest &req, IE
                 createWUXMLParams(xmlparams, parsedSQL, NULL, cw);
             else if (querytype == SQLTypeSelect)
             {
-                if (notEmpty(cluster) && !isValidCluster(cluster))
-                    throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid cluster name: %s", cluster);
+                if (!isEmptyString(cluster))
+                    validateTargetName(cluster);
 
                 createWUXMLParams(xmlparams, parsedSQL->getParamList());
             }
@@ -1028,17 +1066,36 @@ bool CwssqlEx::onExecuteSQL(IEspContext &context, IEspExecuteSQLRequest &req, IE
 
             if (clonable)
             {
-                context.addTraceSummaryTimeStamp(LogNormal, "StartWUCloneExe");
-                cloneAndExecuteWU(context, compiledwuid.str(), runningwuid, xmlparams.str(), NULL, NULL, cluster);
-                context.addTraceSummaryTimeStamp(LogNormal, "EndWUCloneExe");
+                OwnedActiveSpanScope wuCloneSpanScope(queryThreadedActiveSpan()->createInternalSpan("clone_and_execute_wu"));
+                try
+                {
+                    wuCloneSpanScope->setSpanAttribute("compiled_wuid", compiledwuid.str());
+                    wuCloneSpanScope->setSpanAttribute("running_wuid", runningwuid.str());
+                    wuCloneSpanScope->setSpanAttribute("cluster", cluster ? cluster : "");
+                    cloneAndExecuteWU(context, compiledwuid.str(), runningwuid, xmlparams.str(), NULL, NULL, cluster);
+                }
+                catch(IException* e)
+                {
+                    wuCloneSpanScope->recordException(e);
+                    throw;
+                }
+                wuCloneSpanScope.clear();
                 if(cacheeligible && !isQueryCached(normalizedSQL.str()))
                     addQueryToCache(normalizedSQL.str(), compiledwuid.str());
             }
             else
             {
-                context.addTraceSummaryTimeStamp(LogNormal, "StartWUSubmit");
-                WsWuHelpers::submitWsWorkunit(context, compiledwuid.str(), cluster, nullptr, 0, 0, false, true, true, nullptr, nullptr, nullptr, nullptr);
-                context.addTraceSummaryTimeStamp(LogNormal, "EndWUSubmit");
+                OwnedActiveSpanScope wuSubmitSpanScope(queryThreadedActiveSpan()->createInternalSpan("submit_ws_workunit"));
+                try
+                {
+                    WsWuHelpers::submitWsWorkunit(context, compiledwuid.str(), cluster, nullptr, 0, 0, false, true, true, nullptr, nullptr, nullptr, nullptr);
+                }
+                catch (IException* e)
+                {
+                    wuSubmitSpanScope->recordException(e);
+                    throw;
+                }
+                wuSubmitSpanScope.clear();
                 runningwuid.set(compiledwuid.str());
                 if (cacheeligible)
                     addQueryToCache(normalizedSQL.str(), runningwuid.str());
@@ -1047,9 +1104,16 @@ bool CwssqlEx::onExecuteSQL(IEspContext &context, IEspExecuteSQLRequest &req, IE
             int timeToWait = req.getWait();
             if (timeToWait != 0)
             {
-                context.addTraceSummaryTimeStamp(LogNormal, "StartWUProcessWait");
-                waitForWorkUnitToComplete(runningwuid.str(), timeToWait);
-                context.addTraceSummaryTimeStamp(LogNormal, "EndWUProcessWait");
+                OwnedActiveSpanScope wuProcessSpanScope(queryThreadedActiveSpan()->createInternalSpan("wait_for_workunit_to_complete"));
+                try
+                {
+                    waitForWorkUnitToComplete(runningwuid.str(), timeToWait);
+                }
+                catch(IException* e)
+                {
+                    wuProcessSpanScope->recordException(e);
+                    throw;
+                }
             }
 
             if (strcmp(runningwuid.str(), compiledwuid.str())!=0)
@@ -1080,13 +1144,13 @@ bool CwssqlEx::onExecuteSQL(IEspContext &context, IEspExecuteSQLRequest &req, IE
     }
     catch(IException* e)
     {
+        exSpanScope->recordException(e);
         FORWARDEXCEPTION(context, e, -1);
     }
     //catch (...)
     //{
     //    me->append(*MakeStringException(0,"Unknown exception submitting %s",wuid.str()));
     //}
-    context.addTraceSummaryTimeStamp(LogMin, "EndOnExecuteSQL");
     return true;
 }
 
@@ -1232,8 +1296,8 @@ bool CwssqlEx::onExecutePreparedSQL(IEspContext &context, IEspExecutePreparedSQL
        context.ensureFeatureAccess(WSSQLACCESS, SecAccess_Write, -1, "WsSQL::ExecutePreparedSQL: Permission denied.");
 
        const char *cluster = req.getTargetCluster();
-       if (notEmpty(cluster) && !isValidCluster(cluster))
-           throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid cluster name: %s", cluster);
+       if (!isEmptyString(cluster))
+           validateTargetName(cluster);
 
        Owned<IWorkUnitFactory> factory = getWorkUnitFactory(context.querySecManager(), context.queryUser());
 
@@ -1450,11 +1514,7 @@ bool CwssqlEx::onPrepareSQL(IEspContext &context, IEspPrepareSQLRequest &req, IE
             }
             else
             {
-                if (isEmpty(cluster))
-                    throw MakeStringException(1,"Target cluster not set.");
-
-                if (!isValidCluster(cluster))
-                    throw MakeStringException(-1/*ECLWATCH_INVALID_CLUSTER_NAME*/, "Invalid cluster name: %s", cluster);
+                validateTargetName(cluster);
 
                 ECLEngine::generateECL(parsedSQL, ecltext);
                 if (hashoptions.length() > 0)
@@ -1485,7 +1545,8 @@ bool CwssqlEx::onPrepareSQL(IEspContext &context, IEspPrepareSQLRequest &req, IE
                 wu.clear();
 
                 WsWuHelpers::submitWsWorkunit(context, wuid.str(), cluster, nullptr, 0, 0, true, false, false, xmlparams.str(), nullptr, nullptr, nullptr);
-                success = waitForWorkUnitToCompile(wuid.str(), req.getWait());
+                WUState state = waitForWorkUnitToCompile(wuid.str(), req.getWait());
+                success = isCompiled(state);
             }
 
            if (success)
@@ -1686,8 +1747,8 @@ bool CwssqlEx::onCreateTableAndLoad(IEspContext &context, IEspCreateTableAndLoad
         throw MakeStringException(-1, "WsSQL::CreateTableAndLoad: Error: Target TableName is invalid: %s.", targetTableName);
 
     const char * cluster = req.getTargetCluster();
-    if (notEmpty(cluster) && !isValidCluster(cluster))
-        throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "WsSQL::CreateTableAndLoad: Invalid cluster name: %s", cluster);
+    if (!isEmptyString(cluster))
+        validateTargetName(cluster);
 
     IConstDataSourceInfo & datasource = req.getDataSource();
 
@@ -1979,38 +2040,6 @@ bool CwssqlEx::onGetResults(IEspContext &context, IEspGetResultsRequest &req, IE
     return success;
 }
 
-void CwssqlEx::refreshValidClusters()
-{
-    validClusters.kill();
-#ifdef _CONTAINERIZED
-    Owned<IStringIterator> it = getContainerTargetClusters(nullptr, nullptr);
-#else
-    Owned<IStringIterator> it = getTargetClusters(nullptr, nullptr);
-#endif
-    ForEach(*it)
-    {
-        SCMStringBuffer s;
-        IStringVal &val = it->str(s);
-        if (!validClusters.getValue(val.str()))
-            validClusters.setValue(val.str(), true);
-    }
-}
-
-bool CwssqlEx::isValidCluster(const char *cluster)
-{
-    if (!cluster || !*cluster)
-        return false;
-    CriticalBlock block(crit);
-    if (validClusters.getValue(cluster))
-        return true;
-    if (validateTargetClusterName(cluster))
-    {
-        refreshValidClusters();
-        return true;
-    }
-    return false;
-}
-
 bool CwssqlEx::publishWorkunit(IEspContext &context, const char * queryname, const char * wuid, const char * targetcluster)
 {
     Owned<IWorkUnitFactory> factory = getWorkUnitFactory(context.querySecManager(), context.queryUser());
@@ -2019,7 +2048,7 @@ bool CwssqlEx::publishWorkunit(IEspContext &context, const char * queryname, con
         throw MakeStringException(ECLWATCH_CANNOT_OPEN_WORKUNIT,"Cannot find the workunit %s", wuid);
 
     SCMStringBuffer queryName;
-    if (notEmpty(queryname))
+    if (!isEmptyString(queryname))
         queryName.set(queryname);
     else
         queryName.set(cw->queryJobName());
@@ -2028,15 +2057,12 @@ bool CwssqlEx::publishWorkunit(IEspContext &context, const char * queryname, con
         throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Query/Job name not defined for publishing workunit %s", wuid);
 
     SCMStringBuffer target;
-    if (notEmpty(targetcluster))
+    if (!isEmptyString(targetcluster))
         target.set(targetcluster);
     else
         target.set(cw->queryClusterName());
 
-    if (!target.length())
-        throw MakeStringException(ECLWATCH_MISSING_PARAMS, "Cluster name not defined for publishing workunit %s", wuid);
-    if (!isValidCluster(target.str()))
-        throw MakeStringException(ECLWATCH_INVALID_CLUSTER_NAME, "Invalid cluster name: %s", target.str());
+    validateTargetName(target.str());
     //RODRIGO this is needed:
     //copyQueryFilesToCluster(context, cw, "", target.str(), queryName.str(), false);
 

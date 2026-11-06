@@ -1,17 +1,17 @@
 [Unit]
 Description=%i
+PartOf=hpccsystems-platform.target
 After=network.target remote-fs.target @dependencies@
 
 [Service]
-Type=simple
+Type=forking
 User=@RUNTIME_USER@
 Group=@RUNTIME_GROUP@
 PermissionsStartOnly=false
 PIDFile=@PID_PATH@/%i.pid
 EnvironmentFile=@RUNTIME_PATH@/thorslaves/%i.cfg
-@spark_slave_start@
 ExecStart=@EXEC_PATH@/@processName@ @processArgs@
-@spark_slave_stop@
 
 [Install]
 DefaultInstance=my@component@
+WantedBy=hpccsystems-platform.target

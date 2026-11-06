@@ -38,7 +38,7 @@ public:
         ActivityTimer s(slaveTimerStats, timeActivities);
         PARENT::start();
         if (ensureStartFTLookAhead(0))
-            setLookAhead(0, createRowStreamLookAhead(this, inputStream, queryRowInterfaces(input), PULL_SMART_BUFFER_SIZE, true, false, RCUNBOUND, NULL, &container.queryJob().queryIDiskUsage()), false);
+            setLookAhead(0, createRowStreamLookAhead(this, inputStream, queryRowInterfaces(input), PULL_SMART_BUFFER_SIZE, true, false, RCUNBOUND, NULL), false);
     }
     const void * nextRow() override
     {
@@ -54,7 +54,9 @@ public:
     virtual void getMetaInfo(ThorDataLinkMetaInfo &info) const override
     {
         initMetaInfo(info);
-        info.buffersInput = true;
+        info.canBufferInput = true;
+        info.suppressLookAhead = true;
+        info.fastThrough = true;
         calcMetaInfoSize(info, queryInput(0));
     }
 };

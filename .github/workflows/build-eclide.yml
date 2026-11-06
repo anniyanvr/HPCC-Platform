@@ -1,0 +1,224 @@
+name: Build ECLIDE
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,read"
+  VCPKG_NUGET_REPOSITORY: "https://nuget.pkg.github.com/hpcc-systems/index.json"
+
+on:
+  workflow_call:
+    inputs:
+      community-ref:
+        type: string
+        description: 'community_[semver]'
+        required: true
+      eclide-ref:
+        type: string
+        description: 'eclide_[semver]'
+        required: true
+      os:
+        type: string
+        description: 'Operating System'
+        required: false
+        default: 'windows-2022'
+      configure-preset:
+        type: string
+        description: 'CMake Configure Preset'
+        required: false
+        default: 'vcpkg-VS-17'
+      build-preset:
+        type: string
+        description: 'CMake Build Preset'
+        required: false
+        default: 'VS-17-RelWithDebInfo'
+      build-dir:
+        type: string
+        description: 'Build directory name (relative to source)'
+        required: false
+        default: 'build'
+      clienttools-community-asset-name:
+        type: string
+        description: 'Clienttools Community Asset name'
+        required: true
+      documentation-asset-name:
+        type: string
+        description: 'Documentation Asset name'
+        required: true
+      make-latest:
+        type: boolean
+        description: 'Make Latest'
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+
+  build-bare-metal-eclide:
+    name: Build Bare Metal ECLIDE
+    runs-on: ${{ inputs.os }}
+    steps:
+ 
+      - name: VCPKG check
+        shell: "bash"
+        run: |
+          echo "VCPKG_INSTALLATION_ROOT: $VCPKG_INSTALLATION_ROOT"
+          echo "VCPKG_DEFAULT_TRIPLET: $VCPKG_DEFAULT_TRIPLET"
+          echo "VCPKG_TARGET_TRIPLET: $VCPKG_TARGET_TRIPLET"
+          echo "VCPKG_APPLOCAL_DEPS: $VCPKG_APPLOCAL_DEPS"
+          echo "VCPKG_APPLOCAL_DEPS_DEBUG: $VCPKG_APPLOCAL_DEPS_DEBUG"
+          echo "VCPKG_APPLOCAL_DEPS_RELEASE: $VCPKG_APPLOCAL_DEPS_RELEASE"
+          echo "VCPKG_APPLOCAL_DEPS_RELWITHDEBINFO: $VCPKG_APPLOCAL_DEPS_RELWITHDEBINFO"
+          echo "VCPKG_APPLOCAL_DEPS_MINSIZEREL: $VCPKG_APPLOCAL_DEPS_MINSIZEREL"
+          ls -la $VCPKG_INSTALLATION_ROOT
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'microsoft'
+          java-version: '17'
+      
+      - name: Setup Dependencies
+        shell: 'bash'
+        run: |
+          curl -o fop-2.9-bin.tar.gz https://archive.apache.org/dist/xmlgraphics/fop/binaries/fop-2.9-bin.tar.gz
+          mkdir fop
+          tar -xf fop-2.9-bin.tar.gz -C fop --strip-components=1
+          curl -o fop/fop/saxon-he-12.4.jar https://repo1.maven.org/maven2/net/sf/saxon/Saxon-HE/12.4/saxon-he-12.4.jar
+
+      - name: Checkout HPCC-Platform
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.community-ref }}
+          submodules: recursive
+          path: ./HPCC-Platform
+ 
+      - name: Checkout ECLIDE
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/ECLIDE
+          ref: ${{ inputs.eclide-ref }}
+          submodules: recursive
+          path: ./ECLIDE
+          fetch-depth: 0
+
+      - name: Install html-help-workshop
+        shell: "bash"
+        run: |
+          choco install html-help-workshop
+          mkdir -p ./ECLIDE/docs
+
+      - name: Fetch html artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.documentation-asset-name }}
+          merge-multiple: true
+
+      - name: Fetch clienttools artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.clienttools-community-asset-name }}
+          merge-multiple: true
+
+      - name: "Create EN_US CHM file"
+        shell: "bash"
+        run: |
+          html_doc=$(find . -type f -name "html_help_EN_US-*")
+          mkdir html_help_EN_US
+          7z x $html_doc -ohtml_help_EN_US
+          cd html_help_EN_US/html_help
+          # Chocolate install a package but it is not in PATH variable. Use path full of hhc.exe
+          # hhc.exe return non-zero. Appending "true" to work-around
+          C:/"Program Files (x86)"/"HTML Help Workshop"/hhc.exe htmlhelp.hhp || true
+          mv htmlhelp.chm ECLReference.chm
+          cp ECLReference.chm ../../ECLIDE/docs/
+  
+      - name: "Create PT_BR CHM file"
+        shell: "bash"
+        run: |
+          html_doc=$(find . -type f -name "html_help_PT_BR-*")
+          mkdir html_help_PT_BR
+          7z x $html_doc -ohtml_help_PT_BR
+          cd html_help_PT_BR/html_help
+          # Chocolate install a package but it is not in PATH variable. Use path full of hhc.exe
+          # hhc.exe return non-zero. Appending "true" to work-around
+          C:/"Program Files (x86)"/"HTML Help Workshop"/hhc.exe htmlhelp.hhp || true
+          mv htmlhelp.chm ECLReference_PT_BR.chm
+          cp ECLReference_PT_BR.chm ../../ECLIDE/docs/
+
+      - name: vcpkg bootstrap
+        shell: "bash"
+        run: |
+          ./HPCC-Platform/vcpkg/bootstrap-vcpkg.sh
+
+      - name: Setup NuGet credentials
+        shell: "bash"
+        run: |
+            `./HPCC-Platform/vcpkg/vcpkg fetch nuget | tail -n 1` \
+            sources add \
+            -name "GitHub" \
+            -source "https://nuget.pkg.github.com/hpcc-systems/index.json" \
+            -storepasswordincleartext \
+            -username "${{ github.repository_owner }}" \
+            -password "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Setup Certificate File
+        shell: "pwsh"
+        run: |
+          $base64 = "${{ secrets.SM_CLIENT_CERT_FILE_B64 }}"
+          if ([string]::IsNullOrEmpty($base64)) {
+            Write-Error "Secret SM_CLIENT_CERT_FILE_B64 is empty or not set."
+            exit 1
+          }
+          $bytes = [Convert]::FromBase64String($base64)
+          $outDir = "$env:RUNNER_TEMP"
+          $p12Path = Join-Path $outDir "sm_client_cert.p12"
+          [IO.File]::WriteAllBytes($p12Path, $bytes)
+          # Make sure the path is visible to subsequent steps
+          "SM_CLIENT_CERT_FILE=$p12Path" | Out-File -FilePath $env:GITHUB_ENV -Append
+          
+      - name: Setup Software Trust Manager
+        uses: digicert/code-signing-software-trust-action@v1.2.1
+        with:
+          simple-signing-mode: true
+          keypair-alias: "${{ vars.DIGICERT_KEYPAIR_ALIAS }}"
+        env:
+          SM_HOST: https://clientauth.one.digicert.com
+          SM_API_KEY: ${{ secrets.DIGICERT_API_KEY }}
+          SM_CLIENT_CERT_FILE: ${{ env.SM_CLIENT_CERT_FILE }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+
+      - name: Check workspace
+        shell: "bash"
+        run: |
+          ls -la
+
+      - name: Build Community ECLIDE
+        shell: "bash"
+        run: |
+          cd ECLIDE
+          cmake --preset ${{ inputs.configure-preset }} -DDIGICERT_KEYPAIR_ALIAS=${{ vars.DIGICERT_KEYPAIR_ALIAS }}
+          cmake --build --preset ${{ inputs.build-preset }} --target SIGN
+        env:
+          SM_HOST: https://clientauth.one.digicert.com
+          SM_API_KEY: ${{ secrets.DIGICERT_API_KEY }}
+          SM_CLIENT_CERT_FILE: ${{ env.SM_CLIENT_CERT_FILE }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+
+
+      - name: Upload Assets
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          generateReleaseNotes: false
+          prerelease: ${{ contains(github.ref, '-rc') }}
+          makeLatest: ${{ inputs.make-latest }}
+          artifacts: "./ECLIDE/${{ inputs.build-dir }}/hpccsystems-eclide-community_*.exe"
+      
+      - name: Upload Error Logs
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.os }}-${{ inputs.configure-preset }}-eclide-logs
+          path: ./ECLIDE/${{ inputs.build-dir }}/**/*.log

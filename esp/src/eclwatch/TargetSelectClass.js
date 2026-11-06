@@ -6,7 +6,9 @@ define([
     "dojo/_base/Deferred",
     "dojo/data/ItemFileReadStore",
     "dojo/promise/all",
-    "dojo/store/Memory",
+    "src/store/Memory",
+
+    "@hpcc-js/util",
 
     "src/WsTopology",
     "src/WsWorkunits",
@@ -16,8 +18,8 @@ define([
     "src/WsPackageMaps",
     "src/Utility"
 
-], function (lang, nlsHPCCMod, arrayUtil, xhr, Deferred, ItemFileReadStore, all, Memory,
-    WsTopology, WsWorkunits, FileSpray, WsAccess, WsESDLConfig, WsPackageMaps, Utility) {
+], function (lang, nlsHPCCMod, arrayUtil, xhr, Deferred, ItemFileReadStore, all, MemoryMod,
+    hpccUtil, WsTopology, WsWorkunits, FileSpray, WsAccess, WsESDLConfig, WsPackageMaps, Utility) {
 
     var nlsHPCC = nlsHPCCMod.default;
     return {
@@ -89,12 +91,8 @@ define([
             } else if (params.DFUSprayQueues === true) {
                 this.loadSprayQueues();
             } else if (params.GetPackageMapTargets === true) {
-                this.defaultValue = "*";
-                this.set("value", "*");
                 this.loadGetPackageMapTargets();
             } else if (params.GetPackageMapProcesses === true) {
-                this.defaultValue = "*";
-                this.set("value", "*");
                 this.loadGetPackageMapProcesses();
             } else if (params.GetPackageMapProcessFilter === true) {
                 this.defaultValue = "*";
@@ -166,6 +164,9 @@ define([
                         value: "*"
                     });
                     for (var i = 0; i < targetData.length; ++i) {
+                        if (targetData[i].Type === "roxie" && !context.defaultValue) {
+                            context.defaultValue = targetData[i].Name;
+                        }
                         context.options.push({
                             label: targetData[i].Name,
                             value: targetData[i].Name,
@@ -194,6 +195,9 @@ define([
                     for (var i = 0; i < targetData.length; ++i) {
                         if (lang.exists("Processes.Item.length", targetData[i])) {
                             for (var j = 0; j < targetData[i].Processes.Item.length; ++j) {
+                                if (targetData[i].Type === "roxie" && !context.defaultValue) {
+                                    context.defaultValue = targetData[i].Processes.Item[j];
+                                }
                                 context.options.push({
                                     label: targetData[i].Processes.Item[j],
                                     value: targetData[i].Processes.Item[j]
@@ -328,7 +332,7 @@ define([
             });
         },
 
-        loadDropZoneMachines: function (Name) {
+        loadDropZoneMachines: function (Name, useConfig) {
             var context = this;
             this.set("disabled", true);
             if (Name) {
@@ -349,7 +353,7 @@ define([
                             for (var i = 0; i < targetData.length; ++i) {
                                 context.options.push({
                                     label: targetData[i].Netaddress,
-                                    value: targetData[i].Netaddress
+                                    value: useConfig ? targetData[i].ConfigNetaddress : targetData[i].Netaddress
                                 });
                             }
                             context._postLoad();
@@ -411,20 +415,23 @@ define([
             this.getDropZoneFolder = function () {
                 var baseFolder = this._dropZoneTarget.machine.Directory;
                 var selectedFolder = this.get("value");
-                return baseFolder + selectedFolder;
+                var folderPath = hpccUtil.join(baseFolder, selectedFolder);
+                if (!folderPath.endsWith(pathSepChar)) {
+                    folderPath += pathSepChar;
+                }
+                return folderPath;
             };
             if (this._dropZoneTarget) {
                 this._loadDropZoneFolders(pathSepChar, this._dropZoneTarget.machine.Netaddress, this._dropZoneTarget.machine.Directory, this._dropZoneTarget.machine.OS).then(function (results) {
                     results.sort();
-                    var store = new Memory({
-                        data: arrayUtil.map(results, function (_path) {
-                            var path = _path.substring(context._dropZoneTarget.machine.Directory.length);
-                            return {
-                                name: path,
-                                id: _path
-                            };
-                        })
-                    });
+                    var store = new MemoryMod.Memory();
+                    store.setData(arrayUtil.map(results, function (_path) {
+                        var path = _path.substring(context._dropZoneTarget.machine.Directory.length);
+                        return {
+                            name: path,
+                            id: _path
+                        };
+                    }));
                     context.set("store", store);
                     context.set("placeholder", defaultPath);
                     context._postLoad();
@@ -443,6 +450,7 @@ define([
                                 case "Thor":
                                 case "hthor":
                                 case "Roxie":
+                                case "Plane":
                                     context.options.push({
                                         label: targetData[i].Name,
                                         value: targetData[i].Name
@@ -530,11 +538,13 @@ define([
             }).then(function (response) {
                 if (lang.exists("TpLogicalClusterQueryResponse.TpLogicalClusters.TpLogicalCluster", response)) {
                     var targetData = response.TpLogicalClusterQueryResponse.TpLogicalClusters.TpLogicalCluster;
+                    context.logicalClusters = {};
                     for (var i = 0; i < targetData.length; ++i) {
                         context.options.push({
                             label: targetData[i].Name,
                             value: targetData[i].Name
                         });
+                        context.logicalClusters[targetData[i].Name] = targetData[i];
                     }
 
                     if (!context.includeBlank && context._value === "") {
@@ -547,6 +557,10 @@ define([
                 }
                 context._postLoad();
             });
+        },
+
+        selectedTarget() {
+            return this.logicalClusters[this.get("value")];
         },
 
         loadECLSamples: function () {
@@ -573,27 +587,25 @@ define([
         loadLogs: function (params) {
             var context = this;
             this.set("options", []);
-            FileSpray.FileList({
+            WsTopology.TpListLogFiles({
                 request: {
-                    Mask: "*.log",
-                    Netaddr: params.treeNode.newPreflight ? params.treeNode.NetAddress : params.treeNode.getNetaddress(),
-                    OS: params.treeNode.newPreflight ? params.treeNode.OS : params.treeNode.getOS(),
+                    NetworkAddress: params.treeNode.newPreflight ? params.treeNode.NetAddress : params.treeNode.getNetaddress(),
                     Path: params.treeNode.newPreflight ? params.treeNode.LogDirectory : params.treeNode.getLogDirectory()
                 }
             }).then(function (response) {
-                if (lang.exists("FileListResponse.files.PhysicalFileStruct", response)) {
+                if (lang.exists("TpListLogFilesResponse.Files.LogFileStruct", response)) {
                     var options = [];
-                    var targetData = response.FileListResponse.files.PhysicalFileStruct;
+                    var targetData = response.TpListLogFilesResponse.Files.LogFileStruct;
                     var shortestLabelLen = 9999;
                     var shortestLabel = "";
                     for (var i = 0; i < targetData.length; ++i) {
                         options.push({
-                            label: targetData[i].name, // + " " + targetData[i].filesize + " " + targetData[i].modifiedtime,
-                            value: targetData[i].name
+                            label: targetData[i].Name, // + " " + targetData[i].filesize + " " + targetData[i].modifiedtime,
+                            value: targetData[i].Name
                         });
-                        if (shortestLabelLen > targetData[i].name.length) {
-                            shortestLabelLen = targetData[i].name.length;
-                            shortestLabel = targetData[i].name;
+                        if (shortestLabelLen > targetData[i].Name.length) {
+                            shortestLabelLen = targetData[i].Name.length;
+                            shortestLabel = targetData[i].Name;
                         }
                     }
                     options.sort(function (l, r) {

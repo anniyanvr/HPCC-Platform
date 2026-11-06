@@ -1,8 +1,4 @@
-﻿import * as arrayUtil from "dojo/_base/array";
-import * as declare from "dojo/_base/declare";
-import * as Deferred from "dojo/Deferred";
-import * as dom from "dojo/dom";
-import * as domConstruct from "dojo/dom-construct";
+﻿import { arrayUtil, declare, DeferredFull as Deferred, dom, domConstruct } from "src-dojo/index";
 
 import * as ESPQuery from "./ESPQuery";
 import * as ESPWorkunit from "./ESPWorkunit";
@@ -15,7 +11,7 @@ const DebugBase = declare(null, {
     showDebugRow(node, key, value) {
         const domNode = dom.byId(node);
         domConstruct.create("li", {
-            innerHTML: "<b>" + Utility.xmlEncode(key) + "</b>:  " + Utility.xmlEncode(value)
+            innerHTML: "<b>" + Utility.encodeXML(key) + "</b>:  " + Utility.encodeXML(value)
         }, domNode);
     },
 
@@ -26,7 +22,7 @@ const DebugBase = declare(null, {
         }
         const ulNode = domConstruct.create("ul", {}, domNode);
         for (const key in obj) {
-            if (obj.hasOwnProperty(key)) {
+            if (key in obj) {
                 this.showDebugRow(ulNode, key, obj[key]);
             }
         }

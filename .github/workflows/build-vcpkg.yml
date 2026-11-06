@@ -1,0 +1,349 @@
+name: PR Build and Test (build-vcpkg.yml)
+on:
+  workflow_dispatch:
+    inputs:
+      nightly:
+        type: boolean
+        description: 'Run the nightly job set'
+        required: false
+        default: false
+      os:
+        type: choice
+        options:
+          - 'ubuntu-24.04'
+          - 'ubuntu-22.04'
+          - 'rockylinux-8'
+        description: 'Operating System'
+        required: false
+        default: 'ubuntu-22.04'
+      smoketest:
+        type: boolean
+        description: 'Run Smoketest'
+        required: false
+        default: false
+
+  push:
+    tags:
+      - "community_*"
+      - "!community_8.10.*"
+      - "!community_8.8.*"
+      - "!community_8.6.*"
+      - "!community_8.4.*"
+      - "!community_8.2.*"
+      - "!community_8.0.*"
+      - "!community_7.*"
+      - "!HPCC*"
+
+  pull_request:
+    branches:
+      - "master"
+      - "candidate-*"
+      - "!candidate-7.10.*"
+      - "!candidate-7.8.*"
+      - "!candidate-7.6.*"
+      - "!candidate-7.4.*"
+      - "!candidate-7.2.*"
+      - "!candidate-7.0.*"
+      - "!candidate-6.*"
+
+  schedule:
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: read
+  packages: read
+
+jobs:
+  pre_job:
+    if: ${{ contains('pull_request,push', github.event_name) }}
+    runs-on: ubuntu-latest
+    # Map a step output to a job output
+    outputs:
+      workflows: ${{ steps.skip_check.outputs.workflows }}
+      platform: ${{ steps.skip_check.outputs.platform }}
+      plugins: ${{ steps.skip_check.outputs.plugins }}
+      dockerfiles: ${{ steps.skip_check.outputs.dockerfiles }}
+      helm: ${{ steps.skip_check.outputs.helm }}
+      ecllibrary: ${{ steps.skip_check.outputs.ecllibrary }}
+      eclwatch: ${{ steps.skip_check.outputs.eclwatch }}
+      docs: ${{ steps.skip_check.outputs.docs }}
+      testing: ${{ steps.skip_check.outputs.testing }}
+      initfiles: ${{ steps.skip_check.outputs.initfiles }}
+      vcpkg: ${{ steps.skip_check.outputs.vcpkg }}
+      other: ${{ steps.skip_check.outputs.other }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: skip_check
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            workflows:
+              - ".github/workflows/**"
+            platform:
+              - "clienttools/**"
+              - "cmake_modules/**"
+              - "common/**"
+              - "configuration/**"
+              - "dali/**"
+              - "deploy/**"
+              - "deployment/**"
+              - "ecl/**"
+              - "esp/**"
+              - "!esp/src/**"
+              - "!esp/eclwatch/**"
+              - "fs/**"
+              - "lib2/**"
+              - "package/**"
+              - "plugins/**"
+              - "roxie/**"
+              - "rtl/**"
+              - "services/**"
+              - "system/**"
+              - "thorlcr/**"
+              - "tools/**"
+              - "vcpkg/**"
+              - "vcpkg-overlays/**"
+            plugins:
+              - "plugins/**"
+            dockerfiles:
+              - "dockerfiles/**"
+            helm:
+              - "helm/**"
+              - "testing/helm/**"
+            ecllibrary:
+              - "ecllibrary/**"
+            eclwatch:
+              - "esp/eclwatch/**"
+              - "esp/src/**"
+            docs:
+              - "docs/**"
+              - ".github/workflows/test-documentation.yml"
+            testing:
+              - "testing/**"
+            initfiles:
+              - "initfiles/**"
+            vcpkg:
+              - "vcpkg/**"
+              - "vcpkg-overlays/**"
+            other:
+              - "charm/**"
+              - "devdoc/**"
+              - "devel/**"
+              - "githooks/**"
+              - "install/**"
+              - "misc/**"
+          list-files: json
+      - name: Print changed paths
+        run: |
+          echo "=== Path Filter Report ==="
+          echo "Filters with changes: ${{ steps.skip_check.outputs.changes }}"
+          echo ""
+          
+          # Parse the JSON array of changed filters
+          changed_filters='${{ steps.skip_check.outputs.changes }}'
+          
+          # Iterate through each changed filter
+          for filter in $(echo "$changed_filters" | jq -r '.[]'); do
+            echo "### ${filter^} ###"
+            
+            # Get the files for this filter
+            files_var="${filter}_files"
+            files_json=$(echo '${{ toJSON(steps.skip_check.outputs) }}' | jq -r --arg key "$files_var" '.[$key]')
+            
+            if [[ "$files_json" != "null" && "$files_json" != "" ]]; then
+              echo "$files_json" | jq -r '.[]'
+            else
+              echo "No files detected"
+            fi
+            echo ""
+          done
+          
+          echo "=========================="
+
+  build-workflow-dispatch:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.nightly != true }}
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      os: ${{ inputs.os }}
+      upload-package: true
+      asset-name: 'docker-package'
+    secrets: inherit
+
+  test-workflow-dispatch:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.nightly != true && inputs.smoketest == true }}
+    needs: build-workflow-dispatch
+    uses: ./.github/workflows/test-smoke-gh_runner.yml
+    with:
+      os: ${{ inputs.os }}
+      asset-name: 'docker-package'
+    secrets: inherit
+
+  build-docker-ubuntu-24_04-arm64:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      os: ubuntu-24.04
+      tag_postfix: "-arm64"
+    secrets: inherit
+
+  build-docker-ubuntu-24_04:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      os: ubuntu-24.04
+    secrets: inherit
+
+  build-docker-ubuntu-22_04-arm64-package:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.platform == 'true' || needs.pre_job.outputs.testing == 'true') }}
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      os: ubuntu-22.04
+      tag_postfix: "-arm64"
+      upload-package: true
+      asset-name: 'docker-ubuntu-22_04-arm64'
+    secrets: inherit
+
+  build-docker-ubuntu-22_04:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.platform == 'true' || needs.pre_job.outputs.testing == 'true') }}
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      os: ubuntu-22.04
+      upload-package: true
+      asset-name: 'docker-ubuntu-22_04'
+    secrets: inherit
+
+  test-smoke-docker-ubuntu-22_04:
+    needs: [build-docker-ubuntu-22_04, pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.testing == 'true' || needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/test-smoke-gh_runner.yml
+    with:
+      os: ubuntu-22.04
+      asset-name: 'docker-ubuntu-22_04'
+    secrets: inherit
+
+  test-regression-suite-k8s-ubuntu-22_04:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.testing == 'true' || needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/test-regression-suite-k8s.yml
+    secrets: inherit
+    with:
+      os: ubuntu-22.04
+      asset-name: 'docker-ubuntu-22_04-containerized'
+
+  test-unit-docker-ubuntu-22_04:
+    needs: [build-docker-ubuntu-22_04, pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.testing == 'true' || needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/test-unit-gh_runner.yml
+    with:
+      os: ubuntu-22.04
+      asset-name: 'docker-ubuntu-22_04'
+    secrets: inherit
+
+  test-bundles-on-thor-ubuntu-22_04:
+    needs: [build-docker-ubuntu-22_04, pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.testing == 'true' || needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/bundleTest-thor.yml
+    with:
+      os: ubuntu-22.04
+      asset-name: 'docker-ubuntu-22_04'
+      generate-zap: ""
+    secrets: inherit
+
+  test-eclwatch-gh_runner-ubuntu-22_04:
+    needs: [build-docker-ubuntu-22_04, pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && needs.pre_job.outputs.eclwatch == 'true' }}
+    uses: ./.github/workflows/test-eclwatch.yml
+    with:
+      os: ubuntu-22.04
+      asset-name: 'docker-ubuntu-22_04'
+    secrets: inherit
+
+  test-documentation-ubuntu-22_04:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && needs.pre_job.outputs.docs == 'true' }}
+    uses: ./.github/workflows/test-documentation.yml
+    with:
+      os: 'ubuntu-22.04'
+      asset-name: 'Documentation'
+
+  build-docker-rockylinux-8:
+    if: ${{ contains('schedule,push', github.event_name) || (github.event_name == 'workflow_dispatch' && inputs.nightly == true) }}
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      os: rockylinux-8
+    secrets: inherit
+
+  build-docker-wasm32-emscripten:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      os: wasm32-emscripten
+      cmake-configuration-ex: '-DEMSCRIPTEN=ON'
+      build-type: 'MinSizeRel'
+    secrets: inherit
+
+  build-gh_runner-ubuntu-22_04:
+    if: ${{ contains('schedule,push', github.event_name) || (github.event_name == 'workflow_dispatch' && inputs.nightly == true) }}
+    uses: ./.github/workflows/build-gh_runner.yml
+    with:
+      os: ubuntu-22.04
+    secrets: inherit
+
+  build-gh_runner-windows-2022:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/build-gh_runner.yml
+    with:
+      os: windows-2022
+      cmake-configuration-ex: '-T host=x64 -A x64 -DUSE_CPPUNIT=OFF -DCLIENTTOOLS_ONLY=ON -DUSE_AZURE=OFF -DINCLUDE_PLUGINS=OFF -DUSE_CASSANDRA=OFF -DUSE_PARQUET=OFF -DUSE_JAVA=OFF -DUSE_OPENLDAP=OFF'
+    secrets: inherit
+
+  build-gh_runner-windows-2025:
+    if: ${{ contains('schedule,push', github.event_name) || (github.event_name == 'workflow_dispatch' && inputs.nightly == true) }}
+    uses: ./.github/workflows/build-gh_runner.yml
+    with:
+      os: windows-2025
+      cmake-configuration-ex: '-T host=x64 -A x64 -DUSE_CPPUNIT=OFF -DCLIENTTOOLS_ONLY=ON -DINCLUDE_PLUGINS=OFF -DUSE_AZURE=OFF -DUSE_CASSANDRA=OFF -DUSE_PARQUET=OFF -DUSE_JAVA=OFF -DUSE_OPENLDAP=OFF'
+    secrets: inherit
+
+  build-gh_runner-macos-15-x86_64:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/build-gh_runner.yml
+    with:
+      os: macos-15-intel
+      build-type: 'Release'
+      cmake-configuration-ex: '-DCMAKE_OSX_ARCHITECTURES=x86_64 -DCPACK_SYSTEM_NAME=Darwin-x86_64 -DUSE_PYTHON3=OFF -DUSE_CPPUNIT=OFF -DCLIENTTOOLS_ONLY=ON -DINCLUDE_PLUGINS=OFF -DUSE_AZURE=OFF -DUSE_CASSANDRA=OFF -DSUPPRESS_CASSANDRAEMBED=ON -DUSE_JAVA=OFF -DUSE_OPENLDAP=OFF'
+    secrets: inherit
+
+  build-gh_runner-macos-15:
+    needs: [pre_job]
+    if: ${{ contains('pull_request,push', github.event_name) && (needs.pre_job.outputs.platform == 'true') }}
+    uses: ./.github/workflows/build-gh_runner.yml
+    with:
+      os: macos-15
+      build-type: 'Release'
+      cmake-configuration-ex: '-DCMAKE_OSX_ARCHITECTURES=arm64 -DUSE_CPPUNIT=OFF -DCLIENTTOOLS_ONLY=ON -DINCLUDE_PLUGINS=OFF -DUSE_AZURE=OFF -DUSE_CASSANDRA=OFF -DSUPPRESS_CASSANDRAEMBED=ON -DUSE_JAVA=OFF -DUSE_OPENLDAP=OFF'
+    secrets: inherit
+
+  build-build-eclwatch:
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.nightly == true) }}
+    uses: ./.github/workflows/build-eclwatch.yml
+    with:
+      os: 'ubuntu-22.04'
+      asset-name: 'eclwatch-nightly'
+    secrets: inherit

@@ -35,7 +35,7 @@ bool Cws_accountEx::onUpdateUser(IEspContext &context, IEspUpdateUserRequest & r
 {
     try
     {
-        CLdapSecManager* secmgr = dynamic_cast<CLdapSecManager*>(context.querySecManager());
+        ILdapSecManager* secmgr = dynamic_cast<ILdapSecManager*>(context.querySecManager());
         if(secmgr == NULL)
         {
             throw MakeStringException(ECLWATCH_INVALID_SEC_MANAGER, "Security manager can't be converted to LdapSecManager. Only LdapSecManager supports this function.");
@@ -92,6 +92,14 @@ bool Cws_accountEx::onUpdateUser(IEspContext &context, IEspUpdateUserRequest & r
         {
             resp.setRetcode(-1);
             resp.setMessage("The first 8 characters of the new password must be different from before.");
+            return false;
+        }
+
+        SecFeatureSet sfs = secmgr->queryImplementedFeatures();
+        if (!(sfs & SMF_UpdateUserPassword))
+        {
+            resp.setRetcode(-1);
+            resp.setMessage("Changing password is not supported.");
             return false;
         }
 
@@ -153,7 +161,7 @@ bool Cws_accountEx::onMyAccount(IEspContext &context, IEspMyAccountRequest &req,
     try
     {
         ISecUser* userInContext = context.queryUser();
-        CLdapSecManager* secmgr = dynamic_cast<CLdapSecManager*>(context.querySecManager());
+        ILdapSecManager* secmgr = dynamic_cast<ILdapSecManager*>(context.querySecManager());
         if (!userInContext)
         {
             if (secmgr || (context.getDomainAuthType() == AuthUserNameOnly))
@@ -210,6 +218,19 @@ bool Cws_accountEx::onMyAccount(IEspContext &context, IEspMyAccountRequest &req,
             if (version >= 1.05)
             {
                 resp.setAccountStatus(userInContext->getAuthenticateStatus());
+            }
+
+            if (version >= 1.06)
+            {
+                SecFeatureSet sfs = secmgr->queryImplementedFeatures();
+                resp.setCanUpdatePassword((sfs & SMF_UpdateUserPassword) ? true : false);
+            }
+
+            if (version >= 1.07)
+            {
+                StringArray groups;
+                secmgr->getGroups(userName, groups);
+                resp.setGroups(groups);
             }
         }
     }

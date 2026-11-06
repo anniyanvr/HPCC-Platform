@@ -24,6 +24,7 @@ test multiclusteradd with replicate
 #include <platform.h>
 #include <stdio.h>
 #include <limits.h>
+#include <algorithm>
 #include "jexcept.hpp"
 #include "jptree.hpp"
 #include "jsocket.hpp"
@@ -33,6 +34,7 @@ test multiclusteradd with replicate
 
 #include "daclient.hpp"
 #include "dadfs.hpp"
+#include "dafsaudit.hpp"
 #include "dautils.hpp"
 #include "dasds.hpp"
 #include "dasess.hpp"
@@ -48,6 +50,10 @@ test multiclusteradd with replicate
 #include "dfurun.hpp"
 #include "eventqueue.hpp"
 #include "wujobq.hpp"
+#include "dameta.hpp"
+
+#include "ws_dfsclient.hpp"
+
 
 #define SDS_CONNECT_TIMEOUT (5*60*100)
 
@@ -81,23 +87,49 @@ class CDFUengine: public CInterface, implements IDFUengine
         dfuServerName = name;
     }
 
-    void Audit(const char *func,IUserDescriptor *userdesc,const char *lfn1, const char *lfn2)
+    DFSAuditContext buildBaseAuditContext(IUserDescriptor *userdesc, const char *dfuwuid) const
     {
+        DFSAuditContext baseAuditContext = queryDefaultDFSAuditContext();
+
         SocketEndpoint ep;
         ep.setLocalHost(0);
-        StringBuffer aln;
-        aln.append(",FileAccess,DfuPlus,").append(func).append(',');
-        ep.getUrlStr(aln);
-        aln.append(',');
+        StringBuffer host;
+        ep.getEndpointHostText(host);
+        baseAuditContext.setValue("host", host.str());
+
         if (userdesc)
-            userdesc->getUserName(aln);
-        if (lfn1&&*lfn1) {
-            aln.append(',').append(lfn1);
-            if (lfn2&&*lfn2) {
-                aln.append(',').append(lfn2);
-            }
+        {
+            StringBuffer userName;
+            userdesc->getUserName(userName);
+            if (userName.length())
+                baseAuditContext.setValue("user", userName.str());
         }
-        LOG(MCauditInfo,"%s",aln.str());
+
+        if (dfuwuid && *dfuwuid)
+            baseAuditContext.setValue("wuid", dfuwuid);
+
+        return baseAuditContext;
+    }
+
+    DFSAuditContext buildOperationAuditContext(const DFSAuditContext &baseAuditContext, const char *func, const char *lfn1, const char *lfn2) const
+    {
+        DFSAuditContext opAuditContext = baseAuditContext;
+        if (func && *func)
+            opAuditContext.setValue("action", func);
+        if (lfn1 && *lfn1)
+            opAuditContext.setValue("lfn", lfn1);
+        if (lfn2 && *lfn2)
+            opAuditContext.setValue("lfn2", lfn2);
+
+        return opAuditContext;
+    }
+
+    void Audit(DFSAuditContext opAuditContext, const char *func)
+    {
+        // Emit using centralized DFSAuditContext FileAccess logging.
+        // Callers prepare operation context before invoking DFS APIs.
+
+        opAuditContext.logFileAccess(func);
     }
 
 
@@ -116,7 +148,7 @@ class CDFUengine: public CInterface, implements IDFUengine
         void displayProgress(unsigned percentDone, unsigned secsLeft, const char * timeLeft,
                                 unsigned __int64 scaledDone, unsigned __int64 scaledTotal, const char * scale,
                                 unsigned kbPerSecondAve, unsigned kbPerSecondRate,
-                                unsigned slavesDone)
+                                unsigned slavesDone, unsigned __int64 numReads, unsigned __int64 numWrites)
         {
             if (repmode==REPbefore)
                 percentDone /= 2;
@@ -124,7 +156,7 @@ class CDFUengine: public CInterface, implements IDFUengine
                 if (repmode==REPduring)
                     percentDone = percentDone/2+50;
             progress->setProgress(percentDone, secsLeft, timeLeft, scaledDone, scaledTotal, scale,
-                                 kbPerSecondAve, kbPerSecondRate, slavesDone, repmode==REPduring);
+                                 kbPerSecondAve, kbPerSecondRate, slavesDone, repmode==REPduring, numReads, numWrites);
         }
         void displaySummary(const char * timeTaken, unsigned kbPerSecond)
         {
@@ -139,7 +171,14 @@ class CDFUengine: public CInterface, implements IDFUengine
             DaftProgress::setRange(sizeReadBefore,totalSize,_totalNodes);
             progress->setTotalNodes(_totalNodes);
         }
-
+        void setFileAccessCost(cost_type fileAccessCost)
+        {
+            progress->setFileAccessCost(fileAccessCost);
+        }
+        virtual void setTransferOptions(const IPropertyTree * options) override
+        {
+            progress->setTransferOptions(options);
+        }
     };
 
     class cAbortNotify : public CInterface, implements IAbortRequestCallback, implements IDFUabortSubscriber
@@ -204,7 +243,7 @@ class CDFUengine: public CInterface, implements IDFUengine
 
     public:
         cDFUlistener(CDFUengine *_parent,const char *_queuename, bool _ismon, CSDSServerStatus *_serverstatus, unsigned _timeout=WAIT_FOREVER)
-            : queuename(_queuename)
+         : Thread("cDFUlistener"), queuename(_queuename)
         {
             serverstatus = _serverstatus;
             ismon = _ismon;
@@ -248,7 +287,7 @@ class CDFUengine: public CInterface, implements IDFUengine
                             mode = DFUservermode_run;
                     }
                     else {
-                        if (cancelling||(timeout==WAIT_FOREVER)||isAborting())
+                        if (cancelling||(timeout==WAIT_FOREVER)||hasReceivedAbortSignal())
                             mode = DFUservermode_stop;
                         else
                             mode = DFUservermode_cycle;
@@ -445,11 +484,8 @@ class CDFUengine: public CInterface, implements IDFUengine
         filename.getLocalPath(filePath);
         const char * pfilePath = filePath.str();
 
-        if (filename.queryIP().isLoopBack())
-            throwError1(DFTERR_LocalhostAddressUsed, pfilePath);
-
     #ifdef _DEBUG
-        LOG(MCdebugInfo, unknownJob, "File path is '%s'", filePath.str());
+        LOG(MCdebugInfo, "File path is '%s'", filePath.str());
     #endif
 
         const char pathSep = filename.getPathSeparator();
@@ -461,10 +497,22 @@ class CDFUengine: public CInterface, implements IDFUengine
         if ((isDotDotString != nullptr) || (isDotString != nullptr))
             throwError3(DFTERR_InvalidFilePath, pfilePath, dotDotString, dotString);
 
+        StringBuffer netaddress;
+        filename.queryIP().getHostText(netaddress);
+#ifdef _CONTAINERIZED
+        Owned<IPropertyTreeIterator> planes = getDropZonePlanesIterator();
+        ForEach(*planes)
+        {
+            IPropertyTree & plane = planes->query();
+            const char * fullDropZoneDir = plane.queryProp("@prefix");
+            assertex(fullDropZoneDir);
+            if (startsWith(pfilePath, fullDropZoneDir))
+                return;
+        }
+        throwError1(DFTERR_NoMatchingDropzonePlane, pfilePath);
+#else
         Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
         Owned<IConstEnvironment> env = factory->openEnvironment();
-        StringBuffer netaddress;
-        filename.queryIP().getIpText(netaddress);
 
         Owned<IConstDropZoneInfo> dropZone = env->getDropZoneByAddressPath(netaddress.str(), pfilePath);
         if (!dropZone)
@@ -472,7 +520,7 @@ class CDFUengine: public CInterface, implements IDFUengine
             if (env->isDropZoneRestrictionEnabled())
                 throwError2(DFTERR_NoMatchingDropzonePath, netaddress.str(), pfilePath);
             else
-                LOG(MCdebugInfo, unknownJob, "No matching drop zone path on '%s' to file path: '%s'", netaddress.str(), pfilePath);
+                LOG(MCdebugInfo, "No matching drop zone path on '%s' to file path: '%s'", netaddress.str(), pfilePath);
         }
 #ifdef _DEBUG
         else
@@ -480,11 +528,12 @@ class CDFUengine: public CInterface, implements IDFUengine
             SCMStringBuffer dropZoneName;
             dropZone->getName(dropZoneName);
 
-            LOG(MCdebugInfo, unknownJob, "Drop zone path '%s' is %svisible in ECLWatch."
+            LOG(MCdebugInfo, "Drop zone path '%s' is %svisible in ECLWatch."
                 , dropZoneName.str()
                 , (dropZone->isECLWatchVisible() ? "" : "not ")
                 );
         }
+#endif
 #endif
     }
 
@@ -516,20 +565,56 @@ class CDFUengine: public CInterface, implements IDFUengine
         }
     }
 
+    StringBuffer & getFDescName(IFileDescriptor * fd, StringBuffer & result)
+    {
+        fd->getTraceName(result);
+        elideString(result, 255);
+        return result;
+    }
+
+    void ensureFilePermissions(const char * planeName, const char * fileName, SecAccessFlags perm, IUserDescriptor *user, bool write)
+    {
+        if ((write && !HASWRITEPERMISSION(perm)) || (!write && !HASREADPERMISSION(perm)))
+        {
+            StringBuffer context;
+            StringBuffer username;
+            if (user)
+                user->getUserName(username);
+            else
+                username.append("Null user");
+            context.appendf("user: '%s', assigned access %s (%d)", username.str(), getSecAccessFlagName(perm), perm);
+
+            if (!isEmptyString(planeName))
+            {
+                CDfsLogicalFileName dlfn;
+                dlfn.setPlaneExternal(planeName, fileName);
+                if (write)
+                    throw makeStringExceptionV(DFSERR_CreateAccessDenied, "Create permission denied for file scope: %s on DropZone: %s, %s", dlfn.get(), planeName, context.str());
+                else
+                    throw makeStringExceptionV(DFSERR_LookupAccessDenied, "Lookup permission denied for file scope: %s on DropZone: %s, %s", dlfn.get(), planeName, context.str());
+            }
+            if (write)
+                throw makeStringExceptionV(DFSERR_CreateAccessDenied, "Create permission denied for physical file(s): %s, %s", fileName, context.str());
+            else
+                throw makeStringExceptionV(DFSERR_LookupAccessDenied, "Lookup permission denied for physical file(s): %s, %s", fileName, context.str());
+        }
+    }
+
+    Linked<const IPropertyTree> config;
     Owned<IScheduleEventPusher> eventpusher;
     IArrayOf<cDFUlistener> listeners;
 
-    CriticalSection monitorsect;
-    CriticalSection subcopysect;
-    atomic_t runningflag;
+    CriticalSection monitorsect{SYNC_LOCATION};
+    CriticalSection subcopysect{SYNC_LOCATION};
+    std::atomic<unsigned> runningflag;
 
 public:
     IMPLEMENT_IINTERFACE;
 
-    CDFUengine()
+    CDFUengine(const IPropertyTree *_config) : config(_config)
     {
         defaultTransferBufferSize = 0;
-        atomic_set(&runningflag,1);
+        runningflag = 1;
         eventpusher.setown(getScheduleEventPusher());
     }
 
@@ -544,7 +629,7 @@ public:
         PROGLOG("DFU server waiting on queue %s",queuename);
         cDFUlistener *lt = new cDFUlistener(this,queuename,false,serverstatus);
         listeners.append(*lt);
-        lt->start();
+        lt->start(false);
     }
 
     void startMonitor(const char *queuename,CSDSServerStatus *serverstatus,unsigned timeout)
@@ -554,7 +639,7 @@ public:
         PROGLOG("DFU monitor waiting on queue %s timeout %d",queuename,timeout);
         cDFUlistener *lt = new cDFUmonitor(this,queuename,serverstatus,timeout);
         listeners.append(*lt);
-        lt->start();
+        lt->start(false);
     }
 
     void joinListeners()
@@ -573,14 +658,112 @@ public:
     void checkPhysicalFilePermissions(IFileDescriptor *fd,IUserDescriptor *user,bool write)
     {
         unsigned auditflags = (DALI_LDAP_AUDIT_REPORT|DALI_LDAP_READ_WANTED);
+        logNullUser(user);//stack trace if NULL user
         if (write)
             auditflags |= DALI_LDAP_WRITE_WANTED;
+
         SecAccessFlags perm = queryDistributedFileDirectory().getFDescPermissions(fd,user,auditflags);
-        IDFS_Exception *e = NULL;
+        StringBuffer name;
+        ensureFilePermissions(nullptr,getFDescName(fd,name),perm,user,write);
+    }
+
+    void checkForeignFilePermissions(IConstDFUfileSpec *fSpec,IFileDescriptor *fd,IUserDescriptor *user)
+    {
+        // NB: write is not supported on foreign files.
+
+        StringBuffer logicalName;
+        fSpec->getLogicalName(logicalName);
+
+        SocketEndpoint daliEP;
+        fSpec->getForeignDali(daliEP);
+
+        CDfsLogicalFileName dlfn;
+        dlfn.set(logicalName);
+        dlfn.setForeign(daliEP,false);
+
+        StringBuffer fu,fp;
+        Owned<IUserDescriptor> foreignuserdesc;
+        if (fSpec->getForeignUser(fu,fp))
+        {
+            foreignuserdesc.setown(createUserDescriptor());
+            foreignuserdesc->set(fu.str(),fp.str());
+        }
+        else
+            foreignuserdesc.set(user);
+
+        unsigned auditflags = DALI_LDAP_AUDIT_REPORT|DALI_LDAP_READ_WANTED;
+        SecAccessFlags perm = queryDistributedFileDirectory().getDLFNPermissions(dlfn,foreignuserdesc,auditflags);
         if (!HASREADPERMISSION(perm))
-            throw MakeStringException(DFSERR_LookupAccessDenied,"Lookup permission denied for physical file(s)");
-        if (write&&!HASWRITEPERMISSION(perm))
-            throw MakeStringException(DFSERR_CreateAccessDenied,"Create permission denied for physical file(s)");
+        {
+            bool authorized = false;
+            if (getGlobalConfigSP()->getPropBool("expert/@failOverToLegacyPhysicalPerms",!isContainerized()))
+            {
+                perm = queryDistributedFileDirectory().getFDescPermissions(fd,user,auditflags);
+                authorized = HASREADPERMISSION(perm);
+            }
+            if (!authorized)
+            {
+                StringBuffer context;
+                StringBuffer username;
+                if (user)
+                    user->getUserName(username);
+                else
+                    username.append("Null user");
+                context.appendf("user: '%s', assigned access %s (%d)", username.str(), getSecAccessFlagName(perm), perm);
+                throw makeStringExceptionV(DFSERR_LookupAccessDenied, "Lookup permission denied for foreign file: %s, %s", logicalName.str(), context.str());
+            }
+        }
+    }
+
+    void checkPlaneFilePermissions(IFileDescriptor *fd,IUserDescriptor *user,bool write)
+    {
+        logNullUser(user);//stack trace if NULL user
+        //This function checks the scope permissions for a file or files that reside in a single directory on a single plane.
+        //The IFileDescriptor is used to discover the plane and directory.
+        //If the plane is not present, it implies that it is a bare-metal system and useDropZoneRestriction is off, and there
+        //is no matching dropzone in the environment. If this is the case, or the plane permissions are not found
+        //and @failOverToLegacyPhysicalPerms is configured, then the legacy physical file permissions will be checked.
+        unsigned auditflags = (DALI_LDAP_AUDIT_REPORT|DALI_LDAP_READ_WANTED);
+        if (write)
+            auditflags |= DALI_LDAP_WRITE_WANTED;
+
+        SecAccessFlags perm = SecAccess_None;
+        IClusterInfo *iClusterInfo = fd->queryClusterNum(0);
+        const char *planeName = iClusterInfo->queryGroupName();
+        if (!isEmptyString(planeName))
+        {
+            const char *dir = fd->queryDefaultDir();
+            if (isEmptyString(dir))
+                throw makeStringException(-1,"Empty default directory.");
+
+            Owned<IPropertyTree> dropZonePlane = getDropZonePlane(planeName);
+            if (!dropZonePlane)
+                throw makeStringExceptionV(-1,"DropZone %s not found.",planeName);
+            const char *relativePath = getRelativePath(dir,dropZonePlane->queryProp("@prefix"));
+            if (nullptr == relativePath)
+                throw makeStringExceptionV(-1,"Invalid DropZone directory %s.",dir);
+
+            perm = queryDistributedFileDirectory().getDropZoneScopePermissions(planeName,relativePath,user,auditflags);
+            if (((!write&&!HASREADPERMISSION(perm))||(write&&!HASWRITEPERMISSION(perm))))
+            {
+                if (getGlobalConfigSP()->getPropBool("expert/@failOverToLegacyPhysicalPerms",!isContainerized()))
+                    perm = queryDistributedFileDirectory().getFDescPermissions(fd,user,auditflags);
+
+                ensureFilePermissions(planeName,relativePath,perm,user,write);
+            }
+        }
+        else
+        {
+#ifndef _CONTAINERIZED
+            Owned<IEnvironmentFactory> factory = getEnvironmentFactory(true);
+            Owned<IConstEnvironment> env = factory->openEnvironment();
+            if (env->isDropZoneRestrictionEnabled())
+                throw makeStringException(-1,"Empty plane name.");
+            perm = SecAccess_Full; //Not able to check DropZone permissions without a plane name
+#else
+            throw makeStringException(-1,"Unexpected empty plane name."); // should never be the case in containerized setups
+#endif
+        }
     }
 
     void monitorCycle(bool &cancelling)
@@ -833,6 +1016,7 @@ public:
             wu->setJobName(tmp.str());
             ctx.superwu->getQueue(tmp.clear());
             wu->setQueue(tmp.str());
+
             if (ctx.user) {
                 StringBuffer uname;
                 ctx.user->getUserName(uname);
@@ -887,6 +1071,8 @@ public:
             options->setThrottle(ctx.superoptions->getThrottle());
             options->setTransferBufferSize(ctx.superoptions->getTransferBufferSize());
             options->setVerify(ctx.superoptions->getVerify());
+            options->setKeyCompression(ctx.superoptions->queryKeyCompression());
+
             StringBuffer slave;
             if (ctx.superoptions->getSlavePathOverride(slave))
                 options->setSlavePathOverride(slave);
@@ -899,7 +1085,7 @@ public:
         if (wuid.isEmpty())
             return false;
         StringBuffer eps;
-        PROGLOG("%s: Copy %s from %s to %s",wuid.get(),srclfn,srcdali?srcdali->endpoint().getUrlStr(eps).str():"(local)",dstlfn);
+        PROGLOG("%s: Copy %s from %s to %s",wuid.get(),srclfn,srcdali?srcdali->endpoint().getEndpointHostText(eps).str():"(local)",dstlfn);
         DFUstate state = runWU(wuid);
         StringBuffer tmp;
         PROGLOG("%s: Done: %s",wuid.get(),encodeDFUstate(state,tmp).str());
@@ -913,29 +1099,30 @@ public:
         return (state==DFUstate_finished);
     }
 
-    void doSuperForeignCopy(sSuperCopyContext &ctx,const char *dstlfn,INode *foreigndalinode,const char *srclfn, CDfsLogicalFileName &dlfn)
+    void doSuperForeignCopy(sSuperCopyContext &ctx, const char *dstlfn, const char *srclfn, CDfsLogicalFileName &dlfn)
     {
         ctx.level++;
-        Linked<INode> srcdali = foreigndalinode;
         CDfsLogicalFileName slfn;
         slfn.set(srclfn);
-        if (slfn.isForeign()) { // trying to confuse me
-            SocketEndpoint ep;
-            slfn.getEp(ep);
-            slfn.clearForeign();
-            srcdali.setown(createINode(ep));
-        }
-        Owned<IPropertyTree> ftree = queryDistributedFileDirectory().getFileTree(srclfn,ctx.srcuser,srcdali, FOREIGN_DALI_TIMEOUT, false);
-        if (!ftree.get()) {
+
+        SocketEndpoint foreignEp;
+        bool isForeign = slfn.isForeign(&foreignEp); // caller has normalized, to ensure this is truly foreign and not referring to a local env file with a foreign prefix
+
+        Owned<IDistributedFile> file = wsdfs::lookup(slfn.get(), ctx.user, AccessMode::readLogicalMeta, false, false, nullptr, defaultPrivilegedUser, INFINITE);
+
+        if (!file.get())
+        {
             StringBuffer s;
-            throw MakeStringException(-1,"Source file %s could not be found in Dali %s",slfn.get(),srcdali?srcdali->endpoint().getUrlStr(s).str():"(local)");
+            throw makeStringExceptionV(-1, "Source file %s could not be found in Dali %s", slfn.get(true), isForeign?foreignEp.getEndpointHostText(s).str():"(local)");
         }
         // now we can create name
         StringBuffer newroxieprefix;
-        constructDestinationName(dstlfn,ftree->queryProp("Attr/@roxiePrefix"),ctx.superdestination,dlfn,newroxieprefix);
-        if (!srcdali.get()||queryCoven().inCoven(srcdali)) {
+        constructDestinationName(dstlfn,file->queryAttributes().queryProp("@roxiePrefix"),ctx.superdestination,dlfn,newroxieprefix);
+        if (!isForeign)
+        {
             // if dali is local and filenames same
-            if (strcmp(slfn.get(),dlfn.get())==0) {
+            if (strcmp(slfn.get(),dlfn.get())==0)
+            {
                 PROGLOG("File copy of %s not done as file local",slfn.get());
                 ctx.level--;
                 return;
@@ -943,67 +1130,130 @@ public:
         }
 
         // first see if target exists (and remove if does and overwrite specified)
-        Owned<IDistributedFile> dfile = queryDistributedFileDirectory().lookup(dlfn,ctx.user,true,false,false,nullptr,defaultPrivilegedUser);
-        if (dfile) {
-            if (!ctx.superoptions->getOverwrite())
-                throw MakeStringException(-1,"Destination file %s already exists",dlfn.get());
-            if (!dfile->querySuperFile())
+        Owned<IDistributedFile> dfile;
+
+        // Retry `attempt(perAttemptTimeoutMs)` with short-timeout intervals while
+        // updating the workunit state to DFUstate_blocked so ECL Watch shows contention.
+        // `waitMsg` is the human-readable description shown in logs and the blocked state reason.
+        // `attempt` must throw SDSExcpt_LockTimeout when the per-attempt timeout expires.
+        auto withBlockedStateRetry = [&](const char *waitMsg, auto attempt)
+        {
+            constexpr unsigned totalLockTimeoutMs = 5 * 60 * 1000; // 5 minutes total
+            constexpr unsigned initialRetryMs = 5000; // short so blocked state is visible quickly
+            unsigned retryMs = initialRetryMs;
+            DFUstate oldState = ctx.superprogress->getState();
+            CCycleTimer timer;
+            while (true)
             {
-                if (ctx.superoptions->getIfModified()&&
-                    (ftree->hasProp("Attr/@fileCrc")&&ftree->getPropInt64("Attr/@size")&&
-                    ((unsigned)ftree->getPropInt64("Attr/@fileCrc")==(unsigned)dfile->queryAttributes().getPropInt64("@fileCrc"))&&
-                    (ftree->getPropInt64("Attr/@size")==dfile->getFileSize(false,false)))) {
-                    PROGLOG("File copy of %s not done as file unchanged",srclfn);
-                    return;
+                try
+                {
+                    unsigned remaining = timer.remainingMs(totalLockTimeoutMs);
+                    if (remaining == 0)
+                        throw makeStringExceptionV(SDSExcpt_LockTimeout, "Timed out: %s", waitMsg);
+                    attempt(std::min(remaining, retryMs));
+                    break;
+                }
+                catch (IException *e)
+                {
+                    if ((e->errorCode() != SDSExcpt_LockTimeout) || (timer.remainingMs(totalLockTimeoutMs) == 0))
+                        throw;
+                    e->Release();
+                    PROGLOG("%s", waitMsg);
+                    if (ctx.superprogress->getState() != DFUstate_blocked)
+                        ctx.superprogress->setState(DFUstate_blocked, waitMsg);
+                    retryMs = 60000; // after first timeout, increase to 1 minute to reduce log spam and load on dali
                 }
             }
-            dfile->detach();
-            dfile.clear();
-        }
-        if (strcmp(ftree->queryName(),queryDfsXmlBranchName(DXB_File))==0) {
-            StringAttr wuid;
-            const char *kind = ftree->queryProp("@kind");
-            bool iskey = kind&&(strcmp(kind,"key")==0);
-            // note  dstlfn doesn't have roxie prefix
-            if (!doSubFileCopy(ctx,dstlfn,srcdali,srclfn,wuid,iskey,newroxieprefix.str()))
-                throw MakeStringException(-1,"File %s could not be copied - see %s",dstlfn,wuid.isEmpty()?"unknown":wuid.get());
+            if (ctx.superprogress->getState() == DFUstate_blocked)
+                ctx.superprogress->setState(oldState);
+        };
 
-        }
-        else if (strcmp(ftree->queryName(),queryDfsXmlBranchName(DXB_SuperFile))==0) {
-            unsigned numtodo=0;
-            StringArray subfiles;
-            Owned<IPropertyTreeIterator> piter = ftree->getElements("SubFile");
-            ForEach(*piter) {
-                numtodo++;
+        VStringBuffer lookupMsg("looking up destination file: %s", dlfn.get());
+        auto attemptLookup = [&](unsigned timeoutMs)
+        {
+            dfile.setown(wsdfs::lookup(dlfn, ctx.user, AccessMode::erase, false, false, nullptr, defaultPrivilegedUser, timeoutMs));
+        };
+        withBlockedStateRetry(lookupMsg, attemptLookup);
+
+        Owned<IDistributedSuperFile> dsuper;
+
+        IDistributedSuperFile *sourceSuperfile = file->querySuperFile();
+        if (dfile)
+        {
+            if (!ctx.superoptions->getOverwrite())
+                throw MakeStringException(-1,"Destination file %s already exists",dlfn.get());
+            dsuper.set(dfile->querySuperFile());
+            if (!dsuper || !sourceSuperfile) // dest cannot be reused in-place: either dest is not a superfile, or source is not a superfile; delete and recreate. If both are superfiles, the dest superfile is reused in-place with its subfiles replaced.
+            {
+                if (ctx.superoptions->getIfModified()&&
+                    (file->queryAttributes().hasProp("@fileCrc")&&file->queryAttributes().getPropInt64("@size")&&
+                    ((unsigned)file->queryAttributes().getPropInt64("@fileCrc")==(unsigned)dfile->queryAttributes().getPropInt64("@fileCrc"))&&
+                    (file->queryAttributes().getPropInt64("@size")==dfile->getFileSize(false,false))))
+                {
+                    PROGLOG("File copy of %s not done as file unchanged",slfn.get(true));
+                    ctx.level--;
+                    return;
+                }
+                dfile->detach();
+                dfile.clear();
+                dsuper.clear();
             }
+        }
+        if (!sourceSuperfile)
+        {
+            StringAttr wuid;
+            const char *kind = file->queryAttributes().queryProp("@kind");
+            bool iskey = kind&&(strcmp(kind,"key")==0);
+            Owned<INode> srcdali;
+            if (isForeign)
+                srcdali.setown(createINode(foreignEp));
+            // note  dstlfn doesn't have roxie prefix
+            if (!doSubFileCopy(ctx,dstlfn,srcdali,slfn.get(false),wuid,iskey,newroxieprefix.str()))
+                throw makeStringExceptionV(-1, "File %s could not be copied - see %s", dstlfn, wuid.isEmpty()?"unknown":wuid.get());
+        }
+        else
+        {
+            bool superCreated = false;
+            if (!dsuper)
+            {
+                dsuper.setown(queryDistributedFileDirectory().createSuperFile(dlfn.get(),ctx.user,true,false));
+                if (!dsuper)
+                    throw makeStringExceptionV(-1, "SuperFile %s could not be created", dlfn.get());
+                superCreated = true;
+            }
+            DistributedFilePropertyLock lfnLock;
+            VStringBuffer lockMsg("acquiring write lock on superfile: %s", dlfn.get());
+            auto attemptLock = [&](unsigned timeoutMs)
+            {
+                lfnLock.lock(dsuper, timeoutMs);
+            };
+            withBlockedStateRetry(lockMsg, attemptLock);
+            if (!superCreated)
+                dsuper->removeSubFile(nullptr, false); // clear existing subfiles before repopulating
+
+            unsigned numtodo = sourceSuperfile->numSubFiles();
+            Owned<IDistributedFileIterator> sIter = sourceSuperfile->getSubFileIterator();
             unsigned numdone=0;
-            ForEach(*piter) {
-                const char *name = piter->query().queryProp("@name");
+            StringArray subfiles;
+            ForEach(*sIter)
+            {
+                IDistributedFile &sub = sIter->query();
+                const char *name = sub.queryLogicalName();
                 CDfsLogicalFileName dlfnsub;
                 dlfnsub.set(name);
                 CDfsLogicalFileName dlfnres;
-                doSuperForeignCopy(ctx,dlfnsub.get(true),foreigndalinode,name,dlfnres);
+                doSuperForeignCopy(ctx, dlfnsub.get(true), name, dlfnres);
                 numdone++;
                 subfiles.append(dlfnres.get());
                 if ((ctx.level==1)&&ctx.feedback)
-                    ctx.feedback->displayProgress(numtodo?(numdone*100/numtodo):0,0,"unknown",0,0,"",0,0,0);
+                    ctx.feedback->displayProgress(numtodo?(numdone*100/numtodo):0,0,"unknown",0,0,"",0,0,0,0,0);
             }
-            // now construct the superfile
-            Owned<IDistributedSuperFile> sfile = queryDistributedFileDirectory().createSuperFile(dlfn.get(),ctx.user,true,false);
-            if (!sfile)
-                throw MakeStringException(-1,"SuperFile %s could not be created",dlfn.get());
-            ForEachItemIn(i,subfiles) {
-                sfile->addSubFile(subfiles.item(i));
-            }
-            if (newroxieprefix.length()) {
-                DistributedFilePropertyLock lock(sfile);
-                lock.queryAttributes().setProp("@roxiePrefix",newroxieprefix.str());
-            }
-
-        }
-        else {
-            StringBuffer s;
-            throw MakeStringException(-1,"Source file %s in Dali %s is not a file or superfile",srclfn,srcdali?srcdali->endpoint().getUrlStr(s).str():"(local)");
+            // now populate the superfile
+            ForEachItemIn(i,subfiles)
+                dsuper->addSubFile(subfiles.item(i));
+            if (newroxieprefix.length())
+                lfnLock.queryAttributes().setProp("@roxiePrefix",newroxieprefix.str());
+            lfnLock.commit();
         }
         if ((ctx.level==1)&&ctx.feedback)
             ctx.feedback->displaySummary("0",0);
@@ -1030,6 +1280,23 @@ public:
         source->getLogicalName(srcname);
         if (!srcname.length())
             throw MakeStringException(-1,"Source file not specified");
+        // Normalize srclfn: ensure it carries foreign prefix if it's truly foreign
+        CDfsLogicalFileName srclfn;
+        srclfn.set(srcname);
+        SocketEndpoint foreignEp;
+        if (srclfn.isForeign(&foreignEp))
+        {
+            // srclfn already has foreign - it takes precedence over foreigndalinode
+            foreigndalinode.setown(createINode(foreignEp));
+            if (isLocalDali(foreigndalinode))
+            {
+                srclfn.clearForeign();
+                foreigndalinode.clear();
+            }
+        }
+        else if (foreigndalinode && !isLocalDali(foreigndalinode))
+            srclfn.setForeign(foreigndalinode->endpoint(), false);
+
         StringBuffer dstname;
         destination->getLogicalName(dstname);
         if (!dstname.length())
@@ -1047,8 +1314,7 @@ public:
         ctx.superprogress->setSubInProgress("");
         ctx.superprogress->setSubDone("");
         CDfsLogicalFileName dlfn;
-        doSuperForeignCopy(ctx,dstname.str(),foreigndalinode,srcname, dlfn);
-
+        doSuperForeignCopy(ctx, dstname.str(), srclfn.get(), dlfn);
     }
 
     DFUstate runWU(const char *dfuwuid)
@@ -1057,20 +1323,22 @@ public:
         // only clear cache when nothing running (bit of a kludge)
         class CenvClear
         {
-            atomic_t &running;
+            std::atomic<unsigned> &running;
         public:
-            CenvClear(atomic_t &_running)
+            CenvClear(std::atomic<unsigned> &_running)
                 : running(_running)
             {
-                if (atomic_dec_and_test(&running)) {
+                if (--running == 0) {
+#ifndef _CONTAINERIZED
                     Owned<IEnvironmentFactory> envf = getEnvironmentFactory(false);
                     Owned<IConstEnvironment> env = envf->openEnvironment();
                     env->clearCache();
+#endif
                 }
             }
             ~CenvClear()
             {
-                atomic_inc(&running);
+                ++running;
             }
         } cenvclear(runningflag);
         Owned<IDFUWorkUnitFactory> factory = getDFUWorkUnitFactory();
@@ -1079,6 +1347,8 @@ public:
             OWARNLOG("DFURUN: Workunit %s not found",dfuwuid);
             return DFUstate_unknown;
         }
+
+        JobNameScope jobName(dfuwuid);
         if (dfuServerName.length())
             wu->setDFUServerName(dfuServerName.str());
         StringBuffer logname;
@@ -1088,12 +1358,27 @@ public:
         IConstDFUfileSpec *destination = wu->queryDestination();
         IConstDFUoptions *options = wu->queryOptions();
         Owned<IPropertyTree> opttree = createPTreeFromIPT(options->queryTree());
+
+        // in bare-metal continue by default to use ftslave
+        bool defaultUseFtSlave = isContainerized() ? false : true;
+        bool useFtSlave = config->getPropBool("@useFtSlave", defaultUseFtSlave);
+        opttree->setPropBool("@useFtSlave", useFtSlave);
+        opttree->setProp("@sprayServiceName", config->queryProp("@sprayServiceName"));
         StringAttr encryptkey;
         StringAttr decryptkey;
         if (options->getEncDec(encryptkey,decryptkey)) {
             opttree->setProp("@encryptKey",encryptkey);
             opttree->setProp("@decryptKey",decryptkey);
         }
+
+        // if maxConnection is not passed as a user option, check for a default defined in the config/environment.
+        if (!opttree->hasProp("@maxConnections"))
+        {
+            int configDefault = getConfigInt("expert/@maxConnections", -1);
+            if (-1 != configDefault)
+                opttree->setPropInt("@maxConnections", configDefault);
+        }
+
         IDFUprogress *progress = wu->queryUpdateProgress();
         IDistributedFileDirectory &fdir = queryDistributedFileDirectory();
         IDistributedFileSystem &fsys = queryDistributedFileSystem();
@@ -1106,6 +1391,7 @@ public:
             wu->getPassword(password);
             userdesc->set(username.str(),password.str());
         }
+        const DFSAuditContext baseAuditContext = buildBaseAuditContext(userdesc, dfuwuid);
         IPropertyTree *recovery;
         IRemoteConnection *recoveryconn;
         Owned<IRemoteConnection> runningconn;
@@ -1157,6 +1443,7 @@ public:
             Owned<INode> foreigndalinode;
             StringAttr oldRoxiePrefix;
             bool foreigncopy = false;
+            bool remotecopy = false;
             // first check for 'specials' (e.g. multi-cluster keydiff etc)
             switch (cmd) {
             case DFUcmd_copy:
@@ -1171,6 +1458,7 @@ public:
                     CDfsLogicalFileName srclfn;
                     if (tmp.length())
                         srclfn.set(tmp.str());
+                    remotecopy = srclfn.isRemote();
                     destination->getLogicalName(tmp.clear());
                     CDfsLogicalFileName dstlfn;
                     if (tmp.length())
@@ -1221,9 +1509,34 @@ public:
                                 foreignuserdesc.set(userdesc);
                         }
                     }
-                    srcFile.setown(fdir.lookup(tmp.str(),userdesc,
-                            (cmd==DFUcmd_move)||(cmd==DFUcmd_rename)||((cmd==DFUcmd_copy)&&multiclusterinsert),
-                            false,false,nullptr,true));
+                    AccessMode srcAccess = AccessMode::none;
+                    switch (cmd)
+                    {
+                        case DFUcmd_rename:
+                            srcAccess = AccessMode::writeMeta;
+                            break;
+                        case DFUcmd_copy:
+                            srcAccess = AccessMode::readSequential;
+                            if (multiclusterinsert)
+                                srcAccess |= AccessMode::writeMeta;
+                            break;
+                        case DFUcmd_copymerge:
+                            srcAccess = AccessMode::readSequential;
+                            break;
+                        case DFUcmd_move:
+                            srcAccess = AccessMode::readSequential | AccessMode::writeMeta; // reads then deletes source
+                            break;
+                        case DFUcmd_replicate:
+                            srcAccess = AccessMode::readLogicalMeta|AccessMode::writeSequential;
+                            break;
+                        case DFUcmd_export:
+                            srcAccess = AccessMode::readSequential;
+                            break;
+                        default:
+                            throwUnexpected();
+                    }
+                    srcAccess |= AccessMode::external; // because the physical files are read by different processes (i.e. dafilesrv/ftslave)
+                    srcFile.setown(wsdfs::lookup(tmp.str(),userdesc, srcAccess, false, false, nullptr, true, INFINITE));
 
                     if (!srcFile)
                         throw MakeStringException(-1,"Source file %s could not be found",tmp.str());
@@ -1237,20 +1550,18 @@ public:
                     oldRoxiePrefix.set(srcFile->queryAttributes().queryProp("@roxiePrefix"));
                     kind.set(srcFile->queryAttributes().queryProp("@kind"));
 
-                    // keys default wrap for copy
-                    if (destination->getWrap()||(iskey&&(cmd==DFUcmd_copy)))
-                        destination->setNumPartsOverride(srcFile->numParts());
-
                     if (options->getSubfileCopy())
                         opttree->setPropBool("@compress",srcFile->isCompressed());
 
-                    if (options->getNoCommon())
-                        opttree->setPropBool("@noCommon", true);
+                    opttree->setPropBool("@noCommon", options->getNoCommon());
 
                     if (foreigncopy)
                     {
                         if (options->getPush())
                         {
+#ifdef _CONTAINERIZED
+                            UNIMPLEMENTED_X("CONTAINERIZED(ForeignFileCopy:push)");
+#else
                             // need to set ftslave location
                             StringBuffer progpath;
                             StringBuffer workdir;
@@ -1259,6 +1570,7 @@ public:
                             {
                                 opttree->setProp("@slave",progpath.str());
                             }
+#endif
                         }
                     }
                     if (destination->getMultiCopy()&&!destination->getWrap())
@@ -1266,6 +1578,45 @@ public:
                 }
                 break;
             }
+            // update numPartsOverride & set subDirPerFilePart
+            bool dirPerPart = false;
+            switch (cmd) {
+            case DFUcmd_copymerge:
+            case DFUcmd_copy:
+            case DFUcmd_move:
+            case DFUcmd_rename:
+            case DFUcmd_replicate:
+            case DFUcmd_import:
+            case DFUcmd_export:
+                {
+                    IDFUfileSpec *dst = wu->queryUpdateDestination();
+                    StringBuffer clusterName;
+                    destination->getGroupName(0, clusterName);
+                    Owned<const IPropertyTree> plane = getStoragePlaneConfig(clusterName, false);
+                    if (plane)
+                        dirPerPart = plane->getPropBool("@subDirPerFilePart", isContainerized());
+                    // keys default wrap for copy
+                    if (destination->getWrap()||(iskey&&(cmd==DFUcmd_copy)))
+                    {
+                        unsigned numOverrideParts = destination->getNumPartsOverride();
+                        if (numOverrideParts)
+                        {
+                            if (srcFile->numParts() != numOverrideParts)
+                                throw makeStringExceptionV(-1, "Destination NumPartsOverride is provided but %s", (iskey&&(cmd==DFUcmd_copy))?"not supported when copying a key":"getWrap is true");
+                        }
+                        dst->setNumParts(srcFile->numParts());
+                    }
+                    else if (plane)
+                    {
+                        // use destination defaultSprayParts if requestor doesn't provide num parts
+                        if (plane->hasProp("@defaultSprayParts") && destination->getNumPartsOverride()==0)
+                            dst->setNumParts(plane->getPropInt("@defaultSprayParts"));
+                    }
+                }
+                break;
+            }
+
+            bool ensureLfnAlreadyPublished = false;
             // fill dstfile for commands that need it
             switch (cmd) {
             case DFUcmd_copymerge:
@@ -1283,7 +1634,7 @@ public:
                         tmp.clear().append(tmpdlfn.get());
                         bool iswin;
                         if (!destination->getWindowsOS(iswin)) // would normally know!
-                            {
+                        {
                             // set default OS to cluster 0
                             Owned<IGroup> grp=destination->getGroup(0);
                             if (grp.get())
@@ -1302,12 +1653,6 @@ public:
                                 };
                             }
                         }
-                        if (destination->getWrap())
-                        {
-                            Owned<IFileDescriptor> fdesc = source?source->getFileDescriptor():NULL;
-                            if (fdesc)
-                                destination->setNumPartsOverride(fdesc->numParts());
-                        }
 
                         if (options->getFailIfNoSourceFile())
                             opttree->setPropBool("@failIfNoSourceFile", true);
@@ -1320,6 +1665,9 @@ public:
                         opttree->setPropBool("@quotedTerminator", options->getQuotedTerminator());
 
                         opttree->setPropBool("@nosplit", options->getNoSplit());
+
+                        opttree->setPropBool("@noCommon", options->getNoCommon());
+                        opttree->setProp("@keyCompression", options->queryKeyCompression());
 
                         Owned<IFileDescriptor> fdesc = destination->getFileDescriptor(iskey,options->getSuppressNonKeyRepeats()&&!iskey);
                         if (fdesc)
@@ -1358,7 +1706,7 @@ public:
                             }
                             else if (multiclustermerge)
                             {
-                                dstFile.setown(fdir.lookup(tmp.str(),userdesc,true,false,false,nullptr,defaultPrivilegedUser));
+                                dstFile.setown(wsdfs::lookup(tmp.str(),userdesc,AccessMode::erase,false,false,nullptr,defaultPrivilegedUser,INFINITE));
                                 if (!dstFile)
                                     throw MakeStringException(-1,"Destination for merge %s does not exist",tmp.str());
                                 StringBuffer err;
@@ -1367,9 +1715,17 @@ public:
                             }
                             else
                             {
-                                Owned<IDistributedFile> oldfile = fdir.lookup(tmp.str(),userdesc,true,false,false,nullptr,defaultPrivilegedUser);
+                                Owned<IDistributedFile> oldfile = wsdfs::lookup(tmp.str(),userdesc,AccessMode::erase,false,false,nullptr,defaultPrivilegedUser,INFINITE);
                                 if (oldfile)
                                 {
+                                    if (options->getEnsure())
+                                    {
+                                        // logical file already exists.
+                                        ensureLfnAlreadyPublished = true;
+                                        dstFile.setown(oldfile.getClear());
+                                        dstName.set(tmp);
+                                        break;
+                                    }
                                     StringBuffer reason;
                                     bool canRemove = oldfile->canRemove(reason);
                                     oldfile.clear();
@@ -1377,7 +1733,8 @@ public:
                                         throw MakeStringException(-1,"%s",reason.str());
                                     if (!options->getOverwrite())
                                         throw MakeStringException(-1,"Destination file %s already exists and overwrite not specified",tmp.str());
-                                    if (!fdir.removeEntry(tmp.str(),userdesc))
+                                    DFSAuditContext removeAuditContext = buildOperationAuditContext(baseAuditContext, "REMOVE", tmp.str(), nullptr);
+                                    if (!fdir.removeEntry(tmp.str(),userdesc,nullptr,INFINITE,false,removeAuditContext))
                                         throw MakeStringException(-1,"Internal error in attempt to remove file %s",tmp.str());
                                 }
                             }
@@ -1392,6 +1749,10 @@ public:
                                 fdesc->queryProperties().setProp("@kind", "key");
                             else if (kind.length()) // JCSMORE may not really need separate "if (iskey)" line above
                                 fdesc->queryProperties().setProp("@kind", kind);
+
+                            if (dirPerPart && fdesc->numParts()>1)
+                                fdesc->setFlags(FileDescriptorFlags::dirperpart);
+
                             if (multiclusterinsert||multiclustermerge)
                                 multifdesc.setown(fdesc.getClear());
                             else
@@ -1423,13 +1784,25 @@ public:
                         if (diffNameSrc.get()||diffNameDst.get())
                         {
                             Owned<IFileDescriptor> oldf;
-                            oldf.setown(queryDistributedFileDirectory().getFileDescriptor(diffNameSrc,foreigncopy?foreignuserdesc:userdesc,foreigncopy?foreigndalinode:NULL));
+                            CDfsLogicalFileName oldSrcName;
+                            oldSrcName.set(diffNameSrc);
+                            if (foreigncopy && foreigndalinode && !oldSrcName.isForeign())
+                                oldSrcName.setForeign(foreigndalinode->endpoint(), false);
+
+                            Owned<IDistributedFile> oldSrcFile = wsdfs::lookup(oldSrcName, foreigncopy?foreignuserdesc:userdesc, AccessMode::readRandom, false, false, nullptr, false, INFINITE);
+                            if (oldSrcFile)
+                                oldf.setown(oldSrcFile->getFileDescriptor());
                             if (!oldf.get())
                             {
                                 StringBuffer s;
                                 throw MakeStringException(-1,"Old key file %s could not be found in source",diffNameSrc.get());
                             }
-                            olddstf.setown(queryDistributedFileDirectory().getFileDescriptor(diffNameDst,userdesc,NULL));
+
+                            CDfsLogicalFileName oldDstName;
+                            oldDstName.set(diffNameDst);
+                            Owned<IDistributedFile> oldDstFile = wsdfs::lookup(oldDstName, userdesc, AccessMode::writeSequential, false, false, nullptr, false, INFINITE);
+                            if (oldDstFile)
+                                olddstf.setown(oldDstFile->getFileDescriptor());
                             if (!olddstf.get())
                             {
                                 StringBuffer s;
@@ -1457,7 +1830,7 @@ public:
                         if (needrep)
                             feedback.repmode=cProgressReporter::REPbefore;
                         if (foreigncopy)
-                            checkPhysicalFilePermissions(srcFdesc,userdesc,false);
+                            checkForeignFilePermissions(source,srcFdesc,userdesc);
                         if (patchf) { // patch assumes only 1 cluster
                             // need to create dstpatchf
                             StringBuffer gname;
@@ -1480,32 +1853,32 @@ public:
                             default:
                                 os = DFD_OSdefault;
                             };
-                            Owned<IFileDescriptor> dstpatchf = createFileDescriptor(lname.str(),grp,NULL,os,patchf->numParts());
+                            Owned<IFileDescriptor> dstpatchf = createFileDescriptor(lname.str(), gname.str(), patchf->numParts());
                             fsys.transfer(patchf, dstpatchf, NULL, NULL, NULL, opttree, &feedback, &abortnotify, dfuwuid);
                             removePartFiles(patchf);
                             Owned<IFileDescriptor> newf = dstFile->getFileDescriptor();
                             doKeyPatch(olddstf,newf,dstpatchf);
                             removePartFiles(dstpatchf);
                             if (!abortnotify.abortRequested()) {
+                                DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "COPYDIFF", srcName.get(), dstName.get());
                                 if (needrep)
                                     replicating = true;
                                 else
-                                    dstFile->attach(dstName.get(), userdesc);
-                                Audit("COPYDIFF",userdesc,srcName.get(),dstName.get());
+                                    dstFile->attach(dstName.get(), userdesc, opAuditContext);
                             }
                         }
-                        else if (foreigncopy||auxfdesc)
+                        else if (remotecopy||foreigncopy||auxfdesc)
                         {
                             IFileDescriptor * srcDesc = (auxfdesc.get() ? auxfdesc.get() : srcFdesc.get());
                             fsys.import(srcDesc, dstFile, recovery, recoveryconn, filter, opttree, &feedback, &abortnotify, dfuwuid);
 
                             if (!abortnotify.abortRequested())
                             {
+                                DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "COPY", srcName.get(), dstName.get());
                                 if (needrep)
                                     replicating = true;
                                 else
-                                    dstFile->attach(dstName.get(), userdesc);
-                                Audit("COPY",userdesc,srcName.get(),dstName.get());
+                                    dstFile->attach(dstName.get(), userdesc, opAuditContext);
                             }
                         }
                         else if (multiclusterinsert||multiclustermerge) {
@@ -1520,17 +1893,44 @@ public:
                                         multifdesc->getClusterGroupName(0,cname,&queryNamedGroupStore());
                                     (multiclusterinsert?srcFile:dstFile)->addCluster(cname.str(),multifdesc->queryPartDiskMapping(0));
                                 }
-                                Audit(multiclusterinsert?"COPY":"COPYMERGE",userdesc,srcFile?srcName.str():NULL,dstName.get());
+                                const char *action = multiclusterinsert?"COPY":"COPYMERGE";
+                                DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, action, srcFile?srcName.str():NULL, dstName.get());
+                                Audit(opAuditContext, action);
                             }
                         }
                         else {
-                            fsys.copy(srcFile,dstFile,recovery, recoveryconn, filter, opttree, &feedback, &abortnotify, dfuwuid);
-                            if (!abortnotify.abortRequested()) {
-                                if (needrep)
-                                    replicating = true;
+                            bool performCopy = true;
+                            if (options->getEnsure())
+                            {
+                                if (ensureLfnAlreadyPublished)
+                                    performCopy = false;
                                 else
-                                    dstFile->attach(dstName.get(),userdesc);
-                                Audit("COPY",userdesc,srcFile?srcName.str():NULL,dstName.get());
+                                {
+                                    if (dstFile->existsPhysicalPartFiles(0))
+                                    {
+                                        DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "ATTACH", srcFile?srcName.str():nullptr, dstName.get());
+                                        dstFile->attach(dstName.get(), userdesc, opAuditContext.nested());
+                                        performCopy = false;
+                                    }
+                                }
+                                if (!performCopy)
+                                {
+                                    feedback.repmode=cProgressReporter::REPnone;
+                                    feedback.displaySummary(nullptr, 0);
+                                    DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "ATTACH", srcFile?srcName.str():nullptr, dstName.get());
+                                    Audit(opAuditContext, "ATTACH");
+                                }
+                            }
+                            if (performCopy)
+                            {
+                                fsys.copy(srcFile,dstFile,recovery, recoveryconn, filter, opttree, &feedback, &abortnotify, dfuwuid);
+                                if (!abortnotify.abortRequested()) {
+                                    DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "COPY", srcFile?srcName.str():NULL, dstName.get());
+                                    if (needrep)
+                                        replicating = true;
+                                    else
+                                        dstFile->attach(dstName.get(),userdesc, opAuditContext);
+                                }
                             }
                         }
                         runningconn.clear();
@@ -1541,9 +1941,9 @@ public:
                 {
                     source->getLogicalName(tmp.clear());
                     if (tmp.length()) {
+                        DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "REMOVE", tmp.str(), NULL);
                         runningconn.setown(setRunning(runningpath.str()));;
-                        fdir.removeEntry(tmp.str(),userdesc);
-                        Audit("REMOVE",userdesc,tmp.clear(),NULL);
+                        fdir.removeEntry(tmp.str(),userdesc,nullptr,INFINITE,false,opAuditContext);
                         runningconn.clear();
                     }
                     else {
@@ -1557,8 +1957,9 @@ public:
                     fsys.move(srcFile,dstFile,recovery, recoveryconn, filter, opttree, &feedback, &abortnotify, dfuwuid);
                     runningconn.clear();
                     if (!abortnotify.abortRequested()) {
-                        dstFile->attach(dstName.get(),userdesc);
-                        Audit("MOVE",userdesc,srcFile?srcName.str():NULL,dstName.get());
+                        DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "MOVE", srcFile?srcName.str():NULL, dstName.get());
+                        dstFile->attach(dstName.get(),userdesc, opAuditContext.nested());
+                        Audit(opAuditContext, "MOVE");
                     }
                 }
                 break;
@@ -1569,7 +1970,7 @@ public:
                     destination->getLogicalName(toname);
                     if (toname.length()) {
                         unsigned start = msTick();
-                        Owned<IDistributedFile> newfile = fdir.lookup(toname.str(),userdesc,true,false,false,nullptr,defaultPrivilegedUser);
+                        Owned<IDistributedFile> newfile = wsdfs::lookup(toname.str(),userdesc,AccessMode::erase,false,false,nullptr,defaultPrivilegedUser,INFINITE);
                         if (newfile) {
                             // check for rename into multicluster
                             CDfsLogicalFileName dstlfn;
@@ -1581,11 +1982,11 @@ public:
                         StringBuffer fromname(srcName);
                         srcFile.clear();
                         srcFdesc.clear();
-                        queryDistributedFileDirectory().renamePhysical(fromname.str(),toname.str(),userdesc,NULL);
+                        DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "RENAME", fromname.str(), toname.str());
+                        queryDistributedFileDirectory().renamePhysical(fromname.str(),toname.str(),userdesc,NULL, opAuditContext);
                         StringBuffer timetaken;
                         timetaken.appendf("%dms",msTick()-start);
                         progress->setDone(timetaken.str(),0,true);
-                        Audit("RENAME",userdesc,fromname.str(),toname.str());
                     }
                     else {
                         throw MakeStringException(-1,"No target name specified for rename");
@@ -1615,7 +2016,8 @@ public:
                     fsys.replicate(srcFdesc.get(), mode, recovery, recoveryconn, filter, opttree, &feedback, &abortnotify, dfuwuid);
                     runningconn.clear();
                     if (!abortnotify.abortRequested()) {
-                        Audit("REPLICATE",userdesc,srcFile?srcName.str():NULL,NULL);
+                        DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "REPLICATE", srcFile?srcName.str():NULL, NULL);
+                        Audit(opAuditContext, "REPLICATE");
                         // srcFile->queryPartDiskMapping(0).maxCopies = 2;   // ** TBD ?
                     }
                 }
@@ -1625,7 +2027,7 @@ public:
                     if (!replicating) {
                         runningconn.setown(setRunning(runningpath.str()));
                         Owned<IFileDescriptor> fdesc = source->getFileDescriptor();
-                        checkPhysicalFilePermissions(fdesc,userdesc,false);
+                        checkPlaneFilePermissions(fdesc,userdesc,false);
                         checkSourceTarget(fdesc);
                         bool needrep = options->getReplicate();
                         ClusterPartDiskMapSpec mspec;
@@ -1635,7 +2037,7 @@ public:
                                 if (!mspec.isReplicated())
                                     needrep = false;
                             }
-#ifndef _DEBUG
+#if !defined(_DEBUG) &&  !defined(_CONTAINERIZED)
                             StringBuffer gname;
                             if (!destination->getRemoteGroupOverride()&&!testLocalCluster(destination->getGroupName(0,gname).str())) {
                                 throw MakeStringException(-1,"IMPORT cluster %s is not recognized locally",gname.str());
@@ -1647,11 +2049,11 @@ public:
                         fsys.import(fdesc, dstFile, recovery, recoveryconn, filter, opttree, &feedback, &abortnotify, dfuwuid);
                         if (!abortnotify.abortRequested())
                         {
+                            DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "IMPORT", dstName.get(), NULL);
                             if (needrep && !recovery->getPropBool("@noFileMatch"))
                                 replicating = true;
                             else
-                                dstFile->attach(dstName.get(), userdesc);
-                            Audit("IMPORT",userdesc,dstName.get(),NULL);
+                                dstFile->attach(dstName.get(), userdesc, opAuditContext);
                         }
                         runningconn.clear();
                     }
@@ -1661,19 +2063,20 @@ public:
                 {
                     runningconn.setown(setRunning(runningpath.str()));
                     Owned<IFileDescriptor> fdesc = destination->getFileDescriptor(iskey);
-                    checkPhysicalFilePermissions(fdesc,userdesc,true);
+                    checkPlaneFilePermissions(fdesc,userdesc,true);
                     checkSourceTarget(fdesc);
                     fsys.exportFile(srcFile, fdesc, recovery, recoveryconn, filter, opttree, &feedback, &abortnotify, dfuwuid);
                     if (!abortnotify.abortRequested()) {
-                        Audit("EXPORT",userdesc,srcFile?srcName.str():NULL,NULL);
+                        DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "EXPORT", srcFile?srcName.str():NULL, NULL);
+                        Audit(opAuditContext, "EXPORT");
                     }
                     runningconn.clear();
                 }
                 break;
             case DFUcmd_add:
                 {
-                    dstFile->attach(dstName.get(),userdesc);
-                    Audit("ADD",userdesc,dstName.get(),NULL);
+                    DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "ADD", dstName.get(), NULL);
+                    dstFile->attach(dstName.get(),userdesc, opAuditContext);
                 }
                 break;
             case DFUcmd_transfer:
@@ -1685,7 +2088,8 @@ public:
                     checkPhysicalFilePermissions(dstdesc,userdesc,true);
                     fsys.transfer(srcdesc, dstdesc, recovery, recoveryconn, filter, opttree, &feedback, &abortnotify, dfuwuid);
                     if (!abortnotify.abortRequested()) {
-                        Audit("TRANSFER",userdesc,NULL,NULL);
+                        DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "TRANSFER", NULL, NULL);
+                        Audit(opAuditContext, "TRANSFER");
                     }
                     runningconn.clear();
                 }
@@ -1749,10 +2153,12 @@ public:
                             }
                             else {
                                 //dstFile->queryPartDiskMapping(0).maxCopies = 2;           // dont think this is right ** TBD
-                                dstFile->attach(dstName.get(),userdesc);
+                                DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "REPLICATE", dstName.get(), NULL);
+                                dstFile->attach(dstName.get(),userdesc, opAuditContext.nested());
                             }
                             progress->setDone(NULL,0,true);
-                            Audit("REPLICATE",userdesc,dstName.get(),NULL);
+                            DFSAuditContext opAuditContext = buildOperationAuditContext(baseAuditContext, "REPLICATE", dstName.get(), NULL);
+                            Audit(opAuditContext, "REPLICATE");
                         }
                         runningconn.clear();
                     }
@@ -1778,9 +2184,9 @@ public:
 };
 
 
-IDFUengine *createDFUengine()
+IDFUengine *createDFUengine(const IPropertyTree *config)
 {
-    return new CDFUengine;
+    return new CDFUengine(config);
 }
 
 void stopDFUserver(const char *qname)

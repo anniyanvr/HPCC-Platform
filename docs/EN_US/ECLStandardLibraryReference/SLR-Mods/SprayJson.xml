@@ -10,31 +10,7 @@
       <primary>File.SprayJson</primary>
     </indexterm><indexterm>
       <primary>SprayJson</primary>
-    </indexterm>(</emphasis> <emphasis> sourceIP </emphasis> <emphasis
-  role="bold">, </emphasis> <emphasis>sourcepath , </emphasis> <emphasis
-  role="bold">[</emphasis> <emphasis> maxrecordsize </emphasis> <emphasis
-  role="bold">] </emphasis> <emphasis>, </emphasis> <emphasis role="bold">
-  </emphasis> <emphasis> srcRowPath </emphasis> <emphasis role="bold">
-  </emphasis> <emphasis>, </emphasis> <emphasis role="bold">[</emphasis>
-  <emphasis> srcEncoding </emphasis> <emphasis role="bold">] </emphasis>
-  <emphasis>, </emphasis> <emphasis role="bold"> </emphasis>
-  <emphasis>destinationgroup, destinationlogicalname </emphasis> <emphasis
-  role="bold">[</emphasis> <emphasis>timeout</emphasis> <emphasis
-  role="bold">]</emphasis> <emphasis role="bold"> [</emphasis>
-  <emphasis>espserverIPport</emphasis> <emphasis role="bold">]</emphasis>
-  <emphasis> </emphasis> <emphasis role="bold">[</emphasis>
-  <emphasis>maxConnections</emphasis> <emphasis role="bold">]</emphasis>
-  <emphasis role="bold"> [</emphasis> <emphasis>allowoverwrite</emphasis>
-  <emphasis role="bold">] [</emphasis> <emphasis>replicate</emphasis>
-  <emphasis role="bold">] [</emphasis> <emphasis> compress
-  </emphasis><emphasis role="bold">] </emphasis>, <emphasis
-  role="bold">[</emphasis><emphasis>failIfNoSourceFile</emphasis><emphasis
-  role="bold">]</emphasis>, <emphasis
-  role="bold">[</emphasis><emphasis>expireDays</emphasis><emphasis
-  role="bold">] , </emphasis><emphasis role="bold">[</emphasis>
-  <emphasis>dfuServerQueue</emphasis><emphasis role="bold">] ,
-  </emphasis><emphasis role="bold">[</emphasis>
-  <emphasis>noSplit</emphasis><emphasis role="bold">])</emphasis></para>
+    </indexterm>(</emphasis> <emphasis>sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, sourcePlane, destinationNumParts, noCommon</emphasis> <emphasis role="bold">)</emphasis></para>
 
   <para><emphasis>dfuwuid</emphasis> <emphasis role="bold"> :=
   STD.File.fSprayJson<indexterm>
@@ -43,34 +19,11 @@
       <primary>File.fSprayJson</primary>
     </indexterm><indexterm>
       <primary>fSprayJson</primary>
-    </indexterm>(</emphasis> <emphasis> sourceIP</emphasis> <emphasis
-  role="bold">, </emphasis> <emphasis>sourcepath, </emphasis> <emphasis
-  role="bold">[</emphasis> <emphasis> maxrecordsize </emphasis> <emphasis
-  role="bold">] </emphasis> <emphasis>, </emphasis> <emphasis role="bold">
-  </emphasis> <emphasis>srcRowPath</emphasis> <emphasis role="bold">
-  </emphasis> <emphasis>, </emphasis> <emphasis role="bold">[</emphasis>
-  <emphasis> srcEncoding </emphasis> <emphasis role="bold">] </emphasis>
-  <emphasis>,destinationgroup,</emphasis> <emphasis> destinationlogicalname
-  </emphasis> , <emphasis role="bold">[</emphasis>
-  <emphasis>timeout</emphasis> <emphasis role="bold">] , [</emphasis>
-  <emphasis>espserverIPport</emphasis> <emphasis role="bold">]</emphasis>
-  <emphasis> </emphasis>, <emphasis role="bold"> [</emphasis>
-  <emphasis>maxConnections</emphasis> <emphasis role="bold">] , [</emphasis>
-  <emphasis>allowoverwrite</emphasis> <emphasis role="bold">] , [</emphasis>
-  <emphasis>replicate</emphasis> <emphasis role="bold">] , [</emphasis>
-  <emphasis> compress </emphasis> <emphasis role="bold">] </emphasis>,
-  <emphasis
-  role="bold">[</emphasis><emphasis>failIfNoSourceFile</emphasis><emphasis
-  role="bold">]</emphasis>, <emphasis
-  role="bold">[</emphasis><emphasis>expireDays</emphasis><emphasis
-  role="bold">] , </emphasis><emphasis role="bold">[</emphasis>
-  <emphasis>dfuServerQueue</emphasis><emphasis role="bold">] ,
-  </emphasis><emphasis role="bold">[</emphasis>
-  <emphasis>noSplit</emphasis><emphasis role="bold">])</emphasis></para>
+    </indexterm>(</emphasis> <emphasis>sourceIP, sourcePath, sourceMaxRecordSize, sourceRowPath, sourceEncoding, destinationGroup, destinationLogicalName, timeOut, espServerIpPort, maxConnections, allowOverwrite, replicate, compress, failIfNoSourceFile, expireDays, dfuServerQueue, noSplit, username, userPw, sourcePlane, destinationNumParts, noCommon</emphasis> <emphasis role="bold">)</emphasis></para>
 
   <informaltable colsep="1" frame="all" rowsep="1">
     <tgroup cols="2">
-      <colspec colwidth="80.50pt" />
+      <colspec colwidth="130.50pt" />
 
       <colspec />
 
@@ -83,14 +36,14 @@
         </row>
 
         <row>
-          <entry><emphasis>sourcepath</emphasis></entry>
+          <entry><emphasis>sourcePath</emphasis></entry>
 
           <entry>A null-terminated string containing the path and name of the
           file.</entry>
         </row>
 
         <row>
-          <entry><emphasis>maxrecordsize</emphasis></entry>
+          <entry><emphasis>sourceMaxRecordSize</emphasis></entry>
 
           <entry>Optional. An integer containing the maximum size of the
           records in the file. If omitted, the default is 8192.</entry>
@@ -104,7 +57,7 @@
         </row>
 
         <row>
-          <entry><emphasis>srcEncoding</emphasis></entry>
+          <entry><emphasis>sourceEncoding</emphasis></entry>
 
           <entry>Optional. A null-terminated string containing the encoding
           (utf8,utf8n,utf16be,utf16le,utf32be,utf32le). If omitted, the
@@ -112,21 +65,21 @@
         </row>
 
         <row>
-          <entry><emphasis>destinationgroup</emphasis></entry>
+          <entry><emphasis>destinationGroup</emphasis></entry>
 
           <entry>A null-terminated string containing the name of the group to
           distribute the file across.</entry>
         </row>
 
         <row>
-          <entry><emphasis>destinationlogicalname</emphasis></entry>
+          <entry><emphasis>destinationLogicalName</emphasis></entry>
 
           <entry>A null-terminated string containing the logical name of the
           file to create.</entry>
         </row>
 
         <row>
-          <entry><emphasis>timeout</emphasis></entry>
+          <entry><emphasis>timeOut</emphasis></entry>
 
           <entry>Optional. An integer value indicating the timeout setting. If
           omitted, the default is -1. If set to zero (0), execution control
@@ -135,24 +88,27 @@
         </row>
 
         <row>
-          <entry><emphasis>espserverIPport</emphasis></entry>
+          <entry><emphasis>espServerIpPort</emphasis></entry>
 
-          <entry>Optional. A null-terminated string containing the protocol,
-          IP, port, and directory, or the DNS equivalent, of the ESP server
-          program. This is usually the same IP and port as ECL Watch, with
-          "/FileSpray" appended. If omitted, the default is the value
-          contained in the lib_system.ws_fs_server attribute.</entry>
+          <entry>Optional. This should almost always be omitted, which then
+          defaults to the value contained in the lib_system.ws_fs_server
+          attribute. When not omitted, it should be a null-terminated string
+          containing the protocol, IP, port, and directory, or the DNS
+          equivalent, of the ESP server program. This is usually the same IP
+          and port as ECL Watch, with "/FileSpray" appended.</entry>
         </row>
 
         <row>
           <entry><emphasis>maxConnections</emphasis></entry>
 
           <entry>Optional. An integer specifying the maximum number of
-          connections. If omitted, the default is one (1).</entry>
+          connections. If omitted, the default is -1, which indicates the
+          system chooses a suitable default based on the size of the
+          cluster.</entry>
         </row>
 
         <row>
-          <entry><emphasis>allowoverwrite</emphasis></entry>
+          <entry><emphasis>allowOverwrite</emphasis></entry>
 
           <entry>Optional. A boolean TRUE or FALSE flag indicating whether to
           allow the new file to overwrite an existing file of the same name.
@@ -170,7 +126,9 @@
           <entry><emphasis>compress</emphasis></entry>
 
           <entry>Optional. A boolean TRUE or FALSE flag indicating whether to
-          compress the new file. If omitted, the default is FALSE.</entry>
+          compress the new file. If omitted, the default is TRUE in a
+          containerized deployment and FALSE in a bare-metal
+          deployment.</entry>
         </row>
 
         <row>
@@ -205,6 +163,31 @@
           <entry>Optional. A boolean TRUE or FALSE flag indicating to not
           split a file part to multiple target parts. Default is
           FALSE.</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>noCommon</emphasis></entry>
+
+          <entry>Optional. A boolean TRUE or FALSE flag for "commoning up" of
+          pull or push processes on same host. Set to FALSE to "common up" the
+          operation on same host. Default can be set in configuration. Use
+          <link linkend="GetNoCommonDefault">GetNoCommonDefault</link> to
+          retrieve default setting. The value of this parameter can have a
+          significant impact on performance.</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>sourcePlane</emphasis></entry>
+
+          <entry>The name of the landing zone containing the file</entry>
+        </row>
+
+        <row>
+          <entry><emphasis>destinationNumParts</emphasis></entry>
+
+          <entry>Override the number of parts to be created when spraying. The
+          default is 0 which means it will create the same number of parts as
+          the target cluster.</entry>
         </row>
 
         <row>

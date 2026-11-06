@@ -52,7 +52,7 @@ roxie:
   numChannels: 1
   queueNames: roxie.roxie
   logging:
-    detail: 100
+    queueDrop: 32
 )!!";
 
 int main(int argc, const char *argv[])

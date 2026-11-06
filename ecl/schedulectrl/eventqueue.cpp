@@ -172,7 +172,7 @@ private:
     Owned<IScheduleReader> schedule;
     Owned<ICronTable> crontab;
     bool more;
-    Semaphore waiter;
+    Semaphore waiter{SYNC_LOCATION};
 };
 
 class CScheduleEventProcessor : public CInterface, implements IScheduleEventProcessor
@@ -189,8 +189,8 @@ public:
 
     virtual void start()
     {
-        puller->start();
-        timer->start();
+        puller->start(false);
+        timer->start(false);
     }
 
     virtual void stop()

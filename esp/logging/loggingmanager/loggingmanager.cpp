@@ -20,6 +20,9 @@
 #include "loggingmanager.hpp"
 #include "compressutil.hpp"
 
+#include "logconfigptree.hpp"
+using namespace LogConfigPTree;
+
 CLoggingManager::~CLoggingManager(void)
 {
     for (unsigned int x = 0; x < loggingAgentThreads.size(); x++)
@@ -41,13 +44,13 @@ bool CLoggingManager::init(IPropertyTree* cfg, const char* service)
     }
 
     StringAttr failSafeLogsDir;
-    decoupledLogging = cfg->getPropBool(PropDecoupledLogging, false);
-    oneTankFile = cfg->getPropBool("FailSafe", true);
+    decoupledLogging = getConfigValue<bool>(cfg, PropDecoupledLogging, false);
+    oneTankFile = getConfigValue<bool>(cfg, "FailSafe", true);
     if (decoupledLogging)
     {   //Only set the failSafeLogsDir for decoupledLogging.
         //The failSafeLogsDir tells a logging agent to work as a decoupledLogging agent,
         //as well as where to read the tank file.
-        const char* logsDir = cfg->queryProp(PropFailSafeLogsDir);
+        const char* logsDir = queryConfigValue(cfg, PropFailSafeLogsDir);
         if (!isEmptyString(logsDir))
             failSafeLogsDir.set(logsDir);
         else
@@ -191,6 +194,10 @@ bool CLoggingManager::updateLog(IEspContext* espContext, const char* option, IPr
         Owned<IPropertyTree> espContextTree;
         if (espContext)
         {
+            double responseTime = (msTick() - espContext->queryCreationTime()) / 1000.0;
+            CDateTime when;
+            when.setNow();
+
             espContextTree.setown(createPTree("ESPContext"));
 
             short port;
@@ -208,7 +215,16 @@ bool CLoggingManager::updateLog(IEspContext* espContext, const char* option, IPr
             if (userId && *userId)
                 espContextTree->addProp("UserName", userId);
 
-            espContextTree->addProp("ResponseTime", VStringBuffer("%.4f", (msTick()-espContext->queryCreationTime())/1000.0));
+            espContextTree->addProp("ResponseTime", VStringBuffer("%.4f", responseTime));
+            StringBuffer whenStr;
+            when.getString(whenStr);
+            espContextTree->addProp("TransactionEnd", whenStr);
+            if (responseTime > 1.0)
+            {
+                when.adjustTimeSecs(-int(responseTime));
+                when.getString(whenStr.clear());
+            }
+            espContextTree->addProp("TransactionStart", whenStr);
         }
         Owned<IEspUpdateLogRequestWrap> req =  new CUpdateLogRequestWrap(nullptr, option, espContextTree.getClear(), LINK(userContext), LINK(userRequest),
             backEndReq, backEndResp, userResp, logDatasets);
@@ -260,20 +276,19 @@ bool CLoggingManager::updateLog(IEspContext* espContext, IEspUpdateLogRequestWra
             if (!saveToTankFile(req, reqInFile))
                 throw MakeStringException(-1, "LoggingManager: failed in saveToTankFile().");
 
-            //Build new log request for logging agents
-            StringBuffer logContent, v;
-            appendXMLOpenTag(logContent, LOGCONTENTINFILE);
-            appendXMLTag(logContent, LOGCONTENTINFILE_FILENAME, reqInFile->getFileName());
-            appendXMLTag(logContent, LOGCONTENTINFILE_FILEPOS, v.append(reqInFile->getPos()));
-            appendXMLTag(logContent, LOGCONTENTINFILE_FILESIZE, v.clear().append(reqInFile->getSize()));
-            appendXMLTag(logContent, LOGREQUEST_GUID, reqInFile->getGUID());
-            appendXMLCloseTag(logContent, LOGCONTENTINFILE);
-
-            Owned<IEspUpdateLogRequest> logRequest = new CUpdateLogRequest("", "");
-            logRequest->setOption(reqInFile->getOption());
-            logRequest->setLogContent(logContent);
             if (!decoupledLogging)
             {
+                //Build new log request for logging agents
+                StringBuffer logContent, v;
+                appendXMLTag(logContent, LOGCONTENTINFILE_FILENAME, reqInFile->getFileName());
+                appendXMLTag(logContent, LOGCONTENTINFILE_FILEPOS, v.append(reqInFile->getPos()));
+                appendXMLTag(logContent, LOGCONTENTINFILE_FILESIZE, v.clear().append(reqInFile->getSize()));
+                appendXMLTag(logContent, LOGREQUEST_GUID, reqInFile->getGUID());
+
+                Owned<IEspUpdateLogRequest> logRequest = new CUpdateLogRequest("", "");
+                logRequest->setOption(reqInFile->getOption());
+                logRequest->setLogContent(logContent);
+
                 for (unsigned int x = 0; x < loggingAgentThreads.size(); x++)
                 {
                     IUpdateLogThread* loggingThread = loggingAgentThreads[x];
@@ -375,7 +390,32 @@ unsigned CLoggingManager::serializeLogRequestContent(IEspUpdateLogRequestWrap* r
     return logData.length();
 }
 
-bool CLoggingManager::getTransactionSeed(StringBuffer& transactionSeed, StringBuffer& status)
+bool CLoggingManager::hasFilteredService(LOGServiceType service, EspLogAgentIdFilter agentIdFilter) const
+{
+    if (!initialized)
+        throw MakeStringException(-1,"LoggingManager not initialized");
+    if (!agentIdFilter)
+        agentIdFilter = defaultIdFilter;
+
+    try
+    {
+        for (IUpdateLogThread* lat : loggingAgentThreads)
+        {
+            if (lat->hasService(service) && checkAgentIdFilter(lat->getLogAgent(), agentIdFilter))
+                return true;
+        }
+    }
+    catch (IException* e)
+    {
+        StringBuffer errorStr;
+        e->errorMessage(errorStr);
+        OERRLOG("Failed to test service availability: %s",errorStr.str());
+        e->Release();
+    }
+    return false;
+}
+
+bool CLoggingManager::getFilteredTransactionSeed(StringBuffer& transactionSeed, StringBuffer& status, EspLogAgentIdFilter agentIdFilter)
 {
     if (!initialized)
         throw MakeStringException(-1,"LoggingManager not initialized");
@@ -387,7 +427,7 @@ bool CLoggingManager::getTransactionSeed(StringBuffer& transactionSeed, StringBu
         Owned<IEspGetTransactionSeedResponse> resp =  createGetTransactionSeedResponse();
         transactionSeed.set("Seed");
 
-        bRet = getTransactionSeed(*req, *resp);
+        bRet = getFilteredTransactionSeed(*req, *resp, agentIdFilter);
         if (bRet && !resp->getStatusCode())
         {
             const char* seed = resp->getSeedId();
@@ -420,25 +460,23 @@ bool CLoggingManager::getTransactionSeed(StringBuffer& transactionSeed, StringBu
     return bRet;
 }
 
-
-bool CLoggingManager::getTransactionSeed(IEspGetTransactionSeedRequest& req, IEspGetTransactionSeedResponse& resp)
+bool CLoggingManager::getFilteredTransactionSeed(IEspGetTransactionSeedRequest& req, IEspGetTransactionSeedResponse& resp, EspLogAgentIdFilter agentIdFilter)
 {
     if (!initialized)
         throw MakeStringException(-1,"LoggingManager not initialized");
+    if (!agentIdFilter)
+        agentIdFilter = defaultIdFilter;
 
-    bool bRet = false;
     try
     {
-        for (unsigned int x = 0; x < loggingAgentThreads.size(); x++)
+        for (IUpdateLogThread* lat : loggingAgentThreads)
         {
-            IUpdateLogThread* loggingThread = loggingAgentThreads[x];
-            if (!loggingThread->hasService(LGSTGetTransactionSeed))
+            if (!lat->hasService(LGSTGetTransactionSeed))
                 continue;
 
-            IEspLogAgent* loggingAgent = loggingThread->getLogAgent();
-            bRet = loggingAgent->getTransactionSeed(req, resp);
-            if (bRet)
-                break;
+            IEspLogAgent* agent = lat->getLogAgent();
+            if (checkAgentIdFilter(agent, agentIdFilter) && agent->getTransactionSeed(req, resp))
+                return true;
         }
     }
     catch (IException* e)
@@ -450,28 +488,33 @@ bool CLoggingManager::getTransactionSeed(IEspGetTransactionSeedRequest& req, IEs
         resp.setStatusMessage(errorStr.str());
         e->Release();
     }
-
-    return bRet;
+    return false;
 }
 
-bool CLoggingManager::getTransactionID(StringAttrMapping* transFields, StringBuffer& transactionID, StringBuffer& status)
+bool CLoggingManager::getFilteredTransactionID(StringAttrMapping* transFields, StringBuffer& transactionID, StringBuffer& status, EspLogAgentIdFilter agentIdFilter)
 {
     if (!initialized)
         throw MakeStringException(-1,"LoggingManager not initialized");
+    if (!agentIdFilter)
+        agentIdFilter = defaultIdFilter;
 
     try
     {
-        for (unsigned int x = 0; x < loggingAgentThreads.size(); x++)
+        for (IUpdateLogThread* lat : loggingAgentThreads)
         {
-            IUpdateLogThread* loggingThread = loggingAgentThreads[x];
-            if (!loggingThread->hasService(LGSTGetTransactionID))
+            if (!lat->hasService(LGSTGetTransactionID))
                 continue;
 
-            IEspLogAgent* loggingAgent = loggingThread->getLogAgent();
-            loggingAgent->getTransactionID(transFields, transactionID);
-            if (!transactionID.isEmpty())
-                ESPLOG(LogMax, "Got TransactionID '%s'", transactionID.str());
-            return true;
+            IEspLogAgent* agent = lat->getLogAgent();
+            if (checkAgentIdFilter(agent, agentIdFilter))
+            {
+                agent->getTransactionID(transFields, transactionID);
+                if (!transactionID.isEmpty())
+                {
+                    ESPLOG(LogMax, "Got TransactionID '%s'", transactionID.str());
+                    return true;
+                }
+            }
         }
     }
     catch (IException* e)
@@ -480,6 +523,38 @@ bool CLoggingManager::getTransactionID(StringAttrMapping* transFields, StringBuf
         e->Release();
     }
 
+    return false;
+}
+
+bool CLoggingManager::checkAgentIdFilter(const IEspLogAgent* agent, EspLogAgentIdFilter agentIdFilter) const
+{
+    if (!agent)
+        return false;
+    if (!agentIdFilter)
+        return true;
+    const char* agentName = nullptr; // used for error reporting
+    try
+    {
+        Owned<IEspLogAgentVariantIterator> variants(agent->getVariants());
+        ForEach(*variants)
+        {
+            const IEspLogAgentVariant& variant = variants->query();
+            if (!agentName)
+                agentName = variant.getName();
+            if (agentIdFilter(variant))
+                return true;
+        }
+    }
+    catch (IException* e)
+    {
+        StringBuffer msg;
+        IERRLOG("variant predicate exception evaluating agent '%s': %s", agentName, e->errorMessage(msg).str());
+        e->Release();
+    }
+    catch(...)
+    {
+        IERRLOG("variant predicate exception evaluating agent '%s'", agentName);
+    }
     return false;
 }
 

@@ -25,6 +25,21 @@ ESPenum DFUWUActions : string
     Archive("Archive"),
 };
 
+ESPenum DFUCommand : string
+{
+    Copy("copy"),
+    Remove("remove"),
+    Move("move"),
+    Rename("rename"),
+    Replicate("replicate"),
+    Import("import"),
+    Export("export"),
+    Monitor("monitor"),
+    CopyMerge("copymerge"),
+    SuperCopy("supercopy"),
+    Publish("publish"),
+};
+
 ESPStruct [nil_remove] DFUWorkunit
 {
     string ID;
@@ -77,6 +92,7 @@ ESPStruct [nil_remove] DFUWorkunit
     string TimeStarted;
     string TimeStopped;
     string StateMessage;
+    [min_ver("1.29")] string StateReason;
 
     // Monitor
     string MonitorEventName;
@@ -95,6 +111,10 @@ ESPStruct [nil_remove] DFUWorkunit
     [min_ver("1.10")] bool quotedTerminator(true);
     [min_ver("1.12")] bool preserveCompression(true);
     [min_ver("1.14")] int expireDays;
+    [min_ver("1.21")] bool PreserveFileParts;
+    [min_ver("1.23")] double FileAccessCost;
+    [min_ver("1.25")] int KbPerSecAve;
+    [min_ver("1.25")] int KbPerSec;
 };
 
 ESPStruct [nil_remove] GroupNode
@@ -140,7 +160,9 @@ ESPrequest GetDFUWorkunits
     string Owner;
     string Cluster;
     string StateReq;
-    [min_ver("1.03")] string Type;
+    [min_ver("1.03"), depr_ver("1.29")] string Type;
+    [min_ver("1.29")] ESPenum DFUCommand Command;
+    [min_ver("1.29")] bool Archived(false);
     [min_ver("1.03")] string Jobname;
 
     int64 PageSize;
@@ -149,6 +171,11 @@ ESPrequest GetDFUWorkunits
     string Sortby;
     bool Descending(false);
     int64 CacheHint(-1);
+    string ParentWuid;
+    string PublisherWuid;
+    [min_ver("1.24")] bool includeProgressMessages(false);
+    [min_ver("1.25")] bool includeTimings(false);
+    [min_ver("1.25")] bool includeTransferRate(false);
 };
 
 ESPresponse [encode(0), exceptions_inline]
@@ -156,7 +183,9 @@ GetDFUWorkunitsResponse
 {
     ESParray<ESPstruct DFUWorkunit> results;
 
-    [min_ver("1.03")] string Type;
+    [min_ver("1.03"), depr_ver("1.29")] string Type;
+    [min_ver("1.29")] ESPenum DFUCommand Command;
+    [min_ver("1.29")] bool Archived;
     string Owner;
     string Cluster;
     string StateReq;
@@ -214,6 +243,18 @@ ESPrequest CreateDFUWorkunit
 
 ESPresponse [exceptions_inline]
 CreateDFUWorkunitResponse
+{
+    ESPstruct DFUWorkunit result;
+};
+
+ESPrequest CreateDFUPublisherWorkunit
+{
+    string DFUServerQueue;
+};
+
+ESPresponse [exceptions_inline]
+
+CreateDFUPublisherWorkunitResponse
 {
     ESPstruct DFUWorkunit result;
 };
@@ -299,6 +340,7 @@ GetDFUExceptionsResponse
 ESPrequest [nil_remove] SprayFixed
 {
     string sourceIP;
+    [min_ver("1.22")] string sourcePlane;
     string sourcePath;
     binary srcxml;
     [min_ver("1.09")] string sourceFormat;
@@ -306,6 +348,7 @@ ESPrequest [nil_remove] SprayFixed
 
     string destGroup;
     string destLogicalName;
+    [min_ver("1.25")] int destNumParts(0);
     bool   overwrite;
     bool   replicate;
     int    ReplicateOffset(1);
@@ -344,6 +387,7 @@ SprayFixedResponse
 ESPrequest [nil_remove] SprayVariable
 {
     string sourceIP;
+    [min_ver("1.22")] string sourcePlane;
     string sourcePath;
     binary srcxml;
 
@@ -358,6 +402,7 @@ ESPrequest [nil_remove] SprayVariable
 
     string destGroup;
     string destLogicalName;
+    [min_ver("1.25")] int destNumParts(0);
     bool   overwrite;
     bool   replicate;
     int    ReplicateOffset(1);
@@ -414,10 +459,12 @@ ReplicateResponse
 
 ESPrequest Despray
 {
+    string destGroup;
     string sourceLogicalName;
 
     string destIP;
     string destPath;
+    [min_ver("1.22")] string destPlane;
     binary dstxml;
     bool   overwrite;
 
@@ -454,6 +501,7 @@ ESPrequest [nil_remove] Copy
     string srcusername;
     string srcpassword;
     bool   overwrite;
+    bool   ensure;
     bool   replicate;
     int    ReplicateOffset(1);
 
@@ -480,6 +528,10 @@ ESPrequest [nil_remove] Copy
     [min_ver("1.12")] bool preserveCompression(true);
     [min_ver("1.14")] string DFUServerQueue;
     [min_ver("1.17")] int ExpireDays;
+    [min_ver("1.27")] string KeyCompression;
+
+    // Overrides destination part count; 0 = use system/default destination part count
+    [min_ver("1.28")] int DestNumParts(0);
 };
 
 ESPresponse [exceptions_inline]
@@ -526,6 +578,7 @@ ESPresponse [exceptions_inline] DFUWUFileResponse
 
 ESPrequest FileListRequest
 {
+    [min_ver("1.24")] string DropZoneName;
     string Netaddr;
     string Path;
     string Mask;
@@ -536,6 +589,7 @@ ESPrequest FileListRequest
 ESPStruct PhysicalFileStruct
 {
     string name;
+    [min_ver("1.23")] string Server;
     bool isDir;
     int64 filesize;
     string modifiedtime;
@@ -685,9 +739,20 @@ ESPresponse [exceptions_inline, nil_remove] GetDFUServerQueuesResponse
     ESParray<string> Names;
 };
 
+ESPrequest GetRemoteTargetsRequest
+{
+};
+
+ESPresponse [exceptions_inline, nil_remove] GetRemoteTargetsResponse
+{
+    ESParray<string> TargetNames;
+    bool             AllowForeign;
+};
+
 ESPservice [
     auth_feature("DEFERRED"),
-    version("1.20"),
+    version("1.29"),
+    default_client_version("1.29"),
     exceptions_inline("./smc_xslt/exceptions.xslt")] FileSpray
 {
     ESPmethod EchoDateTime(EchoDateTime, EchoDateTimeResponse);
@@ -698,6 +763,7 @@ ESPservice [
     ESPmethod [resp_xsl_default("/esp/xslt/dfu_progress.xslt")] GetDFUProgress(ProgressRequest, ProgressResponse);
 
     ESPmethod [resp_xsl_default("/esp/xslt/dfu_wuid.xslt")] CreateDFUWorkunit(CreateDFUWorkunit, CreateDFUWorkunitResponse);
+    ESPmethod CreateDFUPublisherWorkunit(CreateDFUPublisherWorkunit, CreateDFUPublisherWorkunitResponse);
     ESPmethod [resp_xsl_default("/esp/xslt/dfu_wuid.xslt")] UpdateDFUWorkunit(UpdateDFUWorkunit, UpdateDFUWorkunitResponse);
     ESPmethod DeleteDFUWorkunit(DeleteDFUWorkunit, DeleteDFUWorkunitResponse);
     ESPmethod DeleteDFUWorkunits(DeleteDFUWorkunits, DeleteDFUWorkunitsResponse);
@@ -721,6 +787,7 @@ ESPservice [
     ESPmethod [min_ver("1.13")] DropZoneFileSearch(DropZoneFileSearchRequest, DropZoneFileSearchResponse);
     ESPmethod GetSprayTargets(GetSprayTargetsRequest, GetSprayTargetsResponse);
     ESPmethod [min_ver("1.14")] GetDFUServerQueues(GetDFUServerQueuesRequest, GetDFUServerQueuesResponse);
+    ESPmethod [min_ver("1.26")] GetRemoteTargets(GetRemoteTargetsRequest, GetRemoteTargetsResponse);
 };
 
 SCMexportdef(FileSpray);

@@ -11,9 +11,9 @@
 
   <para><informaltable colsep="1" frame="all" rowsep="1">
       <tgroup cols="2">
-        <colspec colwidth="75.80pt" />
+        <colspec colwidth="75.80pt"/>
 
-        <colspec />
+        <colspec/>
 
         <tbody>
           <row>
@@ -47,9 +47,9 @@
 
     <para><informaltable colsep="1" frame="all" rowsep="1">
         <tgroup cols="2">
-          <colspec colwidth="78.10pt" />
+          <colspec colwidth="78.10pt"/>
 
-          <colspec />
+          <colspec/>
 
           <tbody>
             <row>
@@ -131,11 +131,11 @@
 
     <para><informaltable colsep="1" frame="all" rowsep="1">
         <tgroup cols="3">
-          <colspec colwidth="178.45pt" />
+          <colspec colwidth="178.45pt"/>
 
-          <colspec colwidth="65.60pt" />
+          <colspec colwidth="65.60pt"/>
 
-          <colspec />
+          <colspec/>
 
           <tbody>
             <row>
@@ -523,11 +523,35 @@
             </row>
 
             <row>
+              <entry><emphasis>memoryLimit</emphasis></entry>
+
+              <entry>Default: none</entry>
+
+              <entry>For Roxie queries, sets the per-query memory limit. If
+              not specified, Roxie uses its configured default memory limit.
+              Specify the value as a byte count integer (or an ECL numeric
+              expression that evaluates to a byte count).</entry>
+            </row>
+
+            <row>
               <entry><emphasis>maxCsvRowSizeMb</emphasis></entry>
 
               <entry>Default 10 [MB]</entry>
 
               <entry>Upper limit of a CSV line read in MB.</entry>
+            </row>
+
+            <row>
+              <entry><emphasis>validateFileType</emphasis></entry>
+
+              <entry>Default true</entry>
+
+              <entry>If false, the engines use the definition in the ECL
+              workunit and ignore the file type from the logical file meta
+              data. If true, this check is always ignored if the ECL is
+              reading a CSV or a fixed record width flat file. Also when true,
+              if the ECL is reading XML or JSON, and there is a mismatch, it
+              issues a warning not an error.</entry>
             </row>
 
             <row>
@@ -633,7 +657,7 @@
             <row>
               <entry><emphasis>timeLimit</emphasis></entry>
 
-              <entry></entry>
+              <entry/>
 
               <entry>For Roxie queries. Maximum run time (in ms) for a
               query.</entry>
@@ -651,7 +675,7 @@
             <row>
               <entry><emphasis>analyzeWorkunit</emphasis></entry>
 
-              <entry></entry>
+              <entry/>
 
               <entry>Overrides the setting in ECL Agent to analyze workunits
               after ECL queries are executed (Thor only). This allows a
@@ -659,6 +683,35 @@
               potential issues. These possible issues display in ECL Watch's
               "Warnings &amp; Errors" area. The global setting defaults to
               TRUE, but can be changed using Configuration Manager.</entry>
+            </row>
+
+            <row>
+              <entry><emphasis>maxCost</emphasis></entry>
+
+              <entry>Default: none</entry>
+
+              <entry>Overrides the <emphasis>limit</emphasis> setting in
+              Thor's configuration. If the <emphasis>maxCost</emphasis>
+              threshold is reached, the job guillotine is enforced and the job
+              is halted. This does not override the
+              <emphasis>hardlimit</emphasis> setting. This is only valid for
+              Thor jobs.</entry>
+            </row>
+
+            <row>
+              <entry><emphasis>writeInlineContent</emphasis></entry>
+
+              <entry/>
+
+              <entry>If true, writing a field with XPATH('Name/&lt;&gt;')
+              outputs the string without XML/JSON encoding the content. This
+              allows you to insert arbitrary XML/JSON into the output. There
+              are 3 forms: <emphasis role="bold">'&lt;&gt;'</emphasis> writes
+              the content without a root tag, reading reads all content of
+              parent.<emphasis role="bold"> 'Name&lt;&gt;'</emphasis> writes
+              the content without a tag, reading reads the content of the tag
+              . <emphasis role="bold">'Name/&lt;&gt;' </emphasis>writes the
+              content inside, reading reads the content of the tag.</entry>
             </row>
           </tbody>
         </tgroup>
@@ -678,11 +731,11 @@
 
     <para><informaltable colsep="1" frame="all" rowsep="1">
         <tgroup cols="3">
-          <colspec colwidth="178.45pt" />
+          <colspec colwidth="178.45pt"/>
 
-          <colspec colwidth="65.60pt" />
+          <colspec colwidth="65.60pt"/>
 
-          <colspec />
+          <colspec/>
 
           <tbody>
             <row>
@@ -856,7 +909,7 @@
 
               <entry>Default: false</entry>
 
-              <entry>Show estimates of generated c++ size in the graph</entry>
+              <entry>Show estimates of generated C++ size in the graph</entry>
             </row>
 
             <row>
@@ -878,21 +931,21 @@
         </tgroup>
 
         <tgroup cols="1">
-          <colspec colwidth="441.90pt" />
+          <colspec colwidth="441.90pt"/>
 
           <tbody>
             <row>
-              <entry><emphasis></emphasis></entry>
+              <entry><emphasis/></entry>
             </row>
           </tbody>
         </tgroup>
 
         <tgroup cols="3">
-          <colspec colwidth="178.45pt" />
+          <colspec colwidth="178.45pt"/>
 
-          <colspec colwidth="65.60pt" />
+          <colspec colwidth="65.60pt"/>
 
-          <colspec />
+          <colspec/>
 
           <tbody>
             <row>
@@ -1043,11 +1096,11 @@
 
     <para><informaltable colsep="1" frame="all" rowsep="1">
         <tgroup cols="3">
-          <colspec colwidth="178.45pt" />
+          <colspec colwidth="178.45pt"/>
 
-          <colspec colwidth="65.60pt" />
+          <colspec colwidth="65.60pt"/>
 
-          <colspec />
+          <colspec/>
 
           <tbody>
             <row>
@@ -1150,6 +1203,16 @@
             </row>
 
             <row>
+              <entry><emphasis>soapAuthTraceLevel</emphasis></entry>
+
+              <entry>Default: 1</entry>
+
+              <entry>Controls whether SOAPCALL or HTTPCALL authorization
+              headers are included in logs. Set to 0 to suppress authorization
+              headers or a nonzero value to include them.</entry>
+            </row>
+
+            <row>
               <entry><emphasis>traceEnabled</emphasis></entry>
 
               <entry>Default: FALSE</entry>
@@ -1166,6 +1229,17 @@
               <entry>Overrides the the default KEEP setting for a TRACE
               statement to indicate how many TRACE statement to write to log
               file. See <link linkend="TRACE">TRACE</link>.</entry>
+            </row>
+
+            <row>
+              <entry><emphasis>maxlogdetail</emphasis></entry>
+
+              <entry/>
+
+              <entry>Overrides the the default logging level for a single
+              workunit. This allows logging levels to be set to a low level by
+              default, but allow jobs to be resubmitted with a higher logging
+              level for investigation.</entry>
             </row>
           </tbody>
         </tgroup>
@@ -1184,11 +1258,11 @@
 
     <para><informaltable colsep="1" frame="all" rowsep="1">
         <tgroup cols="3">
-          <colspec colwidth="178.45pt" />
+          <colspec colwidth="178.45pt"/>
 
-          <colspec colwidth="65.60pt" />
+          <colspec colwidth="65.60pt"/>
 
-          <colspec />
+          <colspec/>
 
           <tbody>
             <row>
@@ -1427,9 +1501,12 @@
             <row>
               <entry><emphasis>maxCompileThreads</emphasis></entry>
 
-              <entry>Default 4 for eclccserver and 1 for eclcc</entry>
+              <entry>Default per compilation: minimum of (number of generated
+              C++ files) and (available CPU cores + 1)</entry>
 
-              <entry>Number of compiler instances to compile the c++</entry>
+              <entry>Maximum number of compiler instances used to compile the
+              generated C++ files. Values below 1 use 1, and values above the
+              number of generated files use that file count.</entry>
             </row>
 
             <row>
@@ -1437,7 +1514,7 @@
 
               <entry>Default: false</entry>
 
-              <entry>Report warnings from c++ compilation</entry>
+              <entry>Report warnings from C++ compilation</entry>
             </row>
 
             <row>
@@ -1445,7 +1522,7 @@
 
               <entry>Default: false</entry>
 
-              <entry>Retain the generated c++ files</entry>
+              <entry>Retain the generated C++ files</entry>
             </row>
 
             <row>
@@ -1453,7 +1530,7 @@
 
               <entry>Default: true</entry>
 
-              <entry>Generate a work unit in multiple c++ files</entry>
+              <entry>Generate a work unit in multiple C++ files</entry>
             </row>
 
             <row>
@@ -1461,7 +1538,7 @@
 
               <entry>Default 500 for Linux or 800 for Windows</entry>
 
-              <entry>Number of activities in each c++ file (requires
+              <entry>Number of activities in each C++ file (requires
               spanMultipleCpp)</entry>
             </row>
 
@@ -1479,16 +1556,16 @@
       </informaltable></para>
 
     <para><emphasis role="bold">The following </emphasis><emphasis
-    role="bold">options</emphasis><emphasis role="bold"> are for the workunit
-    analyzer:</emphasis></para>
+    role="bold">options</emphasis><emphasis role="bold"> are for the Cost
+    Optimizer:</emphasis></para>
 
     <informaltable colsep="1" frame="all" rowsep="1">
       <tgroup cols="3">
-        <colspec colwidth="178.45pt" />
+        <colspec colwidth="178.45pt"/>
 
-        <colspec colwidth="78.60pt" />
+        <colspec colwidth="78.60pt"/>
 
-        <colspec />
+        <colspec/>
 
         <tbody>
           <row>
@@ -1538,59 +1615,57 @@
       </tgroup>
     </informaltable>
 
-    <para>Example:</para>
+    <para>Examples:</para>
 
-    <programlisting>  #OPTION('traceRowXml', TRUE);
-  #OPTION('_Probe', TRUE);
+    <para><programlisting lang="ECL_Runnable">#OPTION('traceRowXml', TRUE);
+#OPTION('_Probe', TRUE);
+
+my_rec := RECORD
+  STRING20 lname;
+  STRING20 fname;
+  STRING2 age;
+END;
   
-  my_rec := RECORD
-    STRING20 lname;
-    STRING20 fname;
-    STRING2 age;
-  END;
-  
-  d := DATASET([{ 'PORTLY', 'STUART' , '39'},
+d := DATASET([{ 'PORTLY', 'STUART' , '39'},
               { 'PORTLY', 'STACIE' , '36'},
               { 'PORTLY', 'DARA' , ' 1'},
               { 'PORTLY', 'GARRETT', ' 4'}], my_rec);
   
-  OUTPUT(d(d.age &gt; ' 1'), {lname, fname, age} );
-  
-  //************************************
-  //This example demonstrates Logical Graphs and
-  // Javadoc-style comment blocks
-  #OPTION('generateLogicalGraphOnly',TRUE);
-  #OPTION('logicalGraphDisplayJavadocParameters',TRUE);
-  
-  /**
-  * Defines a record that contains information about a person
-  */
-  namesRecord :=
-       RECORD
+OUTPUT(d(d.age &gt; ' 1'), {lname, fname, age} );
+</programlisting></para>
+
+    <para/>
+
+    <para><programlisting lang="ECL" role="notrunnable">//************************************
+//This example demonstrates Logical Graphs and
+// Javadoc-style comment blocks
+#OPTION('generateLogicalGraphOnly',TRUE);
+#OPTION('logicalGraphDisplayJavadocParameters',TRUE);
+/**
+ * Defines a record that contains information about a person
+*/
+namesRecord := RECORD
   string20    surname;
   string10    forename;
   integer2    age := 25;
-       END;
+END;
   
-  /**
-  Defines a table that can be used to read the information from the file
-  and then do something with it.
-  */
-  namesTable := DATASET('x',namesRecord,FLAT);
+/**
+Defines a table that can be used to read the information from the file
+and then do something with it.
+*/
+namesTable := DATASET('x',namesRecord,FLAT);
   
   
-  /**
-       Allows the name table to be filtered.
-  
-       @param ages The ages that are allowed to be processed.
-            badForename Forname to avoid.
-  
-       @return the filtered dataset.
-  */
-  namesTable filtered(SET OF INTEGER2 ages, STRING badForename) :=
-       namesTable(age in ages, forename != badForename);
-  
-  OUTPUT(filtered([10,20,33], ''));
-</programlisting>
+/**
+ Allows the name table to be filtered.
+ @param ages        The ages that are allowed to be processed.
+ @param badForename Forname to avoid.
+ @return the filtered dataset.
+*/
+namesTable filtered(SET OF INTEGER2 ages, STRING badForename) :=
+                    namesTable(age in ages, forename != badForename);
+OUTPUT(filtered([10,20,33], ''));
+</programlisting></para>
   </sect2>
 </sect1>

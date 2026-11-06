@@ -35,6 +35,11 @@
 //----------------------------------------------------------------------------
 
 //#define PLINK_USE_CMD
+class RemoteSemaphore : public Semaphore
+{
+public:
+    RemoteSemaphore(unsigned initialCount=0) : Semaphore(SYNC_LOCATION, initialCount) {}
+};
 
 class CFRunSSH: public CInterface, implements IFRunSSH
 {
@@ -60,9 +65,7 @@ class CFRunSSH: public CInterface, implements IFRunSSH
     bool dryrun;
     bool useplink;
     int replicationoffset;
-    CriticalSection sect;
-
-
+    CriticalSection sect{SYNC_LOCATION};
 
     StringBuffer &expandCmd(StringBuffer &cmdbuf, unsigned nodenum, unsigned treefrom)
     {
@@ -136,7 +139,7 @@ class CFRunSSH: public CInterface, implements IFRunSSH
                 if (sa.ordinality()) {
                     StringBuffer ns;
                     ForEachItemIn(i,sa) {
-                        sa.item(i).getIpText(ns.clear());
+                        sa.item(i).getHostText(ns.clear());
                         slaves.append(ns.str());
                     }
                     return;
@@ -257,7 +260,7 @@ public:
                             password.set(parm);
                             break;
                         }
-                        // continue
+                        [[fallthrough]];
                     default:
                         throw MakeStringException(-1,"Unknown option %s",argv[i]);
                 }
@@ -422,6 +425,8 @@ public:
                 printf("%s\n",cmdline.str());
             else {
                 Owned<IPipeProcess> pipe = createPipeProcess();
+                // reset LD_LIBRARY_PATH here so ssh cmd itself doesn't use HPCC libssl/crypto as they may be different
+                pipe->setenv("LD_LIBRARY_PATH", ":");
                 if (pipe->run((verbose&&!usepssh)?"FRUNSSH":NULL,cmdline.str(),workdir,
                     useplink, // for some reason plink needs input handle
                     true,true)) {
@@ -478,11 +483,11 @@ public:
             Semaphore *treesem;
         public:
             cRun(CFRunSSH &_parent)
-                : parent(_parent)
+                : CAsyncFor(SYNC_LOCATION), parent(_parent)
             {
                 treemode = !parent.treeroot.isEmpty();
                 if (treemode) {
-                    treesem = new Semaphore[parent.slaves.ordinality()+1];  // don't actually use all 
+                    treesem = new RemoteSemaphore[parent.slaves.ordinality()+1];  // don't actually use all 
                     treesem[0].signal();
                 }
                 else
@@ -548,7 +553,7 @@ public:
         strict = false;
         verbose = false;
         StringBuffer ips;
-        ip.getIpText(ips);
+        ip.getHostText(ips);
         slaves.kill();
         slaves.append(ips.str());
         numthreads = 1;

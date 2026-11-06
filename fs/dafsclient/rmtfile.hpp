@@ -40,12 +40,17 @@ interface IDaFileSrvHook : extends IRemoteFileCreateHook
     virtual IPropertyTree *addFilters(IPropertyTree *filters, const SocketEndpoint *ipAddress) = 0;
     virtual IPropertyTree *addMyFilters(IPropertyTree *filters, SocketEndpoint *myEp=NULL) = 0;
     virtual void clearFilters() = 0;
+    virtual StringBuffer &getSecretBased(StringBuffer &storageSecret, const RemoteFilename & filename) = 0;
+    virtual void addSecretEndpoint(const char *endpoint, const char *optSecret) = 0;
+    virtual void removeSecretEndpoint(const char *endpoint) = 0;
 };
 extern DAFSCLIENT_API IDaFileSrvHook *queryDaFileSrvHook();
 
 extern DAFSCLIENT_API void setDaliServixSocketCaching(bool set);
 extern DAFSCLIENT_API bool canAccessDirectly(const RemoteFilename & file);
 extern DAFSCLIENT_API IFile *createDaliServixFile(const RemoteFilename & file);
+extern DAFSCLIENT_API IFile *createDaliServixFile(const RemoteFilename & file, const char *storageSecret);
+
 extern DAFSCLIENT_API void enableForceRemoteReads(); // forces file reads to be remote reads if they match environment setting 'forceRemotePattern' pattern.
 extern DAFSCLIENT_API bool testForceRemote(const char *path); // return true if forceRemote setup/pattern will make this path a remote read.
 
@@ -73,7 +78,8 @@ extern DAFSCLIENT_API bool asyncCopyFileSection(const char *uuid,   // from genU
                             offset_t fromofs,
                             offset_t size,                      // (offset_t)-1 for all file
                             ICopyFileProgress *progress,
-                            unsigned timeout                    // 0 to start, non-zero to wait
+                            unsigned timeout,                   // 0 to start, non-zero to wait
+                            CFflags copyFlags
                         ); // returns true when done
 
 extern DAFSCLIENT_API void setRemoteFileTimeouts(unsigned maxconnecttime,unsigned maxreadtime);

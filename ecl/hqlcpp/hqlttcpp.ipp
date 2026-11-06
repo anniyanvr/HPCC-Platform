@@ -53,7 +53,7 @@ protected:
 
 //---------------------------------------------------------------------------
 
-enum YesNoOption { OptionUnknown, OptionNo, OptionMaybe, OptionSome, OptionYes };   //NB: last 3 IN ascending order of definiteness.
+enum YesNoOption { OptionUnknown, OptionNo, OptionMaybe, OptionSome, OptionYes, OptionIgnore };   //NB: last 3 IN ascending order of definiteness.
 
 class HqlThorBoundaryInfo : public NewTransformInfo
 {
@@ -88,6 +88,55 @@ protected:
     bool isRoxie;
     bool resourceConditionalActions;
     bool resourceSequential;
+};
+
+//---------------------------------------------------------------------------
+
+class GlobalDatasetInfo : public CInterface
+{
+public:
+    GlobalDatasetInfo(IHqlExpression * _name) : name(_name) { }
+
+public:
+    IHqlExpression * name;
+    unsigned numGraphs = 0;
+};
+
+class GlobalDatasetList : public CInterface
+{
+public:
+    GlobalDatasetList * clone();
+
+public:
+    CIArrayOf<GlobalDatasetInfo> globals;
+};
+
+class HqlGlobalDatasetInfo : public NewTransformInfo
+{
+public:
+    HqlGlobalDatasetInfo(IHqlExpression * _original) : NewTransformInfo(_original) { }
+
+public:
+    Owned<GlobalDatasetInfo> globalInfo;
+    Owned<GlobalDatasetList> globalsUsed;
+};
+
+class HqlGlobalDatasetTransformer : public NewHqlTransformer
+{
+public:
+    HqlGlobalDatasetTransformer();
+
+    virtual void analyseExpr(IHqlExpression * expr) override;
+    virtual IHqlExpression * createTransformed(IHqlExpression * expr) override;
+
+    virtual ANewTransformInfo * createTransformInfo(IHqlExpression * expr) { return CREATE_NEWTRANSFORMINFO(HqlGlobalDatasetInfo, expr); }
+    inline HqlGlobalDatasetInfo * queryBodyExtra(IHqlExpression * expr) { return static_cast<HqlGlobalDatasetInfo *>(queryTransformExtra(expr->queryBody())); }
+
+    bool needToTransform() const;
+
+protected:
+    CICopyArrayOf<GlobalDatasetInfo> allGlobals;
+    bool consistencyError = false;
 };
 
 //---------------------------------------------------------------------------
@@ -533,6 +582,8 @@ protected:
 
     void analyseExpr(IHqlExpression * expr);
     void addWorkflowItem(WorkflowItem & item);
+    unsigned querySingleRootWfid(const HqlExprArray & transformed);
+    bool isRoxie() const { return translator.getTargetClusterType() == RoxieCluster; }
 
 protected:
     IWorkUnit *               wu;
@@ -550,7 +601,6 @@ protected:
     bool                      combineAllStored;
     bool                      combineTrivialStored;
     bool                      isRootAction;
-    bool                      isRoxie;
     bool                      expandPersistInputDependencies;
     int                       multiplePersistInstances;
     UnsignedArray             cumulativeDependencies;
@@ -590,12 +640,13 @@ protected:
         return LINK(expr);
     }
 
+    virtual bool isRoxie() const { return translator.getTargetClusterType() == RoxieCluster; }
+
 private:
     IWorkUnit *               wu;
     HqlCppTranslator &        translator;
     bool seenGlobalScope;
     bool seenLocalGlobalScope;
-    bool isRoxie;
 };
 
 class OptGlobalTransformer : public NewHqlTransformer
@@ -701,10 +752,11 @@ protected:
 
     inline ScopeMigrateInfo * queryBodyExtra(IHqlExpression * expr)     { return static_cast<ScopeMigrateInfo *>(queryTransformExtra(expr->queryBody())); }
 
+    virtual bool isRoxie() const { return translator.getTargetClusterType() == RoxieCluster; }
+
 private:
     IWorkUnit *               wu;
     HqlCppTranslator &        translator;
-    bool isRoxie;
     bool minimizeWorkunitTemporaries;
     unsigned activityDepth;
 };
@@ -728,12 +780,10 @@ public:
     bool neverHoist = false;
 };
 
-class AutoScopeMigrateTransformer : public NewHqlTransformer
+class AutoScopeMigrateTransformer : public HoistingHqlTransformer
 {
 public:
     AutoScopeMigrateTransformer(IWorkUnit * _wu, HqlCppTranslator & _translator);
-
-    void transformRoot(const HqlExprArray & in, HqlExprArray & out);
 
     bool worthTransforming() const { return hasCandidate; }
 
@@ -750,13 +800,15 @@ protected:
     IHqlExpression * transformCond(IHqlExpression * expr);
     void doAnalyseExpr(IHqlExpression * expr);
     void doAnalyseConditionalExpr(IHqlExpression * expr, unsigned firstConditional);
+    virtual IHqlExpression * doTransformIndependent(IHqlExpression * expr) override;
 
     inline AutoScopeMigrateInfo * queryBodyExtra(IHqlExpression * expr)     { return static_cast<AutoScopeMigrateInfo *>(queryTransformExtra(expr->queryBody())); }
+
+    virtual bool isRoxie() const { return translator.getTargetClusterType() == RoxieCluster; }
 
 private:
     IWorkUnit *               wu;
     HqlCppTranslator &        translator;
-    bool isRoxie;
     bool isConditional;
     bool hasCandidate;
     bool isSequential;
@@ -764,7 +816,6 @@ private:
     unsigned graphDepth = 0;
     HqlExprArray graphActions;
     unsigned activityDepth;
-    HqlExprArray * globalTarget;
 };
 
 //---------------------------------------------------------------------------
@@ -1156,6 +1207,8 @@ public:
     virtual void analyseExpr(IHqlExpression * expr);
     virtual ANewTransformInfo * createTransformInfo(IHqlExpression * expr);
     virtual IHqlExpression * createTransformed(IHqlExpression * expr);
+
+    virtual void setTransformed(IHqlExpression * expr, IHqlExpression * transformed) override;
 
 //  virtual void analyseSelector(IHqlExpression * expr);
 //  virtual IHqlExpression * transformSelector(IHqlExpression * expr);

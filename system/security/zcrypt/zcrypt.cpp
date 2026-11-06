@@ -22,14 +22,9 @@
 #include "aes.hpp"
 #include "base64.ipp"
 
-#include "zip.h"
+#include <minizip/zip.h>
 #include "jexcept.hpp"
 #include <math.h>
-
-#ifdef WIN32
-#define USEWIN32IOAPI
-#include "iowin32.h"
-#endif
 
 IZBuffer::~IZBuffer()
 {
@@ -81,16 +76,19 @@ void RSAZCryptor::init()
     priv_size = 0;
     pub_size = 0;
 
-    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
     bio_err=BIO_new_fp(stderr, BIO_NOCLOSE);
 
 #if defined(_WIN32) || defined(__linux__)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     OpenSSL_add_all_ciphers();
+#endif
 #else
     SSL_library_init();
 #endif
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     ERR_load_crypto_strings ();
+#endif
 
     seed_prng();
 
@@ -230,7 +228,9 @@ RSAZCryptor::~RSAZCryptor()
     if(pub_rsa)
         RSA_free(pub_rsa);      
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     EVP_cleanup();
+#endif
 }
 
 void RSAZCryptor::throw_error()
@@ -241,7 +241,7 @@ void RSAZCryptor::throw_error()
     if(m_trace_level > 0)
         printf("Error: %s\n", errbuf);
 
-    throw string(errbuf);
+    throw std::string(errbuf);
 }
 
 void RSAZCryptor::setTraceLevel(unsigned trace_level)
@@ -363,13 +363,7 @@ int RSAZCryptor::zipToFile(const char* zipFileName, bool cleanFileListAfterUsed)
     zipFile zf;
     int opt_overwrite=0; //?1
 
-#ifdef USEWIN32IOAPI
-    zlib_filefunc_def ffunc;
-    fill_win32_filefunc(&ffunc);
-    zf = zipOpen2(filename_try,(opt_overwrite==2) ? 2 : 0,NULL,&ffunc);
-#else
-    zf = zipOpen(filename_try,(opt_overwrite==2) ? 2 : 0);
-#endif
+    zf = zipOpen64(filename_try,(opt_overwrite==2) ? 2 : 0);
 
     int err=0;
     if (zf == NULL)
@@ -410,13 +404,13 @@ int RSAZCryptor::zipToFile(const char* zipFileName, bool cleanFileListAfterUsed)
         zi.internal_fa = 0;
         zi.external_fa = 0;
 
-        err = zipOpenNewFileInZip3(zf,fileName,&zi,
+        err = zipOpenNewFileInZip3_64(zf,fileName,&zi,
                                 NULL,0,NULL,0,NULL /* comment*/,
                                 Z_DEFLATED,
                                 Z_DEFAULT_COMPRESSION,0,
                                 /* -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY, */
                                 -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY,
-                                NULL, 0);
+                    NULL, 0, 1);
 
         if (err != ZIP_OK)
             printf("error in opening %s in zipfile\n",fileName);
@@ -482,13 +476,7 @@ int RSAZCryptor::zipToFile(unsigned contentLength, void const *content, const ch
     zipFile zf;
     int opt_overwrite=0; //?1
 
-#ifdef USEWIN32IOAPI
-    zlib_filefunc_def ffunc;
-    fill_win32_filefunc(&ffunc);
-    zf = zipOpen2(filename_try,(opt_overwrite==2) ? 2 : 0,NULL,&ffunc);
-#else
-    zf = zipOpen(filename_try,(opt_overwrite==2) ? 2 : 0);
-#endif
+    zf = zipOpen64(filename_try,(opt_overwrite==2) ? 2 : 0);
 
     int err=0;
     if (zf == NULL)
@@ -504,13 +492,13 @@ int RSAZCryptor::zipToFile(unsigned contentLength, void const *content, const ch
     zi.internal_fa = 0;
     zi.external_fa = 0;
 
-    err = zipOpenNewFileInZip3(zf,fileToBeZipped,&zi,
+    err = zipOpenNewFileInZip3_64(zf,fileToBeZipped,&zi,
                             NULL,0,NULL,0,NULL /* comment*/,
                             Z_DEFLATED,
                             Z_DEFAULT_COMPRESSION,0,
                             /* -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY, */
                             -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY,
-                            NULL, 0);
+                            NULL, 0, 1);
 
     if (err != ZIP_OK)
         printf("error in opening %s in zipfile\n",fileToBeZipped);
@@ -573,6 +561,7 @@ int RSAZCryptor::zip(int in_len, unsigned char* in, ZBuffer& outbuf)
 
     strm.avail_in = in_len;
     strm.next_in = in;
+    strm.total_out = 0;
     ZBuffer onebuf(buflen);
     do 
     {
@@ -650,6 +639,7 @@ int RSAZCryptor::unzip(int in_len, unsigned char* in, ZBuffer& outbuf)
         {
         case Z_NEED_DICT:
             ret = Z_DATA_ERROR;     /* and fall through */
+            [[fallthrough]];
         case Z_DATA_ERROR:
         case Z_MEM_ERROR:
             if(m_trace_level > 0)

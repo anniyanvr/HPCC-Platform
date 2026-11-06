@@ -35,7 +35,9 @@ private:
     StringAttr                  m_username;
     StringAttr                  m_password;
     StringAttr                  m_realm;
+    StringAttr                  m_mtls_secret;
     bool                        m_disableKeepAlive;
+    Owned<IPropertyTree> m_sec_config;
     Owned<ITransportClient> m_transportclient;
     unsigned m_connectTimeoutMs = 0;
     unsigned m_readTimeoutSecs = 0;
@@ -61,6 +63,22 @@ public:
         m_readTimeoutSecs = val;
         if (m_transportclient)
             static_cast<IHttpClient*>(m_transportclient.get())->setTimeOut(m_readTimeoutSecs); //until we support something other than soap over http, static_cast
+    }
+
+    void setMtlsSecretName(const char *name)
+    {
+        m_mtls_secret.set(name);
+        if (m_transportclient)
+            static_cast<IHttpClient*>(m_transportclient.get())->setMtlsSecretName(m_mtls_secret); //until we support something other than soap over http, static_cast
+    }
+    const char *getMtlsSecretName()
+    {
+        return m_mtls_secret.str();
+    }
+
+    void setSecureSocketConfig(IPropertyTree *config)
+    {
+        m_sec_config.setown(config);
     }
 
     virtual int setUsernameToken(const char* userid, const char* password, const char* realm);

@@ -20,6 +20,7 @@
 #include "jset.hpp"
 #include "jmutex.hpp"
 #include "jexcept.hpp"
+#include "jerror.hpp"
 
 //-----------------------------------------------------------------------
 
@@ -60,7 +61,7 @@ protected:
     inline void addBitSet(bits_t m)
     {
         if (fixedMemory)
-            throw MakeStringException(-1, "CBitSet with fixed mem cannot expand");
+            throw MakeStringException(JLIBERR_UtilCbitsetWithFixedMemCannotExpand, "CBitSet with fixed mem cannot expand");
         mb.append(m);
         mem = (bits_t *)mb.bufferBase();
         ++bitSetUnits;
@@ -357,7 +358,7 @@ size32_t getBitSetMemoryRequirement(unsigned numBits)
 class CBitSetThreadSafe : public CBitSetBase<CBitSetArrayHelper>
 {
     typedef CBitSetBase<CBitSetArrayHelper> PARENT;
-    mutable CriticalSection crit;
+    mutable CriticalSection crit{SYNC_LOCATION};
     void deserialize(MemoryBuffer &buffer)
     {
         CriticalBlock block(crit);
@@ -366,7 +367,7 @@ class CBitSetThreadSafe : public CBitSetBase<CBitSetArrayHelper>
         buffer.read(count);
         if (count)
         {
-            bits.ensure(count);
+            bits.ensureCapacity(count);
             while (count--)
             {
                 bits_t b;

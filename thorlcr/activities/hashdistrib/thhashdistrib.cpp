@@ -26,6 +26,7 @@
 #include "thorport.hpp"
 #include "thbufdef.hpp"
 #include "thexception.hpp"
+#include "thormisc.hpp"
 
 #define NUMINPARALLEL 16
 
@@ -38,7 +39,7 @@ class HashDistributeMasterBase : public CMasterActivity
     mptag_t mptag;
     mptag_t mptag2; // for tag 2
 public:
-    HashDistributeMasterBase(DistributeMode _mode, CMasterGraphElement *info, const StatisticsMapping &actStatsMapping = basicActivityStatistics) 
+    HashDistributeMasterBase(DistributeMode _mode, CMasterGraphElement *info, const StatisticsMapping &actStatsMapping = hashDistribActivityStatistics) 
         : CMasterActivity(info, actStatsMapping), mode(_mode) 
     {
         mptag = TAG_NULL;
@@ -75,6 +76,12 @@ public:
     HashDistributeActivityMaster(DistributeMode mode, CMasterGraphElement *info) : HashDistributeMasterBase(mode, info) { }
 };
 
+class HashDedupActivityMaster : public HashDistributeMasterBase
+{
+public:
+    HashDedupActivityMaster(DistributeMode mode, CMasterGraphElement *info) : HashDistributeMasterBase(mode, info, hashDedupActivityStatistics) { }
+};
+
 class HashJoinDistributeActivityMaster : public HashDistributeMasterBase
 {
 public:
@@ -89,7 +96,7 @@ class IndexDistributeActivityMaster : public HashDistributeMasterBase
     MemoryBuffer tlkMb;
 
 public:
-    IndexDistributeActivityMaster(CMasterGraphElement *info) : HashDistributeMasterBase(DM_index, info) { }
+    IndexDistributeActivityMaster(CMasterGraphElement *info) : HashDistributeMasterBase(DM_index, info, indexDistribActivityStatistics) { }
     virtual void init()
     {
         HashDistributeMasterBase::init();
@@ -100,18 +107,16 @@ public:
         StringBuffer scoped;
         OwnedRoxieString indexFileName(helper->getIndexFileName());
         queryThorFileManager().addScope(container.queryJob(), indexFileName, scoped);
-        Owned<IDistributedFile> file = queryThorFileManager().lookup(container.queryJob(), indexFileName, false, false, false, container.activityIsCodeSigned());
-        if (!file)
-            throw MakeActivityException(this, 0, "KeyedDistribute: Failed to find key: %s", scoped.str());
+        Owned<IDistributedFile> file = lookupReadFile(indexFileName, AccessMode::readRandom, false, false, false);
         if (0 == file->numParts())
             throw MakeActivityException(this, 0, "KeyedDistribute: Can't distribute based on an empty key: %s", scoped.str());
         if (!isFileKey(file))
-            throw MakeActivityException(this, TE_FileTypeMismatch, "Attempting to read flat file as an index: %s", indexFileName.get());
+            throw MakeActivityException(this, ENGINEERR_FILE_TYPE_MISMATCH, "Attempting to read flat file as an index: %s", indexFileName.get());
 
         checkFormatCrc(this, file, helper->getFormatCrc(), nullptr, helper->getFormatCrc(), nullptr, true);
         Owned<IFileDescriptor> fileDesc = file->getFileDescriptor();
         Owned<IPartDescriptor> tlkDesc = fileDesc->getPart(fileDesc->numParts()-1);
-        if (!tlkDesc->queryProperties().hasProp("@kind") || 0 != stricmp("topLevelKey", tlkDesc->queryProperties().queryProp("@kind")))
+        if (!hasTLK(*file, this))
             throw MakeActivityException(this, 0, "Cannot distribute using a non-distributed key: '%s'", scoped.str());
         unsigned location;
         OwnedIFile iFile;
@@ -123,8 +128,6 @@ public:
 
         tlkMb.append(iFileIO->size());
         ::read(iFileIO, 0, (size32_t)iFileIO->size(), tlkMb);
-
-        addReadFile(file);
     }
     virtual void serializeSlaveData(MemoryBuffer &dst, unsigned slave)
     {
@@ -237,7 +240,7 @@ CActivityBase *createHashDedupMergeActivityMaster(CMasterGraphElement *container
     if (container->queryLocalOrGrouped())
         return new CMasterActivity(container);
     else
-        return new HashDistributeActivityMaster(DM_dedup, container);
+        return new HashDedupActivityMaster(DM_dedup, container);
 }
 
 CActivityBase *createHashJoinActivityMaster(CMasterGraphElement *container)

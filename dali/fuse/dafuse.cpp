@@ -44,7 +44,7 @@
 
 class CFuseBase // base NB singleton
 {
-    static CriticalSection crit;
+    static CriticalSection crit{SYNC_LOCATION};
     static CFuseBase *self;
 
 protected:
@@ -338,7 +338,7 @@ public:
     }
 };
 
-CriticalSection CFuseBase::crit;
+CriticalSection CFuseBase::crit(SYNC_LOCATION);
 CFuseBase *CFuseBase::self=NULL;
 
 #define FH_SALT 100
@@ -516,7 +516,7 @@ class CFuseDaliDFS: public CFuseBase
                 stbuf->st_nlink = dci->scopes.ordinality()+2;
             }
             else {
-                Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(lfn,user,false,false,false,nullptr,defaultPrivilegedUser);
+                Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(lfn,user,AccessMode::readMeta,false,false,nullptr,defaultPrivilegedUser);
                 if (file) {
                     stbuf->st_mode = S_IFREG | 0444;
                     stbuf->st_nlink = 1;
@@ -610,7 +610,7 @@ class CFuseDaliDFS: public CFuseBase
         if (!pathToLFN(path,lfn))
             return -ENOENT;
         try {
-            Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(lfn,user,false,false,false,nullptr,defaultPrivilegedUser);
+            Owned<IDistributedFile> file = queryDistributedFileDirectory().lookup(lfn,user,AccessMode::readRandom,false,false,nullptr,defaultPrivilegedUser);
             if (!file)
                 return -ENOENT;
             if((info->flags & 3) != O_RDONLY ) 
@@ -647,7 +647,7 @@ class CFuseDaliDFS: public CFuseBase
                 CDfsLogicalFileName lfn;
                 if (!pathToLFN(path,lfn))
                     return -ENOENT;
-                file.setown(queryDistributedFileDirectory().lookup(lfn,user,false,false,false,nullptr,defaultPrivilegedUser));
+                file.setown(queryDistributedFileDirectory().lookup(lfn,user,AccessMode::readRandom,false,false,nullptr,defaultPrivilegedUser));
                 if (!file)
                     return -ENOENT;
             }
@@ -699,7 +699,7 @@ class CFuseDaliDFS: public CFuseBase
                 bool blocked;
                 bool compressed = file->isCompressed(&blocked);
                 if (compressed&&blocked) {
-                    Owned<ICompressedFileIO> cmpio = createCompressedFileReader(srcio);
+                    Owned<IFileIO> cmpio = createCompressedFileReader(srcio, nullptr, useDefaultIoBufferSize);
                     if (cmpio.get())
                         srcio.setown(cmpio.getClear());
                 }
@@ -1009,6 +1009,7 @@ static bool parseParams(int &argc, char *argv[],IProperties *prop)
         prop->setProp("ACTION","unmount");
         if (prop->hasProp("DIR"))
             return true;
+        action = "unmount"; // because setProp may have invalidated action ptr
     }
     if (eqs(action,"creatopt")) {
         return true;

@@ -5,7 +5,7 @@
 
 externals := 
     SERVICE : fold
-STRING EncodeBase64(const data src) :   eclrtl,pure,include,library='eclrtl',entrypoint='rtlBase64Encode';
+STRING EncodeBase64(const data src, boolean insertLF) :   eclrtl,pure,include,library='eclrtl',entrypoint='rtlBase64EncodeV2';
 DATA DecodeBase64(const string src) :   eclrtl,pure,include,library='eclrtl',entrypoint='rtlBase64Decode';
     END;
 
@@ -433,10 +433,11 @@ EXPORT DATA FromHexPairs(STRING hex_pairs) := lib_stringlib.StringLib.String2Dat
  *
  *
  * @param value         The binary data array to process.
+ * @param insertLF      If TRUE, linefeeds are inserted periodically; OPTIONAL, defaults to TRUE
  * @return              Base 64 encoded string.
  */
 
-EXPORT STRING EncodeBase64(DATA value) := externals.EncodeBase64(value);
+EXPORT STRING EncodeBase64(DATA value, BOOLEAN insertLF = TRUE) := externals.EncodeBase64(value, insertLF);
 
 /*
  * Decode base64 encoded string to binary data.
@@ -450,5 +451,31 @@ EXPORT STRING EncodeBase64(DATA value) := externals.EncodeBase64(value);
  */
 
 EXPORT DATA DecodeBase64(STRING value) := externals.DecodeBase64(value);
+
+/*
+ * Returns the prefix common to both strings.
+ *
+ * @param s1            A string to examine.
+ * @param s2            A string to examine.
+ * @param nocase        If true, the comparison is case-insensitive. Optional, defaults to FALSE.
+ * @return              A string containing the prefix common to both strings, as copied from
+ *                      the first argument. May be empty if the strings have no common prefix
+ *                      or if either argument is empty.
+ */
+
+EXPORT STRING CommonPrefix(STRING s1, STRING s2, BOOLEAN nocase = FALSE) := lib_stringlib.Stringlib.CommonPrefix(s1, s2, nocase);
+
+/*
+ * Returns the suffix common to both strings.
+ *
+ * @param s1            A string to examine.
+ * @param s2            A string to examine.
+ * @param nocase        If true, the comparison is case-insensitive. Optional, defaults to FALSE.
+ * @return              A string containing the suffix common to both strings, as copied from
+ *                      the first argument. May be empty if the strings have no common suffix
+ *                      or if either argument is empty.
+ */
+
+EXPORT STRING CommonSuffix(STRING s1, STRING s2, BOOLEAN nocase = FALSE) := lib_stringlib.Stringlib.CommonSuffix(s1, s2, nocase);
 
 END;

@@ -205,7 +205,7 @@ class InMemoryIndex : public CInterface, implements IInterface, implements IComp
     unsigned numPtrs = 0;
     unsigned maxPtrs = 0;
     unsigned totalScore = 0;
-    CriticalSection stateCrit;
+    CriticalSection stateCrit{SYNC_LOCATION};
     const RtlRecord &recInfo;
 
 public:
@@ -427,7 +427,7 @@ typedef IArrayOf<InMemoryIndex> InMemoryIndexSet;
  *     (the file boundaries are the only place we are sure there are record boundaries - fixed size case could do better in theory)
  *   The disk case gives an empty set to all but the first thread - could certainly do better
  * How it should work
- *   IDirectReader should be derived from ISerialStream (with the addition of the ptr to offset mapping functions)
+ *   IDirectReader should be derived from IBufferedSerialInputStream (with the addition of the ptr to offset mapping functions)
  *   We should not peek past end of a single file
  *   We are then free to use memory-mapped files and/or existing fileIO stream code, and IDirectReader is much simpler, 
  *   just handling the move from one file to the next and the PtrToOffset stuff
@@ -562,7 +562,7 @@ public:
         pos = (memsize_t) _readPos;
     }
 
-    // Interface ISerialStream
+    // Interface IBufferedSerialInputStream
 
     virtual const void * peek(size32_t wanted,size32_t &got) override
     {
@@ -639,8 +639,8 @@ public:
     {
         if (translator)
         {
-            assertex(_ptr==buf.toByteArray());
-            _ptr = deserializeSource.queryRow();
+            if (_ptr==buf.toByteArray())
+                _ptr = deserializeSource.queryRow();
         }
         return baseMap.ptrToFilePosition(_ptr);
     }
@@ -649,8 +649,8 @@ public:
     {
         if (translator)
         {
-            assertex(_ptr==buf.toByteArray());
-            _ptr = deserializeSource.queryRow();
+            if (_ptr==buf.toByteArray())
+                _ptr = deserializeSource.queryRow();
         }
         return baseMap.ptrToLocalFilePosition(_ptr);
     }
@@ -672,7 +672,7 @@ public:
     offset_t thisFileStartPos;
     offset_t completedStreamsSize;
     Owned<IFileIO> thisPart;
-    Owned<ISerialStream> curStream;
+    Owned<IBufferedSerialInputStream> curStream;
     unsigned thisPartIdx;
 
     BufferedDirectReader(const RowFilter &_postFilter, bool _grouped, offset_t _startPos, IFileIOArray *_f, unsigned _partNo, unsigned _numParts, const ITranslatorSet *_translators)
@@ -691,10 +691,11 @@ public:
         while (!_partNo && !thisPart && ++thisPartIdx < maxParts) // MORE
         {
             thisPart.setown(f->getFilePart(thisPartIdx, thisFileStartPos));
-            if (thisPart && _startPos >= thisPart->size())
+            offset_t thisPartSize = f->partSize(thisPartIdx);
+            if (thisPart && _startPos >= thisPartSize)
             {
-                _startPos -= thisPart->size();
-                completedStreamsSize += thisPart->size();
+                _startPos -= thisPartSize;
+                completedStreamsSize += thisPartSize;
                 thisPart.clear();
             }
         }
@@ -882,7 +883,7 @@ class InMemoryIndexManager : implements IInMemoryIndexManager, public CInterface
 
     friend class InMemoryIndexTest;
 
-    mutable CriticalSection activeCrit;
+    mutable CriticalSection activeCrit{SYNC_LOCATION};
     InMemoryIndexSet activeIndexes;
 
     unsigned recordCount;
@@ -967,8 +968,6 @@ public:
                         Owned<IFileIO> file = files->getFilePart(idx, base);
                         offset_t size = file->size();
                         baseMap.addFragment(fileEnd, size, idx-1, base, 0);
-                        if (traceLevel > 6)
-                            DBGLOG("File fragment %d size %" I64F "d", idx, size);
                         totalSize += size; // MORE - check for overflow here
                     }
                 }
@@ -989,7 +988,7 @@ public:
                 EXCLOG(MCoperatorError, E);
                 throw E;
             }
-            if (traceLevel > 2)
+            if (doTrace(traceRoxieFiles))
                 DBGLOG("Loading in-memory file, size %" I64F "d", totalSize);
             // MORE - 32-bit systems could wrap here if totalSize > 2^32
             fileEnd = fileStart = (char *) malloc((size_t)totalSize);
@@ -1282,7 +1281,7 @@ IDirectReader *InMemoryIndexManager::selectKey(ScoredRowFilter &filter, const IT
     }
     if (bestIndex)
     {
-        if (logctx.queryTraceLevel() > 5)
+        if (doTrace(traceFilters))
         {
             StringBuffer ret;
             logctx.CTXLOG("Using key %s", bestIndex->toString(ret).str());

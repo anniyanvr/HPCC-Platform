@@ -150,25 +150,33 @@ extern DAFSCLIENT_API byte traceFlags;
 class CRemoteBase : public CSimpleInterfaceOf<IDaFsConnection>
 {
     Owned<ISocket>          socket;
+    unsigned                activeFileIOs = 0;
+    bool                    disconnectOnLastFileIO = false;
     static SocketEndpoint   lastfailep;
     static unsigned         lastfailtime;
     static CriticalSection  lastFailEpCrit;
-    DAFSConnectCfg          connectMethod;
+    DAFSConnectCfg          connectMethod = SSLNone;
 
-    void connectSocket(SocketEndpoint &ep, unsigned connectTimeoutMs=0, unsigned connectRetries=INFINITE);
+    void connectSocket(SocketEndpoint &ep, unsigned connectTimeoutMs=0, unsigned connectRetries=INFINITE, bool secure=false);
     void killSocket(SocketEndpoint &tep);
+    void disconnectLocked();
 
 protected: friend class CRemoteFileIO;
 
     StringAttr          filename;
-    CriticalSection     crit;
+    CriticalSection crit{SYNC_LOCATION};
     SocketEndpoint      ep;
+    StringBuffer        storageSecret;
 
     void sendRemoteCommand(MemoryBuffer & src, MemoryBuffer & reply, bool retry=true, bool lengthy=false, bool handleErrCode=true);
     void sendRemoteCommand(MemoryBuffer & src, bool retry);
+    void noteFileIOOpen();
+    void noteFileIOClose(bool disconnectonexit);
 public:
     CRemoteBase(const SocketEndpoint &_ep, const char * _filename);
     CRemoteBase(const SocketEndpoint &_ep, DAFSConnectCfg _connectMethod, const char * _filename);
+    CRemoteBase(const SocketEndpoint &_ep, const char *_storageSecret, const char * _filename);
+
     void disconnect();
     const char *queryLocalName()
     {
@@ -197,7 +205,8 @@ extern bool clientAsyncCopyFileSection(const char *uuid,    // from genUUID - mu
                         offset_t fromofs,
                         offset_t size,                      // (offset_t)-1 for all file
                         ICopyFileProgress *progress,
-                        unsigned timeout                    // 0 to start, non-zero to wait
+                        unsigned timeout,                   // 0 to start, non-zero to wait
+                        CFflags copyFlags
                         ); // returns true when done
 
 extern void clientSetRemoteFileTimeouts(unsigned maxconnecttime, unsigned maxreadtime);

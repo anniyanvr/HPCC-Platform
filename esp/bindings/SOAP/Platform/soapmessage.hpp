@@ -15,7 +15,9 @@
     limitations under the License.
 ############################################################################## */
 
+#ifdef _MSC_VER
 #pragma warning( disable : 4786)
+#endif
 
 #ifndef _SOAPMESSAGE_HPP__
 #define _SOAPMESSAGE_HPP__
@@ -51,7 +53,6 @@
 class CSoapValue;
 typedef CIArrayOf<CSoapValue> SoapValueArray;
 
-using namespace std;
 using namespace xpp;
 
 

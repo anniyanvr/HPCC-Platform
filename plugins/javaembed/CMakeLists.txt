@@ -26,9 +26,23 @@
 project(javaembed)
 
 if(JAVAEMBED AND USE_JAVA)
-    ADD_PLUGIN(javaembed PACKAGES JNI)
+    ADD_PLUGIN(javaembed)
     if(MAKE_JAVAEMBED)
+        # On macOS with Homebrew openjdk, the JDK is installed under libexec and
+        # CMake's FindJNI does not search there by default. Provide a hint so
+        # both find_package(Java) and find_package(JNI) can locate the headers.
+        if(APPLE AND NOT DEFINED ENV{JAVA_HOME})
+            execute_process(
+                COMMAND brew --prefix openjdk
+                OUTPUT_VARIABLE HOMEBREW_OPENJDK_PREFIX
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(HOMEBREW_OPENJDK_PREFIX)
+                set(ENV{JAVA_HOME} "${HOMEBREW_OPENJDK_PREFIX}/libexec/openjdk.jdk/Contents/Home")
+            endif()
+        endif()
         find_package(Java 1.8 COMPONENTS Development)
+        find_package(JNI)
         set(
             SRCS
             javaembed.cpp)
@@ -52,10 +66,12 @@ if(JAVAEMBED AND USE_JAVA)
 
         set(java_sources HpccClassLoader.java
                          HpccUtils.java
-                         ActivityContext.java)
+                         ActivityContext.java
+                         HpccLogHandler.java)
         set(java_classes ${CMAKE_CURRENT_BINARY_DIR}/com/HPCCSystems/HpccClassLoader.class
                          ${CMAKE_CURRENT_BINARY_DIR}/com/HPCCSystems/HpccUtils.class
-                         ${CMAKE_CURRENT_BINARY_DIR}/com/HPCCSystems/ActivityContext.class)
+                         ${CMAKE_CURRENT_BINARY_DIR}/com/HPCCSystems/ActivityContext.class
+                         ${CMAKE_CURRENT_BINARY_DIR}/com/HPCCSystems/HpccLogHandler.class)
         add_custom_command ( OUTPUT ${java_classes}
             COMMAND ${Java_JAVAC_EXECUTABLE} ${java_sources} -d ${CMAKE_CURRENT_BINARY_DIR} -source 1.8 -target 1.8
             DEPENDS ${java_sources}
@@ -64,7 +80,7 @@ if(JAVAEMBED AND USE_JAVA)
         add_custom_target(build-java-classes ALL
           DEPENDS ${java_classes}
         )
-            
+
         add_definitions(-D_USRDLL -DJAVAEMBED_EXPORTS)
 
         HPCC_ADD_LIBRARY(javaembed SHARED ${SRCS})
@@ -82,7 +98,8 @@ if(JAVAEMBED AND USE_JAVA)
         install(
             FILES ${java_classes}
             DESTINATION classes/com/HPCCSystems
-            COMPONENT Runtime)
+            COMPONENT Runtime
+            CALC_DEPS)
 
         # We link against jsig so that signals are chained from the jvm
 
@@ -96,10 +113,11 @@ if(JAVAEMBED AND USE_JAVA)
         endif()
 
         target_link_libraries(
-            javaembed
+            javaembed PRIVATE
             #${JSIG_LIBRARY}
             ${JAVA_JVM_LIBRARY}
             eclrtl
+            nbcd
             roxiemem
             jlib)
     endif()

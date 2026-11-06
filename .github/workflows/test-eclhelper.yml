@@ -1,0 +1,28 @@
+name: Check that eclhelper interface has not changed
+
+on:
+  pull_request:
+    branches:
+      - "master"
+      - "candidate-*"
+    paths:
+      - "rtl/include/eclhelper.hpp"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fail-on-eclhelper-change:
+    name: "eclhelper.hpp must not change"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail workflow
+        run: |
+          echo "ERROR: Changes detected in rtl/include/eclhelper.hpp"
+          echo "This is a critical binary compatibility interface that must remain stable."
+          echo "If you need to modify this file, please coordinate with platform maintainers."
+          exit 1

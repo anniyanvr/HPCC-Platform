@@ -18,13 +18,13 @@
 #include "platform.h"
 #include "portlist.h"
 
-#include "build-config.h"
 #include "jlib.hpp"
 #include "jiface.hpp"
 #include "jutil.hpp"
 #include "jfile.hpp"
 #include "jlog.hpp"
 #include "jmisc.hpp"
+#include "jsecrets.hpp"
 #include "dalienv.hpp"
 #include "dafdesc.hpp"
 
@@ -40,22 +40,25 @@ static const char* defaultRowSericeConfiguration = "RowSvc";
 #include "remoteerr.hpp"
 #include "dafscommon.hpp"
 #include "rmtclient.hpp"
+#include "rmtfile.hpp"
 #include "dafsserver.hpp"
 
 void usage()
 {
     printf("dafilesrv usage:\n");
-    printf("    dafilesrv [-T<n>] [...] [<port>] [<send-buff-size-kb> <recv-buff-size-kb>]\n");
+    printf("    dafilesrv [--trace <n>] [...] [--port <port>] [--sbSize <send-buff-size-kb>] [--rbSize <recv-buff-size-kb>]\n");
     printf("                                                  -- run test local\n");
-    printf("    dafilesrv -D [ -L <log-dir> ] [ -LOCAL ]      -- run as linux daemon\n");
-    printf("    dafilesrv -R                                  -- run remote (linux daemon, windows standalone)\n");
-    printf("    dafilesrv -install                            -- install windows service\n");
-    printf("    dafilesrv -remove                             -- remove windows service\n\n");
-    printf("    add -I <instance name> to specify an instance name\n");
-    printf("    add -NOSSL to disable SSL sockets, even when specified in configuration\n\n");
+    printf("    dafilesrv --daemon [ --logDir <log-dir> ] [ -LOCAL ]      -- run as linux daemon\n");
+    printf("    dafilesrv --remote                            -- run remote (linux daemon, windows standalone)\n");
+#ifdef _WIN32
+    printf("    dafilesrv --install                            -- install windows service\n");
+    printf("    dafilesrv --remove                             -- remove windows service\n\n");
+#endif
+    printf("    add --name <instance name> to specify an instance name\n");
+    printf("    add --noSSL to disable SSL sockets, even when specified in configuration\n\n");
     printf("    additional optional args:\n");
-    printf("        [-p <port>] [-sslp <ssl-port>] [-sbsize <send-buff-size-kb>] [-rbsize <recv-buff-size-kb>]\n");
-    printf("        [-addr <ip>:<port>]\n\n");
+    printf("        [--port <port>] [--sslPort <ssl-port>] [--sbSize <send-buff-size-kb>] [--rbSize <recv-buff-size-kb>]\n");
+    printf("        [--addr <ip>:<port>]\n\n");
     printf("    Standard port is %d\n",DAFILESRV_PORT);
     printf("    Standard SSL port is %d (certificate and key required in environment.conf)\n",SECURE_DAFILESRV_PORT);
     printf("    Version:  %s\n\n",remoteServerVersionString());
@@ -335,8 +338,35 @@ int initDaemon()
 
 #endif
 
+const char *getSSLMethodText(DAFSConnectCfg connectMethod)
+{
+    switch (connectMethod)
+    {
+        case SSLNone:
+            return "SSLNone";
+        case SSLOnly:
+            return "SSLOnly";
+        case SSLFirst:
+            return "SSLFirst";
+        case UnsecureFirst:
+            return "UnsecureFirst";
+        case UnsecureAndSSL:
+            return "UnsecureAndSSL";
+        default:
+            throwUnexpected();
+    }
+}
 
-int main(int argc,char **argv) 
+
+static constexpr const char * defaultYaml = R"!!(
+version: 1.0
+dafilesrv:
+  name: dafilesrv
+  logging:
+    detail: 100
+)!!";
+
+int main(int argc, const char* argv[])
 {
     InitModuleObjects();
 
@@ -351,21 +381,64 @@ int main(int argc,char **argv)
     SocketEndpoint listenep;
     unsigned sendbufsize = 0;
     unsigned recvbufsize = 0;
-    int i = 1;
-    bool isdaemon = (memicmp(argv[0]+strlen(argv[0])-4,".exe",4)==0);
-    // bit of a kludge for windows - if .exe not specified then not daemon
     bool locallisten = false;
-    const char *logdir=NULL;
-    StringBuffer logDir;
     StringBuffer componentName;
 
+    // NB: bare-metal dafilesrv does not have a component specific xml
+    Owned<IPropertyTree> extractedGlobalConfig;
+
+#ifndef _CONTAINERIZED
+    Owned<IPropertyTree> env = getHPCCEnvironment();
+    if (env)
+    {
+        IPropertyTree* globalTracing = env->getPropTree("Software/tracing");
+        IPropertyTree* globalStorage = env->getPropTree("Software/Globals/storage");
+        if (globalTracing || globalStorage)
+        {
+            extractedGlobalConfig.setown(createPTree("dafilesrv"));
+            if (globalTracing)
+                extractedGlobalConfig->addPropTree("tracing", globalTracing);
+            if (globalStorage)
+                extractedGlobalConfig->addPropTree("storage", globalStorage);
+        }
+    }
+#endif
+
+    const char* componentTag = "dafilesrv";
+    Owned<IPropertyTree> defaultConfig = createPTreeFromYAMLString(defaultYaml, 0, ptr_ignoreWhiteSpace, nullptr);
+    Owned<IPropertyTree> componentDefault(defaultConfig->getPropTree(componentTag));
+
+    // NB: bare-metal dafilesrv does not have a component specific xml, extracting relevant global configuration instead
+    Owned<IPropertyTree> config = loadConfiguration(componentDefault, extractedGlobalConfig, argv, componentTag, "DAFILESRV", nullptr, nullptr);
+
+    updateTraceFlags(loadTraceFlags(config, dafilesrvServerTraceOptions, queryTraceFlags()), true);
+
+    Owned<IPropertyTree> keyPairInfo; // NB: not used in containerized mode
     // Get SSL Settings
     DAFSConnectCfg  connectMethod;
     unsigned short  port;
     unsigned short  sslport;
-    const char *    sslCertFile;
-    const char *    sslKeyFile;
-    queryDafsSecSettings(&connectMethod, &port, &sslport, &sslCertFile, &sslKeyFile, nullptr);
+    unsigned dedicatedRowServicePort = DEFAULT_ROWSERVICE_PORT;
+#ifdef _CONTAINERIZED
+    // Use the "public" certificate issuer, unless it's visibility is "cluster" (meaning internal only)
+    const char *visibility = getComponentConfigSP()->queryProp("service/@visibility");
+    const char *certScope = strsame("cluster", visibility) ? "local" : "public";
+    connectMethod = hasIssuerTlsConfig(certScope) ? SSLOnly : SSLNone;
+    // NB: connectMethod will direct the CRemoteFileServer on accept to create a secure socket based on the same issuer certificates
+
+    dedicatedRowServicePort = 0; // row service always runs on same secure ssl port in containerized mode
+    port = 0;
+    sslport = config->getPropInt("service/@port", SECURE_DAFILESRV_PORT);
+    listenep.port = sslport;
+#else
+    // NB: certificates used by dafsserver when creating secure socket to listen to
+    queryDafsSecSettings(&connectMethod, &port, &sslport, nullptr, nullptr, nullptr);
+    // bit of a kludge for windows - if .exe not specified then not daemon
+    bool isdaemon = (memicmp(argv[0]+strlen(argv[0])-4,".exe",4)==0);
+    listenep.port = port;
+    if (config->hasProp("@port"))
+        listenep.port = config->getPropInt("@port");
+#endif
 
     unsigned maxThreads = DEFAULT_THREADLIMIT;
     unsigned maxThreadsDelayMs = DEFAULT_THREADLIMITDELAYMS;
@@ -379,115 +452,102 @@ int main(int argc,char **argv)
     unsigned throttleSlowCPULimit = DEFAULT_SLOWCMD_THROTTLECPULIMIT;
     unsigned throttleSlowQueueLimit = DEFAULT_SLOWCMD_THROTTLEQUEUELIMIT;
 
-    unsigned dedicatedRowServicePort = DEFAULT_ROWSERVICE_PORT;
     StringAttr rowServiceConfiguration = defaultRowSericeConfiguration;
     bool dedicatedRowServiceSSL = defaultDedicatedRowServiceSSL;
     bool rowServiceOnStdPort = defaultRowServiceOnStdPort;
 
-    // these should really be in env, but currently they are not ...
-    listenep.port = port;
+    if (config->hasProp("@help"))
+    {
+        usage();
+        exit(0);
+    }
 
-    // get command line arguements, including dafilesrv name
-    while (argc>i) {
-        if (stricmp(argv[i],"-D")==0) {
-            i++;
-            isdaemon = true;
-        }
-        else if (stricmp(argv[i],"-R")==0) { // for remote run
-            i++;
+#ifndef _CONTAINERIZED
+    if (config->getPropBool("@daemon"))
+        isdaemon = true;
+    if (config->getPropBool("@remote"))
+    {
 #ifdef _WIN32
-            isdaemon = false;
+        isdaemon = false;
 #else
-            isdaemon = true;
+        isdaemon = true;
 #endif
-        }
-        else if ((argv[i][0]=='-')&&(toupper(argv[i][1])=='T')&&(!argv[i][2]||isdigit(argv[i][2]))) {
-            if (argv[i][2])
-                setDaliServerTrace((byte)atoi(argv[i]+2));
-            i++;
-            isdaemon = false;
-        }
-        else if ((argc>i+1)&&(stricmp(argv[i],"-L")==0)) {
-            i++;
-            logDir.clear().append(argv[i++]);
-        }
-        else if ((argc>i+1)&&(stricmp(argv[i],"-I")==0)) {
-            i++;
-            componentName.clear().append(argv[i++]);
-        }
-        else if ((argc>i+1)&&(stricmp(argv[i],"-p")==0)) {
-            i++;
-            listenep.port = atoi(argv[i++]);
-        }
-        else if ((argc>i+1)&&(stricmp(argv[i],"-addr")==0)) {
-            i++;
-            if (strchr(argv[i],'.')||!isdigit(argv[i][0]))
-                listenep.set(argv[i], listenep.port);
-            else
-                listenep.port = atoi(argv[i]);
-            i++;
-        }
-        else if ((argc>i+1)&&(stricmp(argv[i],"-sslp")==0)) {
-            i++;
-            sslport = atoi(argv[i++]);
-        }
-        else if ((argc>i+1)&&(stricmp(argv[i],"-sbsize")==0)) {
-            i++;
-            sendbufsize = atoi(argv[i++]);
-        }
-        else if ((argc>i+1)&&(stricmp(argv[i],"-rbsize")==0)) {
-            i++;
-            recvbufsize = atoi(argv[i++]);
-        }
-        else if (stricmp(argv[i],"-h")==0) {
-            usage();
-            exit(0);
-        }
-        else if (stricmp(argv[i],"-LOCAL")==0) {
-            i++;
-            locallisten = true;
-        }
-        else if (stricmp(argv[i],"-NOSSL")==0) { // overrides config setting
-            i++;
-            if (connectMethod == SSLOnly || connectMethod == SSLFirst || connectMethod == UnsecureFirst)
+    }
+    StringBuffer logDir;
+    config->getProp("@logDir", logDir);
+#endif
+    if (config->hasProp("@trace"))
+    {
+        setDaliServerTrace(config->getPropInt("@trace"));
+#ifndef _CONTAINERIZED
+        isdaemon = false;
+#endif
+    }
+    config->getProp("@name", componentName);
+    if (config->hasProp("@addr"))
+    {
+        unsigned portOnly = config->getPropInt("@addr");
+        if (portOnly)
+            listenep.port = portOnly;
+        else
+            listenep.set(config->queryProp("@addr"), listenep.port);
+    }
+    if (config->hasProp("@sslPort"))
+        sslport = config->getPropInt("@sslPort");
+
+    if (config->hasProp("@sbSize"))
+        sendbufsize = config->getPropInt("@sbSize");
+
+    if (config->hasProp("@rbSize"))
+        recvbufsize = config->getPropInt("@rbSize");
+    
+    if (config->hasProp("@local"))
+        locallisten = config->getPropBool("@local", true); // i.e. hasProp means it's present, treat as true, unless value says otherwise
+
+    if (config->hasProp("@noSSL"))
+    {
+        if (config->getPropBool("@noSSL", true)) // i.e. hasProp means it's present, treat as true, unless value says otherwise
+        {
+            if (connectMethod != SSLNone)
             {
-                PROGLOG("DaFileSrv SSL specified in config but overridden by -NOSSL in command line");
+                OWARNLOG("DaFileSrv SSL specified in config but overridden by --NOSSL in command line");
                 connectMethod = SSLNone;
             }
         }
-        else
-            break;
     }
 
 #ifdef _WIN32
-    if ((argc>i)&&(stricmp(argv[i],"-install")==0)) {
-        if (installService(DAFS_SERVICE_NAME,DAFS_SERVICE_DISPLAY_NAME,NULL)) {
+    if (config->hasProp("@install"))
+    {
+        if (installService(DAFS_SERVICE_NAME,DAFS_SERVICE_DISPLAY_NAME,NULL))
+        {
             PROGLOG(DAFS_SERVICE_DISPLAY_NAME " Installed");
             return 0;
         }
         return 1;
     }
-    if ((argc>i)&&(stricmp(argv[i],"-remove")==0)) {
-        if (uninstallService(DAFS_SERVICE_NAME,DAFS_SERVICE_DISPLAY_NAME)) {
+    if (config->hasProp("@remove"))
+    {
+        if (uninstallService(DAFS_SERVICE_NAME,DAFS_SERVICE_DISPLAY_NAME))
+        {
             PROGLOG(DAFS_SERVICE_DISPLAY_NAME " Uninstalled");
             return 0;
         }
         return 1;
     }
 #endif
-    if (argc > i) {
-        if (strchr(argv[i],'.')||!isdigit(argv[i][0]))
-            listenep.set(argv[i], listenep.port);
-        else
-            listenep.port = atoi(argv[i]);
-        sendbufsize = (argc>i+1)?(atoi(argv[i+1])*1024):0;
-        recvbufsize = (argc>i+2)?(atoi(argv[i+2])*1024):0;
-    }
+    // NB: these are not used, but are in Solaris version to setsockopt SO_SNDBUF/SO_RCVBUF, perhaps should be
+    sendbufsize = config->getPropInt("@sendBufSize", sendbufsize);
+    recvbufsize = config->getPropInt("@recvBufSize", recvbufsize);
 
-    Owned<IPropertyTree> env = getHPCCEnvironment();
-    IPropertyTree *keyPairInfo = nullptr;
+    IPropertyTree *dafileSrvInstance = nullptr;
+#ifndef _CONTAINERIZED
+    Owned<IPropertyTree> _dafileSrvInstance;
     if (env)
     {
+        Owned<IPropertyTree> newConfig = createPTreeFromIPT(config); // clone
+        IPropertyTree *expert = ensurePTree(newConfig, "expert");
+
         StringBuffer dafilesrvPath("Software/DafilesrvProcess");
         if (componentName.length())
             dafilesrvPath.appendf("[@name=\"%s\"]", componentName.str());
@@ -495,6 +555,12 @@ int main(int argc,char **argv)
             dafilesrvPath.append("[1]"); // in absence of name, use 1st
         IPropertyTree *daFileSrv = env->queryPropTree(dafilesrvPath);
         Owned<IPropertyTree> _dafileSrv;
+
+        // merge in bare-metal global expert settings
+        IPropertyTree *globalExpert = nullptr;
+        globalExpert = env->queryPropTree("Software/Globals");
+        if (globalExpert)
+            synchronizePTree(expert, globalExpert, false, false);
 
         if (daFileSrv)
         {
@@ -534,19 +600,48 @@ int main(int argc,char **argv)
             if (daFileSrv->queryProp("@rowServiceConfiguration"))
                 rowServiceConfiguration = daFileSrv->queryProp("@rowServiceConfiguration");
 
+            // merge in bare-metal dafilesrv component expert settings
+            IPropertyTree *componentExpert = daFileSrv->queryPropTree("expert");
+            if (componentExpert)
+                synchronizePTree(expert, componentExpert, false, true);
+
+            // merge in bare-metal dafilesrv component cert settings into newConfig
+            IPropertyTree *componentCert = daFileSrv->queryPropTree("cert");
+            if (componentCert)
+            {
+                IPropertyTree *cert = ensurePTree(newConfig, "cert");
+                synchronizePTree(cert, componentCert, false, true);
+            }
+
             // any overrides by Instance definitions?
-            IPropertyTree *dafileSrvInstance = nullptr;
             Owned<IPropertyTreeIterator> iter = daFileSrv->getElements("Instance");
             ForEach(*iter)
             {
-                IpAddress instanceIP(iter->query().queryProp("@netAddress"));
+                const char *instanceAddr = iter->query().queryProp("@netAddress");
+                if (isEmptyString(instanceAddr))
+                    continue;
+                IpAddress instanceIP(instanceAddr);
                 if (instanceIP.ipequals(queryHostIP()))
-                    dafileSrvInstance = &iter->query();
+                {
+                    _dafileSrvInstance.set(&iter->query());
+                    dafileSrvInstance = _dafileSrvInstance;
+                    break;
+                }
             }
+            // If host IP matching fails (e.g. localhost-vs-interface differences),
+            // fall back to first configured instance instead of dereferencing null.
+            if (!dafileSrvInstance)
+            {
+                IPropertyTree *firstInstance = daFileSrv->queryPropTree("Instance[1]");
+                if (firstInstance)
+                {
+                    _dafileSrvInstance.set(firstInstance);
+                    dafileSrvInstance = _dafileSrvInstance;
+                }
+            }
+
             if (dafileSrvInstance)
             {
-                Owned<IPropertyTree> _dafileSrvInstance;
-
                 // check if there's a DaFileSrvGroup
                 const char *instanceGroupName = dafileSrvInstance->queryProp("@group");
                 if (!isEmptyString(instanceGroupName) && (isEmptyString(componentGroupName) || !strsame(instanceGroupName, componentGroupName))) // i.e. only if different
@@ -556,31 +651,28 @@ int main(int argc,char **argv)
                     if (daFileSrvGroup)
                     {
                         // create a copy of the group settings and merge in (overwrite) with the instance settings, i.e. any group settings become defaults
-                        _dafileSrvInstance.setown(createPTreeFromIPT(daFileSrvGroup));
-                        synchronizePTree(_dafileSrvInstance, dafileSrvInstance, false, false);
+                        Owned<IPropertyTree> mergedInstance;
+                        mergedInstance.setown(createPTreeFromIPT(daFileSrvGroup));
+                        synchronizePTree(mergedInstance, dafileSrvInstance, false, false);
+                        _dafileSrvInstance.setown(mergedInstance.getClear());
                         dafileSrvInstance = _dafileSrvInstance;
                     }
                 }
-                maxThreads = dafileSrvInstance->getPropInt("@maxThreads", maxThreads);
-                maxThreadsDelayMs = dafileSrvInstance->getPropInt("@maxThreadsDelayMs", maxThreadsDelayMs);
-                maxAsyncCopy = dafileSrvInstance->getPropInt("@maxAsyncCopy", maxAsyncCopy);
-
-                parallelRequestLimit = dafileSrvInstance->getPropInt("@parallelRequestLimit", parallelRequestLimit);
-                throttleDelayMs = dafileSrvInstance->getPropInt("@throttleDelayMs", throttleDelayMs);
-                throttleCPULimit = dafileSrvInstance->getPropInt("@throttleCPULimit", throttleCPULimit);
-                throttleQueueLimit = dafileSrvInstance->getPropInt("@throttleQueueLimit", throttleQueueLimit);
-
-                parallelSlowRequestLimit = dafileSrvInstance->getPropInt("@parallelSlowRequestLimit", parallelSlowRequestLimit);
-                throttleSlowDelayMs = dafileSrvInstance->getPropInt("@throttleSlowDelayMs", throttleSlowDelayMs);
-                throttleSlowCPULimit = dafileSrvInstance->getPropInt("@throttleSlowCPULimit", throttleSlowCPULimit);
-                throttleSlowQueueLimit = dafileSrvInstance->getPropInt("@throttleSlowQueueLimit", throttleSlowQueueLimit);
-
-                dedicatedRowServicePort = dafileSrvInstance->getPropInt("@rowServicePort", dedicatedRowServicePort);
-                dedicatedRowServiceSSL = dafileSrvInstance->getPropBool("@rowServiceSSL", dedicatedRowServiceSSL);
-                rowServiceOnStdPort = dafileSrvInstance->getPropBool("@rowServiceOnStdPort", rowServiceOnStdPort);
             }
+
+            // merge in bare-metal dafilesrv instance expert settings
+            IPropertyTree *instanceExpert = nullptr;
+            if (dafileSrvInstance)
+                instanceExpert = dafileSrvInstance->queryPropTree("expert");
+            if (instanceExpert)
+                synchronizePTree(expert, instanceExpert, false, true);
         }
-        keyPairInfo = env->queryPropTree("EnvSettings/Keys");
+
+        // update config and hook callback with dafilesrv expert PTree
+        replaceComponentConfig(newConfig, getGlobalConfigSP());
+
+        // bare-metal gets its certificate info. from environment at the moment, 'keyPairInfo' not used in containerized mode
+        keyPairInfo.set(env->queryPropTree("EnvSettings/Keys"));
     }
 
 #ifndef _USE_OPENSSL
@@ -614,29 +706,79 @@ int main(int argc,char **argv)
         usage();
         exit(-1);
     }
-    else if ( ((connectMethod == SSLFirst) || (connectMethod == UnsecureFirst)) && ((listenep.port == 0) || (sslport == 0)) )
+    else if ( ((connectMethod == SSLFirst) || (connectMethod == UnsecureFirst) || (connectMethod == UnsecureAndSSL)) && ((listenep.port == 0) || (sslport == 0)) )
     {
         printf("\nError, both port and secure port must not be 0\n");
         usage();
         exit(-1);
     }
 
-    StringBuffer secMethod;
-    if (connectMethod == SSLNone)
-        secMethod.append("SSLNone");
-    else if (connectMethod == SSLOnly)
-        secMethod.append("SSLOnly");
-    else if (connectMethod == SSLFirst)
-        secMethod.append("SSLFirst");
-    else if (connectMethod == UnsecureFirst)
-        secMethod.append("UnsecureFirst");
+    {
+        Owned<IComponentLogFileCreator> lf = createComponentLogFileCreator(logDir.str(), "DAFILESRV");
+        lf->setCreateAliasFile(false);
+        lf->setMaxDetail(TopDetail);
+        lf->beginLogging();
+    }
+    write_pidfile(componentName.str());
+#else // _CONTAINERIZED
+    setupContainerizedLogMsgHandler();
 
-    if (isdaemon) {
+    dafileSrvInstance = config;
+
+    // k8s defaults, a bit arbitrary, but allow more concurrency by default than legacy
+    maxThreads = 400;
+    maxThreadsDelayMs = (60*1000);
+    maxAsyncCopy = 400;
+    parallelRequestLimit = 400;
+    throttleDelayMs = 1000;
+    throttleCPULimit = 85;
+    throttleQueueLimit = 1000;
+    parallelSlowRequestLimit = parallelRequestLimit;
+    throttleSlowDelayMs = throttleDelayMs;
+    throttleSlowCPULimit = throttleCPULimit;
+    throttleSlowQueueLimit = throttleQueueLimit;
+#endif
+
+    Owned<IPropertyTree> dummyDafileSrvInstance;
+    if (nullptr == dafileSrvInstance)
+    {
+        PROGLOG("WARNING: no dafilesrv configuration, default settings will be used");
+        dummyDafileSrvInstance.setown(createPTree());
+        dafileSrvInstance = dummyDafileSrvInstance;
+    }
+    maxThreads = dafileSrvInstance->getPropInt("@maxThreads", maxThreads);
+    maxThreadsDelayMs = dafileSrvInstance->getPropInt("@maxThreadsDelayMs", maxThreadsDelayMs);
+    maxAsyncCopy = dafileSrvInstance->getPropInt("@maxAsyncCopy", maxAsyncCopy);
+
+    parallelRequestLimit = dafileSrvInstance->getPropInt("@parallelRequestLimit", parallelRequestLimit);
+    throttleDelayMs = dafileSrvInstance->getPropInt("@throttleDelayMs", throttleDelayMs);
+    throttleCPULimit = dafileSrvInstance->getPropInt("@throttleCPULimit", throttleCPULimit);
+    throttleQueueLimit = dafileSrvInstance->getPropInt("@throttleQueueLimit", throttleQueueLimit);
+
+    parallelSlowRequestLimit = dafileSrvInstance->getPropInt("@parallelSlowRequestLimit", parallelSlowRequestLimit);
+    throttleSlowDelayMs = dafileSrvInstance->getPropInt("@throttleSlowDelayMs", throttleSlowDelayMs);
+    throttleSlowCPULimit = dafileSrvInstance->getPropInt("@throttleSlowCPULimit", throttleSlowCPULimit);
+    throttleSlowQueueLimit = dafileSrvInstance->getPropInt("@throttleSlowQueueLimit", throttleSlowQueueLimit);
+
+    dedicatedRowServicePort = dafileSrvInstance->getPropInt("@rowServicePort", dedicatedRowServicePort);
+    dedicatedRowServiceSSL = dafileSrvInstance->getPropBool("@rowServiceSSL", dedicatedRowServiceSSL);
+    rowServiceOnStdPort = dafileSrvInstance->getPropBool("@rowServiceOnStdPort", rowServiceOnStdPort);
+
+    unsigned listenQueueLimit = dafileSrvInstance->getPropInt("@maxBacklogQueueSize", DEFAULT_LISTEN_QUEUE_SIZE);
+    // NB: could check getComponentConfig()->getPropInt("expert/@maxBacklogQueueSize", DEFAULT_LISTEN_QUEUE_SIZE);
+    // but many other components have their own explcit setting for this ...
+
+    installDefaultFileHooks(dafileSrvInstance);
+
+#ifndef _CONTAINERIZED
+    if (isdaemon)
+    {
 #ifdef _WIN32
         class cserv: public CService
         {
             bool stopped;
             bool started;
+            Linked<IPropertyTree> config;
             DAFSConnectCfg connectMethod;
             SocketEndpoint listenep;
             unsigned maxThreads;
@@ -649,7 +791,7 @@ int main(int argc,char **argv)
             unsigned throttleSlowDelayMs;
             unsigned throttleSlowCPULimit;
             unsigned sslport;
-            StringBuffer secMethod;
+            unsigned listenQueueLimit;
             Linked<IPropertyTree> keyPairInfo;
             StringAttr rowServiceConfiguration;
             unsigned dedicatedRowServicePort;
@@ -675,19 +817,19 @@ int main(int argc,char **argv)
 
         public:
 
-            cserv(DAFSConnectCfg _connectMethod, SocketEndpoint _listenep,
+            cserv(IPropertyTree *_config, DAFSConnectCfg _connectMethod, SocketEndpoint _listenep,
                         unsigned _maxThreads, unsigned _maxThreadsDelayMs, unsigned _maxAsyncCopy,
                         unsigned _parallelRequestLimit, unsigned _throttleDelayMs, unsigned _throttleCPULimit,
                         unsigned _parallelSlowRequestLimit, unsigned _throttleSlowDelayMs, unsigned _throttleSlowCPULimit,
-                        unsigned _sslport, const char * _secMethod,
+                        unsigned _sslport, unsigned _listenQueueLimit,
                         IPropertyTree *_keyPairInfo,
                         const char *_rowServiceConfiguration,
                         unsigned _dedicatedRowServicePort, bool _dedicatedRowServiceSSL, bool _rowServiceOnStdPort)
-            : connectMethod(_connectMethod), listenep(_listenep), pollthread(this),
+                : config(_config), connectMethod(_connectMethod), listenep(_listenep), pollthread(this),
                   maxThreads(_maxThreads), maxThreadsDelayMs(_maxThreadsDelayMs), maxAsyncCopy(_maxAsyncCopy),
                   parallelRequestLimit(_parallelRequestLimit), throttleDelayMs(_throttleDelayMs), throttleCPULimit(_throttleCPULimit),
                   parallelSlowRequestLimit(_parallelSlowRequestLimit), throttleSlowDelayMs(_throttleSlowDelayMs), throttleSlowCPULimit(_throttleSlowCPULimit),
-                  sslport(_sslport), secMethod(_secMethod),
+                  sslport(_sslport), listenQueueLimit(_listenQueueLimit),
                   keyPairInfo(_keyPairInfo),
                   rowServiceConfiguration(_rowServiceConfiguration), dedicatedRowServicePort(_dedicatedRowServicePort), dedicatedRowServiceSSL(_dedicatedRowServiceSSL), rowServiceOnStdPort(_rowServiceOnStdPort)
             {
@@ -706,7 +848,7 @@ int main(int argc,char **argv)
             {
                 PROGLOG(DAFS_SERVICE_DISPLAY_NAME " Initialized");
                 started = true;
-                pollthread.start();
+                pollthread.start(false);
                 return true;
             }
 
@@ -731,11 +873,11 @@ int main(int argc,char **argv)
                 if (listenep.isNull())
                     eps.append(listenep.port);
                 else
-                    listenep.getUrlStr(eps);
+                    listenep.getEndpointHostText(eps);
 
                 if (connectMethod != SSLOnly)
                     PROGLOG("Opening " DAFS_SERVICE_DISPLAY_NAME " on %s", eps.str());
-                if (connectMethod == SSLOnly || connectMethod == SSLFirst || connectMethod == UnsecureFirst)
+                if (connectMethod != SSLNone)
                 {
                     SocketEndpoint sslep(listenep);
                     sslep.port = sslport;
@@ -743,11 +885,11 @@ int main(int argc,char **argv)
                     if (sslep.isNull())
                         eps.append(sslep.port);
                     else
-                        sslep.getUrlStr(eps);
+                        sslep.getEndpointHostText(eps);
                     PROGLOG("Opening " DAFS_SERVICE_DISPLAY_NAME " on SECURE %s", eps.str());
                 }
 
-                PROGLOG("Dali File Server socket security model: %s", secMethod.str());
+                PROGLOG("Dali File Server socket security model: %s", getSSLMethodText(connectMethod));
 
                 const char * verstring = remoteServerVersionString();
                 PROGLOG("Version: %s", verstring);
@@ -763,22 +905,23 @@ int main(int argc,char **argv)
                     {
                         SocketEndpoint rowServiceEp(listenep); // copy listenep, incase bound by -addr
                         rowServiceEp.port = dedicatedRowServicePort;
-                        server->run(connectMethod, listenep, sslport, &rowServiceEp, dedicatedRowServiceSSL, rowServiceOnStdPort);
+                        server->run(config, connectMethod, listenep, sslport, listenQueueLimit, &rowServiceEp, dedicatedRowServiceSSL, rowServiceOnStdPort);
                     }
                     else
-                        server->run(connectMethod, listenep, sslport);
+                        server->run(config, connectMethod, listenep, sslport);
                 }
-                catch (IException *e) {
+                catch (IException *e)
+                {
                     EXCLOG(e,DAFS_SERVICE_NAME);
                     e->Release();
                 }
                 PROGLOG(DAFS_SERVICE_DISPLAY_NAME " Stopped");
                 stopped = true;
             }
-        } service(connectMethod, listenep,
+        } service(config, connectMethod, listenep,
                 maxThreads, maxThreadsDelayMs, maxAsyncCopy,
                 parallelRequestLimit, throttleDelayMs, throttleCPULimit,
-                parallelSlowRequestLimit, throttleSlowDelayMs, throttleSlowCPULimit, sslport, secMethod,
+                parallelSlowRequestLimit, throttleSlowDelayMs, throttleSlowCPULimit, sslport, listenQueueLimit,
                 keyPairInfo, rowServiceConfiguration, dedicatedRowServicePort, dedicatedRowServiceSSL, rowServiceOnStdPort);
         service.start();
         return 0;
@@ -788,19 +931,9 @@ int main(int argc,char **argv)
             return ret;
 #endif
     }
-#ifndef _CONTAINERIZED
-    {
-        Owned<IComponentLogFileCreator> lf = createComponentLogFileCreator(logDir.str(), "DAFILESRV");
-        lf->setCreateAliasFile(false);
-        lf->setMaxDetail(TopDetail);
-        lf->beginLogging();
-    }
-#else
-    setupContainerizedLogMsgHandler();
 #endif
 
-    write_pidfile(componentName.str());
-    PROGLOG("Dafilesrv starting - Build %s", BUILD_TAG);
+    PROGLOG("Dafilesrv starting - Build %s", hpccBuildInfo.buildTag);
     PROGLOG("Parallel request limit = %d, throttleDelayMs = %d, throttleCPULimit = %d", parallelRequestLimit, throttleDelayMs, throttleCPULimit);
 
     const char * verstring = remoteServerVersionString();
@@ -809,10 +942,10 @@ int main(int argc,char **argv)
     if (listenep.isNull())
         eps.append(listenep.port);
     else
-        listenep.getUrlStr(eps);
+        listenep.getEndpointHostText(eps);
     if (connectMethod != SSLOnly)
         PROGLOG("Opening Dali File Server on %s", eps.str());
-    if (connectMethod == SSLOnly || connectMethod == SSLFirst || connectMethod == UnsecureFirst)
+    if (connectMethod != SSLNone)
     {
         SocketEndpoint sslep(listenep);
         sslep.port = sslport;
@@ -820,11 +953,11 @@ int main(int argc,char **argv)
         if (sslep.isNull())
             eps.append(sslep.port);
         else
-            sslep.getUrlStr(eps);
+            sslep.getEndpointHostText(eps);
         PROGLOG("Opening Dali File Server on SECURE %s", eps.str());
     }
 
-    PROGLOG("Dali File Server socket security model: %s", secMethod.str());
+    PROGLOG("Dali File Server socket security model: %s", getSSLMethodText(connectMethod));
 
     PROGLOG("Version: %s", verstring);
     if (dedicatedRowServicePort)
@@ -860,10 +993,10 @@ int main(int argc,char **argv)
         {
             SocketEndpoint rowServiceEp(listenep); // copy listenep, incase bound by -addr
             rowServiceEp.port = dedicatedRowServicePort;
-            server->run(connectMethod, listenep, sslport, &rowServiceEp, dedicatedRowServiceSSL, rowServiceOnStdPort);
+            server->run(config, connectMethod, listenep, sslport, listenQueueLimit, &rowServiceEp, dedicatedRowServiceSSL, rowServiceOnStdPort);
         }
         else
-            server->run(connectMethod, listenep, sslport);
+            server->run(config, connectMethod, listenep, sslport);
     }
     catch (IException *e)
     {

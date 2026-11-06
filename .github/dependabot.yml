@@ -1,0 +1,53 @@
+version: 2
+updates:
+  # Maintain dependencies for GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "candidate-9.14.x"
+    schedule:
+      interval: "daily"
+    assignees:
+      - "GardMi01_risk"
+    commit-message:
+      prefix: "security(actions):"
+    open-pull-requests-limit: 0
+
+  # Maintain dependencies for Git Submodules
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    target-branch: "candidate-9.14.x"
+    schedule:
+      interval: "daily"
+    assignees:
+      - "GardMi01_risk"
+    commit-message:
+      prefix: "security(submodule):"
+    open-pull-requests-limit: 0
+
+  # Maintain dependencies for npm projects
+  - package-ecosystem: "npm"
+    directories:
+      - "/"
+      - "/esp/src"
+    target-branch: "candidate-9.14.x"
+    schedule:
+      interval: "daily"
+    assignees:
+      - "SmithG3_risk"
+    commit-message:
+      prefix: "security(npm):"
+    open-pull-requests-limit: 0
+
+  # Maintain dependencies for docker images (docker)
+  - package-ecosystem: "docker"
+    directories:
+      - "/dockerfiles"
+      - "/dockerfiles/platform-core-ubuntu-22.04"
+    target-branch: "candidate-9.14.x"
+    schedule:
+      interval: "daily"
+    assignees:
+      - "GardMi01_risk"
+    commit-message:
+      prefix: "security(docker):"
+    open-pull-requests-limit: 0

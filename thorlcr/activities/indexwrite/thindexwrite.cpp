@@ -29,25 +29,23 @@
 
 class IndexWriteActivityMaster : public CMasterActivity
 {
-    rowcount_t recordsProcessed;
-    unsigned __int64 duplicateKeyCount = 0;
-    unsigned __int64 cummulativeDuplicateKeyCount = 0;
+    rowcount_t recordsProcessed = 0;
+    offset_t compressedFileSize = 0;
+    offset_t uncompressedSize = 0;
+    offset_t originalBlobSize = 0;
     Owned<IFileDescriptor> fileDesc;
-    bool buildTlk, isLocal, singlePartKey;
+    bool buildTlk = false, isLocal = false, singlePartKey = false;
     StringArray clusters;
-    mptag_t mpTag2;
-    bool refactor;
+    mptag_t mpTag2 = TAG_NULL;
+    bool refactor = false;
     CDfsLogicalFileName dlfn;
-    IHThorIndexWriteArg *helper;
+    IHThorIndexWriteArg *helper = nullptr;
     StringAttr fileName;
 
 public:
     IndexWriteActivityMaster(CMasterGraphElement *info) : CMasterActivity(info, indexWriteActivityStatistics)
     {
         helper = (IHThorIndexWriteArg *)queryHelper();
-        recordsProcessed = 0;
-        refactor = singlePartKey = isLocal = false;
-        mpTag2 = TAG_NULL;
         reInit = (0 != (TIWvarfilename & helper->getFlags()));
     }
     ~IndexWriteActivityMaster()
@@ -94,8 +92,8 @@ public:
         }
         if (idx == 0)
         {
-            const char * defaultCluster = queryDefaultStoragePlane();
-            if (defaultCluster)
+            StringBuffer defaultCluster;
+            if (getDefaultIndexBuildStoragePlane(defaultCluster))
                 clusters.append(defaultCluster);
         }
 
@@ -147,13 +145,13 @@ public:
         {
             assertex(!isLocal);
             buildTlk = false;
-            Owned<IDistributedFile> _f = queryThorFileManager().lookup(container.queryJob(), diName, false, false, false, container.activityIsCodeSigned());
+            Owned<IDistributedFile> _f = queryThorFileManager().lookup(container.queryJob(), diName, AccessMode::writeSequential, false, false, false, container.activityIsCodeSigned());
             checkFormatCrc(this, _f, helper->getFormatCrc(), nullptr, helper->getFormatCrc(), nullptr, true);
             IDistributedFile *f = _f->querySuperFile();
             if (!f) f = _f;
-            Owned<IDistributedFilePart> existingTlk = f->getPart(f->numParts()-1);
-            if (!existingTlk->queryAttributes().hasProp("@kind") || 0 != stricmp("topLevelKey", existingTlk->queryAttributes().queryProp("@kind")))
+            if (!hasTLK(*f, this))
                 throw MakeActivityException(this, 0, "Cannot build new key '%s' based on non-distributed key '%s'", fileName.get(), diName.get());
+            Owned<IDistributedFilePart> existingTlk = f->getPart(f->numParts()-1);
             IPartDescriptor *tlkDesc = fileDesc->queryPart(fileDesc->numParts()-1);
             IPropertyTree &props = tlkDesc->queryProperties();
             if (existingTlk->queryAttributes().hasProp("@size"))
@@ -222,7 +220,7 @@ public:
                     assertex(diName.get());
                     IPartDescriptor *tlkDesc = fileDesc->queryPart(fileDesc->numParts()-1);
                     tlkDesc->serialize(dst);
-                    Owned<IDistributedFile> _f = queryThorFileManager().lookup(container.queryJob(), diName, false, false, false, container.activityIsCodeSigned());
+                    Owned<IDistributedFile> _f = queryThorFileManager().lookup(container.queryJob(), diName, AccessMode::readSequential, false, false, false, container.activityIsCodeSigned());
                     IDistributedFile *f = _f->querySuperFile();
                     if (!f) f = _f;
                     Owned<IDistributedFilePart> existingTlk = f->getPart(f->numParts()-1);
@@ -242,16 +240,53 @@ public:
     virtual void done()
     {
         IHThorIndexWriteArg *helper = (IHThorIndexWriteArg *)queryHelper();
-        updateActivityResult(container.queryJob().queryWorkUnit(), helper->getFlags(), helper->getSequence(), fileName, recordsProcessed);
+        updateActivityResult(container.queryJob().queryWorkUnit(), 0, helper->getSequence(), fileName, recordsProcessed);
 
-        cummulativeDuplicateKeyCount += duplicateKeyCount;
         // MORE - add in the extra entry somehow
         if (fileName.get())
         {
             IPropertyTree &props = fileDesc->queryProperties();
             props.setPropInt64("@recordCount", recordsProcessed);
-            props.setPropInt64("@duplicateKeyCount", duplicateKeyCount);
+            props.setPropInt64("@duplicateKeyCount", statsCollection.getStatisticSum(StNumDuplicateKeys));
             props.setProp("@kind", "key");
+            props.setPropInt64("@uncompressedSize", uncompressedSize);
+            props.setPropInt64("@size", compressedFileSize);
+            props.setPropInt64("@numLeafNodes", statsCollection.getStatisticSum(StNumLeafCacheAdds));
+            stat_type numBlobNodes = statsCollection.getStatisticSum(StNumBlobCacheAdds);
+            props.setPropInt64("@numBlobNodes", numBlobNodes);
+            if (numBlobNodes)
+                props.setPropInt64("@originalBlobSize", originalBlobSize);
+            props.setPropInt64("@numBranchNodes", statsCollection.getStatisticSum(StNumNodeCacheAdds));
+
+            stat_type branchMemorySize = statsCollection.getStatisticSum(StSizeBranchMemory);
+            if (branchMemorySize)
+                props.setPropInt64("@branchMemorySize", branchMemorySize);
+            stat_type leafMemorySize = statsCollection.getStatisticSum(StSizeLeafMemory);
+            if (leafMemorySize)
+                props.setPropInt64("@leafMemorySize", leafMemorySize);
+
+            stat_type maxLeafMemorySize = statsCollection.getStatisticMax(StSizeLargestExpandedLeaf);
+            if (maxLeafMemorySize)
+                props.setPropInt64("@maxLeafMemorySize", maxLeafMemorySize);
+
+            // Set the compression type that was actually used
+            StringBuffer defaultIndexCompression;
+            container.queryJob().getWorkUnitValue("defaultIndexCompression", defaultIndexCompression);
+
+            StringBuffer compressionType;
+            getIndexCompressionType(compressionType, helper, defaultIndexCompression.str());
+            props.setProp("@compressionType", compressionType.str());
+
+            Owned<IPropertyTree> metadata;
+            buildUserMetadata(metadata, helper, compressionType.str());
+            unsigned nodeSize = metadata ? metadata->getPropInt("_nodeSize", NODESIZE) : NODESIZE;
+            props.setPropInt64("@nodeSize", nodeSize);
+
+            size32_t keyedSize = helper->getKeyedSize();
+            if (keyedSize == (size32_t)-1)
+                keyedSize = helper->queryDiskRecordSize()->getFixedSize();
+            props.setPropInt64("@keyedSize", keyedSize);
+
             if (0 != (helper->getFlags() & TIWexpires))
                 setExpiryTime(props, helper->getExpiryDays());
             if (TIWupdate & helper->getFlags())
@@ -263,6 +298,8 @@ public:
                 props.setPropInt64("@totalCRC", totalCRC);
             }
             props.setPropInt("@formatCrc", helper->getFormatCrc());
+            props.setPropInt64(getDFUQResultFieldName(DFUQResultField::numDiskWrites), statsCollection.getStatisticSum(StNumDiskWrites));
+            props.setPropInt64(getDFUQResultFieldName(DFUQResultField::writeCost), diskAccessCost);
             if (isLocal)
             {
                 props.setPropBool("@local", true);
@@ -290,25 +327,45 @@ public:
         if (mb.length()) // if 0 implies aborted out from this slave.
         {
             rowcount_t r;
-            unsigned __int64 slaveDuplicateKeyCount;
             mb.read(r);
-            mb.read(slaveDuplicateKeyCount);
+
             recordsProcessed += r;
-            duplicateKeyCount += slaveDuplicateKeyCount;
+
             if (!singlePartKey || 0 == slaveIdx)
             {
                 IPartDescriptor *partDesc = fileDesc->queryPart(slaveIdx);
                 offset_t size;
                 mb.read(size);
                 CDateTime modifiedTime(mb);
+
                 IPropertyTree &props = partDesc->queryProperties();
                 props.setPropInt64("@size", size);
                 props.setPropInt64("@recordCount", r);
+
                 StringBuffer dateStr;
                 props.setProp("@modified", modifiedTime.getString(dateStr).str());
                 unsigned crc;
                 mb.read(crc);
                 props.setPropInt64("@fileCrc", crc);
+
+                offset_t slaveUncompressedSize;
+                offset_t slaveOriginalBlobSize;
+                offset_t offsetBranches;
+                offset_t offsetRoot;
+                mb.read(slaveUncompressedSize);
+                mb.read(slaveOriginalBlobSize);
+                mb.read(offsetBranches);
+                mb.read(offsetRoot);
+
+                compressedFileSize += size;
+                uncompressedSize += slaveUncompressedSize;
+                originalBlobSize += slaveOriginalBlobSize;
+
+                props.setPropInt64("@uncompressedSize", slaveUncompressedSize);
+                props.setPropInt64("@offsetBranches", offsetBranches);
+                props.setPropInt64("@offsetRoot", offsetRoot);
+
+                //Read details for the TLK if it has been generated
                 if (!singlePartKey && 0 == slaveIdx && buildTlk)
                 {
                     IPartDescriptor *partDesc = fileDesc->queryPart(fileDesc->numParts()-1);
@@ -338,7 +395,7 @@ public:
         if (0 == (TIWvarfilename & helper->getFlags()))
         {
             OwnedRoxieString fname(helper->getFileName());
-            Owned<IDistributedFile> file = queryThorFileManager().lookup(container.queryJob(), fname, false, true, false, container.activityIsCodeSigned());
+            Owned<IDistributedFile> file = queryThorFileManager().lookup(container.queryJob(), fname, AccessMode::readLogicalMeta, false, true, false, container.activityIsCodeSigned());
             if (file)
             {
                 if (0 == (TIWoverwrite & helper->getFlags()))
@@ -346,12 +403,13 @@ public:
                 checkSuperFileOwnership(*file);
             }
         }
-        duplicateKeyCount = 0;
     }
     virtual void getActivityStats(IStatisticGatherer & stats) override
     {
         CMasterActivity::getActivityStats(stats);
-        stats.addStatistic(StNumDuplicateKeys, cummulativeDuplicateKeyCount);
+        diskAccessCost = calcDiskWriteCost(clusters, statsCollection.getStatisticSum(StNumDiskWrites));
+        if (diskAccessCost)
+            stats.addStatistic(StCostFileAccess, diskAccessCost);
     }
 };
 
